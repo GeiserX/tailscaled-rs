@@ -42,6 +42,14 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Secret strings: zeroize-on-drop, no Debug/serialize by default (auth keys / tokens in the daemon).
+secrecy = "0.10"
+# Peer-process euid for the same-user LocalAPI write policy. libc is already in the tree
+# (transitively via the engine); used only for geteuid() on unix.
+libc = "0.2"
+# Parse a control-server URL string (from prefs / CLI) into the engine's `url::Url` Config field.
+# Pinned to the same 2.x the engine resolves.
+url = "2"
 
 [profile.release]
 strip = true

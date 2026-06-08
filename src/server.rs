@@ -17,6 +17,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
+use crate::auth::{self, Permissions};
 use crate::ipn::Backend;
 use crate::localapi::{Request, Response};
 
@@ -45,9 +46,14 @@ pub async fn serve(
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _addr)) => {
+                        // Authorize once, at accept: `peer_cred()` needs the whole stream, so we
+                        // resolve permissions before `handle_conn` splits it into read/write halves.
+                        // A single `peer_cred()` read yields both the decision and the uid we log,
+                        // so the logged uid can never disagree with the authorization.
+                        let (perms, peer_uid) = auth::permissions_for_peer(&stream);
                         let backend = Arc::clone(&backend);
                         tokio::spawn(async move {
-                            if let Err(e) = handle_conn(stream, backend).await {
+                            if let Err(e) = handle_conn(stream, perms, peer_uid, backend).await {
                                 tracing::warn!(error = %e, "LocalAPI connection error");
                             }
                         });
@@ -63,7 +69,12 @@ pub async fn serve(
     Ok(())
 }
 
-async fn handle_conn(stream: UnixStream, backend: Arc<Mutex<Backend>>) -> Result<()> {
+async fn handle_conn(
+    stream: UnixStream,
+    perms: Permissions,
+    peer_uid: Option<u32>,
+    backend: Arc<Mutex<Backend>>,
+) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
 
@@ -72,7 +83,7 @@ async fn handle_conn(stream: UnixStream, backend: Arc<Mutex<Backend>>) -> Result
             continue;
         }
         let response = match serde_json::from_str::<Request>(&line) {
-            Ok(req) => dispatch(req, &backend).await,
+            Ok(req) => dispatch(req, perms, peer_uid, &backend).await,
             Err(e) => Response::Error {
                 message: format!("bad request: {e}"),
             },
@@ -85,7 +96,25 @@ async fn handle_conn(stream: UnixStream, backend: Arc<Mutex<Backend>>) -> Result
     Ok(())
 }
 
-async fn dispatch(req: Request, backend: &Arc<Mutex<Backend>>) -> Response {
+async fn dispatch(
+    req: Request,
+    perms: Permissions,
+    peer_uid: Option<u32>,
+    backend: &Arc<Mutex<Backend>>,
+) -> Response {
+    // Authorization gate: writes (`up`/`down`) require root or the daemon's owner. Reads
+    // (`status`) are never gated. Checked before taking the backend lock so a denied caller never
+    // touches lifecycle state.
+    if auth::requires_write(&req) && !perms.write {
+        tracing::warn!(
+            peer_uid = ?peer_uid,
+            "denied LocalAPI write: caller lacks write permission"
+        );
+        return Response::Error {
+            message: "permission denied: writing (up/down) requires root or the same user that owns the daemon".into(),
+        };
+    }
+
     let mut be = backend.lock().await;
     match req {
         Request::Status => Response::Status(be.status().await),
@@ -93,14 +122,20 @@ async fn dispatch(req: Request, backend: &Arc<Mutex<Backend>>) -> Response {
             authkey,
             control_url,
             hostname,
-        } => match be.up(authkey, hostname, control_url).await {
-            Ok(()) => Response::Ok {
-                message: "node brought up".to_string(),
-            },
-            Err(e) => Response::Error {
-                message: format!("{e:#}"),
-            },
-        },
+        } => {
+            // Confine the plaintext authkey to the smallest scope: wrap it into a `SecretString`
+            // right at the boundary and hand the engine path the secret. (The wire type stays
+            // `String` because `SecretString` does not serialize.)
+            let authkey = authkey.map(secrecy::SecretString::from);
+            match be.up(authkey, hostname, control_url).await {
+                Ok(()) => Response::Ok {
+                    message: "node brought up".to_string(),
+                },
+                Err(e) => Response::Error {
+                    message: format!("{e:#}"),
+                },
+            }
+        }
         Request::Down => match be.down().await {
             Ok(()) => Response::Ok {
                 message: "node brought down".to_string(),

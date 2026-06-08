@@ -21,13 +21,20 @@ async fn main() -> Result<()> {
     let socket_path = tailscaled_rs::socket_path();
     tracing::info!(state_dir = %state_dir.display(), "starting tailnetd");
 
+    // The state dir holds unencrypted key material; lock it to 0700 before any key file is written.
+    if let Err(e) = tailscaled_rs::ensure_state_dir_secure(&state_dir).await {
+        tracing::error!(error = %e, state_dir = %state_dir.display(), "failed to secure state dir");
+        return Err(e.into());
+    }
+
     let mut backend = tailscaled_rs::ipn::Backend::load(&state_dir).await?;
 
     // Auto-start if the persisted intent was "up". The MVP relies on an auth key in the
     // environment (`TS_AUTH_KEY`) for non-interactive re-registration on launch.
     if backend.wants_running() {
         tracing::info!("persisted intent is up; auto-starting");
-        let authkey = tailscale::config::auth_key_from_env();
+        // Wrap the env auth key in `SecretString` so it is never logged or accidentally printed.
+        let authkey = tailscale::config::auth_key_from_env().map(secrecy::SecretString::from);
         if let Err(e) = backend.up(authkey, None, None).await {
             // Non-fatal: come up in a needs-login/stopped state and let the CLI drive `up`.
             tracing::warn!(error = %format!("{e:#}"), "auto-start failed; awaiting `tnet up`");
