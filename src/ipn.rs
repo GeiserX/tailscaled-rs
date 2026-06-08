@@ -516,11 +516,9 @@ impl Backend {
         }
         // TUN-mode data path. Default is the engine's userspace netstack (unprivileged); TUN hands
         // packets to a real kernel interface, which needs (a) a daemon built with the `tun` cargo
-        // feature [`tailscale/tun`], (b) root / CAP_NET_ADMIN, and (c) the engine exposing a way to
-        // construct `Config.transport_mode = TransportMode::Tun(..)`. We preflight (a) and (b) here
-        // and FAIL LOUDLY — never silently downgrade to netstack, because the operator asked for
-        // OS-wide connectivity and a silent fallback would be a confusing, hard-to-notice
-        // half-working state.
+        // feature [`tailscale/tun`] and (b) root / CAP_NET_ADMIN. We preflight both and FAIL LOUDLY
+        // — never silently downgrade to netstack, because the operator asked for OS-wide
+        // connectivity and a silent fallback would be a confusing, hard-to-notice half-working state.
         if self.prefs.tun_enabled {
             #[cfg(not(feature = "tun"))]
             {
@@ -542,23 +540,14 @@ impl Backend {
                          systemd/launchd units do) or use the default userspace-networking mode"
                     ));
                 }
-                // ENGINE GAP (pinned rev afa970c): `tailscale::Config.transport_mode` is public but
-                // its type `ts_control::TransportMode` is NOT re-exported by the engine facade, and
-                // there is no `Config` setter/constructor for TUN — so a downstream crate cannot
-                // build `TransportMode::Tun(TunConfig { name, mtu })`. The daemon-side plumbing
-                // (prefs/wire/CLI/feature-gate/root-preflight, name=`tun_name`, mtu=`tun_mtu`) is all
-                // in place and the engine `tun` feature compiles; the one missing piece is an engine
-                // export. Fail loudly with the exact ask rather than pretend, until the engine adds
-                // e.g. `pub use ts_control::{TransportMode, TunConfig};` or a
-                // `Config::use_tun(name, mtu)` builder (tracked: engine bead). When it lands, replace
-                // this block with the actual `config.transport_mode = …` assignment.
-                let _ = (&self.prefs.tun_name, self.prefs.tun_mtu); // wired, pending the engine export
-                return Err(anyhow!(
-                    "TUN mode is not yet wirable: the pinned tailscale-rs engine (afa970c) does not \
-                     export `TransportMode`/`TunConfig` or a `Config` TUN setter, so the daemon \
-                     cannot select the kernel-TUN transport. Use the default userspace-networking \
-                     mode until the engine exposes a TUN constructor (then this is a one-line change)"
-                ));
+                // Select the kernel-TUN transport. The engine (v0.6.7+) re-exports `TransportMode`
+                // and `TunConfig` from the facade, so the daemon can construct the value directly.
+                // `tun_name` (None → OS picks, e.g. `utunN` on macOS) and `tun_mtu` (None → transport
+                // default; Tailscale's overlay MTU is 1280) come from prefs.
+                config.transport_mode = tailscale::TransportMode::Tun(tailscale::TunConfig {
+                    name: self.prefs.tun_name.clone(),
+                    mtu: self.prefs.tun_mtu,
+                });
             }
         }
         Ok(config)

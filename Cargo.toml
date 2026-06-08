@@ -25,15 +25,18 @@ name = "tnet"
 path = "src/bin/tnet.rs"
 
 [dependencies]
-# The engine: a from-scratch Rust Tailscale-protocol library. Imported as `tailscale`,
-# published crate name `tailscale-rs`. Pinned to a specific rev for reproducible builds;
-# Cargo.lock is committed so CI and every clone build the exact same engine.
+# The engine: a from-scratch Rust Tailscale-protocol library. Imported as `tailscale` (the lib
+# name), published crate (package) name `geiserx_tailscale` — the workspace renamed every crate to
+# the `geiserx_*` namespace for crates.io publication, but kept the importable lib name `tailscale`,
+# so `use tailscale::...` is unchanged. Pinned to a specific rev for reproducible builds; Cargo.lock
+# is committed so CI and every clone build the exact same engine. (When `geiserx_tailscale` v0.6.7+
+# is live on crates.io, this can move to a plain `version`-based crates.io dep.)
 #
 # Local engine iteration (optional): a *gitignored* `.cargo/config.toml` with
 #   paths = ["/path/to/your/tailscale-rs/checkout"]
 # transparently overrides this git dep when the local checkout's version matches the pin —
 # so you can edit the engine and rebuild the daemon with no manifest change. See README.
-tailscale = { package = "tailscale-rs", git = "https://github.com/GeiserX/tailscale-rs", rev = "afa970c04ad1a98e6dc88484294f360439a24725" }
+tailscale = { package = "geiserx_tailscale", git = "https://github.com/GeiserX/tailscale-rs", rev = "f64aebe1162097987f79bf16ca46d4570c95ad47" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
 serde = { version = "1", features = ["derive"] }

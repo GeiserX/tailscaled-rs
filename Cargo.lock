@@ -986,6 +986,575 @@ dependencies = [
 ]
 
 [[package]]
+name = "geiserx_tailscale"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "geiserx_ts_control",
+ "geiserx_ts_keys",
+ "geiserx_ts_metrics",
+ "geiserx_ts_netstack_smoltcp",
+ "geiserx_ts_packet",
+ "geiserx_ts_runtime",
+ "geiserx_ts_tka",
+ "ipnet",
+ "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "geiserx_ts_array256"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "geiserx_ts_bitset",
+ "heapless",
+ "smallvec",
+ "static_assertions",
+]
+
+[[package]]
+name = "geiserx_ts_bart"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "cfg-if",
+ "geiserx_ts_array256",
+ "geiserx_ts_bitset",
+ "heapless",
+ "ipnet",
+ "static_assertions",
+]
+
+[[package]]
+name = "geiserx_ts_bart_packetfilter"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "geiserx_ts_array256",
+ "geiserx_ts_bart",
+ "geiserx_ts_bitset",
+ "geiserx_ts_dynbitset",
+ "geiserx_ts_packetfilter",
+ "hashbrown 0.17.1",
+ "smallvec",
+]
+
+[[package]]
+name = "geiserx_ts_bitset"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "cfg-if",
+ "static_assertions",
+]
+
+[[package]]
+name = "geiserx_ts_capabilityversion"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "geiserx_ts_control"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "bytes",
+ "chrono",
+ "futures-util",
+ "geiserx_ts_bitset",
+ "geiserx_ts_capabilityversion",
+ "geiserx_ts_control_noise",
+ "geiserx_ts_control_serde",
+ "geiserx_ts_derp",
+ "geiserx_ts_dynbitset",
+ "geiserx_ts_http_util",
+ "geiserx_ts_keys",
+ "geiserx_ts_nodecapability",
+ "geiserx_ts_packet",
+ "geiserx_ts_packetfilter",
+ "geiserx_ts_packetfilter_state",
+ "geiserx_ts_tls_util",
+ "gethostname",
+ "ipnet",
+ "lazy_static",
+ "pin-project-lite",
+ "ring",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+ "url",
+ "zerocopy",
+]
+
+[[package]]
+name = "geiserx_ts_control_noise"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "base64",
+ "bytes",
+ "chacha20poly1305",
+ "futures-util",
+ "geiserx_ts_capabilityversion",
+ "geiserx_ts_hexdump",
+ "geiserx_ts_keys",
+ "noise-protocol",
+ "noise-rust-crypto",
+ "pin-project-lite",
+ "static_assertions",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "zerocopy",
+ "zeroize",
+]
+
+[[package]]
+name = "geiserx_ts_control_serde"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "base64",
+ "chrono",
+ "geiserx_ts_capabilityversion",
+ "geiserx_ts_keys",
+ "geiserx_ts_nodecapability",
+ "geiserx_ts_packetfilter_serde",
+ "ipnet",
+ "serde",
+ "serde_json",
+ "serde_repr",
+ "serde_with",
+ "url",
+]
+
+[[package]]
+name = "geiserx_ts_dataplane"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "etherparse",
+ "geiserx_ts_bart",
+ "geiserx_ts_overlay_router",
+ "geiserx_ts_packet",
+ "geiserx_ts_packetfilter",
+ "geiserx_ts_time",
+ "geiserx_ts_transport",
+ "geiserx_ts_tunnel",
+ "geiserx_ts_underlay_router",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "geiserx_ts_derp"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "bytes",
+ "crypto_box",
+ "futures",
+ "geiserx_ts_hexdump",
+ "geiserx_ts_http_util",
+ "geiserx_ts_keys",
+ "geiserx_ts_packet",
+ "geiserx_ts_tls_util",
+ "geiserx_ts_transport",
+ "hex",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "yoke",
+ "zerocopy",
+]
+
+[[package]]
+name = "geiserx_ts_disco_protocol"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "aead",
+ "crypto_box",
+ "geiserx_ts_keys",
+ "num-derive",
+ "num-traits",
+ "thiserror",
+ "zerocopy",
+]
+
+[[package]]
+name = "geiserx_ts_dns_wire"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+
+[[package]]
+name = "geiserx_ts_dynbitset"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "geiserx_ts_bitset",
+ "smallvec",
+]
+
+[[package]]
+name = "geiserx_ts_forwarder"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "bytes",
+ "geiserx_ts_netstack_smoltcp",
+ "ipnet",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "geiserx_ts_hexdump"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "heapless",
+]
+
+[[package]]
+name = "geiserx_ts_host_net"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "ipnet",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "geiserx_ts_http_util"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "bytes",
+ "futures",
+ "geiserx_ts_tls_util",
+ "http",
+ "http-body-util",
+ "httparse",
+ "hyper",
+ "hyper-util",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "geiserx_ts_keys"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "crypto_box",
+ "ed25519-dalek",
+ "getrandom 0.4.2",
+ "serde",
+ "thiserror",
+ "x25519-dalek 3.0.0-rc.0",
+ "zerocopy",
+ "zeroize",
+]
+
+[[package]]
+name = "geiserx_ts_magicsock"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "geiserx_ts_disco_protocol",
+ "geiserx_ts_keys",
+ "geiserx_ts_metrics",
+ "geiserx_ts_packet",
+ "geiserx_ts_transport",
+ "if-addrs",
+ "rand 0.10.1",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "zerocopy",
+]
+
+[[package]]
+name = "geiserx_ts_metrics"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+
+[[package]]
+name = "geiserx_ts_netcheck"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "bytes",
+ "dashmap",
+ "geiserx_ts_control",
+ "geiserx_ts_derp",
+ "geiserx_ts_http_util",
+ "stun-rs",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "geiserx_ts_netstack_smoltcp"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "geiserx_ts_netstack_smoltcp_core",
+ "geiserx_ts_netstack_smoltcp_socket",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "geiserx_ts_netstack_smoltcp_core"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "bytes",
+ "flume",
+ "heapless",
+ "smoltcp",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "geiserx_ts_netstack_smoltcp_socket"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "bytes",
+ "geiserx_ts_netstack_smoltcp_core",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "geiserx_ts_nodecapability"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "cfg-if",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "geiserx_ts_overlay_router"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "geiserx_ts_bart",
+ "geiserx_ts_packet",
+ "geiserx_ts_transport",
+ "itertools",
+ "tracing",
+]
+
+[[package]]
+name = "geiserx_ts_packet"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "bytes",
+ "crypto_box",
+ "geiserx_ts_hexdump",
+]
+
+[[package]]
+name = "geiserx_ts_packetfilter"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "hashbrown 0.17.1",
+ "ipnet",
+ "static_assertions",
+ "tracing",
+]
+
+[[package]]
+name = "geiserx_ts_packetfilter_serde"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "geiserx_ts_nodecapability",
+ "geiserx_ts_peercapability",
+ "ipnet",
+ "nom",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "geiserx_ts_packetfilter_state"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "geiserx_ts_packetfilter",
+ "geiserx_ts_packetfilter_serde",
+]
+
+[[package]]
+name = "geiserx_ts_peercapability"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "serde",
+ "url",
+]
+
+[[package]]
+name = "geiserx_ts_runtime"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "base64",
+ "etherparse",
+ "futures",
+ "geiserx_ts_bart",
+ "geiserx_ts_bart_packetfilter",
+ "geiserx_ts_control",
+ "geiserx_ts_dataplane",
+ "geiserx_ts_derp",
+ "geiserx_ts_dns_wire",
+ "geiserx_ts_forwarder",
+ "geiserx_ts_host_net",
+ "geiserx_ts_keys",
+ "geiserx_ts_magicsock",
+ "geiserx_ts_netcheck",
+ "geiserx_ts_netstack_smoltcp",
+ "geiserx_ts_overlay_router",
+ "geiserx_ts_packet",
+ "geiserx_ts_packetfilter",
+ "geiserx_ts_packetfilter_state",
+ "geiserx_ts_tka",
+ "geiserx_ts_transport",
+ "geiserx_ts_transport_tun",
+ "geiserx_ts_tunnel",
+ "httparse",
+ "ipnet",
+ "kameo",
+ "kameo_actors",
+ "smallvec",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "geiserx_ts_time"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+
+[[package]]
+name = "geiserx_ts_tka"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "blake2",
+ "ed25519-dalek",
+ "ed25519-zebra",
+ "thiserror",
+]
+
+[[package]]
+name = "geiserx_ts_tls_util"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "ring",
+ "rustls-pemfile",
+ "subtle",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "url",
+ "webpki-roots",
+]
+
+[[package]]
+name = "geiserx_ts_transport"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "geiserx_ts_packet",
+]
+
+[[package]]
+name = "geiserx_ts_transport_tun"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "bytes",
+ "geiserx_ts_hexdump",
+ "geiserx_ts_packet",
+ "geiserx_ts_transport",
+ "ipnet",
+ "thiserror",
+ "tracing",
+ "tun-rs",
+]
+
+[[package]]
+name = "geiserx_ts_tunnel"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "aead",
+ "blake2",
+ "chacha20poly1305",
+ "geiserx_ts_keys",
+ "geiserx_ts_packet",
+ "geiserx_ts_time",
+ "hkdf",
+ "itertools",
+ "rand 0.10.1",
+ "tracing",
+ "x25519-dalek 3.0.0-rc.0",
+ "zerocopy",
+]
+
+[[package]]
+name = "geiserx_ts_underlay_router"
+version = "0.6.7"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=f64aebe1162097987f79bf16ca46d4570c95ad47#a005920f96c418ee5651bd1b1e4ed035e565a63e"
+dependencies = [
+ "geiserx_ts_packet",
+ "geiserx_ts_transport",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2634,38 +3203,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "tailscale-rs"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "ipnet",
- "rand 0.10.1",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
- "ts_control",
- "ts_keys",
- "ts_metrics",
- "ts_netstack_smoltcp",
- "ts_packet",
- "ts_runtime",
- "ts_tka",
- "url",
-]
-
-[[package]]
 name = "tailscaled-rs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "geiserx_tailscale",
  "libc",
  "secrecy",
  "serde",
  "serde_json",
- "tailscale-rs",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -2887,553 +3434,6 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
-
-[[package]]
-name = "ts_array256"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "heapless",
- "smallvec",
- "static_assertions",
- "ts_bitset",
-]
-
-[[package]]
-name = "ts_bart"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "cfg-if",
- "heapless",
- "ipnet",
- "static_assertions",
- "ts_array256",
- "ts_bitset",
-]
-
-[[package]]
-name = "ts_bart_packetfilter"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "hashbrown 0.17.1",
- "smallvec",
- "ts_array256",
- "ts_bart",
- "ts_bitset",
- "ts_dynbitset",
- "ts_packetfilter",
-]
-
-[[package]]
-name = "ts_bitset"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "cfg-if",
- "static_assertions",
-]
-
-[[package]]
-name = "ts_capabilityversion"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "ts_control"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "bytes",
- "chrono",
- "futures-util",
- "gethostname",
- "ipnet",
- "lazy_static",
- "pin-project-lite",
- "ring",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-rustls",
- "tokio-stream",
- "tokio-util",
- "tracing",
- "ts_bitset",
- "ts_capabilityversion",
- "ts_control_noise",
- "ts_control_serde",
- "ts_derp",
- "ts_dynbitset",
- "ts_http_util",
- "ts_keys",
- "ts_nodecapability",
- "ts_packet",
- "ts_packetfilter",
- "ts_packetfilter_state",
- "ts_tls_util",
- "url",
- "zerocopy",
-]
-
-[[package]]
-name = "ts_control_noise"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "base64",
- "bytes",
- "chacha20poly1305",
- "futures-util",
- "noise-protocol",
- "noise-rust-crypto",
- "pin-project-lite",
- "static_assertions",
- "thiserror",
- "tokio",
- "tokio-util",
- "tracing",
- "ts_capabilityversion",
- "ts_hexdump",
- "ts_keys",
- "zerocopy",
- "zeroize",
-]
-
-[[package]]
-name = "ts_control_serde"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "base64",
- "chrono",
- "ipnet",
- "serde",
- "serde_json",
- "serde_repr",
- "serde_with",
- "ts_capabilityversion",
- "ts_keys",
- "ts_nodecapability",
- "ts_packetfilter_serde",
- "url",
-]
-
-[[package]]
-name = "ts_dataplane"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "etherparse",
- "tokio",
- "tracing",
- "ts_bart",
- "ts_overlay_router",
- "ts_packet",
- "ts_packetfilter",
- "ts_time",
- "ts_transport",
- "ts_tunnel",
- "ts_underlay_router",
-]
-
-[[package]]
-name = "ts_derp"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "bytes",
- "crypto_box",
- "futures",
- "hex",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-util",
- "tracing",
- "ts_hexdump",
- "ts_http_util",
- "ts_keys",
- "ts_packet",
- "ts_tls_util",
- "ts_transport",
- "url",
- "yoke",
- "zerocopy",
-]
-
-[[package]]
-name = "ts_disco_protocol"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "aead",
- "crypto_box",
- "num-derive",
- "num-traits",
- "thiserror",
- "ts_keys",
- "zerocopy",
-]
-
-[[package]]
-name = "ts_dns_wire"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-
-[[package]]
-name = "ts_dynbitset"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "smallvec",
- "ts_bitset",
-]
-
-[[package]]
-name = "ts_forwarder"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "bytes",
- "ipnet",
- "thiserror",
- "tokio",
- "tracing",
- "ts_netstack_smoltcp",
-]
-
-[[package]]
-name = "ts_hexdump"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "heapless",
-]
-
-[[package]]
-name = "ts_host_net"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "ipnet",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "ts_http_util"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "bytes",
- "futures",
- "http",
- "http-body-util",
- "httparse",
- "hyper",
- "hyper-util",
- "thiserror",
- "tokio",
- "tokio-util",
- "tracing",
- "ts_tls_util",
- "url",
-]
-
-[[package]]
-name = "ts_keys"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "crypto_box",
- "ed25519-dalek",
- "getrandom 0.4.2",
- "serde",
- "thiserror",
- "x25519-dalek 3.0.0-rc.0",
- "zerocopy",
- "zeroize",
-]
-
-[[package]]
-name = "ts_magicsock"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "if-addrs",
- "rand 0.10.1",
- "thiserror",
- "tokio",
- "tracing",
- "ts_disco_protocol",
- "ts_keys",
- "ts_metrics",
- "ts_packet",
- "ts_transport",
- "zerocopy",
-]
-
-[[package]]
-name = "ts_metrics"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-
-[[package]]
-name = "ts_netcheck"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "bytes",
- "dashmap",
- "stun-rs",
- "thiserror",
- "tokio",
- "tracing",
- "ts_control",
- "ts_derp",
- "ts_http_util",
- "url",
-]
-
-[[package]]
-name = "ts_netstack_smoltcp"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "bytes",
- "futures-util",
- "tokio",
- "tracing",
- "ts_netstack_smoltcp_core",
- "ts_netstack_smoltcp_socket",
-]
-
-[[package]]
-name = "ts_netstack_smoltcp_core"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "bytes",
- "flume",
- "heapless",
- "smoltcp",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "ts_netstack_smoltcp_socket"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "bytes",
- "tokio",
- "tracing",
- "ts_netstack_smoltcp_core",
-]
-
-[[package]]
-name = "ts_nodecapability"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "cfg-if",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "ts_overlay_router"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "itertools",
- "tracing",
- "ts_bart",
- "ts_packet",
- "ts_transport",
-]
-
-[[package]]
-name = "ts_packet"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "bytes",
- "crypto_box",
- "ts_hexdump",
-]
-
-[[package]]
-name = "ts_packetfilter"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "hashbrown 0.17.1",
- "ipnet",
- "static_assertions",
- "tracing",
-]
-
-[[package]]
-name = "ts_packetfilter_serde"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "ipnet",
- "nom",
- "serde",
- "serde_json",
- "ts_nodecapability",
- "ts_peercapability",
-]
-
-[[package]]
-name = "ts_packetfilter_state"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "ts_packetfilter",
- "ts_packetfilter_serde",
-]
-
-[[package]]
-name = "ts_peercapability"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "serde",
- "url",
-]
-
-[[package]]
-name = "ts_runtime"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "base64",
- "etherparse",
- "futures",
- "httparse",
- "ipnet",
- "kameo",
- "kameo_actors",
- "smallvec",
- "thiserror",
- "tokio",
- "tracing",
- "ts_bart",
- "ts_bart_packetfilter",
- "ts_control",
- "ts_dataplane",
- "ts_derp",
- "ts_dns_wire",
- "ts_forwarder",
- "ts_host_net",
- "ts_keys",
- "ts_magicsock",
- "ts_netcheck",
- "ts_netstack_smoltcp",
- "ts_overlay_router",
- "ts_packet",
- "ts_packetfilter",
- "ts_packetfilter_state",
- "ts_tka",
- "ts_transport",
- "ts_transport_tun",
- "ts_tunnel",
- "url",
-]
-
-[[package]]
-name = "ts_time"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-
-[[package]]
-name = "ts_tka"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "blake2",
- "ed25519-dalek",
- "ed25519-zebra",
- "thiserror",
-]
-
-[[package]]
-name = "ts_tls_util"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "ring",
- "rustls-pemfile",
- "subtle",
- "tokio",
- "tokio-rustls",
- "tracing",
- "url",
- "webpki-roots",
-]
-
-[[package]]
-name = "ts_transport"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "ts_packet",
-]
-
-[[package]]
-name = "ts_transport_tun"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "bytes",
- "ipnet",
- "thiserror",
- "tracing",
- "ts_hexdump",
- "ts_packet",
- "ts_transport",
- "tun-rs",
-]
-
-[[package]]
-name = "ts_tunnel"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "aead",
- "blake2",
- "chacha20poly1305",
- "hkdf",
- "itertools",
- "rand 0.10.1",
- "tracing",
- "ts_keys",
- "ts_packet",
- "ts_time",
- "x25519-dalek 3.0.0-rc.0",
- "zerocopy",
-]
-
-[[package]]
-name = "ts_underlay_router"
-version = "0.6.5"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
-dependencies = [
- "ts_packet",
- "ts_transport",
-]
 
 [[package]]
 name = "tun-rs"
