@@ -17,11 +17,11 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let state_dir = tailnetd::state_dir();
-    let socket_path = tailnetd::socket_path();
+    let state_dir = tailscaled_rs::state_dir();
+    let socket_path = tailscaled_rs::socket_path();
     tracing::info!(state_dir = %state_dir.display(), "starting tailnetd");
 
-    let mut backend = tailnetd::ipn::Backend::load(&state_dir).await?;
+    let mut backend = tailscaled_rs::ipn::Backend::load(&state_dir).await?;
 
     // Auto-start if the persisted intent was "up". The MVP relies on an auth key in the
     // environment (`TS_AUTH_KEY`) for non-interactive re-registration on launch.
@@ -37,7 +37,7 @@ async fn main() -> Result<()> {
     let backend = Arc::new(Mutex::new(backend));
     let server_backend = Arc::clone(&backend);
 
-    tailnetd::server::serve(&socket_path, server_backend, shutdown_signal()).await?;
+    tailscaled_rs::server::serve(&socket_path, server_backend, shutdown_signal()).await?;
 
     backend.lock().await.shutdown().await;
     Ok(())

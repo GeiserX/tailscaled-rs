@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use tailnetd::localapi::{Request, Response};
+use tailscaled_rs::localapi::{Request, Response};
 
 #[derive(Parser)]
 #[command(name = "tnet", about = "Control client for the tailnetd daemon")]
@@ -46,7 +46,7 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let socket = cli.socket.unwrap_or_else(tailnetd::socket_path);
+    let socket = cli.socket.unwrap_or_else(tailscaled_rs::socket_path);
 
     let request = match cli.command {
         Command::Up {

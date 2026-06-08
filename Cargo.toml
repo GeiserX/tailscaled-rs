@@ -1,18 +1,19 @@
 [package]
-name = "tailnetd"
+name = "tailscaled-rs"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 license = "BSD-3-Clause"
+repository = "https://github.com/GeiserX/tailscaled-rs"
 description = "An independent, from-scratch Rust system daemon that joins a WireGuard-based mesh overlay, speaking the Tailscale control protocol. Wraps the tailscale-rs engine in a long-running, IPC-controlled daemon (the layer the embeddable library omits). Not affiliated with, endorsed by, or sponsored by Tailscale Inc.; 'Tailscale' is a trademark of Tailscale Inc."
 
-# NOTE (working title): binaries are `tailnetd` (daemon) + `tnet` (CLI). The repo/crate
-# name is a placeholder and will be finalized to a non-`tailscale*` name before the repo
-# is made public (trademark hygiene). The daemon is the net-new "tailscaled-shaped" layer;
-# the cryptographic/networking engine is the separate `tailscale-rs` dependency below.
+# The publishable crate is `tailscaled-rs` (imported as `tailscaled_rs`). The installed
+# binaries are deliberately `tailnetd` (daemon) + `tnet` (CLI) so they never collide on PATH
+# with an actual Tailscale install. The cryptographic/networking engine is the separate
+# `tailscale-rs` dependency below (imported as `tailscale`).
 
 [lib]
-name = "tailnetd"
+name = "tailscaled_rs"
 path = "src/lib.rs"
 
 [[bin]]

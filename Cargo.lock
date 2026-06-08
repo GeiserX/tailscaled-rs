@@ -2347,20 +2347,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tailnetd"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "serde",
- "serde_json",
- "tailscale-rs",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "tailscale-rs"
 version = "0.6.5"
 source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
@@ -2380,6 +2366,20 @@ dependencies = [
  "ts_runtime",
  "ts_tka",
  "url",
+]
+
+[[package]]
+name = "tailscaled-rs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "tailscale-rs",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
