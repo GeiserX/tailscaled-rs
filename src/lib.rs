@@ -26,13 +26,33 @@ pub mod server;
 
 use std::path::PathBuf;
 
+/// The conventional system-wide state directory used when running as root.
+///
+/// `/var/lib/tailnetd` on Linux, `/usr/local/var/tailnetd` on macOS — matching the packaged
+/// systemd unit / launchd plist. Mirrors how the real `tailscaled` keeps its socket+state under a
+/// fixed system path so the unprivileged-shell CLI and the root daemon agree without env juggling.
+#[cfg(target_os = "macos")]
+const SYSTEM_STATE_DIR: &str = "/usr/local/var/tailnetd";
+#[cfg(not(target_os = "macos"))]
+const SYSTEM_STATE_DIR: &str = "/var/lib/tailnetd";
+
 /// Directory holding the daemon's persistent state (node keys, prefs).
 ///
-/// Resolved from `TAILNETD_STATE_DIR`, else `$XDG_STATE_HOME/tailnetd`, else
-/// `$HOME/.local/state/tailnetd`, else `/tmp/tailnetd`.
+/// Resolution order: `TAILNETD_STATE_DIR`; else — **when running as root** (the daemon under
+/// systemd/launchd, and a `sudo tnet …`) — the system path [`SYSTEM_STATE_DIR`], so the CLI and the
+/// packaged daemon resolve the *same* socket without any env being set; else `$XDG_STATE_HOME/tailnetd`,
+/// else `$HOME/.local/state/tailnetd`, else `/tmp/tailnetd`.
+///
+/// The root branch is the fix for the otherwise-silent split where `tailnetd` (env-configured to
+/// `/var/lib/tailnetd`) and a bare `sudo tnet status` (which has no env) looked in different places.
 pub fn state_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("TAILNETD_STATE_DIR") {
         return PathBuf::from(dir);
+    }
+    // Root → the fixed system path the packaged service uses. SAFETY: geteuid() is infallible.
+    #[cfg(unix)]
+    if unsafe { libc::geteuid() } == 0 {
+        return PathBuf::from(SYSTEM_STATE_DIR);
     }
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)

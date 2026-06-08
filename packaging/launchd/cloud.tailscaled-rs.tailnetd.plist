@@ -47,11 +47,14 @@
         <false/>
     </dict>
 
-    <!-- Logs. Created by launchd; rotate via newsyslog if desired. -->
+    <!-- Logs under /var/log: root-writable and present on every macOS, unlike /usr/local/var/log
+         which is absent on Apple-Silicon Homebrew. Created by launchd; rotate via newsyslog if
+         desired. (State stays under /usr/local/var/tailnetd above — that is the daemon's
+         macOS SYSTEM_STATE_DIR; only the log paths move.) -->
     <key>StandardOutPath</key>
-    <string>/usr/local/var/log/tailnetd.log</string>
+    <string>/var/log/tailnetd.log</string>
     <key>StandardErrorPath</key>
-    <string>/usr/local/var/log/tailnetd.err.log</string>
+    <string>/var/log/tailnetd.err.log</string>
 
     <!-- Long-running background service (not interactive / adaptive). -->
     <key>ProcessType</key>

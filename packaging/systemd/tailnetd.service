@@ -61,14 +61,37 @@ ReadWritePaths=/var/lib/tailnetd
 # Empty set = strip every capability. The userspace-networking MVP needs none.
 CapabilityBoundingSet=
 
+# --- Syscall / namespace lockdown ---------------------------------------------------------
+# Tighten the file-creation mask and the syscall + address-family surface for this key-holding
+# daemon. UMask=0077 is the HIGHEST (most restrictive) value: the engine writes node.key.json
+# with the inherited umask, so this closes the brief world-/group-readable window on the key
+# file even though it lives inside the 0700 state dir.
+UMask=0077
+# AF_UNIX = LocalAPI socket; AF_INET/AF_INET6 = UDP + DERP; AF_NETLINK = the engine's interface
+# queries (do NOT drop netlink — removing it can break the engine's address enumeration).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# Allow only the generic service syscall set, then subtract privileged + resource-control groups.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+# Hide other processes and expose only pid entries under /proc; deny device-node access entirely
+# (the userspace MVP opens no /dev/net/tun).
+ProtectProc=invisible
+ProcSubset=pid
+PrivateDevices=true
+
 # --- Phase-3 (TUN / kernel-mode) NOTE -----------------------------------------------------
 # When the kernel TUN data path lands (Phase 3), this unit must be RELAXED to grant the daemon
 # the ability to create and configure a tun interface. At minimum you will then need:
 #   CapabilityBoundingSet=CAP_NET_ADMIN
 #   AmbientCapabilities=CAP_NET_ADMIN
 #   DeviceAllow=/dev/net/tun rw
+#   PrivateDevices=false   # PrivateDevices=true hides /dev/net/tun; TUN mode needs it visible
 #   # and loosen ProtectSystem (e.g. ProtectSystem=full) so /dev/net/tun is reachable,
-#   # plus relax RestrictNamespaces if a network namespace is used.
+#   # plus relax RestrictNamespaces if a network namespace is used. You will also likely need
+#   # to widen the syscall/address-family lockdown above for the tun ioctls: relax
+#   # SystemCallFilter (the @privileged subtraction blocks some interface-config calls) and
+#   # extend RestrictAddressFamilies (e.g. AF_PACKET) if the kernel data path requires it.
 # Do NOT add these now: the current MVP does not open /dev/net/tun, and granting CAP_NET_ADMIN
 # to experimental code with no need for it only widens the blast radius.
 

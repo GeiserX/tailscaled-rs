@@ -132,6 +132,14 @@ even traverse to the socket:
 - The socket **inode** is deliberately left broadly connectable (no `0600` chmod): the
   "anyone-who-can-reach-it may read" contract relies on the directory, and a `0600` socket would
   also lock out root, breaking read-for-all (rationale at `src/server.rs:55-58`).
+- The daemon enforces `0700` only on the *directory*; the node **key file itself**
+  (`node.key.json`, written by the engine) inherits the process umask, so the `0700` dir is the
+  only at-rest gate on it. Deployments should therefore run with a restrictive umask
+  (`UMask=0077`, now set in the systemd unit) so the key file is not group/world-readable even if
+  the directory gate is ever loosened.
+- Note this `UMask` plus the systemd unit's process sandboxing (`NoNewPrivileges`, `ProtectSystem`,
+  the `SystemCallFilter`) is **Linux/systemd-only**: the macOS (launchd) deployment gets none of it
+  and relies on running as root behind the `0700` directory alone.
 
 ### 4.3 `SecretString` reduces accidental key leakage — defense-in-depth for (e)
 
@@ -219,9 +227,12 @@ The daemon holds the auth key in a `SecretString` and exposes it for the **singl
 `tailscale::Device::new` takes an `Option<String>`, so `up()` must materialize a plain `String` copy
 of the plaintext to make that call (`expose_secret().to_string()`, `src/ipn.rs:153`); the same
 `String`-typed wire field forces a copy on the CLI side (`src/bin/tnet.rs:77`) and at the dispatch
-boundary before re-wrapping (`src/server.rs:289`). Those last-mile `String`s are **not** zeroized on
-drop — only the `SecretString` wrappers are. Closing this fully requires the engine to accept a
-zeroizing secret type at its registration boundary; until then this is a **tracked bead**, and a
+boundary before re-wrapping (`src/server.rs:289`). The daemon's own env path is the same shape: on
+auto-start `auth_key_from_env()` hands back a plain `String` that lives transiently before it is
+wrapped into a `SecretString` (`src/bin/tailnetd.rs`). Those last-mile `String`s are **not**
+zeroized on drop — only the `SecretString` wrappers are. Closing this fully requires the engine to
+accept a zeroizing secret type at its registration boundary; until then this is a **tracked bead**,
+and a
 narrow residual copy of the auth key exists transiently in process memory (which §5.1/§5.2 already
 say is readable by a privileged attacker).
 

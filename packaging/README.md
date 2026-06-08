@@ -56,6 +56,12 @@ sudo systemctl enable --now tailnetd
 `/var/lib/tailnetd` to `0700` (via `StateDirectory=`; the daemon re-checks `0700` itself), and
 already sets `TS_RS_EXPERIMENT` so the engine will start.
 
+> [!NOTE]
+> The unit's `After=/Wants=network-online.target` only delays startup until the network is
+> routable if a wait service is actually enabled (e.g. `systemctl enable systemd-networkd-wait-online`
+> or NetworkManager's `NetworkManager-wait-online.service`). Without one, `network-online.target` is
+> reached early and the daemon may start before the network is up — harmless, since it retries.
+
 Check it came up:
 
 ```bash
@@ -68,9 +74,21 @@ systemctl status tailnetd
 sudo cp launchd/cloud.tailscaled-rs.tailnetd.plist /Library/LaunchDaemons/
 sudo chown root:wheel /Library/LaunchDaemons/cloud.tailscaled-rs.tailnetd.plist
 sudo chmod 0644 /Library/LaunchDaemons/cloud.tailscaled-rs.tailnetd.plist
-# Create the state + log dirs the plist references (daemon enforces 0700 on the state dir):
-sudo mkdir -p /usr/local/var/tailnetd /usr/local/var/log
+
+# Create the state dir the plist references and give it a root-owned parent.
+# launchd starts the daemon as root, but /usr/local is typically owned by the
+# Homebrew user — so chown the state dir (which holds unencrypted key material)
+# to root:wheel rather than leaving the daemon's key dir under a non-root parent.
+# (The daemon also re-checks/enforces 0700 on this dir itself.)
+sudo mkdir -p /usr/local/var/tailnetd
+sudo chown root:wheel /usr/local/var/tailnetd
 sudo chmod 0700 /usr/local/var/tailnetd
+
+# Pre-create the log files mode 0640 root:wheel so they are NOT world-readable.
+# launchd honours pre-existing file permissions, so creating them up front keeps
+# logs (which can contain node identifiers) off other local users' eyes.
+sudo install -m 0640 -o root -g wheel /dev/null /var/log/tailnetd.log
+sudo install -m 0640 -o root -g wheel /dev/null /var/log/tailnetd.err.log
 
 # Load it (modern launchctl):
 sudo launchctl bootstrap system /Library/LaunchDaemons/cloud.tailscaled-rs.tailnetd.plist
@@ -79,7 +97,34 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/cloud.tailscaled-rs.tailn
 ```
 
 State lives under `/usr/local/var/tailnetd`; logs are written to
-`/usr/local/var/log/tailnetd.log` and `…/tailnetd.err.log`.
+`/var/log/tailnetd.log` and `/var/log/tailnetd.err.log`.
+
+## Talking to the daemon: `tnet` and the LocalAPI socket
+
+The daemon serves its LocalAPI on a Unix socket inside its state directory
+(`<state-dir>/tailnetd.sock`). `tnet` resolves the same path automatically **as long as it runs
+with the same view of the state directory as the daemon** — so when you run `tnet` with `sudo`
+(as root), it picks up the system path the service uses and the socket lines up on its own:
+
+```bash
+sudo tnet up --authkey-file /path/to/key   # resolves the system socket as root — no --socket needed
+sudo tnet status
+```
+
+Concretely, when run as **root** the state dir defaults to `/var/lib/tailnetd` (Linux) /
+`/usr/local/var/tailnetd` (macOS) unless `TAILNETD_STATE_DIR` is set — matching the packaged
+units — so `sudo tnet up` / `sudo tnet status` Just Work against the running daemon.
+
+> [!NOTE]
+> If you run `tnet` as a **non-root** user, a non-root shell resolves a *per-user* state path by
+> default, so it will look for the socket in the wrong place. Point it at the daemon's socket
+> explicitly:
+> ```bash
+> tnet --socket /var/lib/tailnetd/tailnetd.sock status         # Linux
+> tnet --socket /usr/local/var/tailnetd/tailnetd.sock status   # macOS
+> ```
+> Reads (`status`) succeed for anyone who can reach the socket; writes (`up`/`down`) are still
+> restricted to root or the daemon's own user (see [`SECURITY.md`](../SECURITY.md)).
 
 ## 3. Join a tailnet (set an auth key safely)
 
@@ -129,7 +174,7 @@ journalctl -u tailnetd -f
 #   sudo systemctl edit tailnetd   →   [Service]\nEnvironment=TAILNETD_LOG=debug
 
 # macOS (plist log paths):
-sudo tail -f /usr/local/var/log/tailnetd.log /usr/local/var/log/tailnetd.err.log
+sudo tail -f /var/log/tailnetd.log /var/log/tailnetd.err.log
 ```
 
 ## 5. Uninstall
@@ -152,7 +197,7 @@ sudo launchctl bootout system /Library/LaunchDaemons/cloud.tailscaled-rs.tailnet
 # Legacy equivalent: sudo launchctl unload -w /Library/LaunchDaemons/cloud.tailscaled-rs.tailnetd.plist
 sudo rm /Library/LaunchDaemons/cloud.tailscaled-rs.tailnetd.plist
 sudo rm -rf /usr/local/var/tailnetd
-sudo rm -f /usr/local/var/log/tailnetd.log /usr/local/var/log/tailnetd.err.log
+sudo rm -f /var/log/tailnetd.log /var/log/tailnetd.err.log
 sudo rm -f /usr/local/bin/tailnetd /usr/local/bin/tnet
 ```
 

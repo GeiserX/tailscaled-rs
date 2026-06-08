@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
@@ -16,23 +16,14 @@ const REQUIRED_EXPERIMENT_VALUE: &str = "this_is_unstable_software";
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_env("TAILNETD_LOG").unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-
-    // The engine refuses to run unless `TS_RS_EXPERIMENT=this_is_unstable_software` is set; mirror
-    // that gate here and surface it early with an actionable message instead of a deep engine error.
-    // We deliberately do NOT set the var ourselves — auto-defeating the experimental gate would hide
-    // that this is unaudited software. The packaged systemd/launchd units set it for the operator.
+    // Gate FIRST, before any logging is set up: the engine refuses to run unless
+    // `TS_RS_EXPERIMENT=this_is_unstable_software` is set, so mirror that gate here and surface it
+    // early with an actionable message instead of a deep engine error. We deliberately do NOT set
+    // the var ourselves — auto-defeating the experimental gate would hide that this is unaudited
+    // software. The packaged systemd/launchd units set it for the operator. On refusal we emit a
+    // single stderr line and exit(1) (matching `tnet`'s error path) rather than logging + returning
+    // an Err, which would otherwise print the same refusal across stdout and stderr.
     if !experiment_gate_ok(std::env::var(EXPERIMENT_VAR).ok().as_deref()) {
-        tracing::error!(
-            "{EXPERIMENT_VAR} is not set to `{REQUIRED_EXPERIMENT_VALUE}`. The underlying engine is \
-             experimental and unaudited, so it refuses to run without an explicit opt-in. To run \
-             tailnetd, set `{EXPERIMENT_VAR}={REQUIRED_EXPERIMENT_VALUE}` in the environment (the \
-             packaged systemd/launchd units already do this for you)."
-        );
         eprintln!(
             "error: {EXPERIMENT_VAR} is not set to `{REQUIRED_EXPERIMENT_VALUE}`.\n\
              The underlying engine is experimental and unaudited; it refuses to run without an \
@@ -40,10 +31,14 @@ async fn main() -> Result<()> {
              To run tailnetd, set `{EXPERIMENT_VAR}={REQUIRED_EXPERIMENT_VALUE}` in the environment \
              (the packaged systemd/launchd units already do this for you)."
         );
-        return Err(anyhow!(
-            "{EXPERIMENT_VAR} must be set to `{REQUIRED_EXPERIMENT_VALUE}` to run the experimental engine"
-        ));
+        std::process::exit(1);
     }
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_env("TAILNETD_LOG").unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
 
     let state_dir = tailscaled_rs::state_dir();
     let socket_path = tailscaled_rs::socket_path();
