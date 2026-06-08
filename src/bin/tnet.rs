@@ -50,11 +50,15 @@ enum Command {
         /// `up`; a malformed URL fails loudly rather than silently using the default.
         #[arg(long)]
         control_url: Option<String>,
-        /// Use a real kernel TUN interface (`TransportMode::Tun`) instead of the userspace netstack.
-        /// Requires a daemon built with the `tun` feature and run as root; the daemon fails loudly
-        /// otherwise. Omitting the flag leaves the persisted setting unchanged.
-        #[arg(long)]
+        /// Enable kernel-TUN mode (`TransportMode::Tun`) instead of the userspace netstack. Requires
+        /// a daemon built with the `tun` feature and run as root; the daemon fails loudly otherwise.
+        /// Mutually exclusive with `--no-tun`; omitting both leaves the persisted setting unchanged.
+        #[arg(long, conflicts_with = "no_tun")]
         tun: bool,
+        /// Disable kernel-TUN mode, forcing the userspace netstack. Mutually exclusive with `--tun`;
+        /// omitting both leaves the persisted setting unchanged.
+        #[arg(long)]
+        no_tun: bool,
         /// Desired TUN interface name (e.g. `tailscale0`); only meaningful with `--tun`.
         #[arg(long, value_name = "NAME")]
         tun_name: Option<String>,
@@ -80,6 +84,7 @@ async fn main() -> Result<()> {
             hostname,
             control_url,
             tun,
+            no_tun,
             tun_name,
             tun_mtu,
         } => {
@@ -91,9 +96,14 @@ async fn main() -> Result<()> {
                 authkey: authkey.map(|k| k.expose_secret().to_owned()),
                 control_url,
                 hostname,
-                // `--tun` present → Some(true) (enable); absent → None (leave the pref unchanged),
-                // so `tnet up` without the flag never silently disables a TUN node.
-                tun: if tun { Some(true) } else { None },
+                // `--tun` → Some(true) (enable); `--no-tun` → Some(false) (disable); neither →
+                // None (leave the pref unchanged), so `tnet up` without either flag never silently
+                // flips a TUN node. clap's `conflicts_with` guarantees the two are never both set.
+                tun: match (tun, no_tun) {
+                    (true, _) => Some(true),
+                    (_, true) => Some(false),
+                    _ => None,
+                },
                 tun_name,
                 tun_mtu,
             }

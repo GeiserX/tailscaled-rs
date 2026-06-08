@@ -125,6 +125,47 @@ pub async fn shutdown_orphan(orphan: Option<tailscale::Device>) {
     }
 }
 
+/// Drive a full bring-up against a shared [`Backend`] **without holding the lock across the
+/// multi-second `Device::new` handshake** — the concurrency-safe `up` for any caller that holds the
+/// `Arc<Mutex<Backend>>` rather than a `&mut Backend`.
+///
+/// This is the three-phase split the LocalAPI server uses, factored out so the SIGHUP reload path
+/// shares it verbatim instead of holding the lock across the handshake (which would reintroduce the
+/// exact head-of-line stall the split exists to remove): lock briefly for [`begin_up`](Backend::begin_up)
+/// → **drop the lock** for the slow [`build_device`] → lock briefly for [`finish_up`](Backend::finish_up)
+/// → drop the lock and settle any superseded orphan off-lock. A concurrent `status`/`down` taken
+/// during the handshake is never blocked, and a `down`/`up` that lands mid-flight correctly
+/// supersedes this attempt (its device is discarded).
+///
+/// Returns the [`begin_up`](Backend::begin_up)/[`finish_up`](Backend::finish_up) error if either
+/// phase failed (intent stays "up" with no device → `NeedsLogin`, so a later retry can resume).
+pub async fn drive_up(
+    backend: &std::sync::Arc<tokio::sync::Mutex<Backend>>,
+    authkey: Option<secrecy::SecretString>,
+    opts: UpOptions,
+) -> Result<()> {
+    // Phase 1: brief lock — prep + persist prefs, build Config, bump generation.
+    let pending = {
+        let mut be = backend.lock().await;
+        be.begin_up(opts).await
+    }?;
+
+    // Phase 2: NO lock held — the slow, network-bound control-plane handshake. Concurrent
+    // `status`/`down` proceed freely here; this is the whole point of the split.
+    let built = build_device(&pending, authkey).await;
+
+    // Phase 3: brief lock — install iff still current, returning any orphan to shut down off-lock.
+    let orphan = {
+        let mut be = backend.lock().await;
+        be.finish_up(pending, built)
+    }?;
+
+    // Lock released — settle the (rare) superseded device off-lock so a supersede never blocks the
+    // lock for up to SHUTDOWN_TIMEOUT.
+    shutdown_orphan(orphan).await;
+    Ok(())
+}
+
 /// Optional overrides applied to the persisted [`Prefs`] when bringing the node up.
 ///
 /// Every field is `None` = "leave the persisted pref as-is"; `Some(..)` sets it. This is how a
@@ -160,6 +201,13 @@ pub struct Backend {
     /// holding the backend lock, so a second `up`/`down` may land first; the generation lets
     /// `finish_up` detect that its device is stale and discard it instead of clobbering newer intent.
     generation: u64,
+    /// Whether **this process** has attempted a boot-time auto-start (set by
+    /// [`mark_boot_attempted_up`](Backend::mark_boot_attempted_up)). Process-local and deliberately
+    /// NOT persisted: it lets the SIGHUP reload path distinguish "retry a bring-up we already
+    /// attempted this run (a transient failure)" from "originate a connection from an out-of-band
+    /// `prefs.json` intent flip" — the latter must not silently resurrect a node, so reload only
+    /// retries when this is `true`.
+    boot_attempted_up: bool,
 }
 
 impl Backend {
@@ -187,12 +235,27 @@ impl Backend {
             device: None,
             ever_configured,
             generation: 0,
+            boot_attempted_up: false,
         })
     }
 
     /// Whether the persisted intent is to be running (used by the daemon to auto-start on launch).
     pub fn wants_running(&self) -> bool {
         self.prefs.want_running && !self.prefs.logged_out
+    }
+
+    /// Record that this process attempted a boot-time auto-start. See
+    /// [`boot_attempted_up`](Backend::boot_attempted_up).
+    pub fn mark_boot_attempted_up(&mut self) {
+        self.boot_attempted_up = true;
+    }
+
+    /// Whether this process attempted a boot-time auto-start. The SIGHUP reload path uses this to
+    /// retry only a bring-up this run already attempted (a transient failure), never to originate a
+    /// connection from an out-of-band `prefs.json` intent flip (which would silently resurrect a node
+    /// the operator may have intentionally downed).
+    pub fn boot_attempted_up(&self) -> bool {
+        self.boot_attempted_up
     }
 
     /// Whether this node is configured ephemeral (the default). Exposed so the daemon can warn, on a
@@ -736,7 +799,26 @@ mod tests {
             device: None,
             ever_configured: false,
             generation: 0,
+            boot_attempted_up: false,
         }
+    }
+
+    #[test]
+    fn boot_attempted_up_defaults_false_and_flips() {
+        // The SIGHUP reload path gates "retry auto-start" on this flag, so a fresh backend must
+        // report `false` (a reload must NOT originate a connection from an out-of-band intent flip),
+        // and `mark_boot_attempted_up` must flip it (so a transient boot failure CAN be retried).
+        let dir = std::env::temp_dir().join(format!("tailnetd-bootflag-{}", std::process::id()));
+        let mut backend = backend_for(&dir);
+        assert!(
+            !backend.boot_attempted_up(),
+            "a fresh backend has not attempted a boot-time up"
+        );
+        backend.mark_boot_attempted_up();
+        assert!(
+            backend.boot_attempted_up(),
+            "mark_boot_attempted_up must record the boot attempt"
+        );
     }
 
     #[tokio::test]

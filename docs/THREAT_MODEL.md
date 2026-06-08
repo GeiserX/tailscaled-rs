@@ -86,12 +86,14 @@ a cryptographic one.
 | **(b) Root / privileged process on the same host** | UID 0, `ptrace`, `/proc/<pid>/mem`, raw disk read. | §5 — **not** mitigated. |
 | **(c) Network attacker on the wire** | Can observe / modify packets between the node and the control plane / peers / DERP. | Engine's domain; relies on (unaudited) Noise + WireGuard. |
 | **(d) Malicious / compromised control plane** | The control server the node registers with is hostile, or is taken over. | §5 — **not** mitigated (Tailnet Lock inert). |
-| **(e) Memory capture: swap / hibernation / coredump / cold-boot** | Can read process memory after the fact, from disk or RAM. | §5 — **not** mitigated yet (no `mlock`/`MADV_DONTDUMP`). |
+| **(e) Memory capture: swap / hibernation / coredump / cold-boot** | Can read process memory after the fact, from disk or RAM. | §4.7 — **best-effort mitigated** (`mlockall` + coredump suppression when `harden_process()` succeeds); cold-boot still uncovered. |
 
 The design point: this daemon meaningfully raises the bar against **(a)**, and applies
-defense-in-depth (zeroize, minimal exposure) that *narrows the window* for **(e)**. It offers
-**no defense** against **(b)** or **(d)**, and traffic-level defense against **(c)** is entirely
-inherited from the unaudited engine.
+defense-in-depth against **(e)** — zeroize and minimal exposure *narrow the window*, and a
+best-effort OS-level pass (`mlockall` + coredump suppression, §4.7) closes the swap/coredump
+routes outright on hosts that grant the privileges. It offers **no defense** against **(b)** or
+**(d)** — a root attacker who owns the kernel reads live memory regardless — and traffic-level
+defense against **(c)** is entirely inherited from the unaudited engine.
 
 ---
 
@@ -181,6 +183,39 @@ is then aborted so it cannot keep the daemon from exiting (`DRAIN_TIMEOUT`, `src
 drain logic `src/server.rs:110`). The engine teardown is likewise bounded (5 s) so a wedged engine
 can't hang the daemon (`stop_device`, `src/ipn.rs:303`).
 
+### 4.7 Best-effort swap / coredump hardening — adversary (e)
+
+A startup pass (`harden_process`, `src/hardening.rs:57`, called early in `main` before any key
+material lands in memory) raises the cost of recovering secrets from a swap image or a coredump.
+Each step is **best-effort and non-fatal** — a denial downgrades to a logged `warn` rather than
+refusing to start, because losing a defense-in-depth layer is not a reason to take the node offline:
+
+- **No swap.** `mlockall(MCL_CURRENT | MCL_FUTURE)` pins current and future pages resident so secret
+  pages are never paged out to swap (`lock_all_memory`, `src/hardening.rs:145`). This is the step
+  most likely to be denied: it needs `CAP_IPC_LOCK` (or root) or a sufficient `RLIMIT_MEMLOCK`, and
+  a denial leaves secrets swappable — the warning says so plainly.
+- **No coredump (Linux).** `prctl(PR_SET_DUMPABLE, 0)` clears the dumpable bit, which both suppresses
+  coredumps and blocks `ptrace` attach by a **non-root** peer (`set_undumpable`, `src/hardening.rs:98`).
+- **No coredump (portable).** `setrlimit(RLIMIT_CORE, 0)` caps the core size at zero as
+  belt-and-suspenders, so no core file is written even if something re-enables the dumpable bit
+  (`zero_core_limit`, `src/hardening.rs:122`). On macOS/BSD there is **no `prctl`**, so coredump
+  suppression there is **rlimit-only** (`set_undumpable` returns `false`, `src/hardening.rs:115`).
+
+Honest caveats, all reflected in the residual column of §7:
+
+- The `mlockall` step is **only effective when granted** `CAP_IPC_LOCK`/root or enough
+  `RLIMIT_MEMLOCK`; without it the swap route stays open (logged, non-fatal).
+- macOS coredump suppression is **rlimit-only** (no dumpable-bit clear, no non-root-ptrace block).
+- The whole pass can be **disabled** with `TAILNETD_NO_HARDEN=1` (debugging / noisy containers),
+  in which case none of the above applies (`NO_HARDEN_VAR`, `src/hardening.rs:18`).
+- This does **not** defend against adversary **(b)**: a **root** attacker can re-enable dumpable,
+  `mlock` does not stop `/proc/<pid>/mem` reads, and `PR_SET_DUMPABLE=0` only blocks *non-root*
+  ptrace. The root/live-memory gap remains exactly as stated in §5.1.
+
+So the §3 row for **(e)** is now "best-effort mitigated when `harden_process()` succeeds" rather
+than "not mitigated" — with the residual that a denied `mlockall`, a macOS host, an opt-out, or a
+cold-boot capture all leave a window open (see §5.2).
+
 ---
 
 ## 5. What is NOT mitigated (blunt)
@@ -196,13 +231,29 @@ cannot stop this** — memory safety is a property *within* the process, not a d
 attacker who owns the kernel or can attach a debugger. The `SecretString` zeroize in §4.3 reduces
 *accidental* exposure; it is no obstacle to a deliberate privileged reader.
 
-### 5.2 Swap / hibernation / coredumps — adversary (e), tracked future bead
+### 5.2 Swap / hibernation / coredumps — adversary (e), best-effort, residual gaps remain
 
-The process does **not** yet `mlock` its secret pages or set `MADV_DONTDUMP` / `prctl(PR_SET_DUMPABLE, 0)`.
-So secret material — including engine-held keys and the transient pre-auth key — **can** be written
-to swap, captured in a hibernation image, or land in a coredump. This is a **tracked future bead**,
-not a shipped mitigation. Until it lands, on-disk encryption of swap and disabling coredumps are
-**your** responsibility, not the daemon's.
+The swap and coredump routes are now addressed **best-effort** by the §4.7 hardening pass
+(`mlockall` + `prctl(PR_SET_DUMPABLE, 0)` + `setrlimit(RLIMIT_CORE, 0)`), so this is no longer an
+unmitigated gap — but the mitigation is conditional, and the conditions are real:
+
+- **`mlockall` can be denied.** Without `CAP_IPC_LOCK`/root (or a high enough `RLIMIT_MEMLOCK`) the
+  lock fails and secret pages **can** still be paged to swap or captured in a hibernation image. The
+  failure is logged at `warn`, non-fatal — so a node running unprivileged in a stock container is
+  swap-exposed unless you grant the capability.
+- **macOS coredump suppression is rlimit-only.** There is no `prctl` on macOS, so the dumpable bit
+  is never cleared there; coredump suppression rests solely on `RLIMIT_CORE = 0`, and there is no
+  non-root-`ptrace` block from this pass.
+- **The pass can be opted out.** `TAILNETD_NO_HARDEN=1` disables all of it, restoring the original
+  exposure (intended for debugging / noisy sandboxes).
+- **Cold-boot is still uncovered.** `mlock` keeps pages out of *swap*; it does nothing about RAM
+  remanence after power-off — a cold-boot attacker reading physical memory is unaffected.
+- **A root attacker is unaffected** (see §5.1): root can re-enable dumpable and read
+  `/proc/<pid>/mem` directly; the pass only raises the bar against non-root capture-after-the-fact.
+
+Bottom line: on a Linux host that grants `CAP_IPC_LOCK`, swap and coredump capture by a non-root
+party are closed; on a host that denies it, on macOS, or with the opt-out set, encrypting swap and
+disabling coredumps yourself remains prudent defense-in-depth.
 
 ### 5.3 The engine's crypto is UNAUDITED — adversary (c)
 
@@ -276,15 +327,18 @@ Here is the honest split.
 
 - **Nothing against a privileged local attacker.** Root / `ptrace` / `/proc/<pid>/mem` read live
   memory regardless of language (§5.1). Rust's guarantees end at the process boundary.
-- **Nothing against swap / hibernation / coredumps** without OS-level help. `zeroize` runs on
-  *drop*; it does nothing for a page the kernel paged out to swap, or a coredump taken mid-run,
-  before the drop. That needs `mlock` + `PR_SET_DUMPABLE=0` — not yet shipped (§5.2).
+- **Nothing against swap / hibernation / coredumps** *by itself*. `zeroize` runs on *drop*; it does
+  nothing for a page the kernel paged out to swap, or a coredump taken mid-run, before the drop.
+  That needs OS-level help — `mlockall` + `PR_SET_DUMPABLE=0` + `RLIMIT_CORE=0`, which the daemon
+  now applies best-effort at startup (§4.7). That OS pass, **not** the Rust/`secrecy` layer, is what
+  closes these routes — and only when its privileges are granted (§5.2).
 - **Nothing about the crypto being correct.** Memory safety is orthogonal to whether the
   (unaudited) handshake is sound (§5.3).
 
 The right framing: Rust + `secrecy` here is **defense-in-depth and bug-class elimination**, not a
-guarantee that secrets are safe in RAM. It removes the accidental and the use-after-free leaks; it
-does not remove the privileged-attacker, the swap, or the cold-boot leaks.
+guarantee that secrets are safe in RAM. It removes the accidental and the use-after-free leaks; the
+swap and coredump leaks are closed separately and best-effort by the OS-level pass (§4.7), not by
+the language; and the privileged-attacker and cold-boot leaks remain unaddressed.
 
 ---
 
@@ -297,7 +351,7 @@ does not remove the privileged-attacker, the swap, or the cold-boot leaks.
 | LocalAPI DoS (buffer OOM / conn flood) | (a) | **Yes** — line cap + conn semaphore | Bounded resource use only; not an availability *guarantee* | `src/server.rs:31`, `src/server.rs:36` |
 | Accidental key leak (logs / `Debug` / serialize) | (e) | **Yes** — `SecretString`, no-`Debug`, expose-once | One forced un-zeroized `String` copy at the engine call | §5.5; `src/ipn.rs:153` |
 | Live key read by root / ptrace / `/proc/mem` | (b) | **No** | Full key disclosure to a privileged local attacker | Out of scope — OS-level threat |
-| Keys in swap / hibernation / coredump | (e) | **No** | Keys recoverable from swap/dump/cold RAM | **Tracked bead** (`mlock` + `PR_SET_DUMPABLE=0`) |
+| Keys in swap / hibernation / coredump | (e) | **Best-effort** — `mlockall` + `PR_SET_DUMPABLE=0` + `RLIMIT_CORE=0` when `harden_process()` succeeds | Swap still exposed if `mlockall` denied (no `CAP_IPC_LOCK`); macOS coredump is rlimit-only; opt-out via `TAILNETD_NO_HARDEN=1`; cold-boot RAM remanence uncovered; root unaffected | §4.7, §5.2; `src/hardening.rs` |
 | Broken handshake / traffic disclosure | (c) | **No** — engine is unaudited | Confidentiality unproven until audited | Engine; `SECURITY.md` |
 | Rogue peer-key injection | (d) | **No** — Tailnet Lock inert | Compromised control plane can add trusted peers | Engine; §5.4, `SECURITY.md` |
 | Operator repoints control plane | (b)/operator | **N/A** — by design | A write-authed caller can move the root of trust (authz-gated) | §5.6; `src/ipn.rs:188` |

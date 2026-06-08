@@ -66,7 +66,17 @@ impl Prefs {
     /// treated as default rather than failing the daemon (the node simply starts unconfigured).
     pub async fn load(path: &Path) -> std::io::Result<Self> {
         match tokio::fs::read(path).await {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes).unwrap_or_default()),
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                // Fail safe but not silent: a corrupted prefs file is otherwise
+                // indistinguishable from a fresh node. Log it (the node still boots on
+                // defaults — a parse error must not stop startup) so the fallback is visible.
+                tracing::warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "prefs file is malformed; falling back to default prefs (node starts unconfigured)"
+                );
+                Self::default()
+            })),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e),
         }

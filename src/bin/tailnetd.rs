@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
-use tailscaled_rs::ipn::Backend;
+use tailscaled_rs::ipn::{self, Backend};
 use tailscaled_rs::prefs::Prefs;
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
@@ -156,8 +156,11 @@ async fn sighup_reload_loop(
             return;
         }
         tracing::info!("SIGHUP: reloading");
-        let mut be = backend.lock().await;
-        reconcile_on_reload(&mut be, &prefs_path).await;
+        // Pass the shared `Arc<Mutex<Backend>>` (NOT a held guard): `reconcile_on_reload` must be
+        // free to release the lock across the multi-second bring-up handshake, exactly like the
+        // LocalAPI server, so a reload-triggered re-auth never head-of-line blocks concurrent
+        // `status`/`down`. Holding the guard here (the previous design) reintroduced that stall.
+        reconcile_on_reload(&backend, &prefs_path).await;
     }
 }
 
@@ -182,13 +185,22 @@ async fn sighup_reload_loop(
 ///   wanted.)
 /// - **Out-of-band prefs edits are not pushed into the live engine config.** The engine's
 ///   construction config (hostname / control_url / ephemeral) is rebuilt from the backend's
-///   *in-memory* [`Prefs`] inside `Backend::up` → `build_config`. This crate does not own `ipn.rs`
+///   *in-memory* [`Prefs`] inside the bring-up path → `build_config`. This crate does not own `ipn.rs`
 ///   and `Backend` exposes no primitive to replace its in-memory prefs from disk, so a SIGHUP cannot
 ///   adopt an out-of-band edit to those fields into a running engine. We DETECT the drift and warn;
 ///   fully applying it needs a minimal `Backend::reload_prefs(&mut self) -> Result<()>` added to
 ///   `ipn.rs` (which would re-`Prefs::load` into `self.prefs`). Filed as a follow-up there rather
 ///   than faking a partial reload across a file this crate doesn't own.
-async fn reconcile_on_reload(backend: &mut Backend, prefs_path: &std::path::Path) {
+/// - **SIGHUP only retries a bring-up THIS process already attempted (`boot_attempted_up`).** It will
+///   not *originate* a connection from a node that was never auto-started this run — so a stale or
+///   hand-restored `prefs.json` flipped to `want_running=true` out-of-band does NOT cause a silent
+///   rejoin on the next `kill -HUP`. The actionable case (a transient boot-time registration failure)
+///   is retried; the surprising case (resurrecting a node the operator downed) is not.
+///
+/// Takes the shared `Arc<Mutex<Backend>>` rather than a held `&mut Backend` guard precisely so it can
+/// **release the lock across the bring-up handshake** (via [`ipn::drive_up`]); holding the lock here
+/// would block every concurrent `status`/`down` for the multi-second re-auth.
+async fn reconcile_on_reload(backend: &Arc<Mutex<Backend>>, prefs_path: &std::path::Path) {
     // Re-read persisted prefs from disk. A read/parse error is non-fatal: log and keep the running
     // state untouched (a transient FS error must not knock a healthy node off).
     let disk = match Prefs::load(prefs_path).await {
@@ -201,40 +213,57 @@ async fn reconcile_on_reload(backend: &mut Backend, prefs_path: &std::path::Path
     };
     let disk_wants_running = disk.want_running && !disk.logged_out;
 
+    // Snapshot the live view under a brief lock, then DROP it before any handshake.
+    let (live_wants_running, device_up, boot_attempted_up, state) = {
+        let be = backend.lock().await;
+        let state = be.status().await.state;
+        (
+            be.wants_running(),
+            matches!(state.as_str(), "Running" | "Starting"),
+            be.boot_attempted_up(),
+            state,
+        )
+    };
+
     // Surface drift between the on-disk intent and the backend's in-memory view. In normal operation
     // the daemon is the sole writer of prefs.json, so these agree; a disagreement means an
     // out-of-band edit, which we can detect+report but not fully adopt (see the doc note above).
-    if disk_wants_running != backend.wants_running() {
+    if disk_wants_running != live_wants_running {
         tracing::warn!(
             disk_want_running = disk_wants_running,
-            live_want_running = backend.wants_running(),
+            live_want_running = live_wants_running,
             "SIGHUP reload: on-disk intent differs from the live backend (an out-of-band prefs \
-             edit); auto-start is re-evaluated from the live intent, but config-field edits \
-             (hostname/control_url/ephemeral) cannot be adopted into a running engine without an \
-             ipn.rs reload_prefs primitive — see reconcile_on_reload docs"
+             edit); config-field edits (hostname/control_url/ephemeral) cannot be adopted into a \
+             running engine without an ipn.rs reload_prefs primitive, and a reload will NOT \
+             originate a connection from an out-of-band intent flip — see reconcile_on_reload docs"
         );
     }
 
-    // Is a device currently up? `status()` reports Running/Starting exactly when a device exists.
-    let state = backend.status().await.state;
-    let device_up = matches!(state.as_str(), "Running" | "Starting");
-
-    if backend.wants_running() {
-        if device_up {
-            // Healthy tunnel + still-up intent → leave it. Do NOT churn on a reload.
-            tracing::info!(state = %state, "SIGHUP reload: intent is up and a device is running; no-op");
-        } else {
-            // Intent is up but nothing is running (e.g. a prior auto-start failed) → retry the same
-            // resume/auth-key path used at boot. This is the actionable half of the reload.
-            tracing::info!(state = %state,
-                "SIGHUP reload: intent is up but no device is running; re-evaluating auto-start");
-            auto_start(backend).await;
-        }
-    } else {
+    if !live_wants_running {
         // Intent is down. We deliberately do not tear a device down from SIGHUP (see doc note).
         tracing::info!(state = %state,
             "SIGHUP reload: intent is not 'want_running'; nothing to start (no teardown on reload)");
+        return;
     }
+    if device_up {
+        // Healthy tunnel + still-up intent → leave it. Do NOT churn on a reload.
+        tracing::info!(state = %state, "SIGHUP reload: intent is up and a device is running; no-op");
+        return;
+    }
+    if !boot_attempted_up {
+        // Intent says up, nothing is running, and THIS process never attempted to bring it up — so
+        // the "up" intent arrived out-of-band (stale/hand-edited prefs). Do not silently resurrect a
+        // node the operator may have intentionally downed; require an explicit `tnet up`.
+        tracing::warn!(state = %state,
+            "SIGHUP reload: on-disk intent is up but this process never auto-started the node \
+             (likely an out-of-band prefs edit); NOT auto-starting — run `tnet up` to bring it up");
+        return;
+    }
+    // Intent is up, nothing is running, and we DID attempt bring-up at boot (it failed transiently,
+    // e.g. control was unreachable) → retry the same resume/auth-key path, OFF-LOCK via drive_up.
+    tracing::info!(state = %state,
+        "SIGHUP reload: intent is up but no device is running; retrying auto-start (off-lock)");
+    auto_start_arc(backend).await;
 }
 
 /// Bring the node up iff the persisted intent is "up", picking resume-vs-fresh-auth from the
@@ -260,23 +289,75 @@ async fn auto_start(backend: &mut Backend) {
     if !backend.wants_running() {
         return;
     }
-    // Wrap the env auth key in `SecretString` so it is never logged or accidentally printed.
-    // `auth_key_from_env()` returns `Some("")` for a set-but-empty var; treat that as absent
-    // (matching the CLI's guard) so an empty `TS_AUTH_KEY` doesn't masquerade as a real key.
-    let env_authkey = tailscale::config::auth_key_from_env()
-        .filter(|k| !k.is_empty())
-        .map(secrecy::SecretString::from);
-    let has_key = backend.has_persisted_node_key().await;
+    // Record that THIS process attempted a bring-up. The SIGHUP path consults this so it only
+    // *retries* a boot we already attempted (a transient failure), never *originates* a connection
+    // from an out-of-band intent flip.
+    backend.mark_boot_attempted_up();
 
-    // The auth key, if any, that we hand to the engine. We resume (no key) only when we hold a
-    // persisted node key and no env key was provided; otherwise the env key (possibly `None`)
-    // governs. An explicit `TS_AUTH_KEY` always wins, so an operator can force re-auth / rotate.
-    let (authkey, resuming) = if has_key && env_authkey.is_none() {
+    let env_authkey = env_authkey();
+    let has_key = backend.has_persisted_node_key().await;
+    let (authkey, resuming) = resume_decision(has_key, env_authkey);
+    log_resume_decision(resuming, authkey.is_some(), backend.prefs_ephemeral());
+
+    // Auto-start uses persisted prefs as-is (no overrides) — TUN/hostname/control-url all come from
+    // the stored prefs the user set via `tnet up`, not from the boot path. No external lock is held
+    // at boot (this runs before `serve`), so the inline `up` is fine here.
+    if let Err(e) = backend.up(authkey, ipn::UpOptions::default()).await {
+        // Non-fatal: come up in a needs-login/stopped state and let the CLI drive `up`.
+        tracing::warn!(error = %format!("{e:#}"), "auto-start failed; awaiting `tnet up`");
+    }
+}
+
+/// SIGHUP-path counterpart to [`auto_start`] that runs against the shared `Arc<Mutex<Backend>>` and
+/// drives the bring-up **off-lock** via [`ipn::drive_up`], so a reload-triggered re-auth never
+/// head-of-line blocks concurrent `status`/`down`. The caller ([`reconcile_on_reload`]) has already
+/// established that the intent is up, no device is running, and this process attempted bring-up at
+/// boot (`boot_attempted_up`); this fn re-reads the key material under a brief lock, then handshakes
+/// unlocked.
+async fn auto_start_arc(backend: &Arc<Mutex<Backend>>) {
+    let env_authkey = env_authkey();
+    // Brief lock to read the resume inputs; released before the handshake.
+    let (has_key, ephemeral) = {
+        let be = backend.lock().await;
+        (be.has_persisted_node_key().await, be.prefs_ephemeral())
+    };
+    let (authkey, resuming) = resume_decision(has_key, env_authkey);
+    log_resume_decision(resuming, authkey.is_some(), ephemeral);
+
+    if let Err(e) = ipn::drive_up(backend, authkey, ipn::UpOptions::default()).await {
+        tracing::warn!(error = %format!("{e:#}"), "SIGHUP auto-start retry failed; awaiting `tnet up`");
+    }
+}
+
+/// Read `TS_AUTH_KEY` as a `SecretString` (never logged), treating a set-but-empty value as absent
+/// (matching the CLI's guard) so an empty `TS_AUTH_KEY` doesn't masquerade as a real key.
+fn env_authkey() -> Option<secrecy::SecretString> {
+    tailscale::config::auth_key_from_env()
+        .filter(|k| !k.is_empty())
+        .map(secrecy::SecretString::from)
+}
+
+/// The resume-vs-fresh-auth decision, pure so it is unit-testable without an engine.
+///
+/// Returns `(authkey_to_use, resuming)`. We resume (no key) only when a persisted node key exists
+/// AND no env key was provided; otherwise the env key (possibly `None`) governs. An explicit
+/// `TS_AUTH_KEY` always wins, so an operator can force re-auth / rotate. With neither a persisted key
+/// nor an env key, we still attempt `up(None)` so the engine yields the authoritative needs-login
+/// state rather than the daemon guessing.
+fn resume_decision(
+    has_persisted_key: bool,
+    env_authkey: Option<secrecy::SecretString>,
+) -> (Option<secrecy::SecretString>, bool) {
+    if has_persisted_key && env_authkey.is_none() {
         (None, true)
     } else {
         (env_authkey, false)
-    };
+    }
+}
 
+/// Emit the operator-facing log line explaining which auth path the bring-up took. Split out so both
+/// [`auto_start`] and [`auto_start_arc`] log identically.
+fn log_resume_decision(resuming: bool, have_authkey: bool, ephemeral: bool) {
     if resuming {
         tracing::info!(
             "persisted intent is up and a persisted node key exists; \
@@ -286,14 +367,14 @@ async fn auto_start(backend: &mut Backend) {
         // garbage-collected by control shortly after it disconnects, so its persisted key may
         // already be invalid after a reboot and this resume can still fail at registration. A
         // node meant to survive reboots and resume from its key alone needs `ephemeral = false`.
-        if backend.prefs_ephemeral() {
+        if ephemeral {
             tracing::warn!(
                 "node is configured ephemeral; control may have garbage-collected it after \
                  its last disconnect, so resume-without-authkey may fail — a node that must \
                  survive reboots needs ephemeral=false (or pass TS_AUTH_KEY to re-register)"
             );
         }
-    } else if authkey.is_some() {
+    } else if have_authkey {
         tracing::info!("persisted intent is up; auto-starting with TS_AUTH_KEY (fresh auth)");
     } else {
         // No key to resume from and none provided — surface why so the operator can act.
@@ -301,16 +382,6 @@ async fn auto_start(backend: &mut Backend) {
             "persisted intent is up but there is no persisted node key and no TS_AUTH_KEY; \
              cannot resume or authenticate — set TS_AUTH_KEY (or run `tnet up`) to register"
         );
-    }
-
-    // Auto-start uses persisted prefs as-is (no overrides) — TUN/hostname/control-url all come from
-    // the stored prefs the user set via `tnet up`, not from the boot path.
-    if let Err(e) = backend
-        .up(authkey, tailscaled_rs::ipn::UpOptions::default())
-        .await
-    {
-        // Non-fatal: come up in a needs-login/stopped state and let the CLI drive `up`.
-        tracing::warn!(error = %format!("{e:#}"), "auto-start failed; awaiting `tnet up`");
     }
 }
 
@@ -340,5 +411,44 @@ mod tests {
     fn experiment_gate_accepts_exact_value() {
         assert!(experiment_gate_ok(Some(REQUIRED_EXPERIMENT_VALUE)));
         assert!(experiment_gate_ok(Some("this_is_unstable_software")));
+    }
+
+    // `resume_decision` is the resume-vs-fresh-auth path selection shared by the boot and SIGHUP
+    // auto-start paths. It is pure, so the four quadrants are table-testable without an engine — and
+    // a regression here (e.g. inverting the priority so the env key loses to a persisted key) would
+    // otherwise be invisible. `secrecy::SecretString` has no value-equality, so we assert on
+    // `is_some()` + the `resuming` flag, which fully characterizes the decision.
+    fn sk(s: &str) -> secrecy::SecretString {
+        secrecy::SecretString::from(s.to_owned())
+    }
+
+    #[test]
+    fn resume_decision_persisted_key_no_env_resumes() {
+        // Persisted key, no env key → resume with NO auth key.
+        let (key, resuming) = resume_decision(true, None);
+        assert!(resuming);
+        assert!(key.is_none());
+    }
+
+    #[test]
+    fn resume_decision_env_key_always_wins() {
+        // Env key present → fresh auth, even when a persisted key also exists (operator forcing a
+        // re-pair / rotation must win over resume).
+        let (key, resuming) = resume_decision(true, Some(sk("tskey-auth-x")));
+        assert!(!resuming);
+        assert!(key.is_some());
+
+        let (key, resuming) = resume_decision(false, Some(sk("tskey-auth-x")));
+        assert!(!resuming);
+        assert!(key.is_some());
+    }
+
+    #[test]
+    fn resume_decision_no_key_no_env_attempts_unauthed() {
+        // Neither a persisted key nor an env key → not "resuming", and no key to send; the daemon
+        // still attempts `up(None)` so the engine yields the authoritative needs-login state.
+        let (key, resuming) = resume_decision(false, None);
+        assert!(!resuming);
+        assert!(key.is_none());
     }
 }

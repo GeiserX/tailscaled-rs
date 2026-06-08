@@ -178,11 +178,23 @@ async fn handle_conn(
                 break;
             }
             LineResult::Line => {
-                let text = String::from_utf8_lossy(&line);
+                // Decode strictly: an invalid-UTF-8 line is rejected cleanly (not lossily patched
+                // with U+FFFD and fed to the JSON parser). Like the malformed-JSON path below, we
+                // answer with an error and keep handling subsequent lines, never closing the loop.
+                let text = match std::str::from_utf8(&line) {
+                    Ok(t) => t,
+                    Err(_) => {
+                        let response = Response::Error {
+                            message: "bad request: invalid UTF-8".into(),
+                        };
+                        write_response(&mut write_half, &response).await?;
+                        continue;
+                    }
+                };
                 if text.trim().is_empty() {
                     continue;
                 }
-                let response = match serde_json::from_str::<Request>(&text) {
+                let response = match serde_json::from_str::<Request>(text) {
                     Ok(req) => dispatch(req, access, peer_uid, &backend).await,
                     Err(e) => Response::Error {
                         message: format!("bad request: {e}"),
@@ -237,6 +249,7 @@ async fn read_capped_line(
             return Ok(LineResult::Eof);
         }
         if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            // Strict `>`: a line of exactly MAX_LINE_BYTES is allowed — the cap is inclusive.
             if out.len() + pos > MAX_LINE_BYTES {
                 // The line (excluding the newline) is over the cap. Don't consume — the caller is
                 // closing the connection anyway, and not consuming keeps this simple.
@@ -247,6 +260,7 @@ async fn read_capped_line(
             return Ok(LineResult::Line);
         }
         // No newline in this chunk: would appending it exceed the cap?
+        // Strict `>` for the same reason as above: MAX_LINE_BYTES bytes exactly is still in-bounds.
         if out.len() + buf.len() > MAX_LINE_BYTES {
             return Ok(LineResult::TooLong);
         }
@@ -293,11 +307,11 @@ async fn dispatch(
             }
         }
         // `up` performs a multi-second control-plane handshake (`Device::new`). Doing that under the
-        // backend lock would head-of-line block every concurrent `status`. So we use the three-phase
-        // split: lock briefly to prep config (begin_up) → DROP the lock → run the slow handshake
-        // (build_device) unlocked → lock briefly again to install (finish_up). A `down`/`up` that
-        // lands during the handshake bumps the generation and supersedes this one (finish_up discards
-        // the orphan). See `ipn::Backend::begin_up`.
+        // backend lock would head-of-line block every concurrent `status`. `ipn::drive_up` runs the
+        // three-phase split — lock briefly for begin_up → DROP the lock for the slow handshake →
+        // lock briefly for finish_up → settle any superseded orphan off-lock — so a `down`/`up` that
+        // lands mid-flight supersedes this one and no concurrent call is blocked. The SIGHUP reload
+        // path shares this exact helper. See `ipn::drive_up`.
         Request::Up {
             authkey,
             control_url,
@@ -317,40 +331,10 @@ async fn dispatch(
                 tun_name,
                 tun_mtu,
             };
-
-            // Phase 1: brief lock — prep + persist prefs, build Config, bump generation.
-            let pending = {
-                let mut be = backend.lock().await;
-                be.begin_up(opts).await
-            };
-            let pending = match pending {
-                Ok(p) => p,
-                Err(e) => {
-                    return Response::Error {
-                        message: format!("{e:#}"),
-                    };
-                }
-            };
-
-            // Phase 2: NO lock held — the slow handshake. Concurrent `status` proceeds freely here.
-            let built = ipn::build_device(&pending, authkey).await;
-
-            // Phase 3: brief lock — install iff still current, returning any orphan to shut down.
-            // `finish_up` does NOT await the orphan's shutdown (that would re-block the lock for up
-            // to SHUTDOWN_TIMEOUT); it hands the orphan back so we tear it down AFTER dropping the
-            // lock, keeping concurrent `status`/`up`/`down` unblocked even on the supersede path.
-            let outcome = {
-                let mut be = backend.lock().await;
-                be.finish_up(pending, built)
-            };
-            match outcome {
-                Ok(orphan) => {
-                    // Lock released — settle the (rare) superseded device off-lock.
-                    ipn::shutdown_orphan(orphan).await;
-                    Response::Ok {
-                        message: "node brought up".to_string(),
-                    }
-                }
+            match ipn::drive_up(backend, authkey, opts).await {
+                Ok(()) => Response::Ok {
+                    message: "node brought up".to_string(),
+                },
                 Err(e) => Response::Error {
                     message: format!("{e:#}"),
                 },
