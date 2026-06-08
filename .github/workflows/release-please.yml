@@ -30,6 +30,7 @@ name: Release Please
 on:
   push:
     branches: [main]
+  workflow_dispatch: {}
 
 # release-please needs to open/maintain the release PR and, on merge, create the
 # release + tag.
