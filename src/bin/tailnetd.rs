@@ -5,9 +5,14 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
+
+/// Env var the underlying engine reads to confirm the operator opted into experimental software.
+const EXPERIMENT_VAR: &str = "TS_RS_EXPERIMENT";
+/// The exact value the engine requires; anything else (or unset) is a refusal.
+const REQUIRED_EXPERIMENT_VALUE: &str = "this_is_unstable_software";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -16,6 +21,29 @@ async fn main() -> Result<()> {
             EnvFilter::try_from_env("TAILNETD_LOG").unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+
+    // The engine refuses to run unless `TS_RS_EXPERIMENT=this_is_unstable_software` is set; mirror
+    // that gate here and surface it early with an actionable message instead of a deep engine error.
+    // We deliberately do NOT set the var ourselves — auto-defeating the experimental gate would hide
+    // that this is unaudited software. The packaged systemd/launchd units set it for the operator.
+    if !experiment_gate_ok(std::env::var(EXPERIMENT_VAR).ok().as_deref()) {
+        tracing::error!(
+            "{EXPERIMENT_VAR} is not set to `{REQUIRED_EXPERIMENT_VALUE}`. The underlying engine is \
+             experimental and unaudited, so it refuses to run without an explicit opt-in. To run \
+             tailnetd, set `{EXPERIMENT_VAR}={REQUIRED_EXPERIMENT_VALUE}` in the environment (the \
+             packaged systemd/launchd units already do this for you)."
+        );
+        eprintln!(
+            "error: {EXPERIMENT_VAR} is not set to `{REQUIRED_EXPERIMENT_VALUE}`.\n\
+             The underlying engine is experimental and unaudited; it refuses to run without an \
+             explicit opt-in.\n\
+             To run tailnetd, set `{EXPERIMENT_VAR}={REQUIRED_EXPERIMENT_VALUE}` in the environment \
+             (the packaged systemd/launchd units already do this for you)."
+        );
+        return Err(anyhow!(
+            "{EXPERIMENT_VAR} must be set to `{REQUIRED_EXPERIMENT_VALUE}` to run the experimental engine"
+        ));
+    }
 
     let state_dir = tailscaled_rs::state_dir();
     let socket_path = tailscaled_rs::socket_path();
@@ -62,5 +90,34 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = sigint.recv() => tracing::info!("SIGINT received, shutting down"),
         _ = sigterm.recv() => tracing::info!("SIGTERM received, shutting down"),
+    }
+}
+
+/// The experimental-gate decision, pure so it can be unit-tested: the gate passes only when the
+/// env var holds exactly the required opt-in value. `None` (unset) and any other value fail.
+fn experiment_gate_ok(value: Option<&str>) -> bool {
+    value == Some(REQUIRED_EXPERIMENT_VALUE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn experiment_gate_rejects_unset() {
+        assert!(!experiment_gate_ok(None));
+    }
+
+    #[test]
+    fn experiment_gate_rejects_wrong_value() {
+        assert!(!experiment_gate_ok(Some("")));
+        assert!(!experiment_gate_ok(Some("yes")));
+        assert!(!experiment_gate_ok(Some("this_is_unstable_software ")));
+    }
+
+    #[test]
+    fn experiment_gate_accepts_exact_value() {
+        assert!(experiment_gate_ok(Some(REQUIRED_EXPERIMENT_VALUE)));
+        assert!(experiment_gate_ok(Some("this_is_unstable_software")));
     }
 }

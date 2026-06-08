@@ -1,0 +1,76 @@
+# tailnetd.service — systemd unit for the tailscaled-rs daemon (Linux).
+#
+# Runs `tailnetd` as an always-on SYSTEM service (root-owned, started at boot via
+# multi-user.target). This is the system-wide deployment; a per-user-session variant is
+# possible later by shipping a `--user` unit (placed under ~/.config/systemd/user/ and
+# managed with `systemctl --user`), which would drop the system hardening below and resolve
+# the state dir from $XDG_STATE_HOME instead of /var/lib.
+#
+# This unit is HARDENED on purpose: tailnetd holds unencrypted WireGuard/node key material in
+# its state dir, so the service is locked down with the systemd sandboxing directives below.
+#
+# WARNING: experimental, unaudited software — not for production. See the repository README.
+# Install / uninstall instructions: ../README.md
+
+[Unit]
+Description=tailscaled-rs daemon (tailnetd) — experimental WireGuard mesh node
+Documentation=https://github.com/GeiserX/tailscaled-rs
+# Wait for routable network before starting (the node dials a control server + DERP).
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tailnetd
+Restart=on-failure
+RestartSec=5
+
+# --- Experiment opt-in (REQUIRED) ---------------------------------------------------------
+# The underlying engine refuses to start unless this is set to exactly this value. We set it
+# here, explicitly and visibly, because enabling this unit IS the operator opting in to running
+# unaudited, experimental software on purpose. tailnetd deliberately does NOT set it for itself.
+Environment=TS_RS_EXPERIMENT=this_is_unstable_software
+
+# --- State directory ----------------------------------------------------------------------
+# systemd creates /var/lib/tailnetd with 0700 ownership root:root (StateDirectory). The daemon
+# additionally enforces 0700 on this dir itself at startup (it holds unencrypted key material),
+# so the two layers agree. TAILNETD_STATE_DIR points the daemon at this exact path.
+StateDirectory=tailnetd
+StateDirectoryMode=0700
+Environment=TAILNETD_STATE_DIR=/var/lib/tailnetd
+
+# --- Hardening (this daemon holds private keys) -------------------------------------------
+# Drop ALL privileges and sandbox aggressively. The MVP is userspace-networking only (DERP /
+# in-process WireGuard), so it needs no capabilities, no TUN device, and no write access to the
+# system outside its own state dir.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=true
+LockPersonality=true
+SystemCallArchitectures=native
+# ProtectSystem=strict makes the whole filesystem read-only; carve out only the state dir.
+ReadWritePaths=/var/lib/tailnetd
+# Empty set = strip every capability. The userspace-networking MVP needs none.
+CapabilityBoundingSet=
+
+# --- Phase-3 (TUN / kernel-mode) NOTE -----------------------------------------------------
+# When the kernel TUN data path lands (Phase 3), this unit must be RELAXED to grant the daemon
+# the ability to create and configure a tun interface. At minimum you will then need:
+#   CapabilityBoundingSet=CAP_NET_ADMIN
+#   AmbientCapabilities=CAP_NET_ADMIN
+#   DeviceAllow=/dev/net/tun rw
+#   # and loosen ProtectSystem (e.g. ProtectSystem=full) so /dev/net/tun is reachable,
+#   # plus relax RestrictNamespaces if a network namespace is used.
+# Do NOT add these now: the current MVP does not open /dev/net/tun, and granting CAP_NET_ADMIN
+# to experimental code with no need for it only widens the blast radius.
+
+[Install]
+WantedBy=multi-user.target

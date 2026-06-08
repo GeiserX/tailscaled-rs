@@ -13,3 +13,6 @@
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# oh-my-claudecode session state (local only)
+.omc/
