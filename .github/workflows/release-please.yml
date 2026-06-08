@@ -1,0 +1,51 @@
+# Release automation: commit-type-driven version bumps via release-please.
+#
+# This is the *versioning* half of the release pipeline; `release.yml` is the
+# *binary-building* half. They are intentionally separate and chain through a tag:
+#
+#   1. Commits land on `main` using Conventional Commits (feat:, fix:, …).
+#   2. release-please reads every commit since the last release and maintains a
+#      standing "release PR" that bumps `version` in Cargo.toml and rewrites the
+#      `[Unreleased]` section of CHANGELOG.md into a dated, versioned entry.
+#   3. When a human merges that release PR, release-please creates the GitHub
+#      Release and pushes the tag `v{version}` (e.g. `v0.2.0`).
+#   4. That `v*` tag push is exactly the trigger `release.yml` listens for, so the
+#      cross-compiled `tailnetd`/`tnet` binaries are built and attached to the
+#      Release that release-please just opened.  release-please never builds
+#      binaries; release.yml never decides versions — no overlap.
+#
+# Pre-1.0 semantics (the project is 0.x): with `release-type: rust`, release-please's
+# default pre-major behavior matches CHANGELOG.md's stated policy —
+#   feat:     → minor (0.MINOR.0)
+#   fix:      → patch (0.x.PATCH)
+#   breaking  → minor while < 1.0 (NOT a major bump), surfaced under "Changed"
+# so no extra config is needed to honor "breaking changes may land in a minor".
+#
+# Tag format: the v4 action defaults `include-v-in-tag: true`, emitting `v{version}`,
+# which lines up with release.yml's `tags: ['v*']` glob.  Do not change one without
+# the other or the tag → binaries chain breaks.
+
+name: Release Please
+
+on:
+  push:
+    branches: [main]
+
+# release-please needs to open/maintain the release PR and, on merge, create the
+# release + tag.
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    name: maintain release PR · cut release on merge
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          # Manifest-driven config (the v4 action's preferred mode): the source of
+          # truth is release-please-config.json + .release-please-manifest.json at
+          # the repo root, which set release-type=rust and the current version.
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json

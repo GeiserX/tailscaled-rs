@@ -37,3 +37,40 @@ jobs:
 
       - name: Build release
         run: cargo build --release --bins
+
+  coverage:
+    name: coverage (codecov)
+    runs-on: ubuntu-latest
+    # Separate job: does NOT gate the `test` job above. The Codecov check is
+    # informational (see codecov.yml) — 90% is the TARGET, not yet met, so a
+    # below-threshold result here must not turn CI red while coverage is built up.
+    # TS_RS_EXPERIMENT is inherited from the workflow-level `env:` block above.
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Runs `cargo test` under instrumentation. `#[ignore]`d tests (e.g.
+      # headscale_e2e, which needs network) are skipped by default — we do NOT
+      # pass `--ignored`, so they never run under coverage.
+      - name: Generate coverage (lcov)
+        run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          # Public repo: upload works tokenless. Token is optional and only used
+          # if the secret is set; absence does not fail the upload for public repos.
+          token: ${{ secrets.CODECOV_TOKEN }}
+          # A Codecov flake must not gate the build.
+          fail_ci_if_error: false

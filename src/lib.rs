@@ -15,10 +15,13 @@
 //! - [`auth`] — peer-credential authorization for the control socket (read for all, write for
 //!   root/same-uid).
 //! - [`server`] — the LocalAPI server, a Unix-domain-socket IPC surface the CLI talks to.
+//! - [`hardening`] — best-effort OS-level protection (no-coredump / no-ptrace / no-swap) for the
+//!   secrets the engine holds in memory, the in-RAM analogue of [`ensure_state_dir_secure`].
 //!
 //! Two binaries consume it: `tailnetd` (the daemon) and `tnet` (the thin CLI client).
 
 pub mod auth;
+pub mod hardening;
 pub mod ipn;
 pub mod localapi;
 pub mod prefs;
