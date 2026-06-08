@@ -94,7 +94,11 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&json).unwrap();
         match back {
-            Request::Up { authkey, hostname, control_url } => {
+            Request::Up {
+                authkey,
+                hostname,
+                control_url,
+            } => {
                 assert_eq!(authkey.as_deref(), Some("tskey-auth-xxx"));
                 assert_eq!(hostname.as_deref(), Some("node-a"));
                 assert!(control_url.is_none());
@@ -105,12 +109,17 @@ mod tests {
 
     #[test]
     fn request_down_wire_format() {
-        assert_eq!(serde_json::to_string(&Request::Down).unwrap(), r#"{"cmd":"down"}"#);
+        assert_eq!(
+            serde_json::to_string(&Request::Down).unwrap(),
+            r#"{"cmd":"down"}"#
+        );
     }
 
     #[test]
     fn response_error_is_tagged() {
-        let resp = Response::Error { message: "boom".to_string() };
+        let resp = Response::Error {
+            message: "boom".to_string(),
+        };
         let json = serde_json::to_string(&resp).unwrap();
         assert_eq!(json, r#"{"kind":"error","message":"boom"}"#);
     }

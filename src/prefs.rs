@@ -69,12 +69,16 @@ mod tests {
         let p = Prefs::default();
         assert!(!p.want_running, "a fresh node must not auto-connect");
         assert!(!p.logged_out);
-        assert!(p.ephemeral, "ephemeral is the safe default for short-lived nodes");
+        assert!(
+            p.ephemeral,
+            "ephemeral is the safe default for short-lived nodes"
+        );
     }
 
     #[tokio::test]
     async fn missing_file_yields_default() {
-        let dir = std::env::temp_dir().join(format!("tailnetd-prefs-missing-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-prefs-missing-{}", std::process::id()));
         let path = dir.join("prefs.json");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         let loaded = Prefs::load(&path).await.expect("load missing");
@@ -111,7 +115,10 @@ mod tests {
         tokio::fs::write(&path, b"not json at all").await.unwrap();
 
         let loaded = Prefs::load(&path).await.expect("load malformed");
-        assert!(!loaded.want_running, "malformed prefs must not leave a node connected");
+        assert!(
+            !loaded.want_running,
+            "malformed prefs must not leave a node connected"
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
