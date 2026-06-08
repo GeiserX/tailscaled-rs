@@ -1,0 +1,46 @@
+[package]
+name = "tailnetd"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "BSD-3-Clause"
+description = "An independent, from-scratch Rust system daemon that joins a WireGuard-based mesh overlay, speaking the Tailscale control protocol. Wraps the tailscale-rs engine in a long-running, IPC-controlled daemon (the layer the embeddable library omits). Not affiliated with, endorsed by, or sponsored by Tailscale Inc.; 'Tailscale' is a trademark of Tailscale Inc."
+
+# NOTE (working title): binaries are `tailnetd` (daemon) + `tnet` (CLI). The repo/crate
+# name is a placeholder and will be finalized to a non-`tailscale*` name before the repo
+# is made public (trademark hygiene). The daemon is the net-new "tailscaled-shaped" layer;
+# the cryptographic/networking engine is the separate `tailscale-rs` dependency below.
+
+[lib]
+name = "tailnetd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tailnetd"
+path = "src/bin/tailnetd.rs"
+
+[[bin]]
+name = "tnet"
+path = "src/bin/tnet.rs"
+
+[dependencies]
+# The engine: a from-scratch Rust Tailscale-protocol library. Imported as `tailscale`,
+# published crate name `tailscale-rs`. Pinned to a specific rev for reproducible builds;
+# Cargo.lock is committed so CI and every clone build the exact same engine.
+#
+# Local engine iteration (optional): a *gitignored* `.cargo/config.toml` with
+#   paths = ["/path/to/your/tailscale-rs/checkout"]
+# transparently overrides this git dep when the local checkout's version matches the pin —
+# so you can edit the engine and rebuild the daemon with no manifest change. See README.
+tailscale = { package = "tailscale-rs", git = "https://github.com/GeiserX/tailscale-rs", rev = "afa970c04ad1a98e6dc88484294f360439a24725" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+strip = true

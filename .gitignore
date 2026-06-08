@@ -1,0 +1,9 @@
+/target
+
+# Local-only engine path override (developer machines only; see README).
+/.cargo/config.toml
+
+# Raw multi-agent research dossiers: kept locally for reference, not published
+# (they contain absolute local paths and working notes). The distilled, public
+# version lives in docs/DESIGN.md.
+/docs/research/
