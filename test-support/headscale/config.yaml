@@ -1,0 +1,81 @@
+# Minimal Headscale config for ToS-clean local e2e testing of the tailscaled-rs daemon.
+#
+# This is the SMALLEST config that boots a usable single-tailnet control server — not a
+# production config. It is loaded by the headscale container in this directory's
+# docker-compose.yml (mounted read-only at /etc/headscale/config.yaml). See ../../docs/TESTING.md
+# for the full local loop (create a user + pre-auth key, then point the daemon at this server).
+#
+# Schema tracks the `config-example.yaml` shipped with the pinned headscale image
+# (headscale/headscale:0.28.0). Keys removed from that example here are simply left at their
+# headscale defaults; everything below is the minimum needed to register a node and serve a netmap.
+
+# Clients connect here; must match the host port published by docker-compose. The daemon is pointed
+# at this same URL via `tnet up --control-url http://localhost:8080` (or TS_CONTROL_URL / the
+# TAILNETD_HS_URL env the gated integration test reads).
+server_url: http://localhost:8080
+
+# Bind on all interfaces inside the container so the published port reaches it.
+listen_addr: 0.0.0.0:8080
+metrics_listen_addr: 127.0.0.1:9090
+grpc_listen_addr: 127.0.0.1:50443
+grpc_allow_insecure: false
+
+# TS2021 Noise handshake key. A missing key file is auto-generated on first boot into the volume.
+noise:
+  private_key_path: /var/lib/headscale/noise_private.key
+
+# Tailnet address pool — the canonical Tailscale CGNAT ranges. A node that registers gets a
+# 100.64.0.0/10 address, which the gated test asserts as the node's self address.
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
+  allocation: sequential
+
+# DERP disabled: the smallest config. The embedded DERP relay needs HTTPS (server_url must be
+# https) and STUN, none of which a local http control server has; direct/local connectivity is all
+# the join + netmap flow under test needs. No external DERP map is fetched either (urls empty), so
+# startup makes no outbound calls.
+derp:
+  server:
+    enabled: false
+  urls: []
+  paths: []
+  auto_update_enabled: false
+  update_frequency: 24h
+
+# Don't phone home for a headscale version check on startup (offline / ToS-clean).
+disable_check_updates: true
+
+# Ephemeral (pre-auth-key) nodes are reaped this long after going offline. Kept short for tests.
+ephemeral_node_inactivity_timeout: 30m
+
+database:
+  type: sqlite
+  sqlite:
+    path: /var/lib/headscale/db.sqlite
+    write_ahead_log: true
+
+log:
+  level: info
+  format: text
+
+# File-mode ACL policy with no path = headscale's permissive default (every node can see every
+# other) — fine for a single-tailnet test server.
+policy:
+  mode: file
+  path: ""
+
+# MagicDNS off and no nameservers: the daemon under test joins in userspace-networking mode and the
+# tests assert registration + a tailnet self address, not DNS. base_domain must still differ from
+# the server_url host, so it is left at the example default.
+dns:
+  magic_dns: false
+  base_domain: example.com
+  nameservers:
+    global: []
+  search_domains: []
+
+# CLI socket: `headscale users create` / `preauthkeys create` (run via `docker compose exec`) talk
+# to the server over this unauthenticated unix socket inside the container.
+unix_socket: /var/run/headscale/headscale.sock
+unix_socket_permission: "0770"

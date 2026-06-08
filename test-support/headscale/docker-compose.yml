@@ -1,0 +1,49 @@
+# Minimal self-hosted Headscale control server for ToS-clean local e2e testing of tailscaled-rs.
+#
+# Headscale (https://github.com/juanfont/headscale) is an independent, protocol-compatible
+# reimplementation of the Tailscale control server. Running the daemon against it exercises the real
+# register / map-poll (netmap) flow WITHOUT touching production Tailscale infrastructure (no ToS or
+# rate-limit exposure). NOTE: headscale lags upstream Tailscale's capability version, so green here
+# is NOT proof of full Tailscale compatibility — see ../../docs/TESTING.md and ../../docs/ENGINE.md.
+#
+# Usage (full loop in ../../docs/TESTING.md):
+#   docker compose -f test-support/headscale/docker-compose.yml up -d
+#   docker compose -f test-support/headscale/docker-compose.yml exec headscale \
+#       headscale users create test
+#   docker compose -f test-support/headscale/docker-compose.yml exec headscale \
+#       headscale preauthkeys create --user test --reusable --expiration 24h
+#   # then point the daemon at http://localhost:8080 with that key.
+
+services:
+  headscale:
+    # Pinned to a real, recent STABLE tag — never `:latest` (reproducible builds; repo rule).
+    # 0.28.0 (2026-02, multi-arch amd64+arm64) is the latest stable headscale release.
+    image: headscale/headscale:0.28.0
+    container_name: tailscaled-rs-headscale-test
+    # The image entrypoint is `headscale`; `serve` starts the control server.
+    command: serve
+    restart: unless-stopped
+    ports:
+      # Publish the HTTP control port to the host so the daemon (and the gated integration test) can
+      # reach it at http://localhost:8080, matching `server_url` in config.yaml.
+      - "8080:8080"
+    volumes:
+      # Config is read-only; the server only reads it.
+      - ./config.yaml:/etc/headscale/config.yaml:ro
+      # Persistent state: sqlite db, auto-generated noise key, and the CLI unix socket dir all live
+      # under /var/lib/headscale + /var/run/headscale. A named volume keeps them across restarts and
+      # out of the repo tree (so nothing secret is ever written into a committed path).
+      - headscale-data:/var/lib/headscale
+      - headscale-run:/var/run/headscale
+    healthcheck:
+      # `headscale` ships no curl/wget; use its own CLI talking to the local unix socket as the
+      # readiness probe. `nodes list` succeeds only once the server is serving.
+      test: ["CMD", "headscale", "nodes", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+volumes:
+  headscale-data:
+  headscale-run:

@@ -21,7 +21,7 @@ use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::auth::{self, Access, AuthPolicy};
-use crate::ipn::Backend;
+use crate::ipn::{self, Backend};
 use crate::localapi::{Request, Response};
 
 /// Max bytes for a single newline-delimited request line. LocalAPI requests are tiny JSON, so this
@@ -275,9 +275,29 @@ async fn dispatch(
         };
     }
 
-    let mut be = backend.lock().await;
     match req {
-        Request::Status => Response::Status(be.status().await),
+        // `status` and `down` are fast under the lock, so take it directly.
+        Request::Status => {
+            let be = backend.lock().await;
+            Response::Status(be.status().await)
+        }
+        Request::Down => {
+            let mut be = backend.lock().await;
+            match be.down().await {
+                Ok(()) => Response::Ok {
+                    message: "node brought down".to_string(),
+                },
+                Err(e) => Response::Error {
+                    message: format!("{e:#}"),
+                },
+            }
+        }
+        // `up` performs a multi-second control-plane handshake (`Device::new`). Doing that under the
+        // backend lock would head-of-line block every concurrent `status`. So we use the three-phase
+        // split: lock briefly to prep config (begin_up) → DROP the lock → run the slow handshake
+        // (build_device) unlocked → lock briefly again to install (finish_up). A `down`/`up` that
+        // lands during the handshake bumps the generation and supersedes this one (finish_up discards
+        // the orphan). See `ipn::Backend::begin_up`.
         Request::Up {
             authkey,
             control_url,
@@ -287,7 +307,27 @@ async fn dispatch(
             // right at the boundary and hand the engine path the secret. (The wire type stays
             // `String` because `SecretString` does not serialize.)
             let authkey = authkey.map(secrecy::SecretString::from);
-            match be.up(authkey, hostname, control_url).await {
+
+            // Phase 1: brief lock — prep + persist prefs, build Config, bump generation.
+            let pending = {
+                let mut be = backend.lock().await;
+                be.begin_up(hostname, control_url).await
+            };
+            let pending = match pending {
+                Ok(p) => p,
+                Err(e) => {
+                    return Response::Error {
+                        message: format!("{e:#}"),
+                    };
+                }
+            };
+
+            // Phase 2: NO lock held — the slow handshake. Concurrent `status` proceeds freely here.
+            let built = ipn::build_device(&pending, authkey).await;
+
+            // Phase 3: brief lock — install iff still current, else discard the orphan.
+            let mut be = backend.lock().await;
+            match be.finish_up(pending, built).await {
                 Ok(()) => Response::Ok {
                     message: "node brought up".to_string(),
                 },
@@ -296,13 +336,5 @@ async fn dispatch(
                 },
             }
         }
-        Request::Down => match be.down().await {
-            Ok(()) => Response::Ok {
-                message: "node brought down".to_string(),
-            },
-            Err(e) => Response::Error {
-                message: format!("{e:#}"),
-            },
-        },
     }
 }

@@ -72,6 +72,39 @@ impl State {
     }
 }
 
+/// How long to wait for a graceful engine shutdown before it is dropped (more violently). Bounds
+/// teardown latency so a wedged engine can't hang the daemon (or an orphaned, superseded `up`).
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// An in-progress bring-up handed between [`Backend::begin_up`] (locked, fast) and
+/// [`Backend::finish_up`] (locked, fast), across the unlocked [`build_device`] handshake.
+///
+/// Carries the engine `Config` to construct from and the lifecycle `generation` this attempt was
+/// started at, so `finish_up` can tell whether a later `up`/`down` superseded it while the backend
+/// lock was released for the slow `Device::new`.
+pub struct PendingUp {
+    config: tailscale::Config,
+    generation: u64,
+}
+
+/// Perform the slow engine handshake (`Device::new`) for a [`PendingUp`], **without** holding the
+/// backend lock. This is the multi-second, network-bound step (control-plane registration); keeping
+/// it off-lock is the whole point of the `begin_up`/`finish_up` split — a concurrent `status` (or
+/// any other LocalAPI call) is not blocked behind an in-flight `up`.
+///
+/// The auth-key secret is exposed exactly once, here, for the single engine call that needs the
+/// plaintext; the exposed `String` lives no longer than this call.
+pub async fn build_device(
+    pending: &PendingUp,
+    authkey: Option<secrecy::SecretString>,
+) -> Result<tailscale::Device> {
+    use secrecy::ExposeSecret;
+    let authkey_string = authkey.as_ref().map(|s| s.expose_secret().to_string());
+    tailscale::Device::new(&pending.config, authkey_string)
+        .await
+        .map_err(|e| anyhow!("engine start failed: {e:?}"))
+}
+
 /// The daemon backend: owns prefs, the key file, and the live engine handle.
 pub struct Backend {
     prefs: Prefs,
@@ -83,6 +116,11 @@ pub struct Backend {
     /// `NoState` from an explicit `Stopped`. Persists across restarts: it is derived in
     /// [`Backend::load`] from whether the prefs file exists on disk, not from the live process.
     ever_configured: bool,
+    /// Monotonic lifecycle generation, bumped on every `up`/`down`. Used by the concurrent
+    /// `begin_up`/`finish_up` split (see [`Backend::begin_up`]): the slow `Device::new` runs without
+    /// holding the backend lock, so a second `up`/`down` may land first; the generation lets
+    /// `finish_up` detect that its device is stale and discard it instead of clobbering newer intent.
+    generation: u64,
 }
 
 impl Backend {
@@ -109,6 +147,7 @@ impl Backend {
             key_path,
             device: None,
             ever_configured,
+            generation: 0,
         })
     }
 
@@ -184,12 +223,36 @@ impl Backend {
     /// It is a [`secrecy::SecretString`] so it is zeroized on drop and never lands in a `Debug`
     /// rendering or log line; it is never stored on the [`Backend`] — it flows through this method
     /// and is exposed exactly once, at the [`tailscale::Device::new`] engine call below.
+    /// Bring the node up in a single call (the auto-start / single-owner path).
+    ///
+    /// This holds whatever lock the caller holds for the whole duration, including the slow
+    /// `Device::new` handshake. For the **concurrent LocalAPI server**, prefer the
+    /// [`begin_up`](Backend::begin_up) / [`finish_up`](Backend::finish_up) split, which performs the
+    /// handshake *without* the backend lock so a concurrent `status` is not head-of-line blocked.
+    /// `up` is kept for the daemon's boot-time auto-start, where there is no concurrency to protect.
     pub async fn up(
         &mut self,
         authkey: Option<secrecy::SecretString>,
         hostname: Option<String>,
         control_url: Option<String>,
     ) -> Result<()> {
+        let pending = self.begin_up(hostname, control_url).await?;
+        let built = build_device(&pending, authkey).await;
+        self.finish_up(pending, built).await
+    }
+
+    /// Phase 1 of the concurrent bring-up: mutate + persist prefs, build the engine `Config`, and
+    /// bump the lifecycle [`generation`](Backend::generation). Returns a [`PendingUp`] describing
+    /// *this* attempt. Runs under the backend lock but does **no** network I/O, so it returns
+    /// quickly; the caller then performs the slow `Device::new` via [`build_device`] **without** the
+    /// lock, and re-acquires it for [`finish_up`].
+    ///
+    /// Tears down any existing device first, so a reconfiguring `up` cleanly replaces the prior one.
+    pub async fn begin_up(
+        &mut self,
+        hostname: Option<String>,
+        control_url: Option<String>,
+    ) -> Result<PendingUp> {
         // Tear down any existing device first so `up` is idempotent / reconfiguring.
         self.stop_device().await;
 
@@ -207,14 +270,44 @@ impl Backend {
         self.persist_prefs().await?;
 
         let config = self.build_config().await?;
+        // Bump + capture the generation: `finish_up` installs its device only if this is still the
+        // current generation (no later `up`/`down` superseded it while the lock was released).
+        self.generation += 1;
+        Ok(PendingUp {
+            config,
+            generation: self.generation,
+        })
+    }
 
-        // Expose the auth-key secret only here, for the single engine call that needs the plaintext
-        // (registration). The exposed `String` lives no longer than this `up` call.
-        use secrecy::ExposeSecret;
-        let authkey_string = authkey.as_ref().map(|s| s.expose_secret().to_string());
-        let device = tailscale::Device::new(&config, authkey_string)
-            .await
-            .map_err(|e| anyhow!("engine start failed: {e:?}"))?;
+    /// Phase 3 of the concurrent bring-up: install the freshly-built device — but only if no later
+    /// `up`/`down` superseded this attempt while the backend lock was released for the handshake.
+    ///
+    /// `pending` is from [`begin_up`](Backend::begin_up); `device` is the [`build_device`] result. If
+    /// the engine failed, the error is returned (and, if this attempt is still current, intent stays
+    /// "up" with no device → `NeedsLogin`, so auto-start can retry). If a newer generation has landed,
+    /// the just-built device is **discarded** (gracefully shut down off-lock) rather than clobbering
+    /// newer intent.
+    pub async fn finish_up(
+        &mut self,
+        pending: PendingUp,
+        device: Result<tailscale::Device>,
+    ) -> Result<()> {
+        if pending.generation != self.generation {
+            // Superseded by a later up/down while we were handshaking. Drop the orphan device
+            // (consuming shutdown, bounded) and report success of *this* call's no-op install — the
+            // newer intent is authoritative. A build error on a stale attempt is irrelevant.
+            if let Ok(dev) = device {
+                let _ = dev.shutdown(Some(SHUTDOWN_TIMEOUT)).await;
+            }
+            tracing::debug!(
+                stale_generation = pending.generation,
+                current_generation = self.generation,
+                "discarding superseded up() result"
+            );
+            return Ok(());
+        }
+        // `device` is already an `anyhow::Result` with engine context from `build_device`.
+        let device = device?;
         self.device = Some(device);
         Ok(())
     }
@@ -272,6 +365,9 @@ impl Backend {
     /// Bring the node down (`WantRunning = false`) without logging out; tears down the engine.
     pub async fn down(&mut self) -> Result<()> {
         self.stop_device().await;
+        // Bump the generation so an `up` whose `Device::new` is still in flight (lock released) is
+        // recognized as stale by `finish_up` and its device discarded — `down` wins.
+        self.generation += 1;
         self.prefs.want_running = false;
         self.ever_configured = true;
         self.persist_prefs().await?;
@@ -369,7 +465,7 @@ impl Backend {
     async fn stop_device(&mut self) {
         if let Some(dev) = self.device.take() {
             // `shutdown` consumes the device; bounded so a wedged engine can't hang the daemon.
-            let _ = dev.shutdown(Some(Duration::from_secs(5))).await;
+            let _ = dev.shutdown(Some(SHUTDOWN_TIMEOUT)).await;
         }
     }
 
@@ -533,6 +629,7 @@ mod tests {
             key_path: dir.join("node.key.json"),
             device: None,
             ever_configured: false,
+            generation: 0,
         }
     }
 
@@ -599,6 +696,82 @@ mod tests {
             !backend.has_persisted_node_key().await,
             "a malformed key file must not be treated as a usable persisted key"
         );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    // --- concurrent bring-up generation guard (tsd-jvn) --------------------------------------------
+
+    #[tokio::test]
+    async fn begin_up_then_down_supersedes_a_stale_finish_up() {
+        // Models the race the begin_up/finish_up split exists to handle: an `up` starts (begin_up),
+        // its slow handshake runs with the lock RELEASED, and a `down` lands first. The stale
+        // `finish_up` must DISCARD its result (return Ok, install nothing) rather than clobber the
+        // newer `down` intent. Driven without a real engine: begin_up + down are pure-ish (fs only),
+        // and we hand finish_up an `Err` device so no real `Device` is needed for the stale path.
+        let dir = std::env::temp_dir().join(format!("tailnetd-gen-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+
+        let gen0 = be.generation;
+        // Phase 1 of an `up`: prep config + bump generation (no engine call).
+        let pending = be.begin_up(None, None).await.expect("begin_up");
+        assert_eq!(
+            pending.generation,
+            gen0 + 1,
+            "begin_up must bump the generation"
+        );
+        assert!(be.prefs.want_running, "begin_up sets want_running");
+
+        // A `down` lands while the (hypothetical) handshake is still in flight → supersedes.
+        be.down().await.expect("down");
+        assert!(!be.prefs.want_running, "down clears want_running");
+        assert!(
+            be.generation > pending.generation,
+            "down must bump the generation past the in-flight up"
+        );
+
+        // The stale finish_up returns Ok (its result is discarded) and installs NO device — the
+        // `down` intent wins. We pass an Err device so the stale-path needs no real engine.
+        be.finish_up(
+            pending,
+            Err(anyhow!("handshake result is irrelevant once superseded")),
+        )
+        .await
+        .expect("a superseded finish_up is a successful no-op");
+        assert!(
+            be.device.is_none(),
+            "a superseded up must not install a device over the newer down intent"
+        );
+        // State reflects the down, not the stale up.
+        assert_eq!(be.derive_state(false), State::Stopped);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn finish_up_with_current_generation_surfaces_engine_error() {
+        // The non-stale path: when this attempt is still current and the engine build failed, the
+        // error must propagate (so intent stays "up" with no device → NeedsLogin, and auto-start can
+        // retry) — it must NOT be swallowed like the superseded case.
+        let dir = std::env::temp_dir().join(format!("tailnetd-gen-err-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+
+        let pending = be.begin_up(None, None).await.expect("begin_up");
+        // No superseding call → pending.generation == be.generation. A build error must surface.
+        let result = be
+            .finish_up(pending, Err(anyhow!("simulated engine start failure")))
+            .await;
+        assert!(
+            result.is_err(),
+            "a current (non-superseded) finish_up must propagate the engine error"
+        );
+        assert!(be.device.is_none(), "no device installed on engine failure");
+        // want_running stayed true (begin_up set it) but no device → NeedsLogin, the retry state.
+        assert_eq!(be.derive_state(false), State::NeedsLogin);
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
