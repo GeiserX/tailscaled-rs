@@ -10,7 +10,12 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 /// The node's persisted preferences.
+///
+/// Container-level `#[serde(default)]`: any field missing from an on-disk `prefs.json` falls back
+/// to [`Prefs::default`], so adding fields in future releases stays backward-compatible with older
+/// files (and forward-compatible — an old daemon ignores unknown fields).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Prefs {
     /// Whether the node should be connected — the spine of `up` vs `down`.
     pub want_running: bool,
@@ -105,6 +110,20 @@ mod tests {
         assert!(loaded.accept_routes);
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn partial_json_defaults_missing_fields() {
+        // Container-level `#[serde(default)]` lets an old/partial prefs file deserialize with only
+        // the fields it carries; everything else takes the `Default` value.
+        let p: Prefs = serde_json::from_str(r#"{"want_running": true}"#).expect("partial parse");
+        assert!(p.want_running, "the field that was present must win");
+        let d = Prefs::default();
+        assert_eq!(p.logged_out, d.logged_out);
+        assert_eq!(p.control_url, d.control_url);
+        assert_eq!(p.hostname, d.hostname);
+        assert_eq!(p.ephemeral, d.ephemeral);
+        assert_eq!(p.accept_routes, d.accept_routes);
     }
 
     #[tokio::test]

@@ -18,11 +18,12 @@
 //! The reported [`State`] is *derived* from `(device present?, netmap received?, prefs)` rather
 //! than stored, so it can never drift from reality. The [`State::NeedsMachineAuth`] and
 //! [`State::InUseOtherUser`] variants exist for parity with Go's `ipn.State`, but the MVP cannot
-//! actually *reach* `NeedsMachineAuth` from a live status snapshot — the engine does not surface a
-//! "machine authorized / awaiting admin approval" signal (see the `// LIMITATION:` note on
-//! [`Backend::derive_state`]); it is only reachable via the explicit registration-error path, and
-//! `InUseOtherUser` is unreachable in this single-user daemon (auth-key registration only, no
-//! interactive multi-profile login). Honest gaps over fabricated states.
+//! actually *reach* either today — the engine does not surface a "machine authorized / awaiting
+//! admin approval" signal (see the `// LIMITATION:` note on [`Backend::derive_state`]), and
+//! `Backend::up` maps every engine error to a string `Response::Error` rather than to a typed
+//! state, so no path produces `NeedsMachineAuth`. `InUseOtherUser` is likewise unreachable in this
+//! single-user daemon (auth-key registration only, no interactive multi-profile login). Honest gaps
+//! over fabricated states.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -41,8 +42,9 @@ pub enum State {
     NeedsLogin,
     /// Registered to control, but the machine is not yet authorized by a tailnet admin (Go's
     /// `ipn.NeedsMachineAuth`). See the `// LIMITATION:` note on [`Backend::derive_state`]: the
-    /// engine does not surface this from a status snapshot, so it is reached only via an explicit
-    /// registration-error path, never inferred from a netmap.
+    /// engine does not surface this from a status snapshot, and no current code path produces it; it
+    /// would require [`Backend::up`] to branch on a typed registration error. Kept for `ipn.State`
+    /// parity.
     NeedsMachineAuth,
     /// The node key is already in use by a different user/profile (Go's `ipn.InUseOtherUser`).
     /// Unreachable in this single-user, auth-key-only daemon; kept only for `ipn.State` parity.
@@ -77,8 +79,9 @@ pub struct Backend {
     key_path: PathBuf,
     /// The running engine, if up. `None` when stopped/needs-login.
     device: Option<tailscale::Device>,
-    /// Whether the node has ever been brought up in this process (distinguishes `NoState` from
-    /// `Stopped`).
+    /// Whether the node has ever been configured (brought `up`/`down`), distinguishing a fresh
+    /// `NoState` from an explicit `Stopped`. Persists across restarts: it is derived in
+    /// [`Backend::load`] from whether the prefs file exists on disk, not from the live process.
     ever_configured: bool,
 }
 
@@ -87,10 +90,19 @@ impl Backend {
     pub async fn load(state_dir: &std::path::Path) -> Result<Self> {
         let prefs_path = state_dir.join("prefs.json");
         let key_path = state_dir.join("node.key.json");
+        // `ever_configured` distinguishes a never-touched node (`NoState`) from one explicitly
+        // brought down (`Stopped`), and must survive a daemon restart. It is derived from the
+        // *existence* of the prefs file rather than from prefs contents: `down()` persists prefs with
+        // `want_running = false` (and not `logged_out`), so a contents-based test
+        // (`want_running || logged_out`) would read `false` after an up→down→restart and the node
+        // would wrongly fall back to `NoState`. A fresh node has never written prefs, so the file is
+        // absent; once `up`/`down` runs, the file exists — exactly the "configured before" signal we
+        // need. (`Prefs::load` returns the default for a missing file, so the file's presence, not
+        // its contents, is the load-bearing signal — hence we probe it before loading.)
+        let ever_configured = tokio::fs::try_exists(&prefs_path).await.unwrap_or(false);
         let prefs = Prefs::load(&prefs_path)
             .await
             .with_context(|| format!("loading prefs from {}", prefs_path.display()))?;
-        let ever_configured = prefs.want_running || prefs.logged_out;
         Ok(Self {
             prefs,
             prefs_path,
@@ -124,7 +136,7 @@ impl Backend {
             self.prefs.hostname = Some(h);
         }
         // Capture an overridden control URL into prefs; it is parsed + applied to the engine config
-        // below.
+        // in `build_config` below.
         if control_url.is_some() {
             self.prefs.control_url = control_url;
         }
@@ -133,19 +145,7 @@ impl Backend {
         self.ever_configured = true;
         self.persist_prefs().await?;
 
-        let mut config = tailscale::Config::default_with_key_file(&self.key_path)
-            .await
-            .map_err(|e| anyhow!("load key file {}: {e:?}", self.key_path.display()))?;
-        config.requested_hostname = self.prefs.hostname.clone();
-        config.ephemeral = self.prefs.ephemeral;
-        config.accept_routes = self.prefs.accept_routes;
-        // Apply a custom control server when prefs carry one; otherwise keep the engine default
-        // (real Tailscale / `TS_CONTROL_URL`). A malformed URL fails loudly rather than silently
-        // falling back to the default — pointing at the wrong control plane must never be silent.
-        if let Some(s) = &self.prefs.control_url {
-            config.control_server_url =
-                url::Url::parse(s).with_context(|| format!("invalid control_url {s:?}"))?;
-        }
+        let config = self.build_config().await?;
 
         // Expose the auth-key secret only here, for the single engine call that needs the plaintext
         // (registration). The exposed `String` lives no longer than this `up` call.
@@ -156,6 +156,48 @@ impl Backend {
             .map_err(|e| anyhow!("engine start failed: {e:?}"))?;
         self.device = Some(device);
         Ok(())
+    }
+
+    /// Translate current [`Prefs`] + the on-disk key file into a [`tailscale::Config`] for the
+    /// engine. This is the single seam where the daemon's reconfigurable intent becomes the engine's
+    /// immutable construction config (Phase-3 platform config will grow here), so `up` stays a thin
+    /// orchestrator over it.
+    ///
+    /// Control-server precedence (highest wins): `prefs.control_url` > `TS_CONTROL_URL` > engine
+    /// default (real Tailscale). The base is built from [`tailscale::Config::default_from_env`] so
+    /// the env var is honored, then the node key is loaded in (mirroring
+    /// `Config::default_with_key_file`, which is just `{ key_state: load_key_file(..), ..default() }`
+    /// over the *non*-env default), then prefs override hostname/ephemeral/accept_routes, and finally
+    /// `prefs.control_url` overrides the control server last so an explicit pref always wins over the
+    /// environment.
+    async fn build_config(&self) -> Result<tailscale::Config> {
+        // Start from the env-aware default so `TS_CONTROL_URL` (and the other `TS_*` vars) are
+        // honored, then fold in the persisted node key — `default_with_key_file` does the same
+        // `load_key_file` but over the plain (non-env) default, which would silently ignore the env.
+        let mut config = tailscale::Config::default_from_env();
+        config.key_state = tailscale::config::load_key_file(&self.key_path, Default::default())
+            .await
+            .map_err(|e| anyhow!("load key file {}: {e:?}", self.key_path.display()))?;
+        config.requested_hostname = self.prefs.hostname.clone();
+        config.ephemeral = self.prefs.ephemeral;
+        config.accept_routes = self.prefs.accept_routes;
+        // Apply a custom control server when prefs carry one; this wins over `TS_CONTROL_URL` and
+        // the engine default. A malformed URL fails loudly rather than silently falling back —
+        // pointing at the wrong control plane must never be silent. Only `http`/`https` are accepted
+        // (defense-in-depth: the value is operator-trusted, but rejecting a stray scheme is cheap).
+        if let Some(s) = &self.prefs.control_url {
+            let url = url::Url::parse(s).with_context(|| format!("invalid control_url {s:?}"))?;
+            match url.scheme() {
+                "http" | "https" => {}
+                other => {
+                    return Err(anyhow!(
+                        "invalid control_url {s:?}: scheme {other:?} is not http or https"
+                    ));
+                }
+            }
+            config.control_server_url = url;
+        }
+        Ok(config)
     }
 
     /// Bring the node down (`WantRunning = false`) without logging out; tears down the engine.
@@ -187,7 +229,13 @@ impl Backend {
                         .collect();
                     (ip, name, peers, have)
                 }
-                Err(_) => (None, None, Vec::new(), false),
+                // A transient engine status error must not be silent: log it, but stay
+                // conservative. With no self-node we report `Starting` (a live node briefly reads as
+                // Starting until the next successful poll) rather than fabricating a `Running` state.
+                Err(e) => {
+                    tracing::warn!(error = %e, "engine status query failed");
+                    (None, None, Vec::new(), false)
+                }
             },
             None => (None, None, Vec::new(), false),
         };
@@ -215,10 +263,12 @@ impl Backend {
     // fire-and-forget actor (see `ts_runtime::control_runner`, with its own `TODO(tsr-kqj)`), so a
     // machine awaiting approval simply presents as `Starting` here (device up, no self-node yet) —
     // indistinguishable from a node that is merely still converging. Rather than fabricate the
-    // distinction, we surface `Starting` honestly. `NeedsMachineAuth` is reachable only via the
-    // explicit registration-error path in [`Backend::up`] (if/when the engine grows a typed
-    // registration error, per its `tsr-kqj` TODO); [`State::InUseOtherUser`] is unreachable in this
-    // single-user, auth-key-only daemon and is kept purely for `ipn.State` parity.
+    // distinction, we surface `Starting` honestly. `NeedsMachineAuth` would become reachable only if
+    // [`Backend::up`] is reworked to call the engine's typed registration error and branch on it
+    // (if/when the engine grows one, per its `tsr-kqj` TODO); today `up` maps every engine error to a
+    // string `Response::Error`, so no code path produces `NeedsMachineAuth` — nor
+    // [`State::InUseOtherUser`], unreachable in this single-user, auth-key-only daemon. Both exist
+    // purely for `ipn.State` parity.
     fn derive_state(&self, have_self_node: bool) -> State {
         derive_state_from(
             self.device.is_some(),
@@ -269,8 +319,9 @@ impl Backend {
 /// - `has_device`: an engine [`tailscale::Device`] is currently constructed (the node is "up").
 /// - `have_self_node`: the engine has received a netmap and assigned this node its addresses.
 /// - `want_running` / `logged_out`: the persisted [`Prefs`] intent.
-/// - `ever_configured`: the node has been brought up at least once this process (distinguishes a
-///   never-touched `NoState` from an explicit `Stopped`).
+/// - `ever_configured`: the node has been configured at least once (distinguishes a never-touched
+///   `NoState` from an explicit `Stopped`); persisted across restarts via the prefs file (see
+///   [`Backend::load`]).
 ///
 /// See the `// LIMITATION:` note on [`Backend::derive_state`] for why [`State::NeedsMachineAuth`]
 /// and [`State::InUseOtherUser`] are never produced here.
@@ -364,6 +415,21 @@ mod tests {
     fn down_after_ever_configured_is_stopped() {
         // No device, not logged out, not wanting to run, but configured before → explicitly Stopped
         // (distinct from the never-configured NoState).
+        assert_eq!(
+            derive_state_from(false, false, false, false, true),
+            State::Stopped
+        );
+    }
+
+    #[test]
+    fn ever_configured_is_the_only_no_state_vs_stopped_discriminator() {
+        // With identical (no-device, not-logged-out, not-want-running) inputs, `ever_configured` is
+        // the sole bit that flips NoState ↔ Stopped — the distinction finding-4 makes survive a
+        // restart. Pin both sides of that single flip in one place.
+        assert_eq!(
+            derive_state_from(false, false, false, false, false),
+            State::NoState
+        );
         assert_eq!(
             derive_state_from(false, false, false, false, true),
             State::Stopped

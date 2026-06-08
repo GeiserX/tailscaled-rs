@@ -34,7 +34,11 @@ async fn main() -> Result<()> {
     if backend.wants_running() {
         tracing::info!("persisted intent is up; auto-starting");
         // Wrap the env auth key in `SecretString` so it is never logged or accidentally printed.
-        let authkey = tailscale::config::auth_key_from_env().map(secrecy::SecretString::from);
+        // `auth_key_from_env()` returns `Some("")` for a set-but-empty var; treat that as absent
+        // (matching the CLI's guard) so an empty `TS_AUTH_KEY` doesn't masquerade as a real key.
+        let authkey = tailscale::config::auth_key_from_env()
+            .filter(|k| !k.is_empty())
+            .map(secrecy::SecretString::from);
         if let Err(e) = backend.up(authkey, None, None).await {
             // Non-fatal: come up in a needs-login/stopped state and let the CLI drive `up`.
             tracing::warn!(error = %format!("{e:#}"), "auto-start failed; awaiting `tnet up`");

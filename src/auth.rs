@@ -4,80 +4,121 @@
 //! process credentials** (`SO_PEERCRED` on Linux, `LOCAL_PEERCRED`/`getpeereid` on macOS — both
 //! surfaced by `tokio::net::UnixStream::peer_cred()`), mirroring Tailscale's model:
 //!
-//! - **Anyone may read** (`status`) — read commands are not gated.
+//! - **Anyone who can reach the socket may read** (`status`) — read commands are not gated.
 //! - **Only root (uid 0) or the same user that owns the daemon may write** (`up` / `down`, which
 //!   mutate node lifecycle and prefs).
 //!
-//! This is deliberately the MVP policy. The richer Tailscale "operator user" GID matrix is a
-//! later phase; this module is the seam where that grows.
+//! Note that "anyone may read" is bounded in practice by the `0700` state directory the socket
+//! lives in (see [`crate::ensure_state_dir_secure`] and the socket-dir hardening in
+//! [`crate::server`]): a different user typically cannot even traverse to the socket. The uid gate
+//! here is the second layer — it is what still denies *writes* if the socket is ever reachable.
+//!
+//! This is deliberately the MVP policy. The richer Tailscale "operator user" GID matrix is a later
+//! phase; the seam for it is [`AuthPolicy`] (constructed once at startup, threaded into the server)
+//! plus the peer's `gid` — see the note on [`AuthPolicy::for_peer`]. Growing to an operator tier
+//! means extending [`AuthPolicy`] and adding an `Access` variant, not rewriting the call sites.
 
 /// What a caller is allowed to do over the LocalAPI, decided from its peer credentials.
+///
+/// Two-variant rather than a `{read, write}` struct because read is currently unconditional — the
+/// distinction that matters is only "may this caller mutate?". A future operator tier adds a
+/// variant here (e.g. `Operator`) rather than a third bool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Permissions {
-    /// May issue read-only commands (always true today).
-    pub read: bool,
-    /// May issue mutating commands (`up`, `down`, prefs edits).
-    pub write: bool,
+pub enum Access {
+    /// May issue read-only commands (`status`) but not mutate.
+    ReadOnly,
+    /// Fully authorized: may issue lifecycle/prefs mutations (`up`, `down`) as well as reads.
+    ReadWrite,
 }
 
-impl Permissions {
-    /// Read-only caller (peer is neither root nor the daemon's owner).
-    pub const READ_ONLY: Permissions = Permissions {
-        read: true,
-        write: false,
-    };
-    /// Fully-authorized caller (root or same-uid).
-    pub const READ_WRITE: Permissions = Permissions {
-        read: true,
-        write: true,
-    };
+impl Access {
+    /// Whether this access level may issue mutating commands.
+    pub fn can_write(self) -> bool {
+        matches!(self, Access::ReadWrite)
+    }
+}
+
+/// The authorization policy, constructed **once** at daemon startup and threaded into the server.
+///
+/// Today it holds only the daemon's effective uid (the "owner" a peer is compared against). This
+/// is the deliberate extension seam: the Phase-2 operator-GID matrix adds fields here (an operator
+/// gid, an allowlist, …) and a richer [`Access`] variant, without changing the per-connection call
+/// sites in [`crate::server`].
+#[derive(Debug, Clone, Copy)]
+pub struct AuthPolicy {
+    /// The daemon's effective uid — the "owner" that, alongside root, is granted write.
+    owner_euid: u32,
+}
+
+impl AuthPolicy {
+    /// Build the policy from the current process. Call once at startup, not per connection.
+    ///
+    /// Uses the daemon's **effective** uid. This is correct for the "same user that owns the
+    /// daemon" policy as long as the daemon is not run setuid (euid == ruid); a setuid deployment
+    /// would make "owner" the setuid target rather than the launching user — revisit `peer_cred`'s
+    /// ruid then.
+    pub fn from_current_process() -> Self {
+        Self {
+            owner_euid: current_euid(),
+        }
+    }
+
+    /// Construct a policy with an explicit owner uid (tests / future config-driven construction).
+    pub fn with_owner_euid(owner_euid: u32) -> Self {
+        Self { owner_euid }
+    }
+
+    /// Decide a peer's [`Access`] from its uid under this policy.
+    ///
+    /// Policy: root (uid 0) or the owner uid → `ReadWrite`; everyone else → `ReadOnly`. Pure, so it
+    /// is unit-testable without a socket.
+    pub fn access_for_uid(&self, peer_uid: u32) -> Access {
+        if peer_uid == 0 || peer_uid == self.owner_euid {
+            Access::ReadWrite
+        } else {
+            Access::ReadOnly
+        }
+    }
+
+    /// Resolve the [`Access`] for a connected LocalAPI peer, plus its uid for logging.
+    ///
+    /// Reads the peer's uid via `stream.peer_cred()` **once** and applies [`Self::access_for_uid`].
+    /// Returns `(access, Some(uid))` so the caller can log the exact uid that drove the decision
+    /// (no second `peer_cred()` syscall, and the log can never disagree with the authorization). If
+    /// the credential lookup fails, we fail **closed** (`ReadOnly`, `None` uid) — an unidentifiable
+    /// caller must never get write.
+    ///
+    /// The peer's `gid` (`cred.gid()`) is intentionally not consulted yet; it is the input the
+    /// future operator-GID tier will add here.
+    pub fn for_peer(&self, stream: &tokio::net::UnixStream) -> (Access, Option<u32>) {
+        match stream.peer_cred() {
+            Ok(cred) => {
+                let uid = cred.uid();
+                (self.access_for_uid(uid), Some(uid))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "peer_cred lookup failed; defaulting to read-only");
+                (Access::ReadOnly, None)
+            }
+        }
+    }
 }
 
 /// The effective uid of the current process (the daemon's owner), used for the same-user check.
 ///
-/// Implemented with `libc::geteuid()` (libc is already in the dependency tree). Isolated here so
-/// the rest of the daemon never calls libc directly.
-pub fn current_euid() -> u32 {
-    // SAFETY: geteuid() is always-succeeds, takes no arguments, and has no preconditions.
+/// Private — the rest of the daemon goes through [`AuthPolicy`] and never calls libc directly, so
+/// the single `unsafe` site lives here.
+fn current_euid() -> u32 {
+    // SAFETY: geteuid() always succeeds, takes no arguments, and has no preconditions.
     unsafe { libc::geteuid() }
-}
-
-/// Decide a peer's [`Permissions`] from its uid and the daemon's own euid.
-///
-/// Policy: root (uid 0) or same-uid → read+write; everyone else → read-only. Pure function so it
-/// is unit-testable without a socket.
-pub fn permissions_for(peer_uid: u32, daemon_euid: u32) -> Permissions {
-    if peer_uid == 0 || peer_uid == daemon_euid {
-        Permissions::READ_WRITE
-    } else {
-        Permissions::READ_ONLY
-    }
-}
-
-/// Resolve the [`Permissions`] for a connected LocalAPI peer, plus its uid for logging.
-///
-/// On unix, reads the peer's uid via `stream.peer_cred()` **once** and applies [`permissions_for`]
-/// against [`current_euid`]. Returns `(permissions, Some(uid))` so the caller can log the exact uid
-/// that drove the decision (no second `peer_cred()` syscall, and the log can never disagree with
-/// the authorization). If the credential lookup fails, we fail **closed** (read-only, `None` uid) —
-/// an unidentifiable caller must never get write.
-pub fn permissions_for_peer(stream: &tokio::net::UnixStream) -> (Permissions, Option<u32>) {
-    match stream.peer_cred() {
-        Ok(cred) => {
-            let uid = cred.uid();
-            (permissions_for(uid, current_euid()), Some(uid))
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "peer_cred lookup failed; defaulting to read-only");
-            (Permissions::READ_ONLY, None)
-        }
-    }
 }
 
 /// Whether a given LocalAPI command requires write permission.
 ///
 /// Centralized so the server has one authority on which verbs mutate. Read commands (`status`)
-/// return false; lifecycle/prefs commands (`up`, `down`) return true.
+/// return false; lifecycle/prefs commands (`up`, `down`) return true. The match is exhaustive over
+/// [`crate::localapi::Request`], so a new command forces an explicit authorization decision at
+/// compile time.
 pub fn requires_write(request: &crate::localapi::Request) -> bool {
     use crate::localapi::Request;
     match request {
@@ -86,39 +127,83 @@ pub fn requires_write(request: &crate::localapi::Request) -> bool {
     }
 }
 
+/// Returned by [`authorize`] when a request is refused: the caller lacked the required access.
+///
+/// A distinct (zero-field) type rather than `()` so the `Result` error carries meaning and so the
+/// signature reads as a real authorization verdict (and satisfies `clippy::result_unit_err`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Denied;
+
+/// Authorize a request under a caller's [`Access`]: `Ok(())` if permitted, `Err(Denied)` otherwise.
+///
+/// Pure and side-effect-free so the security-critical deny decision is directly unit-testable
+/// without a socket or a second uid. The server maps `Err(Denied)` to a `permission denied`
+/// [`crate::localapi::Response::Error`].
+pub fn authorize(request: &crate::localapi::Request, access: Access) -> Result<(), Denied> {
+    if requires_write(request) && !access.can_write() {
+        Err(Denied)
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::localapi::Request;
 
-    #[test]
-    fn root_gets_write() {
-        assert_eq!(permissions_for(0, 1000), Permissions::READ_WRITE);
+    fn up() -> Request {
+        Request::Up {
+            authkey: None,
+            control_url: None,
+            hostname: None,
+        }
     }
 
     #[test]
-    fn same_uid_gets_write() {
-        assert_eq!(permissions_for(1000, 1000), Permissions::READ_WRITE);
+    fn root_gets_write() {
+        let p = AuthPolicy::with_owner_euid(1000);
+        assert_eq!(p.access_for_uid(0), Access::ReadWrite);
+    }
+
+    #[test]
+    fn owner_uid_gets_write() {
+        let p = AuthPolicy::with_owner_euid(1000);
+        assert_eq!(p.access_for_uid(1000), Access::ReadWrite);
     }
 
     #[test]
     fn other_uid_is_read_only() {
-        let p = permissions_for(1001, 1000);
-        assert!(p.read);
-        assert!(!p.write);
+        let p = AuthPolicy::with_owner_euid(1000);
+        assert_eq!(p.access_for_uid(1001), Access::ReadOnly);
+        assert!(!p.access_for_uid(1001).can_write());
     }
 
     #[test]
-    fn read_commands_need_no_write() {
-        assert!(!requires_write(&crate::localapi::Request::Status));
+    fn requires_write_classifies_commands() {
+        assert!(!requires_write(&Request::Status));
+        assert!(requires_write(&Request::Down));
+        assert!(requires_write(&up()));
+    }
+
+    // The security-critical deny path, tested directly (no socket, no second uid needed). These
+    // tests fail if the gate is deleted or inverted — closing the mutation-survives gap the review
+    // flagged.
+    #[test]
+    fn read_only_caller_is_denied_writes() {
+        assert_eq!(authorize(&Request::Down, Access::ReadOnly), Err(Denied));
+        assert_eq!(authorize(&up(), Access::ReadOnly), Err(Denied));
     }
 
     #[test]
-    fn lifecycle_commands_need_write() {
-        assert!(requires_write(&crate::localapi::Request::Down));
-        assert!(requires_write(&crate::localapi::Request::Up {
-            authkey: None,
-            control_url: None,
-            hostname: None,
-        }));
+    fn read_only_caller_may_still_read() {
+        assert_eq!(authorize(&Request::Status, Access::ReadOnly), Ok(()));
+    }
+
+    #[test]
+    fn read_write_caller_may_do_everything() {
+        assert_eq!(authorize(&Request::Status, Access::ReadWrite), Ok(()));
+        assert_eq!(authorize(&Request::Down, Access::ReadWrite), Ok(()));
+        assert_eq!(authorize(&up(), Access::ReadWrite), Ok(()));
     }
 }
