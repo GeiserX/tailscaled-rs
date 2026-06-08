@@ -32,11 +32,20 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # The `tun` feature is off by default (it pulls the privileged kernel-TUN
+      # transport). Lint + build it explicitly so the cfg(feature = "tun")-gated
+      # code can't silently rot — it isn't covered by the default-config steps above.
+      - name: Clippy (tun feature)
+        run: cargo clippy --all-targets --features tun -- -D warnings
+
       - name: Test
         run: cargo test --all-targets
 
       - name: Build release
         run: cargo build --release --bins
+
+      - name: Build release (tun feature)
+        run: cargo build --release --bins --features tun
 
   coverage:
     name: coverage (codecov)
