@@ -73,9 +73,14 @@ stateDiagram-v2
     Running --> NeedsLogin: auth lost / key expired
 ```
 
-Compared to the full Tailscale state machine, the MVP omits `NeedsMachineAuth` and
-`InUseOtherUser` (it is pre-auth-key only) and interactive login; those currently surface as a
-`NeedsLogin`/error rather than dedicated states.
+All seven Go `ipn.State` variants now exist as `ipn::State` for wire/API parity:
+`NoState`, `NeedsLogin`, `NeedsMachineAuth`, `InUseOtherUser`, `Starting`, `Running`, `Stopped`
+(`ipn::State::as_str` is the authoritative list). Two of them are **parity-only and not yet
+reachable** from a live status snapshot: because the MVP is pre-auth-key only with no interactive
+login, `NeedsMachineAuth` (node registered, awaiting admin approval) and `InUseOtherUser`
+(node key already bound to another user/profile) are never produced — those conditions currently
+surface as `NeedsLogin`/error instead. They are kept so the state name set never has to change
+when interactive login lands.
 
 ## Minimal Viable Daemon — in / out
 
@@ -92,8 +97,8 @@ service packaging.
 
 | Phase | Goal | Milestone |
 |---|---|---|
-| **1 — MVP** *(done)* | userspace-networking node: authkey join, `status`/`up`/`down` over LocalAPI, persisted prefs | A node joins a tailnet and answers `status` |
-| **2 — Daemonize** | service install (systemd/launchd), `netmon`-driven re-bind on network change, richer LocalAPI auth (`SO_PEERCRED`), Linux OS-DNS | Survives reboot + link-change as a managed service |
+| **1 — MVP** *(done)* | userspace-networking node: authkey join, `status`/`up`/`down` over LocalAPI, `SO_PEERCRED` LocalAPI authorization (read for all, write for root/same-UID), persisted prefs in a `0700` state dir, zeroized secret handling | A node joins a tailnet and answers `status` |
+| **2 — Daemonize** | service install (systemd/launchd), `netmon`-driven re-bind on network change, Linux OS-DNS | Survives reboot + link-change as a managed service |
 | **3 — Platform breadth** | TUN mode + per-OS router/DNS (Linux/macOS/Windows), port mapping | Transparent OS-wide connectivity on three platforms |
 | **4 — Feature parity** | MagicDNS, exit/subnet routing, Serve/Funnel, SSH, Tailnet Lock enforcement | Approaches `tailscaled` feature parity |
 
@@ -109,5 +114,30 @@ service packaging.
 
 ## Security posture
 
-See [`../SECURITY.md`](../SECURITY.md). In short: experimental, unaudited crypto, protect the state
-directory yourself, and do not rely on it for data privacy until audited.
+See [`../SECURITY.md`](../SECURITY.md). In short: experimental, **unaudited crypto** — do not rely
+on it for data privacy until independently audited.
+
+Several local-host protections that an earlier draft listed as "do it yourself" are now **shipped**:
+
+- **`0700` state directory.** The daemon creates and `chmod`s its state dir to `0700` on startup
+  (it holds unencrypted key material), and re-tightens the socket's parent dir in `serve` itself —
+  it doesn't trust the launcher to have done it.
+- **Zeroized secret handling.** Auth keys are carried as `secrecy::SecretString` (zeroized on drop,
+  no `Debug`/serialize), exposed exactly once at the engine registration call and never stored on
+  the backend or logged.
+- **`SO_PEERCRED` LocalAPI authorization.** Every control-socket connection is authorized by its
+  peer process credentials, mirroring Tailscale's `ipnauth` model: anyone who can reach the socket
+  may **read** (`status`), but only **root or the daemon's own UID may write** (`up`/`down`). The
+  `0700` dir is the first gate; peer-cred is the second — it still denies writes even if the socket
+  is ever reachable by another user.
+
+```mermaid
+flowchart LR
+    PEER["LocalAPI client<br/>(connects to Unix socket)"] -->|"peer_cred()"| AUTH{"uid == 0<br/>or uid == owner?"}
+    AUTH -->|"yes"| RW["ReadWrite<br/>(status / up / down)"]
+    AUTH -->|"no (or lookup fails)"| RO["ReadOnly<br/>(status only)"]
+```
+
+Not yet done (honest scope): the richer Tailscale "operator user" GID matrix is a later phase —
+the seam exists (the policy is built once at startup and threaded per-connection, and the peer's
+`gid` is already read) but is not enforced; and the crypto remains unaudited.

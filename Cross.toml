@@ -1,0 +1,26 @@
+# `cross` configuration (https://github.com/cross-rs/cross).
+#
+# Cross-compiles the daemon (`tailnetd`) + CLI (`tnet`) for the Linux targets the daemon
+# supports today. `cross` runs the compile inside a docker image that already ships the
+# matching cross C toolchain, which `ring`'s build script (transitively, via the
+# `tailscale-rs` engine) requires to assemble its C/asm sources.
+#
+# Usage:
+#   cross build --release --target aarch64-unknown-linux-gnu
+#   cross build --release --target x86_64-unknown-linux-gnu
+#
+# Targets: the daemon is **unix-only** (LocalAPI over a Unix domain socket, `SO_PEERCRED`
+# authorization), so the supported `cross` targets are Linux glibc on x86_64 + aarch64.
+# macOS builds natively (`cargo build`) and is NOT produced via `cross` — there is no
+# Linux-hosted Apple cross image; build it on a Mac.
+#
+# `TS_RS_EXPERIMENT` is forwarded into the container so any build-time test/run step that
+# hits the engine's experiment gate (`TS_RS_EXPERIMENT=this_is_unstable_software`) is
+# permitted. A plain `cross build` does not need it, but a `cross test` would.
+
+[build.env]
+passthrough = [
+    "TS_RS_EXPERIMENT",
+    "CARGO_TERM_COLOR",
+    "RUST_BACKTRACE",
+]

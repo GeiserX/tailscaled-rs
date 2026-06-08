@@ -7,3 +7,12 @@
 # (they contain absolute local paths and working notes). The distilled, public
 # version lives in docs/DESIGN.md.
 /docs/research/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+
+# oh-my-claudecode session state (local only)
+.omc/

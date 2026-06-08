@@ -2074,6 +2074,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "secrecy"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
+dependencies = [
+ "zeroize",
+]
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2347,20 +2356,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tailnetd"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "serde",
- "serde_json",
- "tailscale-rs",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "tailscale-rs"
 version = "0.6.5"
 source = "git+https://github.com/GeiserX/tailscale-rs?rev=afa970c04ad1a98e6dc88484294f360439a24725#afa970c04ad1a98e6dc88484294f360439a24725"
@@ -2379,6 +2374,23 @@ dependencies = [
  "ts_packet",
  "ts_runtime",
  "ts_tka",
+ "url",
+]
+
+[[package]]
+name = "tailscaled-rs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tailscale-rs",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
  "url",
 ]
 

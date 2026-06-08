@@ -2,9 +2,10 @@
 //!
 //! These are this crate's *own* serde types, deliberately decoupled from the engine's internal
 //! types so the IPC surface is stable independent of engine churn. The transport today is
-//! newline-delimited JSON over a Unix domain socket (see [`crate::server`]); the planned
-//! evolution is HTTP/1 over the socket with `SO_PEERCRED` authorization, matching Tailscale's
-//! `LocalAPI` shape (read for anyone, write for root/same-UID).
+//! newline-delimited JSON over a Unix domain socket (see [`crate::server`]). Peer-credential
+//! authorization is implemented (`SO_PEERCRED`, see [`crate::auth`]), matching Tailscale's
+//! `LocalAPI` policy: reads are allowed for anyone, writes only for root or the same UID as the
+//! daemon.
 
 use serde::{Deserialize, Serialize};
 
@@ -48,7 +49,10 @@ pub enum Response {
 /// A snapshot of daemon + netmap state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusReport {
-    /// The IPN state name (`NoState`, `NeedsLogin`, `Starting`, `Running`, `Stopped`).
+    /// The IPN state name. One of the seven [`crate::ipn::State`] variants (the authoritative
+    /// list is [`crate::ipn::State::as_str`]): `NoState`, `NeedsLogin`, `NeedsMachineAuth`,
+    /// `InUseOtherUser`, `Starting`, `Running`, `Stopped`. (`NeedsMachineAuth`/`InUseOtherUser`
+    /// exist for Go-`ipn.State` parity and are not currently reachable; see `ipn::State`.)
     pub state: String,
     /// The persisted `WantRunning` intent.
     pub want_running: bool,
@@ -94,7 +98,11 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&json).unwrap();
         match back {
-            Request::Up { authkey, hostname, control_url } => {
+            Request::Up {
+                authkey,
+                hostname,
+                control_url,
+            } => {
                 assert_eq!(authkey.as_deref(), Some("tskey-auth-xxx"));
                 assert_eq!(hostname.as_deref(), Some("node-a"));
                 assert!(control_url.is_none());
@@ -105,12 +113,17 @@ mod tests {
 
     #[test]
     fn request_down_wire_format() {
-        assert_eq!(serde_json::to_string(&Request::Down).unwrap(), r#"{"cmd":"down"}"#);
+        assert_eq!(
+            serde_json::to_string(&Request::Down).unwrap(),
+            r#"{"cmd":"down"}"#
+        );
     }
 
     #[test]
     fn response_error_is_tagged() {
-        let resp = Response::Error { message: "boom".to_string() };
+        let resp = Response::Error {
+            message: "boom".to_string(),
+        };
         let json = serde_json::to_string(&resp).unwrap();
         assert_eq!(json, r#"{"kind":"error","message":"boom"}"#);
     }
@@ -138,5 +151,41 @@ mod tests {
             }
             other => panic!("expected Status, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn request_up_all_none_round_trips() {
+        // The CLI sends `up` with every override absent (use the daemon's persisted prefs /
+        // engine defaults). The all-`None` shape must survive the JSON wire intact.
+        let req = Request::Up {
+            authkey: None,
+            control_url: None,
+            hostname: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: Request = serde_json::from_str(&json).unwrap();
+        match back {
+            Request::Up {
+                authkey,
+                control_url,
+                hostname,
+            } => {
+                assert!(authkey.is_none());
+                assert!(control_url.is_none());
+                assert!(hostname.is_none());
+            }
+            other => panic!("expected Up, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn secret_string_debug_is_redacted() {
+        // Auth keys flow through the daemon as `secrecy::SecretString` precisely so they never
+        // land in a `Debug` rendering or log line. Pin that redaction property here.
+        // NB: the sentinel deliberately avoids a real provider prefix (e.g. `tskey-auth-`) so
+        // secret scanners don't flag this redaction test as a leaked credential (it isn't one).
+        let sentinel = "SENSITIVE-VALUE-SHOULD-NOT-APPEAR";
+        let s = secrecy::SecretString::from(sentinel.to_string());
+        assert!(!format!("{s:?}").contains(sentinel));
     }
 }

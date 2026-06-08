@@ -15,9 +15,23 @@ Known limitations relevant to security:
 - **Tailnet Lock is not enforced** in the engine — a malicious or compromised control plane could
   inject peer node-keys.
 - **Key material at rest** (node/machine keys, pre-auth keys) is persisted by the engine without
-  at-rest encryption. Protect the state directory (`0600`, full-disk encryption) yourself.
-- The LocalAPI socket currently authorizes by filesystem permissions on the socket path; richer
-  `SO_PEERCRED`-based authorization is planned, not yet implemented.
+  at-rest encryption. The daemon creates its state directory and enforces `0700` on it itself (it
+  tightens the mode at startup if it finds the dir group/world-accessible), so the on-disk keys are
+  not exposed to other local users. It does **not**, however, mitigate a root compromise, swap, or
+  coredumps — use full-disk encryption and run the daemon with `UMask=0077` (the packaged units do)
+  for defence in depth.
+
+What the daemon **does** enforce on the LocalAPI socket:
+
+- **`SO_PEERCRED`-based authorization is implemented** (`src/auth.rs`): the daemon reads the
+  connecting peer's uid from the socket and authorizes per-command. **Reads** (`status`) succeed for
+  anyone who can reach the socket; **writes** (`up`/`down`, prefs mutations) are restricted to root
+  (uid 0) or the daemon's own uid, and an unidentifiable peer fails **closed** (read-only). This is
+  in addition to the `0700` state directory, which already keeps the socket out of other users'
+  reach in the default deployment.
+
+For the full picture — trust boundaries, what each control does and does not cover, and the residual
+risks above — see [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md).
 
 ## Reporting Security Issues
 

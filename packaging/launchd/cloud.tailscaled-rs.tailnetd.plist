@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  cloud.tailscaled-rs.tailnetd.plist — launchd LaunchDaemon for the tailscaled-rs daemon (macOS).
+
+  Runs `tailnetd` as an always-on system daemon (root, started at load / boot). Install to
+  /Library/LaunchDaemons and load with `launchctl bootstrap system <plist>` (see ../README.md).
+
+  WARNING: experimental, unaudited software — not for production. See the repository README.
+
+  The EnvironmentVariables dict sets the engine's required experiment opt-in (TS_RS_EXPERIMENT)
+  explicitly: loading this daemon IS the operator choosing to run experimental software. The
+  daemon deliberately does not set that var for itself. State lives under /usr/local/var/tailnetd
+  (the macOS-conventional location for local daemon state); the daemon enforces 0700 on it itself.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>cloud.tailscaled-rs.tailnetd</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/tailnetd</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- Required engine opt-in; without it tailnetd refuses to start. -->
+        <key>TS_RS_EXPERIMENT</key>
+        <string>this_is_unstable_software</string>
+        <!-- State dir (node keys + prefs). macOS-conventional /usr/local/var path. -->
+        <key>TAILNETD_STATE_DIR</key>
+        <string>/usr/local/var/tailnetd</string>
+    </dict>
+
+    <!-- Start at load / boot. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart on failure only: relaunch if it crashes or exits non-zero, but respect a clean
+         `tnet down` + stop (do not fight an intentional exit-0 shutdown). -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>Crashed</key>
+        <true/>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Logs under /var/log: root-writable and present on every macOS, unlike /usr/local/var/log
+         which is absent on Apple-Silicon Homebrew. Created by launchd; rotate via newsyslog if
+         desired. (State stays under /usr/local/var/tailnetd above — that is the daemon's
+         macOS SYSTEM_STATE_DIR; only the log paths move.) -->
+    <key>StandardOutPath</key>
+    <string>/var/log/tailnetd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/tailnetd.err.log</string>
+
+    <!-- Long-running background service (not interactive / adaptive). -->
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
