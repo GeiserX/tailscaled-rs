@@ -73,9 +73,9 @@ pub struct StatusReport {
     /// This node's display name, once known.
     pub self_name: Option<String>,
     /// The interactive-login authorization URL, set only when `state == "NeedsLogin"` because the
-    /// engine reported [`DeviceState::NeedsLogin`](https://docs.rs/) — i.e. an `up` with no usable
-    /// auth key needs a human to authorize the node in a browser. `None` in every other state. The
-    /// CLI prints this so `tnet up` (no `--authkey`) yields a clickable login link.
+    /// engine reported `DeviceState::NeedsLogin(url)` — i.e. an `up` with no usable auth key needs a
+    /// human to authorize the node in a browser. `None` in every other state. The CLI prints this so
+    /// `tnet up` (no `--authkey`) yields a clickable login link.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_url: Option<String>,
     /// Known peers in the netmap.

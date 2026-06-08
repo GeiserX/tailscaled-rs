@@ -202,7 +202,10 @@ async fn poll_for_auth_url(socket: &std::path::Path) -> Option<String> {
         }
         if !announced {
             announced = true;
-            println!("waiting for the control server to issue a login URL…");
+            // Softened wording: on a permanent registration failure the daemon currently maps to
+            // NeedsLogin-without-URL, so this poll can run its full window without a URL ever
+            // arriving. Don't promise a URL is coming; point the operator at `tnet status`.
+            println!("contacting the control server… (run `tnet status` for the latest state)");
         }
         tokio::time::sleep(AUTH_URL_POLL_INTERVAL).await;
     }

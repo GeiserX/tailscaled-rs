@@ -85,6 +85,13 @@ impl State {
 /// teardown latency so a wedged engine can't hang the daemon (or an orphaned, superseded `up`).
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Upper bound on the blocking netmap query inside [`Backend::status`]. The query is held under the
+/// backend lock, so this caps how long a `status` can head-of-line block `up`/`down` in the brief
+/// Running-but-pre-netmap window (or if a Running engine wedges). On elapse we report `Running`
+/// without addresses (the next poll fills them). Generous enough that a healthy converged node
+/// always answers well within it.
+const STATUS_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// An in-progress bring-up handed between [`Backend::begin_up`] (locked, fast) and
 /// [`Backend::finish_up`] (locked, fast), across the unlocked [`build_device`] handshake.
 ///
@@ -546,32 +553,36 @@ impl Backend {
     /// Produce a [`StatusReport`] reflecting the live engine + netmap.
     ///
     /// State comes from the engine's **cheap, non-blocking** [`device_state`](tailscale::Device::device_state)
-    /// (a `watch` read) — it is the authoritative connection state and knows about interactive-login,
+    /// (a `watch` borrow) — it is the authoritative connection state and knows about interactive-login,
     /// expiry, and hard failure. We only issue the **blocking** netmap query
     /// ([`status`](tailscale::Device::status), an actor round-trip) when the device is `Running`.
-    /// That is deliberate: while the node is still registering — especially in `NeedsLogin`, where the
-    /// engine's control runner is busy in its auth-retry loop — `dev.status().await` queues behind the
-    /// busy control actor and can block for many seconds, which would hang every `status` LocalAPI
-    /// call (and freeze the interactive-login `tnet up` poll). In non-`Running` states there is no
-    /// self-node or peer list to report anyway, so skipping the query loses nothing and keeps status
-    /// responsive in every state.
+    /// That is deliberate: while the node is still registering — especially in `NeedsLogin` — the
+    /// engine's control runner is still inside its `Actor::on_start` auth-retry loop and processes no
+    /// mailbox messages until registration succeeds, so `dev.status().await` would block until then,
+    /// hanging every `status` LocalAPI call (and freezing the interactive-login `tnet up` poll). In
+    /// non-`Running` states there is no self-node or peer list to report anyway, so skipping the query
+    /// loses nothing and keeps status responsive in every state.
+    ///
+    /// Even in `Running`, the netmap query is bounded by [`STATUS_QUERY_TIMEOUT`]: in the brief
+    /// window between the stream attaching (`Running` published) and the first netmap arriving, the
+    /// self-node read waits, and we must not hold the backend lock on it unboundedly (that would
+    /// head-of-line block `up`/`down`). On timeout we report `Running` with no addresses yet (the
+    /// next poll fills them) — the same shape as the error arm.
     pub async fn status(&self) -> StatusReport {
-        // Cheap, non-blocking: the engine's authoritative connection state + any interactive-login
-        // URL. The engine's `DeviceState::Running` already means "registered, netmap live" — so we
-        // pass `have_self_node = true` to let it map straight to `Running` (we do NOT do a blocking
-        // netmap query just to confirm a self address; the address fill-in below is best-effort).
-        let (state, auth_url) = match &self.device {
-            Some(dev) => state_from_device(dev.device_state(), true),
+        // Cheap, non-blocking watch borrow → authoritative connection state + any interactive-login
+        // URL. `DeviceState::Running` already means "registered, netmap live", so it maps straight to
+        // `Running`; the address fill-in below is best-effort on top of that.
+        let (state, auth_url) = match self.device.as_ref() {
+            Some(dev) => state_from_device(dev.device_state()),
             None => (self.derive_state(false), None),
         };
 
-        // Only query the (blocking) netmap when the device reports Running — that is the only state
-        // with a self-node/peers, and the only state where the control actor is idle enough to answer
-        // promptly. See the method doc for why we must not call it in NeedsLogin/Starting.
-        let (self_ipv4, self_name, peers) = if state == State::Running {
-            match &self.device {
-                Some(dev) => match dev.status().await {
-                    Ok(s) => {
+        // Query the (blocking) netmap only when Running — the only state with a self-node/peers.
+        // Bounded by a timeout so the backend lock is never held indefinitely (see method doc).
+        let (self_ipv4, self_name, peers) = match (state, self.device.as_ref()) {
+            (State::Running, Some(dev)) => {
+                match tokio::time::timeout(STATUS_QUERY_TIMEOUT, dev.status()).await {
+                    Ok(Ok(s)) => {
                         let (ip, name) = match s.self_node {
                             Some(n) => (Some(n.ipv4.to_string()), Some(n.display_name)),
                             None => (None, None),
@@ -587,17 +598,23 @@ impl Backend {
                             .collect();
                         (ip, name, peers)
                     }
-                    // A transient engine status error must not be silent: log it and report no
-                    // addresses/peers (the state still reads Running from device_state).
-                    Err(e) => {
+                    // Transient engine error: log and report no addresses/peers (state stays Running).
+                    Ok(Err(e)) => {
                         tracing::warn!(error = %e, "engine status query failed");
                         (None, None, Vec::new())
                     }
-                },
-                None => (None, None, Vec::new()),
+                    // Pre-netmap window (or a wedged Running engine): don't hold the lock waiting.
+                    // Report Running with no addresses yet; the next status poll fills them in.
+                    Err(_elapsed) => {
+                        tracing::debug!(
+                            "engine status query exceeded {STATUS_QUERY_TIMEOUT:?}; \
+                             reporting Running without addresses (netmap not yet converged)"
+                        );
+                        (None, None, Vec::new())
+                    }
+                }
             }
-        } else {
-            (None, None, Vec::new())
+            _ => (None, None, Vec::new()),
         };
 
         StatusReport {
@@ -709,20 +726,21 @@ fn derive_state_from(
 ///
 /// This is the source of truth when a device exists: the engine knows about interactive-login,
 /// key-expiry, and hard registration failure — distinctions netmap-presence alone cannot make.
-/// - `Connecting` → `Starting` (registering; `Running` only once the self-node/netmap has landed,
-///   refined by `have_self_node` so a connected-but-not-yet-converged node reads `Starting`).
-/// - `Running` → `Running`.
+/// - `Connecting` → `Starting` (registering; the netmap stream is not yet live).
+/// - `Running` → `Running`. The engine publishes `Running` only once "registered and the netmap
+///   stream is live" (per its `DeviceState` doc), so it already implies the node is up — we do not
+///   second-guess it with a separate self-node check.
 /// - `NeedsLogin(url)` → [`State::NeedsLogin`] **carrying the auth URL** — an `up` without a usable
 ///   auth key needs a human to authorize the node at that URL (the interactive-login flow).
 /// - `Expired` → [`State::NeedsLogin`] (the node key expired; re-auth required; the engine carries
 ///   no URL here, so the operator re-runs `tnet up`).
 /// - `Failed(_)` → [`State::NeedsLogin`] (permanent registration failure, e.g. a bad auth key; not
 ///   retried by the engine — surfaced as needs-login so the operator re-authenticates).
-fn state_from_device(ds: tailscale::DeviceState, have_self_node: bool) -> (State, Option<String>) {
+fn state_from_device(ds: tailscale::DeviceState) -> (State, Option<String>) {
     use tailscale::DeviceState;
     match ds {
-        DeviceState::Running if have_self_node => (State::Running, None),
-        DeviceState::Running | DeviceState::Connecting => (State::Starting, None),
+        DeviceState::Running => (State::Running, None),
+        DeviceState::Connecting => (State::Starting, None),
         DeviceState::NeedsLogin(url) => (State::NeedsLogin, Some(url.to_string())),
         DeviceState::Expired => (State::NeedsLogin, None),
         DeviceState::Failed(_) => (State::NeedsLogin, None),
@@ -861,23 +879,18 @@ mod tests {
     // expiry/failure→NeedsLogin collapse must not drift. Pure, so testable without a live engine.
 
     #[test]
-    fn device_running_with_self_node_is_running_no_url() {
-        let (st, url) = state_from_device(tailscale::DeviceState::Running, true);
+    fn device_running_is_running_no_url() {
+        // The engine publishes `Running` only once "registered and the netmap stream is live", so it
+        // maps straight to `Running` (no separate self-node check).
+        let (st, url) = state_from_device(tailscale::DeviceState::Running);
         assert_eq!(st, State::Running);
         assert!(url.is_none());
     }
 
     #[test]
-    fn device_running_without_self_node_is_starting() {
-        // Connected to control but the netmap/self-node hasn't landed yet → still converging.
-        let (st, url) = state_from_device(tailscale::DeviceState::Running, false);
-        assert_eq!(st, State::Starting);
-        assert!(url.is_none());
-    }
-
-    #[test]
     fn device_connecting_is_starting() {
-        let (st, url) = state_from_device(tailscale::DeviceState::Connecting, false);
+        // Registering, netmap stream not yet live → still converging.
+        let (st, url) = state_from_device(tailscale::DeviceState::Connecting);
         assert_eq!(st, State::Starting);
         assert!(url.is_none());
     }
@@ -887,7 +900,7 @@ mod tests {
         // The headline of interactive login: NeedsLogin(url) → State::NeedsLogin + the URL surfaced
         // verbatim so the CLI can print a clickable login link.
         let url: url::Url = "https://login.example.com/a/abc123".parse().unwrap();
-        let (st, out) = state_from_device(tailscale::DeviceState::NeedsLogin(url.clone()), false);
+        let (st, out) = state_from_device(tailscale::DeviceState::NeedsLogin(url.clone()));
         assert_eq!(st, State::NeedsLogin);
         assert_eq!(out.as_deref(), Some(url.as_str()));
     }
@@ -895,7 +908,7 @@ mod tests {
     #[test]
     fn device_expired_is_needs_login_no_url() {
         // Key expiry needs re-auth but the engine carries no URL here → NeedsLogin, no URL.
-        let (st, url) = state_from_device(tailscale::DeviceState::Expired, true);
+        let (st, url) = state_from_device(tailscale::DeviceState::Expired);
         assert_eq!(st, State::NeedsLogin);
         assert!(url.is_none());
     }
