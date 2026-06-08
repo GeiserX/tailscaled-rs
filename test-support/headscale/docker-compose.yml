@@ -8,11 +8,13 @@
 #
 # Usage (full loop in ../../docs/TESTING.md):
 #   docker compose -f test-support/headscale/docker-compose.yml up -d
-#   docker compose -f test-support/headscale/docker-compose.yml exec headscale \
-#       headscale users create test
-#   docker compose -f test-support/headscale/docker-compose.yml exec headscale \
-#       headscale preauthkeys create --user test --reusable --expiration 24h
-#   # then point the daemon at http://localhost:8080 with that key.
+#   docker compose -f test-support/headscale/docker-compose.yml exec headscale headscale users create test
+#   # 0.28.0's `preauthkeys --user` takes the numeric user ID, NOT the name, so resolve it first:
+#   UID=$(docker compose -f test-support/headscale/docker-compose.yml exec -T headscale \
+#       headscale users list -o json | python3 -c "import sys,json; print(next(u['id'] for u in json.load(sys.stdin) if u['name']=='test'))")
+#   docker compose -f test-support/headscale/docker-compose.yml exec -T headscale \
+#       headscale preauthkeys create --user "$UID" --reusable --expiration 24h
+#   # then point the daemon at http://localhost:8080 with that hskey-auth-… key.
 
 services:
   headscale:
@@ -27,6 +29,9 @@ services:
       # Publish the HTTP control port to the host so the daemon (and the gated integration test) can
       # reach it at http://localhost:8080, matching `server_url` in config.yaml.
       - "8080:8080"
+      # Embedded-DERP STUN endpoint (config.yaml derp.server.stun_listen_addr). Not needed just to
+      # boot or to register a node over localhost; published only for NAT-traversal experiments.
+      - "3478:3478/udp"
     volumes:
       # Config is read-only; the server only reads it.
       - ./config.yaml:/etc/headscale/config.yaml:ro

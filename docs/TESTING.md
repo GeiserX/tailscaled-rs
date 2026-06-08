@@ -68,7 +68,13 @@ exposure). The daemon already supports a custom control server; this tier points
 Everything lives in [`test-support/headscale/`](../test-support/headscale/): a pinned
 `docker-compose.yml` (image `headscale/headscale:0.28.0` — a real, recent **stable** tag, never
 `:latest`) and the smallest `config.yaml` that boots a single tailnet (sqlite, auto-generated noise
-key, `100.64.0.0/10` pool, DERP disabled, no update check).
+key, `100.64.0.0/10` pool, embedded DERP region — 0.28.0 refuses to boot with an empty DERPMap — no
+update check).
+
+> **Smoke-testing the config:** `headscale configtest` only validates that the file *parses*; it
+> does **not** catch the empty-DERPMap / DNS-override startup checks, which fail only at `serve`
+> time. So the real readiness test is bringing the container up and waiting for the healthcheck
+> (`headscale nodes list` succeeding over the unix socket), not `configtest`.
 
 ### The full local loop
 
@@ -81,9 +87,12 @@ docker compose -f test-support/headscale/docker-compose.yml up -d
 # 2. Create a user and a reusable pre-auth key (the daemon's only login path is auth-key).
 docker compose -f test-support/headscale/docker-compose.yml exec headscale \
     headscale users create test
+# In 0.28.0 `preauthkeys --user` takes the numeric user ID, not the name, so resolve it first:
+UID=$(docker compose -f test-support/headscale/docker-compose.yml exec -T headscale \
+    headscale users list -o json | python3 -c "import sys,json; print(next(u['id'] for u in json.load(sys.stdin) if u['name']=='test'))")
 docker compose -f test-support/headscale/docker-compose.yml exec -T headscale \
-    headscale preauthkeys create --user test --reusable --expiration 24h
-#   → prints a key like  <hs-preauth-key>
+    headscale preauthkeys create --user "$UID" --reusable --expiration 24h
+#   → prints a key like  <hskey-auth-…>
 
 # 3a. Drive it by hand with the real binaries:
 ./target/release/tailnetd &                    # daemon (Tier A build)

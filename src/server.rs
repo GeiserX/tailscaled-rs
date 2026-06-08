@@ -325,12 +325,22 @@ async fn dispatch(
             // Phase 2: NO lock held — the slow handshake. Concurrent `status` proceeds freely here.
             let built = ipn::build_device(&pending, authkey).await;
 
-            // Phase 3: brief lock — install iff still current, else discard the orphan.
-            let mut be = backend.lock().await;
-            match be.finish_up(pending, built).await {
-                Ok(()) => Response::Ok {
-                    message: "node brought up".to_string(),
-                },
+            // Phase 3: brief lock — install iff still current, returning any orphan to shut down.
+            // `finish_up` does NOT await the orphan's shutdown (that would re-block the lock for up
+            // to SHUTDOWN_TIMEOUT); it hands the orphan back so we tear it down AFTER dropping the
+            // lock, keeping concurrent `status`/`up`/`down` unblocked even on the supersede path.
+            let outcome = {
+                let mut be = backend.lock().await;
+                be.finish_up(pending, built)
+            };
+            match outcome {
+                Ok(orphan) => {
+                    // Lock released — settle the (rare) superseded device off-lock.
+                    ipn::shutdown_orphan(orphan).await;
+                    Response::Ok {
+                        message: "node brought up".to_string(),
+                    }
+                }
                 Err(e) => Response::Error {
                     message: format!("{e:#}"),
                 },

@@ -39,6 +39,15 @@ pub enum State {
     /// Process started, nothing configured yet.
     NoState,
     /// No valid login / not authenticated to control.
+    ///
+    /// Transient nuance from the concurrent bring-up split: between
+    /// [`begin_up`](Backend::begin_up) (which sets `want_running = true` but installs no device yet)
+    /// and [`finish_up`](Backend::finish_up), a concurrent `status` observes `(device = None,
+    /// want_running = true)` and reports `NeedsLogin` for the duration of the handshake — i.e. a
+    /// `status` polled *during* an `up` may briefly read `NeedsLogin` before `Running`. This is the
+    /// deliberate latency-vs-staleness tradeoff of not holding the lock across `Device::new` (a
+    /// poller is no longer *blocked* for the handshake; it sees this transient state instead). A
+    /// future refinement could surface a dedicated "bringing up" signal as `Starting`.
     NeedsLogin,
     /// Registered to control, but the machine is not yet authorized by a tailnet admin (Go's
     /// `ipn.NeedsMachineAuth`). See the `// LIMITATION:` note on [`Backend::derive_state`]: the
@@ -103,6 +112,17 @@ pub async fn build_device(
     tailscale::Device::new(&pending.config, authkey_string)
         .await
         .map_err(|e| anyhow!("engine start failed: {e:?}"))
+}
+
+/// Gracefully shut down an orphaned device returned by [`Backend::finish_up`] (a device built for a
+/// bring-up that was superseded before it could be installed). **Call this with NO backend lock
+/// held** — the shutdown awaits up to [`SHUTDOWN_TIMEOUT`], and doing it under the lock would
+/// reintroduce the head-of-line stall the begin/finish split removes. A no-op for `None`.
+pub async fn shutdown_orphan(orphan: Option<tailscale::Device>) {
+    if let Some(dev) = orphan {
+        // Best-effort, bounded; the engine's `Runtime::drop` also kills its actors if this times out.
+        let _ = dev.shutdown(Some(SHUTDOWN_TIMEOUT)).await;
+    }
 }
 
 /// The daemon backend: owns prefs, the key file, and the live engine handle.
@@ -217,19 +237,17 @@ impl Backend {
         }
     }
 
-    /// Bring the node up: set `WantRunning`, (re)build the engine from current prefs, and register.
-    ///
-    /// `authkey` is the pre-auth key for non-interactive registration (the MVP's only login path).
-    /// It is a [`secrecy::SecretString`] so it is zeroized on drop and never lands in a `Debug`
-    /// rendering or log line; it is never stored on the [`Backend`] — it flows through this method
-    /// and is exposed exactly once, at the [`tailscale::Device::new`] engine call below.
     /// Bring the node up in a single call (the auto-start / single-owner path).
     ///
-    /// This holds whatever lock the caller holds for the whole duration, including the slow
-    /// `Device::new` handshake. For the **concurrent LocalAPI server**, prefer the
-    /// [`begin_up`](Backend::begin_up) / [`finish_up`](Backend::finish_up) split, which performs the
-    /// handshake *without* the backend lock so a concurrent `status` is not head-of-line blocked.
-    /// `up` is kept for the daemon's boot-time auto-start, where there is no concurrency to protect.
+    /// Runs all three phases ([`begin_up`](Backend::begin_up) → [`build_device`] →
+    /// [`finish_up`](Backend::finish_up)) inline. Intended for callers that hold no shared lock — the
+    /// daemon's boot-time auto-start, where there is no concurrency to protect. The auth key
+    /// ([`secrecy::SecretString`], zeroized on drop, never stored on the [`Backend`]) flows through to
+    /// [`build_device`], which exposes it exactly once for the `Device::new` engine call.
+    ///
+    /// For the **concurrent LocalAPI server**, use the explicit `begin_up` / `build_device` /
+    /// `finish_up` phases so the slow handshake runs *without* the backend lock and a concurrent
+    /// `status` is not head-of-line blocked.
     pub async fn up(
         &mut self,
         authkey: Option<secrecy::SecretString>,
@@ -238,16 +256,24 @@ impl Backend {
     ) -> Result<()> {
         let pending = self.begin_up(hostname, control_url).await?;
         let built = build_device(&pending, authkey).await;
-        self.finish_up(pending, built).await
+        // Single-owner path: settle the (rare) orphan inline. No external lock is held here, so the
+        // off-lock requirement is trivially satisfied — but in practice nothing supersedes a
+        // synchronous `up`, so this is virtually always a no-op.
+        let orphan = self.finish_up(pending, built)?;
+        shutdown_orphan(orphan).await;
+        Ok(())
     }
 
     /// Phase 1 of the concurrent bring-up: mutate + persist prefs, build the engine `Config`, and
     /// bump the lifecycle [`generation`](Backend::generation). Returns a [`PendingUp`] describing
-    /// *this* attempt. Runs under the backend lock but does **no** network I/O, so it returns
-    /// quickly; the caller then performs the slow `Device::new` via [`build_device`] **without** the
-    /// lock, and re-acquires it for [`finish_up`].
+    /// *this* attempt. Does **no** network I/O — the caller then performs the slow `Device::new` via
+    /// [`build_device`] **without** the lock, and re-acquires it for [`finish_up`].
     ///
     /// Tears down any existing device first, so a reconfiguring `up` cleanly replaces the prior one.
+    /// Note: that teardown ([`stop_device`](Backend::stop_device)) awaits the prior engine's graceful
+    /// shutdown (bounded by [`SHUTDOWN_TIMEOUT`]), so on a *reconfigure* (a device was already live)
+    /// this phase is not strictly instantaneous under the lock — only the fresh-up case is. The
+    /// common, head-of-line-sensitive case (no prior device) returns immediately.
     pub async fn begin_up(
         &mut self,
         hostname: Option<String>,
@@ -282,34 +308,42 @@ impl Backend {
     /// Phase 3 of the concurrent bring-up: install the freshly-built device — but only if no later
     /// `up`/`down` superseded this attempt while the backend lock was released for the handshake.
     ///
-    /// `pending` is from [`begin_up`](Backend::begin_up); `device` is the [`build_device`] result. If
-    /// the engine failed, the error is returned (and, if this attempt is still current, intent stays
-    /// "up" with no device → `NeedsLogin`, so auto-start can retry). If a newer generation has landed,
-    /// the just-built device is **discarded** (gracefully shut down off-lock) rather than clobbering
-    /// newer intent.
-    pub async fn finish_up(
+    /// `pending` is from [`begin_up`](Backend::begin_up); `device` is the [`build_device`] result.
+    ///
+    /// Returns the **orphaned device the caller must shut down OFF-LOCK**, if any:
+    /// - If a newer generation landed (a later `up`/`down` superseded this attempt while the lock was
+    ///   released for the handshake), the just-built device is *not* installed — it is returned as
+    ///   `Ok(Some(orphan))` so the caller can `orphan.shutdown(..).await` **after dropping the backend
+    ///   lock**. We must NOT await the (up-to-`SHUTDOWN_TIMEOUT`) shutdown here, because `finish_up`
+    ///   runs under the lock and that would reintroduce the very head-of-line stall the begin/finish
+    ///   split exists to remove. A stale *build error* is simply dropped (nothing to shut down).
+    /// - If this attempt is still current and the engine succeeded, the device is installed and
+    ///   `Ok(None)` is returned. If the engine failed, the error is returned (intent stays "up" with no
+    ///   device → `NeedsLogin`, so auto-start can retry).
+    ///
+    /// Use [`finish_up_and_settle`](Backend::finish_up_and_settle) if you don't hold the lock yourself
+    /// and just want the orphan shut down for you.
+    #[must_use = "the returned orphan device must be shut down off-lock"]
+    pub fn finish_up(
         &mut self,
         pending: PendingUp,
         device: Result<tailscale::Device>,
-    ) -> Result<()> {
+    ) -> Result<Option<tailscale::Device>> {
         if pending.generation != self.generation {
-            // Superseded by a later up/down while we were handshaking. Drop the orphan device
-            // (consuming shutdown, bounded) and report success of *this* call's no-op install — the
-            // newer intent is authoritative. A build error on a stale attempt is irrelevant.
-            if let Ok(dev) = device {
-                let _ = dev.shutdown(Some(SHUTDOWN_TIMEOUT)).await;
-            }
+            // Superseded by a later up/down while we were handshaking. The newer intent is
+            // authoritative; hand any built device back to be torn down off-lock. A build error on a
+            // stale attempt is irrelevant (nothing to return).
             tracing::debug!(
                 stale_generation = pending.generation,
                 current_generation = self.generation,
                 "discarding superseded up() result"
             );
-            return Ok(());
+            return Ok(device.ok());
         }
         // `device` is already an `anyhow::Result` with engine context from `build_device`.
         let device = device?;
         self.device = Some(device);
-        Ok(())
+        Ok(None)
     }
 
     /// Translate current [`Prefs`] + the on-disk key file into a [`tailscale::Config`] for the
@@ -732,14 +766,19 @@ mod tests {
             "down must bump the generation past the in-flight up"
         );
 
-        // The stale finish_up returns Ok (its result is discarded) and installs NO device — the
-        // `down` intent wins. We pass an Err device so the stale-path needs no real engine.
-        be.finish_up(
-            pending,
-            Err(anyhow!("handshake result is irrelevant once superseded")),
-        )
-        .await
-        .expect("a superseded finish_up is a successful no-op");
+        // The stale finish_up returns Ok(None) (no orphan to settle, since the stale build was an
+        // Err) and installs NO device — the `down` intent wins. We pass an Err device so the
+        // stale-path needs no real engine.
+        let orphan = be
+            .finish_up(
+                pending,
+                Err(anyhow!("handshake result is irrelevant once superseded")),
+            )
+            .expect("a superseded finish_up is a successful no-op");
+        assert!(
+            orphan.is_none(),
+            "a stale build error yields no orphan device to shut down"
+        );
         assert!(
             be.device.is_none(),
             "a superseded up must not install a device over the newer down intent"
@@ -762,9 +801,7 @@ mod tests {
 
         let pending = be.begin_up(None, None).await.expect("begin_up");
         // No superseding call → pending.generation == be.generation. A build error must surface.
-        let result = be
-            .finish_up(pending, Err(anyhow!("simulated engine start failure")))
-            .await;
+        let result = be.finish_up(pending, Err(anyhow!("simulated engine start failure")));
         assert!(
             result.is_err(),
             "a current (non-superseded) finish_up must propagate the engine error"

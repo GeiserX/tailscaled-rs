@@ -19,11 +19,14 @@
 //! # 1. Start the self-hosted control server.
 //! docker compose -f test-support/headscale/docker-compose.yml up -d
 //!
-//! # 2. Mint a user + a reusable pre-auth key.
+//! # 2. Mint a user + a reusable pre-auth key. In 0.28.0 `preauthkeys --user` is the numeric user
+//! #    ID (not the name), so resolve it from `users list` first.
 //! docker compose -f test-support/headscale/docker-compose.yml exec headscale \
 //!     headscale users create test
+//! UID=$(docker compose -f test-support/headscale/docker-compose.yml exec -T headscale \
+//!     headscale users list -o json | python3 -c "import sys,json; print(next(u['id'] for u in json.load(sys.stdin) if u['name']=='test'))")
 //! KEY=$(docker compose -f test-support/headscale/docker-compose.yml exec -T headscale \
-//!     headscale preauthkeys create --user test --reusable --expiration 24h)
+//!     headscale preauthkeys create --user "$UID" --reusable --expiration 24h)
 //!
 //! # 3. Point the test at it and run the (otherwise-ignored) e2e.
 //! export TAILNETD_HS_URL=http://localhost:8080
@@ -65,14 +68,11 @@ async fn headscale_join_netmap_down() {
         _ => {
             eprintln!(
                 "SKIP headscale_join_netmap_down: set TAILNETD_HS_URL and TAILNETD_HS_AUTHKEY to \
-                 run this. Bring up the control server first:\n  \
-                 docker compose -f test-support/headscale/docker-compose.yml up -d\n  \
-                 docker compose -f test-support/headscale/docker-compose.yml exec headscale \
-                 headscale users create test\n  \
-                 docker compose -f test-support/headscale/docker-compose.yml exec -T headscale \
-                 headscale preauthkeys create --user test --reusable --expiration 24h\n\
-                 then export TAILNETD_HS_URL=http://localhost:8080 and TAILNETD_HS_AUTHKEY=<key>. \
-                 See docs/TESTING.md."
+                 run this. Bring up the control server with \
+                 `docker compose -f test-support/headscale/docker-compose.yml up -d`, then create a \
+                 user + reusable pre-auth key and export the two env vars. The exact commands \
+                 (headscale 0.28's `--user` takes a numeric id) are in docs/TESTING.md and \
+                 test-support/headscale/README.md."
             );
             return;
         }

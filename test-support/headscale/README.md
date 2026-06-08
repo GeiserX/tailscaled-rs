@@ -11,7 +11,8 @@ quick loop kept next to the compose stack.
 - [`docker-compose.yml`](./docker-compose.yml) — runs `headscale/headscale:0.28.0` (a real, recent
   **stable** tag — never `:latest`), publishing the HTTP control port on `localhost:8080`.
 - [`config.yaml`](./config.yaml) — the smallest config that boots a single tailnet: sqlite,
-  auto-generated noise key, `100.64.0.0/10` address pool, DERP disabled, no update check.
+  auto-generated noise key, `100.64.0.0/10` address pool, embedded DERP region (0.28.0 refuses to
+  boot with an empty DERPMap), no update check.
 
 ## The loop
 
@@ -24,9 +25,12 @@ docker compose -f test-support/headscale/docker-compose.yml up -d
 # 2. Create a user and a reusable pre-auth key (auth-key is the daemon's only login path).
 docker compose -f test-support/headscale/docker-compose.yml exec headscale \
     headscale users create test
+# In 0.28.0 `preauthkeys --user` is the numeric user ID, not the name, so resolve it first:
+UID=$(docker compose -f test-support/headscale/docker-compose.yml exec -T headscale \
+    headscale users list -o json | python3 -c "import sys,json; print(next(u['id'] for u in json.load(sys.stdin) if u['name']=='test'))")
 docker compose -f test-support/headscale/docker-compose.yml exec -T headscale \
-    headscale preauthkeys create --user test --reusable --expiration 24h
-#   → prints a pre-auth key
+    headscale preauthkeys create --user "$UID" --reusable --expiration 24h
+#   → prints a pre-auth key (hskey-auth-…)
 
 # 3. Point the daemon at it (either of these works):
 TS_CONTROL_URL=http://localhost:8080 ./target/release/tnet up --authkey <key> --hostname hs-smoke

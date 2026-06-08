@@ -31,13 +31,20 @@ prefixes:
   v6: fd7a:115c:a1e0::/48
   allocation: sequential
 
-# DERP disabled: the smallest config. The embedded DERP relay needs HTTPS (server_url must be
-# https) and STUN, none of which a local http control server has; direct/local connectivity is all
-# the join + netmap flow under test needs. No external DERP map is fetched either (urls empty), so
-# startup makes no outbound calls.
+# Embedded DERP enabled: 0.28.0 refuses to start with an empty DERPMap ("initial DERPMap is empty,
+# Headscale requires at least one entry"), so the smallest *bootable* config turns on the built-in
+# relay region. It works fine over plain http://localhost:8080 — no HTTPS is required for the join +
+# netmap flow under test. No external DERP map is fetched (urls/paths empty), so startup makes no
+# outbound calls. STUN listens on 3478/udp inside the container (publish it in docker-compose.yml if
+# you need NAT traversal; not required just to boot or to register a node).
 derp:
   server:
-    enabled: false
+    enabled: true
+    region_id: 999
+    region_code: headscale
+    region_name: Headscale Embedded DERP
+    stun_listen_addr: "0.0.0.0:3478"
+    private_key_path: /var/lib/headscale/derp_server_private.key
   urls: []
   paths: []
   auto_update_enabled: false
@@ -65,10 +72,14 @@ policy:
   mode: file
   path: ""
 
-# MagicDNS off and no nameservers: the daemon under test joins in userspace-networking mode and the
-# tests assert registration + a tailnet self address, not DNS. base_domain must still differ from
-# the server_url host, so it is left at the example default.
+# DNS off: the daemon under test joins in userspace-networking mode and the tests assert
+# registration + a tailnet self address, not DNS. `override_local_dns` MUST be false here — 0.28.0
+# defaults it to true, which then REQUIRES a non-empty `nameservers.global` ("dns.nameservers.global
+# must be set when dns.override_local_dns is true") and would refuse to boot. With it false (and
+# magic_dns off) an empty nameserver list is fine. base_domain must still differ from the server_url
+# host, so it is left at the example default.
 dns:
+  override_local_dns: false
   magic_dns: false
   base_domain: example.com
   nameservers:
