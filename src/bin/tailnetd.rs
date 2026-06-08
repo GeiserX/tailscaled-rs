@@ -303,7 +303,12 @@ async fn auto_start(backend: &mut Backend) {
         );
     }
 
-    if let Err(e) = backend.up(authkey, None, None).await {
+    // Auto-start uses persisted prefs as-is (no overrides) — TUN/hostname/control-url all come from
+    // the stored prefs the user set via `tnet up`, not from the boot path.
+    if let Err(e) = backend
+        .up(authkey, tailscaled_rs::ipn::UpOptions::default())
+        .await
+    {
         // Non-fatal: come up in a needs-login/stopped state and let the CLI drive `up`.
         tracing::warn!(error = %format!("{e:#}"), "auto-start failed; awaiting `tnet up`");
     }

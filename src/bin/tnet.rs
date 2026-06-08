@@ -50,6 +50,17 @@ enum Command {
         /// `up`; a malformed URL fails loudly rather than silently using the default.
         #[arg(long)]
         control_url: Option<String>,
+        /// Use a real kernel TUN interface (`TransportMode::Tun`) instead of the userspace netstack.
+        /// Requires a daemon built with the `tun` feature and run as root; the daemon fails loudly
+        /// otherwise. Omitting the flag leaves the persisted setting unchanged.
+        #[arg(long)]
+        tun: bool,
+        /// Desired TUN interface name (e.g. `tailscale0`); only meaningful with `--tun`.
+        #[arg(long, value_name = "NAME")]
+        tun_name: Option<String>,
+        /// TUN interface MTU (Tailscale's overlay MTU is 1280); only meaningful with `--tun`.
+        #[arg(long, value_name = "MTU")]
+        tun_mtu: Option<u16>,
     },
     /// Disconnect the node without logging out.
     Down,
@@ -68,6 +79,9 @@ async fn main() -> Result<()> {
             authkey_file,
             hostname,
             control_url,
+            tun,
+            tun_name,
+            tun_mtu,
         } => {
             // Resolve the secret through the precedence chain and hold it as a `SecretString`
             // (zeroized on drop, never `Debug`-printed). Expose it only here, at the moment we
@@ -77,6 +91,11 @@ async fn main() -> Result<()> {
                 authkey: authkey.map(|k| k.expose_secret().to_owned()),
                 control_url,
                 hostname,
+                // `--tun` present → Some(true) (enable); absent → None (leave the pref unchanged),
+                // so `tnet up` without the flag never silently disables a TUN node.
+                tun: if tun { Some(true) } else { None },
+                tun_name,
+                tun_mtu,
             }
         }
         Command::Down => Request::Down,

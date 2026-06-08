@@ -29,6 +29,20 @@ pub struct Prefs {
     pub ephemeral: bool,
     /// Accept (and route traffic to) subnet routes advertised by peers.
     pub accept_routes: bool,
+    /// Use a real kernel TUN interface for the node's data path instead of the userspace netstack.
+    ///
+    /// `false` (default) = the engine's in-process smoltcp netstack: unprivileged, app reaches the
+    /// tailnet via the LocalAPI/loopback. `true` = `TransportMode::Tun`, giving the host OS
+    /// networking stack direct tailnet access (closer to real `tailscaled`) — but it needs root /
+    /// `CAP_NET_ADMIN`, a TUN-capable platform, AND a daemon built with the `tun` cargo feature. If
+    /// `true` without that feature, the daemon fails loudly at `up` rather than silently falling back.
+    pub tun_enabled: bool,
+    /// Desired TUN interface name (e.g. `tailscale0`); `None` lets the OS pick (`utunN` on macOS).
+    /// Ignored unless [`tun_enabled`](Prefs::tun_enabled) is `true`.
+    pub tun_name: Option<String>,
+    /// TUN interface MTU; `None` uses the transport default. Tailscale's overlay MTU is 1280.
+    /// Ignored unless [`tun_enabled`](Prefs::tun_enabled) is `true`.
+    pub tun_mtu: Option<u16>,
 }
 
 impl Default for Prefs {
@@ -40,6 +54,9 @@ impl Default for Prefs {
             hostname: None,
             ephemeral: true,
             accept_routes: false,
+            tun_enabled: false,
+            tun_name: None,
+            tun_mtu: None,
         }
     }
 }

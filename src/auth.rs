@@ -157,6 +157,9 @@ mod tests {
             authkey: None,
             control_url: None,
             hostname: None,
+            tun: None,
+            tun_name: None,
+            tun_mtu: None,
         }
     }
 

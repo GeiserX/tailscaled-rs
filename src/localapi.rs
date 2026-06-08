@@ -23,6 +23,18 @@ pub enum Request {
         control_url: Option<String>,
         /// Override the requested hostname.
         hostname: Option<String>,
+        /// Use a real kernel TUN interface (`TransportMode::Tun`) instead of the userspace netstack.
+        /// `None` leaves the persisted pref unchanged; `Some(true/false)` sets it. Requires a daemon
+        /// built with the `tun` feature + root; the daemon fails loudly otherwise. `#[serde(default)]`
+        /// keeps the wire backward-compatible with clients that omit it.
+        #[serde(default)]
+        tun: Option<bool>,
+        /// Desired TUN interface name (only meaningful with `tun: Some(true)`).
+        #[serde(default)]
+        tun_name: Option<String>,
+        /// TUN interface MTU (only meaningful with `tun: Some(true)`).
+        #[serde(default)]
+        tun_mtu: Option<u16>,
     },
     /// Bring the node down (`WantRunning = false`) without logging out.
     Down,
@@ -94,6 +106,9 @@ mod tests {
             authkey: Some("tskey-auth-xxx".to_string()),
             control_url: None,
             hostname: Some("node-a".to_string()),
+            tun: Some(true),
+            tun_name: Some("tailscale0".to_string()),
+            tun_mtu: Some(1280),
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&json).unwrap();
@@ -102,10 +117,16 @@ mod tests {
                 authkey,
                 hostname,
                 control_url,
+                tun,
+                tun_name,
+                tun_mtu,
             } => {
                 assert_eq!(authkey.as_deref(), Some("tskey-auth-xxx"));
                 assert_eq!(hostname.as_deref(), Some("node-a"));
                 assert!(control_url.is_none());
+                assert_eq!(tun, Some(true));
+                assert_eq!(tun_name.as_deref(), Some("tailscale0"));
+                assert_eq!(tun_mtu, Some(1280));
             }
             other => panic!("expected Up, got {other:?}"),
         }
@@ -161,6 +182,9 @@ mod tests {
             authkey: None,
             control_url: None,
             hostname: None,
+            tun: None,
+            tun_name: None,
+            tun_mtu: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&json).unwrap();
@@ -169,10 +193,16 @@ mod tests {
                 authkey,
                 control_url,
                 hostname,
+                tun,
+                tun_name,
+                tun_mtu,
             } => {
                 assert!(authkey.is_none());
                 assert!(control_url.is_none());
                 assert!(hostname.is_none());
+                assert!(tun.is_none());
+                assert!(tun_name.is_none());
+                assert!(tun_mtu.is_none());
             }
             other => panic!("expected Up, got {other:?}"),
         }

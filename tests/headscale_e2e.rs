@@ -106,8 +106,11 @@ async fn headscale_join_netmap_down() {
     backend
         .up(
             Some(authkey),
-            Some("tailscaled-rs-hs-e2e".to_string()),
-            Some(hs_url.clone()),
+            tailscaled_rs::ipn::UpOptions {
+                hostname: Some("tailscaled-rs-hs-e2e".to_string()),
+                control_url: Some(hs_url.clone()),
+                ..Default::default()
+            },
         )
         .await
         .unwrap_or_else(|e| panic!("up() against headscale {hs_url} failed: {e:?}"));

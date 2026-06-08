@@ -125,6 +125,25 @@ pub async fn shutdown_orphan(orphan: Option<tailscale::Device>) {
     }
 }
 
+/// Optional overrides applied to the persisted [`Prefs`] when bringing the node up.
+///
+/// Every field is `None` = "leave the persisted pref as-is"; `Some(..)` sets it. This is how a
+/// `tnet up --hostname h --tun` request mutates only what the user named, preserving the rest of the
+/// stored intent. Built from a [`crate::localapi::Request::Up`] at the server boundary.
+#[derive(Debug, Default, Clone)]
+pub struct UpOptions {
+    /// Override the requested hostname.
+    pub hostname: Option<String>,
+    /// Override the control server URL.
+    pub control_url: Option<String>,
+    /// Enable/disable kernel-TUN mode (`None` leaves the pref unchanged).
+    pub tun: Option<bool>,
+    /// Desired TUN interface name (only applied when TUN is/becomes enabled).
+    pub tun_name: Option<String>,
+    /// TUN interface MTU (only applied when TUN is/becomes enabled).
+    pub tun_mtu: Option<u16>,
+}
+
 /// The daemon backend: owns prefs, the key file, and the live engine handle.
 pub struct Backend {
     prefs: Prefs,
@@ -251,10 +270,9 @@ impl Backend {
     pub async fn up(
         &mut self,
         authkey: Option<secrecy::SecretString>,
-        hostname: Option<String>,
-        control_url: Option<String>,
+        opts: UpOptions,
     ) -> Result<()> {
-        let pending = self.begin_up(hostname, control_url).await?;
+        let pending = self.begin_up(opts).await?;
         let built = build_device(&pending, authkey).await;
         // Single-owner path: settle the (rare) orphan inline. No external lock is held here, so the
         // off-lock requirement is trivially satisfied — but in practice nothing supersedes a
@@ -274,21 +292,28 @@ impl Backend {
     /// shutdown (bounded by [`SHUTDOWN_TIMEOUT`]), so on a *reconfigure* (a device was already live)
     /// this phase is not strictly instantaneous under the lock — only the fresh-up case is. The
     /// common, head-of-line-sensitive case (no prior device) returns immediately.
-    pub async fn begin_up(
-        &mut self,
-        hostname: Option<String>,
-        control_url: Option<String>,
-    ) -> Result<PendingUp> {
+    pub async fn begin_up(&mut self, opts: UpOptions) -> Result<PendingUp> {
         // Tear down any existing device first so `up` is idempotent / reconfiguring.
         self.stop_device().await;
 
-        if let Some(h) = hostname {
+        if let Some(h) = opts.hostname {
             self.prefs.hostname = Some(h);
         }
         // Capture an overridden control URL into prefs; it is parsed + applied to the engine config
         // in `build_config` below.
-        if control_url.is_some() {
-            self.prefs.control_url = control_url;
+        if opts.control_url.is_some() {
+            self.prefs.control_url = opts.control_url;
+        }
+        // TUN overrides: `Some` sets the persisted pref, `None` leaves it unchanged (so a plain
+        // `up` after a `tun`-enabled `up` keeps TUN). The name/mtu only matter when enabled.
+        if let Some(tun) = opts.tun {
+            self.prefs.tun_enabled = tun;
+        }
+        if opts.tun_name.is_some() {
+            self.prefs.tun_name = opts.tun_name;
+        }
+        if opts.tun_mtu.is_some() {
+            self.prefs.tun_mtu = opts.tun_mtu;
         }
         self.prefs.want_running = true;
         self.prefs.logged_out = false;
@@ -392,6 +417,53 @@ impl Backend {
                 }
             }
             config.control_server_url = url;
+        }
+        // TUN-mode data path. Default is the engine's userspace netstack (unprivileged); TUN hands
+        // packets to a real kernel interface, which needs (a) a daemon built with the `tun` cargo
+        // feature [`tailscale/tun`], (b) root / CAP_NET_ADMIN, and (c) the engine exposing a way to
+        // construct `Config.transport_mode = TransportMode::Tun(..)`. We preflight (a) and (b) here
+        // and FAIL LOUDLY — never silently downgrade to netstack, because the operator asked for
+        // OS-wide connectivity and a silent fallback would be a confusing, hard-to-notice
+        // half-working state.
+        if self.prefs.tun_enabled {
+            #[cfg(not(feature = "tun"))]
+            {
+                return Err(anyhow!(
+                    "TUN mode requested (tun_enabled) but this daemon was built without the `tun` \
+                     feature; rebuild with `cargo build --features tun` (and run as root) to use it"
+                ));
+            }
+            #[cfg(feature = "tun")]
+            {
+                // Privilege preflight: the engine's TUN transport errors `RootUserRequired` without
+                // root; surface that here with actionable context before the handshake starts.
+                #[cfg(unix)]
+                // SAFETY: geteuid() is infallible (no args, no preconditions).
+                if unsafe { libc::geteuid() } != 0 {
+                    return Err(anyhow!(
+                        "TUN mode requires root / CAP_NET_ADMIN to create the kernel TUN interface, \
+                         but the daemon is not running as root. Run tailnetd as root (the packaged \
+                         systemd/launchd units do) or use the default userspace-networking mode"
+                    ));
+                }
+                // ENGINE GAP (pinned rev afa970c): `tailscale::Config.transport_mode` is public but
+                // its type `ts_control::TransportMode` is NOT re-exported by the engine facade, and
+                // there is no `Config` setter/constructor for TUN — so a downstream crate cannot
+                // build `TransportMode::Tun(TunConfig { name, mtu })`. The daemon-side plumbing
+                // (prefs/wire/CLI/feature-gate/root-preflight, name=`tun_name`, mtu=`tun_mtu`) is all
+                // in place and the engine `tun` feature compiles; the one missing piece is an engine
+                // export. Fail loudly with the exact ask rather than pretend, until the engine adds
+                // e.g. `pub use ts_control::{TransportMode, TunConfig};` or a
+                // `Config::use_tun(name, mtu)` builder (tracked: engine bead). When it lands, replace
+                // this block with the actual `config.transport_mode = …` assignment.
+                let _ = (&self.prefs.tun_name, self.prefs.tun_mtu); // wired, pending the engine export
+                return Err(anyhow!(
+                    "TUN mode is not yet wirable: the pinned tailscale-rs engine (afa970c) does not \
+                     export `TransportMode`/`TunConfig` or a `Config` TUN setter, so the daemon \
+                     cannot select the kernel-TUN transport. Use the default userspace-networking \
+                     mode until the engine exposes a TUN constructor (then this is a one-line change)"
+                ));
+            }
         }
         Ok(config)
     }
@@ -750,7 +822,7 @@ mod tests {
 
         let gen0 = be.generation;
         // Phase 1 of an `up`: prep config + bump generation (no engine call).
-        let pending = be.begin_up(None, None).await.expect("begin_up");
+        let pending = be.begin_up(UpOptions::default()).await.expect("begin_up");
         assert_eq!(
             pending.generation,
             gen0 + 1,
@@ -799,7 +871,7 @@ mod tests {
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let mut be = backend_for(&dir);
 
-        let pending = be.begin_up(None, None).await.expect("begin_up");
+        let pending = be.begin_up(UpOptions::default()).await.expect("begin_up");
         // No superseding call → pending.generation == be.generation. A build error must surface.
         let result = be.finish_up(pending, Err(anyhow!("simulated engine start failure")));
         assert!(

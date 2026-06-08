@@ -302,16 +302,26 @@ async fn dispatch(
             authkey,
             control_url,
             hostname,
+            tun,
+            tun_name,
+            tun_mtu,
         } => {
             // Confine the plaintext authkey to the smallest scope: wrap it into a `SecretString`
             // right at the boundary and hand the engine path the secret. (The wire type stays
             // `String` because `SecretString` does not serialize.)
             let authkey = authkey.map(secrecy::SecretString::from);
+            let opts = ipn::UpOptions {
+                hostname,
+                control_url,
+                tun,
+                tun_name,
+                tun_mtu,
+            };
 
             // Phase 1: brief lock — prep + persist prefs, build Config, bump generation.
             let pending = {
                 let mut be = backend.lock().await;
-                be.begin_up(hostname, control_url).await
+                be.begin_up(opts).await
             };
             let pending = match pending {
                 Ok(p) => p,

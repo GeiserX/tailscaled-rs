@@ -51,5 +51,14 @@ libc = "0.2"
 # Pinned to the same 2.x the engine resolves.
 url = "2"
 
+[features]
+# TUN-mode data path (Phase 3). Off by default so the standard build stays lean and unprivileged
+# (the default is the engine's userspace smoltcp netstack). Enabling `tun` pulls in the engine's
+# kernel-TUN transport (`ts_transport_tun` via `tailscale/tun`); a daemon built with it can run in
+# `TransportMode::Tun`, which needs root / `CAP_NET_ADMIN` and a TUN-capable platform (Linux
+# `/dev/net/tun`, macOS `utun`). Build with `cargo build --features tun`.
+default = []
+tun = ["tailscale/tun"]
+
 [profile.release]
 strip = true
