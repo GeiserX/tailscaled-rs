@@ -77,6 +77,10 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let socket = cli.socket.unwrap_or_else(tailscaled_rs::socket_path);
 
+    // Track whether this is an `up` with no auth key — the interactive-login case, where after a
+    // successful bring-up we follow with a `status` to surface the control auth URL the operator
+    // must visit (it isn't known at `up`-time; it arrives once the engine reaches `NeedsLogin`).
+    let mut interactive_up = false;
     let request = match cli.command {
         Command::Up {
             authkey,
@@ -92,6 +96,7 @@ async fn main() -> Result<()> {
             // (zeroized on drop, never `Debug`-printed). Expose it only here, at the moment we
             // serialize the wire `Request` — the field on the wire stays a plain `Option<String>`.
             let authkey = resolve_authkey(authkey, authkey_file).await?;
+            interactive_up = authkey.is_none();
             Request::Up {
                 authkey: authkey.map(|k| k.expose_secret().to_owned()),
                 control_url,
@@ -125,6 +130,14 @@ async fn main() -> Result<()> {
                 s.self_name.as_deref().unwrap_or("(unknown)"),
                 s.self_ipv4.as_deref().unwrap_or("-")
             );
+            // Interactive login: when the node is waiting for a human to authorize it (an `up` with
+            // no usable auth key), the daemon surfaces the control auth URL. Make it prominent so the
+            // operator can click it; registration retries until they do.
+            if let Some(url) = s.auth_url.as_deref() {
+                println!();
+                println!("To authenticate this node, visit:");
+                println!("    {url}");
+            }
             println!("peers:        {}", s.peers.len());
             for p in s.peers {
                 println!(
@@ -135,13 +148,65 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        Response::Ok { message } => println!("ok: {message}"),
+        Response::Ok { message } => {
+            println!("ok: {message}");
+            // Interactive login: an authkey-less `up` succeeds at the daemon, but the node now needs
+            // a human to authorize it. The auth URL isn't known yet at `up`-time — it arrives once
+            // the engine reaches `NeedsLogin` — so poll `status` briefly to surface it.
+            if interactive_up && let Some(url) = poll_for_auth_url(&socket).await {
+                println!();
+                println!("To authenticate this node, visit:");
+                println!("    {url}");
+                println!();
+                println!(
+                    "(the node will finish connecting automatically once authorized; \
+                          run `tnet status` to check)"
+                );
+            }
+        }
         Response::Error { message } => {
             eprintln!("error: {message}");
             std::process::exit(1);
         }
     }
     Ok(())
+}
+
+/// Maximum time to wait, after an interactive `up`, for the control auth URL to appear. Measured
+/// against the real control plane, the engine takes ~10s to register, be told "needs auth", and
+/// propagate `DeviceState::NeedsLogin(url)`, so a too-short poll silently misses it; 20s gives
+/// comfortable margin while still bounding a `tnet up` that will never get a URL (e.g. offline).
+const AUTH_URL_POLL: std::time::Duration = std::time::Duration::from_secs(20);
+/// Interval between `status` polls while waiting for the auth URL.
+const AUTH_URL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// After an interactive (authkey-less) `up`, poll `status` for up to [`AUTH_URL_POLL`] to surface
+/// the control auth URL. The engine reaches `NeedsLogin(url)` ~10s after registration begins, so we
+/// wait a generous 20s; if the node authorizes instantly (pre-approved) or never needs login,
+/// returns `None` and the operator can always re-run `tnet status`.
+///
+/// Prints a one-time "waiting…" line on the first poll so an interactive `up` doesn't look frozen
+/// during the ~10s the engine needs.
+async fn poll_for_auth_url(socket: &std::path::Path) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + AUTH_URL_POLL;
+    let mut announced = false;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Response::Status(s)) = round_trip(socket, &Request::Status).await {
+            if s.auth_url.is_some() {
+                return s.auth_url;
+            }
+            // Already past NeedsLogin (authorized / running) — nothing to prompt.
+            if s.state == "Running" {
+                return None;
+            }
+        }
+        if !announced {
+            announced = true;
+            println!("waiting for the control server to issue a login URL…");
+        }
+        tokio::time::sleep(AUTH_URL_POLL_INTERVAL).await;
+    }
+    None
 }
 
 /// Resolve the pre-auth key from the available sources, in precedence order:

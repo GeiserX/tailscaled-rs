@@ -72,6 +72,12 @@ pub struct StatusReport {
     pub self_ipv4: Option<String>,
     /// This node's display name, once known.
     pub self_name: Option<String>,
+    /// The interactive-login authorization URL, set only when `state == "NeedsLogin"` because the
+    /// engine reported [`DeviceState::NeedsLogin`](https://docs.rs/) — i.e. an `up` with no usable
+    /// auth key needs a human to authorize the node in a browser. `None` in every other state. The
+    /// CLI prints this so `tnet up` (no `--authkey`) yields a clickable login link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_url: Option<String>,
     /// Known peers in the netmap.
     pub peers: Vec<PeerReport>,
 }
@@ -156,6 +162,7 @@ mod tests {
             want_running: true,
             self_ipv4: Some("100.70.22.12".to_string()),
             self_name: Some("node-a".to_string()),
+            auth_url: None,
             peers: vec![PeerReport {
                 name: "peer-b".to_string(),
                 ipv4: "100.64.0.2".to_string(),
@@ -169,9 +176,37 @@ mod tests {
                 assert_eq!(s.state, "Running");
                 assert_eq!(s.peers.len(), 1);
                 assert!(s.peers[0].is_exit_node);
+                assert!(s.auth_url.is_none());
             }
             other => panic!("expected Status, got {other:?}"),
         }
+        // `auth_url` is `skip_serializing_if = None`, so a no-login status carries no `auth_url` key.
+        assert!(
+            !json.contains("auth_url"),
+            "auth_url must be omitted when None"
+        );
+    }
+
+    #[test]
+    fn status_report_auth_url_round_trips() {
+        // Interactive login: when the daemon surfaces a NeedsLogin auth URL it must serialize and
+        // survive the round-trip so the CLI can print it.
+        let report = StatusReport {
+            state: "NeedsLogin".to_string(),
+            want_running: true,
+            self_ipv4: None,
+            self_name: None,
+            auth_url: Some("https://login.example.com/a/abc123".to_string()),
+            peers: vec![],
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("auth_url"));
+        let back: StatusReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.auth_url.as_deref(),
+            Some("https://login.example.com/a/abc123")
+        );
+        assert_eq!(back.state, "NeedsLogin");
     }
 
     #[test]
