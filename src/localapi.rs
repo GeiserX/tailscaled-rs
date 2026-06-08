@@ -182,7 +182,10 @@ mod tests {
     fn secret_string_debug_is_redacted() {
         // Auth keys flow through the daemon as `secrecy::SecretString` precisely so they never
         // land in a `Debug` rendering or log line. Pin that redaction property here.
-        let s = secrecy::SecretString::from("tskey-auth-SHOULD-NOT-APPEAR".to_string());
-        assert!(!format!("{s:?}").contains("tskey-auth-SHOULD-NOT-APPEAR"));
+        // NB: the sentinel deliberately avoids a real provider prefix (e.g. `tskey-auth-`) so
+        // secret scanners don't flag this redaction test as a leaked credential (it isn't one).
+        let sentinel = "SENSITIVE-VALUE-SHOULD-NOT-APPEAR";
+        let s = secrecy::SecretString::from(sentinel.to_string());
+        assert!(!format!("{s:?}").contains(sentinel));
     }
 }
