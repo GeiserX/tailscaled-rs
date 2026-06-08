@@ -69,7 +69,12 @@ enum Command {
     /// Disconnect the node without logging out.
     Down,
     /// Show daemon and netmap status.
-    Status,
+    Status {
+        /// Stream status continuously, re-printing on every state transition, until interrupted
+        /// (Ctrl-C). Like `tailscale status --watch`.
+        #[arg(long)]
+        watch: bool,
+    },
 }
 
 #[tokio::main]
@@ -114,7 +119,16 @@ async fn main() -> Result<()> {
             }
         }
         Command::Down => Request::Down,
-        Command::Status => Request::Status,
+        // `status --watch` is a long-lived stream, not a one-shot round-trip — handle it here and
+        // return. Plain `status` falls through to the one-shot path below.
+        Command::Status { watch } => {
+            if watch {
+                return watch_status(&socket)
+                    .await
+                    .with_context(|| format!("watching status at {}", socket.display()));
+            }
+            Request::Status
+        }
     };
 
     let response = round_trip(&socket, &request)
@@ -122,32 +136,7 @@ async fn main() -> Result<()> {
         .with_context(|| format!("talking to daemon at {}", socket.display()))?;
 
     match response {
-        Response::Status(s) => {
-            println!("state:        {}", s.state);
-            println!("want_running: {}", s.want_running);
-            println!(
-                "self:         {} {}",
-                s.self_name.as_deref().unwrap_or("(unknown)"),
-                s.self_ipv4.as_deref().unwrap_or("-")
-            );
-            // Interactive login: when the node is waiting for a human to authorize it (an `up` with
-            // no usable auth key), the daemon surfaces the control auth URL. Make it prominent so the
-            // operator can click it; registration retries until they do.
-            if let Some(url) = s.auth_url.as_deref() {
-                println!();
-                println!("To authenticate this node, visit:");
-                println!("    {url}");
-            }
-            println!("peers:        {}", s.peers.len());
-            for p in s.peers {
-                println!(
-                    "  - {:<28} {:<16}{}",
-                    p.name,
-                    p.ipv4,
-                    if p.is_exit_node { "  [exit]" } else { "" }
-                );
-            }
-        }
+        Response::Status(s) => print_status(&s),
         Response::Ok { message } => {
             println!("ok: {message}");
             // Interactive login: an authkey-less `up` succeeds at the daemon, but the node now needs
@@ -167,6 +156,83 @@ async fn main() -> Result<()> {
         Response::Error { message } => {
             eprintln!("error: {message}");
             std::process::exit(1);
+        }
+    }
+    Ok(())
+}
+
+/// Render a [`StatusReport`] to stdout (the shared one-shot + watch formatter).
+fn print_status(s: &tailscaled_rs::localapi::StatusReport) {
+    println!("state:        {}", s.state);
+    println!("want_running: {}", s.want_running);
+    println!(
+        "self:         {} {}",
+        s.self_name.as_deref().unwrap_or("(unknown)"),
+        s.self_ipv4.as_deref().unwrap_or("-")
+    );
+    // Interactive login: when the node is waiting for a human to authorize it, the daemon surfaces
+    // the control auth URL — make it prominent so the operator can click it.
+    if let Some(url) = s.auth_url.as_deref() {
+        println!();
+        println!("To authenticate this node, visit:");
+        println!("    {url}");
+    }
+    println!("peers:        {}", s.peers.len());
+    for p in &s.peers {
+        println!(
+            "  - {:<28} {:<16}{}",
+            p.name,
+            p.ipv4,
+            if p.is_exit_node { "  [exit]" } else { "" }
+        );
+    }
+}
+
+/// Stream status: send `Request::Watch` and print each [`StatusReport`] the daemon pushes (an
+/// initial snapshot, then one per state transition) until the connection ends or the user
+/// interrupts (Ctrl-C). The daemon closes the stream when the device is torn down. A `---` rule
+/// separates successive snapshots so transitions are visually distinct.
+async fn watch_status(socket: &std::path::Path) -> Result<()> {
+    let stream = UnixStream::connect(socket)
+        .await
+        .context("connect (is tailnetd running?)")?;
+    let (read_half, mut write_half) = stream.into_split();
+
+    let mut line = serde_json::to_vec(&Request::Watch)?;
+    line.push(b'\n');
+    write_half.write_all(&line).await?;
+    write_half.flush().await?;
+
+    let mut reader = BufReader::new(read_half);
+    let mut buf = String::new();
+    let mut first = true;
+    loop {
+        buf.clear();
+        let n = reader.read_line(&mut buf).await?;
+        if n == 0 {
+            // Daemon closed the stream (device torn down / shutdown).
+            break;
+        }
+        let trimmed = buf.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Response>(trimmed)
+            .with_context(|| format!("parsing daemon stream line: {trimmed:?}"))?
+        {
+            Response::Status(s) => {
+                if !first {
+                    println!("---");
+                }
+                first = false;
+                print_status(&s);
+            }
+            Response::Error { message } => {
+                eprintln!("error: {message}");
+                std::process::exit(1);
+            }
+            // The watch stream only carries Status frames; an Ok is unexpected but harmless.
+            Response::Ok { message } => println!("ok: {message}"),
         }
     }
     Ok(())

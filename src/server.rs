@@ -194,17 +194,130 @@ async fn handle_conn(
                 if text.trim().is_empty() {
                     continue;
                 }
-                let response = match serde_json::from_str::<Request>(text) {
-                    Ok(req) => dispatch(req, access, peer_uid, &backend).await,
-                    Err(e) => Response::Error {
-                        message: format!("bad request: {e}"),
-                    },
-                };
-                write_response(&mut write_half, &response).await?;
+                match serde_json::from_str::<Request>(text) {
+                    // `Watch` is terminal for this connection: it takes over the socket and streams
+                    // status lines until the client disconnects (or shutdown). It is read-only, so
+                    // it is gated exactly like `Status` — anyone who may read may watch.
+                    Ok(Request::Watch) => {
+                        stream_watch(&mut write_half, &backend).await?;
+                        break;
+                    }
+                    Ok(req) => {
+                        let response = dispatch(req, access, peer_uid, &backend).await;
+                        write_response(&mut write_half, &response).await?;
+                    }
+                    Err(e) => {
+                        let response = Response::Error {
+                            message: format!("bad request: {e}"),
+                        };
+                        write_response(&mut write_half, &response).await?;
+                    }
+                }
             }
         }
     }
     Ok(())
+}
+
+/// Stream `status` over a connection: emit an initial [`StatusReport`] line, then one more on each
+/// engine connection-state transition, surviving device replacement (`down`+`up`), until the client
+/// disconnects or the daemon shuts down. The analogue of `tailscale status --watch`.
+///
+/// ## Why it is a two-level loop (and not just `rx.changed()`)
+///
+/// The engine's `DeviceState` receiver is **per-device**: each `up` builds a fresh `Device` with a
+/// fresh receiver. A naive single-receiver loop goes deaf the moment a `down`+`up` replaces the
+/// device, and never starts at all if the watch began before the first `up`. So we also subscribe to
+/// the backend's **lifecycle** channel ([`Backend::watch_lifecycle`], bumped on every `up`/`down`)
+/// and re-derive the current device receiver on each lifecycle change. The outer loop owns one
+/// "device epoch"; the inner loop streams that epoch's transitions until the device goes away or a
+/// lifecycle change supersedes it.
+///
+/// ## The load-bearing rule: snapshot FIRST, then await
+///
+/// A freshly-acquired `watch` receiver's first `changed()` may fire immediately (the engine hands
+/// out a clone pinned at the initial version) — so we must **never rely on `changed()` to deliver
+/// the current value**. Each epoch emits a `status()` snapshot *before* awaiting any `changed()`,
+/// treating `changed()` purely as a wake source. This closes the missed-edge window on the first
+/// device and on every replacement.
+///
+/// ## Lock discipline
+///
+/// The backend guard is held only inside the brief blocks that subscribe / snapshot+grab-receiver /
+/// re-snapshot — **never** across a `changed()` await — so a watcher never head-of-line blocks a
+/// concurrent `up`/`down`/`status`. The snapshot and the receiver are grabbed in the *same* locked
+/// block so they describe the same device.
+async fn stream_watch(
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    backend: &Arc<Mutex<Backend>>,
+) -> Result<()> {
+    // Subscribe to lifecycle BEFORE the first snapshot so an up/down landing between the snapshot
+    // and the subscribe is never lost. `subscribe()` starts synced to the current generation.
+    let mut life = {
+        let be = backend.lock().await;
+        be.watch_lifecycle()
+    };
+
+    // Outer loop: one "device epoch" per iteration. Re-entered whenever the device is replaced
+    // (down+up) or torn down (down) — re-deriving the current receiver each time.
+    loop {
+        // BRIEF LOCK: snapshot status + grab the current device receiver together, so the emitted
+        // snapshot and the receiver we then watch describe the same device.
+        let (report, mut dev_rx) = {
+            let be = backend.lock().await;
+            (be.status().await, be.watch_state_receiver())
+        };
+        // Emit the snapshot FIRST (never rely on changed() to deliver the value). Write error =
+        // client hung up → done.
+        if write_response(write_half, &Response::Status(report))
+            .await
+            .is_err()
+        {
+            return Ok(());
+        }
+
+        match dev_rx.as_mut() {
+            // No device this epoch: nothing transitions. Wait only for the next lifecycle change,
+            // then re-derive at the top (an `up` may now have installed a device).
+            None => {
+                if life.changed().await.is_err() {
+                    return Ok(()); // lifecycle sender dropped (daemon gone)
+                }
+                continue;
+            }
+            // A device exists: stream its transitions, but also break out on a lifecycle change so a
+            // replacement device is re-derived by the outer loop.
+            Some(rx) => loop {
+                tokio::select! {
+                    res = rx.changed() => {
+                        if res.is_err() {
+                            // Device torn down (its watch::Sender dropped). Re-derive at the top:
+                            // either a new device exists, or we fall into the None arm and wait.
+                            break;
+                        }
+                        let report = {
+                            let be = backend.lock().await;
+                            be.status().await
+                        };
+                        if write_response(write_half, &Response::Status(report))
+                            .await
+                            .is_err()
+                        {
+                            return Ok(()); // client hung up
+                        }
+                    }
+                    res = life.changed() => {
+                        if res.is_err() {
+                            return Ok(()); // lifecycle sender dropped (daemon gone)
+                        }
+                        // A down+up replaced the device — supersede this epoch; the outer loop
+                        // re-derives the new receiver and snapshots it first.
+                        break;
+                    }
+                }
+            },
+        }
+    }
 }
 
 /// Serialize one [`Response`] as a single newline-terminated JSON line and flush it.
@@ -292,6 +405,13 @@ async fn dispatch(
     match req {
         // `status` and `down` are fast under the lock, so take it directly.
         Request::Status => {
+            let be = backend.lock().await;
+            Response::Status(be.status().await)
+        }
+        // `Watch` is intercepted in `handle_conn` (it takes over the connection to stream) and never
+        // reaches `dispatch`; this arm exists only for match exhaustiveness. Treat a stray `Watch`
+        // here as a single status snapshot rather than erroring.
+        Request::Watch => {
             let be = backend.lock().await;
             Response::Status(be.status().await)
         }

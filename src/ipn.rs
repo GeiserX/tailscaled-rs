@@ -208,6 +208,12 @@ pub struct Backend {
     /// holding the backend lock, so a second `up`/`down` may land first; the generation lets
     /// `finish_up` detect that its device is stale and discard it instead of clobbering newer intent.
     generation: u64,
+    /// Wakes status watchers on every lifecycle change (`up`/`down`), carrying the current
+    /// [`generation`](Backend::generation). A streaming `status` watcher selects over this *and* the
+    /// current device's state receiver, so when a `down`+`up` replaces the device it re-derives the
+    /// new receiver rather than going deaf. Bumped in lockstep with `generation` via
+    /// [`bump_generation`](Backend::bump_generation).
+    lifecycle_tx: tokio::sync::watch::Sender<u64>,
     /// Whether **this process** has attempted a boot-time auto-start (set by
     /// [`mark_boot_attempted_up`](Backend::mark_boot_attempted_up)). Process-local and deliberately
     /// NOT persisted: it lets the SIGHUP reload path distinguish "retry a bring-up we already
@@ -235,6 +241,7 @@ impl Backend {
         let prefs = Prefs::load(&prefs_path)
             .await
             .with_context(|| format!("loading prefs from {}", prefs_path.display()))?;
+        let (lifecycle_tx, _) = tokio::sync::watch::channel(0u64);
         Ok(Self {
             prefs,
             prefs_path,
@@ -243,7 +250,25 @@ impl Backend {
             ever_configured,
             generation: 0,
             boot_attempted_up: false,
+            lifecycle_tx,
         })
+    }
+
+    /// Bump the monotonic [`generation`](Backend::generation) **and** notify lifecycle watchers. The
+    /// single place `generation` advances, so the lifecycle signal can never drift from the counter.
+    /// A send to zero receivers is a no-op, so this is unconditional.
+    fn bump_generation(&mut self) {
+        self.generation += 1;
+        let _ = self.lifecycle_tx.send(self.generation);
+    }
+
+    /// A receiver that wakes on every lifecycle change (`up`/`down`), carrying the current
+    /// [`generation`](Backend::generation). A streaming `status` watcher uses this to re-derive the
+    /// current device's state receiver when the device is replaced, so a `down`+`up` is *followed*
+    /// rather than silently ending the stream. `subscribe()` (not a stored clone) so the caller
+    /// starts synced to the current generation and only wakes on genuinely later events.
+    pub fn watch_lifecycle(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.lifecycle_tx.subscribe()
     }
 
     /// Whether the persisted intent is to be running (used by the daemon to auto-start on launch).
@@ -392,8 +417,9 @@ impl Backend {
 
         let config = self.build_config().await?;
         // Bump + capture the generation: `finish_up` installs its device only if this is still the
-        // current generation (no later `up`/`down` superseded it while the lock was released).
-        self.generation += 1;
+        // current generation (no later `up`/`down` superseded it while the lock was released). The
+        // bump also notifies status watchers (so one watching a replaced device re-derives).
+        self.bump_generation();
         Ok(PendingUp {
             config,
             generation: self.generation,
@@ -542,12 +568,23 @@ impl Backend {
     pub async fn down(&mut self) -> Result<()> {
         self.stop_device().await;
         // Bump the generation so an `up` whose `Device::new` is still in flight (lock released) is
-        // recognized as stale by `finish_up` and its device discarded — `down` wins.
-        self.generation += 1;
+        // recognized as stale by `finish_up` and its device discarded — `down` wins. The bump also
+        // notifies status watchers that the device was torn down.
+        self.bump_generation();
         self.prefs.want_running = false;
         self.ever_configured = true;
         self.persist_prefs().await?;
         Ok(())
+    }
+
+    /// A receiver that wakes on every engine connection-state transition, for streaming `status`
+    /// (`tnet status --watch`). `None` when no device is up (nothing to watch yet — the caller
+    /// should fall back to a one-shot status). The receiver is a cheap `watch` handle; awaiting its
+    /// `changed()` does not hold the backend lock, so a watcher never blocks other LocalAPI calls.
+    pub fn watch_state_receiver(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<tailscale::DeviceState>> {
+        self.device.as_ref().map(|dev| dev.watch_state())
     }
 
     /// Produce a [`StatusReport`] reflecting the live engine + netmap.
@@ -871,6 +908,7 @@ mod tests {
             ever_configured: false,
             generation: 0,
             boot_attempted_up: false,
+            lifecycle_tx: tokio::sync::watch::channel(0u64).0,
         }
     }
 

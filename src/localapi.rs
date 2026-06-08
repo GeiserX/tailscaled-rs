@@ -15,6 +15,11 @@ use serde::{Deserialize, Serialize};
 pub enum Request {
     /// Report current state and netmap.
     Status,
+    /// Stream status: the daemon replies with an initial [`StatusReport`] line and then one more
+    /// every time the connection state transitions, until the client disconnects. This is a
+    /// long-lived connection (the analogue of `tailscale status --watch`), not a one-shot. Read-only
+    /// — gated identically to [`Status`](Request::Status).
+    Watch,
     /// Bring the node up (`WantRunning = true`), optionally (re)setting login/config fields.
     Up {
         /// Pre-auth key for non-interactive registration.
@@ -144,6 +149,19 @@ mod tests {
             serde_json::to_string(&Request::Down).unwrap(),
             r#"{"cmd":"down"}"#
         );
+    }
+
+    #[test]
+    fn request_watch_wire_format() {
+        // `watch` is the streaming-status command; assert its discriminant so daemon + CLI agree.
+        assert_eq!(
+            serde_json::to_string(&Request::Watch).unwrap(),
+            r#"{"cmd":"watch"}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<Request>(r#"{"cmd":"watch"}"#).unwrap(),
+            Request::Watch
+        ));
     }
 
     #[test]

@@ -122,7 +122,7 @@ fn current_euid() -> u32 {
 pub fn requires_write(request: &crate::localapi::Request) -> bool {
     use crate::localapi::Request;
     match request {
-        Request::Status => false,
+        Request::Status | Request::Watch => false,
         Request::Up { .. } | Request::Down => true,
     }
 }
