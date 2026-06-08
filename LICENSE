@@ -1,13 +1,7 @@
 BSD 3-Clause License
 
 Copyright (c) 2026 Sergio (GeiserX) & contributors.
-
-This project builds upon and is compatible with tailscale-rs
-(https://github.com/GeiserX/tailscale-rs), itself a fork of
-github.com/tailscale/tailscale-rs. Portions derived from or interoperating
-with that work retain the original copyright below, per BSD-3-Clause:
-
-  Copyright (c) 2026 Tailscale Inc & contributors.
+Copyright (c) 2026 Tailscale Inc & contributors.
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:

@@ -1,0 +1,24 @@
+tailscaled-rs
+Copyright (c) 2026 Sergio (GeiserX) & contributors.
+
+This product builds upon and is compatible with tailscale-rs
+(https://github.com/GeiserX/tailscale-rs), itself a fork of
+github.com/tailscale/tailscale-rs, which is licensed under the BSD 3-Clause
+License:
+
+    Copyright (c) 2026 Tailscale Inc & contributors.
+
+Portions of this project that are derived from, or that interoperate on the
+wire with, that work retain the above Tailscale Inc. copyright notice as
+required by clause 1 of the BSD 3-Clause License. The full license text
+(covering both copyright holders) is in the LICENSE file.
+
+------------------------------------------------------------------------------
+Trademarks
+------------------------------------------------------------------------------
+
+"Tailscale" is a trademark of Tailscale Inc. "WireGuard" is a registered
+trademark of Jason A. Donenfeld. This project is independent and unofficial:
+it is not affiliated with, endorsed by, or sponsored by Tailscale Inc. or the
+WireGuard project. Those names are used only nominatively, to describe the
+protocols this software is compatible with.
