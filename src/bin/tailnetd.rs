@@ -52,16 +52,68 @@ async fn main() -> Result<()> {
 
     let mut backend = tailscaled_rs::ipn::Backend::load(&state_dir).await?;
 
-    // Auto-start if the persisted intent was "up". The MVP relies on an auth key in the
-    // environment (`TS_AUTH_KEY`) for non-interactive re-registration on launch.
+    // Auto-start if the persisted intent was "up".
+    //
+    // A real daemon should *resume* from its persisted node key on reboot, the way `tailscaled`
+    // does: it re-`POST`s `/machine/register` with the node key it already holds and, for a node
+    // control still recognizes as authorized, comes straight back up with NO auth key. The engine
+    // does exactly this — `Device::new(cfg, None)` → `check_auth`/`register` send the persisted
+    // `node_key` and simply omit the `auth` field when there is no key (see
+    // `ts_control::tokio::register`). So an auth key must only be required when there is *no* usable
+    // persisted key (first run, or the key was expired/GC'd by control), not on every boot.
+    //
+    // Path selection:
+    //   - persisted key present AND no `TS_AUTH_KEY`  → RESUME (`up(None, ..)`).
+    //   - `TS_AUTH_KEY` set                           → FRESH AUTH (env key wins; covers first run
+    //                                                    and deliberate re-pair / key rotation).
+    //   - no persisted key AND no `TS_AUTH_KEY`       → nothing to resume from and no key to auth
+    //                                                    with; still attempt `up(None, ..)` so the
+    //                                                    engine yields the authoritative
+    //                                                    needs-login state instead of a guess.
     if backend.wants_running() {
-        tracing::info!("persisted intent is up; auto-starting");
         // Wrap the env auth key in `SecretString` so it is never logged or accidentally printed.
         // `auth_key_from_env()` returns `Some("")` for a set-but-empty var; treat that as absent
         // (matching the CLI's guard) so an empty `TS_AUTH_KEY` doesn't masquerade as a real key.
-        let authkey = tailscale::config::auth_key_from_env()
+        let env_authkey = tailscale::config::auth_key_from_env()
             .filter(|k| !k.is_empty())
             .map(secrecy::SecretString::from);
+        let has_key = backend.has_persisted_node_key().await;
+
+        // The auth key, if any, that we hand to the engine. We resume (no key) only when we hold a
+        // persisted node key and no env key was provided; otherwise the env key (possibly `None`)
+        // governs. An explicit `TS_AUTH_KEY` always wins, so an operator can force re-auth / rotate.
+        let (authkey, resuming) = if has_key && env_authkey.is_none() {
+            (None, true)
+        } else {
+            (env_authkey, false)
+        };
+
+        if resuming {
+            tracing::info!(
+                "persisted intent is up and a persisted node key exists; \
+                 resuming registration without an auth key"
+            );
+            // Honest caveat: an ephemeral node (the default — see `ipn::Backend::build_config`) is
+            // garbage-collected by control shortly after it disconnects, so its persisted key may
+            // already be invalid after a reboot and this resume can still fail at registration. A
+            // node meant to survive reboots and resume from its key alone needs `ephemeral = false`.
+            if backend.prefs_ephemeral() {
+                tracing::warn!(
+                    "node is configured ephemeral; control may have garbage-collected it after \
+                     its last disconnect, so resume-without-authkey may fail — a node that must \
+                     survive reboots needs ephemeral=false (or pass TS_AUTH_KEY to re-register)"
+                );
+            }
+        } else if authkey.is_some() {
+            tracing::info!("persisted intent is up; auto-starting with TS_AUTH_KEY (fresh auth)");
+        } else {
+            // No key to resume from and none provided — surface why so the operator can act.
+            tracing::warn!(
+                "persisted intent is up but there is no persisted node key and no TS_AUTH_KEY; \
+                 cannot resume or authenticate — set TS_AUTH_KEY (or run `tnet up`) to register"
+            );
+        }
+
         if let Err(e) = backend.up(authkey, None, None).await {
             // Non-fatal: come up in a needs-login/stopped state and let the CLI drive `up`.
             tracing::warn!(error = %format!("{e:#}"), "auto-start failed; awaiting `tnet up`");

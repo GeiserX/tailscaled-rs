@@ -117,6 +117,67 @@ impl Backend {
         self.prefs.want_running && !self.prefs.logged_out
     }
 
+    /// Whether this node is configured ephemeral (the default). Exposed so the daemon can warn, on a
+    /// resume-without-authkey auto-start, that an ephemeral node may have been garbage-collected by
+    /// control after its last disconnect — see the ephemeral note in [`Backend::build_config`].
+    pub fn prefs_ephemeral(&self) -> bool {
+        self.prefs.ephemeral
+    }
+
+    /// Whether a usable persisted node key exists on disk — the signal the daemon uses to decide
+    /// whether it can *resume* a prior registration without an auth key (see `tailnetd`'s auto-start).
+    ///
+    /// ## What "usable" means here (and what it deliberately does NOT mean)
+    ///
+    /// The key file (`node.key.json`) holds a [`tailscale::keys::PersistState`], whose `node_key` is a
+    /// fixed 32-byte `NodePrivateKey` — it is *never* structurally empty, and a fresh
+    /// `PersistState::default()` already contains a random one. So "non-empty node key" is **always**
+    /// true for any parseable key file and is not, on its own, a fresh-vs-registered discriminator.
+    /// The load-bearing signal is therefore the **file's existence**: the daemon only ever writes the
+    /// key file inside [`Backend::up`] → [`Backend::build_config`] → `tailscale::config::load_key_file`
+    /// (which creates it with fresh keys when absent). A node that has never been brought up has no
+    /// key file; once `up` has run at least once, the file exists carrying the very keys that were
+    /// sent to control. We read it **without side effects** (a plain parse — *not* `load_key_file`,
+    /// which would create-on-missing and so manufacture a key the first time it was merely *checked*),
+    /// and confirm it parses into a `PersistState` (so a node key is present). A missing or malformed
+    /// file reads as "no persisted key".
+    ///
+    /// ## This is necessary, not sufficient
+    ///
+    /// A `true` here means only that *we hold* a node key previously used with control — NOT that
+    /// control will still accept it. Control may have expired or garbage-collected the node (see the
+    /// ephemeral caveat in [`Backend::build_config`]); in that case resume-without-authkey still
+    /// fails at registration and the operator must supply a fresh `TS_AUTH_KEY`. The engine resolves
+    /// that authoritatively (re-`POST /machine/register` with this node key; `auth` omitted when no
+    /// authkey), so this method is a cheap *pre-flight* to pick the resume path, never a guarantee.
+    pub async fn has_persisted_node_key(&self) -> bool {
+        // Pure read: do NOT call `tailscale::config::load_key_file`, which create-on-missing-writes a
+        // fresh key file as a side effect — checking must never manufacture a key.
+        let Ok(bytes) = tokio::fs::read(&self.key_path).await else {
+            // Missing (fresh node) or unreadable → treat as "no persisted key".
+            return false;
+        };
+        // The on-disk shape is `{ "key_state": <PersistState> }`. Reuse the engine's own
+        // `PersistState` Deserialize (rather than hand-rolling the field set) so this can't drift if
+        // the engine's key-state layout changes. A parse failure (truncated/corrupt file) reads as
+        // "no persisted key" — the daemon then falls back to fresh auth rather than trusting garbage.
+        #[derive(serde::Deserialize)]
+        struct KeyFile {
+            key_state: tailscale::keys::PersistState,
+        }
+        // A parseable `PersistState` always carries a (32-byte, non-empty) node key, so a successful
+        // parse is exactly the "node key present" condition. We derive the public node key from it
+        // both to *use* the parsed state (not just discard it) and as a final structural sanity check
+        // that the private key material is well-formed.
+        match serde_json::from_slice::<KeyFile>(&bytes) {
+            Ok(kf) => {
+                let _node_public = kf.key_state.node_key.public_key();
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Bring the node up: set `WantRunning`, (re)build the engine from current prefs, and register.
     ///
     /// `authkey` is the pre-auth key for non-interactive registration (the MVP's only login path).
@@ -179,6 +240,14 @@ impl Backend {
             .await
             .map_err(|e| anyhow!("load key file {}: {e:?}", self.key_path.display()))?;
         config.requested_hostname = self.prefs.hostname.clone();
+        // Ephemeral defaults to `true` (see `Prefs::default` / `tailscale::Config.ephemeral`). We
+        // deliberately do NOT override it to `false` here just to make persisted-key resume more
+        // reliable: ephemeral vs. persistent is a node-identity *intent* decision that belongs to
+        // prefs/config, not a silent default the daemon flips behind the operator's back. The
+        // consequence — surfaced honestly by `tailnetd`'s auto-start logging — is that an ephemeral
+        // node is garbage-collected by control shortly after it disconnects, so after a reboot its
+        // persisted node key may already be gone from control and a resume-without-authkey will fail.
+        // A node that must survive reboots and resume from its key alone needs `ephemeral = false`.
         config.ephemeral = self.prefs.ephemeral;
         config.accept_routes = self.prefs.accept_routes;
         // Apply a custom control server when prefs carry one; this wins over `TS_CONTROL_URL` and
@@ -446,5 +515,91 @@ mod tests {
         assert_eq!(State::Starting.as_str(), "Starting");
         assert_eq!(State::Running.as_str(), "Running");
         assert_eq!(State::Stopped.as_str(), "Stopped");
+    }
+
+    // --- has_persisted_node_key ---------------------------------------------------------------
+    //
+    // The auto-start "resume vs. fresh-auth" decision hinges on this probe: it must read `false` for
+    // a never-configured node (no key file) and `true` once a key file with a node key exists, all
+    // with NO side effect (checking must never create a key file). These tests roll their own temp
+    // dir via `process::id()` + the test name (the prefs-module idiom) so no `tempfile` dep is added.
+
+    /// A throwaway `Backend` pointed at `dir`, used only to exercise `has_persisted_node_key`. We
+    /// construct it directly rather than via `Backend::load` so the test is independent of prefs I/O.
+    fn backend_for(dir: &std::path::Path) -> Backend {
+        Backend {
+            prefs: Prefs::default(),
+            prefs_path: dir.join("prefs.json"),
+            key_path: dir.join("node.key.json"),
+            device: None,
+            ever_configured: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn has_persisted_node_key_false_for_fresh_dir() {
+        // Fresh state dir, no key file → no persisted key (the daemon must take the fresh-auth path).
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-haskey-fresh-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let backend = backend_for(&dir);
+        assert!(
+            !backend.has_persisted_node_key().await,
+            "a node that has never been brought up has no key file → no persisted key"
+        );
+        // The probe must be side-effect-free: it must NOT have created the key file just by checking.
+        assert!(
+            !tokio::fs::try_exists(dir.join("node.key.json"))
+                .await
+                .unwrap(),
+            "has_persisted_node_key must not create the key file as a side effect"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn has_persisted_node_key_true_after_key_file_written() {
+        // A key file carrying a `PersistState` node key (exactly what `up` persists) → resume is
+        // possible. We serialize a real engine `PersistState` so the on-disk shape can never drift
+        // from what `has_persisted_node_key` parses.
+        let dir = std::env::temp_dir().join(format!("tailnetd-haskey-set-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        let key_path = dir.join("node.key.json");
+        // This is the side-effecting engine loader (it create-on-missing-writes the file) — used
+        // here precisely to MINT a realistic key file for the assertion, not as the probe itself.
+        tailscale::config::load_key_file(&key_path, Default::default())
+            .await
+            .expect("mint a key file");
+
+        let backend = backend_for(&dir);
+        assert!(
+            backend.has_persisted_node_key().await,
+            "a key file with a node key must read as a usable persisted key"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn has_persisted_node_key_false_for_malformed_file() {
+        // A truncated/corrupt key file must read as "no persisted key" so the daemon falls back to
+        // fresh auth rather than trusting garbage (mirrors prefs' malformed-file fail-safe).
+        let dir = std::env::temp_dir().join(format!("tailnetd-haskey-bad-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("node.key.json"), b"not json at all")
+            .await
+            .unwrap();
+
+        let backend = backend_for(&dir);
+        assert!(
+            !backend.has_persisted_node_key().await,
+            "a malformed key file must not be treated as a usable persisted key"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

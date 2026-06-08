@@ -1,0 +1,90 @@
+# Release: prebuilt binaries on GitHub Releases.
+#
+# On a pushed version tag (`v*`) — or a manual `workflow_dispatch` — this cross-compiles
+# the daemon (`tailnetd`) + CLI (`tnet`) for the Linux glibc targets the daemon supports
+# (x86_64 + aarch64, the two triples in Cross.toml), packages each pair as a `.tar.gz`
+# (with a `LICENSE`/`README.md` copy), emits a `.sha256` checksum, and attaches both to a
+# GitHub Release named after the tag.
+#
+# macOS is intentionally NOT built here: `cross` has no Linux-hosted Apple toolchain, so a
+# native-runner (`macos-latest`) release step is a separate future addition.
+#
+# NOTE: this is binaries-on-Releases only — there is deliberately no `crates.io publish`
+# step (publishing is tracked/blocked separately).
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+# Required to create the GitHub Release and upload its assets.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # The engine requires this acknowledgement even to link against it in some paths.
+  # The daemon's gate is a runtime check in main(), so `cargo build` does not strictly
+  # need it, but the engine build may reference it — mirror CI and set it. `cross`
+  # passthrough (Cross.toml) forwards it into the build container.
+  TS_RS_EXPERIMENT: this_is_unstable_software
+
+jobs:
+  release:
+    name: build · package · upload (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build release binaries
+        run: cross build --release --bins --target ${{ matrix.target }}
+
+      - name: Package archive + checksum
+        id: package
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          target="${{ matrix.target }}"
+          name="tailscaled-rs-${tag}-${target}"
+          bindir="target/${target}/release"
+
+          staging="$(mktemp -d)"
+          cp "${bindir}/tailnetd" "${bindir}/tnet" "${staging}/"
+          cp LICENSE README.md "${staging}/"
+
+          tar -C "${staging}" -czf "${name}.tar.gz" tailnetd tnet LICENSE README.md
+          sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
+
+          echo "archive=${name}.tar.gz" >> "${GITHUB_OUTPUT}"
+          echo "checksum=${name}.tar.gz.sha256" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.checksum }}
