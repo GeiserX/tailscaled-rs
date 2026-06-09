@@ -29,6 +29,18 @@ pub struct Prefs {
     pub ephemeral: bool,
     /// Accept (and route traffic to) subnet routes advertised by peers.
     pub accept_routes: bool,
+    /// Route this node's traffic out through a peer exit node, selected by IP or MagicDNS name
+    /// (the Go `--exit-node` flag). `None` = no exit node (direct egress). Stored as the raw
+    /// selector string and parsed into the engine's `ExitNodeSelector` in `build_config`.
+    pub exit_node: Option<String>,
+    /// Advertise this node as an exit node so peers can route their traffic out through it (Go
+    /// `--advertise-exit-node`). Egress still requires control/admin approval (autoApprovers or a
+    /// manual route approval) before peers may use it.
+    pub advertise_exit_node: bool,
+    /// Subnet routes (CIDRs) this node advertises to the tailnet so peers can reach the LANs behind
+    /// it (Go `--advertise-routes`). Stored as raw CIDR strings, parsed into `ipnet::IpNet` in
+    /// `build_config`. Empty = advertise nothing. v6 prefixes are dropped by the engine (v4-only).
+    pub advertise_routes: Vec<String>,
     /// Use a real kernel TUN interface for the node's data path instead of the userspace netstack.
     ///
     /// `false` (default) = the engine's in-process smoltcp netstack: unprivileged, app reaches the
@@ -54,6 +66,9 @@ impl Default for Prefs {
             hostname: None,
             ephemeral: true,
             accept_routes: false,
+            exit_node: None,
+            advertise_exit_node: false,
+            advertise_routes: Vec::new(),
             tun_enabled: false,
             tun_name: None,
             tun_mtu: None,

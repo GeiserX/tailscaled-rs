@@ -160,6 +160,9 @@ mod tests {
             tun: None,
             tun_name: None,
             tun_mtu: None,
+            exit_node: None,
+            advertise_exit_node: None,
+            advertise_routes: None,
         }
     }
 

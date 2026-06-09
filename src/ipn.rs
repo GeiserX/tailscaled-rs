@@ -190,6 +190,17 @@ pub struct UpOptions {
     pub tun_name: Option<String>,
     /// TUN interface MTU (only applied when TUN is/becomes enabled).
     pub tun_mtu: Option<u16>,
+    /// Exit-node selector override. The OUTER `Option` is the "leave pref unchanged" sentinel
+    /// (`None` = don't touch `prefs.exit_node`); the INNER `Option<String>` is the value to store
+    /// (`Some(None)` clears it = stop using an exit node, `Some(Some(sel))` sets it). This double
+    /// `Option` is what lets `tnet up --exit-node X` and `tnet up --exit-node=` (clear) and a plain
+    /// `tnet up` (unchanged) all be distinct on the wire.
+    pub exit_node: Option<Option<String>>,
+    /// Advertise-exit-node override (`None` leaves the pref unchanged; `Some(b)` sets it).
+    pub advertise_exit_node: Option<bool>,
+    /// Advertise-routes override. `None` leaves the pref unchanged; `Some(vec)` replaces the set
+    /// (`Some(vec![])` clears it). A `Vec` alone could not express "unchanged", hence the `Option`.
+    pub advertise_routes: Option<Vec<String>>,
 }
 
 /// The daemon backend: owns prefs, the key file, and the live engine handle.
@@ -410,6 +421,24 @@ impl Backend {
         if opts.tun_mtu.is_some() {
             self.prefs.tun_mtu = opts.tun_mtu;
         }
+        // Exit-node + route-advertising overrides. Each uses the same "unchanged unless named"
+        // sentinel as the rest of `UpOptions`, but `exit_node` is a *double* `Option`: the OUTER
+        // `Option` is the unchanged sentinel (`None` = leave `prefs.exit_node` as-is), and the
+        // INNER `Option<String>` it carries is the value to store — so binding `en` (itself an
+        // `Option<String>`) and assigning it through both SETS (`Some(Some(sel))`) and CLEARS
+        // (`Some(None)` = stop using an exit node) in one move. `advertise_exit_node` /
+        // `advertise_routes` are plain `Some` = set / `None` = unchanged (a `Some(vec![])` clears
+        // the advertised set). These are persisted as raw selector/CIDR strings here and parsed
+        // into the engine's typed `ExitNodeSelector` / `ipnet::IpNet` in `build_config`.
+        if let Some(en) = opts.exit_node {
+            self.prefs.exit_node = en;
+        }
+        if let Some(ae) = opts.advertise_exit_node {
+            self.prefs.advertise_exit_node = ae;
+        }
+        if let Some(ar) = opts.advertise_routes {
+            self.prefs.advertise_routes = ar;
+        }
         self.prefs.want_running = true;
         self.prefs.logged_out = false;
         self.ever_configured = true;
@@ -498,6 +527,33 @@ impl Backend {
         // A node that must survive reboots and resume from its key alone needs `ephemeral = false`.
         config.ephemeral = self.prefs.ephemeral;
         config.accept_routes = self.prefs.accept_routes;
+        // Exit node: prefs store the raw selector string; parse it into the engine's
+        // `ExitNodeSelector`. `FromStr` is infallible (a bare IP → `Ip`, anything else → `Name`),
+        // so the parse cannot fail — `Err` is `core::convert::Infallible` and `unwrap` here is
+        // unreachable, not a fallible-result-swallow. `None` leaves `config.exit_node` at its
+        // default (no exit node = direct egress).
+        if let Some(s) = &self.prefs.exit_node {
+            let sel: tailscale::ExitNodeSelector = s.parse().unwrap();
+            config.exit_node = Some(sel);
+        }
+        config.advertise_exit_node = self.prefs.advertise_exit_node;
+        // Advertised subnet routes: prefs store raw CIDR strings; parse each into `ipnet::IpNet`.
+        // A malformed CIDR FAILS LOUDLY (mirroring the `control_url` parse above) rather than being
+        // silently dropped — naming the bad value — because an operator who asked to advertise a
+        // route and instead got it silently discarded would have a confusing, hard-to-notice gap.
+        // (The engine itself is v4-only: it drops any IPv6 prefix internally after this point, so a
+        // v6 CIDR is *accepted and parsed* here, then dropped by the engine with no error — we do
+        // NOT pre-filter v6, matching the engine's "accept-then-drop" contract.)
+        let advertise_routes = self
+            .prefs
+            .advertise_routes
+            .iter()
+            .map(|s| {
+                s.parse::<ipnet::IpNet>()
+                    .with_context(|| format!("invalid advertise route {s:?}"))
+            })
+            .collect::<Result<Vec<ipnet::IpNet>>>()?;
+        config.advertise_routes = advertise_routes;
         // Apply a custom control server when prefs carry one; this wins over `TS_CONTROL_URL` and
         // the engine default. A malformed URL fails loudly rather than silently falling back —
         // pointing at the wrong control plane must never be silent. Only `http`/`https` are accepted
@@ -1370,6 +1426,193 @@ mod tests {
         assert!(be.device.is_none(), "no device installed on engine failure");
         // want_running stayed true (begin_up set it) but no device → NeedsLogin, the retry state.
         assert_eq!(be.derive_state(false), State::NeedsLogin);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    // --- exit-node / advertise-routes config wiring (tsd) ----------------------------------------
+    //
+    // `build_config` parses the raw selector/CIDR strings prefs persist into the engine's typed
+    // `ExitNodeSelector` / `ipnet::IpNet`. These tests pin the daemon's assumptions about the
+    // engine API (so a facade bump that changed the `FromStr`/parse contract would trip here) and
+    // the fail-loud-on-bad-CIDR behavior — all pure/offline, no live engine or network.
+
+    #[test]
+    fn exit_node_selector_parses_ip_vs_name() {
+        // Confirms the daemon's assumption that the engine's `ExitNodeSelector: FromStr` is
+        // infallible and discriminates a bare IP (→ `Ip`) from anything else (→ `Name`) — exactly
+        // what `build_config`'s `s.parse().unwrap()` relies on. The `Err` is `Infallible`, so
+        // `.unwrap()` is total here, not a swallowed fallible parse.
+        let ip: tailscale::ExitNodeSelector = "100.64.0.9".parse().unwrap();
+        assert!(
+            matches!(ip, tailscale::ExitNodeSelector::Ip(_)),
+            "a bare IP must parse to the Ip variant, got {ip:?}"
+        );
+        let name: tailscale::ExitNodeSelector = "mynode".parse().unwrap();
+        assert!(
+            matches!(name, tailscale::ExitNodeSelector::Name(_)),
+            "a non-IP selector must parse to the Name variant, got {name:?}"
+        );
+    }
+
+    #[test]
+    fn advertise_route_cidr_parse_ok_and_fails_loud() {
+        // Pins the fail-loud contract `build_config` depends on: a valid CIDR parses to
+        // `ipnet::IpNet`, and a malformed one is an `Err` (which `build_config` turns into a
+        // loud `anyhow` error naming the value, never a silent drop).
+        assert!(
+            "192.168.1.0/24".parse::<ipnet::IpNet>().is_ok(),
+            "a valid CIDR must parse"
+        );
+        assert!(
+            "nope".parse::<ipnet::IpNet>().is_err(),
+            "a malformed CIDR must be an Err so build_config can fail loudly"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_config_maps_exit_node_and_advertise_prefs() {
+        // End-to-end (but offline) round-trip: prefs → `build_config` → engine `Config`. Exercises
+        // the exit-node selector parse, the `advertise_exit_node` passthrough, and the
+        // CIDR→`IpNet` collection in one place. `build_config` touches only the key file (created
+        // on demand by the engine's `load_key_file`); it stands up NO engine and does NO network.
+        let dir = std::env::temp_dir().join(format!("tailnetd-bc-ok-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+        be.prefs.exit_node = Some("100.64.0.9".to_string());
+        be.prefs.advertise_exit_node = true;
+        be.prefs.advertise_routes = vec!["192.168.1.0/24".to_string(), "10.0.0.0/8".to_string()];
+
+        let cfg = be.build_config().await.expect("build_config");
+        assert!(
+            matches!(cfg.exit_node, Some(tailscale::ExitNodeSelector::Ip(_))),
+            "a bare-IP exit_node pref must map to Config.exit_node = Some(Ip(..))"
+        );
+        assert!(
+            cfg.advertise_exit_node,
+            "advertise_exit_node pref must flow straight into Config"
+        );
+        assert_eq!(
+            cfg.advertise_routes,
+            vec![
+                "192.168.1.0/24".parse::<ipnet::IpNet>().unwrap(),
+                "10.0.0.0/8".parse::<ipnet::IpNet>().unwrap(),
+            ],
+            "every advertised CIDR must parse into Config.advertise_routes in order"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn build_config_no_exit_node_leaves_config_default() {
+        // The unchanged/clear path: a `None` exit_node pref must leave `Config.exit_node` at its
+        // default (`None` = direct egress), and an empty advertise set yields an empty Vec.
+        let dir = std::env::temp_dir().join(format!("tailnetd-bc-none-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let be = backend_for(&dir); // Prefs::default → exit_node None, advertise_routes empty.
+
+        let cfg = be.build_config().await.expect("build_config");
+        assert!(
+            cfg.exit_node.is_none(),
+            "no exit_node pref must leave Config.exit_node = None (direct egress)"
+        );
+        assert!(
+            !cfg.advertise_exit_node,
+            "default prefs do not advertise this node as an exit node"
+        );
+        assert!(
+            cfg.advertise_routes.is_empty(),
+            "no advertised routes → empty Config.advertise_routes"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn build_config_rejects_malformed_advertise_route() {
+        // A bad CIDR must FAIL LOUDLY (not be silently dropped), with the offending value named in
+        // the error — pinning the fail-loud contract end-to-end through `build_config`.
+        let dir = std::env::temp_dir().join(format!("tailnetd-bc-bad-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+        be.prefs.advertise_routes = vec!["192.168.1.0/24".to_string(), "not-a-cidr".to_string()];
+
+        // `tailscale::Config` is not `Debug`, so `expect_err` (which would format the `Ok` value)
+        // won't compile — match on the result and panic on the unexpected-`Ok` arm by hand.
+        let err = match be.build_config().await {
+            Ok(_) => panic!("a malformed advertise route must make build_config fail"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not-a-cidr"),
+            "the error must name the offending CIDR value, got {msg:?}"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn begin_up_applies_exit_node_and_advertise_overrides() {
+        // The `UpOptions` sentinel semantics, end-to-end through `begin_up`: a `Some(Some(sel))`
+        // sets exit_node, a `Some(None)` clears it, and the advertise overrides set/clear. Driven
+        // without an engine (begin_up only mutates + persists prefs and builds Config).
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-bu-overrides-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+
+        // SET via overrides.
+        let _ = be
+            .begin_up(UpOptions {
+                exit_node: Some(Some("exit-1".to_string())),
+                advertise_exit_node: Some(true),
+                advertise_routes: Some(vec!["10.0.0.0/8".to_string()]),
+                ..UpOptions::default()
+            })
+            .await
+            .expect("begin_up set");
+        assert_eq!(be.prefs.exit_node.as_deref(), Some("exit-1"));
+        assert!(be.prefs.advertise_exit_node);
+        assert_eq!(be.prefs.advertise_routes, vec!["10.0.0.0/8".to_string()]);
+
+        // A plain follow-up `up` (all None) must leave the prefs UNCHANGED.
+        let _ = be
+            .begin_up(UpOptions::default())
+            .await
+            .expect("begin_up unchanged");
+        assert_eq!(
+            be.prefs.exit_node.as_deref(),
+            Some("exit-1"),
+            "an unchanged (None) override must preserve the stored exit_node"
+        );
+        assert!(
+            be.prefs.advertise_exit_node,
+            "unchanged override preserves it"
+        );
+        assert_eq!(be.prefs.advertise_routes, vec!["10.0.0.0/8".to_string()]);
+
+        // CLEAR exit_node via `Some(None)`, clear the advertised set via `Some(vec![])`.
+        let _ = be
+            .begin_up(UpOptions {
+                exit_node: Some(None),
+                advertise_exit_node: Some(false),
+                advertise_routes: Some(vec![]),
+                ..UpOptions::default()
+            })
+            .await
+            .expect("begin_up clear");
+        assert!(
+            be.prefs.exit_node.is_none(),
+            "Some(None) must clear the exit_node pref"
+        );
+        assert!(!be.prefs.advertise_exit_node);
+        assert!(be.prefs.advertise_routes.is_empty());
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

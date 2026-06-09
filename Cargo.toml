@@ -53,6 +53,14 @@ libc = "0.2"
 # Parse a control-server URL string (from prefs / CLI) into the engine's `url::Url` Config field.
 # Pinned to the same 2.x the engine resolves.
 url = "2"
+# Parse `--advertise-routes` CIDR strings into `ipnet::IpNet` for the engine's `advertise_routes`
+# Config field. Pinned to the same 2.x the engine resolves (so the IpNet types are identical).
+ipnet = "2.12"
+# `double_option` for the `exit_node: Option<Option<String>>` wire field: lets serde distinguish an
+# ABSENT key (→ None = "leave the pref unchanged") from a present `null` (→ Some(None) = "clear the
+# exit node"). Without it, `#[serde(default)]` collapses both to None and the clear command becomes a
+# silent no-op. Already in the tree transitively via the engine (3.x).
+serde_with = "3"
 # Enumerate existing network interfaces to pick a free `utunN` for macOS TUN mode (the engine's
 # default name `tailscale0` is Linux-only and macOS's tun-rs needs an explicit free utun index).
 # Already in the dependency tree transitively via the engine; only used on macOS.

@@ -40,6 +40,28 @@ pub enum Request {
         /// TUN interface MTU (only meaningful with `tun: Some(true)`).
         #[serde(default)]
         tun_mtu: Option<u16>,
+        /// Exit-node selector override (route this node's egress through a peer exit node), by IP or
+        /// MagicDNS name. Double `Option`: outer = "leave pref unchanged" (`None`), inner = the value
+        /// (`Some(None)` clears = stop using an exit node; `Some(Some(sel))` sets it).
+        ///
+        /// `double_option` is load-bearing here: it maps an ABSENT key → `None` (unchanged) but a
+        /// present JSON `null` → `Some(None)` (clear). Plain `#[serde(default)]` collapses both to
+        /// `None`, which would make the "clear my exit node" command silently deserialize as a no-op
+        /// (caught by `request_up_exit_and_advertise_round_trip_and_back_compat`). `skip_serializing_if`
+        /// keeps an unchanged field off the wire so it stays backward-compatible with older daemons.
+        #[serde(
+            default,
+            with = "::serde_with::rust::double_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        exit_node: Option<Option<String>>,
+        /// Advertise this node as an exit node (`None` leaves the pref unchanged; `Some(b)` sets it).
+        #[serde(default)]
+        advertise_exit_node: Option<bool>,
+        /// Subnet routes (CIDRs) this node advertises. `None` leaves the pref unchanged; `Some(vec)`
+        /// replaces the set (`Some([])` clears).
+        #[serde(default)]
+        advertise_routes: Option<Vec<String>>,
     },
     /// Bring the node down (`WantRunning = false`) without logging out.
     Down,
@@ -134,6 +156,9 @@ mod tests {
             tun: Some(true),
             tun_name: Some("tailscale0".to_string()),
             tun_mtu: Some(1280),
+            exit_node: Some(Some("100.64.0.9".to_string())),
+            advertise_exit_node: Some(true),
+            advertise_routes: Some(vec!["192.168.1.0/24".to_string()]),
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&json).unwrap();
@@ -145,6 +170,9 @@ mod tests {
                 tun,
                 tun_name,
                 tun_mtu,
+                exit_node,
+                advertise_exit_node,
+                advertise_routes,
             } => {
                 assert_eq!(authkey.as_deref(), Some("tskey-auth-xxx"));
                 assert_eq!(hostname.as_deref(), Some("node-a"));
@@ -152,6 +180,9 @@ mod tests {
                 assert_eq!(tun, Some(true));
                 assert_eq!(tun_name.as_deref(), Some("tailscale0"));
                 assert_eq!(tun_mtu, Some(1280));
+                assert_eq!(exit_node, Some(Some("100.64.0.9".to_string())));
+                assert_eq!(advertise_exit_node, Some(true));
+                assert_eq!(advertise_routes, Some(vec!["192.168.1.0/24".to_string()]));
             }
             other => panic!("expected Up, got {other:?}"),
         }
@@ -358,6 +389,9 @@ mod tests {
             tun: None,
             tun_name: None,
             tun_mtu: None,
+            exit_node: None,
+            advertise_exit_node: None,
+            advertise_routes: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&json).unwrap();
@@ -369,6 +403,9 @@ mod tests {
                 tun,
                 tun_name,
                 tun_mtu,
+                exit_node,
+                advertise_exit_node,
+                advertise_routes,
             } => {
                 assert!(authkey.is_none());
                 assert!(control_url.is_none());
@@ -376,9 +413,157 @@ mod tests {
                 assert!(tun.is_none());
                 assert!(tun_name.is_none());
                 assert!(tun_mtu.is_none());
+                assert!(exit_node.is_none());
+                assert!(advertise_exit_node.is_none());
+                assert!(advertise_routes.is_none());
             }
             other => panic!("expected Up, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn request_up_exit_and_advertise_round_trip_and_back_compat() {
+        // A client that omits the new fields (old wire) must still deserialize — `#[serde(default)]`
+        // fills them as `None` (= "leave pref unchanged"). Pin that back-compat plus the populated
+        // round-trip for the three routing fields.
+        let old_wire = r#"{"cmd":"up","authkey":null,"hostname":"h"}"#;
+        match serde_json::from_str::<Request>(old_wire).expect("old wire still parses") {
+            Request::Up {
+                exit_node,
+                advertise_exit_node,
+                advertise_routes,
+                hostname,
+                ..
+            } => {
+                assert_eq!(hostname.as_deref(), Some("h"));
+                assert!(exit_node.is_none(), "omitted exit_node defaults to None");
+                assert!(advertise_exit_node.is_none());
+                assert!(advertise_routes.is_none());
+            }
+            other => panic!("expected Up, got {other:?}"),
+        }
+
+        // Clearing an exit node (`Some(None)`) must be distinct on the wire from "unchanged" (`None`).
+        let clear = Request::Up {
+            authkey: None,
+            control_url: None,
+            hostname: None,
+            tun: None,
+            tun_name: None,
+            tun_mtu: None,
+            exit_node: Some(None),
+            advertise_exit_node: Some(false),
+            advertise_routes: Some(vec![]),
+        };
+        let json = serde_json::to_string(&clear).unwrap();
+        match serde_json::from_str::<Request>(&json).unwrap() {
+            Request::Up {
+                exit_node,
+                advertise_exit_node,
+                advertise_routes,
+                ..
+            } => {
+                assert_eq!(
+                    exit_node,
+                    Some(None),
+                    "Some(None) = clear, distinct from unchanged"
+                );
+                assert_eq!(advertise_exit_node, Some(false));
+                assert_eq!(advertise_routes, Some(vec![]));
+            }
+            other => panic!("expected Up, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exit_node_double_option_wire_distinguishes_clear_from_unchanged() {
+        // The load-bearing `double_option` contract, pinned at the RAW WIRE layer (the existing
+        // round-trip test only ever constructs `Some(None)` in Rust, which a plain
+        // `#[serde(default)] Option<Option<String>>` would also round-trip — so it does NOT actually
+        // exercise the absent-vs-`null` deserialize split that `double_option` exists for). The bug
+        // that was found+fixed is precisely that a present JSON `null` (the "clear my exit node"
+        // command) silently collapses to `None` ("leave unchanged") without `double_option`, making
+        // the clear a no-op. This test fails if `double_option` is removed.
+
+        // (1) DESERIALIZE: a present `null` must decode to `Some(None)` = CLEAR — distinct from an
+        //     absent key, which decodes to `None` = UNCHANGED. This is the half a plain
+        //     `#[serde(default)]` gets wrong (it would yield `None` for both).
+        let cleared = match serde_json::from_str::<Request>(r#"{"cmd":"up","exit_node":null}"#)
+            .expect("a present exit_node:null must parse")
+        {
+            Request::Up { exit_node, .. } => exit_node,
+            other => panic!("expected Up, got {other:?}"),
+        };
+        assert_eq!(
+            cleared,
+            Some(None),
+            "a present JSON null must decode to Some(None) = CLEAR (double_option), not None"
+        );
+        let unchanged = match serde_json::from_str::<Request>(r#"{"cmd":"up"}"#)
+            .expect("an absent exit_node must parse")
+        {
+            Request::Up { exit_node, .. } => exit_node,
+            other => panic!("expected Up, got {other:?}"),
+        };
+        assert_eq!(
+            unchanged, None,
+            "an absent exit_node key must decode to None = UNCHANGED"
+        );
+        assert_ne!(
+            cleared, unchanged,
+            "clear (Some(None)) and unchanged (None) must be distinct after decoding the wire"
+        );
+
+        // (2) SERIALIZE: the two intents must also be byte-distinct on the wire — CLEAR emits a
+        //     present `exit_node:null`, while UNCHANGED omits the key entirely (skip_serializing_if).
+        //     A consumer that re-parses either form must recover the original intent (round-trip).
+        let clear_json = serde_json::to_string(&Request::Up {
+            authkey: None,
+            control_url: None,
+            hostname: None,
+            tun: None,
+            tun_name: None,
+            tun_mtu: None,
+            exit_node: Some(None),
+            advertise_exit_node: None,
+            advertise_routes: None,
+        })
+        .unwrap();
+        let unchanged_json = serde_json::to_string(&Request::Up {
+            authkey: None,
+            control_url: None,
+            hostname: None,
+            tun: None,
+            tun_name: None,
+            tun_mtu: None,
+            exit_node: None,
+            advertise_exit_node: None,
+            advertise_routes: None,
+        })
+        .unwrap();
+        assert!(
+            clear_json.contains("\"exit_node\":null"),
+            "CLEAR must serialize a present exit_node:null, got {clear_json}"
+        );
+        // Match the `exit_node` KEY specifically — `advertise_exit_node` also contains the substring
+        // `exit_node`, so a naive `contains("exit_node")` would false-positive on it. Re-parse to a
+        // generic Value and check the map keys instead of substring-matching the raw JSON.
+        let unchanged_val: serde_json::Value = serde_json::from_str(&unchanged_json).unwrap();
+        assert!(
+            unchanged_val.get("exit_node").is_none(),
+            "UNCHANGED must omit the exit_node key entirely (skip_serializing_if), got {unchanged_json}"
+        );
+        // CLEAR, by contrast, carries an explicit `exit_node: null` key.
+        let clear_val: serde_json::Value = serde_json::from_str(&clear_json).unwrap();
+        assert_eq!(
+            clear_val.get("exit_node"),
+            Some(&serde_json::Value::Null),
+            "CLEAR must carry an explicit exit_node:null key, got {clear_json}"
+        );
+        assert_ne!(
+            clear_json, unchanged_json,
+            "clear and unchanged must be byte-distinct on the wire"
+        );
     }
 
     #[test]
