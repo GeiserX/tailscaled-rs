@@ -729,18 +729,53 @@ impl Backend {
 /// The default TUN interface name to request when the operator gave none, by platform.
 ///
 /// `None` means "let the engine choose its default" (`tailscale0` on Linux, which the kernel
-/// accepts). On macOS the kernel requires utun interfaces to be named `utun*`, and the engine's
-/// `tailscale0` default is rejected by `tun-rs` ("device name must start with utun"), so we return
-/// `Some("utun")` — the bare prefix the macOS kernel treats as "assign the next free `utunN`". Pure,
-/// so the per-platform choice is unit-testable. (The real fix is a platform-aware default in the
-/// engine; this is the daemon-side keep-it-working measure until then.)
+/// accepts). macOS is special: the engine coerces a `None` name to `tailscale0`, which the kernel
+/// rejects (utun interfaces *must* be named `utun*`), and `tun-rs` also rejects a *bare* `"utun"`
+/// (it parses the trailing digits as the unit, and `""` fails: "cannot parse integer from empty
+/// string"). The only value that works through the engine on macOS is an explicit, currently-free
+/// `utunN`. So on macOS we scan existing interfaces and return the lowest free index. Linux/BSD
+/// return `None` (the engine's `tailscale0` default stands).
+///
+/// (The real fix is a platform-aware default in the engine — see `docs/ENGINE_ASKS.md` #5 — at
+/// which point this becomes a redundant no-op. Until then it keeps macOS TUN working.)
+///
+/// Note the inherent, bounded TOCTOU: another process could claim the chosen `utunN` between this
+/// scan and the engine's device create. That is fine — device creation fails closed (no silent
+/// downgrade), so the operator simply retries and the next scan picks a different free index.
 #[cfg(feature = "tun")]
 fn default_tun_name() -> Option<String> {
-    if cfg!(target_os = "macos") {
-        Some("utun".to_owned())
-    } else {
+    #[cfg(target_os = "macos")]
+    {
+        Some(lowest_free_utun())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
         None
     }
+}
+
+/// The lowest `utunN` name not currently present on the host (macOS). Enumerates interfaces via
+/// `if-addrs`; if enumeration fails, falls back to `utun0` (the kernel will still reject it if taken,
+/// which fails closed and prompts a retry — never a silent wrong-interface).
+#[cfg(all(feature = "tun", target_os = "macos"))]
+fn lowest_free_utun() -> String {
+    use std::collections::BTreeSet;
+    let used: BTreeSet<u32> = if_addrs::get_if_addrs()
+        .map(|ifaces| {
+            ifaces
+                .into_iter()
+                .filter_map(|i| {
+                    i.name
+                        .strip_prefix("utun")
+                        .and_then(|n| n.parse::<u32>().ok())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let n = (0..)
+        .find(|n| !used.contains(n))
+        .expect("a free utun index exists");
+    format!("utun{n}")
 }
 
 /// Pure state-derivation decision, extracted from [`Backend::derive_state`] so it is unit-testable
@@ -934,12 +969,29 @@ mod tests {
 
     #[cfg(feature = "tun")]
     #[test]
-    fn default_tun_name_is_utun_on_macos_else_none() {
-        // macOS rejects a non-`utun*` TUN name, so the daemon must default to the bare `utun`
-        // prefix there; on other platforms it defers to the engine default (None).
+    fn default_tun_name_is_free_utun_on_macos_else_none() {
+        // macOS needs an explicit free `utunN` (the engine default `tailscale0` is rejected, and a
+        // bare `utun` fails tun-rs's unit parse); other platforms defer to the engine default (None).
         let got = default_tun_name();
         if cfg!(target_os = "macos") {
-            assert_eq!(got.as_deref(), Some("utun"));
+            let name = got.expect("macOS must pick a concrete utun name");
+            let n = name
+                .strip_prefix("utun")
+                .and_then(|s| s.parse::<u32>().ok())
+                .expect("name must be utun<N> with a numeric unit");
+            // The chosen index must be free: it must not be a utun currently on the host.
+            let used: std::collections::BTreeSet<u32> = if_addrs::get_if_addrs()
+                .map(|ifs| {
+                    ifs.into_iter()
+                        .filter_map(|i| {
+                            i.name
+                                .strip_prefix("utun")
+                                .and_then(|s| s.parse::<u32>().ok())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert!(!used.contains(&n), "chosen utun{n} must be free");
         } else {
             assert_eq!(got, None);
         }

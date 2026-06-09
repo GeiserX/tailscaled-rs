@@ -36,7 +36,7 @@ path = "src/bin/tnet.rs"
 #   paths = ["/path/to/your/tailscale-rs/checkout"]
 # transparently overrides this git dep when the local checkout's version matches the pin —
 # so you can edit the engine and rebuild the daemon with no manifest change. See README.
-tailscale = { package = "geiserx_tailscale", git = "https://github.com/GeiserX/tailscale-rs", rev = "f64aebe1162097987f79bf16ca46d4570c95ad47" }
+tailscale = { package = "geiserx_tailscale", git = "https://github.com/GeiserX/tailscale-rs", rev = "991c8c95fab4517451e9112a1ff2ddf2d1729f6e" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
 serde = { version = "1", features = ["derive"] }
@@ -53,6 +53,11 @@ libc = "0.2"
 # Parse a control-server URL string (from prefs / CLI) into the engine's `url::Url` Config field.
 # Pinned to the same 2.x the engine resolves.
 url = "2"
+# Enumerate existing network interfaces to pick a free `utunN` for macOS TUN mode (the engine's
+# default name `tailscale0` is Linux-only and macOS's tun-rs needs an explicit free utun index).
+# Already in the dependency tree transitively via the engine; only used on macOS.
+[target.'cfg(target_os = "macos")'.dependencies]
+if-addrs = "0.15"
 
 [features]
 # TUN-mode data path (Phase 3). Off by default so the standard build stays lean and unprivileged

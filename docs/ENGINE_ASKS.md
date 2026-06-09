@@ -143,34 +143,50 @@ default, the daemon workaround can be removed (it becomes a redundant no-op).
 
 ---
 
-## 6. (BLOCKER for macOS TUN) IPv6 /128 assigned to the utun interface even with IPv6 off → macOS EADDRNOTAVAIL
+## 6. (BLOCKER for macOS TUN) Host-route programming fails on macOS — EADDRNOTAVAIL (it is NOT the v6 /128)
 
-**Why:** In TUN mode on macOS, the node registers and reaches Running, but the overlay data path
-fails closed at interface-address assignment. The engine's `route_updater` iterates ALL
-`accepted_routes` — including the node's IPv6 `/128` (e.g. `fd7a:115c:a1e0::.../128`) — and tries to
-assign each to the utun. macOS rejects the v6 assignment with **EADDRNOTAVAIL (os error 49, "Can't
-assign requested address")**, which surfaces as `tun_actor: host route programming failed; TUN idle
-(fail-closed)` and the utun is torn down. Net: Running on the control plane, no working tunnel.
+> **CORRECTION (re-verified on v0.6.9, supersedes the earlier v6 theory).** My first cut of this ask
+> blamed the IPv6 `/128`. **That was wrong** — I re-read v0.6.9 and `host_routes_from_node`
+> (`ts_runtime/src/tun_actor.rs:161-200`) is genuinely v4-only: it drops every `IpNet::V6`
+> (line 175) and returns `Vec<Ipv4Net>`, and `tun_config_from_control` (`tun_actor.rs:133-144`)
+> emits `prefix: IpNet::V4(prefix)` only. The `/128` that appears in the `route_updater` debug log
+> (`route_updater.rs:416`, "populating accepted routes") is logged *before* the v4-only filter and
+> never reaches a syscall. So the engine's caution was right; the v6 was a red herring.
 
-**Verified (engine v0.6.7, debug log of a live root run on macOS):**
+**Actual symptom (engine v0.6.9, fresh root run on macOS, explicit `--tun-name utun11` to rule out
+any utun-name/collision issue):** device is created, node reaches Running with a v4 tailnet IP, then
+the **host-route programming** step fails:
 ```
-route_updater: populating accepted routes accepted_routes=[100.112.2.94/32, fd7a:115c:a1e0::.../128]
-tun_rs::platform::macos::device: Os { code: 49, kind: AddrNotAvailable, ... }
-tun_actor: host route programming failed; TUN idle (fail-closed) error=os error 2
+tun_rs::platform::macos::device: Os { code: 49, kind: AddrNotAvailable, message: "Can't assign requested address" }
+ts_runtime::tun_actor: host route programming failed; TUN idle (fail-closed) error=No such file or directory (os error 2)
 ```
+The utun is torn down (fail-closed), so the node is Running on the control plane with no working
+tunnel. Reproduces 100% on macOS (Darwin 25.x). The rejected assignment is a **v4** host
+route/address (the v6 is already dropped) — most likely a `/32` (e.g. the MagicDNS
+`100.100.100.100/32` steered into the TUN at `tun_actor.rs:~197`, or a non-self host `/32`), and the
+follow-on `os error 2` suggests the programming sequence/order is off (e.g. adding a route before the
+interface address/`ifconfig … up`, or using a route op macOS rejects for an on-link `/32`).
 
-**Inconsistency:** `ts_runtime/src/tun_actor.rs:150-175` documents and applies an "IPv4-only by
-construction: every IPv6 prefix in accepted_routes is dropped" invariant for *host routes* — but the
-`route_updater.rs:391-416` path that assigns addresses to the interface does NOT drop the v6 prefix,
-so the v6 /128 still reaches the macOS utun and fails. The daemon already runs IPv6-off by default
-(`enable_ipv6 = false`), yet the engine still derives and tries to bind the /128.
+**Answer to the engine lane's question (where the daemon builds the TUN Config / where the prefix
+comes from):** the daemon does **NOT** construct `ts_transport_tun::Config` and supplies **no prefix
+at all**. It builds the *facade* `tailscale::Config` and sets
+`transport_mode = TransportMode::Tun(TunConfig { name, mtu })` — and `TunConfig` (v0.6.9) has only
+`name: Option<String>` + `mtu: Option<u16>`, **no prefix field**. So every prefix/route in the TUN
+path (`/32`, the MagicDNS `/32`, any `/0`) is derived **inside the engine** from
+`node.tailnet_address` / `node.accepted_routes` via `tun_config_from_control` +
+`host_routes_from_node`. The daemon cannot be the source and cannot work around this.
 
-**Ask:** in TUN mode (at least on macOS, and consistent with the v4-only host-route invariant), do
-not assign IPv6 prefixes to the utun when IPv6 is not enabled — drop v6 from the
-interface-address-assignment path the same way `tun_actor` already drops it from host routes. Or, if
-v6 is intended, bring the utun's IPv6 up before assigning (macOS needs the interface v6-ready first).
+**Repro for the engine lane:** macOS, root, `--features tun`. `tnet up --tun` (or `--tun-name utun11`).
+Watch with `TAILNETD_LOG='info,ts_runtime::tun_actor=trace,ts_transport_tun=trace,tun_rs=trace'`. You
+will see device-up succeed, then the `code 49 AddrNotAvailable` from `tun_rs::platform::macos::device`
+during host-route programming, then the fail-closed teardown.
 
-**Downstream:** the daemon cannot work around this (it already has IPv6 off and the /128 is derived
-inside the engine from the netmap self-node). macOS TUN is blocked on this engine fix. Linux TUN is
-likely unaffected (Linux accepts the v6 assignment); the daemon-side name fix (#5) + this (#6) are
-the two macOS-specific TUN blockers.
+**Ask:** debug the macOS host-route/address programming in `ts_host_net` (the macOS impl behind
+`HostNet`) + `tun_rs` device — specifically the order of operations and which v4 `/32` assignment
+draws `EADDRNOTAVAIL`. Likely fixes: bring the interface address up before adding on-link `/32`
+routes, or use the correct macOS route/ifconfig syscall for an on-link host route. You have the
+source + macOS to repro; this is squarely an engine-side platform-integration bug.
+
+**Downstream:** daemon-side is complete (device name fix #5 landed; daemon supplies no prefix). macOS
+TUN is blocked here. **Linux TUN is untested** from this lane — it may already work (Linux host-route
+programming differs); worth a Linux check independent of this macOS bug.
