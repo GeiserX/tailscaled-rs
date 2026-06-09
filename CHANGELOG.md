@@ -25,6 +25,25 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.2.0](https://github.com/GeiserX/tailscaled-rs/compare/tailscaled-rs-v0.1.0...tailscaled-rs-v0.2.0) (2026-06-09)
+
+
+### Features
+
+* **login:** interactive/browser login — surface the control auth URL (tsd-8j2) ([862a708](https://github.com/GeiserX/tailscaled-rs/commit/862a708824e19f5eb10610128a8c52588fdcb9ca))
+* **status:** 'tnet status --watch' streaming over LocalAPI (tsd-c3p) ([c93e492](https://github.com/GeiserX/tailscaled-rs/commit/c93e49266bfaa840f1613556e55206ae4d4faaed))
+* **tun:** Phase-3 TUN-mode plumbing (daemon-ready; blocked on one engine export) ([9275693](https://github.com/GeiserX/tailscaled-rs/commit/92756939d211d5032ff6832a607be911feff282c))
+* **tun:** wire kernel-TUN transport on engine v0.6.7 (tsd-tth) ([a86fb3b](https://github.com/GeiserX/tailscaled-rs/commit/a86fb3b5e189c3275738e2d6aba86761c54ad7cb))
+
+
+### Bug Fixes
+
+* bump engine to v0.6.9 + correct macOS-TUN engine ask [#6](https://github.com/GeiserX/tailscaled-rs/issues/6) ([3f9675c](https://github.com/GeiserX/tailscaled-rs/commit/3f9675cbce0261fcb49d052be8ff306d8525d163))
+* **ci:** gate the utun-name test to macOS so Linux+tun compiles ([eb6fee3](https://github.com/GeiserX/tailscaled-rs/commit/eb6fee3fddbbdd8b464d42b8c83596549a392db7))
+* **review:** bound status() netmap query + drop vestigial param ([a85c324](https://github.com/GeiserX/tailscaled-rs/commit/a85c324a1fa07916281f32ccdea9a7ef18ec892a))
+* **review:** off-lock SIGHUP reload, --no-tun, boot-attempt guard, hardening ([814ccef](https://github.com/GeiserX/tailscaled-rs/commit/814ccefb02c70757f581aede9e34f14ecbcb3547))
+* **tun:** default macOS TUN name to utun (engine default tailscale0 is rejected) ([7b4c41d](https://github.com/GeiserX/tailscaled-rs/commit/7b4c41dd23cb7d11afb6fbde800b744db84ed6c1))
+
 ## [Unreleased]
 
 _Nothing yet._
