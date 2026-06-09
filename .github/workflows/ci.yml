@@ -38,14 +38,27 @@ jobs:
       - name: Clippy (tun feature)
         run: cargo clippy --all-targets --features tun -- -D warnings
 
+      # The `ssh` feature is off by default (it pulls the russh-based Tailscale SSH
+      # server — a remote-shell surface). Lint + test + build it explicitly: this is
+      # security-sensitive code, so the primary gate must cover it, not just the
+      # `coverage` job's `--all-features` run.
+      - name: Clippy (ssh feature)
+        run: cargo clippy --all-targets --features ssh -- -D warnings
+
       - name: Test
         run: cargo test --all-targets
+
+      - name: Test (ssh feature)
+        run: cargo test --all-targets --features ssh
 
       - name: Build release
         run: cargo build --release --bins
 
       - name: Build release (tun feature)
         run: cargo build --release --bins --features tun
+
+      - name: Build release (ssh feature)
+        run: cargo build --release --bins --features ssh
 
   coverage:
     name: coverage (codecov)

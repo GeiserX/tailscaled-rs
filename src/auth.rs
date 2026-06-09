@@ -163,6 +163,7 @@ mod tests {
             exit_node: None,
             advertise_exit_node: None,
             advertise_routes: None,
+            ssh: None,
         }
     }
 
@@ -173,6 +174,7 @@ mod tests {
             exit_node: None,
             advertise_exit_node: None,
             advertise_routes: None,
+            ssh: None,
         }
     }
 

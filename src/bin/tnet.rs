@@ -95,6 +95,15 @@ enum Command {
         /// being unset.
         #[arg(long)]
         advertise_routes_clear: bool,
+        /// Run the Tailscale SSH server on this node (accept tailnet SSH on port 22, authorized by
+        /// the control SSH policy). Requires a daemon built with the `ssh` feature and run as root.
+        /// Mutually exclusive with `--no-ssh`; omitting both leaves the setting unchanged.
+        #[arg(long, conflicts_with = "no_ssh")]
+        ssh: bool,
+        /// Stop running the Tailscale SSH server on this node. Mutually exclusive with `--ssh`;
+        /// omitting both leaves the setting unchanged.
+        #[arg(long)]
+        no_ssh: bool,
     },
     /// Tweak individual prefs on an already-configured node, without an up/down cycle (the analogue
     /// of Go's `tailscale set`). This never (re)authenticates and never changes whether the node is
@@ -145,6 +154,15 @@ enum Command {
         /// being unset.
         #[arg(long)]
         advertise_routes_clear: bool,
+        /// Run the Tailscale SSH server on this node (accept tailnet SSH on port 22, authorized by
+        /// the control SSH policy). Requires a daemon built with the `ssh` feature and run as root.
+        /// Mutually exclusive with `--no-ssh`; omitting both leaves the setting unchanged.
+        #[arg(long, conflicts_with = "no_ssh")]
+        ssh: bool,
+        /// Stop running the Tailscale SSH server on this node. Mutually exclusive with `--ssh`;
+        /// omitting both leaves the setting unchanged.
+        #[arg(long)]
+        no_ssh: bool,
     },
     /// Disconnect the node without logging out.
     Down,
@@ -193,6 +211,18 @@ fn resolve_advertise_exit_node(advertise: bool, no_advertise: bool) -> Option<bo
     }
 }
 
+/// Map the `--ssh` / `--no-ssh` flag pair to a tri-state `Option<bool>`. Enable → `Some(true)` (run
+/// the Tailscale SSH server); disable → `Some(false)`; neither → `None` (leave the persisted pref
+/// unchanged). Mirrors the `--tun`/`--no-tun` mapping; clap's `conflicts_with` guarantees the two
+/// are never both set.
+fn resolve_ssh(ssh: bool, no_ssh: bool) -> Option<bool> {
+    match (ssh, no_ssh) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        _ => None,
+    }
+}
+
 /// Map the `--advertise-routes` / `--advertise-routes-clear` flags to the wire field's
 /// `Option<Vec<String>>`. Any routes passed → `Some(routes)` (replace the set); else
 /// `--advertise-routes-clear` → `Some(vec![])` (advertise none); else `None` (leave the persisted
@@ -232,6 +262,8 @@ async fn main() -> Result<()> {
             no_advertise_exit_node,
             advertise_routes,
             advertise_routes_clear,
+            ssh,
+            no_ssh,
         } => {
             // Resolve the secret through the precedence chain and hold it as a `SecretString`
             // (zeroized on drop, never `Debug`-printed). Expose it only here, at the moment we
@@ -266,6 +298,8 @@ async fn main() -> Result<()> {
                     advertise_routes,
                     advertise_routes_clear,
                 ),
+                // `--ssh`/`--no-ssh` tri-state (mirrors `--tun`).
+                ssh: resolve_ssh(ssh, no_ssh),
             }
         }
         Command::Set {
@@ -278,6 +312,8 @@ async fn main() -> Result<()> {
             no_advertise_exit_node,
             advertise_routes,
             advertise_routes_clear,
+            ssh,
+            no_ssh,
         } => Request::Set {
             hostname,
             // `--accept-routes`/`--no-accept-routes` tri-state (mirrors `--tun`).
@@ -294,6 +330,8 @@ async fn main() -> Result<()> {
             // Passed routes replace the set; `--advertise-routes-clear` empties it; neither leaves
             // the persisted set unchanged.
             advertise_routes: resolve_advertise_routes(advertise_routes, advertise_routes_clear),
+            // `--ssh`/`--no-ssh` tri-state (mirrors `--tun`).
+            ssh: resolve_ssh(ssh, no_ssh),
         },
         Command::Down => Request::Down,
         // `status --watch` is a long-lived stream, not a one-shot round-trip — handle it here and
@@ -694,6 +732,17 @@ mod tests {
     }
 
     #[test]
+    fn resolve_ssh_tristate() {
+        // `--ssh` → Some(true) (run the SSH server); `--no-ssh` → Some(false); neither → None
+        // (leave the persisted pref unchanged).
+        assert_eq!(resolve_ssh(true, false), Some(true));
+        assert_eq!(resolve_ssh(false, true), Some(false));
+        assert_eq!(resolve_ssh(false, false), None);
+        // Enable wins if both are somehow set (clap's conflicts_with prevents this in practice).
+        assert_eq!(resolve_ssh(true, true), Some(true));
+    }
+
+    #[test]
     fn command_set_maps_to_request_set_fields() {
         // A representative invocation: rename + set an exit node + accept routes, leaving the
         // advertise-* prefs untouched. Built from the same resolver helpers the `Command::Set` arm
@@ -705,6 +754,7 @@ mod tests {
             exit_node: resolve_exit_node(Some("100.64.0.9".to_string()), false),
             advertise_exit_node: resolve_advertise_exit_node(false, false),
             advertise_routes: resolve_advertise_routes(vec![], false),
+            ssh: resolve_ssh(false, false),
         };
         match req {
             Request::Set {
@@ -713,12 +763,14 @@ mod tests {
                 exit_node,
                 advertise_exit_node,
                 advertise_routes,
+                ssh,
             } => {
                 assert_eq!(hostname, Some("laptop".to_string()));
                 assert_eq!(accept_routes, Some(true));
                 assert_eq!(exit_node, Some(Some("100.64.0.9".to_string())));
                 assert_eq!(advertise_exit_node, None, "unset → unchanged, not flipped");
                 assert_eq!(advertise_routes, None, "unset → unchanged, not cleared");
+                assert_eq!(ssh, None, "unset → unchanged, not flipped");
             }
             other => panic!("expected Request::Set, got {other:?}"),
         }
@@ -735,6 +787,7 @@ mod tests {
             exit_node: resolve_exit_node(None, true),
             advertise_exit_node: resolve_advertise_exit_node(false, true),
             advertise_routes: resolve_advertise_routes(vec![], true),
+            ssh: resolve_ssh(true, false),
         };
         match req {
             Request::Set {
@@ -743,6 +796,7 @@ mod tests {
                 exit_node,
                 advertise_exit_node,
                 advertise_routes,
+                ssh,
             } => {
                 assert_eq!(hostname, None);
                 assert_eq!(accept_routes, Some(false));
@@ -753,6 +807,7 @@ mod tests {
                     Some(vec![]),
                     "--advertise-routes-clear → Some(vec![])"
                 );
+                assert_eq!(ssh, Some(true), "--ssh → Some(true)");
             }
             other => panic!("expected Request::Set, got {other:?}"),
         }

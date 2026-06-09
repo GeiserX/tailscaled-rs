@@ -41,6 +41,12 @@ pub struct Prefs {
     /// it (Go `--advertise-routes`). Stored as raw CIDR strings, parsed into `ipnet::IpNet` in
     /// `build_config`. Empty = advertise nothing. v6 prefixes are dropped by the engine (v4-only).
     pub advertise_routes: Vec<String>,
+    /// Run the Tailscale SSH server on this node (Go `--ssh`): accept tailnet SSH connections on
+    /// `<tailnet-ip>:22`, authorized by the control-pushed SSH policy (fail-closed). Requires a
+    /// daemon built with the `ssh` cargo feature AND running as root (to drop privileges to the
+    /// policy-mapped local user); the daemon fails loudly otherwise. Default `false` — SSH is a
+    /// remote-shell surface, opt-in at both build and runtime.
+    pub ssh_enabled: bool,
     /// Use a real kernel TUN interface for the node's data path instead of the userspace netstack.
     ///
     /// `false` (default) = the engine's in-process smoltcp netstack: unprivileged, app reaches the
@@ -69,6 +75,7 @@ impl Default for Prefs {
             exit_node: None,
             advertise_exit_node: false,
             advertise_routes: Vec::new(),
+            ssh_enabled: false,
             tun_enabled: false,
             tun_name: None,
             tun_mtu: None,
