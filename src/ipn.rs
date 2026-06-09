@@ -276,6 +276,18 @@ pub async fn drive_set(
         // begin_up/build_device/finish_up off-lock handshake exactly like `drive_up`. The brief
         // reconnect is documented on this function and `SetAction::Rebuild`.
         SetAction::Rebuild => {
+            // Phase 2-pre: PREFLIGHT the rebuilt config before tearing the live device down.
+            // `begin_up` → `stop_device` drops the running engine, but the SSH root/feature checks
+            // (and control-URL/route parse) live in `build_config`, which `begin_up` only reaches
+            // AFTER teardown. If that check fails (e.g. `set --ssh` without the `ssh` feature or
+            // without root), a naive rebuild would leave a healthy node OFFLINE — a `set` that fails
+            // must never drop the tunnel. So validate FIRST under a brief lock; on error, return it
+            // with the live device untouched. (The pref is already persisted by `begin_set`; it
+            // applies on the next successful `up`/`set` — but the running node stays up now.)
+            {
+                let be = backend.lock().await;
+                be.build_config().await?;
+            }
             // Phase 2a: brief lock — begin a bring-up from the (already-updated) prefs. No authkey:
             // a rebuild resumes from the persisted node key; `set` never (re)authenticates. NB:
             // `begin_up` sets `want_running = true`, which for a Rebuild action is a no-op (we only
@@ -631,6 +643,15 @@ impl Backend {
             // it (the engine Config is immutable). Brief reconnect; no authkey (resume from the
             // persisted node key); `want_running` unchanged. Inline three-phase like `up`.
             SetAction::Rebuild => {
+                // PREFLIGHT before tearing the live device down: `begin_up` → `stop_device` drops
+                // the running engine, but the SSH root/feature checks (and control-URL/route parse)
+                // live in `build_config`, which `begin_up` only reaches AFTER teardown. If that
+                // check fails (e.g. `set --ssh` without the `ssh` feature or without root), a naive
+                // rebuild would leave a healthy node OFFLINE — a `set` that fails must never drop the
+                // tunnel. So validate the rebuilt config FIRST; on error, return it with the live
+                // device untouched. (The pref is already persisted by `begin_set`; it applies on the
+                // next successful `up`/`set` — but the running node stays up now.)
+                self.build_config().await?;
                 let pending = self.begin_up(UpOptions::default()).await?;
                 let built = build_device(&pending, None).await;
                 let orphan = self.finish_up(pending, built)?;
