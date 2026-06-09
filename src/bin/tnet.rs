@@ -141,16 +141,35 @@ async fn main() -> Result<()> {
             println!("ok: {message}");
             // Interactive login: an authkey-less `up` succeeds at the daemon, but the node now needs
             // a human to authorize it. The auth URL isn't known yet at `up`-time — it arrives once
-            // the engine reaches `NeedsLogin` — so poll `status` briefly to surface it.
-            if interactive_up && let Some(url) = poll_for_auth_url(&socket).await {
-                println!();
-                println!("To authenticate this node, visit:");
-                println!("    {url}");
-                println!();
-                println!(
-                    "(the node will finish connecting automatically once authorized; \
-                          run `tnet status` to check)"
-                );
+            // the engine reaches `NeedsLogin` — so poll `status` briefly to surface it (or a
+            // terminal registration failure).
+            if interactive_up {
+                match poll_for_auth_url(&socket).await {
+                    AuthOutcome::Url(url) => {
+                        println!();
+                        println!("To authenticate this node, visit:");
+                        println!("    {url}");
+                        println!();
+                        println!(
+                            "(the node will finish connecting automatically once authorized; \
+                                  run `tnet status` to check)"
+                        );
+                    }
+                    AuthOutcome::Failed(reason) => {
+                        // Registration hard-failed. An interactive `up` that terminally fails must
+                        // not exit 0 implying success, and must not tell the operator to log in —
+                        // re-running with the same key loops forever. Surface the reason and exit
+                        // non-zero (mirroring the `Response::Error` path below).
+                        eprintln!();
+                        eprintln!("registration failed: {reason}");
+                        eprintln!(
+                            "(this is a permanent failure — re-run `tnet up --authkey <NEW_KEY>` \
+                             with a fresh key; the same key will keep failing)"
+                        );
+                        std::process::exit(1);
+                    }
+                    AuthOutcome::None => {}
+                }
             }
         }
         Response::Error { message } => {
@@ -176,6 +195,17 @@ fn print_status(s: &tailscaled_rs::localapi::StatusReport) {
         println!();
         println!("To authenticate this node, visit:");
         println!("    {url}");
+    }
+    // Terminal registration failure: distinct from `auth_url`, this means registration hard-failed
+    // and the engine will not retry. Re-running with the same key loops forever, so spell out that
+    // the operator must re-authenticate with a fresh key.
+    if let Some(reason) = s.error.as_deref() {
+        println!();
+        println!("registration failed: {reason}");
+        println!(
+            "(this is a permanent failure — re-run `tnet up --authkey <NEW_KEY>` with a fresh \
+             key; the same key will keep failing)"
+        );
     }
     println!("peers:        {}", s.peers.len());
     for p in &s.peers {
@@ -246,36 +276,67 @@ const AUTH_URL_POLL: std::time::Duration = std::time::Duration::from_secs(20);
 /// Interval between `status` polls while waiting for the auth URL.
 const AUTH_URL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// The outcome of an interactive-`up` poll, distinguishing the three terminal cases the caller must
+/// render differently: a login URL arrived, registration *terminally failed*, or nothing actionable
+/// surfaced before the deadline.
+enum AuthOutcome {
+    /// The control auth URL the operator must visit to authorize the node.
+    Url(String),
+    /// Registration hard-failed (terminal `error`); the reason is control's Display string. The
+    /// operator must re-authenticate with a fresh key — re-running with the same one loops forever.
+    Failed(String),
+    /// Nothing to prompt: the node authorized instantly (pre-approved / `Running`) or no URL/error
+    /// appeared before the deadline. The operator can re-run `tnet status`.
+    None,
+}
+
+/// Classify a single [`StatusReport`] into an [`AuthOutcome`]. Pure (no I/O) so the bail logic is
+/// unit-testable. Precedence: a terminal `error` wins over everything (it is the permanent state),
+/// then a pending `auth_url`, then a node already past login (`Running`); otherwise keep waiting.
+fn classify_auth(s: &tailscaled_rs::localapi::StatusReport) -> AuthOutcome {
+    // Terminal failure is checked first: if both somehow co-occur, the permanent error must win
+    // over a stale/pending URL (re-running with the same key would loop forever).
+    if let Some(reason) = s.error.as_deref() {
+        return AuthOutcome::Failed(reason.to_owned());
+    }
+    if let Some(url) = s.auth_url.as_deref() {
+        return AuthOutcome::Url(url.to_owned());
+    }
+    // Already past NeedsLogin (authorized / running) — nothing to prompt.
+    AuthOutcome::None
+}
+
 /// After an interactive (authkey-less) `up`, poll `status` for up to [`AUTH_URL_POLL`] to surface
-/// the control auth URL. The engine reaches `NeedsLogin(url)` ~10s after registration begins, so we
-/// wait a generous 20s; if the node authorizes instantly (pre-approved) or never needs login,
-/// returns `None` and the operator can always re-run `tnet status`.
+/// either the control auth URL or a terminal registration failure. The engine reaches
+/// `NeedsLogin(url)` ~10s after registration begins, so we wait a generous 20s for a URL; but a
+/// permanent failure (`error`) short-circuits immediately — there is no point dwelling the full
+/// window for a login that will never help. If the node authorizes instantly (pre-approved) or
+/// never needs login, returns [`AuthOutcome::None`] and the operator can re-run `tnet status`.
 ///
-/// Prints a one-time "waiting…" line on the first poll so an interactive `up` doesn't look frozen
-/// during the ~10s the engine needs.
-async fn poll_for_auth_url(socket: &std::path::Path) -> Option<String> {
+/// Prints a one-time "contacting…" line on the first poll so an interactive `up` doesn't look
+/// frozen during the ~10s the engine needs.
+async fn poll_for_auth_url(socket: &std::path::Path) -> AuthOutcome {
     let deadline = tokio::time::Instant::now() + AUTH_URL_POLL;
     let mut announced = false;
     while tokio::time::Instant::now() < deadline {
         if let Ok(Response::Status(s)) = round_trip(socket, &Request::Status).await {
-            if s.auth_url.is_some() {
-                return s.auth_url;
-            }
-            // Already past NeedsLogin (authorized / running) — nothing to prompt.
-            if s.state == "Running" {
-                return None;
+            match classify_auth(&s) {
+                // A pending URL or a terminal failure are both decisive — return at once. The
+                // failure case is the early-bail: we do NOT keep polling the full window.
+                outcome @ (AuthOutcome::Url(_) | AuthOutcome::Failed(_)) => return outcome,
+                // Already authorized / running before any URL appeared — nothing to prompt.
+                AuthOutcome::None if s.state == "Running" => return AuthOutcome::None,
+                // Still in flight (e.g. NoState/Starting and no URL yet) — keep polling.
+                AuthOutcome::None => {}
             }
         }
         if !announced {
             announced = true;
-            // Softened wording: on a permanent registration failure the daemon currently maps to
-            // NeedsLogin-without-URL, so this poll can run its full window without a URL ever
-            // arriving. Don't promise a URL is coming; point the operator at `tnet status`.
             println!("contacting the control server… (run `tnet status` for the latest state)");
         }
         tokio::time::sleep(AUTH_URL_POLL_INTERVAL).await;
     }
-    None
+    AuthOutcome::None
 }
 
 /// Resolve the pre-auth key from the available sources, in precedence order:
@@ -324,4 +385,69 @@ async fn round_trip(socket: &std::path::Path, request: &Request) -> Result<Respo
     let response = serde_json::from_str(response_line.trim())
         .with_context(|| format!("parsing daemon response: {response_line:?}"))?;
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tailscaled_rs::localapi::StatusReport;
+
+    /// Build a minimal `StatusReport` in the given state with no auth_url/error, no peers.
+    fn report(state: &str) -> StatusReport {
+        StatusReport {
+            state: state.to_string(),
+            want_running: true,
+            self_ipv4: None,
+            self_name: None,
+            auth_url: None,
+            error: None,
+            peers: vec![],
+        }
+    }
+
+    #[test]
+    fn classify_auth_url() {
+        let mut s = report("NeedsLogin");
+        s.auth_url = Some("https://login.example.com/a/abc123".to_string());
+        match classify_auth(&s) {
+            AuthOutcome::Url(url) => assert_eq!(url, "https://login.example.com/a/abc123"),
+            _ => panic!("expected Url"),
+        }
+    }
+
+    #[test]
+    fn classify_auth_failed() {
+        // Terminal registration failure → Failed, the early-bail case.
+        let mut s = report("NeedsLogin");
+        s.error = Some("authentication rejected by control: invalid key".to_string());
+        match classify_auth(&s) {
+            AuthOutcome::Failed(reason) => {
+                assert_eq!(reason, "authentication rejected by control: invalid key");
+            }
+            _ => panic!("expected Failed"),
+        }
+    }
+
+    #[test]
+    fn classify_auth_none() {
+        // No URL, no error → nothing to prompt yet.
+        match classify_auth(&report("Running")) {
+            AuthOutcome::None => {}
+            _ => panic!("expected None"),
+        }
+    }
+
+    #[test]
+    fn classify_auth_error_wins_over_url() {
+        // If both somehow co-occur, the permanent error must win over a pending URL.
+        let mut s = report("NeedsLogin");
+        s.auth_url = Some("https://login.example.com/a/stale".to_string());
+        s.error = Some("node key expired; re-authentication required".to_string());
+        match classify_auth(&s) {
+            AuthOutcome::Failed(reason) => {
+                assert_eq!(reason, "node key expired; re-authentication required");
+            }
+            _ => panic!("expected Failed to win over Url"),
+        }
+    }
 }

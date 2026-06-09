@@ -70,6 +70,39 @@ systemctl status tailnetd
 
 ## 2b. macOS (launchd)
 
+### Scripted install (macOS)
+
+The quickest path is the bundled installer, which automates every manual step below (install
+the binary, drop in the plist with `root:wheel`/`0644`, create the `0700` state dir, pre-create
+the non-world-readable log files, and `launchctl bootstrap` the daemon). It is idempotent —
+re-running it updates the binary + plist and reloads the service cleanly:
+
+```bash
+# Build first (see "1. Install the binary"), then:
+sudo packaging/macos/install.sh                       # uses ./target/release/tailnetd
+# …or point it at a binary explicitly:
+sudo packaging/macos/install.sh /path/to/tailnetd
+```
+
+```mermaid
+flowchart LR
+    INST["sudo macos/install.sh<br/>[path-to-tailnetd]"] --> B["install → /usr/local/bin/tailnetd"]
+    B --> P["plist → /Library/LaunchDaemons<br/>(root:wheel 0644)"]
+    P --> S["mkdir /usr/local/var/tailnetd<br/>(0700 root:wheel)"]
+    S --> L["launchctl bootstrap system …<br/>(legacy: launchctl load -w)"]
+    L --> UP["sudo tnet up --authkey-file …"]
+```
+
+To remove the service later, run the matching uninstaller. It boots the daemon out and removes
+the plist + binary, but **leaves the state dir** (`/usr/local/var/tailnetd`, the node's keys +
+prefs) in place; it prints the `rm -rf` command to purge the node identity if you want to:
+
+```bash
+sudo packaging/macos/uninstall.sh
+```
+
+The manual steps below remain the documented fallback and explain exactly what the script does.
+
 ```bash
 sudo cp launchd/cloud.tailscaled-rs.tailnetd.plist /Library/LaunchDaemons/
 sudo chown root:wheel /Library/LaunchDaemons/cloud.tailscaled-rs.tailnetd.plist
