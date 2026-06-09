@@ -83,6 +83,20 @@ pub struct StatusReport {
     /// `tnet up` (no `--authkey`) yields a clickable login link.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_url: Option<String>,
+    /// A terminal registration-failure reason, set only when the engine reported
+    /// `DeviceState::Failed(RegistrationError)` — a **permanent** failure (e.g. a bad/expired/unknown
+    /// auth key) that the engine will *not* retry. `None` in every other state.
+    ///
+    /// This is the Rust analogue of Go's `ipnstate.Status.ErrMessage`: rather than fabricate an
+    /// eighth `ipn.State`, terminal failure is carried as a separate field so the reported `state`
+    /// stays one of the seven canonical `ipn.State` names. It is deliberately distinct from
+    /// [`auth_url`](StatusReport::auth_url): an `auth_url` means interactive login is *pending and
+    /// will succeed once the user authorizes* (transient), whereas `error` means registration
+    /// *hard-failed and re-running with the same key will loop forever* (terminal — the operator must
+    /// re-authenticate). The CLI prints this and, on an interactive `up`, bails early instead of
+    /// dwelling the full auth-URL poll window implying that login will help.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     /// Known peers in the netmap.
     pub peers: Vec<PeerReport>,
 }
@@ -181,6 +195,7 @@ mod tests {
             self_ipv4: Some("100.70.22.12".to_string()),
             self_name: Some("node-a".to_string()),
             auth_url: None,
+            error: None,
             peers: vec![PeerReport {
                 name: "peer-b".to_string(),
                 ipv4: "100.64.0.2".to_string(),
@@ -203,6 +218,11 @@ mod tests {
             !json.contains("auth_url"),
             "auth_url must be omitted when None"
         );
+        // `error` is likewise `skip_serializing_if = None`: a non-failing status carries no `error` key.
+        assert!(
+            !json.contains("\"error\""),
+            "error must be omitted when None"
+        );
     }
 
     #[test]
@@ -215,16 +235,116 @@ mod tests {
             self_ipv4: None,
             self_name: None,
             auth_url: Some("https://login.example.com/a/abc123".to_string()),
+            error: None,
             peers: vec![],
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("auth_url"));
+        // Interactive login is transient, not a terminal failure: the URL is present, `error` absent.
+        assert!(
+            !json.contains("\"error\""),
+            "error must be absent when only auth_url is set"
+        );
         let back: StatusReport = serde_json::from_str(&json).unwrap();
         assert_eq!(
             back.auth_url.as_deref(),
             Some("https://login.example.com/a/abc123")
         );
         assert_eq!(back.state, "NeedsLogin");
+        assert!(back.error.is_none());
+    }
+
+    #[test]
+    fn status_report_error_round_trips() {
+        // Terminal failure: a bad/expired/unknown auth key makes the engine report
+        // `DeviceState::Failed`, which surfaces as `state == "NeedsLogin"` with a populated `error`
+        // and no `auth_url`. The reason string must serialize and survive the round-trip so the CLI
+        // can print it and bail instead of dwelling the auth-URL poll window.
+        let report = StatusReport {
+            state: "NeedsLogin".to_string(),
+            want_running: true,
+            self_ipv4: None,
+            self_name: None,
+            auth_url: None,
+            error: Some("authentication rejected by control: invalid key".to_string()),
+            peers: vec![],
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"error\""));
+        assert!(json.contains("authentication rejected by control: invalid key"));
+        let back: StatusReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.error.as_deref(),
+            Some("authentication rejected by control: invalid key")
+        );
+        assert_eq!(back.state, "NeedsLogin");
+        assert!(back.auth_url.is_none());
+    }
+
+    #[test]
+    fn status_report_error_omitted_when_none() {
+        // `error` is `skip_serializing_if = None`: a status that is not a terminal failure must not
+        // carry an `error` key on the wire.
+        let report = StatusReport {
+            state: "Running".to_string(),
+            want_running: true,
+            self_ipv4: Some("100.70.22.12".to_string()),
+            self_name: Some("node-a".to_string()),
+            auth_url: None,
+            error: None,
+            peers: vec![],
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(
+            !json.contains("\"error\""),
+            "error must be omitted when None"
+        );
+    }
+
+    #[test]
+    fn status_report_error_and_auth_url_are_independent() {
+        // The wire format keeps the transient (interactive login pending) and terminal (registration
+        // hard-failed) cases distinct: each report carries exactly one of the two fields, never both.
+
+        // Interactive login pending: `auth_url` present, `error` absent.
+        let pending = StatusReport {
+            state: "NeedsLogin".to_string(),
+            want_running: true,
+            self_ipv4: None,
+            self_name: None,
+            auth_url: Some("https://login.example.com/a/abc123".to_string()),
+            error: None,
+            peers: vec![],
+        };
+        let pending_json = serde_json::to_string(&pending).unwrap();
+        assert!(pending_json.contains("auth_url"));
+        assert!(!pending_json.contains("\"error\""));
+        let pending_back: StatusReport = serde_json::from_str(&pending_json).unwrap();
+        assert_eq!(
+            pending_back.auth_url.as_deref(),
+            Some("https://login.example.com/a/abc123")
+        );
+        assert!(pending_back.error.is_none());
+
+        // Terminal failure: `error` present, `auth_url` absent.
+        let failed = StatusReport {
+            state: "NeedsLogin".to_string(),
+            want_running: true,
+            self_ipv4: None,
+            self_name: None,
+            auth_url: None,
+            error: Some("authentication rejected by control: invalid key".to_string()),
+            peers: vec![],
+        };
+        let failed_json = serde_json::to_string(&failed).unwrap();
+        assert!(failed_json.contains("\"error\""));
+        assert!(!failed_json.contains("auth_url"));
+        let failed_back: StatusReport = serde_json::from_str(&failed_json).unwrap();
+        assert_eq!(
+            failed_back.error.as_deref(),
+            Some("authentication rejected by control: invalid key")
+        );
+        assert!(failed_back.auth_url.is_none());
     }
 
     #[test]

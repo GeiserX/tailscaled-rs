@@ -608,9 +608,9 @@ impl Backend {
         // Cheap, non-blocking watch borrow → authoritative connection state + any interactive-login
         // URL. `DeviceState::Running` already means "registered, netmap live", so it maps straight to
         // `Running`; the address fill-in below is best-effort on top of that.
-        let (state, auth_url) = match self.device.as_ref() {
+        let (state, auth_url, error) = match self.device.as_ref() {
             Some(dev) => state_from_device(dev.device_state()),
-            None => (self.derive_state(false), None),
+            None => (self.derive_state(false), None, None),
         };
 
         // Query the (blocking) netmap only when Running — the only state with a self-node/peers.
@@ -659,6 +659,7 @@ impl Backend {
             self_ipv4,
             self_name,
             auth_url,
+            error,
             peers,
         }
     }
@@ -808,30 +809,56 @@ fn derive_state_from(
     }
 }
 
-/// Map the engine's authoritative [`tailscale::DeviceState`] to the daemon's [`State`] plus the
-/// interactive-login auth URL (set only for `NeedsLogin`). Pure, so the mapping is unit-testable
-/// without a live engine.
+/// Map the engine's authoritative [`tailscale::DeviceState`] to the daemon's reported [`State`]
+/// plus two optional, mutually-exclusive detail strings: the interactive-login auth URL and the
+/// terminal-failure reason. Pure, so the mapping is unit-testable without a live engine.
+///
+/// Returns `(State, auth_url, error)`:
+/// - **`State`** — the lifecycle state surfaced on the wire (`StatusReport.state`). There are only
+///   ever the seven `ipn.State` names (pinned by [`state_as_str_is_stable`](tests)); we deliberately
+///   do **not** mint an eighth variant for a terminal failure. Go surfaces that case the same way:
+///   the state stays `NeedsLogin`, and a separate `ipnstate.Status.ErrMessage` field carries the
+///   reason. The `error` return below is that field's analogue.
+/// - **`auth_url`** (2nd) — `Some(url)` **only** for `NeedsLogin(url)`: an interactive-login flow is
+///   pending and the operator must authorize the node at that URL. Always `None` otherwise.
+/// - **`error`** (3rd) — `Some(reason)` **only** for `Failed(e)`: registration hard-failed and the
+///   engine will not retry. It carries [`tailscale::RegistrationError`]'s `Display` string so a
+///   caller can report *why* (and, via [`RegistrationError::is_permanent`](tailscale::RegistrationError::is_permanent),
+///   that it is terminal). Always `None` otherwise.
 ///
 /// This is the source of truth when a device exists: the engine knows about interactive-login,
 /// key-expiry, and hard registration failure — distinctions netmap-presence alone cannot make.
-/// - `Connecting` → `Starting` (registering; the netmap stream is not yet live).
-/// - `Running` → `Running`. The engine publishes `Running` only once "registered and the netmap
-///   stream is live" (per its `DeviceState` doc), so it already implies the node is up — we do not
-///   second-guess it with a separate self-node check.
+/// - `Connecting` → `Starting` (registering; the netmap stream is not yet live), no url, no error.
+/// - `Running` → `Running`, no url, no error. The engine publishes `Running` only once "registered
+///   and the netmap stream is live" (per its `DeviceState` doc), so it already implies the node is
+///   up — we do not second-guess it with a separate self-node check.
 /// - `NeedsLogin(url)` → [`State::NeedsLogin`] **carrying the auth URL** — an `up` without a usable
 ///   auth key needs a human to authorize the node at that URL (the interactive-login flow).
-/// - `Expired` → [`State::NeedsLogin`] (the node key expired; re-auth required; the engine carries
-///   no URL here, so the operator re-runs `tnet up`).
-/// - `Failed(_)` → [`State::NeedsLogin`] (permanent registration failure, e.g. a bad auth key; not
-///   retried by the engine — surfaced as needs-login so the operator re-authenticates).
-fn state_from_device(ds: tailscale::DeviceState) -> (State, Option<String>) {
+/// - `Expired` → [`State::NeedsLogin`] with **no url and no error**: an expired node key is a
+///   re-auth *prompt*, not a hard failure (the operator simply re-runs `tnet up`); the engine
+///   carries no URL here, and we deliberately do not populate `error` so an expiry never looks like
+///   a terminal registration failure.
+/// - `Failed(e)` → [`State::NeedsLogin`] with **no url** but **`error = Some(e.to_string())`**: a
+///   permanent registration failure (e.g. a bad/expired/unknown auth key) the engine will NOT retry.
+///   The state stays `NeedsLogin` (no eighth `ipn.State`; see above), but `error` now carries the
+///   reason so the daemon/CLI can distinguish "interactive login pending" (`auth_url` set, transient)
+///   from "registration hard-failed" (`error` set, terminal). The absent `auth_url` is intentional:
+///   a hard failure must NOT masquerade as an interactive-login prompt.
+fn state_from_device(ds: tailscale::DeviceState) -> (State, Option<String>, Option<String>) {
     use tailscale::DeviceState;
     match ds {
-        DeviceState::Running => (State::Running, None),
-        DeviceState::Connecting => (State::Starting, None),
-        DeviceState::NeedsLogin(url) => (State::NeedsLogin, Some(url.to_string())),
-        DeviceState::Expired => (State::NeedsLogin, None),
-        DeviceState::Failed(_) => (State::NeedsLogin, None),
+        DeviceState::Running => (State::Running, None, None),
+        DeviceState::Connecting => (State::Starting, None, None),
+        DeviceState::NeedsLogin(url) => (State::NeedsLogin, Some(url.to_string()), None),
+        // Key expiry is a re-auth prompt, not a hard failure: NeedsLogin with no url and no error
+        // (an expiry must not be reported as a terminal registration failure).
+        DeviceState::Expired => (State::NeedsLogin, None, None),
+        // Terminal registration failure (the engine will not retry): keep the state mapped to
+        // NeedsLogin (we add no eighth ipn.State — Go surfaces this via a separate ErrMessage
+        // field), but carry `RegistrationError`'s Display string in the `error` field so the
+        // daemon/CLI can tell a hard failure (error set, no auth_url) apart from interactive login
+        // (auth_url set, no error). No auth_url: a hard failure is not an interactive-login prompt.
+        DeviceState::Failed(e) => (State::NeedsLogin, None, Some(e.to_string())),
     }
 }
 
@@ -963,9 +990,12 @@ mod tests {
         }
     }
 
-    // `state_from_device` maps the engine's authoritative `DeviceState` → `(State, auth_url)`. It is
-    // the source of truth when a device exists, so the interactive-login URL surfacing and the
-    // expiry/failure→NeedsLogin collapse must not drift. Pure, so testable without a live engine.
+    // `state_from_device` maps the engine's authoritative `DeviceState` → `(State, auth_url, error)`.
+    // It is the source of truth when a device exists, so the interactive-login URL surfacing, the
+    // expiry→NeedsLogin collapse, and the terminal-failure→`error` surfacing must not drift. The
+    // `auth_url` and `error` outputs are mutually exclusive (interactive-login vs. hard failure) and
+    // every non-NeedsLogin(url)/non-Failed state carries neither. Pure, so testable without a live
+    // engine.
 
     // macOS picks an explicit free `utunN` (the engine default `tailscale0` is rejected, and a bare
     // `utun` fails tun-rs's unit parse). `if_addrs` is a macOS-only dependency, so this test — which
@@ -1004,36 +1034,139 @@ mod tests {
     #[test]
     fn device_running_is_running_no_url() {
         // The engine publishes `Running` only once "registered and the netmap stream is live", so it
-        // maps straight to `Running` (no separate self-node check).
-        let (st, url) = state_from_device(tailscale::DeviceState::Running);
+        // maps straight to `Running` (no separate self-node check). A healthy state carries neither
+        // an auth URL nor a failure reason.
+        let (st, url, err) = state_from_device(tailscale::DeviceState::Running);
         assert_eq!(st, State::Running);
         assert!(url.is_none());
+        assert!(err.is_none(), "Running is not a failure → no error reason");
     }
 
     #[test]
     fn device_connecting_is_starting() {
-        // Registering, netmap stream not yet live → still converging.
-        let (st, url) = state_from_device(tailscale::DeviceState::Connecting);
+        // Registering, netmap stream not yet live → still converging. Neither an auth URL nor a
+        // failure reason while merely converging.
+        let (st, url, err) = state_from_device(tailscale::DeviceState::Connecting);
         assert_eq!(st, State::Starting);
         assert!(url.is_none());
+        assert!(
+            err.is_none(),
+            "Connecting is not a failure → no error reason"
+        );
     }
 
     #[test]
     fn device_needs_login_carries_auth_url() {
         // The headline of interactive login: NeedsLogin(url) → State::NeedsLogin + the URL surfaced
-        // verbatim so the CLI can print a clickable login link.
+        // verbatim so the CLI can print a clickable login link. Interactive login is NOT a hard
+        // failure, so the `error` field stays empty (auth_url and error are mutually exclusive).
         let url: url::Url = "https://login.example.com/a/abc123".parse().unwrap();
-        let (st, out) = state_from_device(tailscale::DeviceState::NeedsLogin(url.clone()));
+        let (st, out, err) = state_from_device(tailscale::DeviceState::NeedsLogin(url.clone()));
         assert_eq!(st, State::NeedsLogin);
         assert_eq!(out.as_deref(), Some(url.as_str()));
+        assert!(
+            err.is_none(),
+            "interactive login carries an auth_url, not an error reason"
+        );
     }
 
     #[test]
     fn device_expired_is_needs_login_no_url() {
-        // Key expiry needs re-auth but the engine carries no URL here → NeedsLogin, no URL.
-        let (st, url) = state_from_device(tailscale::DeviceState::Expired);
+        // Key expiry needs re-auth but the engine carries no URL here → NeedsLogin, no URL. An
+        // expiry is a re-auth *prompt*, not a terminal failure, so `error` is also empty (it must
+        // NOT be reported like a hard registration failure).
+        let (st, url, err) = state_from_device(tailscale::DeviceState::Expired);
         assert_eq!(st, State::NeedsLogin);
         assert!(url.is_none());
+        assert!(
+            err.is_none(),
+            "key expiry is a re-auth prompt, not a terminal failure → no error reason"
+        );
+    }
+
+    #[test]
+    fn device_failed_carries_error_reason() {
+        // A terminal registration failure (bad/unknown auth key) the engine will NOT retry. The
+        // state still collapses to `NeedsLogin` (no eighth `ipn.State`; see `state_from_device`'s
+        // doc), but the failure must surface through the `error` field — and crucially NOT through
+        // `auth_url`, so a hard failure can never be mistaken for an interactive-login prompt.
+        let (st, url, err) = state_from_device(tailscale::DeviceState::Failed(
+            tailscale::RegistrationError::AuthRejected("bad auth key".into()),
+        ));
+        assert_eq!(st, State::NeedsLogin, "a hard failure maps to NeedsLogin");
+        assert!(
+            url.is_none(),
+            "a hard failure has NO login URL — it must not look like interactive login"
+        );
+        let reason = err.expect("a terminal failure must carry its reason in `error`");
+        // `RegistrationError::AuthRejected`'s Display is
+        // "authentication rejected by control: {0}", so it contains the inner reason verbatim.
+        assert!(
+            reason.contains("bad auth key"),
+            "the error must carry the rejection reason, got {reason:?}"
+        );
+    }
+
+    #[test]
+    fn device_failed_key_expired_carries_error() {
+        // The other terminal `RegistrationError` variant: an *expired* node key that surfaces as a
+        // hard `Failed` (distinct from the transient `DeviceState::Expired` re-auth prompt above).
+        // It likewise stays `NeedsLogin` with no auth_url, but populates `error` with the variant's
+        // Display string ("node key expired; re-authentication required").
+        let (st, url, err) = state_from_device(tailscale::DeviceState::Failed(
+            tailscale::RegistrationError::KeyExpired,
+        ));
+        assert_eq!(st, State::NeedsLogin);
+        assert!(
+            url.is_none(),
+            "a hard failure carries no interactive-login URL"
+        );
+        let reason = err.expect("a terminal failure must carry its reason in `error`");
+        assert!(
+            reason.contains("expired"),
+            "the error must describe the key-expiry failure, got {reason:?}"
+        );
+    }
+
+    #[test]
+    fn every_failed_variant_surfaces_via_error_never_auth_url() {
+        // Invariant guard for the two same-typed `Option<String>` outputs: **any** `Failed(_)`
+        // surfaces its reason through `error` and NEVER through `auth_url`, regardless of which
+        // `RegistrationError` it carries. This pins the field mapping against a transposition (the
+        // `state_from_device` doc says auth_url ⊕ error are mutually exclusive) and — crucially —
+        // covers the engine's *non-permanent* `Failed` arms (`NetworkUnreachable` / `Timeout` /
+        // the `RegistrationError::NeedsLogin` URL form) that the two tests above do not, since the
+        // engine really can publish a transient `DeviceState::Failed(NetworkUnreachable)` when the
+        // control session fails to come up. Whatever the variant, the daemon's contract today is:
+        // state == NeedsLogin, auth_url == None, error == Some(<Display>) — and the inner reason
+        // must be carried verbatim, never silently dropped or routed to auth_url.
+        let url: url::Url = "https://login.example.com/a/xyz".parse().unwrap();
+        let cases = [
+            tailscale::RegistrationError::AuthRejected("bad key".into()),
+            tailscale::RegistrationError::KeyExpired,
+            tailscale::RegistrationError::NeedsLogin(url),
+            tailscale::RegistrationError::NetworkUnreachable,
+            tailscale::RegistrationError::Timeout,
+        ];
+        for re in cases {
+            let expected_reason = re.to_string();
+            let (st, auth_url, error) =
+                state_from_device(tailscale::DeviceState::Failed(re.clone()));
+            assert_eq!(
+                st,
+                State::NeedsLogin,
+                "every Failed variant maps to NeedsLogin (no eighth ipn.State); variant {re:?}"
+            );
+            assert!(
+                auth_url.is_none(),
+                "a Failed variant must NEVER populate auth_url (transposition guard); variant {re:?}"
+            );
+            assert_eq!(
+                error.as_deref(),
+                Some(expected_reason.as_str()),
+                "a Failed variant must carry its Display reason verbatim in `error`; variant {re:?}"
+            );
+        }
     }
 
     #[test]
