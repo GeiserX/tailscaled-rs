@@ -25,6 +25,20 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.5.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.4.0...v0.5.0) (2026-06-09)
+
+
+### Features
+
+* **exit:** leak-safety guard + documented invariant (tsd-iqq.3) ([#19](https://github.com/GeiserX/tailscaled-rs/issues/19)) ([53bbd22](https://github.com/GeiserX/tailscaled-rs/commit/53bbd220aee2a837381b1748f9b9b3eda7d90e9b))
+* **set:** tnet set — live pref mutation without up/down (tsd-iqq.1) ([#15](https://github.com/GeiserX/tailscaled-rs/issues/15)) ([c918cc1](https://github.com/GeiserX/tailscaled-rs/commit/c918cc15fd4baf820d7df79c08e1e7d8bd9801ad))
+* **ssh:** Tailscale SSH server (tsd-46c) ([#17](https://github.com/GeiserX/tailscaled-rs/issues/17)) ([3b17972](https://github.com/GeiserX/tailscaled-rs/commit/3b1797280afa651199dfa3e5fa536030a18f58de))
+
+
+### Bug Fixes
+
+* **set:** preflight rebuilt config before tearing down the live device ([#18](https://github.com/GeiserX/tailscaled-rs/issues/18)) ([ee1f6b0](https://github.com/GeiserX/tailscaled-rs/commit/ee1f6b01f882d7e32031302253a342d2bc152f28))
+
 ## [0.4.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.3.1...v0.4.0) (2026-06-09)
 
 
