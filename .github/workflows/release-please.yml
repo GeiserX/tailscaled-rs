@@ -21,9 +21,15 @@
 #   breaking  → minor while < 1.0 (NOT a major bump), surfaced under "Changed"
 # so no extra config is needed to honor "breaking changes may land in a minor".
 #
-# Tag format: the v4 action defaults `include-v-in-tag: true`, emitting `v{version}`,
-# which lines up with release.yml's `tags: ['v*']` glob.  Do not change one without
-# the other or the tag → binaries chain breaks.
+# Tag format: release.yml triggers on the `v*` glob, so the tag MUST be `v{version}`
+# (e.g. `v0.2.0`) with no component prefix. Two config keys together produce that:
+#   include-v-in-tag: true          → prepend the `v`
+#   include-component-in-tag: false → DROP the `tailscaled-rs-` package prefix
+# Both live in release-please-config.json. The second is load-bearing and easy to
+# miss: in manifest mode `include-component-in-tag` DEFAULTS TO TRUE, which emits
+# `tailscaled-rs-v{version}` — that does NOT match `v*`, so release.yml never fires
+# and the GitHub Release ships with no binaries. Do not change the glob or either
+# key without the others, or the tag → binaries chain silently breaks.
 
 name: Release Please
 
