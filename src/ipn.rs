@@ -967,34 +967,34 @@ mod tests {
     // the source of truth when a device exists, so the interactive-login URL surfacing and the
     // expiry/failure→NeedsLogin collapse must not drift. Pure, so testable without a live engine.
 
-    #[cfg(feature = "tun")]
+    // macOS picks an explicit free `utunN` (the engine default `tailscale0` is rejected, and a bare
+    // `utun` fails tun-rs's unit parse). `if_addrs` is a macOS-only dependency, so this test — which
+    // references it — must be `target_os = "macos"`-gated at COMPILE time (a runtime `cfg!()` would
+    // still try to compile the `if_addrs` path on Linux, where the crate isn't present).
+    #[cfg(all(feature = "tun", target_os = "macos"))]
     #[test]
-    fn default_tun_name_is_free_utun_on_macos_else_none() {
-        // macOS needs an explicit free `utunN` (the engine default `tailscale0` is rejected, and a
-        // bare `utun` fails tun-rs's unit parse); other platforms defer to the engine default (None).
-        let got = default_tun_name();
-        if cfg!(target_os = "macos") {
-            let name = got.expect("macOS must pick a concrete utun name");
-            let n = name
-                .strip_prefix("utun")
-                .and_then(|s| s.parse::<u32>().ok())
-                .expect("name must be utun<N> with a numeric unit");
-            // The chosen index must be free: it must not be a utun currently on the host.
-            let used: std::collections::BTreeSet<u32> = if_addrs::get_if_addrs()
-                .map(|ifs| {
-                    ifs.into_iter()
-                        .filter_map(|i| {
-                            i.name
-                                .strip_prefix("utun")
-                                .and_then(|s| s.parse::<u32>().ok())
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            assert!(!used.contains(&n), "chosen utun{n} must be free");
-        } else {
-            assert_eq!(got, None);
-        }
+    fn default_tun_name_is_free_utun_on_macos() {
+        let name = default_tun_name().expect("macOS must pick a concrete utun name");
+        let n = name
+            .strip_prefix("utun")
+            .and_then(|s| s.parse::<u32>().ok())
+            .expect("name must be utun<N> with a numeric unit");
+        // The chosen index must be free: not a utun currently on the host.
+        let used: std::collections::BTreeSet<u32> = if_addrs::get_if_addrs()
+            .map(|ifs| {
+                ifs.into_iter()
+                    .filter_map(|i| i.name.strip_prefix("utun").and_then(|s| s.parse::<u32>().ok()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(!used.contains(&n), "chosen utun{n} must be free");
+    }
+
+    // On non-macOS the daemon defers to the engine's default name (None).
+    #[cfg(all(feature = "tun", not(target_os = "macos")))]
+    #[test]
+    fn default_tun_name_is_none_off_macos() {
+        assert_eq!(default_tun_name(), None);
     }
 
     #[test]
