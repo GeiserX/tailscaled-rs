@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.4.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.3.1...v0.4.0) (2026-06-09)
+
+
+### Features
+
+* **routing:** exit-node + advertise-exit-node + advertise-routes (tsd-hob, tsd-cmi) ([#13](https://github.com/GeiserX/tailscaled-rs/issues/13)) ([ceb8ec3](https://github.com/GeiserX/tailscaled-rs/commit/ceb8ec3c5bfe0b311a52b56dd8b71774d58afbfc))
+
 ## [0.3.1](https://github.com/GeiserX/tailscaled-rs/compare/v0.3.0...v0.3.1) (2026-06-09)
 
 
