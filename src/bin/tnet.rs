@@ -67,7 +67,7 @@ enum Command {
         tun_mtu: Option<u16>,
         /// Route this node's outbound traffic through a peer exit node, named by its tailnet IP or
         /// MagicDNS name (e.g. `100.64.0.9` or `exit-1`). Mutually exclusive with
-        /// `--exit-node-clear`; omitting both leaves the persisted exit-node setting unchanged.
+        /// `--clear-exit-node`; omitting both leaves the persisted exit-node setting unchanged.
         #[arg(long, value_name = "IP|NAME", conflicts_with = "clear_exit_node")]
         exit_node: Option<String>,
         /// Stop routing through any exit node (clears the exit-node setting). Use this instead of an
@@ -107,8 +107,8 @@ enum Command {
     },
 }
 
-/// Map the `--exit-node` / `--exit-node-clear` flag pair to the wire field's double `Option`.
-/// `--exit-node <sel>` → `Some(Some(sel))` (set it); `--exit-node-clear` → `Some(None)` (stop using
+/// Map the `--exit-node` / `--clear-exit-node` flag pair to the wire field's double `Option`.
+/// `--exit-node <sel>` → `Some(Some(sel))` (set it); `--clear-exit-node` → `Some(None)` (stop using
 /// an exit node); neither → `None` (leave the persisted pref unchanged). A set value wins if both
 /// somehow arrive, though clap's `conflicts_with` already guarantees they are never both present.
 fn resolve_exit_node(set: Option<String>, clear: bool) -> Option<Option<String>> {
@@ -190,7 +190,7 @@ async fn main() -> Result<()> {
                 },
                 tun_name,
                 tun_mtu,
-                // `--exit-node <sel>` sets, `--exit-node-clear` stops using one, neither leaves it
+                // `--exit-node <sel>` sets, `--clear-exit-node` stops using one, neither leaves it
                 // unchanged; clap's `conflicts_with` guarantees the two are never both set.
                 exit_node: resolve_exit_node(exit_node, clear_exit_node),
                 // `--advertise-exit-node`/`--no-advertise-exit-node` tri-state (mirrors `--tun`).
@@ -579,7 +579,7 @@ mod tests {
 
     #[test]
     fn resolve_exit_node_clear_and_unchanged() {
-        // `--exit-node-clear` → Some(None) (stop using one); neither flag → None (unchanged).
+        // `--clear-exit-node` → Some(None) (stop using one); neither flag → None (unchanged).
         assert_eq!(resolve_exit_node(None, true), Some(None));
         assert_eq!(resolve_exit_node(None, false), None);
     }
