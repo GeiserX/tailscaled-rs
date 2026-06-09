@@ -25,6 +25,18 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.3.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.2.2...v0.3.0) (2026-06-09)
+
+
+### Features
+
+* **status:** surface terminal registration failure distinctly (tsd-bml) ([#7](https://github.com/GeiserX/tailscaled-rs/issues/7)) ([46fe77d](https://github.com/GeiserX/tailscaled-rs/commit/46fe77d15da76f0aafd4aad6118b145ae098f204))
+
+
+### Bug Fixes
+
+* gate terminal-failure on is_permanent + harden installer symlinks ([#9](https://github.com/GeiserX/tailscaled-rs/issues/9)) ([8cef416](https://github.com/GeiserX/tailscaled-rs/commit/8cef4165bbe83eeb3d7cfa9bbd21552e36261af9))
+
 ## [0.2.2](https://github.com/GeiserX/tailscaled-rs/compare/v0.2.1...v0.2.2) (2026-06-09)
 
 
