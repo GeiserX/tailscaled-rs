@@ -2,7 +2,7 @@
 
 This lists the changes the downstream daemon (`tailscaled-rs`) needs from the `tailscale-rs`
 library to unblock end-to-end features. Each ask is self-contained, additive, and
-backward-compatible. Verified against the pinned engine rev `afa970c` (released `v0.6.6`).
+backward-compatible. Verified against the pinned engine rev `e126bba` (released `v0.6.9`).
 
 Ranked by leverage: #1 converts ~115 lines of already-written, CI-built, feature-gated daemon code
 into a working feature with a one-line change downstream.
@@ -143,50 +143,84 @@ default, the daemon workaround can be removed (it becomes a redundant no-op).
 
 ---
 
-## 6. (BLOCKER for macOS TUN) Host-route programming fails on macOS — EADDRNOTAVAIL (it is NOT the v6 /128)
+## 6. (BLOCKER for macOS TUN — ROOT-CAUSED + FIX PROVEN) `ROUTE_BIN` is the Linux path `/usr/sbin/route`; on macOS `route` is `/sbin/route`
 
-> **CORRECTION (re-verified on v0.6.9, supersedes the earlier v6 theory).** My first cut of this ask
-> blamed the IPv6 `/128`. **That was wrong** — I re-read v0.6.9 and `host_routes_from_node`
-> (`ts_runtime/src/tun_actor.rs:161-200`) is genuinely v4-only: it drops every `IpNet::V6`
-> (line 175) and returns `Vec<Ipv4Net>`, and `tun_config_from_control` (`tun_actor.rs:133-144`)
-> emits `prefix: IpNet::V4(prefix)` only. The `/128` that appears in the `route_updater` debug log
-> (`route_updater.rs:416`, "populating accepted routes") is logged *before* the v4-only filter and
-> never reaches a syscall. So the engine's caution was right; the v6 was a red herring.
+> **RESOLVED to a one-line root cause and proven end-to-end live (engine v0.6.9, e126bba).**
+> This supersedes BOTH earlier theories (the v6 `/128`, then the vaguer "host-route
+> programming order is off"). The actual bug is a single wrong constant.
 
-**Actual symptom (engine v0.6.9, fresh root run on macOS, explicit `--tun-name utun11` to rule out
-any utun-name/collision issue):** device is created, node reaches Running with a v4 tailnet IP, then
-the **host-route programming** step fails:
+**Root cause (one line).** `ts_host_net/src/macos.rs:26`:
+```rust
+const ROUTE_BIN: &str = "/usr/sbin/route";   // ← Linux/iproute2 path. WRONG on macOS.
 ```
-tun_rs::platform::macos::device: Os { code: 49, kind: AddrNotAvailable, message: "Can't assign requested address" }
-ts_runtime::tun_actor: host route programming failed; TUN idle (fail-closed) error=No such file or directory (os error 2)
+On macOS, `route(8)` ships at **`/sbin/route`** — there is **no** `/usr/sbin/route` (that path is
+Linux). So `apply_routes` → `run_route` → `Command::new("/usr/sbin/route").args(argv).status()?`
+returns `Err(ENOENT)`, which `?`-propagates out of `apply_routes` and is rendered as
+**"No such file or directory (os error 2)"** — the exact fatal string in the trace. The TunActor
+treats that `Err` as fatal and fail-closes (`host route programming failed; TUN idle`), tearing the
+interface down. (`scutil` is fine — it really is at `/usr/sbin/scutil`. Only `ROUTE_BIN` is wrong.)
+
+**The `code 49 AddrNotAvailable` is a RED HERRING — not fatal, not the engine's route shellout.** It
+is logged by *tun-rs's own* associated-route helper, which is a `log::warn!`, not an error return
+(`tun-rs-2.8.1/src/platform/macos/device.rs:85-87`):
+```rust
+if let Err(err) = siocaifaddr(ctl()?.as_raw_fd(), &req) { return Err(io::Error::from(err)); } // address assign — SUCCEEDS
+if let Err(e) = self.add_route(addr.into(), mask.into(), associate_route) { log::warn!("{e:?}"); } // ← code 49, SWALLOWED as warn
 ```
-The utun is torn down (fail-closed), so the node is Running on the control plane with no working
-tunnel. Reproduces 100% on macOS (Darwin 25.x). The rejected assignment is a **v4** host
-route/address (the v6 is already dropped) — most likely a `/32` (e.g. the MagicDNS
-`100.100.100.100/32` steered into the TUN at `tun_actor.rs:~197`, or a non-self host `/32`), and the
-follow-on `os error 2` suggests the programming sequence/order is off (e.g. adding a route before the
-interface address/`ifconfig … up`, or using a route op macOS rejects for an on-link `/32`).
+tun-rs assigns the interface `/32` via `SIOCAIFADDR` successfully (it would `return Err` otherwise),
+then its *own* `route_manager` `RTM_ADD` for the on-link `/32` warns `EADDRNOTAVAIL` and is ignored.
+The device is created fine. This warn is unrelated to the fatal `os error 2`.
 
-**Answer to the engine lane's question (where the daemon builds the TUN Config / where the prefix
-comes from):** the daemon does **NOT** construct `ts_transport_tun::Config` and supplies **no prefix
-at all**. It builds the *facade* `tailscale::Config` and sets
-`transport_mode = TransportMode::Tun(TunConfig { name, mtu })` — and `TunConfig` (v0.6.9) has only
-`name: Option<String>` + `mtu: Option<u16>`, **no prefix field**. So every prefix/route in the TUN
-path (`/32`, the MagicDNS `/32`, any `/0`) is derived **inside the engine** from
-`node.tailnet_address` / `node.accepted_routes` via `tun_config_from_control` +
-`host_routes_from_node`. The daemon cannot be the source and cannot work around this.
+**The fix (one line):**
+```rust
+/// `route(8)` binary path. On macOS `route` lives in `/sbin`, NOT `/usr/sbin`.
+const ROUTE_BIN: &str = "/sbin/route";
+```
 
-**Repro for the engine lane:** macOS, root, `--features tun`. `tnet up --tun` (or `--tun-name utun11`).
-Watch with `TAILNETD_LOG='info,ts_runtime::tun_actor=trace,ts_transport_tun=trace,tun_rs=trace'`. You
-will see device-up succeed, then the `code 49 AddrNotAvailable` from `tun_rs::platform::macos::device`
-during host-route programming, then the fail-closed teardown.
+**Proof it is correct — verified live on this macOS box (Darwin 25.x), engine v0.6.9 patched to
+`/sbin/route`, real tailnet:**
+- `command -v route` → `/sbin/route`; `/usr/sbin/route` → does not exist (ENOENT).
+- Direct OS check, current (broken) path: `sudo /usr/sbin/route … add …` → `command not found`.
+- Direct OS check, fixed path: `sudo /sbin/route -n get -inet 100.100.100.100` → exit 0.
+- With the patched engine, `tnet up --tun --tun-name utun11`:
+  - `state: Running`, self `100.99.101.81`, 19 peers.
+  - log reaches `ts_runtime::tun_actor: TUN device created prefix=100.99.101.81/32` — that line is
+    the **last** statement in the StateUpdate handler (`tun_actor.rs:759`), only reached **after**
+    `apply_routes` returns `Ok`. **No `os error 2`, no `host route programming failed`, no
+    fail-closed teardown.** The exact pre-fix failure is gone.
+  - the `route(8)` invocation now actually runs (its own stdout `add net 100.100.100.100: gateway
+    utun11` appears in the log — proof the binary was found and executed).
+  - `ifconfig utun11` → `inet 100.99.101.81 --> 100.99.101.81 netmask 0xffffffff`, MTU 1280.
+  - clean RAII teardown on `tnet down`: utun11 removed, zero leftover routes.
 
-**Ask:** debug the macOS host-route/address programming in `ts_host_net` (the macOS impl behind
-`HostNet`) + `tun_rs` device — specifically the order of operations and which v4 `/32` assignment
-draws `EADDRNOTAVAIL`. Likely fixes: bring the interface address up before adding on-link `/32`
-routes, or use the correct macOS route/ifconfig syscall for an on-link host route. You have the
-source + macOS to repro; this is squarely an engine-side platform-integration bug.
+**`route add` on an already-present route is NOT a second bug.** macOS `/sbin/route -n -q add` returns
+**exit 0 even when it prints "File exists"** (EEXIST) — verified directly (`add` twice → both exit 0).
+So `run_route`'s `status.success()` check passes whether the route is new or pre-existing; no extra
+EEXIST tolerance is needed in `apply_routes`. (`expand_routes` already handles the `/0` EEXIST case
+separately; the per-`/32` adds are naturally idempotent at the `route(8)` exit-code level.)
 
-**Downstream:** daemon-side is complete (device name fix #5 landed; daemon supplies no prefix). macOS
-TUN is blocked here. **Linux TUN is untested** from this lane — it may already work (Linux host-route
-programming differs); worth a Linux check independent of this macOS bug.
+**Answer to the engine lane's earlier question (where the daemon builds the TUN Config / the prefix):**
+the daemon does **NOT** construct `ts_transport_tun::Config` and supplies **no prefix** — it sets the
+facade `transport_mode = TransportMode::Tun(TunConfig { name, mtu })` (only `name` + `mtu`, no prefix
+field). Every prefix/route is derived inside the engine from `node.tailnet_address` /
+`node.accepted_routes`. So this was never a daemon-side issue — confirming your instinct not to patch
+blind. It's the one wrong constant above.
+
+**Repro for the engine lane (to re-confirm after patching):** macOS, root, `--features tun`,
+`tnet up --tun --tun-name utunNN` with `TAILNETD_LOG='info,ts_runtime::tun_actor=trace,ts_host_net=trace,tun_rs=debug'`.
+Pre-fix: dies at `host route programming failed … os error 2`. Post-fix: reaches `TUN device created`
+and `Running`. NOTE: if you test on a box that **already runs real Tailscale**, the host's existing
+`utun` owns the whole `100.x` CGNAT range, so a *second* node's peer `/32`s lose the route race and
+end-to-end ping won't traverse the new utun — that's a test-host artifact, not an engine bug. Test on
+a box with no other Tailscale, or just assert the bring-up reaches Running + `TUN device created`
+without the `os error 2`.
+
+**Ask:** change `ROUTE_BIN` from `/usr/sbin/route` to `/sbin/route` in `ts_host_net/src/macos.rs`.
+That's the entire fix. (Optional hardening, not required: resolve `route` via `PATH`/both-paths
+fallback so it's robust to layout differences — but the absolute `/sbin/route` matches what Go
+`tailscaled`'s `router_darwin` and `wireguard-apple` use, so a bare constant is fine.)
+
+**Downstream:** daemon-side is complete (name fix #5 landed; daemon supplies no prefix). After this
+lands + a release is cut, the daemon drops the temporary local `paths` override and bumps the pin.
+**Linux TUN** uses bare `ip`/`resolvectl` (PATH-resolved) — unaffected by this; still untested from
+this lane but has no analogous hardcoded-path trap.
