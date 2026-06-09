@@ -86,7 +86,7 @@ sudo packaging/macos/install.sh /path/to/tailnetd
 
 ```mermaid
 flowchart LR
-    INST["sudo macos/install.sh<br/>[path-to-tailnetd]"] --> B["install → /usr/local/bin/tailnetd"]
+    INST["sudo packaging/macos/install.sh<br/>[path-to-tailnetd]"] --> B["install → /usr/local/bin/tailnetd"]
     B --> P["plist → /Library/LaunchDaemons<br/>(root:wheel 0644)"]
     P --> S["mkdir /usr/local/var/tailnetd<br/>(0700 root:wheel)"]
     S --> L["launchctl bootstrap system …<br/>(legacy: launchctl load -w)"]

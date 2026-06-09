@@ -131,6 +131,12 @@ fi
 if [ ! -e "${LOG_ERR}" ]; then
     install -m 0640 -o root -g wheel /dev/null "${LOG_ERR}"
 fi
+# Enforce the secure mode/ownership UNCONDITIONALLY, not just on first creation: a log left over
+# from a prior run (or created by another tool) with looser perms would otherwise stay
+# world/group-readable, and these logs can carry node identifiers. Re-applying is cheap and keeps
+# the installer idempotent in the security-relevant sense too.
+chown root:wheel "${LOG_OUT}" "${LOG_ERR}"
+chmod 0640 "${LOG_OUT}" "${LOG_ERR}"
 
 # ---------------------------------------------------------------------------------------------
 # 6. Load (or reload) the daemon.
@@ -147,12 +153,31 @@ elif launchctl print "system/${LABEL}" >/dev/null 2>&1; then
     # Already loaded (this is a re-install): rebootstrap so the new plist takes effect, then
     # restart the service from the freshly-installed binary.
     echo "    already loaded — reloading to pick up the updated plist/binary ..."
+    # `bootout` may legitimately fail if the service is mid-teardown / not currently loaded — that
+    # is harmless, so it stays tolerant. But the re-`bootstrap` is the load that actually matters,
+    # so we must NOT mask its failure and then claim success (that would leave the daemon unloaded
+    # while reporting a clean install). If re-bootstrap fails, confirm the service is loaded by
+    # another route (`launchctl print`); only then is a kickstart-restart enough. If it is neither
+    # bootstrapped nor present, fail loudly so the operator knows the install did not take.
     launchctl bootout "system/${LABEL}" 2>/dev/null || true
-    if ! launchctl bootstrap system "${PLIST_DEST}" 2>/dev/null; then
-        echo "    note: re-bootstrap returned non-zero; kickstarting the existing service instead." >&2
+    if launchctl bootstrap system "${PLIST_DEST}" 2>/dev/null; then
+        launchctl kickstart -k "system/${LABEL}" 2>/dev/null || true
+        echo "    reloaded."
+    elif launchctl print "system/${LABEL}" >/dev/null 2>&1; then
+        # Re-bootstrap was rejected but the service is still loaded (e.g. bootout did not fully
+        # settle before bootstrap ran): restart it in place so it picks up the new binary/plist.
+        launchctl kickstart -k "system/${LABEL}" 2>/dev/null || true
+        echo "    reloaded (restarted existing service)."
+    else
+        echo "error: failed to reload the daemon — re-bootstrap was rejected and the service is" >&2
+        echo "       not loaded. The binary and plist are installed at:" >&2
+        echo "           ${BIN_DEST}" >&2
+        echo "           ${PLIST_DEST}" >&2
+        echo "       Load it manually and inspect the error:" >&2
+        echo "           sudo launchctl bootstrap system ${PLIST_DEST}" >&2
+        echo "           sudo launchctl print system/${LABEL}" >&2
+        exit 1
     fi
-    launchctl kickstart -k "system/${LABEL}" 2>/dev/null || true
-    echo "    reloaded."
 else
     # `bootstrap` itself is unsupported on this (older) macOS — use the legacy loader.
     echo "    'launchctl bootstrap' unavailable — falling back to 'launchctl load -w' ..."
