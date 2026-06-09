@@ -44,6 +44,26 @@
 //!   feature, and only ever started when the `ssh_enabled` pref is set. [`build_config`](Backend::build_config)
 //!   preflights both requirements and **fails the bring-up loudly** if SSH was requested without the
 //!   feature, or without root (the engine needs root to drop privileges) — never a silent no-SSH node.
+//!
+//! ## Exit-node leak-safety invariant (tsd-iqq.3)
+//!
+//! The project's hard constraint is leak-free residential egress: when an exit node is in use, the
+//! destination must see the exit's IP, never this host's real IP, and DNS must not leak either. That
+//! invariant is satisfied by **construction**, split across the two transport modes:
+//!
+//! - **TUN mode** is the only OS-wide mode, and it is leak-safe: the engine captures the OS default
+//!   route AND takes over the OS resolver (points it at the in-datapath MagicDNS responder, which
+//!   delegates recursive resolution to the *exit node's* peerAPI DoH over the overlay — a fresh
+//!   overlay socket per query, v4-only, never a host socket). The daemon adds nothing here; the
+//!   engine's `ts_host_net` does the takeover (and ONLY in TUN mode).
+//! - **Netstack mode** (default) touches neither the OS default route nor the OS resolver, so it has
+//!   no OS-level leak surface — but it is also *not* machine-wide egress (only traffic apps send
+//!   through the daemon uses the exit). [`build_config`](Backend::build_config) emits a `warn!` when
+//!   an exit node is set without TUN, so the "this isn't whole-machine egress" gap is never silent.
+//!
+//! Consequently the dangerous "OS-wide exit with DNS leaking" configuration is **unreachable**: OS-
+//! wide capture *is* TUN mode, and TUN mode *is* where the engine performs the DNS takeover. No
+//! per-OS DNS subsystem is needed in the daemon — only the guard + this documented invariant.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -1006,6 +1026,30 @@ impl Backend {
         if let Some(s) = &self.prefs.exit_node {
             let sel: tailscale::ExitNodeSelector = s.parse().unwrap();
             config.exit_node = Some(sel);
+
+            // LEAK-SAFETY POSTURE (tsd-iqq.3). An exit node is leak-free ONLY when the OS-wide
+            // traffic + DNS actually traverse it. The two modes differ, and this is the one place
+            // both are visible, so surface the posture here rather than let an operator assume:
+            //
+            // - TUN mode (`tun_enabled`): the engine captures OS-wide traffic AND takes over the OS
+            //   resolver (points it at the in-datapath MagicDNS responder on `100.100.100.100` and
+            //   delegates recursive resolution to the *exit node's* peerAPI DoH over the overlay —
+            //   never a host socket, v4-only). So OS-wide exit is leak-safe: no real-origin-IP DNS
+            //   leak. Nothing for the daemon to add — the engine's `ts_host_net` does it (and only
+            //   in TUN mode; see `ts_runtime::tun_actor`).
+            // - Netstack mode (default, no TUN): the OS default route and resolver are UNTOUCHED, so
+            //   exit-node selection only affects traffic that apps send *through the daemon* (via
+            //   LocalAPI/loopback). It is NOT OS-wide and has no OS-level DNS-leak surface — but an
+            //   operator expecting "all my machine's traffic now exits residential" will NOT get
+            //   that without TUN. Warn so the expectation gap is visible, not silent.
+            if !self.prefs.tun_enabled {
+                tracing::warn!(
+                    "exit node configured in netstack mode (TUN off): only traffic routed THROUGH \
+                     this daemon uses the exit — the OS default route and resolver are untouched, \
+                     so this is NOT machine-wide egress. Enable TUN (`--tun`, root) for OS-wide, \
+                     DNS-leak-free exit."
+                );
+            }
         }
         config.advertise_exit_node = self.prefs.advertise_exit_node;
         // Advertised subnet routes: prefs store raw CIDR strings; parse each into `ipnet::IpNet`.
