@@ -39,10 +39,12 @@ on:
   workflow_dispatch: {}
 
 # release-please needs to open/maintain the release PR and, on merge, create the
-# release + tag.
+# release + tag. `actions: write` lets the post-release step dispatch release.yml
+# (the GITHUB_TOKEN recursion guard means the tag push alone won't trigger it).
 permissions:
   contents: write
   pull-requests: write
+  actions: write
 
 jobs:
   release-please:
@@ -50,9 +52,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: googleapis/release-please-action@v4
+        id: release
         with:
           # Manifest-driven config (the v4 action's preferred mode): the source of
           # truth is release-please-config.json + .release-please-manifest.json at
           # the repo root, which set release-type=rust and the current version.
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+      # Kick off the binary build (release.yml) when a release was just cut.
+      #
+      # Why we can't rely on release.yml's own `on: push: tags: ['v*']`: the tag is
+      # pushed by release-please using the workflow's GITHUB_TOKEN, and GitHub
+      # deliberately does NOT trigger further workflow runs from events made with
+      # GITHUB_TOKEN (recursion guard). So a release-please tag push lands silently
+      # and release.yml never fires — the Release ships with no binaries. Explicitly
+      # dispatching it here closes that gap without needing a PAT. (release.yml keeps
+      # its tag/dispatch triggers for manual re-runs.)
+      - name: Dispatch binary build for the new tag
+        if: ${{ steps.release.outputs.release_created }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag_name }}
+        run: gh workflow run release.yml --repo "${GITHUB_REPOSITORY}" --ref "${TAG}"
