@@ -983,7 +983,11 @@ mod tests {
         let used: std::collections::BTreeSet<u32> = if_addrs::get_if_addrs()
             .map(|ifs| {
                 ifs.into_iter()
-                    .filter_map(|i| i.name.strip_prefix("utun").and_then(|s| s.parse::<u32>().ok()))
+                    .filter_map(|i| {
+                        i.name
+                            .strip_prefix("utun")
+                            .and_then(|s| s.parse::<u32>().ok())
+                    })
                     .collect()
             })
             .unwrap_or_default();
