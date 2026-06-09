@@ -115,8 +115,24 @@ chmod 0644 "${PLIST_DEST}"
 #    unencrypted node key material — we do not want it under a non-root parent's default mode.
 # ---------------------------------------------------------------------------------------------
 echo "==> Creating state directory ${STATE_DIR} (0700 root:wheel) ..."
+# Symlink guard (TOCTOU/symlink-follow): /usr/local is typically owned by the non-root Homebrew
+# user, so a local attacker could pre-plant a symlink at ${STATE_DIR}. Running `chown`/`chmod` on a
+# symlink as root follows it and would retarget an arbitrary file. Refuse to operate on a symlinked
+# target rather than blindly chmod/chown through it.
+if [ -L "${STATE_DIR}" ]; then
+    echo "error: ${STATE_DIR} is a symlink; refusing to chown/chmod through it." >&2
+    echo "       Remove it and re-run: sudo rm -- '${STATE_DIR}' && sudo ${BASH_SOURCE[0]}" >&2
+    exit 1
+fi
 mkdir -p "${STATE_DIR}"
-chown root:wheel "${STATE_DIR}"
+# Re-check AFTER mkdir -p: a pre-existing symlink would have been followed by mkdir -p itself, so a
+# symlinked path that survived to here (target now exists) must still be rejected before we chown it.
+if [ -L "${STATE_DIR}" ]; then
+    echo "error: ${STATE_DIR} is a symlink after creation; refusing to chown/chmod through it." >&2
+    exit 1
+fi
+# `-h` so even a race that swaps the dir for a symlink between the check and here is not followed.
+chown -h root:wheel "${STATE_DIR}"
 chmod 0700 "${STATE_DIR}"
 
 # ---------------------------------------------------------------------------------------------
@@ -125,18 +141,23 @@ chmod 0700 "${STATE_DIR}"
 #    keep them off other local users' eyes. (Documented as a step in the README.)
 # ---------------------------------------------------------------------------------------------
 echo "==> Pre-creating log files ${LOG_OUT} and ${LOG_ERR} (0640 root:wheel) ..."
-if [ ! -e "${LOG_OUT}" ]; then
-    install -m 0640 -o root -g wheel /dev/null "${LOG_OUT}"
-fi
-if [ ! -e "${LOG_ERR}" ]; then
-    install -m 0640 -o root -g wheel /dev/null "${LOG_ERR}"
-fi
-# Enforce the secure mode/ownership UNCONDITIONALLY, not just on first creation: a log left over
-# from a prior run (or created by another tool) with looser perms would otherwise stay
-# world/group-readable, and these logs can carry node identifiers. Re-applying is cheap and keeps
-# the installer idempotent in the security-relevant sense too.
-chown root:wheel "${LOG_OUT}" "${LOG_ERR}"
-chmod 0640 "${LOG_OUT}" "${LOG_ERR}"
+# /var/log is root-owned, but harden the same way as the state dir: never chmod/chown THROUGH a
+# symlink as root (a planted symlink here could retarget an arbitrary file's mode/owner). Guard each
+# path, then apply secure mode+ownership UNCONDITIONALLY (not only on first creation) so a log left
+# from a prior run / another tool with looser perms cannot keep leaking node identifiers. `chown -h`
+# never follows a link even under a check→use race.
+for logf in "${LOG_OUT}" "${LOG_ERR}"; do
+    if [ -L "${logf}" ]; then
+        echo "error: ${logf} is a symlink; refusing to create/chown/chmod through it." >&2
+        echo "       Remove it and re-run: sudo rm -- '${logf}' && sudo ${BASH_SOURCE[0]}" >&2
+        exit 1
+    fi
+    if [ ! -e "${logf}" ]; then
+        install -m 0640 -o root -g wheel /dev/null "${logf}"
+    fi
+    chown -h root:wheel "${logf}"
+    chmod 0640 "${logf}"
+done
 
 # ---------------------------------------------------------------------------------------------
 # 6. Load (or reload) the daemon.
