@@ -442,6 +442,7 @@ async fn dispatch(
             exit_node,
             advertise_exit_node,
             advertise_routes,
+            ssh,
         } => {
             // Confine the plaintext authkey to the smallest scope: wrap it into a `SecretString`
             // right at the boundary and hand the engine path the secret. (The wire type stays
@@ -458,6 +459,7 @@ async fn dispatch(
                 exit_node,
                 advertise_exit_node,
                 advertise_routes,
+                ssh,
             };
             match ipn::drive_up(backend, authkey, opts).await {
                 Ok(()) => Response::Ok {
@@ -478,6 +480,7 @@ async fn dispatch(
             exit_node,
             advertise_exit_node,
             advertise_routes,
+            ssh,
         } => {
             let opts = ipn::SetOptions {
                 hostname,
@@ -485,6 +488,7 @@ async fn dispatch(
                 exit_node,
                 advertise_exit_node,
                 advertise_routes,
+                ssh,
             };
             // `tailscale set` with no flags names no prefs: reject it as a usage error before touching
             // the backend, rather than driving a no-op reconcile.

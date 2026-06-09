@@ -24,6 +24,26 @@
 //! state, so no path produces `NeedsMachineAuth`. `InUseOtherUser` is likewise unreachable in this
 //! single-user daemon (auth-key registration only, no interactive multi-profile login). Honest gaps
 //! over fabricated states.
+//!
+//! ## Tailscale SSH server (Phase 4, tsd-46c)
+//!
+//! When `prefs.ssh_enabled` is set, the backend runs the engine's turnkey, **fail-closed**
+//! `Device::listen_ssh` accept loop as a side task bound to the device's lifecycle:
+//!
+//! - **Spawn-on-install:** [`finish_up`](Backend::finish_up) spawns the SSH server task (an
+//!   [`Arc`](std::sync::Arc) clone of the just-installed [`Device`](tailscale::Device)) right after
+//!   installing the device, storing its [`JoinHandle`](tokio::task::JoinHandle) in
+//!   [`ssh_task`](Backend::ssh_task). The engine authorizes every connection against the
+//!   control-pushed SSH policy and drops privileges to the policy-mapped local user.
+//! - **Abort + reclaim-on-stop:** [`stop_device`](Backend::stop_device) **aborts** the SSH task and
+//!   awaits the aborted handle (so its `Arc` clone is gone), **then** reclaims the sole `Device` from
+//!   the `Arc` via [`Arc::into_inner`](std::sync::Arc::into_inner) for a graceful, bounded
+//!   `shutdown`. Toggling SSH via `set` on a running node takes the device-rebuild path (a brief
+//!   reconnect; see [`drive_set`]), which tears the task down and re-spawns it from the updated pref.
+//! - **Opt-in twice — build AND runtime:** the server task is compiled in only with the `ssh` cargo
+//!   feature, and only ever started when the `ssh_enabled` pref is set. [`build_config`](Backend::build_config)
+//!   preflights both requirements and **fails the bring-up loudly** if SSH was requested without the
+//!   feature, or without root (the engine needs root to drop privileges) — never a silent no-SSH node.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -125,10 +145,31 @@ pub async fn build_device(
 /// bring-up that was superseded before it could be installed). **Call this with NO backend lock
 /// held** — the shutdown awaits up to [`SHUTDOWN_TIMEOUT`], and doing it under the lock would
 /// reintroduce the head-of-line stall the begin/finish split removes. A no-op for `None`.
-pub async fn shutdown_orphan(orphan: Option<tailscale::Device>) {
+///
+/// The orphan arrives as an [`Arc`](std::sync::Arc) (the type [`Backend::device`] and `finish_up`
+/// now deal in), but a superseded orphan was **never installed and never SSH-spawned**, so the
+/// `Arc` is uniquely owned (refcount 1) and [`Arc::into_inner`](std::sync::Arc::into_inner) always
+/// returns the owned `Device` for a graceful, consuming `shutdown`. Should that invariant ever be
+/// violated (some other clone outlives this), we fall through to dropping the last `Arc` clone — the
+/// engine's `Runtime::drop` still kills its actors — rather than leaking.
+pub async fn shutdown_orphan(orphan: Option<std::sync::Arc<tailscale::Device>>) {
     if let Some(dev) = orphan {
-        // Best-effort, bounded; the engine's `Runtime::drop` also kills its actors if this times out.
-        let _ = dev.shutdown(Some(SHUTDOWN_TIMEOUT)).await;
+        match std::sync::Arc::into_inner(dev) {
+            // The normal path: a superseded orphan is uniquely owned, so we reclaim the `Device` and
+            // shut it down gracefully (bounded; the engine's `Runtime::drop` also kills its actors if
+            // this times out).
+            Some(owned) => {
+                let _ = owned.shutdown(Some(SHUTDOWN_TIMEOUT)).await;
+            }
+            // Unreachable for a true orphan (refcount 1, never SSH-spawned). If it ever happens,
+            // dropping the last clone still tears the engine down via `Runtime::drop` — never a leak.
+            None => {
+                tracing::warn!(
+                    "orphaned device Arc was not uniquely owned at shutdown; dropping (engine \
+                     Runtime::drop will still tear down its actors)"
+                );
+            }
+        }
     }
 }
 
@@ -187,12 +228,13 @@ pub async fn drive_up(
 /// 2. **Exit-node-only, node up** ([`SetAction::LiveExitNode`]) — the one change the engine applies
 ///    *live* (no reconnect) via [`tailscale::Device::set_exit_node`]. We re-acquire the lock just
 ///    long enough to issue that single actor message and await it. `set_exit_node` takes `&self`
-///    (not `&mut`), but [`tailscale::Device`] is **not** `Clone`/`Arc`-shareable (it owns a
-///    `Runtime` and `Mutex`es), so the call cannot be hoisted off-lock by cloning the handle —
-///    it runs under a brief lock. That is acceptable: it is a quick mailbox round-trip (re-resolve
-///    the selector against the live peer set + recompute routes), not the multi-second registration
-///    handshake the begin/finish split exists to keep off-lock. Only NEW flows use the new exit;
-///    in-flight connections are untouched (no teardown, no reconnect).
+///    (not `&mut`); the device is held behind an `Arc` (shared with the SSH task), so it *could* be
+///    cloned and hoisted off-lock — but we deliberately do NOT, because it is a quick mailbox
+///    round-trip (re-resolve the selector against the live peer set + recompute routes), not the
+///    multi-second registration handshake the begin/finish split exists to keep off-lock. Holding
+///    the brief lock for it keeps the code simple and the prefs-apply + live-set atomic under one
+///    lock. Only NEW flows use the new exit; in-flight connections are untouched (no teardown, no
+///    reconnect).
 /// 3. **Other prefs changed, node up** ([`SetAction::Rebuild`]) — `hostname` / `accept_routes` /
 ///    `advertise_*` are baked into the engine's *immutable* construction [`tailscale::Config`], so
 ///    the only way to apply them to a running node is to **rebuild the device** from the
@@ -217,9 +259,9 @@ pub async fn drive_set(
     opts: SetOptions,
 ) -> Result<()> {
     // Phase 1: brief lock — apply + persist the pref overrides and decide the reconcile path. For
-    // the live exit-node path we ALSO issue the live `set_exit_node` here (it needs the device, and
-    // the device is neither `Clone` nor `Arc`-shareable, so it must be called under the lock — but
-    // it is a quick actor message, not the off-lock-worthy registration handshake).
+    // the live exit-node path we ALSO issue the live `set_exit_node` here, under the same brief lock:
+    // it is a quick actor message (not the off-lock-worthy registration handshake), so we keep it
+    // atomic with the prefs-apply rather than hoisting it off-lock via the device's `Arc`.
     let action = {
         let mut be = backend.lock().await;
         be.begin_set(opts).await
@@ -303,6 +345,8 @@ pub struct UpOptions {
     /// Advertise-routes override. `None` leaves the pref unchanged; `Some(vec)` replaces the set
     /// (`Some(vec![])` clears it). A `Vec` alone could not express "unchanged", hence the `Option`.
     pub advertise_routes: Option<Vec<String>>,
+    /// Run-SSH-server override (`None` leaves the pref unchanged; `Some(b)` sets it).
+    pub ssh: Option<bool>,
 }
 
 /// Prefs to patch via [`Backend::set`] (the `tnet set` path) — the live-mutation analogue of
@@ -325,6 +369,10 @@ pub struct SetOptions {
     pub advertise_exit_node: Option<bool>,
     /// Subnet routes this node advertises (`None` unchanged; `Some(vec)` replaces).
     pub advertise_routes: Option<Vec<String>>,
+    /// Run the Tailscale SSH server (`None` unchanged; `Some(b)` sets it). Toggling SSH is a
+    /// device-rebuild change (the SSH server task is tied to the device lifecycle), so it takes the
+    /// [`SetAction::Rebuild`] path on a running node — not the live exit-node fast path.
+    pub ssh: Option<bool>,
 }
 
 impl SetOptions {
@@ -335,16 +383,21 @@ impl SetOptions {
             && self.exit_node.is_none()
             && self.advertise_exit_node.is_none()
             && self.advertise_routes.is_none()
+            && self.ssh.is_none()
     }
 
     /// Whether the ONLY change requested is the exit node — the case the engine can satisfy purely
-    /// live (via [`tailscale::Device::set_exit_node`]) with no device rebuild.
+    /// live (via [`tailscale::Device::set_exit_node`]) with no device rebuild. Note `ssh` is
+    /// deliberately part of this guard: toggling the SSH server is a device-lifecycle change (the
+    /// server task is bound to the device), so a `set` that touches `ssh` is NOT exit-node-only and
+    /// must take the rebuild path even if it also names an exit node.
     pub fn is_exit_node_only(&self) -> bool {
         self.exit_node.is_some()
             && self.hostname.is_none()
             && self.accept_routes.is_none()
             && self.advertise_exit_node.is_none()
             && self.advertise_routes.is_none()
+            && self.ssh.is_none()
     }
 }
 
@@ -354,7 +407,28 @@ pub struct Backend {
     prefs_path: PathBuf,
     key_path: PathBuf,
     /// The running engine, if up. `None` when stopped/needs-login.
-    device: Option<tailscale::Device>,
+    ///
+    /// Held behind an [`Arc`](std::sync::Arc) (not a bare `Device`) so the engine handle can be
+    /// **shared** with the long-lived Tailscale SSH server task ([`ssh_task`](Backend::ssh_task)):
+    /// the engine's `Device::listen_ssh` takes `self: Arc<Self>` (it runs an accept loop forever and
+    /// internally authorizes each connection against the control-pushed policy). Every existing
+    /// `&self` engine call (`ipv4_addr`/`status`/`device_state`/`watch_state`/`set_exit_node`) works
+    /// unchanged through `Arc`'s `Deref`; the only owned-`self` consumer is `Device::shutdown`, which
+    /// [`stop_device`](Backend::stop_device) reaches by *reclaiming* the unique `Device` from the
+    /// `Arc` (via [`Arc::into_inner`](std::sync::Arc::into_inner)) **after** aborting the SSH task so
+    /// its `Arc` clone is gone — see `stop_device`. When the `ssh` feature is off no clone is ever
+    /// made, so the `Arc` is always uniquely owned and reclaim is infallible.
+    device: Option<std::sync::Arc<tailscale::Device>>,
+    /// The spawned Tailscale SSH server task, when SSH is running (the node is up **and**
+    /// `prefs.ssh_enabled`); `None` otherwise. The task holds an [`Arc`](std::sync::Arc) clone of
+    /// [`device`](Backend::device) and runs the engine's `listen_ssh` accept loop, which never
+    /// returns under normal operation — so its lifecycle is bound to the device's: it is **spawned**
+    /// on install in [`finish_up`](Backend::finish_up) and **aborted** (then awaited) in
+    /// [`stop_device`](Backend::stop_device) before the device is reclaimed and shut down. Aborting
+    /// drops the task's `Arc` clone, which is what lets `stop_device` reclaim the sole `Device` from
+    /// the `Arc` for a graceful `shutdown`. Only ever populated in a daemon built with the `ssh`
+    /// cargo feature; without it, spawning is a no-op and this stays `None`.
+    ssh_task: Option<tokio::task::JoinHandle<()>>,
     /// Whether the node has ever been configured (brought `up`/`down`), distinguishing a fresh
     /// `NoState` from an explicit `Stopped`. Persists across restarts: it is derived in
     /// [`Backend::load`] from whether the prefs file exists on disk, not from the live process.
@@ -403,6 +477,7 @@ impl Backend {
             prefs_path,
             key_path,
             device: None,
+            ssh_task: None,
             ever_configured,
             generation: 0,
             boot_attempted_up: false,
@@ -588,8 +663,9 @@ impl Backend {
     ///   `ExitNodeSelector`, or `None` if cleared — the `FromStr` is infallible, see
     ///   [`build_config`](Backend::build_config)), then return [`SetAction::LiveExitNode`]. No
     ///   rebuild, no reconnect — the fast path that is the whole point of `set`. The actor message is
-    ///   awaited under the lock (the device is not `Clone`/`Arc`-shareable so it cannot be hoisted
-    ///   off-lock), but it is quick.
+    ///   awaited under the lock; the device's `Arc` could in principle be cloned to hoist it off-lock,
+    ///   but it is a quick mailbox round-trip, so we keep it atomic with the prefs-apply under the one
+    ///   brief lock instead.
     /// - **Device up AND other prefs changed** → [`SetAction::Rebuild`]: the caller must rebuild the
     ///   device from the updated prefs (the engine `Config` is immutable). A brief reconnect.
     ///
@@ -623,6 +699,15 @@ impl Backend {
         if let Some(routes) = opts.advertise_routes {
             self.prefs.advertise_routes = routes;
         }
+        // Run-SSH-server override. Toggling SSH is a device-lifecycle change (the server task is
+        // bound to the device), so on a running node it must take the Rebuild path, NOT the live
+        // exit-node fast path — `SetOptions::is_exit_node_only` already returns false whenever `ssh`
+        // is named (see its doc), so the reconcile match below routes a device-up `ssh` change to
+        // `Rebuild`, which on rebuild re-runs `finish_up` and (re)spawns the SSH task from the
+        // now-updated `ssh_enabled`. The brief reconnect is documented on `drive_set`.
+        if let Some(ssh) = opts.ssh {
+            self.prefs.ssh_enabled = ssh;
+        }
         // `set` is a policy-pref mutation, not a lifecycle change: deliberately do NOT touch
         // `want_running` / `logged_out` (that is `up`/`down`'s job). It still marks the node as
         // configured-at-least-once (a `set` on a never-touched node has now written prefs), matching
@@ -638,10 +723,11 @@ impl Backend {
             // (now-updated) pref into the engine selector; `None` (cleared) clears the exit node. The
             // `ExitNodeSelector` `FromStr` is infallible (bare IP → `Ip`, else `Name`), so `.parse()`
             // cannot fail — the `Err` is `core::convert::Infallible` (same total parse `build_config`
-            // relies on). The call is awaited under the (brief) lock the caller holds: the device is
-            // neither `Clone` nor `Arc`-shareable, so it cannot be hoisted off-lock — but this is a
-            // quick mailbox round-trip (re-resolve selector + recompute routes), not the multi-second
-            // registration handshake the off-lock split exists for. Only NEW flows use the new exit.
+            // relies on). The call is awaited under the (brief) lock the caller holds: the device's
+            // `Arc` could be cloned to hoist this off-lock, but it is a quick mailbox round-trip
+            // (re-resolve selector + recompute routes), not the multi-second registration handshake
+            // the off-lock split exists for, so we keep it atomic under the one lock. Only NEW flows
+            // use the new exit.
             Some(dev) if exit_node_only => {
                 let sel: Option<tailscale::ExitNodeSelector> =
                     self.prefs.exit_node.as_ref().map(|s| s.parse().unwrap());
@@ -707,6 +793,12 @@ impl Backend {
         if let Some(ar) = opts.advertise_routes {
             self.prefs.advertise_routes = ar;
         }
+        // Run-SSH-server override (same "unchanged unless named" sentinel). The actual SSH server
+        // task is spawned on install in `finish_up` when this is set; `build_config` (below) also
+        // preflights the feature/root requirements so an impossible `--ssh` fails the bring-up loudly.
+        if let Some(ssh) = opts.ssh {
+            self.prefs.ssh_enabled = ssh;
+        }
         self.prefs.want_running = true;
         self.prefs.logged_out = false;
         self.ever_configured = true;
@@ -741,27 +833,117 @@ impl Backend {
     ///
     /// Use [`finish_up_and_settle`](Backend::finish_up_and_settle) if you don't hold the lock yourself
     /// and just want the orphan shut down for you.
+    ///
+    /// ## SSH server task (spawn-on-install)
+    ///
+    /// When this attempt is current, the engine succeeded, AND `prefs.ssh_enabled` is set, this also
+    /// spawns the long-lived Tailscale SSH server task (a clone of the freshly-installed device's
+    /// [`Arc`](std::sync::Arc) running the engine's `listen_ssh` accept loop) and stores its
+    /// [`JoinHandle`](tokio::task::JoinHandle) in [`ssh_task`](Backend::ssh_task). The device is
+    /// wrapped in the `Arc` **before** the clone, so the task and the backend share one engine. The
+    /// spawn is compiled in only with the `ssh` cargo feature; without it, it is a no-op (and
+    /// [`build_config`](Backend::build_config) has already failed the bring-up loudly if SSH was
+    /// requested, so a feature-less daemon never reaches here with `ssh_enabled`). The task is torn
+    /// down (aborted, then the device reclaimed and shut down) by [`stop_device`](Backend::stop_device).
     #[must_use = "the returned orphan device must be shut down off-lock"]
     pub fn finish_up(
         &mut self,
         pending: PendingUp,
         device: Result<tailscale::Device>,
-    ) -> Result<Option<tailscale::Device>> {
+    ) -> Result<Option<std::sync::Arc<tailscale::Device>>> {
         if pending.generation != self.generation {
             // Superseded by a later up/down while we were handshaking. The newer intent is
-            // authoritative; hand any built device back to be torn down off-lock. A build error on a
-            // stale attempt is irrelevant (nothing to return).
+            // authoritative; hand any built device back (wrapped in the `Arc` the caller settles
+            // off-lock) to be torn down. A superseded build was never installed and never
+            // SSH-spawned, so its `Arc` is uniquely owned — `shutdown_orphan` reclaims it. A build
+            // error on a stale attempt is irrelevant (nothing to return).
             tracing::debug!(
                 stale_generation = pending.generation,
                 current_generation = self.generation,
                 "discarding superseded up() result"
             );
-            return Ok(device.ok());
+            return Ok(device.ok().map(std::sync::Arc::new));
         }
-        // `device` is already an `anyhow::Result` with engine context from `build_device`.
-        let device = device?;
-        self.device = Some(device);
+        // `device` is already an `anyhow::Result` with engine context from `build_device`. Wrap it in
+        // the `Arc` BEFORE any SSH-task clone so the task and the backend share one engine handle.
+        let device = std::sync::Arc::new(device?);
+        self.device = Some(device.clone());
+        // Spawn the SSH server task iff SSH is enabled (and the daemon was built with the `ssh`
+        // feature). It outlives this call, running the engine's fail-closed `listen_ssh` accept loop.
+        self.spawn_ssh_task(device);
         Ok(None)
+    }
+
+    /// Spawn the long-lived Tailscale SSH server task for a freshly-installed `device`, iff
+    /// `prefs.ssh_enabled`. Stores the [`JoinHandle`](tokio::task::JoinHandle) in
+    /// [`ssh_task`](Backend::ssh_task) so [`stop_device`](Backend::stop_device) can abort it.
+    ///
+    /// The task takes the device's [`Arc`](std::sync::Arc) clone and calls the engine's `listen_ssh`,
+    /// which binds the node's tailnet IPv4 on port 22 and serves an accept loop **forever**,
+    /// authorizing every connection against the control-pushed SSH policy (fail-closed) and dropping
+    /// privileges to the policy-mapped local user. `listen_ssh` only returns on a bind/setup error,
+    /// which we log; the loop is otherwise terminated by the abort in `stop_device` (which also drops
+    /// this task's `Arc` clone, letting `stop_device` reclaim and gracefully shut down the device).
+    ///
+    /// With the `ssh` cargo feature **off** this is an unconditional no-op: the `device` is dropped
+    /// here, no task is spawned, and `ssh_task` stays `None`. That is safe because
+    /// [`build_config`](Backend::build_config) fails the bring-up loudly when `ssh_enabled` is set
+    /// without the feature, so this is never reached with `ssh_enabled` in a feature-less daemon.
+    #[allow(unused_variables)] // `device` is unused when the `ssh` feature is off.
+    fn spawn_ssh_task(&mut self, device: std::sync::Arc<tailscale::Device>) {
+        // The `ssh_enabled` guard lives INSIDE the feature block so the no-`ssh`-feature build has an
+        // empty body (no spawn, no dangling `return`); the device is simply dropped here.
+        #[cfg(feature = "ssh")]
+        {
+            if !self.prefs.ssh_enabled {
+                return;
+            }
+            use tailscale::ssh::russh;
+            // A fresh, ephemeral Ed25519 host key per server start (the engine example's recipe).
+            // `russh::keys::PrivateKey` is `ssh-key`'s key type and `random` needs a CSPRNG; we use
+            // `rand::rng()` (a ChaCha-based `ThreadRng` seeded from OS entropy) exactly as the engine
+            // example does. Generation cannot realistically fail for Ed25519, but if it ever did we
+            // FAIL CLOSED: log and do NOT spawn (no insecure fallback host key).
+            let host_key = match russh::keys::PrivateKey::random(
+                &mut rand::rng(),
+                russh::keys::Algorithm::Ed25519,
+            ) {
+                Ok(k) => k,
+                Err(e) => {
+                    tracing::error!(error = ?e, "ssh: failed to generate host key; SSH server NOT started");
+                    return;
+                }
+            };
+            let config = russh::server::Config {
+                keys: vec![host_key],
+                // Authentication is the control-pushed SSH policy enforced inside the engine
+                // (`Device::authorize_ssh`), not an SSH userauth method — so the wire offers `none`,
+                // exactly like the engine example. The real gate is the fail-closed policy check.
+                methods: russh::MethodSet::from(&[russh::MethodKind::None][..]),
+                nodelay: true,
+                ..Default::default()
+            };
+            let handle = tokio::spawn(async move {
+                // Bind on the node's own tailnet IPv4:22. `ipv4_addr` only resolves once the netmap
+                // has assigned an address, so it may briefly wait; an error here means we never got
+                // one (engine torn down) — log and exit the task.
+                let ipv4 = match device.ipv4_addr().await {
+                    Ok(ip) => ip,
+                    Err(e) => {
+                        tracing::error!(error = ?e, "ssh: could not resolve tailnet IPv4; SSH server not started");
+                        return;
+                    }
+                };
+                let listen_addr = std::net::SocketAddr::from((ipv4, 22));
+                tracing::info!(%listen_addr, "starting Tailscale SSH server");
+                // Runs the accept loop forever; only returns on a bind/setup error (or when this task
+                // is aborted by `stop_device`, which drops the future). Either way, log the outcome.
+                if let Err(e) = device.listen_ssh(config, listen_addr).await {
+                    tracing::error!(error = ?e, "ssh: server exited with error");
+                }
+            });
+            self.ssh_task = Some(handle);
+        }
     }
 
     /// Translate current [`Prefs`] + the on-disk key file into a [`tailscale::Config`] for the
@@ -882,6 +1064,38 @@ impl Backend {
                     name: tun_name,
                     mtu: self.prefs.tun_mtu,
                 });
+            }
+        }
+        // Tailscale SSH server preflight. Unlike TUN, SSH is NOT an engine `Config` knob — the server
+        // is a daemon-spawned task (see `spawn_ssh_task`), so `ssh_enabled` sets NO field on
+        // `config`. It only gates the spawn, plus these two fail-loud preflights mirroring TUN's, so
+        // an impossible `--ssh` fails the bring-up here rather than silently doing nothing:
+        // (a) built without the `ssh` cargo feature → there is no server to spawn; and
+        // (b) running as non-root → the engine's `listen_ssh` must drop privileges to the
+        //     policy-mapped local user, which requires root, so the session would fail closed.
+        // Both fail loudly here (never a silent no-SSH node when SSH was explicitly requested).
+        if self.prefs.ssh_enabled {
+            #[cfg(not(feature = "ssh"))]
+            {
+                return Err(anyhow!(
+                    "SSH requested (ssh_enabled) but this daemon was built without the `ssh` \
+                     feature; rebuild with `cargo build --features ssh` (and run as root) to use it"
+                ));
+            }
+            #[cfg(feature = "ssh")]
+            {
+                // Privilege preflight: the engine's `listen_ssh` drops privileges to the
+                // policy-mapped local user and so requires root; surface that here with actionable
+                // context before the handshake starts.
+                #[cfg(unix)]
+                // SAFETY: geteuid() is infallible (no args, no preconditions).
+                if unsafe { libc::geteuid() } != 0 {
+                    return Err(anyhow!(
+                        "Tailscale SSH server requires root to drop privileges to the policy-mapped \
+                         local user, but the daemon is not running as root. Run tailnetd as root \
+                         (the packaged systemd/launchd units do) to use --ssh"
+                    ));
+                }
             }
         }
         Ok(config)
@@ -1036,10 +1250,50 @@ impl Backend {
         self.stop_device().await;
     }
 
+    /// Tear down the live engine (and its SSH server task, if any), gracefully and bounded.
+    ///
+    /// ## Order matters (abort SSH, *then* reclaim the device)
+    ///
+    /// The SSH server task holds an [`Arc`](std::sync::Arc) clone of the device, so the backend is
+    /// NOT the sole owner while it runs. We therefore tear down in two steps:
+    ///
+    /// 1. **Abort the SSH task and `await` the aborted handle.** `abort()` requests cancellation;
+    ///    awaiting the handle blocks until the task has actually stopped (it resolves to a
+    ///    `JoinError` reporting the cancel, which we ignore). This `await` is the load-bearing
+    ///    guarantee: once it returns, the task — and thus its `Arc` clone of the device — is gone.
+    /// 2. **Reclaim the sole `Device` from the `Arc`** via [`Arc::into_inner`](std::sync::Arc::into_inner)
+    ///    and call the consuming `Device::shutdown` (bounded by [`SHUTDOWN_TIMEOUT`] so a wedged
+    ///    engine can't hang the daemon). The abort+await in step 1 makes `into_inner` return `Some`
+    ///    in the normal path; if it somehow returns `None` (a clone unexpectedly outlived the abort),
+    ///    we log and drop — the engine's `Runtime::drop` still kills its actors — rather than leak.
+    ///    With the `ssh` feature off there is never a clone, so reclaim is trivially infallible.
     async fn stop_device(&mut self) {
+        // Step 1: stop the SSH server task first so its `Arc` clone of the device is released before
+        // we try to reclaim sole ownership. Aborting an already-finished task is harmless.
+        if let Some(task) = self.ssh_task.take() {
+            task.abort();
+            // Await the aborted handle so the task (and its `Arc` clone) is truly gone before we
+            // reclaim the device. The result is the expected cancellation `JoinError` — ignore it.
+            let _ = task.await;
+        }
+        // Step 2: reclaim and gracefully shut down the engine. After the abort+await above, the
+        // backend holds the only `Arc`, so `into_inner` yields the owned `Device` for `shutdown`.
         if let Some(dev) = self.device.take() {
-            // `shutdown` consumes the device; bounded so a wedged engine can't hang the daemon.
-            let _ = dev.shutdown(Some(SHUTDOWN_TIMEOUT)).await;
+            match std::sync::Arc::into_inner(dev) {
+                Some(owned) => {
+                    // `shutdown` consumes the device; bounded so a wedged engine can't hang the daemon.
+                    let _ = owned.shutdown(Some(SHUTDOWN_TIMEOUT)).await;
+                }
+                None => {
+                    // Should not happen after the SSH task was aborted and awaited above (the backend
+                    // is then the sole owner). Drop the last clone rather than leak — the engine's
+                    // `Runtime::drop` tears down its actors — but flag the unexpected sharing.
+                    tracing::warn!(
+                        "device Arc still shared at stop_device after aborting the SSH task; \
+                         dropping (engine Runtime::drop will tear down its actors)"
+                    );
+                }
+            }
         }
     }
 
@@ -1329,6 +1583,7 @@ mod tests {
             prefs_path: dir.join("prefs.json"),
             key_path: dir.join("node.key.json"),
             device: None,
+            ssh_task: None,
             ever_configured: false,
             generation: 0,
             boot_attempted_up: false,
@@ -1942,6 +2197,16 @@ mod tests {
             .is_empty(),
             "a named advertise_routes (even the clearing empty vec) is not empty"
         );
+        // An ssh-only `set` (toggle the SSH server) is a real change → NOT empty (so the server does
+        // not reject `tnet set --ssh` as a no-op).
+        assert!(
+            !SetOptions {
+                ssh: Some(true),
+                ..SetOptions::default()
+            }
+            .is_empty(),
+            "a named ssh toggle is not empty"
+        );
     }
 
     #[test]
@@ -1995,6 +2260,26 @@ mod tests {
             }
             .is_exit_node_only(),
             "a non-exit-node change is not exit-node-only"
+        );
+        // SSH is a device-lifecycle change, so it must take the REBUILD path, never the live
+        // exit-node fast path: an ssh-only set is not exit-node-only, and pairing ssh WITH an
+        // exit_node still is not (the ssh toggle forces a rebuild even alongside an exit-node change).
+        assert!(
+            !SetOptions {
+                ssh: Some(true),
+                ..SetOptions::default()
+            }
+            .is_exit_node_only(),
+            "an ssh-only toggle is a device-lifecycle change → NOT exit-node-only"
+        );
+        assert!(
+            !SetOptions {
+                exit_node: Some(Some("100.64.0.9".into())),
+                ssh: Some(true),
+                ..SetOptions::default()
+            }
+            .is_exit_node_only(),
+            "exit_node + ssh must rebuild (ssh is bound to the device) → NOT exit-node-only"
         );
     }
 
@@ -2117,5 +2402,191 @@ mod tests {
             matches!(sel, tailscale::ExitNodeSelector::Name(_)),
             "any non-IP exit-node selector must parse to Name (never panic), got {sel:?}"
         );
+    }
+
+    // --- SSH server pref wiring + build_config preflight (tsd-46c) --------------------------------
+    //
+    // The SSH server is opt-in twice (build feature + runtime pref). These tests pin the PURE,
+    // offline surface: the `ssh` override sentinel through `begin_up`/`begin_set` (set/unchanged/
+    // clear, like every other pref), and the `build_config` preflight that fails the bring-up loudly
+    // when SSH is impossible. The actual spawn/abort lifecycle needs a live engine (integration
+    // territory), so it is NOT unit-tested here. All offline: a device-less backend does no engine I/O.
+
+    #[tokio::test]
+    async fn begin_up_applies_ssh_override() {
+        // The `UpOptions.ssh` sentinel through `begin_up`, exercised in the directions that do NOT
+        // require the `ssh` feature + root: `None` leaves `ssh_enabled` unchanged, and `Some(false)`
+        // disables it. (The ENABLE direction is NOT tested through `begin_up` here because `begin_up`
+        // builds Config internally, and `build_config`'s SSH preflight correctly fails an
+        // `ssh_enabled = true` bring-up without the feature/root — that preflight is pinned by its own
+        // tests, and the ENABLE *override semantics* are pinned via `begin_set` in
+        // `begin_set_applies_ssh_override_and_persisted_only_when_down`, which does no Config build.)
+        // Offline in every feature config: with `ssh_enabled` staying false, no SSH preflight fires.
+        let dir = std::env::temp_dir().join(format!("tailnetd-bu-ssh-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+        assert!(
+            !be.prefs.ssh_enabled,
+            "default prefs do not run the SSH server"
+        );
+
+        // A plain `up` (ssh: None) must leave ssh_enabled at its default (false).
+        let _ = be
+            .begin_up(UpOptions::default())
+            .await
+            .expect("begin_up unchanged");
+        assert!(
+            !be.prefs.ssh_enabled,
+            "a None ssh override must leave ssh_enabled unchanged"
+        );
+
+        // Seed ssh_enabled = true directly (bypassing the override path) so we can prove the
+        // `Some(false)` override DISABLES it — without needing the feature/root an ENABLE would.
+        be.prefs.ssh_enabled = true;
+        let _ = be
+            .begin_up(UpOptions {
+                ssh: Some(false),
+                ..UpOptions::default()
+            })
+            .await
+            .expect("begin_up disable ssh");
+        assert!(
+            !be.prefs.ssh_enabled,
+            "Some(false) must disable ssh_enabled"
+        );
+
+        // And a follow-up `None` override must preserve the now-disabled state.
+        let _ = be
+            .begin_up(UpOptions::default())
+            .await
+            .expect("begin_up unchanged after disable");
+        assert!(
+            !be.prefs.ssh_enabled,
+            "a None ssh override must preserve the disabled ssh_enabled"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn begin_set_applies_ssh_override_and_persisted_only_when_down() {
+        // `begin_set` applies the `ssh` override with the same sentinel and, with NO device up,
+        // returns `PersistedOnly` (the persist is the whole job; the toggle takes effect on the next
+        // `up`). `begin_set` does NOT build Config, so this is safe in every feature config (no root
+        // needed). Drives ENABLE → no-op (unchanged) → DISABLE.
+        let dir = std::env::temp_dir().join(format!("tailnetd-set-ssh-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+        assert!(!be.prefs.ssh_enabled);
+
+        // ENABLE.
+        let action = be
+            .begin_set(SetOptions {
+                ssh: Some(true),
+                ..SetOptions::default()
+            })
+            .await
+            .expect("begin_set enable ssh");
+        assert_eq!(
+            action,
+            SetAction::PersistedOnly,
+            "no device up → an ssh toggle just persists; it applies on next up"
+        );
+        assert!(be.prefs.ssh_enabled, "Some(true) must enable ssh_enabled");
+
+        // A no-op set (ssh: None) must leave it ENABLED.
+        be.begin_set(SetOptions {
+            accept_routes: Some(true),
+            ..SetOptions::default()
+        })
+        .await
+        .expect("begin_set unrelated change");
+        assert!(
+            be.prefs.ssh_enabled,
+            "a None ssh override must preserve the stored ssh_enabled"
+        );
+
+        // DISABLE.
+        be.begin_set(SetOptions {
+            ssh: Some(false),
+            ..SetOptions::default()
+        })
+        .await
+        .expect("begin_set disable ssh");
+        assert!(
+            !be.prefs.ssh_enabled,
+            "Some(false) must disable ssh_enabled"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    // `build_config`'s SSH preflight fails the bring-up LOUDLY when SSH is impossible. The error
+    // depends on the build: WITHOUT the `ssh` feature, *any* `ssh_enabled` is an error (there is no
+    // server to spawn); WITH it, the error is gated on running as non-root (the engine must drop
+    // privileges). We split into two feature-gated tests so each is meaningful in its own config.
+
+    #[cfg(not(feature = "ssh"))]
+    #[tokio::test]
+    async fn build_config_ssh_requested_without_feature_errors() {
+        // Default build (no `ssh` feature): `ssh_enabled = true` must make `build_config` fail with a
+        // message naming the missing feature — never a silent no-SSH node.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-bc-ssh-nofeat-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+        be.prefs.ssh_enabled = true;
+
+        // `tailscale::Config` is not `Debug`, so match by hand (cannot use `expect_err`).
+        let err = match be.build_config().await {
+            Ok(_) => panic!("ssh_enabled without the `ssh` feature must make build_config fail"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("ssh") && msg.contains("feature"),
+            "the error must name the missing `ssh` feature, got {msg:?}"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[cfg(all(feature = "ssh", unix))]
+    #[tokio::test]
+    async fn build_config_ssh_requires_root() {
+        // With the `ssh` feature on unix, `ssh_enabled` requires root (the engine drops privileges to
+        // the policy-mapped local user). Under a non-root test runner this must FAIL LOUDLY naming
+        // the root requirement; if the runner happens to be root, the preflight passes — assert the
+        // matching outcome for whichever euid the test runs under so it is correct either way.
+        let dir = std::env::temp_dir().join(format!("tailnetd-bc-ssh-root-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+        be.prefs.ssh_enabled = true;
+
+        // SAFETY: geteuid() is infallible (no args, no preconditions).
+        let is_root = unsafe { libc::geteuid() } == 0;
+        match be.build_config().await {
+            Ok(_) => assert!(
+                is_root,
+                "build_config may only succeed with ssh_enabled when running as root"
+            ),
+            Err(e) => {
+                assert!(
+                    !is_root,
+                    "as root, the SSH root-preflight must not fail; got error {e:#}"
+                );
+                let msg = format!("{e:#}");
+                assert!(
+                    msg.contains("root"),
+                    "the non-root SSH preflight error must name the root requirement, got {msg:?}"
+                );
+            }
+        }
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

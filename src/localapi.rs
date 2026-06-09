@@ -62,6 +62,10 @@ pub enum Request {
         /// replaces the set (`Some([])` clears).
         #[serde(default)]
         advertise_routes: Option<Vec<String>>,
+        /// Run the Tailscale SSH server (`None` leaves the pref unchanged; `Some(b)` sets it).
+        /// Requires a daemon built with the `ssh` feature + root; the daemon fails loudly otherwise.
+        #[serde(default)]
+        ssh: Option<bool>,
     },
     /// Change individual prefs on the node **without** a full up/down cycle (the analogue of Go's
     /// `tailscale set`). Every field is the same "leave unchanged unless named" sentinel as
@@ -93,6 +97,10 @@ pub enum Request {
         /// `Some([])` clears).
         #[serde(default)]
         advertise_routes: Option<Vec<String>>,
+        /// Run the Tailscale SSH server (`None` unchanged; `Some(b)` sets it). Toggling SSH via
+        /// `set` rebuilds the running device (the SSH server task is tied to the device lifecycle).
+        #[serde(default)]
+        ssh: Option<bool>,
     },
     /// Bring the node down (`WantRunning = false`) without logging out.
     Down,
@@ -190,6 +198,7 @@ mod tests {
             exit_node: Some(Some("100.64.0.9".to_string())),
             advertise_exit_node: Some(true),
             advertise_routes: Some(vec!["192.168.1.0/24".to_string()]),
+            ssh: Some(true),
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&json).unwrap();
@@ -204,11 +213,13 @@ mod tests {
                 exit_node,
                 advertise_exit_node,
                 advertise_routes,
+                ssh,
             } => {
                 assert_eq!(authkey.as_deref(), Some("tskey-auth-xxx"));
                 assert_eq!(hostname.as_deref(), Some("node-a"));
                 assert!(control_url.is_none());
                 assert_eq!(tun, Some(true));
+                assert_eq!(ssh, Some(true));
                 assert_eq!(tun_name.as_deref(), Some("tailscale0"));
                 assert_eq!(tun_mtu, Some(1280));
                 assert_eq!(exit_node, Some(Some("100.64.0.9".to_string())));
@@ -423,6 +434,7 @@ mod tests {
             exit_node: None,
             advertise_exit_node: None,
             advertise_routes: None,
+            ssh: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&json).unwrap();
@@ -437,6 +449,7 @@ mod tests {
                 exit_node,
                 advertise_exit_node,
                 advertise_routes,
+                ssh,
             } => {
                 assert!(authkey.is_none());
                 assert!(control_url.is_none());
@@ -447,6 +460,7 @@ mod tests {
                 assert!(exit_node.is_none());
                 assert!(advertise_exit_node.is_none());
                 assert!(advertise_routes.is_none());
+                assert!(ssh.is_none());
             }
             other => panic!("expected Up, got {other:?}"),
         }
@@ -485,6 +499,7 @@ mod tests {
             exit_node: Some(None),
             advertise_exit_node: Some(false),
             advertise_routes: Some(vec![]),
+            ssh: None,
         };
         let json = serde_json::to_string(&clear).unwrap();
         match serde_json::from_str::<Request>(&json).unwrap() {
@@ -558,6 +573,7 @@ mod tests {
             exit_node: Some(None),
             advertise_exit_node: None,
             advertise_routes: None,
+            ssh: None,
         })
         .unwrap();
         let unchanged_json = serde_json::to_string(&Request::Up {
@@ -570,6 +586,7 @@ mod tests {
             exit_node: None,
             advertise_exit_node: None,
             advertise_routes: None,
+            ssh: None,
         })
         .unwrap();
         assert!(

@@ -61,6 +61,11 @@ ipnet = "2.12"
 # exit node"). Without it, `#[serde(default)]` collapses both to None and the clear command becomes a
 # silent no-op. Already in the tree transitively via the engine (3.x).
 serde_with = "3"
+# RNG for generating the Tailscale SSH server's host key (`russh::keys::PrivateKey::random`). Must
+# be `rand 0.10` — russh 0.61's `ssh-key` bounds `random` on `rand_core 0.10`'s `CryptoRng`, which
+# `rand 0.9`'s `ThreadRng` does NOT implement (verified: build fails with a CryptoRng trait-bound
+# error on 0.9). Only pulled in with the `ssh` feature; optional so the default build never links it.
+rand = { version = "0.10", optional = true }
 # Enumerate existing network interfaces to pick a free `utunN` for macOS TUN mode (the engine's
 # default name `tailscale0` is Linux-only and macOS's tun-rs needs an explicit free utun index).
 # Already in the dependency tree transitively via the engine; only used on macOS.
@@ -75,6 +80,12 @@ if-addrs = "0.15"
 # `/dev/net/tun`, macOS `utun`). Build with `cargo build --features tun`.
 default = []
 tun = ["tailscale/tun"]
+# Tailscale SSH server (Phase 4, tsd-46c). Off by default — it's a remote-shell surface, so it is
+# opt-in at BUILD time (the `ssh` cargo feature) AND at runtime (the `ssh_enabled` pref / `--ssh`).
+# Pulls in the engine's `ssh` feature (russh-based server + control-policy authorization +
+# privilege-dropping login shell). Running the server needs root (to drop privileges to the
+# policy-mapped local user). Build with `cargo build --features ssh`.
+ssh = ["tailscale/ssh", "dep:rand"]
 
 [profile.release]
 strip = true
