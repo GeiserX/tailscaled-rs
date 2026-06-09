@@ -116,3 +116,27 @@ This one needs engine design input — listed for awareness, not as a precise pa
 a shipped feature. #2 and #3 are security-hardening and warrant their own reviewed PRs. #4 needs
 design discussion. After #1 lands and the engine cuts a release, the daemon bumps its pinned
 `rev`/version and flips TUN on in one line.
+
+---
+
+## 5. (BLOCKER for macOS TUN) Platform-aware default TUN interface name
+
+**Why:** `ts_runtime::tun_actor::tun_config_from_control` defaults a `None` interface name to
+`"tailscale0"` (Linux-style). On macOS the kernel requires utun interfaces to be named `utun*`, so
+`tun-rs`'s `DeviceBuilder::name("tailscale0").build_async()` fails with **"device name must start
+with utun"**, the TUN device is never created, and the overlay data path fails closed (the node
+reaches Running on the control plane but has no working tunnel).
+
+**Verified:** engine v0.6.7, `ts_runtime/src/tun_actor.rs:138` (`name: cfg.name.clone()
+.unwrap_or_else(|| "tailscale0".to_owned())`) → `ts_transport_tun/src/async_tokio.rs:34`
+(`DeviceBuilder::new().name(&config.name)`). On Linux `tailscale0` is fine; on macOS it is rejected.
+
+**Ask:** make the default name platform-aware in `tun_config_from_control` (or wherever the `None`
+name is resolved):
+- Linux/BSD: `"tailscale0"` (unchanged).
+- macOS: `"utun"` (bare prefix → the kernel assigns the next free `utunN`), or accept an empty/None
+  name through to `tun-rs` so it auto-picks.
+
+**Downstream note:** the daemon currently works around this by defaulting `tun_name` to `"utun"` on
+macOS itself (`tailscaled-rs` `ipn::default_tun_name`). Once the engine picks a platform-correct
+default, the daemon workaround can be removed (it becomes a redundant no-op).

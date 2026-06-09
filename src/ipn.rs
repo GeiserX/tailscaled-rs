@@ -542,10 +542,20 @@ impl Backend {
                 }
                 // Select the kernel-TUN transport. The engine (v0.6.7+) re-exports `TransportMode`
                 // and `TunConfig` from the facade, so the daemon can construct the value directly.
-                // `tun_name` (None → OS picks, e.g. `utunN` on macOS) and `tun_mtu` (None → transport
-                // default; Tailscale's overlay MTU is 1280) come from prefs.
+                //
+                // Interface name: when the operator did not pass `--tun-name`, we must pick a
+                // platform-appropriate default rather than let the engine apply its own. The engine
+                // defaults a `None` name to `"tailscale0"` (Linux-style), but on macOS the kernel
+                // requires utun interfaces to be named `utun*` — `tailscale0` is rejected by `tun-rs`
+                // with "device name must start with utun", and the device (hence the whole overlay
+                // data path) fails to come up. So on macOS we default to bare `"utun"`, which the
+                // kernel treats as "assign the next free utunN". On Linux we leave `None` so the
+                // engine's `tailscale0` default stands. (The real fix belongs in the engine's
+                // platform-aware default; tracked as an engine ask — until then this keeps TUN
+                // working cross-platform.)
+                let tun_name = self.prefs.tun_name.clone().or_else(default_tun_name);
                 config.transport_mode = tailscale::TransportMode::Tun(tailscale::TunConfig {
-                    name: self.prefs.tun_name.clone(),
+                    name: tun_name,
                     mtu: self.prefs.tun_mtu,
                 });
             }
@@ -713,6 +723,23 @@ impl Backend {
             .save(&self.prefs_path)
             .await
             .with_context(|| format!("saving prefs to {}", self.prefs_path.display()))
+    }
+}
+
+/// The default TUN interface name to request when the operator gave none, by platform.
+///
+/// `None` means "let the engine choose its default" (`tailscale0` on Linux, which the kernel
+/// accepts). On macOS the kernel requires utun interfaces to be named `utun*`, and the engine's
+/// `tailscale0` default is rejected by `tun-rs` ("device name must start with utun"), so we return
+/// `Some("utun")` — the bare prefix the macOS kernel treats as "assign the next free `utunN`". Pure,
+/// so the per-platform choice is unit-testable. (The real fix is a platform-aware default in the
+/// engine; this is the daemon-side keep-it-working measure until then.)
+#[cfg(feature = "tun")]
+fn default_tun_name() -> Option<String> {
+    if cfg!(target_os = "macos") {
+        Some("utun".to_owned())
+    } else {
+        None
     }
 }
 
@@ -904,6 +931,19 @@ mod tests {
     // `state_from_device` maps the engine's authoritative `DeviceState` → `(State, auth_url)`. It is
     // the source of truth when a device exists, so the interactive-login URL surfacing and the
     // expiry/failure→NeedsLogin collapse must not drift. Pure, so testable without a live engine.
+
+    #[cfg(feature = "tun")]
+    #[test]
+    fn default_tun_name_is_utun_on_macos_else_none() {
+        // macOS rejects a non-`utun*` TUN name, so the daemon must default to the bare `utun`
+        // prefix there; on other platforms it defers to the engine default (None).
+        let got = default_tun_name();
+        if cfg!(target_os = "macos") {
+            assert_eq!(got.as_deref(), Some("utun"));
+        } else {
+            assert_eq!(got, None);
+        }
+    }
 
     #[test]
     fn device_running_is_running_no_url() {
