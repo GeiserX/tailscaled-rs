@@ -468,5 +468,39 @@ async fn dispatch(
                 },
             }
         }
+        // `set` patches individual prefs without an up/down cycle (the `tailscale set` analogue). Like
+        // `up`, it reconciles a live device (and `exit_node` is applied live with no reconnect), so it
+        // goes through `ipn::drive_set` for the same off-lock handshake discipline rather than holding
+        // the backend lock across the reconfigure. The fields move 1:1 into `SetOptions`.
+        Request::Set {
+            hostname,
+            accept_routes,
+            exit_node,
+            advertise_exit_node,
+            advertise_routes,
+        } => {
+            let opts = ipn::SetOptions {
+                hostname,
+                accept_routes,
+                exit_node,
+                advertise_exit_node,
+                advertise_routes,
+            };
+            // `tailscale set` with no flags names no prefs: reject it as a usage error before touching
+            // the backend, rather than driving a no-op reconcile.
+            if opts.is_empty() {
+                return Response::Error {
+                    message: "set: no preferences specified".into(),
+                };
+            }
+            match ipn::drive_set(backend, opts).await {
+                Ok(()) => Response::Ok {
+                    message: "preferences updated".to_string(),
+                },
+                Err(e) => Response::Error {
+                    message: format!("{e:#}"),
+                },
+            }
+        }
     }
 }

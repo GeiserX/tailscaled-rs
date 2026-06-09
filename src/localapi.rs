@@ -63,6 +63,37 @@ pub enum Request {
         #[serde(default)]
         advertise_routes: Option<Vec<String>>,
     },
+    /// Change individual prefs on the node **without** a full up/down cycle (the analogue of Go's
+    /// `tailscale set`). Every field is the same "leave unchanged unless named" sentinel as
+    /// [`Up`](Request::Up)'s overrides. Unlike `Up`, `Set` never (re)authenticates and never flips
+    /// `want_running` — it only patches the named prefs and reconciles the live engine: `exit_node`
+    /// is applied **live** (the engine has a runtime setter, no reconnect), while prefs with no live
+    /// setter (`hostname` / `accept_routes` / `advertise_*`) take effect by reconfiguring a running
+    /// device (or simply persist if the node is down, applying on the next `up`).
+    Set {
+        /// Requested hostname.
+        #[serde(default)]
+        hostname: Option<String>,
+        /// Accept (and route to) subnet routes advertised by peers.
+        #[serde(default)]
+        accept_routes: Option<bool>,
+        /// Exit-node selector override — applied LIVE when a device is up (no reconnect). Double
+        /// `Option` with `double_option`: absent = unchanged (`None`), present `null` = clear
+        /// (`Some(None)`), present value = set (`Some(Some(sel))`). See [`Up`](Request::Up)'s field.
+        #[serde(
+            default,
+            with = "::serde_with::rust::double_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        exit_node: Option<Option<String>>,
+        /// Advertise this node as an exit node (`None` unchanged; `Some(b)` sets it).
+        #[serde(default)]
+        advertise_exit_node: Option<bool>,
+        /// Subnet routes (CIDRs) this node advertises (`None` unchanged; `Some(vec)` replaces,
+        /// `Some([])` clears).
+        #[serde(default)]
+        advertise_routes: Option<Vec<String>>,
+    },
     /// Bring the node down (`WantRunning = false`) without logging out.
     Down,
 }

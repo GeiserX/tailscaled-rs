@@ -48,3 +48,4 @@
 {"id":"int-b59ce5644ef30884fc8996346d2edd20","kind":"field_change","created_at":"2026-06-09T19:07:10.95619Z","actor":"GeiserX","issue_id":"tsd-6xi","extra":{"field":"status","new_value":"closed","old_value":"open","reason":"probe, not a real issue"}}
 {"id":"int-d79b43cc96dcbba22966a1b3603950f1","kind":"field_change","created_at":"2026-06-09T19:08:14.393908Z","actor":"GeiserX","issue_id":"tsd-hob","extra":{"field":"status","new_value":"in_progress","old_value":"open"}}
 {"id":"int-bc1d96dfe87bf8ba529f114f84ade9c3","kind":"field_change","created_at":"2026-06-09T19:08:15.047788Z","actor":"GeiserX","issue_id":"tsd-cmi","extra":{"field":"status","new_value":"in_progress","old_value":"open"}}
+{"id":"int-f8b5a2cf5189542ad9edaabf79d7d5e7","kind":"field_change","created_at":"2026-06-09T21:02:41.223617Z","actor":"GeiserX","issue_id":"tsd-iqq.1","extra":{"field":"status","new_value":"in_progress","old_value":"open"}}

@@ -96,6 +96,56 @@ enum Command {
         #[arg(long)]
         advertise_routes_clear: bool,
     },
+    /// Tweak individual prefs on an already-configured node, without an up/down cycle (the analogue
+    /// of Go's `tailscale set`). This never (re)authenticates and never changes whether the node is
+    /// up — it only patches the prefs you name and reconciles the running engine. The exit-node
+    /// change applies live (no reconnect); the others take effect on a running device or persist for
+    /// the next `up` if the node is down. Omitting a flag leaves that pref unchanged; pass no flags
+    /// and the daemon reports "no preferences specified".
+    Set {
+        /// Requested hostname. Omit to leave the persisted hostname unchanged.
+        #[arg(long)]
+        hostname: Option<String>,
+        /// Accept (and route to) subnet routes advertised by peers. Mutually exclusive with
+        /// `--no-accept-routes`; omitting both leaves the persisted setting unchanged.
+        #[arg(long, conflicts_with = "no_accept_routes")]
+        accept_routes: bool,
+        /// Stop accepting subnet routes advertised by peers. Mutually exclusive with
+        /// `--accept-routes`; omitting both leaves the persisted setting unchanged.
+        #[arg(long)]
+        no_accept_routes: bool,
+        /// Route this node's outbound traffic through a peer exit node, named by its tailnet IP or
+        /// MagicDNS name (e.g. `100.64.0.9` or `exit-1`). Applied live on a running node — no
+        /// reconnect. Mutually exclusive with `--clear-exit-node`; omitting both leaves the persisted
+        /// exit-node setting unchanged.
+        #[arg(long, value_name = "IP|NAME", conflicts_with = "clear_exit_node")]
+        exit_node: Option<String>,
+        /// Stop routing through any exit node (clears the exit-node setting). Use this instead of an
+        /// empty `--exit-node`, which clap can't tell apart from the flag being unset. Mutually
+        /// exclusive with `--exit-node`.
+        #[arg(long)]
+        clear_exit_node: bool,
+        /// Offer this node to the tailnet as an exit node (other nodes may route their traffic
+        /// through it). Mutually exclusive with `--no-advertise-exit-node`; omitting both leaves the
+        /// persisted setting unchanged.
+        #[arg(long, conflicts_with = "no_advertise_exit_node")]
+        advertise_exit_node: bool,
+        /// Stop offering this node as an exit node. Mutually exclusive with
+        /// `--advertise-exit-node`; omitting both leaves the persisted setting unchanged.
+        #[arg(long)]
+        no_advertise_exit_node: bool,
+        /// Advertise these subnet routes (comma-separated CIDRs, e.g.
+        /// `192.168.1.0/24,10.0.0.0/8`) so other tailnet nodes can reach those subnets through this
+        /// node. Replaces the whole advertised set. Use `--advertise-routes-clear` to advertise
+        /// none; passing neither leaves the persisted set unchanged.
+        #[arg(long, value_name = "CIDR,...", value_delimiter = ',')]
+        advertise_routes: Vec<String>,
+        /// Stop advertising any subnet routes (clears the advertised set). Use this instead of an
+        /// empty `--advertise-routes`, since clap can't distinguish "advertise none" from the flag
+        /// being unset.
+        #[arg(long)]
+        advertise_routes_clear: bool,
+    },
     /// Disconnect the node without logging out.
     Down,
     /// Show daemon and netmap status.
@@ -115,6 +165,18 @@ fn resolve_exit_node(set: Option<String>, clear: bool) -> Option<Option<String>>
     match (set, clear) {
         (Some(s), _) => Some(Some(s)),
         (_, true) => Some(None),
+        _ => None,
+    }
+}
+
+/// Map the `--accept-routes` / `--no-accept-routes` flag pair to a tri-state `Option<bool>`.
+/// Enable → `Some(true)`; disable → `Some(false)`; neither → `None` (leave the persisted pref
+/// unchanged). Mirrors the `--tun`/`--no-tun` mapping; clap's `conflicts_with` guarantees the two
+/// are never both set.
+fn resolve_accept_routes(accept: bool, no_accept: bool) -> Option<bool> {
+    match (accept, no_accept) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
         _ => None,
     }
 }
@@ -206,6 +268,33 @@ async fn main() -> Result<()> {
                 ),
             }
         }
+        Command::Set {
+            hostname,
+            accept_routes,
+            no_accept_routes,
+            exit_node,
+            clear_exit_node,
+            advertise_exit_node,
+            no_advertise_exit_node,
+            advertise_routes,
+            advertise_routes_clear,
+        } => Request::Set {
+            hostname,
+            // `--accept-routes`/`--no-accept-routes` tri-state (mirrors `--tun`).
+            accept_routes: resolve_accept_routes(accept_routes, no_accept_routes),
+            // `--exit-node <sel>` sets, `--clear-exit-node` stops using one, neither leaves it
+            // unchanged; clap's `conflicts_with` guarantees the two are never both set. Reuses the
+            // same resolver as the `up` arm.
+            exit_node: resolve_exit_node(exit_node, clear_exit_node),
+            // `--advertise-exit-node`/`--no-advertise-exit-node` tri-state (mirrors `--tun`).
+            advertise_exit_node: resolve_advertise_exit_node(
+                advertise_exit_node,
+                no_advertise_exit_node,
+            ),
+            // Passed routes replace the set; `--advertise-routes-clear` empties it; neither leaves
+            // the persisted set unchanged.
+            advertise_routes: resolve_advertise_routes(advertise_routes, advertise_routes_clear),
+        },
         Command::Down => Request::Down,
         // `status --watch` is a long-lived stream, not a one-shot round-trip — handle it here and
         // return. Plain `status` falls through to the one-shot path below.
@@ -592,6 +681,81 @@ mod tests {
         assert_eq!(resolve_advertise_exit_node(false, false), None);
         // Enable wins if both are somehow set (clap's conflicts_with prevents this in practice).
         assert_eq!(resolve_advertise_exit_node(true, true), Some(true));
+    }
+
+    #[test]
+    fn resolve_accept_routes_tristate() {
+        // Enable → Some(true); disable → Some(false); neither → None (unchanged).
+        assert_eq!(resolve_accept_routes(true, false), Some(true));
+        assert_eq!(resolve_accept_routes(false, true), Some(false));
+        assert_eq!(resolve_accept_routes(false, false), None);
+        // Enable wins if both are somehow set (clap's conflicts_with prevents this in practice).
+        assert_eq!(resolve_accept_routes(true, true), Some(true));
+    }
+
+    #[test]
+    fn command_set_maps_to_request_set_fields() {
+        // A representative invocation: rename + set an exit node + accept routes, leaving the
+        // advertise-* prefs untouched. Built from the same resolver helpers the `Command::Set` arm
+        // in `main` uses, so the wire mapping is covered without spawning the CLI. The unset prefs
+        // must map to `None` (unchanged), not a silent clear.
+        let req = Request::Set {
+            hostname: Some("laptop".to_string()),
+            accept_routes: resolve_accept_routes(true, false),
+            exit_node: resolve_exit_node(Some("100.64.0.9".to_string()), false),
+            advertise_exit_node: resolve_advertise_exit_node(false, false),
+            advertise_routes: resolve_advertise_routes(vec![], false),
+        };
+        match req {
+            Request::Set {
+                hostname,
+                accept_routes,
+                exit_node,
+                advertise_exit_node,
+                advertise_routes,
+            } => {
+                assert_eq!(hostname, Some("laptop".to_string()));
+                assert_eq!(accept_routes, Some(true));
+                assert_eq!(exit_node, Some(Some("100.64.0.9".to_string())));
+                assert_eq!(advertise_exit_node, None, "unset → unchanged, not flipped");
+                assert_eq!(advertise_routes, None, "unset → unchanged, not cleared");
+            }
+            other => panic!("expected Request::Set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn command_set_maps_clears_distinctly_from_unset() {
+        // The "clear" flags must produce the present-but-empty sentinels (`Some(None)` /
+        // `Some(vec![])`), distinct from the absent (`None`) case above — that's the whole reason
+        // the clear flags exist. Built via the same resolvers as `main`'s `Command::Set` arm.
+        let req = Request::Set {
+            hostname: None,
+            accept_routes: resolve_accept_routes(false, true),
+            exit_node: resolve_exit_node(None, true),
+            advertise_exit_node: resolve_advertise_exit_node(false, true),
+            advertise_routes: resolve_advertise_routes(vec![], true),
+        };
+        match req {
+            Request::Set {
+                hostname,
+                accept_routes,
+                exit_node,
+                advertise_exit_node,
+                advertise_routes,
+            } => {
+                assert_eq!(hostname, None);
+                assert_eq!(accept_routes, Some(false));
+                assert_eq!(exit_node, Some(None), "--clear-exit-node → Some(None)");
+                assert_eq!(advertise_exit_node, Some(false));
+                assert_eq!(
+                    advertise_routes,
+                    Some(vec![]),
+                    "--advertise-routes-clear → Some(vec![])"
+                );
+            }
+            other => panic!("expected Request::Set, got {other:?}"),
+        }
     }
 
     #[test]
