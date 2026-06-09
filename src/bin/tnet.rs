@@ -161,7 +161,7 @@ async fn main() -> Result<()> {
                         // re-running with the same key loops forever. Surface the reason and exit
                         // non-zero (mirroring the `Response::Error` path below).
                         eprintln!();
-                        eprintln!("registration failed: {reason}");
+                        eprintln!("registration failed: {}", sanitize_for_terminal(&reason));
                         eprintln!(
                             "(this is a permanent failure — re-run `tnet up --authkey <NEW_KEY>` \
                              with a fresh key; the same key will keep failing)"
@@ -178,6 +178,29 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Sanitize a control-plane-supplied string before printing it to the terminal.
+///
+/// The registration-failure `reason` (and, defensively, any other server-supplied text) originates
+/// from the control server, which the daemon treats as only semi-trusted. Printing it verbatim would
+/// let a malicious or compromised control server smuggle ANSI/terminal escape sequences (cursor
+/// moves, color, clear-screen, even hyperlink/OSC injection) into the operator's terminal. We strip
+/// every C0/C1 control character except plain whitespace (`\t`, `\n`, `\r`) so the reason renders as
+/// inert text. This is display hardening only — the wire value is unchanged.
+fn sanitize_for_terminal(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c == '\t' || c == '\n' || c == '\r' {
+                c
+            } else if c.is_control() {
+                // C0 (incl. ESC 0x1B) and C1 controls → a visible placeholder, never the raw byte.
+                '\u{FFFD}'
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 /// Render a [`StatusReport`] to stdout (the shared one-shot + watch formatter).
@@ -201,7 +224,7 @@ fn print_status(s: &tailscaled_rs::localapi::StatusReport) {
     // the operator must re-authenticate with a fresh key.
     if let Some(reason) = s.error.as_deref() {
         println!();
-        println!("registration failed: {reason}");
+        println!("registration failed: {}", sanitize_for_terminal(reason));
         println!(
             "(this is a permanent failure — re-run `tnet up --authkey <NEW_KEY>` with a fresh \
              key; the same key will keep failing)"
@@ -449,5 +472,31 @@ mod tests {
             }
             _ => panic!("expected Failed to win over Url"),
         }
+    }
+
+    #[test]
+    fn sanitize_strips_terminal_escapes_keeps_plain_text() {
+        // A control-supplied failure reason is only semi-trusted; before we print it, ANSI/terminal
+        // escapes must be neutralized so a malicious control server can't drive the operator's
+        // terminal. Plain text + ordinary whitespace survive unchanged.
+        let evil = "auth rejected\x1b[2J\x1b[31mFAKE PROMPT\x07 token=\x00secret";
+        let clean = sanitize_for_terminal(evil);
+        assert!(
+            !clean.contains('\x1b'),
+            "ESC must be stripped, got {clean:?}"
+        );
+        assert!(!clean.contains('\x07'), "BEL must be stripped");
+        assert!(!clean.contains('\x00'), "NUL must be stripped");
+        // The readable words are preserved (just the control bytes become the replacement char).
+        assert!(clean.contains("auth rejected"));
+        assert!(clean.contains("token="));
+
+        // Ordinary text and whitespace pass through verbatim.
+        let benign = "authentication rejected by control: key not found\n\tretry later";
+        assert_eq!(
+            sanitize_for_terminal(benign),
+            benign,
+            "plain text + tab/newline must be unchanged"
+        );
     }
 }

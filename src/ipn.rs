@@ -838,12 +838,20 @@ fn derive_state_from(
 ///   re-auth *prompt*, not a hard failure (the operator simply re-runs `tnet up`); the engine
 ///   carries no URL here, and we deliberately do not populate `error` so an expiry never looks like
 ///   a terminal registration failure.
-/// - `Failed(e)` → [`State::NeedsLogin`] with **no url** but **`error = Some(e.to_string())`**: a
-///   permanent registration failure (e.g. a bad/expired/unknown auth key) the engine will NOT retry.
-///   The state stays `NeedsLogin` (no eighth `ipn.State`; see above), but `error` now carries the
-///   reason so the daemon/CLI can distinguish "interactive login pending" (`auth_url` set, transient)
-///   from "registration hard-failed" (`error` set, terminal). The absent `auth_url` is intentional:
-///   a hard failure must NOT masquerade as an interactive-login prompt.
+/// - `Failed(e)` splits on [`RegistrationError::is_permanent`](tailscale::RegistrationError::is_permanent),
+///   because the engine reuses this one variant for two very different cases:
+///   - **permanent** (`AuthRejected` / `KeyExpired`) → [`State::NeedsLogin`] with **no url** but
+///     **`error = Some(e.to_string())`**: a failure the engine will NOT retry. The state stays
+///     `NeedsLogin` (no eighth `ipn.State`; see above), but `error` carries the reason so the
+///     daemon/CLI can distinguish "interactive login pending" (`auth_url` set, transient) from
+///     "registration hard-failed" (`error` set, terminal). The absent `auth_url` is intentional: a
+///     hard failure must NOT masquerade as an interactive-login prompt.
+///   - **transient** (`NetworkUnreachable` / `Timeout`) → [`State::Starting`] with **no url and no
+///     error**: the engine keeps retrying (it publishes `Failed(NetworkUnreachable)` precisely when
+///     "a retry may succeed"), so this is neither terminal nor a login problem. Reporting it via
+///     `error` would tell the operator to rotate a key that is actually fine — the exact misleading
+///     guidance this mapping exists to avoid — so a transient failure looks like ongoing
+///     convergence, and the next poll reflects the retry's outcome.
 fn state_from_device(ds: tailscale::DeviceState) -> (State, Option<String>, Option<String>) {
     use tailscale::DeviceState;
     match ds {
@@ -853,12 +861,26 @@ fn state_from_device(ds: tailscale::DeviceState) -> (State, Option<String>, Opti
         // Key expiry is a re-auth prompt, not a hard failure: NeedsLogin with no url and no error
         // (an expiry must not be reported as a terminal registration failure).
         DeviceState::Expired => (State::NeedsLogin, None, None),
-        // Terminal registration failure (the engine will not retry): keep the state mapped to
-        // NeedsLogin (we add no eighth ipn.State — Go surfaces this via a separate ErrMessage
-        // field), but carry `RegistrationError`'s Display string in the `error` field so the
-        // daemon/CLI can tell a hard failure (error set, no auth_url) apart from interactive login
-        // (auth_url set, no error). No auth_url: a hard failure is not an interactive-login prompt.
-        DeviceState::Failed(e) => (State::NeedsLogin, None, Some(e.to_string())),
+        // A `Failed` outcome splits on permanence — the engine reuses this one variant for BOTH a
+        // terminal failure AND a transient one (it publishes `Failed(NetworkUnreachable)` when the
+        // control session can't connect, with the explicit intent that "a retry / fresh Device::new
+        // may succeed" — see ts_runtime control_runner). Treating every `Failed` as terminal would
+        // tell the operator "permanent failure, use a fresh key" on a mere network blip — exactly
+        // the misleading guidance this whole change exists to remove. So we gate on
+        // `RegistrationError::is_permanent()` (true only for `AuthRejected` / `KeyExpired`):
+        DeviceState::Failed(e) if e.is_permanent() => {
+            // PERMANENT (bad/expired/unknown key): the engine will NOT retry. Keep the state mapped
+            // to NeedsLogin (no eighth ipn.State — Go surfaces this via a separate ErrMessage
+            // field), but carry the reason in `error` so the daemon/CLI can tell a hard failure
+            // (error set, no auth_url) apart from interactive login (auth_url set, no error). No
+            // auth_url: a hard failure is not an interactive-login prompt.
+            (State::NeedsLogin, None, Some(e.to_string()))
+        }
+        // TRANSIENT (`NetworkUnreachable` / `Timeout`): the engine keeps retrying, so this is NOT
+        // terminal and NOT a login problem — surface it as `Starting` (still converging), with no
+        // `error` (so the CLI never tells the operator to rotate a key that is actually fine) and no
+        // auth_url. The next poll reflects the retry's outcome (Running, or a permanent Failed).
+        DeviceState::Failed(_) => (State::Starting, None, None),
     }
 }
 
@@ -1129,17 +1151,13 @@ mod tests {
     }
 
     #[test]
-    fn every_failed_variant_surfaces_via_error_never_auth_url() {
-        // Invariant guard for the two same-typed `Option<String>` outputs: **any** `Failed(_)`
-        // surfaces its reason through `error` and NEVER through `auth_url`, regardless of which
-        // `RegistrationError` it carries. This pins the field mapping against a transposition (the
-        // `state_from_device` doc says auth_url ⊕ error are mutually exclusive) and — crucially —
-        // covers the engine's *non-permanent* `Failed` arms (`NetworkUnreachable` / `Timeout` /
-        // the `RegistrationError::NeedsLogin` URL form) that the two tests above do not, since the
-        // engine really can publish a transient `DeviceState::Failed(NetworkUnreachable)` when the
-        // control session fails to come up. Whatever the variant, the daemon's contract today is:
-        // state == NeedsLogin, auth_url == None, error == Some(<Display>) — and the inner reason
-        // must be carried verbatim, never silently dropped or routed to auth_url.
+    fn failed_splits_on_permanence_permanent_carries_error_transient_is_starting() {
+        // The core of the review fix: `Failed(e)` is NOT uniformly terminal. The engine reuses the
+        // variant for both a permanent failure (the user must re-pair) AND a transient one it keeps
+        // retrying (`Failed(NetworkUnreachable)` on a control-session connect blip). The daemon must
+        // split on `RegistrationError::is_permanent()` so a network hiccup never tells the operator
+        // their key is bad. This test drives BOTH classes and is also the transposition guard for the
+        // two same-typed `Option<String>` outputs (auth_url ⊕ error are mutually exclusive).
         let url: url::Url = "https://login.example.com/a/xyz".parse().unwrap();
         let cases = [
             tailscale::RegistrationError::AuthRejected("bad key".into()),
@@ -1149,23 +1167,46 @@ mod tests {
             tailscale::RegistrationError::Timeout,
         ];
         for re in cases {
+            let permanent = re.is_permanent();
             let expected_reason = re.to_string();
             let (st, auth_url, error) =
                 state_from_device(tailscale::DeviceState::Failed(re.clone()));
-            assert_eq!(
-                st,
-                State::NeedsLogin,
-                "every Failed variant maps to NeedsLogin (no eighth ipn.State); variant {re:?}"
-            );
+
+            // NEVER populate auth_url for a Failed of any flavor — a hard failure (or a retrying
+            // one) must not masquerade as an interactive-login prompt. This is the transposition
+            // guard: a swap of the auth_url/error fields would trip here.
             assert!(
                 auth_url.is_none(),
-                "a Failed variant must NEVER populate auth_url (transposition guard); variant {re:?}"
+                "a Failed variant must NEVER populate auth_url; variant {re:?}"
             );
-            assert_eq!(
-                error.as_deref(),
-                Some(expected_reason.as_str()),
-                "a Failed variant must carry its Display reason verbatim in `error`; variant {re:?}"
-            );
+
+            if permanent {
+                // AuthRejected / KeyExpired: terminal → NeedsLogin + the reason in `error`.
+                assert_eq!(
+                    st,
+                    State::NeedsLogin,
+                    "a permanent Failed maps to NeedsLogin; variant {re:?}"
+                );
+                assert_eq!(
+                    error.as_deref(),
+                    Some(expected_reason.as_str()),
+                    "a permanent Failed must carry its Display reason verbatim in `error`; variant {re:?}"
+                );
+            } else {
+                // NetworkUnreachable / Timeout / the NeedsLogin-URL form: the engine keeps retrying,
+                // so this is ongoing convergence, NOT a terminal error. Surface `Starting` with no
+                // error — so the CLI never tells the operator to rotate a key that is actually fine.
+                assert_eq!(
+                    st,
+                    State::Starting,
+                    "a transient/retrying Failed maps to Starting (still converging); variant {re:?}"
+                );
+                assert!(
+                    error.is_none(),
+                    "a transient Failed must NOT populate `error` (no misleading permanent-failure \
+                     guidance); variant {re:?}"
+                );
+            }
         }
     }
 
