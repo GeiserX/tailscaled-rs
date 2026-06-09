@@ -439,17 +439,25 @@ async fn dispatch(
             tun,
             tun_name,
             tun_mtu,
+            exit_node,
+            advertise_exit_node,
+            advertise_routes,
         } => {
             // Confine the plaintext authkey to the smallest scope: wrap it into a `SecretString`
             // right at the boundary and hand the engine path the secret. (The wire type stays
             // `String` because `SecretString` does not serialize.)
             let authkey = authkey.map(secrecy::SecretString::from);
+            // The routing fields (exit node + advertised exit/routes) flow straight through to
+            // prefs via `UpOptions`; their semantics are documented on the field types.
             let opts = ipn::UpOptions {
                 hostname,
                 control_url,
                 tun,
                 tun_name,
                 tun_mtu,
+                exit_node,
+                advertise_exit_node,
+                advertise_routes,
             };
             match ipn::drive_up(backend, authkey, opts).await {
                 Ok(()) => Response::Ok {

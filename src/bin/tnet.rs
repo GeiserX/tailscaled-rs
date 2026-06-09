@@ -65,6 +65,36 @@ enum Command {
         /// TUN interface MTU (Tailscale's overlay MTU is 1280); only meaningful with `--tun`.
         #[arg(long, value_name = "MTU")]
         tun_mtu: Option<u16>,
+        /// Route this node's outbound traffic through a peer exit node, named by its tailnet IP or
+        /// MagicDNS name (e.g. `100.64.0.9` or `exit-1`). Mutually exclusive with
+        /// `--exit-node-clear`; omitting both leaves the persisted exit-node setting unchanged.
+        #[arg(long, value_name = "IP|NAME", conflicts_with = "clear_exit_node")]
+        exit_node: Option<String>,
+        /// Stop routing through any exit node (clears the exit-node setting). Use this instead of an
+        /// empty `--exit-node`, which clap can't tell apart from the flag being unset. Mutually
+        /// exclusive with `--exit-node`.
+        #[arg(long)]
+        clear_exit_node: bool,
+        /// Offer this node to the tailnet as an exit node (other nodes may route their traffic
+        /// through it). Mutually exclusive with `--no-advertise-exit-node`; omitting both leaves the
+        /// persisted setting unchanged.
+        #[arg(long, conflicts_with = "no_advertise_exit_node")]
+        advertise_exit_node: bool,
+        /// Stop offering this node as an exit node. Mutually exclusive with
+        /// `--advertise-exit-node`; omitting both leaves the persisted setting unchanged.
+        #[arg(long)]
+        no_advertise_exit_node: bool,
+        /// Advertise these subnet routes (comma-separated CIDRs, e.g.
+        /// `192.168.1.0/24,10.0.0.0/8`) so other tailnet nodes can reach those subnets through this
+        /// node. Replaces the whole advertised set. Use `--advertise-routes-clear` to advertise
+        /// none; passing neither leaves the persisted set unchanged.
+        #[arg(long, value_name = "CIDR,...", value_delimiter = ',')]
+        advertise_routes: Vec<String>,
+        /// Stop advertising any subnet routes (clears the advertised set). Use this instead of an
+        /// empty `--advertise-routes`, since clap can't distinguish "advertise none" from the flag
+        /// being unset.
+        #[arg(long)]
+        advertise_routes_clear: bool,
     },
     /// Disconnect the node without logging out.
     Down,
@@ -75,6 +105,44 @@ enum Command {
         #[arg(long)]
         watch: bool,
     },
+}
+
+/// Map the `--exit-node` / `--exit-node-clear` flag pair to the wire field's double `Option`.
+/// `--exit-node <sel>` → `Some(Some(sel))` (set it); `--exit-node-clear` → `Some(None)` (stop using
+/// an exit node); neither → `None` (leave the persisted pref unchanged). A set value wins if both
+/// somehow arrive, though clap's `conflicts_with` already guarantees they are never both present.
+fn resolve_exit_node(set: Option<String>, clear: bool) -> Option<Option<String>> {
+    match (set, clear) {
+        (Some(s), _) => Some(Some(s)),
+        (_, true) => Some(None),
+        _ => None,
+    }
+}
+
+/// Map the `--advertise-exit-node` / `--no-advertise-exit-node` flag pair to a tri-state
+/// `Option<bool>`. Enable → `Some(true)`; disable → `Some(false)`; neither → `None` (leave the
+/// persisted pref unchanged). Mirrors the `--tun`/`--no-tun` mapping; clap's `conflicts_with`
+/// guarantees the two are never both set.
+fn resolve_advertise_exit_node(advertise: bool, no_advertise: bool) -> Option<bool> {
+    match (advertise, no_advertise) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        _ => None,
+    }
+}
+
+/// Map the `--advertise-routes` / `--advertise-routes-clear` flags to the wire field's
+/// `Option<Vec<String>>`. Any routes passed → `Some(routes)` (replace the set); else
+/// `--advertise-routes-clear` → `Some(vec![])` (advertise none); else `None` (leave the persisted
+/// set unchanged). A non-empty list takes precedence over the clear flag.
+fn resolve_advertise_routes(routes: Vec<String>, clear: bool) -> Option<Vec<String>> {
+    if !routes.is_empty() {
+        Some(routes)
+    } else if clear {
+        Some(vec![])
+    } else {
+        None
+    }
 }
 
 #[tokio::main]
@@ -96,6 +164,12 @@ async fn main() -> Result<()> {
             no_tun,
             tun_name,
             tun_mtu,
+            exit_node,
+            clear_exit_node,
+            advertise_exit_node,
+            no_advertise_exit_node,
+            advertise_routes,
+            advertise_routes_clear,
         } => {
             // Resolve the secret through the precedence chain and hold it as a `SecretString`
             // (zeroized on drop, never `Debug`-printed). Expose it only here, at the moment we
@@ -116,6 +190,20 @@ async fn main() -> Result<()> {
                 },
                 tun_name,
                 tun_mtu,
+                // `--exit-node <sel>` sets, `--exit-node-clear` stops using one, neither leaves it
+                // unchanged; clap's `conflicts_with` guarantees the two are never both set.
+                exit_node: resolve_exit_node(exit_node, clear_exit_node),
+                // `--advertise-exit-node`/`--no-advertise-exit-node` tri-state (mirrors `--tun`).
+                advertise_exit_node: resolve_advertise_exit_node(
+                    advertise_exit_node,
+                    no_advertise_exit_node,
+                ),
+                // Passed routes replace the set; `--advertise-routes-clear` empties it; neither
+                // leaves the persisted set unchanged.
+                advertise_routes: resolve_advertise_routes(
+                    advertise_routes,
+                    advertise_routes_clear,
+                ),
             }
         }
         Command::Down => Request::Down,
@@ -472,6 +560,60 @@ mod tests {
             }
             _ => panic!("expected Failed to win over Url"),
         }
+    }
+
+    #[test]
+    fn resolve_exit_node_set_wins() {
+        // A set value maps to Some(Some(_)); it also wins if a clear is somehow also present (clap
+        // forbids that via conflicts_with, but the mapping must still be unambiguous).
+        assert_eq!(
+            resolve_exit_node(Some("100.64.0.9".to_string()), false),
+            Some(Some("100.64.0.9".to_string()))
+        );
+        assert_eq!(
+            resolve_exit_node(Some("exit-1".to_string()), true),
+            Some(Some("exit-1".to_string())),
+            "an explicit selector wins over the clear flag"
+        );
+    }
+
+    #[test]
+    fn resolve_exit_node_clear_and_unchanged() {
+        // `--exit-node-clear` → Some(None) (stop using one); neither flag → None (unchanged).
+        assert_eq!(resolve_exit_node(None, true), Some(None));
+        assert_eq!(resolve_exit_node(None, false), None);
+    }
+
+    #[test]
+    fn resolve_advertise_exit_node_tristate() {
+        // Enable → Some(true); disable → Some(false); neither → None (unchanged).
+        assert_eq!(resolve_advertise_exit_node(true, false), Some(true));
+        assert_eq!(resolve_advertise_exit_node(false, true), Some(false));
+        assert_eq!(resolve_advertise_exit_node(false, false), None);
+        // Enable wins if both are somehow set (clap's conflicts_with prevents this in practice).
+        assert_eq!(resolve_advertise_exit_node(true, true), Some(true));
+    }
+
+    #[test]
+    fn resolve_advertise_routes_set_clear_unchanged() {
+        // A non-empty list replaces the set.
+        assert_eq!(
+            resolve_advertise_routes(
+                vec!["192.168.1.0/24".to_string(), "10.0.0.0/8".to_string()],
+                false
+            ),
+            Some(vec!["192.168.1.0/24".to_string(), "10.0.0.0/8".to_string()])
+        );
+        // No routes + clear flag → advertise none (empty set).
+        assert_eq!(resolve_advertise_routes(vec![], true), Some(vec![]));
+        // Neither → leave the persisted set unchanged.
+        assert_eq!(resolve_advertise_routes(vec![], false), None);
+        // A passed list takes precedence over the clear flag.
+        assert_eq!(
+            resolve_advertise_routes(vec!["172.16.0.0/12".to_string()], true),
+            Some(vec!["172.16.0.0/12".to_string()]),
+            "an explicit list wins over the clear flag"
+        );
     }
 
     #[test]
