@@ -32,10 +32,23 @@ pub struct Prefs {
     /// Route this node's traffic out through a peer exit node, selected by IP or MagicDNS name
     /// (the Go `--exit-node` flag). `None` = no exit node (direct egress). Stored as the raw
     /// selector string and parsed into the engine's `ExitNodeSelector` in `build_config`.
+    ///
+    /// DNS leak-safety: this is leak-free only in TUN mode, where the engine takes over the OS
+    /// resolver and routes recursive DNS to the exit node's peerAPI DoH over the overlay (never a
+    /// host socket). If the chosen exit node does NOT advertise DNS-proxy capability, recursive
+    /// resolution falls back to this node's own configured upstreams — still sent over the overlay,
+    /// not the host's real resolver, so it is not an OS-level leak (matches Go's behavior for a
+    /// non-DNS-proxy exit). In netstack mode the OS resolver is untouched (see `build_config`).
     pub exit_node: Option<String>,
     /// Advertise this node as an exit node so peers can route their traffic out through it (Go
     /// `--advertise-exit-node`). Egress still requires control/admin approval (autoApprovers or a
     /// manual route approval) before peers may use it.
+    ///
+    /// Advertising is decoupled from actually forwarding: the engine only egresses a peer's traffic
+    /// when `forward_exit_egress` is set (which the daemon does not set), so the default
+    /// `DirectDialer` structurally refuses exit egress and this node's real IP cannot leak just from
+    /// advertising. Forwarded-client DNS on the advertise side is an engine concern (tracked
+    /// upstream as `tsr-c39`), not a daemon responsibility.
     pub advertise_exit_node: bool,
     /// Subnet routes (CIDRs) this node advertises to the tailnet so peers can reach the LANs behind
     /// it (Go `--advertise-routes`). Stored as raw CIDR strings, parsed into `ipnet::IpNet` in
