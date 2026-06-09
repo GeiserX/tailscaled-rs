@@ -116,14 +116,14 @@ fn current_euid() -> u32 {
 /// Whether a given LocalAPI command requires write permission.
 ///
 /// Centralized so the server has one authority on which verbs mutate. Read commands (`status`)
-/// return false; lifecycle/prefs commands (`up`, `down`) return true. The match is exhaustive over
-/// [`crate::localapi::Request`], so a new command forces an explicit authorization decision at
+/// return false; lifecycle/prefs commands (`up`, `set`, `down`) return true. The match is exhaustive
+/// over [`crate::localapi::Request`], so a new command forces an explicit authorization decision at
 /// compile time.
 pub fn requires_write(request: &crate::localapi::Request) -> bool {
     use crate::localapi::Request;
     match request {
         Request::Status | Request::Watch => false,
-        Request::Up { .. } | Request::Down => true,
+        Request::Up { .. } | Request::Set { .. } | Request::Down => true,
     }
 }
 
@@ -166,6 +166,16 @@ mod tests {
         }
     }
 
+    fn set() -> Request {
+        Request::Set {
+            hostname: None,
+            accept_routes: None,
+            exit_node: None,
+            advertise_exit_node: None,
+            advertise_routes: None,
+        }
+    }
+
     #[test]
     fn root_gets_write() {
         let p = AuthPolicy::with_owner_euid(1000);
@@ -190,6 +200,7 @@ mod tests {
         assert!(!requires_write(&Request::Status));
         assert!(requires_write(&Request::Down));
         assert!(requires_write(&up()));
+        assert!(requires_write(&set()));
     }
 
     // The security-critical deny path, tested directly (no socket, no second uid needed). These
@@ -199,6 +210,7 @@ mod tests {
     fn read_only_caller_is_denied_writes() {
         assert_eq!(authorize(&Request::Down, Access::ReadOnly), Err(Denied));
         assert_eq!(authorize(&up(), Access::ReadOnly), Err(Denied));
+        assert_eq!(authorize(&set(), Access::ReadOnly), Err(Denied));
     }
 
     #[test]
@@ -211,5 +223,6 @@ mod tests {
         assert_eq!(authorize(&Request::Status, Access::ReadWrite), Ok(()));
         assert_eq!(authorize(&Request::Down, Access::ReadWrite), Ok(()));
         assert_eq!(authorize(&up(), Access::ReadWrite), Ok(()));
+        assert_eq!(authorize(&set(), Access::ReadWrite), Ok(()));
     }
 }
