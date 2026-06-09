@@ -143,11 +143,18 @@ default, the daemon workaround can be removed (it becomes a redundant no-op).
 
 ---
 
-## 6. (BLOCKER for macOS TUN — ROOT-CAUSED + FIX PROVEN) `ROUTE_BIN` is the Linux path `/usr/sbin/route`; on macOS `route` is `/sbin/route`
+## 6. ✅ FIXED in engine v0.6.10 — `ROUTE_BIN` was the Linux path `/usr/sbin/route`; on macOS `route` is `/sbin/route`
 
-> **RESOLVED to a one-line root cause and proven end-to-end live (engine v0.6.9, e126bba).**
+> **DONE.** The engine shipped the one-line fix in **v0.6.10** (`ts_host_net/src/macos.rs`:
+> `const ROUTE_BIN: &str = "/sbin/route";`, commit `f0277391`). The daemon bumped its pin to that
+> rev and **re-verified the fix live on the released engine**: `tnet up --tun` reaches `Running`
+> with a tailnet `/32`, the log hits `TUN device created`, and there is **zero `os error 2`** (the
+> fatal fail-closed string is gone); clean RAII teardown. Daemon bead `tsd-tth` closed. The section
+> below is retained as the diagnostic record.
+>
+> **Original RESOLVED note (proven end-to-end live against a locally-patched v0.6.9, e126bba).**
 > This supersedes BOTH earlier theories (the v6 `/128`, then the vaguer "host-route
-> programming order is off"). The actual bug is a single wrong constant.
+> programming order is off"). The actual bug was a single wrong constant.
 
 **Root cause (one line).** `ts_host_net/src/macos.rs:26`:
 ```rust
