@@ -479,6 +479,7 @@ async fn dispatch(
             advertise_routes,
             accept_routes,
             ssh,
+            reset,
         } => {
             // Confine the plaintext authkey to the smallest scope: wrap it into a `SecretString`
             // right at the boundary and hand the engine path the secret. (The wire type stays
@@ -497,7 +498,21 @@ async fn dispatch(
                 advertise_routes,
                 accept_routes,
                 ssh,
+                reset,
             };
+            // Accidental-revert guard (Go `checkForAccidentalSettingReverts`): unless this is a
+            // `--reset` up, refuse an `up` that would silently revert a non-default pref it didn't
+            // mention. This is a PURE READ that mutates nothing — done under a brief lock BEFORE
+            // `drive_up` so a tripped guard leaves the node exactly as it was (no teardown, no
+            // persist). On a non-empty result we return the structured reverts and the CLI renders
+            // Go's "re-mention the current value of all non-default settings / pass --reset" message.
+            // `--reset` opts out of the guard by construction (the operator accepts the reverts).
+            if !opts.reset {
+                let reverts = { backend.lock().await.up_revert_guard(&opts) };
+                if !reverts.is_empty() {
+                    return Response::RevertGuard { reverts };
+                }
+            }
             match ipn::drive_up(backend, authkey, opts).await {
                 Ok(()) => Response::Ok {
                     message: "node brought up".to_string(),

@@ -123,6 +123,31 @@ impl Prefs {
         }
     }
 
+    /// Reset every "up-managed" pref (one a `tnet up` flag controls) to its [`Default`] value,
+    /// leaving lifecycle/registration prefs untouched. This is the mutation behind `up --reset` (Go
+    /// `tailscale up --reset`): the single path where `up` is a true wholesale REPLACE rather than a
+    /// PATCH of only the mentioned flags. [`crate::ipn::Backend::begin_up`] calls this **before**
+    /// applying the command's overrides, so e.g. `up --reset --ssh` ends with only `ssh_enabled` set
+    /// and every other up-managed pref back at its default.
+    ///
+    /// Deliberately NOT reset: `want_running` / `logged_out` (lifecycle — `up` sets `want_running`
+    /// itself just after), `ephemeral` (a registration-time property with no `up` flag), and
+    /// `taildrop_dir` (not an `up`-managed pref). The set reset here is exactly the set the
+    /// accidental-revert guard (`crate::ipn::revert_guard`) checks — they must stay in lockstep.
+    pub fn reset_up_managed_to_default(&mut self) {
+        let d = Self::default();
+        self.control_url = d.control_url;
+        self.hostname = d.hostname;
+        self.accept_routes = d.accept_routes;
+        self.exit_node = d.exit_node;
+        self.advertise_exit_node = d.advertise_exit_node;
+        self.advertise_routes = d.advertise_routes;
+        self.ssh_enabled = d.ssh_enabled;
+        self.tun_enabled = d.tun_enabled;
+        self.tun_name = d.tun_name;
+        self.tun_mtu = d.tun_mtu;
+    }
+
     /// Atomically-enough persist prefs to `path`, creating parent directories as needed.
     pub async fn save(&self, path: &Path) -> std::io::Result<()> {
         if let Some(dir) = path.parent() {

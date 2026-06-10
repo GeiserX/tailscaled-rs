@@ -12,7 +12,7 @@ use secrecy::{ExposeSecret, SecretString};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use tailscaled_rs::localapi::{Request, Response};
+use tailscaled_rs::localapi::{Request, Response, RevertedPref};
 
 /// Env var consulted for the auth key when neither `--authkey` nor `--authkey-file` is given.
 const AUTHKEY_ENV: &str = "TS_AUTH_KEY";
@@ -115,6 +115,13 @@ enum Command {
         /// omitting both leaves the setting unchanged.
         #[arg(long)]
         no_ssh: bool,
+        /// Reset every setting this command does not mention back to its default (Go `tailscale up
+        /// --reset`). By default `tnet up` refuses to silently revert a non-default setting you did
+        /// not re-mention (it tells you to re-state it or pass `--reset`); `--reset` is how you opt
+        /// into "anything I didn't mention goes back to default". This is the only form of `up` that
+        /// is a true wholesale replace rather than a patch of just the flags you passed.
+        #[arg(long)]
+        reset: bool,
     },
     /// Tweak individual prefs on an already-configured node, without an up/down cycle (the analogue
     /// of Go's `tailscale set`). This never (re)authenticates and never changes whether the node is
@@ -344,6 +351,7 @@ async fn main() -> Result<()> {
             no_accept_routes,
             ssh,
             no_ssh,
+            reset,
         } => {
             // Resolve the secret through the precedence chain and hold it as a `SecretString`
             // (zeroized on drop, never `Debug`-printed). Expose it only here, at the moment we
@@ -379,6 +387,9 @@ async fn main() -> Result<()> {
                 accept_routes: resolve_accept_routes(accept_routes, no_accept_routes),
                 // `--ssh`/`--no-ssh` tri-state (mirrors `--tun`).
                 ssh: resolve_ssh(ssh, no_ssh),
+                // `--reset`: reset unmentioned settings to default + bypass the accidental-revert
+                // guard. A plain bool flag (Go's `--reset`), passed straight through.
+                reset,
             }
         }
         Command::Set {
@@ -510,12 +521,84 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        // The daemon refused an `up` that would silently revert non-default settings the command did
+        // not mention (Go's accidental-revert guard). Render Go's guidance with a copy-pasteable
+        // command and exit non-zero — nothing was changed on the node.
+        Response::RevertGuard { reverts } => {
+            eprint!("{}", format_revert_guard(&reverts));
+            std::process::exit(1);
+        }
         Response::Error { message } => {
             eprintln!("error: {message}");
             std::process::exit(1);
         }
     }
     Ok(())
+}
+
+/// Map a daemon pref key (from [`Response::RevertGuard`]) to the `tnet up` flag the operator must
+/// re-pass to keep that setting, rendered as a copy-pasteable `--flag` / `--flag=value` token.
+///
+/// The daemon deliberately speaks pref keys, not flag spellings (it has no notion of `--advertise-
+/// routes`); this is the CLI-owned half of that split. Boolean prefs render as a bare `--flag` when
+/// their current value is `true` (the only case the guard reports a bool — a `false` bool equals its
+/// default and so never trips), and as `--no-flag` defensively otherwise. Value prefs render as
+/// `--flag=value`. An unknown key (daemon newer than CLI) falls back to `--key=value` so the message
+/// is still actionable rather than dropping the setting silently.
+fn revert_pref_to_flag(key: &str, value: &str) -> String {
+    match key {
+        // Boolean up-managed prefs. The guard only reports these when non-default (i.e. `true`),
+        // so the keep-it token is the bare enabling flag; `--no-*` is a defensive fallback.
+        "accept_routes" => bool_keep_flag("accept-routes", "no-accept-routes", value),
+        "advertise_exit_node" => {
+            bool_keep_flag("advertise-exit-node", "no-advertise-exit-node", value)
+        }
+        "ssh" => bool_keep_flag("ssh", "no-ssh", value),
+        "tun" => bool_keep_flag("tun", "no-tun", value),
+        // Value-bearing prefs: re-pass the current value verbatim. `advertise_routes` is already a
+        // comma-joined list, which `--advertise-routes` accepts directly.
+        "advertise_routes" => format!("--advertise-routes={value}"),
+        "exit_node" => format!("--exit-node={value}"),
+        "hostname" => format!("--hostname={value}"),
+        "control_url" => format!("--control-url={value}"),
+        "tun_name" => format!("--tun-name={value}"),
+        "tun_mtu" => format!("--tun-mtu={value}"),
+        // Daemon knows a pref this CLI build doesn't: keep the message actionable.
+        other => format!("--{other}={value}"),
+    }
+}
+
+/// Render a boolean "keep this setting" flag: the bare enabling flag when `value == "true"` (the
+/// non-default case the guard reports), else the explicit disabling flag.
+fn bool_keep_flag(enable: &str, disable: &str, value: &str) -> String {
+    if value == "true" {
+        format!("--{enable}")
+    } else {
+        format!("--{disable}")
+    }
+}
+
+/// Render the accidental-revert guard message — the Rust analogue of Go's `accidentalUpPrefix`
+/// guidance — listing the settings that would be lost and a copy-pasteable command to keep them.
+/// Pure (returns the string) so it is unit-testable; the caller prints it to stderr.
+fn format_revert_guard(reverts: &[RevertedPref]) -> String {
+    // Deterministic order regardless of how the daemon happened to enumerate them.
+    let mut flags: Vec<String> = reverts
+        .iter()
+        .map(|r| revert_pref_to_flag(&r.key, &r.value))
+        .collect();
+    flags.sort();
+    let joined = flags.join(" ");
+    let mut out = String::new();
+    out.push_str(
+        "error: this `tnet up` would revert settings you did not mention back to their defaults.\n",
+    );
+    out.push_str("To proceed, either re-run mentioning the current value of every non-default\n");
+    out.push_str("setting, or pass --reset to accept the reverts:\n\n");
+    out.push_str(&format!("    tnet up {joined}\n\n"));
+    out.push_str("Or to reset the unmentioned settings to their defaults:\n\n");
+    out.push_str("    tnet up --reset ...\n");
+    out
 }
 
 /// Sanitize a control-plane-supplied string before printing it to the terminal.
@@ -1022,6 +1105,7 @@ mod tests {
             advertise_routes: None,
             accept_routes: resolve_accept_routes(true, false),
             ssh: None,
+            reset: false,
         };
         match enabled {
             Request::Up { accept_routes, .. } => {
@@ -1042,6 +1126,7 @@ mod tests {
             advertise_routes: None,
             accept_routes: resolve_accept_routes(false, true),
             ssh: None,
+            reset: false,
         };
         match disabled {
             Request::Up { accept_routes, .. } => {
@@ -1066,6 +1151,7 @@ mod tests {
             advertise_routes: None,
             accept_routes: resolve_accept_routes(false, false),
             ssh: None,
+            reset: false,
         };
         match unchanged {
             Request::Up { accept_routes, .. } => assert_eq!(
@@ -1382,5 +1468,65 @@ mod tests {
             benign,
             "plain text + tab/newline must be unchanged"
         );
+    }
+
+    #[test]
+    fn revert_pref_to_flag_maps_keys_to_their_up_flags() {
+        // Value prefs render as `--flag=value`; the daemon's `advertise_routes` value is already
+        // comma-joined and re-passed verbatim.
+        assert_eq!(
+            revert_pref_to_flag("advertise_routes", "10.0.0.0/8,192.168.1.0/24"),
+            "--advertise-routes=10.0.0.0/8,192.168.1.0/24"
+        );
+        assert_eq!(
+            revert_pref_to_flag("exit_node", "100.64.0.9"),
+            "--exit-node=100.64.0.9"
+        );
+        assert_eq!(
+            revert_pref_to_flag("hostname", "node-a"),
+            "--hostname=node-a"
+        );
+        // Boolean prefs: the guard only reports them when non-default (true), so the keep-it token is
+        // the bare enabling flag.
+        assert_eq!(revert_pref_to_flag("ssh", "true"), "--ssh");
+        assert_eq!(
+            revert_pref_to_flag("accept_routes", "true"),
+            "--accept-routes"
+        );
+        assert_eq!(revert_pref_to_flag("tun", "true"), "--tun");
+        // Defensive: a false bool renders the disabling flag (shouldn't occur from the guard).
+        assert_eq!(revert_pref_to_flag("ssh", "false"), "--no-ssh");
+        // Unknown key (daemon newer than CLI): still actionable, not dropped.
+        assert_eq!(revert_pref_to_flag("future_pref", "x"), "--future_pref=x");
+    }
+
+    #[test]
+    fn format_revert_guard_renders_sorted_copy_pasteable_command() {
+        // The canonical case: `tnet up --ssh` on a node that already advertises routes + accepts
+        // routes. The daemon reports the two reverts; the message must list a `tnet up` line that
+        // re-mentions both, in a deterministic (sorted) order, and offer `--reset`.
+        let reverts = vec![
+            RevertedPref {
+                key: "advertise_routes".to_string(),
+                value: "10.0.0.0/8".to_string(),
+            },
+            RevertedPref {
+                key: "accept_routes".to_string(),
+                value: "true".to_string(),
+            },
+        ];
+        let out = format_revert_guard(&reverts);
+        // Both keep-flags present, sorted: "--accept-routes" < "--advertise-routes=...".
+        assert!(
+            out.contains("tnet up --accept-routes --advertise-routes=10.0.0.0/8"),
+            "expected a sorted copy-pasteable command, got:\n{out}"
+        );
+        assert!(
+            out.contains("--reset"),
+            "must mention the --reset escape hatch"
+        );
+        // It is framed as an error (non-zero exit at the call site) and explains the revert.
+        assert!(out.starts_with("error:"));
+        assert!(out.contains("revert"));
     }
 }
