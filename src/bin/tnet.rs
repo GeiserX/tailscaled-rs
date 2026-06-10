@@ -427,6 +427,28 @@ fn print_status(s: &tailscaled_rs::localapi::StatusReport) {
         s.self_name.as_deref().unwrap_or("(unknown)"),
         s.self_ipv4.as_deref().unwrap_or("-")
     );
+    // Configured posture (the node's persisted prefs), so `tnet status` shows what `up`/`set` left
+    // in effect — the analogue of the config Go's `tailscale status` reflects. Each line is printed
+    // only when it carries non-default information, to keep a plain node's status uncluttered.
+    let p = &s.prefs;
+    if let Some(en) = p.exit_node.as_deref() {
+        println!("exit-node:    {en}");
+    }
+    if p.advertise_exit_node {
+        println!("advertising:  exit-node");
+    }
+    if !p.advertise_routes.is_empty() {
+        println!("adv-routes:   {}", p.advertise_routes.join(", "));
+    }
+    if p.accept_routes {
+        println!("accept-routes: on");
+    }
+    if p.ssh {
+        println!("ssh-server:   on");
+    }
+    if p.tun {
+        println!("tun:          on");
+    }
     // Interactive login: when the node is waiting for a human to authorize it, the daemon surfaces
     // the control auth URL — make it prominent so the operator can click it.
     if let Some(url) = s.auth_url.as_deref() {
@@ -639,6 +661,7 @@ mod tests {
             self_name: None,
             auth_url: None,
             error: None,
+            prefs: Default::default(),
             peers: vec![],
         }
     }
