@@ -159,6 +159,17 @@ pub enum Request {
         /// The profile id to remove.
         target: String,
     },
+    /// Connect to `port` on a tailnet host and splice the connection to the client (Go `tailscale
+    /// nc`). After the daemon's one-line acknowledgement, this connection is **hijacked**: the daemon
+    /// bidirectionally copies bytes between the LocalAPI socket and the overlay TCP stream until
+    /// either side closes (like [`Watch`](Request::Watch), it is terminal for the connection). A WRITE
+    /// (it opens an outbound connection) — gated like `up`/`down`.
+    Nc {
+        /// Destination host: a tailnet IP or MagicDNS name.
+        host: String,
+        /// Destination TCP port.
+        port: u16,
+    },
     /// Bring the node down (`WantRunning = false`) without logging out.
     Down,
     /// Log the node out (the analogue of Go's `tailscale logout`): deregister the node key with the

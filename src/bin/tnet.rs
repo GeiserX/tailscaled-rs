@@ -347,6 +347,16 @@ enum Command {
     /// fork uploads no logs — the marker is a LOCAL identifier (id + daemon version + state) to quote
     /// when reporting an issue, not a server-retrievable log id.
     Bugreport,
+    /// Connect to a TCP port on a tailnet host and pipe stdin/stdout over the overlay (Go `tailscale
+    /// nc`). Like netcat: bytes from stdin go to the peer, the peer's bytes go to stdout, until EOF.
+    Nc {
+        /// Destination host: a tailnet IP or MagicDNS name.
+        #[arg(value_name = "HOST")]
+        host: String,
+        /// Destination TCP port.
+        #[arg(value_name = "PORT")]
+        port: u16,
+    },
 }
 
 /// `tnet metrics` subcommands. Bare `tnet metrics` prints to stdout; `write <path>` writes a file.
@@ -611,6 +621,13 @@ async fn main() -> Result<()> {
             ssh: resolve_ssh(ssh, no_ssh),
         },
         Command::Bugreport => Request::BugReport,
+        // `nc` hijacks its connection (the daemon splices to the overlay after a one-line ack), so it
+        // is handled by a dedicated piping path, not the generic round-trip.
+        Command::Nc { host, port } => {
+            return run_nc(&socket, &host, port)
+                .await
+                .with_context(|| format!("nc to {host}:{port} via {}", socket.display()));
+        }
         Command::Down => Request::Down,
         Command::Logout => Request::Logout,
         // `switch` (Go `tailscale switch`): --list renders a table; `remove <id>` deletes; a bare
@@ -1885,6 +1902,62 @@ async fn round_trip(socket: &std::path::Path, request: &Request) -> Result<Respo
     let response = serde_json::from_str(response_line.trim())
         .with_context(|| format!("parsing daemon response: {response_line:?}"))?;
     Ok(response)
+}
+
+/// `tnet nc <host> <port>`: open a connection through the daemon and pipe stdin/stdout over it.
+///
+/// Protocol: send `Request::Nc`, read ONE ack line — `Ok` means the overlay connection is live (the
+/// daemon has switched that socket into raw splice mode), `Error` means the connect failed (printed +
+/// exit 1, the connection was never hijacked). On `Ok`, copy concurrently in both directions until
+/// EOF: local stdin → socket (→ peer) and socket (← peer) → local stdout. A clean EOF on either side
+/// ends the session (exit 0).
+async fn run_nc(socket: &std::path::Path, host: &str, port: u16) -> Result<()> {
+    let stream = UnixStream::connect(socket)
+        .await
+        .context("connect (is tailnetd running?)")?;
+    let (read_half, mut write_half) = stream.into_split();
+
+    // Send the nc request line.
+    let mut line = serde_json::to_vec(&Request::Nc {
+        host: host.to_string(),
+        port,
+    })?;
+    line.push(b'\n');
+    write_half.write_all(&line).await?;
+    write_half.flush().await?;
+
+    // Read exactly the one-line ack (the daemon writes nothing more before we send, so the BufReader
+    // holds no peer payload past the newline — any subsequent bytes are the peer's, read below).
+    let mut reader = BufReader::new(read_half);
+    let mut ack = String::new();
+    reader.read_line(&mut ack).await?;
+    match serde_json::from_str::<Response>(ack.trim())
+        .with_context(|| format!("parsing nc ack: {ack:?}"))?
+    {
+        Response::Ok { .. } => {} // connection live — proceed to pipe
+        Response::Error { message } => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        other => anyhow::bail!("unexpected nc ack: {other:?}"),
+    }
+
+    // Splice local stdio <-> the socket. stdin → socket (→ peer); socket (← peer) → stdout. Run both
+    // until EOF; the first side to close ends its copy, and we return once both finish.
+    let mut stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+    let stdin_to_peer = async {
+        let r = tokio::io::copy(&mut stdin, &mut write_half).await;
+        let _ = write_half.shutdown().await; // half-close so the peer sees our EOF
+        r
+    };
+    let peer_to_stdout = async {
+        let r = tokio::io::copy(&mut reader, &mut stdout).await;
+        let _ = stdout.flush().await;
+        r
+    };
+    let (_s2p, _p2s) = tokio::join!(stdin_to_peer, peer_to_stdout);
+    Ok(())
 }
 
 #[cfg(test)]
