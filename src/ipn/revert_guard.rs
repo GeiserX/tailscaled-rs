@@ -288,13 +288,19 @@ mod tests {
     #[test]
     fn advertise_tags_validation() {
         use super::super::validate_advertise_tags;
-        // Valid: tag:<name> entries.
+        // Valid: tag:<name> — letter-led, [A-Za-z0-9-] only.
         assert!(validate_advertise_tags(&["tag:server".into(), "tag:ci".into()]).is_ok());
+        assert!(validate_advertise_tags(&["tag:web-1".into()]).is_ok());
         assert!(validate_advertise_tags(&[]).is_ok());
         // Invalid: bare name, empty tag name, wrong prefix.
         assert!(validate_advertise_tags(&["server".into()]).is_err());
         assert!(validate_advertise_tags(&["tag:".into()]).is_err());
         assert!(validate_advertise_tags(&["notatag:x".into()]).is_err());
+        // Invalid per Go CheckTag: leading digit, underscore, space, punctuation.
+        assert!(validate_advertise_tags(&["tag:9server".into()]).is_err());
+        assert!(validate_advertise_tags(&["tag:my_tag".into()]).is_err());
+        assert!(validate_advertise_tags(&["tag:has space".into()]).is_err());
+        assert!(validate_advertise_tags(&["tag:exit!".into()]).is_err());
     }
 
     /// A node that already advertises routes; the canonical "non-default prefs present" fixture.
