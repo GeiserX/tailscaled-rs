@@ -25,6 +25,18 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.14.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.13.0...v0.14.0) (2026-06-10)
+
+
+### Features
+
+* **ping:** tnet ping -c &lt;count&gt; (Go parity) ([#53](https://github.com/GeiserX/tailscaled-rs/issues/53)) ([92cfdd6](https://github.com/GeiserX/tailscaled-rs/commit/92cfdd6cc824867ecbc6c001408be050e616a991))
+
+
+### Bug Fixes
+
+* **tags,ping:** tighten tag validation to Go CheckTag + pace ping -c ([#55](https://github.com/GeiserX/tailscaled-rs/issues/55)) ([61d3068](https://github.com/GeiserX/tailscaled-rs/commit/61d3068f7f3b6c13ac2959a53265ea6201165d78))
+
 ## [0.13.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.12.0...v0.13.0) (2026-06-10)
 
 
