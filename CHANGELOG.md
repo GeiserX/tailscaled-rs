@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.7.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.6.0...v0.7.0) (2026-06-10)
+
+
+### Features
+
+* **security:** use engine Device::new_with_secret + bump to v0.8.0 (tsd-tnv) ([#26](https://github.com/GeiserX/tailscaled-rs/issues/26)) ([9a8a703](https://github.com/GeiserX/tailscaled-rs/commit/9a8a703b592ed5ca1bcbc311b69855deeef7243a))
+
 ## [0.6.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.5.0...v0.6.0) (2026-06-10)
 
 
