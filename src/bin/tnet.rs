@@ -203,6 +203,18 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Show current preference values (Go `tailscale get`). With no setting name, shows all prefs;
+    /// with a name (e.g. `accept-routes`), shows just that one. Setting names match the `tnet set`
+    /// flags.
+    Get {
+        /// A single setting to show (e.g. `accept-routes`, `exit-node`, `ssh`); omit (or `all`) to
+        /// show every setting.
+        #[arg(value_name = "SETTING")]
+        setting: Option<String>,
+        /// Output as JSON (a flattened `{ "setting-name": value }` map, matching Go `get --json`).
+        #[arg(long)]
+        json: bool,
+    },
     /// Show daemon and netmap status.
     Status {
         /// Stream status continuously, re-printing on every state transition, until interrupted
@@ -467,6 +479,31 @@ async fn main() -> Result<()> {
             print_version(client_version, daemon_version.as_deref(), json);
             return Ok(());
         }
+        // `get` (Go `tailscale get`): round-trip GetPrefs, then render. Handled inline (early return)
+        // because its `setting`/`json` args shape the output and are not part of the wire request —
+        // keeping the projection→render in one place, like `version`.
+        Command::Get { setting, json } => {
+            let view = match round_trip(&socket, &Request::GetPrefs).await {
+                Ok(Response::Prefs(v)) => v,
+                Ok(Response::Error { message }) => {
+                    eprintln!("error: {message}");
+                    std::process::exit(1);
+                }
+                Ok(other) => anyhow::bail!("unexpected response to get request: {other:?}"),
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("getting prefs at {}", socket.display()));
+                }
+            };
+            match format_get(&view, setting.as_deref(), json) {
+                Ok(out) => print!("{out}"),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return Ok(());
+        }
         // `status --watch` is a long-lived stream, not a one-shot round-trip — handle it here and
         // return. Plain `status` falls through to the one-shot path below.
         Command::Status { watch } => {
@@ -575,6 +612,9 @@ async fn main() -> Result<()> {
         // `--daemon` was passed), so a `Response::Version` never reaches here. This arm exists only
         // for match exhaustiveness; treat a stray one defensively rather than panicking.
         Response::Version { version } => println!("{version}"),
+        // `get` is likewise handled inline above (early return); this arm is only for exhaustiveness.
+        // Render the all-prefs table defensively if one ever reaches here.
+        Response::Prefs(view) => print!("{}", format_get(&view, None, false).unwrap_or_default()),
         Response::Error { message } => {
             eprintln!("error: {message}");
             std::process::exit(1);
@@ -586,6 +626,70 @@ async fn main() -> Result<()> {
 /// Print `tnet version` output (thin wrapper over [`format_version`], which is pure + unit-tested).
 fn print_version(client: &str, daemon: Option<&str>, json: bool) {
     print!("{}", format_version(client, daemon, json));
+}
+
+/// The canonical `(set-flag name, value-string)` projection of a [`PrefsView`], in the stable order
+/// `tnet get` displays. The names match the `tnet set`/`tnet up` flags (Go keys its `get` output by
+/// the same set-flag names), and the value strings are what you'd pass back to `set` (a bare CIDR
+/// list for routes, `true`/`false` for bools, the selector for exit-node, empty for an unset
+/// optional). One source so the table, the `--json` map, and single-setting lookup all agree.
+fn get_settings(view: &tailscaled_rs::localapi::PrefsView) -> Vec<(&'static str, String)> {
+    vec![
+        ("exit-node", view.exit_node.clone().unwrap_or_default()),
+        ("advertise-exit-node", view.advertise_exit_node.to_string()),
+        ("advertise-routes", view.advertise_routes.join(",")),
+        ("accept-routes", view.accept_routes.to_string()),
+        ("ssh", view.ssh.to_string()),
+        ("tun", view.tun.to_string()),
+    ]
+}
+
+/// Render `tnet get` output from a [`PrefsView`] (Go `tailscale get`). `setting` selects a single
+/// setting by its set-flag name (`None` or `"all"` = every setting); `json` selects the flattened
+/// `{ "name": "value" }` map form (matching Go `get --json`, which is a name→value map, NOT a raw
+/// prefs-struct dump). Default (no json) is a `NAME  VALUE` table; a single named setting prints just
+/// its raw value. Returns `Err` for an unknown setting name (Go errors too). Pure → unit-testable.
+fn format_get(
+    view: &tailscaled_rs::localapi::PrefsView,
+    setting: Option<&str>,
+    json: bool,
+) -> Result<String> {
+    let settings = get_settings(view);
+
+    // Single named setting (not "all"): print just that value, or error on an unknown name.
+    if let Some(name) = setting
+        && name != "all"
+    {
+        let (_, value) = settings.iter().find(|(n, _)| *n == name).ok_or_else(|| {
+            anyhow::anyhow!("unknown setting {name:?} (try `tnet get` to list all)")
+        })?;
+        return Ok(if json {
+            format!("\"{value}\"\n")
+        } else {
+            format!("{value}\n")
+        });
+    }
+
+    // All settings.
+    if json {
+        // Flattened name→value map, stable order, hand-built so the shape is dependency-free and
+        // matches Go's name-keyed map (string values, like the set-flag args).
+        let mut out = String::from("{\n");
+        for (i, (name, value)) in settings.iter().enumerate() {
+            let comma = if i + 1 < settings.len() { "," } else { "" };
+            out.push_str(&format!("  \"{name}\": \"{value}\"{comma}\n"));
+        }
+        out.push_str("}\n");
+        Ok(out)
+    } else {
+        // NAME  VALUE table, column-aligned to the widest name.
+        let width = settings.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+        let mut out = String::new();
+        for (name, value) in &settings {
+            out.push_str(&format!("{name:<width$}  {value}\n"));
+        }
+        Ok(out)
+    }
 }
 
 /// Render `tnet version` output. `client` is this CLI's crate version; `daemon` is the daemon's
@@ -1591,6 +1695,58 @@ mod tests {
         let jd = format_version("0.9.0", Some("0.8.0"), true);
         assert!(jd.contains("\"client\": \"0.9.0\""), "{jd}");
         assert!(jd.contains("\"daemon\": \"0.8.0\""), "{jd}");
+    }
+
+    #[test]
+    fn format_get_shapes() {
+        use tailscaled_rs::localapi::PrefsView;
+        let view = PrefsView {
+            exit_node: Some("100.64.0.9".into()),
+            advertise_exit_node: false,
+            advertise_routes: vec!["10.0.0.0/8".into(), "192.168.1.0/24".into()],
+            accept_routes: true,
+            ssh: true,
+            ssh_running: true,
+            tun: false,
+        };
+
+        // Default table: one NAME VALUE line per setting, all settings present.
+        let table = format_get(&view, None, false).unwrap();
+        assert!(table.contains("accept-routes"), "{table}");
+        assert!(table.contains("true"), "{table}");
+        assert!(
+            table.contains("advertise-routes") && table.contains("10.0.0.0/8,192.168.1.0/24"),
+            "{table}"
+        );
+        // 6 settings → 6 lines.
+        assert_eq!(table.lines().count(), 6, "{table}");
+
+        // --json: flattened name→value map (string values), every setting keyed by set-flag name.
+        let j = format_get(&view, None, true).unwrap();
+        assert!(j.contains("\"accept-routes\": \"true\""), "{j}");
+        assert!(j.contains("\"exit-node\": \"100.64.0.9\""), "{j}");
+        assert!(
+            j.trim_start().starts_with('{') && j.trim_end().ends_with('}'),
+            "{j}"
+        );
+
+        // Single named setting → just its value.
+        assert_eq!(
+            format_get(&view, Some("accept-routes"), false).unwrap(),
+            "true\n"
+        );
+        assert_eq!(
+            format_get(&view, Some("advertise-routes"), false).unwrap(),
+            "10.0.0.0/8,192.168.1.0/24\n"
+        );
+        // Single setting --json → quoted value.
+        assert_eq!(format_get(&view, Some("ssh"), true).unwrap(), "\"true\"\n");
+
+        // "all" behaves like None (all settings).
+        assert_eq!(format_get(&view, Some("all"), false).unwrap(), table);
+
+        // Unknown setting → error (Go errors too).
+        assert!(format_get(&view, Some("no-such-setting"), false).is_err());
     }
 
     #[test]

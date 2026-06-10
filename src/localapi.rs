@@ -118,6 +118,11 @@ pub enum Request {
     /// Report the daemon's own version (Go `tailscale version --daemon` reads `Status.Version`).
     /// Read-only — gated like [`Status`](Request::Status).
     Version,
+    /// Report the node's current preferences (Go `tailscale get` / the `GetPrefs` LocalAPI). Replies
+    /// with a [`PrefsView`] projection of the persisted prefs. Read-only — gated like
+    /// [`Status`](Request::Status). Distinct from the prefs embedded in a full [`Status`] report: this
+    /// is the focused "just the prefs" query `tnet get` uses, with no netmap/peer round-trip.
+    GetPrefs,
     /// Bring the node down (`WantRunning = false`) without logging out.
     Down,
     /// Log the node out (the analogue of Go's `tailscale logout`): deregister the node key with the
@@ -205,6 +210,9 @@ pub enum Response {
         /// The daemon binary's version (its crate version, `CARGO_PKG_VERSION`).
         version: String,
     },
+    /// The node's current preferences (reply to [`Request::GetPrefs`]) — a [`PrefsView`] projection
+    /// of the persisted prefs, rendered by `tnet get`.
+    Prefs(PrefsView),
     /// A command succeeded.
     Ok {
         /// Human-readable detail.
@@ -471,6 +479,32 @@ mod tests {
         match serde_json::from_str::<Response>(&json).unwrap() {
             Response::Version { version } => assert_eq!(version, "0.9.0"),
             other => panic!("expected Version, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_prefs_request_response_round_trip() {
+        // `get_prefs` discriminant + the Prefs(PrefsView) reply must survive the wire.
+        assert_eq!(
+            serde_json::to_string(&Request::GetPrefs).unwrap(),
+            r#"{"cmd":"get_prefs"}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<Request>(r#"{"cmd":"get_prefs"}"#).unwrap(),
+            Request::GetPrefs
+        ));
+        let resp = Response::Prefs(PrefsView {
+            advertise_routes: vec!["10.0.0.0/8".into()],
+            accept_routes: true,
+            ..PrefsView::default()
+        });
+        let json = serde_json::to_string(&resp).unwrap();
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::Prefs(v) => {
+                assert_eq!(v.advertise_routes, vec!["10.0.0.0/8".to_string()]);
+                assert!(v.accept_routes);
+            }
+            other => panic!("expected Prefs, got {other:?}"),
         }
     }
 
