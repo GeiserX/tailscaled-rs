@@ -146,6 +146,7 @@ pub fn requires_write(request: &crate::localapi::Request) -> bool {
         | Request::Logout
         | Request::SwitchProfile { .. }
         | Request::DeleteProfile { .. }
+        | Request::Nc { .. }
         | Request::FileCp { .. }
         | Request::FileGet { .. } => true,
     }
@@ -309,6 +310,13 @@ mod tests {
                 target: "work".into()
             }),
             "removing a profile deletes persisted state — a write"
+        );
+        assert!(
+            requires_write(&Request::Nc {
+                host: "peer".into(),
+                port: 22
+            }),
+            "nc opens an outbound connection — a write, gated like up/down"
         );
     }
 

@@ -202,6 +202,39 @@ async fn handle_conn(
                         stream_watch(&mut write_half, &backend).await?;
                         break;
                     }
+                    // `nc` is terminal for this connection like `Watch`, but it is a WRITE (it opens
+                    // an outbound connection), so it is authorized here before connecting. On a
+                    // successful connect the daemon acks, then splices the LocalAPI socket <-> the
+                    // overlay TCP stream bidirectionally (taking over `reader` + `write_half`). On a
+                    // denied/failed connect it writes a normal error line and keeps the request loop
+                    // alive (the connection was never hijacked).
+                    Ok(Request::Nc { host, port }) => {
+                        if auth::authorize(
+                            &Request::Nc {
+                                host: host.clone(),
+                                port,
+                            },
+                            access,
+                        )
+                        .is_err()
+                        {
+                            tracing::warn!(peer_uid = ?peer_uid, "denied LocalAPI nc: caller lacks write permission");
+                            write_response(
+                                &mut write_half,
+                                &Response::Error {
+                                    message: "permission denied: nc requires root or the same user that owns the daemon".into(),
+                                },
+                            )
+                            .await?;
+                            continue;
+                        }
+                        // `stream_nc` returns Ok(true) if it hijacked the connection (spliced to EOF),
+                        // Ok(false) if it only wrote an error line (connect failed) and the loop
+                        // should continue serving this peer.
+                        if stream_nc(&mut reader, &mut write_half, &backend, &host, port).await? {
+                            break;
+                        }
+                    }
                     Ok(req) => {
                         let response = dispatch(req, access, peer_uid, &backend).await;
                         write_response(&mut write_half, &response).await?;
@@ -320,6 +353,80 @@ async fn stream_watch(
     }
 }
 
+/// Connect to `host:port` over the tailnet and, on success, splice the LocalAPI connection to the
+/// overlay TCP stream bidirectionally (the `tnet nc` path). Returns `Ok(true)` if it hijacked the
+/// connection (spliced until EOF — the caller must stop serving this peer), or `Ok(false)` if it only
+/// wrote an error line because the connect could not be established (the caller keeps the request
+/// loop alive).
+///
+/// The connect runs off the backend lock (clone the device handle, drop the lock — like the other
+/// diagnostics), so a long-lived `nc` never holds the lock. After the one-line `Ok` ack, the daemon
+/// copies in both directions concurrently: `reader` (which carries any bytes the client already sent
+/// after the request line) → the overlay stream, and the overlay stream → `write_half`. When either
+/// direction hits EOF the splice ends and the connection closes.
+async fn stream_nc(
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    backend: &Arc<Mutex<Backend>>,
+    host: &str,
+    port: u16,
+) -> Result<bool> {
+    // Off-lock device handle, like the other diagnostics.
+    let dev = { backend.lock().await.device_handle() };
+    let Some(dev) = dev else {
+        write_response(
+            write_half,
+            &Response::Error {
+                message: "node is not up".into(),
+            },
+        )
+        .await?;
+        return Ok(false);
+    };
+    // Resolve + connect over the overlay (host may be a MagicDNS name or an IP). `connect_by_name`
+    // handles both (it resolves a name, and an IP literal resolves to itself).
+    let tcp = match dev.connect_by_name(host, port).await {
+        Ok(s) => s,
+        Err(e) => {
+            write_response(
+                write_half,
+                &Response::Error {
+                    message: format!("nc: connect to {host}:{port} failed: {e}"),
+                },
+            )
+            .await?;
+            return Ok(false);
+        }
+    };
+    // Ack so the client knows the connection is live and can switch to raw piping.
+    write_response(
+        write_half,
+        &Response::Ok {
+            message: format!("connected to {host}:{port}"),
+        },
+    )
+    .await?;
+
+    // Splice: client→peer reads from `reader` (so any bytes buffered after the request line are not
+    // lost) and writes to the overlay; peer→client reads the overlay and writes to `write_half`.
+    let (mut tcp_r, mut tcp_w) = tokio::io::split(tcp);
+    let client_to_peer = async {
+        let r = tokio::io::copy(reader, &mut tcp_w).await;
+        // Half-close the overlay write side on client EOF so the peer sees the end of input.
+        let _ = tcp_w.shutdown().await;
+        r
+    };
+    let peer_to_client = async {
+        let r = tokio::io::copy(&mut tcp_r, write_half).await;
+        let _ = write_half.shutdown().await;
+        r
+    };
+    // Run both directions until each completes (or one errors). Either EOF naturally ends its copy;
+    // we join so the connection lives as long as either direction is still flowing.
+    let (_c2p, _p2c) = tokio::join!(client_to_peer, peer_to_client);
+    Ok(true)
+}
+
 /// Serialize one [`Response`] as a single newline-terminated JSON line and flush it.
 async fn write_response(
     write_half: &mut tokio::net::unix::OwnedWriteHalf,
@@ -415,6 +522,11 @@ async fn dispatch(
             let be = backend.lock().await;
             Response::Status(be.status().await)
         }
+        // `nc` is intercepted in `handle_conn` (it hijacks the connection to splice) and never reaches
+        // `dispatch`; this arm exists only for match exhaustiveness.
+        Request::Nc { .. } => Response::Error {
+            message: "internal error: nc must be handled by the connection splicer".into(),
+        },
         // `version` (Go `tailscale version --daemon` reads `Status.Version`). The daemon's version is
         // its own compile-time crate version — a constant, needing no backend lock or engine.
         Request::Version => Response::Version {
