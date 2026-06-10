@@ -132,6 +132,7 @@ pub fn requires_write(request: &crate::localapi::Request) -> bool {
         | Request::Whois { .. }
         | Request::Ping { .. }
         | Request::Version
+        | Request::GetPrefs
         | Request::FileList => false,
         // Writes: lifecycle/prefs mutations plus the Taildrop transfers. `FileCp` initiates a send
         // and `FileGet` consumes/deletes an inbound file, so both mutate and gate like `up`/`down`.
@@ -268,6 +269,10 @@ mod tests {
         assert!(
             !requires_write(&Request::Version),
             "version only reports a constant — a read, gated like status"
+        );
+        assert!(
+            !requires_write(&Request::GetPrefs),
+            "get only reads the persisted prefs — a read, gated like status"
         );
     }
 

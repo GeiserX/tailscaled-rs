@@ -420,6 +420,12 @@ async fn dispatch(
         Request::Version => Response::Version {
             version: env!("CARGO_PKG_VERSION").to_string(),
         },
+        // `get` (Go `tailscale get` / GetPrefs). Project the persisted prefs under a brief lock — no
+        // engine round-trip, so it never head-of-line blocks. Shares `prefs_view()` with `status`.
+        Request::GetPrefs => {
+            let be = backend.lock().await;
+            Response::Prefs(be.prefs_view())
+        }
         // `logout` (Go `tailscale logout`): deregisters the node key with control, tears down, and
         // discards the on-disk key so the next `up` re-registers fresh — distinct from `down` (which
         // resumes). Backend::logout holds the lock for the whole sequence: the control-plane

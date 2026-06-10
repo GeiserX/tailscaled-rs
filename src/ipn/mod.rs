@@ -1255,29 +1255,38 @@ impl Backend {
             auth_url,
             error,
             // Project the persisted prefs into the status view so `tnet status` shows the full
-            // configured posture (read straight from prefs — no engine round-trip).
-            prefs: crate::localapi::PrefsView {
-                exit_node: self.prefs.exit_node.clone(),
-                advertise_exit_node: self.prefs.advertise_exit_node,
-                advertise_routes: self.prefs.advertise_routes.clone(),
-                accept_routes: self.prefs.accept_routes,
-                ssh: self.prefs.ssh_enabled,
-                // SSH *liveness*, distinct from the `ssh_enabled` pref above: the server task is
-                // spawned in `finish_up` and can die at bind time (no tailnet IPv4, `listen_ssh`
-                // error). Report it as running only when we hold a task handle that has not finished
-                // — `JoinHandle::is_finished()` is stable and non-blocking, so this never stalls the
-                // brief `status` lock. A missing handle (`None`) — SSH off, node down, or a daemon
-                // built without the `ssh` feature where no task is ever spawned — reads as not
-                // running. So `ssh: true, ssh_running: false` honestly flags an SSH server that was
-                // requested but is not actually accepting connections.
-                ssh_running: self
-                    .ssh_task
-                    .as_ref()
-                    .map(|h| !h.is_finished())
-                    .unwrap_or(false),
-                tun: self.prefs.tun_enabled,
-            },
+            // configured posture (read straight from prefs — no engine round-trip). Shared with
+            // `tnet get` via `prefs_view()` so both surfaces report one identical projection.
+            prefs: self.prefs_view(),
             peers,
+        }
+    }
+
+    /// Project the persisted [`Prefs`] into the read-only [`PrefsView`] surfaced by both `tnet status`
+    /// and `tnet get`. One source of truth so the two commands can never disagree about the node's
+    /// configured posture. Reads only `self.prefs` + the SSH task handle — no engine round-trip — so
+    /// it is cheap and safe to call under the brief backend lock.
+    pub fn prefs_view(&self) -> crate::localapi::PrefsView {
+        crate::localapi::PrefsView {
+            exit_node: self.prefs.exit_node.clone(),
+            advertise_exit_node: self.prefs.advertise_exit_node,
+            advertise_routes: self.prefs.advertise_routes.clone(),
+            accept_routes: self.prefs.accept_routes,
+            ssh: self.prefs.ssh_enabled,
+            // SSH *liveness*, distinct from the `ssh_enabled` pref above: the server task is spawned
+            // in `finish_up` and can die at bind time (no tailnet IPv4, `listen_ssh` error). Report
+            // it as running only when we hold a task handle that has not finished —
+            // `JoinHandle::is_finished()` is stable and non-blocking, so this never stalls the brief
+            // lock. A missing handle (`None`) — SSH off, node down, or a daemon built without the
+            // `ssh` feature where no task is ever spawned — reads as not running. So
+            // `ssh: true, ssh_running: false` honestly flags an SSH server that was requested but is
+            // not actually accepting connections.
+            ssh_running: self
+                .ssh_task
+                .as_ref()
+                .map(|h| !h.is_finished())
+                .unwrap_or(false),
+            tun: self.prefs.tun_enabled,
         }
     }
 
