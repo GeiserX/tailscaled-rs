@@ -87,6 +87,12 @@ material should not linger in freed heap.
 `expose`/`as_bytes` method rather than free `Copy`). This is a security-hardening change; it will
 ripple through call sites that rely on `Copy`. Tracks downstream bead `tsd-c3d`.
 
+**✅ SHIPPED (engine v0.11.0).** Private keys are now `ZeroizeOnDrop` + no-`Copy`; `public_key()`
+widened to `&self`. **Daemon impact: NONE** — the daemon never holds a raw private key (auth keys
+flow as `secrecy::SecretString` via `Device::new_with_secret`; the persisted node key is read by
+`&self` in `has_persisted_node_key`, no hot-path clone). Bead `tsd-c3d` closed. Rides in on the
+v0.12.0 pin bump.
+
 ---
 
 ## 4. (Lower priority) A network-change / rebind hook
@@ -102,6 +108,13 @@ node). Tracks downstream bead `tsd-94d`.
 - internal `netmon`-driven rebind inside the runtime so the daemon doesn't have to.
 
 This one needs engine design input — listed for awareness, not as a precise patch.
+
+**✅ SHIPPED (engine v0.12.0, `Device::rebind(&self) -> Result<(), Error>`).** The engine took the
+explicit-method option (the daemon owns *when*; `rebind` does the socket work: re-bind preferring the
+same local port, clear reflexive/confirmed-direct paths → re-probe + DERP-relay until a path
+re-confirms, IPv4-only invariant preserved, no-op if DERP-only). Daemon work now unblocked: build the
+link-change monitor (`tsd-94d`) that calls `Device::rebind()` on Wi-Fi switch / sleep-wake. Rides in
+on the v0.12.0 pin bump.
 
 ---
 
