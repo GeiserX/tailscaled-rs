@@ -115,6 +115,9 @@ pub enum Request {
         #[serde(default)]
         ssh: Option<bool>,
     },
+    /// Report the daemon's own version (Go `tailscale version --daemon` reads `Status.Version`).
+    /// Read-only — gated like [`Status`](Request::Status).
+    Version,
     /// Bring the node down (`WantRunning = false`) without logging out.
     Down,
     /// Log the node out (the analogue of Go's `tailscale logout`): deregister the node key with the
@@ -195,6 +198,12 @@ pub enum Response {
     Files {
         /// Files in the receive directory, each `(name, size_bytes)`.
         files: Vec<WaitingFileReport>,
+    },
+    /// The daemon's own version (reply to [`Request::Version`]) — the analogue of Go's
+    /// `ipnstate.Status.Version`, used by `tnet version --daemon`.
+    Version {
+        /// The daemon binary's version (its crate version, `CARGO_PKG_VERSION`).
+        version: String,
     },
     /// A command succeeded.
     Ok {
@@ -441,6 +450,28 @@ mod tests {
             serde_json::from_str::<Request>(r#"{"cmd":"watch"}"#).unwrap(),
             Request::Watch
         ));
+    }
+
+    #[test]
+    fn version_request_response_round_trip() {
+        // The `version` discriminant + the daemon's reply shape must be stable across the CLI/daemon
+        // process boundary (they agree only on this JSON wire format).
+        assert_eq!(
+            serde_json::to_string(&Request::Version).unwrap(),
+            r#"{"cmd":"version"}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<Request>(r#"{"cmd":"version"}"#).unwrap(),
+            Request::Version
+        ));
+        let resp = Response::Version {
+            version: "0.9.0".into(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::Version { version } => assert_eq!(version, "0.9.0"),
+            other => panic!("expected Version, got {other:?}"),
+        }
     }
 
     #[test]

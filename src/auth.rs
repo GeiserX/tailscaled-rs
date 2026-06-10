@@ -131,6 +131,7 @@ pub fn requires_write(request: &crate::localapi::Request) -> bool {
         | Request::Ip
         | Request::Whois { .. }
         | Request::Ping { .. }
+        | Request::Version
         | Request::FileList => false,
         // Writes: lifecycle/prefs mutations plus the Taildrop transfers. `FileCp` initiates a send
         // and `FileGet` consumes/deletes an inbound file, so both mutate and gate like `up`/`down`.
@@ -254,7 +255,8 @@ mod tests {
 
     #[test]
     fn read_only_diagnostics_do_not_require_write() {
-        // `ip`/`whois`/`ping` mutate no state — they must classify as reads, like `status`/`watch`.
+        // `ip`/`whois`/`ping`/`version` mutate no state — they must classify as reads, like
+        // `status`/`watch`.
         assert!(!requires_write(&Request::Ip));
         assert!(!requires_write(&Request::Whois {
             ip: "100.64.0.1".into()
@@ -263,6 +265,10 @@ mod tests {
             ip: "100.64.0.1".into(),
             timeout_ms: None,
         }));
+        assert!(
+            !requires_write(&Request::Version),
+            "version only reports a constant — a read, gated like status"
+        );
     }
 
     #[test]

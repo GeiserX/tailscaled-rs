@@ -191,6 +191,18 @@ enum Command {
     /// which keeps the registration for a seamless reconnect, `logout` ends it. Mirrors Go
     /// `tailscale logout`.
     Logout,
+    /// Print the version of this client (and, with `--daemon`, the running daemon). Mirrors Go
+    /// `tailscale version`.
+    Version {
+        /// Also query and print the running daemon's version (Go `--daemon`). Without it, `version`
+        /// answers purely locally and never contacts the daemon.
+        #[arg(long)]
+        daemon: bool,
+        /// Output as JSON (`{ "client": "..", "daemon": ".." }`; `daemon` present only with
+        /// `--daemon`). Mirrors Go `--json`.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show daemon and netmap status.
     Status {
         /// Stream status continuously, re-printing on every state transition, until interrupted
@@ -430,6 +442,31 @@ async fn main() -> Result<()> {
         },
         Command::Down => Request::Down,
         Command::Logout => Request::Logout,
+        // `version` answers from the CLI's own crate version. WITHOUT `--daemon` it never contacts
+        // the daemon (Go also prints the client version with no LocalAPI call) — handle it here and
+        // return. WITH `--daemon` it round-trips `Request::Version` to learn the daemon's version,
+        // then renders both; we do that inline here (rather than falling through to the generic
+        // response printer) so the client/daemon pairing + `--json` shape stay in one place.
+        Command::Version { daemon, json } => {
+            let client_version = env!("CARGO_PKG_VERSION");
+            let daemon_version = if daemon {
+                match round_trip(&socket, &Request::Version).await {
+                    Ok(Response::Version { version }) => Some(version),
+                    Ok(other) => {
+                        anyhow::bail!("unexpected response to version request: {other:?}")
+                    }
+                    Err(e) => {
+                        return Err(e).with_context(|| {
+                            format!("querying daemon version at {}", socket.display())
+                        });
+                    }
+                }
+            } else {
+                None
+            };
+            print_version(client_version, daemon_version.as_deref(), json);
+            return Ok(());
+        }
         // `status --watch` is a long-lived stream, not a one-shot round-trip — handle it here and
         // return. Plain `status` falls through to the one-shot path below.
         Command::Status { watch } => {
@@ -534,12 +571,43 @@ async fn main() -> Result<()> {
             eprint!("{}", format_revert_guard(&reverts));
             std::process::exit(1);
         }
+        // `version` is fully handled inline above (it early-returns before this match, whether or not
+        // `--daemon` was passed), so a `Response::Version` never reaches here. This arm exists only
+        // for match exhaustiveness; treat a stray one defensively rather than panicking.
+        Response::Version { version } => println!("{version}"),
         Response::Error { message } => {
             eprintln!("error: {message}");
             std::process::exit(1);
         }
     }
     Ok(())
+}
+
+/// Print `tnet version` output (thin wrapper over [`format_version`], which is pure + unit-tested).
+fn print_version(client: &str, daemon: Option<&str>, json: bool) {
+    print!("{}", format_version(client, daemon, json));
+}
+
+/// Render `tnet version` output. `client` is this CLI's crate version; `daemon` is the daemon's
+/// version when `--daemon` was passed (else `None`). `json` selects the JSON object form. Mirrors Go
+/// `tailscale version`: plain prints the bare client version (and a `Client:`/`Daemon:` pair when the
+/// daemon was queried); `--json` emits `{ "client": "..", "daemon": ".." }` with `daemon` present
+/// only when queried. Pure (returns the string, trailing newline included) so it is unit-testable.
+fn format_version(client: &str, daemon: Option<&str>, json: bool) -> String {
+    if json {
+        // Hand-built so the shape is stable and dependency-free; `daemon` omitted unless queried.
+        match daemon {
+            Some(d) => format!("{{\n  \"client\": \"{client}\",\n  \"daemon\": \"{d}\"\n}}\n"),
+            None => format!("{{\n  \"client\": \"{client}\"\n}}\n"),
+        }
+    } else {
+        match daemon {
+            // Go prints `Client:`/`Daemon:` when `--daemon` is set.
+            Some(d) => format!("Client: {client}\nDaemon: {d}\n"),
+            // Plain `version`: just the client version, like Go's bare first line.
+            None => format!("{client}\n"),
+        }
+    }
 }
 
 /// Map a daemon pref key (from [`Response::RevertGuard`]) to the `tnet up` flag the operator must
@@ -1504,6 +1572,35 @@ mod tests {
         assert_eq!(revert_pref_to_flag("ssh", "false"), "--no-ssh");
         // Unknown key (daemon newer than CLI): still actionable, not dropped.
         assert_eq!(revert_pref_to_flag("future_pref", "x"), "--future_pref=x");
+    }
+
+    #[test]
+    fn format_version_shapes() {
+        // Plain, no daemon → bare client version line (Go's first line).
+        assert_eq!(format_version("0.9.0", None, false), "0.9.0\n");
+        // Plain, with daemon → Client:/Daemon: pair (Go's --daemon form).
+        assert_eq!(
+            format_version("0.9.0", Some("0.9.0"), false),
+            "Client: 0.9.0\nDaemon: 0.9.0\n"
+        );
+        // JSON, no daemon → object with only client.
+        let j = format_version("0.9.0", None, true);
+        assert!(j.contains("\"client\": \"0.9.0\""), "{j}");
+        assert!(!j.contains("daemon"), "no daemon key without --daemon: {j}");
+        // JSON, with daemon → object with both; valid-enough to parse the two fields.
+        let jd = format_version("0.9.0", Some("0.8.0"), true);
+        assert!(jd.contains("\"client\": \"0.9.0\""), "{jd}");
+        assert!(jd.contains("\"daemon\": \"0.8.0\""), "{jd}");
+    }
+
+    #[test]
+    fn version_command_client_matches_crate_version() {
+        // The client version `tnet version` prints is the crate version — guards against drift if the
+        // print path ever stops using CARGO_PKG_VERSION.
+        assert_eq!(
+            format_version(env!("CARGO_PKG_VERSION"), None, false),
+            format!("{}\n", env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[test]
