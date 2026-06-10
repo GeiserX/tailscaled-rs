@@ -86,14 +86,16 @@ enum Command {
         no_advertise_exit_node: bool,
         /// Advertise these subnet routes (comma-separated CIDRs, e.g.
         /// `192.168.1.0/24,10.0.0.0/8`) so other tailnet nodes can reach those subnets through this
-        /// node. Replaces the whole advertised set. Use `--advertise-routes-clear` to advertise
+        /// node. Replaces the whole advertised set. Use `--clear-advertise-routes` to advertise
         /// none; passing neither leaves the persisted set unchanged.
         #[arg(long, value_name = "CIDR,...", value_delimiter = ',')]
         advertise_routes: Vec<String>,
         /// Stop advertising any subnet routes (clears the advertised set). Use this instead of an
         /// empty `--advertise-routes`, since clap can't distinguish "advertise none" from the flag
         /// being unset.
-        #[arg(long)]
+        // `--clear-advertise-routes` is the canonical spelling (consistent with `--clear-exit-node`);
+        // `--advertise-routes-clear` is kept as an alias for backward-compatibility.
+        #[arg(long = "clear-advertise-routes", alias = "advertise-routes-clear")]
         advertise_routes_clear: bool,
         /// Accept (and route to) subnet routes advertised by peers (Go `tailscale up
         /// --accept-routes`). Mutually exclusive with `--no-accept-routes`; omitting both leaves the
@@ -154,14 +156,16 @@ enum Command {
         no_advertise_exit_node: bool,
         /// Advertise these subnet routes (comma-separated CIDRs, e.g.
         /// `192.168.1.0/24,10.0.0.0/8`) so other tailnet nodes can reach those subnets through this
-        /// node. Replaces the whole advertised set. Use `--advertise-routes-clear` to advertise
+        /// node. Replaces the whole advertised set. Use `--clear-advertise-routes` to advertise
         /// none; passing neither leaves the persisted set unchanged.
         #[arg(long, value_name = "CIDR,...", value_delimiter = ',')]
         advertise_routes: Vec<String>,
         /// Stop advertising any subnet routes (clears the advertised set). Use this instead of an
         /// empty `--advertise-routes`, since clap can't distinguish "advertise none" from the flag
         /// being unset.
-        #[arg(long)]
+        // `--clear-advertise-routes` is the canonical spelling (consistent with `--clear-exit-node`);
+        // `--advertise-routes-clear` is kept as an alias for backward-compatibility.
+        #[arg(long = "clear-advertise-routes", alias = "advertise-routes-clear")]
         advertise_routes_clear: bool,
         /// Run the Tailscale SSH server on this node (accept tailnet SSH on port 22, authorized by
         /// the control SSH policy). Requires a daemon built with the `ssh` feature and run as root.
@@ -260,6 +264,19 @@ fn resolve_accept_routes(accept: bool, no_accept: bool) -> Option<bool> {
     }
 }
 
+/// Map the `--tun` / `--no-tun` flag pair to a tri-state `Option<bool>` — enable → `Some(true)`,
+/// disable → `Some(false)`, neither → `None` (leave the persisted pref unchanged). A named helper
+/// for symmetry with the other tri-state resolvers (`resolve_accept_routes` / `resolve_ssh` / …),
+/// rather than inlining the same `match` at the call site. clap's `conflicts_with` guarantees the
+/// two flags are never both set.
+fn resolve_tun(tun: bool, no_tun: bool) -> Option<bool> {
+    match (tun, no_tun) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        _ => None,
+    }
+}
+
 /// Map the `--advertise-exit-node` / `--no-advertise-exit-node` flag pair to a tri-state
 /// `Option<bool>`. Enable → `Some(true)`; disable → `Some(false)`; neither → `None` (leave the
 /// persisted pref unchanged). Mirrors the `--tun`/`--no-tun` mapping; clap's `conflicts_with`
@@ -340,11 +357,7 @@ async fn main() -> Result<()> {
                 // `--tun` → Some(true) (enable); `--no-tun` → Some(false) (disable); neither →
                 // None (leave the pref unchanged), so `tnet up` without either flag never silently
                 // flips a TUN node. clap's `conflicts_with` guarantees the two are never both set.
-                tun: match (tun, no_tun) {
-                    (true, _) => Some(true),
-                    (_, true) => Some(false),
-                    _ => None,
-                },
+                tun: resolve_tun(tun, no_tun),
                 tun_name,
                 tun_mtu,
                 // `--exit-node <sel>` sets, `--clear-exit-node` stops using one, neither leaves it

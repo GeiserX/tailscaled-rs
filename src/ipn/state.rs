@@ -295,8 +295,8 @@ mod tests {
     #[test]
     fn ever_configured_is_the_only_no_state_vs_stopped_discriminator() {
         // With identical (no-device, not-logged-out, not-want-running) inputs, `ever_configured` is
-        // the sole bit that flips NoState ↔ Stopped — the distinction finding-4 makes survive a
-        // restart. Pin both sides of that single flip in one place.
+        // the sole bit that flips NoState ↔ Stopped — the distinction that must survive a daemon
+        // restart (it is persisted via the prefs-file existence). Pin both sides of that single flip.
         assert_eq!(
             derive_state_from(false, false, false, false, false),
             State::NoState
