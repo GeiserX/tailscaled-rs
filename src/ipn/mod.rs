@@ -1072,6 +1072,63 @@ impl Backend {
         Ok(())
     }
 
+    /// Log the node out — the Rust analogue of Go's `tailscale logout`. Distinct from
+    /// [`down`](Backend::down): `down` keeps the node key for a seamless resume, whereas `logout`
+    /// **ends the registration** and forces the next `up` to re-login from scratch.
+    ///
+    /// Three things happen, in this order:
+    /// 1. **Deregister with control** (if a device is up): call the engine's
+    ///    [`Device::logout`](tailscale::Device::logout), a *control-plane* state change that expires
+    ///    this node key with control immediately (rather than leaving the node to be GC'd up to ~24h
+    ///    later). It is idempotent — logging out an already-gone/ephemeral node is not an error. The
+    ///    engine deliberately does NOT tear down the datapath or rotate the on-disk key, so the daemon
+    ///    owns steps 2–3. A control round-trip failure here is logged but **not fatal**: a local
+    ///    logout (key wipe + intent flip) must still complete so the operator is never wedged "half
+    ///    logged in" by a transient control error (Go also proceeds with the local logout).
+    /// 2. **Tear down the datapath + flip intent**: [`stop_device`](Backend::stop_device), bump the
+    ///    generation (supersede any in-flight `up`), set `want_running = false` **and**
+    ///    `logged_out = true` (so daemon auto-start does not silently resurrect the node — see
+    ///    [`wants_running`](Backend::wants_running)), and persist.
+    /// 3. **Discard the persisted node key**: delete `node.key.json` so the next `up` cannot resume
+    ///    the old registration and instead registers fresh (requiring a new auth key / interactive
+    ///    login). This is the daemon's responsibility because the engine's `logout` intentionally
+    ///    leaves the key on disk (re-`new` with the same key is its *re-login* path — the opposite of
+    ///    what `tailscale logout` means). A missing key file is fine (already fresh).
+    pub async fn logout(&mut self) -> Result<()> {
+        // 1. Best-effort control-plane deregistration while the device is still alive.
+        if let Some(dev) = self.device.as_ref() {
+            if let Err(e) = dev.logout().await {
+                // Non-fatal: proceed with the local logout regardless (never leave the operator
+                // wedged half-logged-in on a transient control error). Go behaves the same.
+                tracing::warn!(
+                    error = ?e,
+                    "logout: control-plane deregistration failed; proceeding with local logout \
+                     (key wipe + intent flip) anyway"
+                );
+            }
+        }
+        // 2. Tear down + flip intent to logged-out.
+        self.stop_device().await;
+        self.bump_generation();
+        self.prefs.want_running = false;
+        self.prefs.logged_out = true;
+        self.ever_configured = true;
+        self.persist_prefs().await?;
+        // 3. Discard the persisted node key so the next `up` re-registers fresh. A missing file is
+        // not an error (the node was never registered, or already logged out).
+        match tokio::fs::remove_file(&self.key_path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(anyhow!(
+                    "logout: failed to remove node key file {}: {e}",
+                    self.key_path.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// A receiver that wakes on every engine connection-state transition, for streaming `status`
     /// (`tnet status --watch`). `None` when no device is up (nothing to watch yet — the caller
     /// should fall back to a one-shot status). The receiver is a cheap `watch` handle; awaiting its
@@ -1391,6 +1448,72 @@ mod tests {
             boot_attempted_up: false,
             lifecycle_tx: tokio::sync::watch::channel(0u64).0,
         }
+    }
+
+    #[tokio::test]
+    async fn logout_wipes_key_and_sets_logged_out_but_down_keeps_key() {
+        // The parity-defining distinction between `logout` and `down`: both bring the node down, but
+        // `logout` ALSO discards the on-disk node key and sets `logged_out` (forcing a fresh login
+        // next `up`), while `down` keeps the key (resume). Driven with no live device (device: None),
+        // so `logout` skips the control-plane deregister and exercises the local mechanics — which is
+        // exactly the behavior that differs from `down`.
+        let dir = std::env::temp_dir().join(format!("tailnetd-logout-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // --- `down` keeps the key file ---
+        let mut be = backend_for(&dir);
+        be.prefs.want_running = true;
+        // Simulate a prior registration: a node key file on disk.
+        tokio::fs::write(&be.key_path, b"{\"key_state\":{}}")
+            .await
+            .unwrap();
+        be.down().await.expect("down");
+        assert!(!be.prefs.want_running, "down clears want_running");
+        assert!(!be.prefs.logged_out, "down must NOT set logged_out");
+        assert!(
+            tokio::fs::try_exists(&be.key_path).await.unwrap(),
+            "down must KEEP the node key file (resume path)"
+        );
+
+        // --- `logout` wipes the key file + sets logged_out ---
+        let mut be = backend_for(&dir);
+        be.prefs.want_running = true;
+        // key file still present from the `down` case above.
+        assert!(tokio::fs::try_exists(&be.key_path).await.unwrap());
+        be.logout().await.expect("logout");
+        assert!(!be.prefs.want_running, "logout clears want_running");
+        assert!(
+            be.prefs.logged_out,
+            "logout MUST set logged_out (suppresses auto-start; forces fresh login)"
+        );
+        assert!(
+            !be.wants_running(),
+            "a logged-out node must not auto-start even though it was want_running before"
+        );
+        assert!(
+            !tokio::fs::try_exists(&be.key_path).await.unwrap(),
+            "logout MUST discard the node key file (fresh-login path)"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn logout_is_idempotent_with_no_key_file() {
+        // Logging out a never-registered node (no key file) is not an error — the remove is a
+        // tolerated NotFound. Mirrors Go's idempotent logout.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-logout-nokey-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+        assert!(!tokio::fs::try_exists(&be.key_path).await.unwrap());
+        be.logout()
+            .await
+            .expect("logout with no key file must succeed");
+        assert!(be.prefs.logged_out);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[test]

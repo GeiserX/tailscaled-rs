@@ -186,6 +186,11 @@ enum Command {
     },
     /// Disconnect the node without logging out.
     Down,
+    /// Log out: deregister this node from the control plane and discard its node key, so the next
+    /// `up` registers as a fresh login (requires a new auth key / interactive login). Unlike `down`,
+    /// which keeps the registration for a seamless reconnect, `logout` ends it. Mirrors Go
+    /// `tailscale logout`.
+    Logout,
     /// Show daemon and netmap status.
     Status {
         /// Stream status continuously, re-printing on every state transition, until interrupted
@@ -424,6 +429,7 @@ async fn main() -> Result<()> {
             ssh: resolve_ssh(ssh, no_ssh),
         },
         Command::Down => Request::Down,
+        Command::Logout => Request::Logout,
         // `status --watch` is a long-lived stream, not a one-shot round-trip — handle it here and
         // return. Plain `status` falls through to the one-shot path below.
         Command::Status { watch } => {
