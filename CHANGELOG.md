@@ -25,6 +25,14 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.13.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.12.0...v0.13.0) (2026-06-10)
+
+
+### Features
+
+* **bugreport:** tnet bugreport — local diagnostic marker (Go parity, honest) ([#52](https://github.com/GeiserX/tailscaled-rs/issues/52)) ([7348a16](https://github.com/GeiserX/tailscaled-rs/commit/7348a168262ca8e6d805dab86d77854a8460da3b))
+* **up,set:** advertise-tags pref (Go --advertise-tags parity) ([#50](https://github.com/GeiserX/tailscaled-rs/issues/50)) ([7b04fe7](https://github.com/GeiserX/tailscaled-rs/commit/7b04fe72d8b85fbe1f80fb33e13ecdef0445ac90))
+
 ## [0.12.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.11.0...v0.12.0) (2026-06-10)
 
 
