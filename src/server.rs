@@ -426,20 +426,40 @@ async fn dispatch(
                 },
             }
         }
-        // Read-only diagnostics (`ip`/`whois`/`ping`): each is fast under the lock, so take it
-        // directly like `status` and return the backend's `Response` verbatim — the backend methods
-        // already build the typed reply (including their own error responses).
+        // Read-only diagnostics (`ip`/`whois`/`ping`): these run engine calls that are NOT bounded
+        // under the backend lock — `ping` in particular waits the caller's timeout (up to seconds),
+        // and holding the lock across it would head-of-line block every concurrent `status`/`up`/
+        // `down`. So we follow the same "clone the work out, drop the lock" discipline as `drive_up`:
+        // lock only long enough to clone the engine handle (`device_handle()`), DROP the lock, then
+        // run the engine call off-lock. `Some` reproduces each method's prior behavior; `None` is the
+        // "node is not up" branch that used to live inside the method. The backend methods build the
+        // typed reply verbatim (including their own bad-input error responses).
         Request::Ip => {
-            let be = backend.lock().await;
-            be.ip_report().await
+            let dev = { backend.lock().await.device_handle() };
+            match dev {
+                Some(dev) => Backend::ip_report(&dev).await,
+                None => Response::Error {
+                    message: "node is not up".into(),
+                },
+            }
         }
         Request::Whois { ip } => {
-            let be = backend.lock().await;
-            be.whois(&ip).await
+            let dev = { backend.lock().await.device_handle() };
+            match dev {
+                Some(dev) => Backend::whois(&dev, &ip).await,
+                None => Response::Error {
+                    message: "node is not up".into(),
+                },
+            }
         }
         Request::Ping { ip, timeout_ms } => {
-            let be = backend.lock().await;
-            be.ping(&ip, timeout_ms).await
+            let dev = { backend.lock().await.device_handle() };
+            match dev {
+                Some(dev) => Backend::ping(&dev, &ip, timeout_ms).await,
+                None => Response::Error {
+                    message: "node is not up".into(),
+                },
+            }
         }
         // `up` performs a multi-second control-plane handshake (`Device::new`). Doing that under the
         // backend lock would head-of-line block every concurrent `status`. `ipn::drive_up` runs the
@@ -457,6 +477,7 @@ async fn dispatch(
             exit_node,
             advertise_exit_node,
             advertise_routes,
+            accept_routes,
             ssh,
         } => {
             // Confine the plaintext authkey to the smallest scope: wrap it into a `SecretString`
@@ -474,6 +495,7 @@ async fn dispatch(
                 exit_node,
                 advertise_exit_node,
                 advertise_routes,
+                accept_routes,
                 ssh,
             };
             match ipn::drive_up(backend, authkey, opts).await {
@@ -521,24 +543,50 @@ async fn dispatch(
                 },
             }
         }
-        // Taildrop. Each backend method already builds the typed `Response` (including its own error
-        // responses), so we return it verbatim — no `Ok`/`Err` remap. `file_cp`/`file_get` are
-        // writes (gated above); `file_list` is a read.
+        // Taildrop. `file_cp` and `file_get` run **slow, potentially unbounded** engine transfers
+        // (an entire file over the overlay — `file_cp` has NO total deadline), so holding the backend
+        // lock across them would freeze every concurrent `status`/`up`/`down` for the transfer's whole
+        // duration — a daemon-wide DoS. We use the same clone-then-drop discipline as the diagnostics
+        // above and as `drive_up`: lock only to clone the engine handle, DROP the lock, run the
+        // transfer off-lock. `file_list` is a non-blocking store read (not part of that DoS) but takes
+        // the identical shape for uniformity. The `None` arm is the prior in-method "node is not up"
+        // branch. Each method builds the typed `Response` verbatim — no `Ok`/`Err` remap. `file_cp`/
+        // `file_get` are writes (gated above); `file_list` is a read.
+        //
+        // NB: because the transfer runs off-lock holding only an `Arc` clone of the device, a
+        // concurrent `down` may land mid-flight; `stop_device`'s `Arc::into_inner` then observes this
+        // extra clone and takes the documented benign "drop the last clone" path. That is the correct
+        // trade — a `down` no longer blocks for a multi-minute transfer — not a regression.
         Request::FileCp { path, peer } => {
-            let be = backend.lock().await;
-            be.file_cp(&path, &peer).await
+            let dev = { backend.lock().await.device_handle() };
+            match dev {
+                Some(dev) => Backend::file_cp(&dev, &path, &peer).await,
+                None => Response::Error {
+                    message: "node is not up".into(),
+                },
+            }
         }
         Request::FileList => {
-            let be = backend.lock().await;
-            be.file_list()
+            let dev = { backend.lock().await.device_handle() };
+            match dev {
+                Some(dev) => Backend::file_list(&dev),
+                None => Response::Error {
+                    message: "node is not up".into(),
+                },
+            }
         }
         Request::FileGet {
             name,
             dest,
             delete_after,
         } => {
-            let be = backend.lock().await;
-            be.file_get(&name, &dest, delete_after).await
+            let dev = { backend.lock().await.device_handle() };
+            match dev {
+                Some(dev) => Backend::file_get(&dev, &name, &dest, delete_after).await,
+                None => Response::Error {
+                    message: "node is not up".into(),
+                },
+            }
         }
     }
 }

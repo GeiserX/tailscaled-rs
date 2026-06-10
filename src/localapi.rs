@@ -62,6 +62,11 @@ pub enum Request {
         /// replaces the set (`Some([])` clears).
         #[serde(default)]
         advertise_routes: Option<Vec<String>>,
+        /// Accept (and route to) subnet routes advertised by peers (Go `tailscale up
+        /// --accept-routes`). `None` leaves the pref unchanged; `Some(b)` sets it. `#[serde(default)]`
+        /// keeps the wire backward-compatible with clients that omit it.
+        #[serde(default)]
+        accept_routes: Option<bool>,
         /// Run the Tailscale SSH server (`None` leaves the pref unchanged; `Some(b)` sets it).
         /// Requires a daemon built with the `ssh` feature + root; the daemon fails loudly otherwise.
         #[serde(default)]
@@ -280,8 +285,19 @@ pub struct PrefsView {
     pub advertise_routes: Vec<String>,
     /// Whether this node accepts subnet routes advertised by peers.
     pub accept_routes: bool,
-    /// Whether the Tailscale SSH server is enabled on this node.
+    /// Whether the Tailscale SSH server is *enabled* by the persisted pref (`ssh_enabled`). This is
+    /// the configured *intent*, NOT proof the server is actually accepting connections — see
+    /// [`ssh_running`](PrefsView::ssh_running) for liveness.
     pub ssh: bool,
+    /// Whether the Tailscale SSH server task is actually *live* (spawned and not yet finished), as
+    /// opposed to merely enabled by the [`ssh`](PrefsView::ssh) pref. The server task can die at
+    /// bind time (e.g. it never resolved a tailnet IPv4, or `listen_ssh` returned an error), in which
+    /// case `ssh` stays `true` but `ssh_running` reads `false` — so an operator is not misled into
+    /// thinking SSH is serving when the task has exited. Always `false` when SSH is not enabled, when
+    /// the node is down, or in a daemon built without the `ssh` feature (no task is ever spawned).
+    /// `#[serde(default)]` keeps the wire backward-compatible with clients that predate this field.
+    #[serde(default)]
+    pub ssh_running: bool,
     /// Whether the node uses the kernel-TUN data path (vs the userspace netstack).
     pub tun: bool,
 }
@@ -322,6 +338,7 @@ mod tests {
             exit_node: Some(Some("100.64.0.9".to_string())),
             advertise_exit_node: Some(true),
             advertise_routes: Some(vec!["192.168.1.0/24".to_string()]),
+            accept_routes: Some(true),
             ssh: Some(true),
         };
         let json = serde_json::to_string(&req).unwrap();
@@ -337,6 +354,7 @@ mod tests {
                 exit_node,
                 advertise_exit_node,
                 advertise_routes,
+                accept_routes,
                 ssh,
             } => {
                 assert_eq!(authkey.as_deref(), Some("tskey-auth-xxx"));
@@ -349,6 +367,7 @@ mod tests {
                 assert_eq!(exit_node, Some(Some("100.64.0.9".to_string())));
                 assert_eq!(advertise_exit_node, Some(true));
                 assert_eq!(advertise_routes, Some(vec!["192.168.1.0/24".to_string()]));
+                assert_eq!(accept_routes, Some(true));
             }
             other => panic!("expected Up, got {other:?}"),
         }
@@ -564,6 +583,7 @@ mod tests {
             exit_node: None,
             advertise_exit_node: None,
             advertise_routes: None,
+            accept_routes: None,
             ssh: None,
         };
         let json = serde_json::to_string(&req).unwrap();
@@ -579,6 +599,7 @@ mod tests {
                 exit_node,
                 advertise_exit_node,
                 advertise_routes,
+                accept_routes,
                 ssh,
             } => {
                 assert!(authkey.is_none());
@@ -590,6 +611,7 @@ mod tests {
                 assert!(exit_node.is_none());
                 assert!(advertise_exit_node.is_none());
                 assert!(advertise_routes.is_none());
+                assert!(accept_routes.is_none());
                 assert!(ssh.is_none());
             }
             other => panic!("expected Up, got {other:?}"),
@@ -607,6 +629,7 @@ mod tests {
                 exit_node,
                 advertise_exit_node,
                 advertise_routes,
+                accept_routes,
                 hostname,
                 ..
             } => {
@@ -614,6 +637,10 @@ mod tests {
                 assert!(exit_node.is_none(), "omitted exit_node defaults to None");
                 assert!(advertise_exit_node.is_none());
                 assert!(advertise_routes.is_none());
+                assert!(
+                    accept_routes.is_none(),
+                    "omitted accept_routes defaults to None (leave pref unchanged)"
+                );
             }
             other => panic!("expected Up, got {other:?}"),
         }
@@ -629,6 +656,7 @@ mod tests {
             exit_node: Some(None),
             advertise_exit_node: Some(false),
             advertise_routes: Some(vec![]),
+            accept_routes: None,
             ssh: None,
         };
         let json = serde_json::to_string(&clear).unwrap();
@@ -703,6 +731,7 @@ mod tests {
             exit_node: Some(None),
             advertise_exit_node: None,
             advertise_routes: None,
+            accept_routes: None,
             ssh: None,
         })
         .unwrap();
@@ -716,6 +745,7 @@ mod tests {
             exit_node: None,
             advertise_exit_node: None,
             advertise_routes: None,
+            accept_routes: None,
             ssh: None,
         })
         .unwrap();
@@ -737,6 +767,96 @@ mod tests {
             clear_val.get("exit_node"),
             Some(&serde_json::Value::Null),
             "CLEAR must carry an explicit exit_node:null key, got {clear_json}"
+        );
+        assert_ne!(
+            clear_json, unchanged_json,
+            "clear and unchanged must be byte-distinct on the wire"
+        );
+    }
+
+    #[test]
+    fn request_set_exit_node_double_option_distinguishes_clear_from_unchanged() {
+        // `Request::Set` carries the SAME load-bearing `double_option` on `exit_node` as `Up`, but
+        // (unlike `Up`) had no wire test — so a refactor dropping the serde attr would make
+        // `tnet set --clear-exit-node` a silent no-op with nothing to catch it. This mirrors `Up`'s
+        // `exit_node_double_option_wire_distinguishes_clear_from_unchanged` for the `set` path.
+
+        // (1) DESERIALIZE: a present `null` must decode to `Some(None)` = CLEAR — distinct from an
+        //     absent key, which decodes to `None` = UNCHANGED. A plain `#[serde(default)]` would
+        //     collapse both to `None`, silently dropping the clear.
+        let cleared = match serde_json::from_str::<Request>(r#"{"cmd":"set","exit_node":null}"#)
+            .expect("a present exit_node:null must parse")
+        {
+            Request::Set { exit_node, .. } => exit_node,
+            other => panic!("expected Set, got {other:?}"),
+        };
+        assert_eq!(
+            cleared,
+            Some(None),
+            "a present JSON null must decode to Some(None) = CLEAR (double_option), not None"
+        );
+        let unchanged = match serde_json::from_str::<Request>(r#"{"cmd":"set"}"#)
+            .expect("an absent exit_node must parse")
+        {
+            Request::Set { exit_node, .. } => exit_node,
+            other => panic!("expected Set, got {other:?}"),
+        };
+        assert_eq!(
+            unchanged, None,
+            "an absent exit_node key must decode to None = UNCHANGED"
+        );
+        assert_ne!(
+            cleared, unchanged,
+            "clear (Some(None)) and unchanged (None) must be distinct after decoding the wire"
+        );
+
+        // A present value must decode to `Some(Some(sel))` = SET.
+        let set = match serde_json::from_str::<Request>(r#"{"cmd":"set","exit_node":"100.64.0.9"}"#)
+            .expect("a present exit_node value must parse")
+        {
+            Request::Set { exit_node, .. } => exit_node,
+            other => panic!("expected Set, got {other:?}"),
+        };
+        assert_eq!(
+            set,
+            Some(Some("100.64.0.9".to_string())),
+            "a present exit_node value must decode to Some(Some(sel)) = SET"
+        );
+
+        // (2) SERIALIZE: the two intents must be byte-distinct on the wire — CLEAR emits a present
+        //     `exit_node:null`, while UNCHANGED omits the key entirely (skip_serializing_if). A
+        //     consumer that re-parses either form must recover the original intent.
+        let clear_json = serde_json::to_string(&Request::Set {
+            hostname: None,
+            accept_routes: None,
+            exit_node: Some(None),
+            advertise_exit_node: None,
+            advertise_routes: None,
+            ssh: None,
+        })
+        .unwrap();
+        let unchanged_json = serde_json::to_string(&Request::Set {
+            hostname: None,
+            accept_routes: None,
+            exit_node: None,
+            advertise_exit_node: None,
+            advertise_routes: None,
+            ssh: None,
+        })
+        .unwrap();
+        // Match the `exit_node` KEY specifically — `advertise_exit_node` also contains the substring
+        // `exit_node`, so re-parse to a generic Value and check the map keys instead of substring-
+        // matching the raw JSON.
+        let clear_val: serde_json::Value = serde_json::from_str(&clear_json).unwrap();
+        assert_eq!(
+            clear_val.get("exit_node"),
+            Some(&serde_json::Value::Null),
+            "CLEAR must carry an explicit exit_node:null key, got {clear_json}"
+        );
+        let unchanged_val: serde_json::Value = serde_json::from_str(&unchanged_json).unwrap();
+        assert!(
+            unchanged_val.get("exit_node").is_none(),
+            "UNCHANGED must omit the exit_node key entirely (skip_serializing_if), got {unchanged_json}"
         );
         assert_ne!(
             clear_json, unchanged_json,
