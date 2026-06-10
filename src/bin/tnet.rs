@@ -357,6 +357,36 @@ enum Command {
         #[arg(value_name = "PORT")]
         port: u16,
     },
+    /// Expose a local service on the tailnet (Go `tailscale serve`). This build serves the TCP-forward
+    /// mode (`--tcp`); HTTPS/HTTP/TLS modes need an HTTP/TLS stack this build doesn't have.
+    Serve {
+        #[command(subcommand)]
+        cmd: ServeCmd,
+    },
+}
+
+/// `tnet serve` subcommands. Mirrors the TCP-forward subset of Go `tailscale serve`.
+#[derive(Subcommand)]
+enum ServeCmd {
+    /// Forward a tailnet TCP port to a local address (Go `serve --tcp <port> <target>`). Inbound
+    /// connections on tailnet `<PORT>` are spliced to `<TARGET>` (`host:port`, or a bare port meaning
+    /// `127.0.0.1:<port>`).
+    Tcp {
+        /// The tailnet port to listen on.
+        #[arg(value_name = "PORT")]
+        port: u16,
+        /// Local forward target: `host:port`, or a bare port for `127.0.0.1:<port>`.
+        #[arg(value_name = "TARGET")]
+        target: String,
+    },
+    /// Show the current serve configuration.
+    Status {
+        /// Output as JSON (the raw ServeConfig).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Clear the entire serve configuration.
+    Reset,
 }
 
 /// `tnet metrics` subcommands. Bare `tnet metrics` prints to stdout; `write <path>` writes a file.
@@ -627,6 +657,13 @@ async fn main() -> Result<()> {
             return run_nc(&socket, &host, port)
                 .await
                 .with_context(|| format!("nc to {host}:{port} via {}", socket.display()));
+        }
+        // `serve`: read-modify-write the ServeConfig (tcp/reset) or render it (status). Inline because
+        // tcp/reset must GET the current config, mutate, then SET it.
+        Command::Serve { cmd } => {
+            return run_serve(&socket, cmd)
+                .await
+                .with_context(|| format!("serve via {}", socket.display()));
         }
         Command::Down => Request::Down,
         Command::Logout => Request::Logout,
@@ -1076,6 +1113,8 @@ async fn main() -> Result<()> {
         // `metrics`/`lock status` are handled inline above; these arms are exhaustiveness-only.
         Response::Metrics { text } => print!("{text}"),
         Response::Lock(report) => print!("{}", format_lock_status(&report, false)),
+        // `serve` is handled inline above (read-modify-write); this arm is exhaustiveness-only.
+        Response::ServeConfig(cfg) => print!("{}", format_serve_status(&cfg, false)),
         // `bugreport`: print the local marker + a one-line honesty note (no logs were uploaded).
         Response::BugReport { marker } => {
             println!("{marker}");
@@ -1960,6 +1999,96 @@ async fn run_nc(socket: &std::path::Path, host: &str, port: u16) -> Result<()> {
     Ok(())
 }
 
+/// Normalize a `serve --tcp` forward target: a bare port `5000` → `127.0.0.1:5000`; a `host:port`
+/// passes through. Mirrors Go's `ExpandProxyTargetValue(target, ["tcp"], "tcp")` host extraction.
+fn normalize_serve_target(target: &str) -> String {
+    if target.parse::<u16>().is_ok() {
+        format!("127.0.0.1:{target}")
+    } else {
+        target.to_string()
+    }
+}
+
+/// Drive `tnet serve <sub>`: `tcp` and `reset` read-modify-write the ServeConfig (GET → mutate →
+/// SET); `status` GETs + renders. The ServeConfig is replaced wholesale on SET (matching Go's
+/// SetServeConfig), so `tcp` first fetches the current config and adds its entry.
+async fn run_serve(socket: &std::path::Path, cmd: ServeCmd) -> Result<()> {
+    use tailscaled_rs::localapi::ServeConfig;
+    // Fetch the current config (GetServeConfig is read-only; always replies ServeConfig).
+    let get_cfg = || async {
+        match round_trip(socket, &Request::GetServeConfig).await {
+            Ok(Response::ServeConfig(c)) => Ok(c),
+            Ok(other) => anyhow::bail!("unexpected response to get serve config: {other:?}"),
+            Err(e) => Err(e).context("getting serve config"),
+        }
+    };
+    match cmd {
+        ServeCmd::Status { json } => {
+            let cfg = get_cfg().await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&cfg)?);
+            } else {
+                print!("{}", format_serve_status(&cfg, false));
+            }
+            Ok(())
+        }
+        ServeCmd::Tcp { port, target } => {
+            let mut cfg = get_cfg().await?;
+            let fwd = normalize_serve_target(&target);
+            cfg.tcp.insert(
+                port.to_string(),
+                tailscaled_rs::localapi::TcpPortHandler {
+                    tcp_forward: fwd.clone(),
+                    ..Default::default()
+                },
+            );
+            send_ok_or_die(socket, Request::SetServeConfig { config: cfg }).await?;
+            println!("serving tailnet :{port} -> {fwd}");
+            Ok(())
+        }
+        ServeCmd::Reset => {
+            send_ok_or_die(
+                socket,
+                Request::SetServeConfig {
+                    config: ServeConfig::default(),
+                },
+            )
+            .await?;
+            println!("serve config cleared");
+            Ok(())
+        }
+    }
+}
+
+/// Render `tnet serve status` from a [`ServeConfig`](tailscaled_rs::localapi::ServeConfig). Lists each
+/// served TCP forward, and flags any HTTPS/HTTP/TLS-terminated entry as "not served by this build"
+/// (honest — those modes need an HTTP/TLS stack this build lacks). `_json` is handled by the caller.
+/// Pure → unit-testable.
+fn format_serve_status(cfg: &tailscaled_rs::localapi::ServeConfig, _json: bool) -> String {
+    if cfg.tcp.is_empty() {
+        return "No serve config.\n".to_string();
+    }
+    let mut out = String::new();
+    for (port, h) in &cfg.tcp {
+        if !h.tcp_forward.is_empty() && !h.https && !h.http && h.terminate_tls.is_empty() {
+            out.push_str(&format!("tcp :{port} -> {}\n", h.tcp_forward));
+        } else if !h.terminate_tls.is_empty() {
+            out.push_str(&format!(
+                "tcp :{port} -> {} (TLS-terminated; NOT served by this build)\n",
+                h.tcp_forward
+            ));
+        } else if h.https || h.http {
+            let kind = if h.https { "HTTPS" } else { "HTTP" };
+            out.push_str(&format!(
+                ":{port} {kind} web (NOT served by this build — needs an HTTP/TLS stack)\n"
+            ));
+        } else {
+            out.push_str(&format!(":{port} (empty handler)\n"));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2713,6 +2842,56 @@ mod tests {
         assert!(!out.contains("* default"), "{out}");
         // Empty → placeholder.
         assert_eq!(format_profiles(&[]), "(no profiles)\n");
+    }
+
+    #[test]
+    fn normalize_serve_target_expands_bare_port() {
+        assert_eq!(normalize_serve_target("5000"), "127.0.0.1:5000");
+        assert_eq!(normalize_serve_target("10.0.0.5:22"), "10.0.0.5:22");
+        assert_eq!(normalize_serve_target("localhost:8080"), "localhost:8080");
+    }
+
+    #[test]
+    fn format_serve_status_lists_and_flags() {
+        use tailscaled_rs::localapi::{ServeConfig, TcpPortHandler};
+        // Empty → placeholder.
+        assert!(format_serve_status(&ServeConfig::default(), false).contains("No serve config"));
+
+        let mut cfg = ServeConfig::default();
+        cfg.tcp.insert(
+            "8443".to_string(),
+            TcpPortHandler {
+                tcp_forward: "127.0.0.1:5000".into(),
+                ..Default::default()
+            },
+        );
+        cfg.tcp.insert(
+            "443".to_string(),
+            TcpPortHandler {
+                https: true,
+                ..Default::default()
+            },
+        );
+        cfg.tcp.insert(
+            "9000".to_string(),
+            TcpPortHandler {
+                tcp_forward: "127.0.0.1:9".into(),
+                terminate_tls: "host.ts.net".into(),
+                ..Default::default()
+            },
+        );
+        let out = format_serve_status(&cfg, false);
+        // Plain forward is served.
+        assert!(out.contains("tcp :8443 -> 127.0.0.1:5000"), "{out}");
+        // HTTPS + TLS-terminated are flagged as not served by this build.
+        assert!(
+            out.contains("443") && out.contains("NOT served by this build"),
+            "{out}"
+        );
+        assert!(
+            out.contains("9000") && out.contains("TLS-terminated"),
+            "{out}"
+        );
     }
 
     #[test]

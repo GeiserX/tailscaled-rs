@@ -137,6 +137,7 @@ pub fn requires_write(request: &crate::localapi::Request) -> bool {
         | Request::Metrics
         | Request::LockStatus
         | Request::BugReport
+        | Request::GetServeConfig
         | Request::FileList => false,
         // Writes: lifecycle/prefs mutations plus the Taildrop transfers. `FileCp` initiates a send
         // and `FileGet` consumes/deletes an inbound file, so both mutate and gate like `up`/`down`.
@@ -147,6 +148,7 @@ pub fn requires_write(request: &crate::localapi::Request) -> bool {
         | Request::SwitchProfile { .. }
         | Request::DeleteProfile { .. }
         | Request::Nc { .. }
+        | Request::SetServeConfig { .. }
         | Request::FileCp { .. }
         | Request::FileGet { .. } => true,
     }
@@ -298,6 +300,16 @@ mod tests {
         assert!(
             !requires_write(&Request::BugReport),
             "bugreport only reads daemon state into a marker — a read"
+        );
+        assert!(
+            !requires_write(&Request::GetServeConfig),
+            "serve status only reads the serve config — a read"
+        );
+        assert!(
+            requires_write(&Request::SetServeConfig {
+                config: Default::default()
+            }),
+            "setting the serve config persists state + re-arms listeners — a write"
         );
         assert!(
             requires_write(&Request::SwitchProfile {

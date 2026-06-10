@@ -572,6 +572,24 @@ async fn dispatch(
             let be = backend.lock().await;
             be.bugreport()
         }
+        // `serve status` (Go GetServeConfig): read the persisted serve config under a brief lock.
+        Request::GetServeConfig => {
+            let cfg = { backend.lock().await.serve_config().await };
+            Response::ServeConfig(cfg)
+        }
+        // `serve --tcp` / `serve reset` (Go SetServeConfig): persist the new config. (Re-arming the
+        // accept loops to match is US-017; for now this persists faithfully — a restart applies it.)
+        Request::SetServeConfig { config } => {
+            let be = backend.lock().await;
+            match be.set_serve_config(&config).await {
+                Ok(()) => Response::Ok {
+                    message: "serve config updated".to_string(),
+                },
+                Err(e) => Response::Error {
+                    message: format!("{e:#}"),
+                },
+            }
+        }
         // `switch <id>` (Go `tailscale switch`). Tears down the current device + swaps the active
         // profile under the lock (the teardown is a bounded graceful shutdown, not the multi-second
         // `Device::new` handshake, so holding the lock is correct and keeps the swap atomic). Does NOT
