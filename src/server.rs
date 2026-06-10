@@ -426,6 +426,40 @@ async fn dispatch(
             let be = backend.lock().await;
             Response::Prefs(be.prefs_view())
         }
+        // `switch --list` (Go `tailscale switch --list`). A read over the profile state dir.
+        Request::ProfileList => {
+            let be = backend.lock().await;
+            Response::Profiles {
+                profiles: be.list_profiles().await,
+            }
+        }
+        // `switch <id>` (Go `tailscale switch`). Tears down the current device + swaps the active
+        // profile under the lock (the teardown is a bounded graceful shutdown, not the multi-second
+        // `Device::new` handshake, so holding the lock is correct and keeps the swap atomic). Does NOT
+        // auto-up the target — the operator runs `up` if the new profile should connect.
+        Request::SwitchProfile { target } => {
+            let mut be = backend.lock().await;
+            match be.switch_profile(&target).await {
+                Ok(()) => Response::Ok {
+                    message: format!("switched to profile {target}"),
+                },
+                Err(e) => Response::Error {
+                    message: format!("{e:#}"),
+                },
+            }
+        }
+        // `switch remove <id>` (Go `tailscale switch remove`). Refuses the current/default profile.
+        Request::DeleteProfile { target } => {
+            let mut be = backend.lock().await;
+            match be.delete_profile(&target).await {
+                Ok(()) => Response::Ok {
+                    message: format!("removed profile {target}"),
+                },
+                Err(e) => Response::Error {
+                    message: format!("{e:#}"),
+                },
+            }
+        }
         // `logout` (Go `tailscale logout`): deregisters the node key with control, tears down, and
         // discards the on-disk key so the next `up` re-registers fresh — distinct from `down` (which
         // resumes). Backend::logout holds the lock for the whole sequence: the control-plane

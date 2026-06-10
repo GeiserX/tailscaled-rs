@@ -75,6 +75,7 @@ use crate::prefs::Prefs;
 
 mod config;
 mod diag;
+pub mod profile;
 mod revert_guard;
 mod state;
 
@@ -437,6 +438,13 @@ impl SetOptions {
 /// The daemon backend: owns prefs, the key file, and the live engine handle.
 pub struct Backend {
     prefs: Prefs,
+    /// The daemon's state directory — the root under which all profiles live. Held so the backend
+    /// can resolve per-profile paths on a `switch` (see [`profile`]).
+    state_dir: PathBuf,
+    /// The id of the currently-active profile (`"default"` for the legacy/top-level layout). Switching
+    /// profiles swaps `prefs`/`prefs_path`/`key_path` to the target profile's and persists the
+    /// `current-profile` pointer.
+    current_profile: String,
     prefs_path: PathBuf,
     key_path: PathBuf,
     /// The running engine, if up. `None` when stopped/needs-login.
@@ -487,10 +495,14 @@ pub struct Backend {
 }
 
 impl Backend {
-    /// Construct a backend from a state directory, loading any persisted prefs.
+    /// Construct a backend from a state directory, loading the current profile's persisted prefs.
+    ///
+    /// The active profile is read from the `current-profile` pointer (absent ⇒ `"default"`, which is
+    /// the legacy top-level `prefs.json`/`node.key.json` layout — so a pre-profiles state dir loads
+    /// exactly as before). Per-profile paths come from [`profile::profile_paths`].
     pub async fn load(state_dir: &std::path::Path) -> Result<Self> {
-        let prefs_path = state_dir.join("prefs.json");
-        let key_path = state_dir.join("node.key.json");
+        let current_profile = profile::read_current_profile(state_dir).await;
+        let (prefs_path, key_path) = profile::profile_paths(state_dir, &current_profile);
         // `ever_configured` distinguishes a never-touched node (`NoState`) from one explicitly
         // brought down (`Stopped`), and must survive a daemon restart. It is derived from the
         // *existence* of the prefs file rather than from prefs contents: `down()` persists prefs with
@@ -507,6 +519,8 @@ impl Backend {
         let (lifecycle_tx, _) = tokio::sync::watch::channel(0u64);
         Ok(Self {
             prefs,
+            state_dir: state_dir.to_path_buf(),
+            current_profile,
             prefs_path,
             key_path,
             device: None,
@@ -516,6 +530,133 @@ impl Backend {
             boot_attempted_up: false,
             lifecycle_tx,
         })
+    }
+
+    /// List the known profiles (the analogue of Go `tailscale switch --list`). Returns one entry per
+    /// profile — the implicit `default` plus every id in `profiles.json` — each with its display name
+    /// and whether it is the current profile. Pure read (no device, no lock-sensitive work).
+    pub async fn list_profiles(&self) -> Vec<crate::localapi::ProfileEntry> {
+        let meta = profile::load_profiles_file(&self.state_dir).await;
+        let mut entries = Vec::new();
+        // The default profile always exists (it is the legacy top-level layout); include it first.
+        entries.push(crate::localapi::ProfileEntry {
+            id: profile::DEFAULT_PROFILE_ID.to_string(),
+            name: meta
+                .profiles
+                .get(profile::DEFAULT_PROFILE_ID)
+                .map(|m| m.name.clone())
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| profile::DEFAULT_PROFILE_ID.to_string()),
+            current: self.current_profile == profile::DEFAULT_PROFILE_ID,
+        });
+        for (id, m) in &meta.profiles {
+            if id == profile::DEFAULT_PROFILE_ID {
+                continue; // already emitted above
+            }
+            entries.push(crate::localapi::ProfileEntry {
+                id: id.clone(),
+                name: if m.name.is_empty() {
+                    id.clone()
+                } else {
+                    m.name.clone()
+                },
+                current: &self.current_profile == id,
+            });
+        }
+        entries
+    }
+
+    /// Switch the active profile to `target` (the analogue of Go `tailscale switch <id>`). Tears the
+    /// current device down, repoints `prefs`/`prefs_path`/`key_path` at the target profile, reloads
+    /// that profile's persisted prefs, persists the `current-profile` pointer, registers the target in
+    /// `profiles.json` if new, and bumps the generation (so any in-flight `up` is superseded). It does
+    /// **not** auto-`up` the target — the caller decides whether to bring it up (matching Go, where
+    /// switch changes the profile and the engine reconciles to the new prefs' `WantRunning`).
+    ///
+    /// `target` is validated as a profile id ([`profile::is_valid_profile_id`]) so it is always a safe
+    /// single path component. Switching to the already-current profile is a no-op success.
+    pub async fn switch_profile(&mut self, target: &str) -> Result<()> {
+        if !profile::is_valid_profile_id(target) {
+            return Err(anyhow!(
+                "invalid profile id {target:?} (use letters, digits, '-' or '_')"
+            ));
+        }
+        if target == self.current_profile {
+            return Ok(()); // already on it
+        }
+        // Tear down the live device + supersede any in-flight up before swapping the active files.
+        self.stop_device().await;
+        self.bump_generation();
+
+        let (prefs_path, key_path) = profile::profile_paths(&self.state_dir, target);
+        let ever_configured = tokio::fs::try_exists(&prefs_path).await.unwrap_or(false);
+        let prefs = Prefs::load(&prefs_path)
+            .await
+            .with_context(|| format!("loading prefs for profile {target:?}"))?;
+
+        self.prefs = prefs;
+        self.prefs_path = prefs_path;
+        self.key_path = key_path;
+        self.ever_configured = ever_configured;
+        self.current_profile = target.to_string();
+        // This process has not attempted a boot-up for the newly-active profile.
+        self.boot_attempted_up = false;
+
+        // Register the target in profiles.json (so `--list` shows it) if it is a new named profile.
+        if target != profile::DEFAULT_PROFILE_ID {
+            let mut meta = profile::load_profiles_file(&self.state_dir).await;
+            meta.profiles
+                .entry(target.to_string())
+                .or_insert_with(profile::ProfileMeta::default);
+            profile::save_profiles_file(&self.state_dir, &meta)
+                .await
+                .with_context(|| "persisting profiles.json")?;
+        }
+        // Persist the pointer LAST: if anything above failed we have not yet committed the switch.
+        profile::write_current_profile(&self.state_dir, target)
+            .await
+            .with_context(|| "persisting current-profile pointer")?;
+        Ok(())
+    }
+
+    /// Delete profile `target` (the analogue of Go `tailscale switch remove`). Refuses to delete the
+    /// **current** profile (Go switches away first; we require the operator to switch away, which is
+    /// the safer, more explicit contract) and refuses to delete the reserved `default` profile.
+    /// Removes the profile's prefs+key files and its `profiles.json` entry. Idempotent for an
+    /// already-absent named profile.
+    pub async fn delete_profile(&mut self, target: &str) -> Result<()> {
+        if !profile::is_valid_profile_id(target) {
+            return Err(anyhow!("invalid profile id {target:?}"));
+        }
+        if target == profile::DEFAULT_PROFILE_ID {
+            return Err(anyhow!("the default profile cannot be removed"));
+        }
+        if target == self.current_profile {
+            return Err(anyhow!(
+                "cannot remove the current profile {target:?}; switch to another profile first"
+            ));
+        }
+        // Remove the profile's files (tolerate already-absent — idempotent).
+        let (prefs_path, key_path) = profile::profile_paths(&self.state_dir, target);
+        for p in [&prefs_path, &key_path] {
+            match tokio::fs::remove_file(p).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(anyhow!("removing {}: {e}", p.display())),
+            }
+        }
+        // Best-effort remove the now-empty profile dir.
+        if let Some(dir) = prefs_path.parent() {
+            let _ = tokio::fs::remove_dir(dir).await;
+        }
+        // Drop it from profiles.json.
+        let mut meta = profile::load_profiles_file(&self.state_dir).await;
+        if meta.profiles.remove(target).is_some() {
+            profile::save_profiles_file(&self.state_dir, &meta)
+                .await
+                .with_context(|| "persisting profiles.json after delete")?;
+        }
+        Ok(())
     }
 
     /// Bump the monotonic [`generation`](Backend::generation) **and** notify lifecycle watchers. The
@@ -1477,6 +1618,8 @@ mod tests {
     fn backend_for(dir: &std::path::Path) -> Backend {
         Backend {
             prefs: Prefs::default(),
+            state_dir: dir.to_path_buf(),
+            current_profile: profile::DEFAULT_PROFILE_ID.to_string(),
             prefs_path: dir.join("prefs.json"),
             key_path: dir.join("node.key.json"),
             device: None,
@@ -1551,6 +1694,114 @@ mod tests {
             .await
             .expect("logout with no key file must succeed");
         assert!(be.prefs.logged_out);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn profile_switch_isolates_prefs_and_lists_with_current_marker() {
+        // The load-bearing profile guarantee: switching profiles isolates each profile's prefs (and,
+        // by the same path layout, its node key) — profile A's settings must never bleed into B.
+        // Driven via Backend::load against a temp state dir (no engine; switch only swaps files +
+        // pointer when no device is up).
+        let dir = std::env::temp_dir().join(format!("tailnetd-prof-sw-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // Fresh daemon → default profile, legacy top-level paths (backward compatible).
+        let mut be = Backend::load(&dir).await.unwrap();
+        assert_eq!(be.current_profile, profile::DEFAULT_PROFILE_ID);
+        assert_eq!(be.prefs_path, dir.join("prefs.json"));
+        // Configure the default profile distinctively + persist.
+        be.prefs.hostname = Some("default-host".into());
+        be.prefs.accept_routes = true;
+        be.ever_configured = true;
+        be.persist_prefs().await.unwrap();
+
+        // Switch to a new profile "work": its prefs start at default (NOT the default profile's).
+        be.switch_profile("work").await.unwrap();
+        assert_eq!(be.current_profile, "work");
+        assert_eq!(
+            be.prefs_path,
+            dir.join("profiles").join("work").join("prefs.json")
+        );
+        assert!(
+            be.prefs.hostname.is_none() && !be.prefs.accept_routes,
+            "a fresh profile must NOT inherit the default profile's prefs (isolation)"
+        );
+        // Configure "work" distinctively + persist.
+        be.prefs.hostname = Some("work-host".into());
+        be.ever_configured = true;
+        be.persist_prefs().await.unwrap();
+
+        // Switch back to default: its prefs are intact (work's changes didn't bleed in).
+        be.switch_profile(profile::DEFAULT_PROFILE_ID)
+            .await
+            .unwrap();
+        assert_eq!(be.prefs.hostname.as_deref(), Some("default-host"));
+        assert!(be.prefs.accept_routes);
+
+        // Switch to work again: work's prefs are intact too.
+        be.switch_profile("work").await.unwrap();
+        assert_eq!(be.prefs.hostname.as_deref(), Some("work-host"));
+        assert!(!be.prefs.accept_routes);
+
+        // list_profiles shows both, with the current marker on "work".
+        let list = be.list_profiles().await;
+        let work = list.iter().find(|e| e.id == "work").unwrap();
+        let def = list
+            .iter()
+            .find(|e| e.id == profile::DEFAULT_PROFILE_ID)
+            .unwrap();
+        assert!(work.current && !def.current);
+
+        // The pointer persists across a reload (a restart resumes the same profile).
+        drop(be);
+        let be2 = Backend::load(&dir).await.unwrap();
+        assert_eq!(be2.current_profile, "work");
+        assert_eq!(be2.prefs.hostname.as_deref(), Some("work-host"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn profile_delete_refuses_current_and_default_but_removes_others() {
+        let dir = std::env::temp_dir().join(format!("tailnetd-prof-del-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = Backend::load(&dir).await.unwrap();
+
+        // Create + populate "work", then switch back to default so "work" is deletable.
+        be.switch_profile("work").await.unwrap();
+        be.prefs.hostname = Some("work-host".into());
+        be.persist_prefs().await.unwrap();
+        be.switch_profile(profile::DEFAULT_PROFILE_ID)
+            .await
+            .unwrap();
+
+        // Refuses the default profile and the current profile.
+        assert!(
+            be.delete_profile(profile::DEFAULT_PROFILE_ID)
+                .await
+                .is_err()
+        );
+        // (current is now default) — deleting current also refused:
+        assert!(
+            be.delete_profile(&be.current_profile.clone())
+                .await
+                .is_err()
+        );
+
+        // Removes a non-current named profile + its files.
+        let (work_prefs, _) = profile::profile_paths(&dir, "work");
+        assert!(tokio::fs::try_exists(&work_prefs).await.unwrap());
+        be.delete_profile("work").await.unwrap();
+        assert!(!tokio::fs::try_exists(&work_prefs).await.unwrap());
+        // It's gone from the list (only default remains).
+        let list = be.list_profiles().await;
+        assert!(!list.iter().any(|e| e.id == "work"));
+        // Idempotent: deleting an absent profile is fine.
+        be.delete_profile("work").await.unwrap();
+
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
