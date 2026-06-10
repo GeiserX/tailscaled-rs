@@ -1095,17 +1095,19 @@ impl Backend {
     ///    leaves the key on disk (re-`new` with the same key is its *re-login* path — the opposite of
     ///    what `tailscale logout` means). A missing key file is fine (already fresh).
     pub async fn logout(&mut self) -> Result<()> {
-        // 1. Best-effort control-plane deregistration while the device is still alive.
-        if let Some(dev) = self.device.as_ref() {
-            if let Err(e) = dev.logout().await {
-                // Non-fatal: proceed with the local logout regardless (never leave the operator
-                // wedged half-logged-in on a transient control error). Go behaves the same.
-                tracing::warn!(
-                    error = ?e,
-                    "logout: control-plane deregistration failed; proceeding with local logout \
-                     (key wipe + intent flip) anyway"
-                );
-            }
+        // 1. Best-effort control-plane deregistration while the device is still alive. (Let-chain
+        // rather than nested `if let` — clippy::collapsible_if; mirrors the `&&`-let style this
+        // module already uses, e.g. the revert-guard arms.)
+        if let Some(dev) = self.device.as_ref()
+            && let Err(e) = dev.logout().await
+        {
+            // Non-fatal: proceed with the local logout regardless (never leave the operator wedged
+            // half-logged-in on a transient control error). Go behaves the same.
+            tracing::warn!(
+                error = ?e,
+                "logout: control-plane deregistration failed; proceeding with local logout \
+                 (key wipe + intent flip) anyway"
+            );
         }
         // 2. Tear down + flip intent to logged-out.
         self.stop_device().await;
