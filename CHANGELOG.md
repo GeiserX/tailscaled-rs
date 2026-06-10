@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.15.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.14.0...v0.15.0) (2026-06-10)
+
+
+### Features
+
+* **nc:** tnet nc &lt;host&gt; &lt;port&gt; — overlay netcat (Go parity) ([#56](https://github.com/GeiserX/tailscaled-rs/issues/56)) ([3c5bc9e](https://github.com/GeiserX/tailscaled-rs/commit/3c5bc9e9f365b14b1638f2d7c98381435ac144e0))
+
 ## [0.14.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.13.0...v0.14.0) (2026-06-10)
 
 
