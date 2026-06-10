@@ -379,6 +379,9 @@ pub struct UpOptions {
     /// Advertise-routes override. `None` leaves the pref unchanged; `Some(vec)` replaces the set
     /// (`Some(vec![])` clears it). A `Vec` alone could not express "unchanged", hence the `Option`.
     pub advertise_routes: Option<Vec<String>>,
+    /// Accept-subnet-routes override (`None` leaves the pref unchanged; `Some(b)` sets it). Go's
+    /// `tailscale up --accept-routes`; same tri-state as `set`'s `accept_routes`.
+    pub accept_routes: Option<bool>,
     /// Run-SSH-server override (`None` leaves the pref unchanged; `Some(b)` sets it).
     pub ssh: Option<bool>,
 }
@@ -721,6 +724,21 @@ impl Backend {
         // decision crisply about the *request* rather than post-apply state.
         let exit_node_only = opts.is_exit_node_only();
 
+        // PRE-VALIDATE the advertised CIDRs BEFORE mutating/persisting prefs. `build_config` is the
+        // final authority (it re-parses the same way; see its `advertise_routes` block), but it only
+        // runs on the rebuild path AFTER `persist_prefs` here — so a malformed CIDR would otherwise
+        // be written to `prefs.json` and only rejected later, leaving the persisted prefs
+        // inconsistent with the running device (a failed `set` having corrupted state). Parse each
+        // candidate up-front as `ipnet::IpNet` (byte-identical to `build_config`'s parse) and bail on
+        // the first bad one with NOTHING yet mutated or persisted. Defense in depth, not a
+        // replacement for the build_config parse.
+        if let Some(routes) = opts.advertise_routes.as_ref() {
+            for s in routes {
+                s.parse::<ipnet::IpNet>()
+                    .map_err(|_| anyhow!("invalid advertise route {s:?}"))?;
+            }
+        }
+
         // Apply the overrides. Same sentinel semantics as `begin_up`'s override block, restricted to
         // the fields `set` accepts. `exit_node` is the double `Option`: binding `en` (an
         // `Option<String>`) and assigning it through both SETS (`Some(Some(sel))`) and CLEARS
@@ -796,6 +814,20 @@ impl Backend {
     /// this phase is not strictly instantaneous under the lock — only the fresh-up case is. The
     /// common, head-of-line-sensitive case (no prior device) returns immediately.
     pub async fn begin_up(&mut self, opts: UpOptions) -> Result<PendingUp> {
+        // PRE-VALIDATE the advertised CIDRs FIRST — before tearing down the device, mutating, or
+        // persisting prefs. Same persist-before-validate gap as `begin_set`: `build_config` (below,
+        // the final authority) only rejects a malformed CIDR AFTER `stop_device` + `persist_prefs`
+        // have run, so a bad value would tear down a live engine AND be written to `prefs.json`
+        // before being caught. Parse each up-front as `ipnet::IpNet` (byte-identical to
+        // `build_config`'s parse) and bail on the first bad one with the device untouched and
+        // nothing persisted. Defense in depth, not a replacement for the build_config parse.
+        if let Some(routes) = opts.advertise_routes.as_ref() {
+            for s in routes {
+                s.parse::<ipnet::IpNet>()
+                    .map_err(|_| anyhow!("invalid advertise route {s:?}"))?;
+            }
+        }
+
         // Tear down any existing device first so `up` is idempotent / reconfiguring.
         self.stop_device().await;
 
@@ -835,6 +867,11 @@ impl Backend {
         }
         if let Some(ar) = opts.advertise_routes {
             self.prefs.advertise_routes = ar;
+        }
+        // Accept-subnet-routes override (Go `up --accept-routes`), same "unchanged unless named"
+        // sentinel as `set`'s accept_routes; baked into the engine Config in `build_config`.
+        if let Some(ar) = opts.accept_routes {
+            self.prefs.accept_routes = ar;
         }
         // Run-SSH-server override (same "unchanged unless named" sentinel). The actual SSH server
         // task is spawned on install in `finish_up` when this is set; `build_config` (below) also
@@ -1297,6 +1334,19 @@ impl Backend {
                 advertise_routes: self.prefs.advertise_routes.clone(),
                 accept_routes: self.prefs.accept_routes,
                 ssh: self.prefs.ssh_enabled,
+                // SSH *liveness*, distinct from the `ssh_enabled` pref above: the server task is
+                // spawned in `finish_up` and can die at bind time (no tailnet IPv4, `listen_ssh`
+                // error). Report it as running only when we hold a task handle that has not finished
+                // — `JoinHandle::is_finished()` is stable and non-blocking, so this never stalls the
+                // brief `status` lock. A missing handle (`None`) — SSH off, node down, or a daemon
+                // built without the `ssh` feature where no task is ever spawned — reads as not
+                // running. So `ssh: true, ssh_running: false` honestly flags an SSH server that was
+                // requested but is not actually accepting connections.
+                ssh_running: self
+                    .ssh_task
+                    .as_ref()
+                    .map(|h| !h.is_finished())
+                    .unwrap_or(false),
                 tun: self.prefs.tun_enabled,
             },
             peers,
@@ -2538,6 +2588,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn begin_set_rejects_malformed_advertise_route_without_persisting() {
+        // FIX (set-persist-order): a malformed advertise-route CIDR must be rejected by `begin_set`
+        // UP-FRONT, before any pref is mutated or persisted — so a failed `set` never writes a value
+        // to prefs.json that the rebuild's `build_config` preflight would then reject, leaving
+        // prefs inconsistent with the running device. Assert the error names the bad value AND that
+        // NO pref moved (the named-alongside `accept_routes` must NOT have been applied) AND that
+        // nothing was persisted to disk.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-set-badroute-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+        // Seed a known-good baseline that must survive a rejected set untouched.
+        be.prefs.advertise_routes = vec!["192.168.1.0/24".to_string()];
+
+        let err = be
+            .begin_set(SetOptions {
+                // A valid route paired with a malformed one, plus an unrelated pref change — the
+                // whole apply must be rejected atomically before any of it is persisted.
+                advertise_routes: Some(vec!["10.0.0.0/8".to_string(), "not-a-cidr".to_string()]),
+                accept_routes: Some(true),
+                ..SetOptions::default()
+            })
+            .await
+            .expect_err("a malformed advertise route must make begin_set fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not-a-cidr"),
+            "the error must name the offending CIDR value, got {msg:?}"
+        );
+        // NOT mutated: neither the routes nor the co-named accept_routes moved (validate-before-apply).
+        assert_eq!(
+            be.prefs.advertise_routes,
+            vec!["192.168.1.0/24".to_string()],
+            "a rejected set must leave the advertise_routes pref untouched"
+        );
+        assert!(
+            !be.prefs.accept_routes,
+            "a rejected set must not have applied the co-named accept_routes change"
+        );
+        // NOT persisted: the validation fails before `persist_prefs`, so no prefs file was written.
+        assert!(
+            !tokio::fs::try_exists(dir.join("prefs.json")).await.unwrap(),
+            "a set rejected for a bad CIDR must not have persisted prefs.json"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn begin_up_rejects_malformed_advertise_route_without_persisting() {
+        // FIX (set-persist-order), the `up`/`begin_up` half: a malformed advertise-route CIDR must be
+        // rejected up-front, before the device is torn down, prefs mutated, or persisted — so a
+        // failed `up` neither drops a live engine nor writes a doomed value to prefs.json. Assert the
+        // error names the value and that nothing was persisted.
+        let dir = std::env::temp_dir().join(format!("tailnetd-bu-badroute-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+
+        // `begin_up` returns `Result<PendingUp>` and `PendingUp` is not `Debug`, so `expect_err`
+        // (which would format the `Ok` value) won't compile — match by hand like
+        // `build_config_rejects_malformed_advertise_route`.
+        let err = match be
+            .begin_up(UpOptions {
+                advertise_routes: Some(vec!["10.0.0.0/8".to_string(), "nope/33".to_string()]),
+                ..UpOptions::default()
+            })
+            .await
+        {
+            Ok(_) => panic!("a malformed advertise route must make begin_up fail"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("nope/33"),
+            "the error must name the offending CIDR value, got {msg:?}"
+        );
+        // begin_up sets want_running before persist, but the early CIDR reject is BEFORE that — so a
+        // rejected up must not have flipped want_running nor persisted prefs.
+        assert!(
+            !be.prefs.want_running,
+            "a CIDR-rejected up must not have flipped want_running (reject is before that)"
+        );
+        assert!(
+            !tokio::fs::try_exists(dir.join("prefs.json")).await.unwrap(),
+            "an up rejected for a bad CIDR must not have persisted prefs.json"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
     async fn begin_up_applies_exit_node_and_advertise_overrides() {
         // The `UpOptions` sentinel semantics, end-to-end through `begin_up`: a `Some(Some(sel))`
         // sets exit_node, a `Some(None)` clears it, and the advertise overrides set/clear. Driven
@@ -2594,6 +2737,60 @@ mod tests {
         );
         assert!(!be.prefs.advertise_exit_node);
         assert!(be.prefs.advertise_routes.is_empty());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn begin_up_applies_accept_routes_override() {
+        // `UpOptions.accept_routes` (Go `up --accept-routes`) uses the same "unchanged unless named"
+        // sentinel as the other up overrides: `Some(true)` enables, `Some(false)` disables, `None`
+        // leaves the pref untouched. Driven without an engine (begin_up only mutates + persists prefs
+        // and builds Config; default prefs have accept_routes false so no SSH/TUN preflight fires).
+        let dir = std::env::temp_dir().join(format!("tailnetd-bu-accept-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+        assert!(
+            !be.prefs.accept_routes,
+            "default prefs do not accept routes"
+        );
+
+        // ENABLE via the override.
+        let _ = be
+            .begin_up(UpOptions {
+                accept_routes: Some(true),
+                ..UpOptions::default()
+            })
+            .await
+            .expect("begin_up accept_routes enable");
+        assert!(
+            be.prefs.accept_routes,
+            "Some(true) must enable accept_routes"
+        );
+
+        // A plain follow-up `up` (None) must leave it enabled (unchanged).
+        let _ = be
+            .begin_up(UpOptions::default())
+            .await
+            .expect("begin_up unchanged");
+        assert!(
+            be.prefs.accept_routes,
+            "a None accept_routes override must preserve the stored value"
+        );
+
+        // DISABLE via the override.
+        let _ = be
+            .begin_up(UpOptions {
+                accept_routes: Some(false),
+                ..UpOptions::default()
+            })
+            .await
+            .expect("begin_up accept_routes disable");
+        assert!(
+            !be.prefs.accept_routes,
+            "Some(false) must disable accept_routes"
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -2841,6 +3038,60 @@ mod tests {
         assert!(
             be.prefs.exit_node.is_none(),
             "Some(None) must clear the exit_node pref (distinct from None = unchanged)"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn status_prefs_view_projects_every_pref_field() {
+        // `status()` projects the persisted `Prefs` into the wire `PrefsView`. That projection is
+        // hand-written field-by-field, so a transposition (e.g. `ssh: tun_enabled`) would silently
+        // misreport the node's posture with nothing to catch it. Drive a device-less backend (so
+        // `status()` does no engine I/O) with NON-DEFAULT, mutually-distinguishable values for every
+        // field and assert each lands in the matching `PrefsView` field. `accept_routes` (false) is
+        // set OPPOSITE `advertise_exit_node`/`tun` (true) so a swap between same-typed bool fields is
+        // caught, not masked by equal values.
+        let dir = std::env::temp_dir().join(format!("tailnetd-status-view-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+        be.prefs.exit_node = Some("100.64.0.9".to_string());
+        be.prefs.advertise_exit_node = true;
+        be.prefs.advertise_routes = vec!["192.168.1.0/24".to_string(), "10.0.0.0/8".to_string()];
+        be.prefs.accept_routes = false;
+        be.prefs.ssh_enabled = true;
+        be.prefs.tun_enabled = true;
+
+        let view = be.status().await.prefs;
+        assert_eq!(
+            view.exit_node.as_deref(),
+            Some("100.64.0.9"),
+            "exit_node pref must project into PrefsView.exit_node verbatim"
+        );
+        assert!(
+            view.advertise_exit_node,
+            "advertise_exit_node pref must project into PrefsView.advertise_exit_node"
+        );
+        assert_eq!(
+            view.advertise_routes,
+            vec!["192.168.1.0/24".to_string(), "10.0.0.0/8".to_string()],
+            "advertise_routes pref must project into PrefsView.advertise_routes in order"
+        );
+        assert!(
+            !view.accept_routes,
+            "accept_routes pref (false) must project into PrefsView.accept_routes (not swapped)"
+        );
+        assert!(
+            view.ssh,
+            "ssh_enabled pref must project into PrefsView.ssh (not tun_enabled)"
+        );
+        assert!(view.tun, "tun_enabled pref must project into PrefsView.tun");
+        // No device is up, so the SSH server task was never spawned → not running, even though the
+        // `ssh` pref is enabled. This is exactly the `ssh: true, ssh_running: false` honest signal.
+        assert!(
+            !view.ssh_running,
+            "a device-less backend spawns no SSH task → ssh_running is false even with ssh enabled"
         );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;

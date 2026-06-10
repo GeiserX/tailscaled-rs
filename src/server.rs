@@ -477,6 +477,7 @@ async fn dispatch(
             exit_node,
             advertise_exit_node,
             advertise_routes,
+            accept_routes,
             ssh,
         } => {
             // Confine the plaintext authkey to the smallest scope: wrap it into a `SecretString`
@@ -494,6 +495,7 @@ async fn dispatch(
                 exit_node,
                 advertise_exit_node,
                 advertise_routes,
+                accept_routes,
                 ssh,
             };
             match ipn::drive_up(backend, authkey, opts).await {

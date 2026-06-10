@@ -95,6 +95,15 @@ enum Command {
         /// being unset.
         #[arg(long)]
         advertise_routes_clear: bool,
+        /// Accept (and route to) subnet routes advertised by peers (Go `tailscale up
+        /// --accept-routes`). Mutually exclusive with `--no-accept-routes`; omitting both leaves the
+        /// persisted setting unchanged.
+        #[arg(long, conflicts_with = "no_accept_routes")]
+        accept_routes: bool,
+        /// Stop accepting subnet routes advertised by peers. Mutually exclusive with
+        /// `--accept-routes`; omitting both leaves the persisted setting unchanged.
+        #[arg(long)]
+        no_accept_routes: bool,
         /// Run the Tailscale SSH server on this node (accept tailnet SSH on port 22, authorized by
         /// the control SSH policy). Requires a daemon built with the `ssh` feature and run as root.
         /// Mutually exclusive with `--no-ssh`; omitting both leaves the setting unchanged.
@@ -314,6 +323,8 @@ async fn main() -> Result<()> {
             no_advertise_exit_node,
             advertise_routes,
             advertise_routes_clear,
+            accept_routes,
+            no_accept_routes,
             ssh,
             no_ssh,
         } => {
@@ -350,6 +361,9 @@ async fn main() -> Result<()> {
                     advertise_routes,
                     advertise_routes_clear,
                 ),
+                // `--accept-routes`/`--no-accept-routes` tri-state (mirrors `--tun`); reuses the same
+                // resolver as the `set` arm.
+                accept_routes: resolve_accept_routes(accept_routes, no_accept_routes),
                 // `--ssh`/`--no-ssh` tri-state (mirrors `--tun`).
                 ssh: resolve_ssh(ssh, no_ssh),
             }
@@ -610,7 +624,17 @@ fn print_status(s: &tailscaled_rs::localapi::StatusReport) {
         println!("accept-routes: on");
     }
     if p.ssh {
-        println!("ssh-server:   on");
+        // Distinguish the *enabled* pref from the server actually *running*. The task can die at
+        // bind time (no tailnet IPv4, `listen_ssh` error) while the pref stays on, so flag that
+        // honestly rather than imply SSH is serving. Only warn when the node is in a state where the
+        // server is expected to be up (Running/Starting) — a deliberately-down node has no task
+        // (`ssh_running: false`) and must not be reported as a broken SSH server.
+        let node_should_serve = s.state == "Running" || s.state == "Starting";
+        if node_should_serve && !p.ssh_running {
+            println!("ssh-server:   on (NOT RUNNING — check logs)");
+        } else {
+            println!("ssh-server:   on");
+        }
     }
     if p.tun {
         println!("tun:          on");
@@ -964,6 +988,78 @@ mod tests {
                 assert_eq!(ssh, None, "unset → unchanged, not flipped");
             }
             other => panic!("expected Request::Set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn command_up_maps_accept_routes_tristate() {
+        // `tnet up` now carries `--accept-routes`/`--no-accept-routes` (Go parity), reusing the same
+        // `resolve_accept_routes` tri-state helper as `set`. Pin all three states map into the wire
+        // `Request::Up.accept_routes`: enable → Some(true), disable → Some(false), neither → None
+        // (leave unchanged). Built from the same resolver the `Command::Up` arm in `main` uses.
+        let enabled = Request::Up {
+            authkey: None,
+            control_url: None,
+            hostname: None,
+            tun: None,
+            tun_name: None,
+            tun_mtu: None,
+            exit_node: None,
+            advertise_exit_node: None,
+            advertise_routes: None,
+            accept_routes: resolve_accept_routes(true, false),
+            ssh: None,
+        };
+        match enabled {
+            Request::Up { accept_routes, .. } => {
+                assert_eq!(accept_routes, Some(true), "--accept-routes → Some(true)")
+            }
+            other => panic!("expected Request::Up, got {other:?}"),
+        }
+
+        let disabled = Request::Up {
+            authkey: None,
+            control_url: None,
+            hostname: None,
+            tun: None,
+            tun_name: None,
+            tun_mtu: None,
+            exit_node: None,
+            advertise_exit_node: None,
+            advertise_routes: None,
+            accept_routes: resolve_accept_routes(false, true),
+            ssh: None,
+        };
+        match disabled {
+            Request::Up { accept_routes, .. } => {
+                assert_eq!(
+                    accept_routes,
+                    Some(false),
+                    "--no-accept-routes → Some(false)"
+                )
+            }
+            other => panic!("expected Request::Up, got {other:?}"),
+        }
+
+        let unchanged = Request::Up {
+            authkey: None,
+            control_url: None,
+            hostname: None,
+            tun: None,
+            tun_name: None,
+            tun_mtu: None,
+            exit_node: None,
+            advertise_exit_node: None,
+            advertise_routes: None,
+            accept_routes: resolve_accept_routes(false, false),
+            ssh: None,
+        };
+        match unchanged {
+            Request::Up { accept_routes, .. } => assert_eq!(
+                accept_routes, None,
+                "neither flag → None (leave the persisted pref unchanged)"
+            ),
+            other => panic!("expected Request::Up, got {other:?}"),
         }
     }
 
