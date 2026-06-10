@@ -25,6 +25,20 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.10.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.9.0...v0.10.0) (2026-06-10)
+
+
+### Features
+
+* **get:** tnet get — show current prefs (Go parity) ([#39](https://github.com/GeiserX/tailscaled-rs/issues/39)) ([1b64d6b](https://github.com/GeiserX/tailscaled-rs/commit/1b64d6b35b09a1fc8b05942cca73cddf4928208e))
+* **version:** tnet version (+ --daemon, --json) — Go parity ([#38](https://github.com/GeiserX/tailscaled-rs/issues/38)) ([8f3b711](https://github.com/GeiserX/tailscaled-rs/commit/8f3b711bc0af8b52067b97130d96f80cc9988cac))
+* **wait,whoami:** tnet wait + whoami (Go parity) ([#40](https://github.com/GeiserX/tailscaled-rs/issues/40)) ([407993c](https://github.com/GeiserX/tailscaled-rs/commit/407993ce86b056349761f95a79ba18dfb77931e3))
+
+
+### Bug Fixes
+
+* **up,logout:** drift-proof the revert guard + crash-safe logout key wipe ([#36](https://github.com/GeiserX/tailscaled-rs/issues/36)) ([78c50a3](https://github.com/GeiserX/tailscaled-rs/commit/78c50a32bbf1f31890b47a70efe44964bfd36189))
+
 ## [0.9.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.8.0...v0.9.0) (2026-06-10)
 
 
