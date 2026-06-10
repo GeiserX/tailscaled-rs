@@ -225,6 +225,17 @@ enum Command {
         /// `tailscale status --json`.
         #[arg(long)]
         json: bool,
+        /// Show only active peers (Go `--active`). NOTE: Go's "active" means recent traffic; this
+        /// fork has no per-peer traffic signal, so it approximates it with the peer's *online*
+        /// (control-plane-connected) state — peers with unknown liveness are hidden.
+        #[arg(long)]
+        active: bool,
+        /// Hide the peer list (Go `--peers=false`). Use `--no-peers`.
+        #[arg(long = "no-peers")]
+        no_peers: bool,
+        /// Hide this node's own line/object (Go `--self=false`). Use `--no-self`.
+        #[arg(long = "no-self")]
+        no_self: bool,
     },
     /// Block until the node is connected (state `Running` with a tailnet IP), then exit 0. Mirrors
     /// Go `tailscale wait` — handy in scripts as `tnet wait && start-my-service`.
@@ -382,6 +393,9 @@ async fn main() -> Result<()> {
     // Track whether the user asked for `status --json`, so the (generic) `Response::Status` render
     // site below emits the Go `ipnstate.Status`-shaped JSON instead of the human table.
     let mut status_json = false;
+    // `status` filtering flags (--active / --no-peers / --self), applied client-side to the report
+    // before either renderer. Default = show everything.
+    let mut status_filter = StatusFilter::default();
     let request = match cli.command {
         Command::Up {
             authkey,
@@ -591,13 +605,24 @@ async fn main() -> Result<()> {
         }
         // `status --watch` is a long-lived stream, not a one-shot round-trip — handle it here and
         // return. Plain `status` falls through to the one-shot path below.
-        Command::Status { watch, json } => {
+        Command::Status {
+            watch,
+            json,
+            active,
+            no_peers,
+            no_self,
+        } => {
             if watch {
                 return watch_status(&socket)
                     .await
                     .with_context(|| format!("watching status at {}", socket.display()));
             }
             status_json = json;
+            status_filter = StatusFilter {
+                active_only: active,
+                hide_peers: no_peers,
+                hide_self: no_self,
+            };
             Request::Status
         }
         Command::Ip => Request::Ip,
@@ -632,6 +657,9 @@ async fn main() -> Result<()> {
 
     match response {
         Response::Status(s) => {
+            // Apply the client-side --active / --no-peers / --no-self filters before rendering, so
+            // both the human and --json paths honor them identically.
+            let s = status_filter.apply(s);
             if status_json {
                 // Go `status --json`: the ipnstate.Status-shaped object (faithful subset).
                 match format_status_json(&s) {
@@ -1078,6 +1106,44 @@ fn print_status(s: &tailscaled_rs::localapi::StatusReport) {
             p.ipv4,
             if p.is_exit_node { "  [exit]" } else { "" }
         );
+    }
+}
+
+/// Client-side filters for `tnet status` (Go's `--active` / `--peers=false` / `--self=false`),
+/// applied to the [`StatusReport`] before either renderer so the human and `--json` outputs honor
+/// them identically. Default = show everything.
+#[derive(Default, Clone, Copy)]
+struct StatusFilter {
+    /// Show only "active" peers. Go's `--active` means recent traffic; this fork has no per-peer
+    /// traffic signal, so it approximates with the peer's *online* (control-connected) state —
+    /// peers whose liveness is unknown (`online: None`) are hidden.
+    active_only: bool,
+    /// Hide the peer list entirely (Go `--peers=false`).
+    hide_peers: bool,
+    /// Hide this node's own self info (Go `--self=false`).
+    hide_self: bool,
+}
+
+impl StatusFilter {
+    /// Apply the filters to a [`StatusReport`], returning the projected report. Pure (consumes +
+    /// returns), so it is unit-testable. `hide_self` blanks the self fields so both renderers omit
+    /// the self line/object; `hide_peers` empties the peer list; `active_only` keeps only peers
+    /// reported online.
+    fn apply(
+        &self,
+        mut s: tailscaled_rs::localapi::StatusReport,
+    ) -> tailscaled_rs::localapi::StatusReport {
+        if self.hide_self {
+            s.self_ipv4 = None;
+            s.self_name = None;
+        }
+        if self.hide_peers {
+            s.peers.clear();
+        } else if self.active_only {
+            // "active" ≈ online (the only liveness signal we have). Unknown liveness → hidden.
+            s.peers.retain(|p| p.online == Some(true));
+        }
+        s
     }
 }
 
@@ -2011,6 +2077,84 @@ mod tests {
 
         // Unknown setting → error (Go errors too).
         assert!(format_get(&view, Some("no-such-setting"), false).is_err());
+    }
+
+    #[test]
+    fn status_filter_active_self_peers() {
+        use tailscaled_rs::localapi::{PeerReport, PrefsView, StatusReport};
+        let base = || StatusReport {
+            state: "Running".to_string(),
+            want_running: true,
+            self_ipv4: Some("100.70.22.12".to_string()),
+            self_name: Some("node-a".to_string()),
+            auth_url: None,
+            error: None,
+            prefs: PrefsView::default(),
+            peers: vec![
+                PeerReport {
+                    name: "online-peer".to_string(),
+                    ipv4: "100.64.0.2".to_string(),
+                    is_exit_node: false,
+                    stable_id: "n1".to_string(),
+                    online: Some(true),
+                },
+                PeerReport {
+                    name: "offline-peer".to_string(),
+                    ipv4: "100.64.0.3".to_string(),
+                    is_exit_node: false,
+                    stable_id: "n2".to_string(),
+                    online: Some(false),
+                },
+                PeerReport {
+                    name: "unknown-peer".to_string(),
+                    ipv4: "100.64.0.4".to_string(),
+                    is_exit_node: false,
+                    stable_id: "n3".to_string(),
+                    online: None,
+                },
+            ],
+        };
+
+        // No filter → everything.
+        let all = StatusFilter::default().apply(base());
+        assert_eq!(all.peers.len(), 3);
+        assert!(all.self_name.is_some());
+
+        // --no-peers → peer list emptied, self kept.
+        let np = StatusFilter {
+            hide_peers: true,
+            ..Default::default()
+        }
+        .apply(base());
+        assert!(np.peers.is_empty());
+        assert!(np.self_name.is_some());
+
+        // --no-self → self blanked, peers kept.
+        let ns = StatusFilter {
+            hide_self: true,
+            ..Default::default()
+        }
+        .apply(base());
+        assert!(ns.self_name.is_none() && ns.self_ipv4.is_none());
+        assert_eq!(ns.peers.len(), 3);
+
+        // --active → only online==Some(true) peers (offline + unknown hidden).
+        let act = StatusFilter {
+            active_only: true,
+            ..Default::default()
+        }
+        .apply(base());
+        assert_eq!(act.peers.len(), 1);
+        assert_eq!(act.peers[0].name, "online-peer");
+
+        // --no-peers wins over --active (no peers at all).
+        let both = StatusFilter {
+            active_only: true,
+            hide_peers: true,
+            ..Default::default()
+        }
+        .apply(base());
+        assert!(both.peers.is_empty());
     }
 
     #[test]
