@@ -77,6 +77,7 @@ mod config;
 mod diag;
 pub mod profile;
 mod revert_guard;
+pub mod serve;
 mod state;
 
 // The reported [`State`] enum lives in [`state`] (with the pure state-derivation helpers) but is
@@ -1550,6 +1551,20 @@ impl Backend {
     /// mapping.
     pub async fn lock_status(dev: &tailscale::Device) -> crate::localapi::Response {
         diag::lock_status(dev).await
+    }
+
+    /// Load the current profile's serve config (the `tnet serve status` / GetServeConfig path).
+    /// Missing/malformed → empty (no serve). Reads only the profile's serve-config file.
+    pub async fn serve_config(&self) -> serve::ServeConfig {
+        serve::load(&self.state_dir, &self.current_profile).await
+    }
+
+    /// Persist a new serve config for the current profile (the SetServeConfig path). The caller is
+    /// responsible for (re)arming the serve accept loops to match; this only persists.
+    pub async fn set_serve_config(&self, cfg: &serve::ServeConfig) -> Result<()> {
+        serve::save(cfg, &self.state_dir, &self.current_profile)
+            .await
+            .with_context(|| "persisting serve-config")
     }
 
     /// Resolve a tailnet IP to the peer that owns it (the `tnet whois` / Go `tailscale whois` path).

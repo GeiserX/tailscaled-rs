@@ -146,6 +146,16 @@ pub enum Request {
     /// this fork has no log-upload backend, so the marker is a LOCAL diagnostic identifier only (it is
     /// not a server-retrievable log id — see the daemon's `bugreport` builder + the CLI note).
     BugReport,
+    /// Read the node's serve configuration (Go `GetServeConfig`; `tnet serve status`). Replies with
+    /// [`Response::ServeConfig`]. Read-only — gated like [`Status`](Request::Status).
+    GetServeConfig,
+    /// Replace the node's serve configuration (Go `SetServeConfig`; `tnet serve --tcp` / `reset`).
+    /// The daemon persists it and re-arms its serve accept loops to match. A WRITE — gated like
+    /// `up`/`down`.
+    SetServeConfig {
+        /// The new serve config (replaces the current one wholesale).
+        config: ServeConfig,
+    },
     /// Switch the active profile (Go `tailscale switch <id>`). The daemon tears down the current
     /// device, swaps to the target profile's prefs/key, and persists the pointer. A WRITE (it changes
     /// node lifecycle + persisted state) — gated like `up`/`down`.
@@ -279,6 +289,9 @@ pub enum Response {
         /// log id — this fork uploads nothing.
         marker: String,
     },
+    /// The node's serve configuration (reply to [`Request::GetServeConfig`]), rendered by
+    /// `tnet serve status`.
+    ServeConfig(ServeConfig),
     /// A command succeeded.
     Ok {
         /// Human-readable detail.
@@ -432,6 +445,58 @@ pub struct PrefsView {
     pub ssh_running: bool,
     /// Whether the node uses the kernel-TUN data path (vs the userspace netstack).
     pub tun: bool,
+}
+
+/// The node's serve configuration (the TCP-forward subset of Go `ipn.ServeConfig`), carried by
+/// [`Request::SetServeConfig`] / [`Response::ServeConfig`]. The serde shape mirrors Go's wire JSON
+/// byte-for-byte (PascalCase, `omitempty`), e.g. `{"TCP":{"8443":{"TCPForward":"127.0.0.1:5000"}}}`.
+/// Persistence + the served/not-served logic live in `crate::ipn::serve`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServeConfig {
+    /// Per-tailnet-port handler, keyed by the tailnet listen port AS A STRING. The key is a string
+    /// (not `u16`) deliberately: this DTO is carried inside the internally-tagged [`Request`] enum,
+    /// whose deserialization buffers through `serde_json::Value` — and a `Value` map only has string
+    /// keys, so an integer-keyed map fails to round-trip there ("invalid type: string, expected u16").
+    /// A string key also matches Go's wire JSON (`{"TCP":{"8443":{...}}}`) byte-for-byte. The daemon
+    /// parses the key to a port number where it needs one.
+    #[serde(
+        default,
+        rename = "TCP",
+        skip_serializing_if = "std::collections::BTreeMap::is_empty"
+    )]
+    pub tcp: std::collections::BTreeMap<String, TcpPortHandler>,
+}
+
+/// One served tailnet port (Go `ipn.TCPPortHandler`); only `tcp_forward` is served by this build.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TcpPortHandler {
+    /// Handle as HTTPS via a Web config (recognized, NOT served — needs an HTTP/TLS stack).
+    #[serde(default, rename = "HTTPS", skip_serializing_if = "core::ops::Not::not")]
+    pub https: bool,
+    /// Handle as HTTP via a Web config (recognized, NOT served — needs an HTTP stack).
+    #[serde(default, rename = "HTTP", skip_serializing_if = "core::ops::Not::not")]
+    pub http: bool,
+    /// `IP:port` to forward inbound TCP to (the served case). Empty = not a forward.
+    #[serde(
+        default,
+        rename = "TCPForward",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub tcp_forward: String,
+    /// If non-empty, terminate TLS for this SNI before forwarding (NOT served — needs a TLS server).
+    #[serde(
+        default,
+        rename = "TerminateTLS",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub terminate_tls: String,
+    /// PROXY-protocol version to prepend before forwarding (Go `omitzero`; 0 = none).
+    #[serde(default, rename = "ProxyProtocol", skip_serializing_if = "is_zero_i32")]
+    pub proxy_protocol: i32,
+}
+
+fn is_zero_i32(n: &i32) -> bool {
+    *n == 0
 }
 
 /// Tailnet Lock (TKA) status in a [`Response::Lock`] reply (Go `tailscale lock status`, read-only
