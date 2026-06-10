@@ -314,6 +314,10 @@ enum Command {
         /// Per-attempt timeout in milliseconds (omit for a sensible default).
         #[arg(long, value_name = "MS")]
         timeout: Option<u64>,
+        /// Number of pings to send (Go `-c`). Default 1. Prints one result line per attempt, then a
+        /// summary; a failed attempt is counted but does not abort the rest.
+        #[arg(short = 'c', long, value_name = "N", default_value_t = 1)]
+        count: u32,
     },
     /// Send and receive files over Taildrop (Go `tailscale file`).
     File {
@@ -833,12 +837,46 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Command::Whois { ip } => Request::Whois { ip },
-        // `--timeout` (ms) maps straight to the wire's `timeout_ms`; omitting it sends `None`, which
-        // the daemon reads as "use a sensible default".
-        Command::Ping { ip, timeout } => Request::Ping {
-            ip,
-            timeout_ms: timeout,
-        },
+        // `ping` (Go `tailscale ping [-c N]`): the engine pings one-at-a-time, so `-c` is a CLI-side
+        // loop over `Request::Ping`. Handled inline (the loop + summary + exit-code contract); each
+        // attempt prints a result line, a failure is counted but does not abort the rest, and the
+        // command exits non-zero only if NOTHING was received.
+        Command::Ping { ip, timeout, count } => {
+            let n = count.max(1);
+            let mut received = 0u32;
+            for seq in 1..=n {
+                match round_trip(
+                    &socket,
+                    &Request::Ping {
+                        ip: ip.clone(),
+                        timeout_ms: timeout,
+                    },
+                )
+                .await
+                {
+                    Ok(Response::Ping { rtt_ms, ip }) => {
+                        received += 1;
+                        println!("pong from {ip} in {rtt_ms:.1} ms  (seq {seq}/{n})");
+                    }
+                    Ok(Response::Error { message }) => {
+                        eprintln!("ping {seq}/{n} failed: {message}");
+                    }
+                    Ok(other) => anyhow::bail!("unexpected response to ping: {other:?}"),
+                    Err(e) => {
+                        return Err(e).with_context(|| format!("pinging at {}", socket.display()));
+                    }
+                }
+            }
+            // Only print a summary for a multi-ping run (a single ping's one line is self-explanatory).
+            if n > 1 {
+                println!("{}", format_ping_summary(n, received));
+            }
+            // Exit non-zero only if nothing came back at all (Go: success if any reply).
+            if received == 0 {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         // Taildrop. The nested subcommand picks which wire `Request` to send: `cp` and `get` are
         // writes (the daemon reads/consumes a file) and reply `Ok`; `list` is read-only and replies
         // `Files`.
@@ -956,6 +994,7 @@ async fn main() -> Result<()> {
             print!("{}", format_whois(&w, queried_ip));
         }
         // Round-trip time of an overlay ping (`tnet ping`).
+        // `ping` is handled inline above (the -c loop); this arm is exhaustiveness-only.
         Response::Ping { rtt_ms, ip } => println!("pong from {ip} in {rtt_ms:.1} ms"),
         // Waiting Taildrop files (`tnet file list`). One line per file; an empty inbox prints a
         // clear placeholder rather than nothing. The file name is engine/peer-supplied, so it is run
@@ -1355,6 +1394,18 @@ fn format_ip(ipv4: Option<&str>, ipv6: Option<&str>) -> String {
         out.push_str("(no tailnet address yet)\n");
     }
     out
+}
+
+/// Format the `tnet ping -c N` summary line: how many were sent vs received, with the loss percent.
+/// Pure → unit-testable.
+fn format_ping_summary(sent: u32, received: u32) -> String {
+    let lost = sent.saturating_sub(received);
+    let loss_pct = if sent == 0 {
+        0.0
+    } else {
+        (lost as f64 / sent as f64) * 100.0
+    };
+    format!("--- {sent} sent, {received} received, {loss_pct:.0}% loss ---")
 }
 
 /// Address-family / count selection for `tnet ip` (Go `-4`/`-6`/`-1`). `v4`/`v6` are mutually
@@ -2584,6 +2635,22 @@ mod tests {
         assert!(!out.contains("* default"), "{out}");
         // Empty → placeholder.
         assert_eq!(format_profiles(&[]), "(no profiles)\n");
+    }
+
+    #[test]
+    fn format_ping_summary_counts_and_loss() {
+        assert_eq!(
+            format_ping_summary(3, 3),
+            "--- 3 sent, 3 received, 0% loss ---"
+        );
+        assert_eq!(
+            format_ping_summary(4, 1),
+            "--- 4 sent, 1 received, 75% loss ---"
+        );
+        assert_eq!(
+            format_ping_summary(2, 0),
+            "--- 2 sent, 0 received, 100% loss ---"
+        );
     }
 
     #[test]
