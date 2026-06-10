@@ -585,24 +585,24 @@ impl Backend {
             return Ok(()); // already on it
         }
         // Tear down the live device + supersede any in-flight up before swapping the active files.
+        // (The device is down either way after this — a switch always disconnects; the engine is
+        // rebuilt from the new profile on the next `up`.)
         self.stop_device().await;
         self.bump_generation();
 
+        // Compute the target's state into LOCALS first, and do every fallible disk write BEFORE
+        // committing anything to `self`. This is the D1 fix: the in-memory active-profile identity
+        // (`current_profile`/`prefs`/paths) is mutated only after BOTH persisted writes succeed, so a
+        // failed `profiles.json`/pointer write leaves the live backend coherently on the OLD profile
+        // (matching the unchanged on-disk pointer) rather than diverging — in-memory ahead of disk.
         let (prefs_path, key_path) = profile::profile_paths(&self.state_dir, target);
         let ever_configured = tokio::fs::try_exists(&prefs_path).await.unwrap_or(false);
         let prefs = Prefs::load(&prefs_path)
             .await
             .with_context(|| format!("loading prefs for profile {target:?}"))?;
 
-        self.prefs = prefs;
-        self.prefs_path = prefs_path;
-        self.key_path = key_path;
-        self.ever_configured = ever_configured;
-        self.current_profile = target.to_string();
-        // This process has not attempted a boot-up for the newly-active profile.
-        self.boot_attempted_up = false;
-
-        // Register the target in profiles.json (so `--list` shows it) if it is a new named profile.
+        // (1) Register the target in profiles.json (so `--list` shows it) if it is a new named
+        // profile — before the pointer, so a crash between them only leaves a harmless extra entry.
         if target != profile::DEFAULT_PROFILE_ID {
             let mut meta = profile::load_profiles_file(&self.state_dir).await;
             meta.profiles
@@ -612,10 +612,20 @@ impl Backend {
                 .await
                 .with_context(|| "persisting profiles.json")?;
         }
-        // Persist the pointer LAST: if anything above failed we have not yet committed the switch.
+        // (2) Persist the pointer. On failure, `self` is still on the old profile (we have not
+        // touched it yet) and so is the on-disk pointer — coherent, recoverable by retry.
         profile::write_current_profile(&self.state_dir, target)
             .await
             .with_context(|| "persisting current-profile pointer")?;
+
+        // (3) Only now — every persisted write succeeded — commit the in-memory swap.
+        self.prefs = prefs;
+        self.prefs_path = prefs_path;
+        self.key_path = key_path;
+        self.ever_configured = ever_configured;
+        self.current_profile = target.to_string();
+        // This process has not attempted a boot-up for the newly-active profile.
+        self.boot_attempted_up = false;
         Ok(())
     }
 
@@ -1759,6 +1769,50 @@ mod tests {
         let be2 = Backend::load(&dir).await.unwrap();
         assert_eq!(be2.current_profile, "work");
         assert_eq!(be2.prefs.hostname.as_deref(), Some("work-host"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn switch_profile_pointer_write_failure_keeps_old_profile_in_memory() {
+        // D1 fix: if persisting the current-profile pointer fails, switch_profile must return Err
+        // WITHOUT having committed the in-memory swap — the live backend stays coherently on the old
+        // profile (matching the unchanged on-disk pointer), not diverged ahead of disk. We force the
+        // pointer write to fail by making `current-profile` an un-removable DIRECTORY (write to a path
+        // that is a dir errors with non-NotFound).
+        let dir = std::env::temp_dir().join(format!("tailnetd-prof-d1-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = Backend::load(&dir).await.unwrap();
+        be.prefs.hostname = Some("default-host".into());
+        be.persist_prefs().await.unwrap();
+
+        // Sabotage: make the pointer path a directory so `write_current_profile` fails.
+        tokio::fs::create_dir_all(profile::current_profile_path(&dir))
+            .await
+            .unwrap();
+
+        let before = be.current_profile.clone();
+        let result = be.switch_profile("work").await;
+        assert!(
+            result.is_err(),
+            "a failed pointer write must surface as Err"
+        );
+        // The in-memory state must NOT have advanced past the failed commit.
+        assert_eq!(
+            be.current_profile, before,
+            "current_profile must stay on the old profile when the pointer write failed"
+        );
+        assert_eq!(
+            be.prefs.hostname.as_deref(),
+            Some("default-host"),
+            "prefs must not have been swapped to the target's"
+        );
+        assert_eq!(
+            be.prefs_path,
+            dir.join("prefs.json"),
+            "paths must not have swapped"
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
