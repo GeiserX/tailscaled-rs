@@ -231,3 +231,49 @@ fallback so it's robust to layout differences — but the absolute `/sbin/route`
 lands + a release is cut, the daemon drops the temporary local `paths` override and bumps the pin.
 **Linux TUN** uses bare `ip`/`resolvectl` (PATH-resolved) — unaffected by this; still untested from
 this lane but has no analogous hardcoded-path trap.
+
+---
+
+## 7. SSH check-mode (`HoldAndDelegate`) + session-recording enforcement (engine bead `tsr-0h2`)
+
+The daemon now runs the engine's turnkey `Device::listen_ssh` (Tailscale SSH server, tsd-46c,
+shipped daemon v0.5.0). Base parity works live: policy accept/reject + privilege-drop login shell.
+**Gap:** `ts_control/src/ssh_policy.rs:82-83` PARSES `recorders` / `on_recording_failure` and the
+interactive check path off the netmap but **drops them before evaluation** — so:
+
+- A policy with `action: "check"` (`HoldAndDelegate`) is not honored — there's no just-in-time
+  control round-trip (`DoNoiseRequest` poll until Accept/Reject, with `OnPolicyChange` revocation).
+- A policy that says "record this session or refuse" (`on_recording_failure: terminate/reject`) is
+  **silently ignored** — a real policy bypass (the operator believes sessions are recorded; they
+  aren't).
+
+**Ask:** implement check-mode (the `HoldAndDelegate` round-trip) and enforce session-recording per
+`OnRecordingFailure`, OR — if deferred — make the daemon-visible surface report that they're
+unenforced so the daemon can warn loudly. This is engine-side (policy eval + the control noise
+channel live in the engine). Daemon impact: until this lands, `tnet up --ssh` ships base server
+parity only; the daemon documents the gap. Mirrors Go `tailssh`'s `evaluatePolicy` +
+`fetchSSHAction` + `sessionrecording`.
+
+## 8. Exit-node DNS path for forwarded clients — advertise side (engine bead `tsr-c39`)
+
+When THIS node advertises itself as an exit node (`advertise_exit_node`, shipped daemon v0.4.0) and
+egress is enabled, traffic forwarded **through** it has no DNS handling — the overlay router only
+loopbacks MagicDNS (`100.100.100.100`) for the **local** node. Go's model expects the exit node to
+also be the DNS path for its clients.
+
+**Ask:** confirm whether forwarded-client DNS is in scope for the engine's forwarder (and if so, that
+it stays v4-only + leak-free), or document that it's strictly the client-side daemon's concern. Filed
+so the daemon doesn't wrongly assume the engine handles it. (The USE side is already leak-safe — see
+ask #6 / the daemon's leak-safety invariant; this is specifically the ADVERTISE side.)
+
+## 9. Document the live-set surface (engine bead `tsr-89s`)
+
+The daemon's `tnet set` (shipped v0.5.0) applies `exit_node` **live** via `Device::set_exit_node`
+(no reconnect) and **rebuilds** the device for every other pref (hostname / accept_routes /
+advertise_* / ssh), because the engine `Config` is immutable per-construction.
+
+**Ask (doc-only if the setters already exist):** publish the COMPLETE list of prefs the engine can
+change **live** on a running `Device` (no rebuild) vs those that require reconstruction. Today the
+daemon only knows `set_exit_node` is live; if `set_serve_config` / `listen_funnel` / others are also
+live, the daemon's `set` can widen its seamless fast-path instead of triggering a brief reconnect.
+No new engine code needed if the live setters already exist — just the contract.
