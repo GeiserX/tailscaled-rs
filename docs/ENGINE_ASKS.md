@@ -234,7 +234,16 @@ this lane but has no analogous hardcoded-path trap.
 
 ---
 
-## 7. SSH check-mode (`HoldAndDelegate`) + session-recording enforcement (engine bead `tsr-0h2`)
+## 7. ✅ PARTIALLY FIXED in engine v0.7.3 — SSH session-recording enforcement (engine bead `tsr-0h2`)
+
+> **UPDATE:** the engine shipped the **session-recording enforcement** half in **v0.7.3** (`dd4b33e`,
+> PR #25): `recorders` / `on_recording_failure` are no longer dropped in the domain conversion, and
+> the SSH server now **fails closed** — when a matched rule requires recording but no recorder
+> transport is available, the session is refused. That closes the silent-bypass. The daemon bumped
+> its pin to v0.7.3 to pick this up. **Still open:** the interactive **check-mode**
+> (`HoldAndDelegate`) just-in-time control round-trip, and the recorder *transport* itself — both
+> deferred by the engine; the daemon's SSH server honors a record-required policy by refusing, the
+> correct fail-closed posture until the recorder transport lands.
 
 The daemon now runs the engine's turnkey `Device::listen_ssh` (Tailscale SSH server, tsd-46c,
 shipped daemon v0.5.0). Base parity works live: policy accept/reject + privilege-drop login shell.
