@@ -117,6 +117,12 @@ pub enum Request {
     },
     /// Bring the node down (`WantRunning = false`) without logging out.
     Down,
+    /// Log the node out (the analogue of Go's `tailscale logout`): deregister the node key with the
+    /// control plane, tear the datapath down, and **discard the persisted node key** so the next
+    /// `up` re-registers fresh (a new login) rather than resuming the old registration. This is
+    /// distinct from [`Down`](Request::Down), which keeps the node key for a seamless resume. A WRITE
+    /// — gated like `up`/`down`.
+    Logout,
     /// Report this node's own tailnet addresses (Go `tailscale ip`). Read-only — gated like
     /// [`Status`](Request::Status).
     Ip,

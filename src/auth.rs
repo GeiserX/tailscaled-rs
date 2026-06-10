@@ -137,6 +137,7 @@ pub fn requires_write(request: &crate::localapi::Request) -> bool {
         Request::Up { .. }
         | Request::Set { .. }
         | Request::Down
+        | Request::Logout
         | Request::FileCp { .. }
         | Request::FileGet { .. } => true,
     }
@@ -233,6 +234,10 @@ mod tests {
     fn requires_write_classifies_commands() {
         assert!(!requires_write(&Request::Status));
         assert!(requires_write(&Request::Down));
+        assert!(
+            requires_write(&Request::Logout),
+            "logout deregisters + wipes the key — a write, gated like down"
+        );
         assert!(requires_write(&up()));
         assert!(requires_write(&set()));
     }

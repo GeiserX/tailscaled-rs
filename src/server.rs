@@ -415,6 +415,23 @@ async fn dispatch(
             let be = backend.lock().await;
             Response::Status(be.status().await)
         }
+        // `logout` (Go `tailscale logout`): deregisters the node key with control, tears down, and
+        // discards the on-disk key so the next `up` re-registers fresh — distinct from `down` (which
+        // resumes). Backend::logout holds the lock for the whole sequence: the control-plane
+        // deregister is a quick mailbox round-trip (like `set`'s live exit-node, not the multi-second
+        // `Device::new` handshake the begin/finish split exists for), so keeping it atomic under the
+        // one lock is correct and simplest — no concurrent `up` should interleave a half-logout.
+        Request::Logout => {
+            let mut be = backend.lock().await;
+            match be.logout().await {
+                Ok(()) => Response::Ok {
+                    message: "node logged out".to_string(),
+                },
+                Err(e) => Response::Error {
+                    message: format!("{e:#}"),
+                },
+            }
+        }
         Request::Down => {
             let mut be = backend.lock().await;
             match be.down().await {
