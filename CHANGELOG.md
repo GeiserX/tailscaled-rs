@@ -25,6 +25,21 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.11.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.10.0...v0.11.0) (2026-06-10)
+
+
+### Features
+
+* **ip:** tnet ip -4/-6/-1 and [peer] (Go parity) ([#45](https://github.com/GeiserX/tailscaled-rs/issues/45)) ([1868ac7](https://github.com/GeiserX/tailscaled-rs/commit/1868ac74cf45ce0d1ff9e8591d25708d7b1b9a99))
+* **profiles:** multi-profile state + tnet switch (Go parity) ([#46](https://github.com/GeiserX/tailscaled-rs/issues/46)) ([fc5aa7e](https://github.com/GeiserX/tailscaled-rs/commit/fc5aa7e5b6d24875f2a7f5d26a8393518eec9b5e))
+* **status:** --active / --no-peers / --no-self filters (Go parity) ([#44](https://github.com/GeiserX/tailscaled-rs/issues/44)) ([9fc2826](https://github.com/GeiserX/tailscaled-rs/commit/9fc28261d553da133c320ab32160305ca285c1dd))
+* **status:** tnet status --json (Go ipnstate.Status-shaped subset) ([#42](https://github.com/GeiserX/tailscaled-rs/issues/42)) ([46447e3](https://github.com/GeiserX/tailscaled-rs/commit/46447e30e2ab4fdbbec3ba65e8962f579e477c6c))
+
+
+### Bug Fixes
+
+* **profiles:** commit in-memory switch only after persisted writes succeed ([#47](https://github.com/GeiserX/tailscaled-rs/issues/47)) ([12069a4](https://github.com/GeiserX/tailscaled-rs/commit/12069a46cba0c703a85f44f2739f5b20f74d362f))
+
 ## [0.10.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.9.0...v0.10.0) (2026-06-10)
 
 
