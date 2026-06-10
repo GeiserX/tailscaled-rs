@@ -302,6 +302,54 @@ enum Command {
         #[command(subcommand)]
         cmd: FileCmd,
     },
+    /// Print this node's client metrics in Prometheus text format (Go `tailscale metrics`). With
+    /// `write <path>`, writes them to a file instead of stdout.
+    Metrics {
+        #[command(subcommand)]
+        cmd: Option<MetricsCmd>,
+    },
+    /// Tailnet Lock (TKA) commands. Currently `status` (read-only): whether lock is in use, the
+    /// authority head, and any pending disablement. Mirrors Go `tailscale lock status`.
+    Lock {
+        #[command(subcommand)]
+        cmd: LockCmd,
+    },
+    /// Exit-node commands. `list` shows tailnet peers offering to be exit nodes. Mirrors Go
+    /// `tailscale exit-node`.
+    #[command(name = "exit-node")]
+    ExitNode {
+        #[command(subcommand)]
+        cmd: ExitNodeCmd,
+    },
+}
+
+/// `tnet metrics` subcommands. Bare `tnet metrics` prints to stdout; `write <path>` writes a file.
+#[derive(Subcommand)]
+enum MetricsCmd {
+    /// Write the metrics to a file instead of stdout.
+    Write {
+        /// Destination path.
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
+    },
+}
+
+/// `tnet lock` subcommands.
+#[derive(Subcommand)]
+enum LockCmd {
+    /// Show Tailnet Lock status (read-only).
+    Status {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// `tnet exit-node` subcommands.
+#[derive(Subcommand)]
+enum ExitNodeCmd {
+    /// List tailnet peers offering to be exit nodes.
+    List,
 }
 
 /// The `tnet switch` subcommands. Mirrors Go's `tailscale switch remove`.
@@ -762,6 +810,66 @@ async fn main() -> Result<()> {
         // Taildrop. The nested subcommand picks which wire `Request` to send: `cp` and `get` are
         // writes (the daemon reads/consumes a file) and reply `Ok`; `list` is read-only and replies
         // `Files`.
+        // `metrics` (Go `tailscale metrics`): fetch the Prometheus text, then print or write it.
+        // Inline because `write <path>` chooses a file sink over stdout.
+        Command::Metrics { cmd } => {
+            let text = match round_trip(&socket, &Request::Metrics).await {
+                Ok(Response::Metrics { text }) => text,
+                Ok(Response::Error { message }) => {
+                    eprintln!("error: {message}");
+                    std::process::exit(1);
+                }
+                Ok(other) => anyhow::bail!("unexpected response to metrics: {other:?}"),
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("querying metrics at {}", socket.display()));
+                }
+            };
+            match cmd {
+                Some(MetricsCmd::Write { path }) => {
+                    tokio::fs::write(&path, text.as_bytes())
+                        .await
+                        .with_context(|| format!("writing metrics to {}", path.display()))?;
+                    println!("wrote metrics to {}", path.display());
+                }
+                None => print!("{text}"),
+            }
+            return Ok(());
+        }
+        // `lock status` (Go `tailscale lock status`): fetch + render the TKA status.
+        Command::Lock {
+            cmd: LockCmd::Status { json },
+        } => {
+            let report = match round_trip(&socket, &Request::LockStatus).await {
+                Ok(Response::Lock(r)) => r,
+                Ok(Response::Error { message }) => {
+                    eprintln!("error: {message}");
+                    std::process::exit(1);
+                }
+                Ok(other) => anyhow::bail!("unexpected response to lock status: {other:?}"),
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("querying lock status at {}", socket.display()));
+                }
+            };
+            print!("{}", format_lock_status(&report, json));
+            return Ok(());
+        }
+        // `exit-node list` (Go `tailscale exit-node list`): reuse Status, filter to exit-node peers.
+        Command::ExitNode {
+            cmd: ExitNodeCmd::List,
+        } => {
+            let status = match round_trip(&socket, &Request::Status).await {
+                Ok(Response::Status(s)) => s,
+                Ok(other) => anyhow::bail!("unexpected response to status: {other:?}"),
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("querying status at {}", socket.display()));
+                }
+            };
+            print!("{}", format_exit_node_list(&status.peers));
+            return Ok(());
+        }
         Command::File { cmd } => match cmd {
             FileCmd::Cp { path, peer } => Request::FileCp { path, peer },
             FileCmd::List => Request::FileList,
@@ -872,6 +980,9 @@ async fn main() -> Result<()> {
         Response::Prefs(view) => print!("{}", format_get(&view, None, false).unwrap_or_default()),
         // `switch --list` is handled inline above; this arm is exhaustiveness-only.
         Response::Profiles { profiles } => print!("{}", format_profiles(&profiles)),
+        // `metrics`/`lock status` are handled inline above; these arms are exhaustiveness-only.
+        Response::Metrics { text } => print!("{text}"),
+        Response::Lock(report) => print!("{}", format_lock_status(&report, false)),
         Response::Error { message } => {
             eprintln!("error: {message}");
             std::process::exit(1);
@@ -901,6 +1012,54 @@ async fn send_ok_or_die(socket: &std::path::Path, request: Request) -> Result<()
         Ok(other) => anyhow::bail!("unexpected response: {other:?}"),
         Err(e) => Err(e).with_context(|| format!("talking to daemon at {}", socket.display())),
     }
+}
+
+/// Render `tnet lock status` from a [`LockReport`](tailscaled_rs::localapi::LockReport). Human form
+/// states whether Tailnet Lock is in use and, if so, the authority head + any pending disablement;
+/// `json` emits a small serde object. Pure → unit-testable.
+fn format_lock_status(r: &tailscaled_rs::localapi::LockReport, json: bool) -> String {
+    if json {
+        let mut m = serde_json::Map::new();
+        m.insert("enabled".into(), serde_json::json!(r.enabled));
+        m.insert("head".into(), serde_json::json!(r.head));
+        m.insert("disabled".into(), serde_json::json!(r.disabled));
+        return format!(
+            "{}\n",
+            serde_json::to_string_pretty(&m).unwrap_or_else(|_| "{}".to_string())
+        );
+    }
+    if !r.enabled {
+        return "Tailnet Lock is NOT enabled on this tailnet.\n".to_string();
+    }
+    let mut out = String::from("Tailnet Lock is ENABLED.\n");
+    if !r.head.is_empty() {
+        out.push_str(&format!("  authority head: {}\n", r.head));
+    }
+    if r.disabled {
+        out.push_str("  status: a disablement is pending (control signalled disable).\n");
+    }
+    out
+}
+
+/// Render `tnet exit-node list`: one line per peer offering to be an exit node (IP, hostname, and
+/// online state when known), or a placeholder when none. Country/City columns (Go) are omitted —
+/// this fork has no control-supplied Location data. Pure → unit-testable.
+fn format_exit_node_list(peers: &[tailscaled_rs::localapi::PeerReport]) -> String {
+    let exits: Vec<&tailscaled_rs::localapi::PeerReport> =
+        peers.iter().filter(|p| p.is_exit_node).collect();
+    if exits.is_empty() {
+        return "(no exit nodes available in this tailnet)\n".to_string();
+    }
+    let mut out = String::from("IP               HOSTNAME\n");
+    for p in exits {
+        let online = match p.online {
+            Some(true) => "  (online)",
+            Some(false) => "  (offline)",
+            None => "",
+        };
+        out.push_str(&format!("{:<16} {}{}\n", p.ipv4, p.name, online));
+    }
+    out
 }
 
 /// Render `tnet switch --list`: one line per profile, `* ` marking the current one, then the id and
@@ -2282,6 +2441,73 @@ mod tests {
 
         // Unknown setting → error (Go errors too).
         assert!(format_get(&view, Some("no-such-setting"), false).is_err());
+    }
+
+    #[test]
+    fn format_lock_status_human_and_json() {
+        use tailscaled_rs::localapi::LockReport;
+        // Not enabled.
+        let off = LockReport::default();
+        assert!(format_lock_status(&off, false).contains("NOT enabled"));
+        // Enabled with a head + pending disablement.
+        let on = LockReport {
+            enabled: true,
+            head: "tka-aumhash-abc".into(),
+            disabled: true,
+        };
+        let h = format_lock_status(&on, false);
+        assert!(h.contains("ENABLED"), "{h}");
+        assert!(h.contains("tka-aumhash-abc"), "{h}");
+        assert!(h.contains("disablement is pending"), "{h}");
+        // JSON shape (typed bools).
+        let j = format_lock_status(&on, true);
+        let v: serde_json::Value = serde_json::from_str(&j).unwrap();
+        assert_eq!(v["enabled"], serde_json::json!(true));
+        assert_eq!(v["head"], serde_json::json!("tka-aumhash-abc"));
+        assert_eq!(v["disabled"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn format_exit_node_list_filters_and_placeholder() {
+        use tailscaled_rs::localapi::PeerReport;
+        // None offering → placeholder.
+        let none = vec![PeerReport {
+            name: "plain".into(),
+            ipv4: "100.64.0.2".into(),
+            is_exit_node: false,
+            ..Default::default()
+        }];
+        assert!(format_exit_node_list(&none).contains("no exit nodes"));
+        // Mixed → only exit-node peers listed, with online state.
+        let peers = vec![
+            PeerReport {
+                name: "exit-a".into(),
+                ipv4: "100.64.0.9".into(),
+                is_exit_node: true,
+                online: Some(true),
+                ..Default::default()
+            },
+            PeerReport {
+                name: "plain-b".into(),
+                ipv4: "100.64.0.3".into(),
+                is_exit_node: false,
+                ..Default::default()
+            },
+            PeerReport {
+                name: "exit-c".into(),
+                ipv4: "100.64.0.10".into(),
+                is_exit_node: true,
+                online: Some(false),
+                ..Default::default()
+            },
+        ];
+        let out = format_exit_node_list(&peers);
+        assert!(out.contains("exit-a") && out.contains("(online)"), "{out}");
+        assert!(out.contains("exit-c") && out.contains("(offline)"), "{out}");
+        assert!(
+            !out.contains("plain-b"),
+            "non-exit peer must not appear: {out}"
+        );
     }
 
     #[test]

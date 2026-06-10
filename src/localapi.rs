@@ -126,6 +126,13 @@ pub enum Request {
     /// List the known profiles (Go `tailscale switch --list`). Replies with [`Response::Profiles`].
     /// Read-only — gated like [`Status`](Request::Status).
     ProfileList,
+    /// Snapshot the node's client metrics in Prometheus text format (Go `tailscale metrics`). Replies
+    /// with [`Response::Metrics`]. Read-only — gated like [`Status`](Request::Status). Requires the
+    /// node to be up (metrics come from the live engine).
+    Metrics,
+    /// Report Tailnet Lock (TKA) status (Go `tailscale lock status`, read-only subset). Replies with
+    /// [`Response::Lock`]. Read-only — gated like [`Status`](Request::Status).
+    LockStatus,
     /// Switch the active profile (Go `tailscale switch <id>`). The daemon tears down the current
     /// device, swaps to the target profile's prefs/key, and persists the pointer. A WRITE (it changes
     /// node lifecycle + persisted state) — gated like `up`/`down`.
@@ -234,6 +241,14 @@ pub enum Response {
         /// One entry per known profile (the implicit default plus any named profiles).
         profiles: Vec<ProfileEntry>,
     },
+    /// The node's client metrics in Prometheus text exposition format (reply to
+    /// [`Request::Metrics`]), printed/written by `tnet metrics`.
+    Metrics {
+        /// The Prometheus text (`# TYPE <name> <kind>\n<name> <value>\n` per metric).
+        text: String,
+    },
+    /// Tailnet Lock (TKA) status (reply to [`Request::LockStatus`]), rendered by `tnet lock status`.
+    Lock(LockReport),
     /// A command succeeded.
     Ok {
         /// Human-readable detail.
@@ -384,6 +399,20 @@ pub struct PrefsView {
     pub ssh_running: bool,
     /// Whether the node uses the kernel-TUN data path (vs the userspace netstack).
     pub tun: bool,
+}
+
+/// Tailnet Lock (TKA) status in a [`Response::Lock`] reply (Go `tailscale lock status`, read-only
+/// subset). Mirrors the engine's `ts_control::TkaStatus`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LockReport {
+    /// Whether Tailnet Lock is in use (control sent TKA info for this node).
+    pub enabled: bool,
+    /// The base32 `AUMHash` of control's latest authority head (empty when none / not enabled).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub head: String,
+    /// Whether control believes Tailnet Lock should be disabled (a disablement is pending).
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 /// One profile in a [`Response::Profiles`] reply (Go `tailscale switch --list`).

@@ -134,6 +134,8 @@ pub fn requires_write(request: &crate::localapi::Request) -> bool {
         | Request::Version
         | Request::GetPrefs
         | Request::ProfileList
+        | Request::Metrics
+        | Request::LockStatus
         | Request::FileList => false,
         // Writes: lifecycle/prefs mutations plus the Taildrop transfers. `FileCp` initiates a send
         // and `FileGet` consumes/deletes an inbound file, so both mutate and gate like `up`/`down`.
@@ -280,6 +282,14 @@ mod tests {
         assert!(
             !requires_write(&Request::ProfileList),
             "switch --list only reads the profile set — a read"
+        );
+        assert!(
+            !requires_write(&Request::Metrics),
+            "metrics only snapshots counters — a read"
+        );
+        assert!(
+            !requires_write(&Request::LockStatus),
+            "lock status only reads TKA status — a read"
         );
         assert!(
             requires_write(&Request::SwitchProfile {
