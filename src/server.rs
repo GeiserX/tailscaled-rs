@@ -454,6 +454,12 @@ async fn dispatch(
                 },
             }
         }
+        // `bugreport` (Go `tailscale bugreport`). Reads only daemon state under a brief lock (no
+        // engine round-trip); works whether or not the node is up.
+        Request::BugReport => {
+            let be = backend.lock().await;
+            be.bugreport()
+        }
         // `switch <id>` (Go `tailscale switch`). Tears down the current device + swaps the active
         // profile under the lock (the teardown is a bounded graceful shutdown, not the multi-second
         // `Device::new` handshake, so holding the lock is correct and keeps the swap atomic). Does NOT

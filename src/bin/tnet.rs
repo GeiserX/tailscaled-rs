@@ -339,6 +339,10 @@ enum Command {
         #[command(subcommand)]
         cmd: ExitNodeCmd,
     },
+    /// Print a shareable diagnostic marker for bug reports (Go `tailscale bugreport`). NOTE: this
+    /// fork uploads no logs — the marker is a LOCAL identifier (id + daemon version + state) to quote
+    /// when reporting an issue, not a server-retrievable log id.
+    Bugreport,
 }
 
 /// `tnet metrics` subcommands. Bare `tnet metrics` prints to stdout; `write <path>` writes a file.
@@ -602,6 +606,7 @@ async fn main() -> Result<()> {
             // `--ssh`/`--no-ssh` tri-state (mirrors `--tun`).
             ssh: resolve_ssh(ssh, no_ssh),
         },
+        Command::Bugreport => Request::BugReport,
         Command::Down => Request::Down,
         Command::Logout => Request::Logout,
         // `switch` (Go `tailscale switch`): --list renders a table; `remove <id>` deletes; a bare
@@ -1010,6 +1015,13 @@ async fn main() -> Result<()> {
         // `metrics`/`lock status` are handled inline above; these arms are exhaustiveness-only.
         Response::Metrics { text } => print!("{text}"),
         Response::Lock(report) => print!("{}", format_lock_status(&report, false)),
+        // `bugreport`: print the local marker + a one-line honesty note (no logs were uploaded).
+        Response::BugReport { marker } => {
+            println!("{marker}");
+            eprintln!(
+                "(local diagnostic marker — this client uploads no logs; quote it when reporting an issue)"
+            );
+        }
         Response::Error { message } => {
             eprintln!("error: {message}");
             std::process::exit(1);
