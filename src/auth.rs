@@ -133,6 +133,7 @@ pub fn requires_write(request: &crate::localapi::Request) -> bool {
         | Request::Ping { .. }
         | Request::Version
         | Request::GetPrefs
+        | Request::ProfileList
         | Request::FileList => false,
         // Writes: lifecycle/prefs mutations plus the Taildrop transfers. `FileCp` initiates a send
         // and `FileGet` consumes/deletes an inbound file, so both mutate and gate like `up`/`down`.
@@ -140,6 +141,8 @@ pub fn requires_write(request: &crate::localapi::Request) -> bool {
         | Request::Set { .. }
         | Request::Down
         | Request::Logout
+        | Request::SwitchProfile { .. }
+        | Request::DeleteProfile { .. }
         | Request::FileCp { .. }
         | Request::FileGet { .. } => true,
     }
@@ -273,6 +276,22 @@ mod tests {
         assert!(
             !requires_write(&Request::GetPrefs),
             "get only reads the persisted prefs — a read, gated like status"
+        );
+        assert!(
+            !requires_write(&Request::ProfileList),
+            "switch --list only reads the profile set — a read"
+        );
+        assert!(
+            requires_write(&Request::SwitchProfile {
+                target: "work".into()
+            }),
+            "switching profiles changes lifecycle + persisted state — a write"
+        );
+        assert!(
+            requires_write(&Request::DeleteProfile {
+                target: "work".into()
+            }),
+            "removing a profile deletes persisted state — a write"
         );
     }
 

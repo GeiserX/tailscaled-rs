@@ -191,6 +191,19 @@ enum Command {
     /// which keeps the registration for a seamless reconnect, `logout` ends it. Mirrors Go
     /// `tailscale logout`.
     Logout,
+    /// Switch between profiles (separate accounts/tailnets), or list/remove them. Mirrors Go
+    /// `tailscale switch`. Each profile keeps its own prefs + node key; switching tears down the
+    /// current connection and activates the target (run `tnet up` to connect it).
+    Switch {
+        /// List known profiles (with a `*` marking the current one) instead of switching.
+        #[arg(long)]
+        list: bool,
+        /// The profile id to switch to (omit with `--list`). Ignored when `--list` is given.
+        #[arg(value_name = "PROFILE")]
+        target: Option<String>,
+        #[command(subcommand)]
+        cmd: Option<SwitchCmd>,
+    },
     /// Print the version of this client (and, with `--daemon`, the running daemon). Mirrors Go
     /// `tailscale version`.
     Version {
@@ -288,6 +301,17 @@ enum Command {
     File {
         #[command(subcommand)]
         cmd: FileCmd,
+    },
+}
+
+/// The `tnet switch` subcommands. Mirrors Go's `tailscale switch remove`.
+#[derive(Subcommand)]
+enum SwitchCmd {
+    /// Remove a profile (delete its prefs + node key). Cannot remove the current or default profile.
+    Remove {
+        /// The profile id to remove.
+        #[arg(value_name = "PROFILE")]
+        target: String,
     },
 }
 
@@ -505,6 +529,41 @@ async fn main() -> Result<()> {
         },
         Command::Down => Request::Down,
         Command::Logout => Request::Logout,
+        // `switch` (Go `tailscale switch`): --list renders a table; `remove <id>` deletes; a bare
+        // `<target>` switches. Handled inline — `--list` renders the Profiles reply, and the three
+        // modes map to different requests.
+        Command::Switch { list, target, cmd } => {
+            // `switch remove <id>` (subcommand) takes precedence.
+            if let Some(SwitchCmd::Remove { target }) = cmd {
+                return send_ok_or_die(&socket, Request::DeleteProfile { target }).await;
+            }
+            if list {
+                match round_trip(&socket, &Request::ProfileList).await {
+                    Ok(Response::Profiles { profiles }) => {
+                        print!("{}", format_profiles(&profiles));
+                        return Ok(());
+                    }
+                    Ok(Response::Error { message }) => {
+                        eprintln!("error: {message}");
+                        std::process::exit(1);
+                    }
+                    Ok(other) => anyhow::bail!("unexpected response to profile list: {other:?}"),
+                    Err(e) => {
+                        return Err(e)
+                            .with_context(|| format!("listing profiles at {}", socket.display()));
+                    }
+                }
+            }
+            match target {
+                Some(target) => {
+                    return send_ok_or_die(&socket, Request::SwitchProfile { target }).await;
+                }
+                None => {
+                    eprintln!("usage: tnet switch <profile> | --list | remove <profile>");
+                    std::process::exit(1);
+                }
+            }
+        }
         // `version` answers from the CLI's own crate version. WITHOUT `--daemon` it never contacts
         // the daemon (Go also prints the client version with no LocalAPI call) — handle it here and
         // return. WITH `--daemon` it round-trips `Request::Version` to learn the daemon's version,
@@ -811,6 +870,8 @@ async fn main() -> Result<()> {
         // `get` is likewise handled inline above (early return); this arm is only for exhaustiveness.
         // Render the all-prefs table defensively if one ever reaches here.
         Response::Prefs(view) => print!("{}", format_get(&view, None, false).unwrap_or_default()),
+        // `switch --list` is handled inline above; this arm is exhaustiveness-only.
+        Response::Profiles { profiles } => print!("{}", format_profiles(&profiles)),
         Response::Error { message } => {
             eprintln!("error: {message}");
             std::process::exit(1);
@@ -822,6 +883,43 @@ async fn main() -> Result<()> {
 /// Print `tnet version` output (thin wrapper over [`format_version`], which is pure + unit-tested).
 fn print_version(client: &str, daemon: Option<&str>, json: bool) {
     print!("{}", format_version(client, daemon, json));
+}
+
+/// Send a write `Request` that replies `Ok`/`Error`, printing `ok: <msg>` on success or the error +
+/// exit 1 on failure. Used by the `switch`/`switch remove` inline arms (they're plain writes whose
+/// success is just an acknowledgement). Returns `Ok(())` so the caller can `return` it directly.
+async fn send_ok_or_die(socket: &std::path::Path, request: Request) -> Result<()> {
+    match round_trip(socket, &request).await {
+        Ok(Response::Ok { message }) => {
+            println!("ok: {message}");
+            Ok(())
+        }
+        Ok(Response::Error { message }) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        Ok(other) => anyhow::bail!("unexpected response: {other:?}"),
+        Err(e) => Err(e).with_context(|| format!("talking to daemon at {}", socket.display())),
+    }
+}
+
+/// Render `tnet switch --list`: one line per profile, `* ` marking the current one, then the id and
+/// (if different) the display name. Pure → unit-testable.
+fn format_profiles(profiles: &[tailscaled_rs::localapi::ProfileEntry]) -> String {
+    if profiles.is_empty() {
+        return "(no profiles)\n".to_string();
+    }
+    let mut out = String::new();
+    for p in profiles {
+        let marker = if p.current { "*" } else { " " };
+        // Show the name only when it adds information beyond the id.
+        if p.name.is_empty() || p.name == p.id {
+            out.push_str(&format!("{marker} {}\n", p.id));
+        } else {
+            out.push_str(&format!("{marker} {}  ({})\n", p.id, p.name));
+        }
+    }
+    out
 }
 
 /// The canonical `(set-flag name, value)` projection of a [`PrefsView`], in the stable order
@@ -2184,6 +2282,29 @@ mod tests {
 
         // Unknown setting → error (Go errors too).
         assert!(format_get(&view, Some("no-such-setting"), false).is_err());
+    }
+
+    #[test]
+    fn format_profiles_marks_current() {
+        use tailscaled_rs::localapi::ProfileEntry;
+        let out = format_profiles(&[
+            ProfileEntry {
+                id: "default".into(),
+                name: "default".into(),
+                current: false,
+            },
+            ProfileEntry {
+                id: "work".into(),
+                name: "Work tailnet".into(),
+                current: true,
+            },
+        ]);
+        // Current profile marked with `*`; name shown only when it differs from the id.
+        assert!(out.contains("* work  (Work tailnet)"), "{out}");
+        assert!(out.contains("  default\n"), "{out}");
+        assert!(!out.contains("* default"), "{out}");
+        // Empty → placeholder.
+        assert_eq!(format_profiles(&[]), "(no profiles)\n");
     }
 
     #[test]

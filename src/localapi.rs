@@ -123,6 +123,22 @@ pub enum Request {
     /// [`Status`](Request::Status). Distinct from the prefs embedded in a full [`Status`] report: this
     /// is the focused "just the prefs" query `tnet get` uses, with no netmap/peer round-trip.
     GetPrefs,
+    /// List the known profiles (Go `tailscale switch --list`). Replies with [`Response::Profiles`].
+    /// Read-only — gated like [`Status`](Request::Status).
+    ProfileList,
+    /// Switch the active profile (Go `tailscale switch <id>`). The daemon tears down the current
+    /// device, swaps to the target profile's prefs/key, and persists the pointer. A WRITE (it changes
+    /// node lifecycle + persisted state) — gated like `up`/`down`.
+    SwitchProfile {
+        /// The target profile id (or name; the daemon resolves either).
+        target: String,
+    },
+    /// Delete a profile (Go `tailscale switch remove`). Refuses the current/default profile. A WRITE
+    /// — gated like `up`/`down`.
+    DeleteProfile {
+        /// The profile id to remove.
+        target: String,
+    },
     /// Bring the node down (`WantRunning = false`) without logging out.
     Down,
     /// Log the node out (the analogue of Go's `tailscale logout`): deregister the node key with the
@@ -213,6 +229,11 @@ pub enum Response {
     /// The node's current preferences (reply to [`Request::GetPrefs`]) — a [`PrefsView`] projection
     /// of the persisted prefs, rendered by `tnet get`.
     Prefs(PrefsView),
+    /// The known profiles (reply to [`Request::ProfileList`]), rendered by `tnet switch --list`.
+    Profiles {
+        /// One entry per known profile (the implicit default plus any named profiles).
+        profiles: Vec<ProfileEntry>,
+    },
     /// A command succeeded.
     Ok {
         /// Human-readable detail.
@@ -363,6 +384,17 @@ pub struct PrefsView {
     pub ssh_running: bool,
     /// Whether the node uses the kernel-TUN data path (vs the userspace netstack).
     pub tun: bool,
+}
+
+/// One profile in a [`Response::Profiles`] reply (Go `tailscale switch --list`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProfileEntry {
+    /// The profile id (`"default"` for the legacy/top-level profile).
+    pub id: String,
+    /// Display name (falls back to the id when unset).
+    pub name: String,
+    /// Whether this is the currently-active profile.
+    pub current: bool,
 }
 
 /// A single peer entry in a [`StatusReport`].
