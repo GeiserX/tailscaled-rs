@@ -1109,25 +1109,47 @@ impl Backend {
                  (key wipe + intent flip) anyway"
             );
         }
-        // 2. Tear down + flip intent to logged-out.
+        // 2. Tear down the datapath.
         self.stop_device().await;
         self.bump_generation();
-        self.prefs.want_running = false;
-        self.prefs.logged_out = true;
-        self.ever_configured = true;
-        self.persist_prefs().await?;
-        // 3. Discard the persisted node key so the next `up` re-registers fresh. A missing file is
-        // not an error (the node was never registered, or already logged out).
+
+        // 3. Discard the persisted node key BEFORE flipping intent to logged-out — ordering is
+        // load-bearing for crash-safety. Both this `remove_file` and the `persist_prefs` below are
+        // separate, non-atomic disk writes; a crash (or kill) between them leaves a partial state. We
+        // choose the order whose partial state is SAFE:
+        //   - key-wipe THEN persist (this order): a crash after the wipe but before the persist
+        //     leaves NO key on disk with `logged_out` not yet set. The next `up` finds no key and
+        //     re-registers fresh — exactly the logout intent. Safe.
+        //   - persist THEN key-wipe (the reverse): a crash in between leaves `logged_out=true` but the
+        //     OLD key still on disk. A later `up` flips `logged_out=false` and `load_key_file` happily
+        //     resumes the very registration logout was meant to end — silently resurrecting the old
+        //     identity. That is the wrong direction for a logout, so we do NOT use this order.
+        // A key-wipe failure is therefore FATAL here, before any intent is persisted: if we cannot
+        // discard the key, the logout has not achieved its security goal, so we must not record it as
+        // done. The node stays as it was (device down from step 2, but prefs unchanged → a retry of
+        // `logout` cleanly re-attempts). A missing key file is success (never registered / already
+        // logged out). The control-plane deregister in step 1 already ran, so a retry just re-asserts
+        // it (idempotent).
         match tokio::fs::remove_file(&self.key_path).await {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
                 return Err(anyhow!(
-                    "logout: failed to remove node key file {}: {e}",
+                    "logout: could not discard the node key at {} ({e}); logout aborted before \
+                     recording it — remove the file or re-run `tnet logout`. Until the key is gone, \
+                     a later `up` could resume the old registration.",
                     self.key_path.display()
                 ));
             }
         }
+
+        // 4. Now that the key is gone, flip intent to logged-out and persist. `logged_out` suppresses
+        // auto-start (see `wants_running`); `ever_configured` keeps a post-logout restart reporting
+        // `NeedsLogin`/`Stopped` rather than `NoState`.
+        self.prefs.want_running = false;
+        self.prefs.logged_out = true;
+        self.ever_configured = true;
+        self.persist_prefs().await?;
         Ok(())
     }
 
@@ -1515,6 +1537,45 @@ mod tests {
             .await
             .expect("logout with no key file must succeed");
         assert!(be.prefs.logged_out);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn logout_key_wipe_failure_aborts_before_flipping_logged_out() {
+        // M3/M4 crash-safety: the key MUST be discarded BEFORE `logged_out` is persisted, so the two
+        // can never disagree (logged_out set + old key resurrectable). If the key-wipe fails, logout
+        // must return Err WITHOUT having flipped intent — so a retry cleanly re-attempts and a later
+        // `up` can't resume the old registration on a "logged out" node. We force a non-NotFound
+        // remove_file error by making `key_path` a NON-EMPTY directory (remove_file on a populated
+        // dir fails with an error that is not NotFound on both Linux and macOS).
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-logout-wipefail-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+        be.prefs.want_running = true;
+        // Make the key_path an un-removable directory (non-empty → remove_file errors, not NotFound).
+        tokio::fs::create_dir_all(&be.key_path).await.unwrap();
+        tokio::fs::write(be.key_path.join("blocker"), b"x")
+            .await
+            .unwrap();
+
+        let result = be.logout().await;
+        assert!(
+            result.is_err(),
+            "a key-wipe failure must make logout fail, not silently half-complete"
+        );
+        // The critical invariant: intent was NOT flipped, so on-disk/in-memory state stays coherent.
+        assert!(
+            !be.prefs.logged_out,
+            "logout must NOT set logged_out when it could not discard the key (else a later `up` \
+             resumes the old identity on a 'logged out' node)"
+        );
+        assert!(
+            be.prefs.want_running,
+            "logout must not flip want_running before the key is gone either"
+        );
+
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 

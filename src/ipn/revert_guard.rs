@@ -157,6 +157,121 @@ pub fn check_accidental_reverts(
 mod tests {
     use super::*;
 
+    /// **Drift tripwire (the H1 safeguard).** The accidental-revert guard, the `--reset` helper
+    /// ([`Prefs::reset_up_managed_to_default`]), and the [`Prefs`] struct itself must stay in
+    /// lockstep: every up-managed pref MUST be both reset by `--reset` and checked by the guard, or a
+    /// future `up` silently reverts it (the exact footgun the guard exists to prevent) and `--reset`
+    /// leaves it set. That lockstep was comment-only; this test makes a drift a COMPILE error.
+    ///
+    /// It exhaustively destructures `Prefs` with **no `..`**, so adding or removing any field stops
+    /// compilation here and forces the author to classify the new field below: either UP-MANAGED
+    /// (then it must be added to BOTH `reset_up_managed_to_default` AND `check_accidental_reverts`,
+    /// and to the runtime assertion in this test), or EXEMPT (lifecycle/registration — listed with a
+    /// reason). The runtime half then proves the guard actually fires on every field classified
+    /// up-managed, so you cannot satisfy the compiler by classifying a field up-managed and forgetting
+    /// the guard arm.
+    #[test]
+    fn prefs_guard_reset_lockstep_no_silent_drift() {
+        // Exhaustive destructure — NO `..`. Adding/removing a Prefs field breaks this and forces a
+        // conscious classification (see the doc above).
+        let Prefs {
+            // --- EXEMPT (not up-managed; never guarded, never reset by --reset) ---
+            want_running: _, // lifecycle — `up`/`down` own it directly, not a revertable setting.
+            logged_out: _,   // lifecycle — `up`/`logout` own it directly.
+            ephemeral: _,    // registration-time property; no `up`/`set` flag controls it.
+            taildrop_dir: _, // configured out-of-band (engine Config), not an `up` flag.
+            // --- UP-MANAGED (MUST be in reset + guard; asserted at runtime below) ---
+            control_url: _,
+            hostname: _,
+            accept_routes: _,
+            exit_node: _,
+            advertise_exit_node: _,
+            advertise_routes: _,
+            ssh_enabled: _,
+            tun_enabled: _,
+            tun_name: _,
+            tun_mtu: _,
+        } = Prefs::default();
+
+        // Runtime half: for EACH field classified up-managed above, build a node where ONLY that
+        // field is non-default and assert the guard reports it as a revert when an UNRELATED pref is
+        // mentioned (so the bare-up exemption doesn't apply). If a field is classified up-managed but
+        // its guard arm is missing, this fails. The "unrelated mention" is `want_running`-only via a
+        // sentinel `UpOptions` that mentions a *different* up-managed pref than the one under test.
+        //
+        // We drive each via a tiny table of (set-non-default closure, expected revert key). Each
+        // closure mutates exactly one up-managed field away from its default. (Aliased to dodge
+        // clippy::type_complexity on the `Vec<(&str, fn(&mut Prefs))>` literal.)
+        type Case = (&'static str, fn(&mut Prefs));
+        let cases: Vec<Case> = vec![
+            ("control_url", |p| {
+                p.control_url = Some("https://hs.example".into())
+            }),
+            ("hostname", |p| p.hostname = Some("h".into())),
+            ("accept_routes", |p| p.accept_routes = true),
+            ("exit_node", |p| p.exit_node = Some("100.64.0.9".into())),
+            ("advertise_exit_node", |p| p.advertise_exit_node = true),
+            ("advertise_routes", |p| {
+                p.advertise_routes = vec!["10.0.0.0/8".into()]
+            }),
+            ("ssh", |p| p.ssh_enabled = true),
+            ("tun", |p| p.tun_enabled = true),
+            ("tun_name", |p| p.tun_name = Some("tailscale0".into())),
+            ("tun_mtu", |p| p.tun_mtu = Some(1280)),
+        ];
+
+        for (expected_key, set_non_default) in &cases {
+            let mut prefs = Prefs {
+                want_running: true,
+                ..Prefs::default()
+            };
+            set_non_default(&mut prefs);
+
+            // (a) The guard must report this field as a revert when an UNRELATED pref is mentioned.
+            // Mention `hostname` to defeat the bare-up exemption — unless the field under test IS
+            // hostname, in which case mention `ssh` instead (any other up-managed pref works).
+            let opts = if *expected_key == "hostname" {
+                UpOptions {
+                    ssh: Some(true),
+                    ..UpOptions::default()
+                }
+            } else {
+                UpOptions {
+                    hostname: Some("other".into()),
+                    ..UpOptions::default()
+                }
+            };
+            let reverts = check_accidental_reverts(&prefs, &opts, true);
+            assert!(
+                reverts.iter().any(|r| r.key == *expected_key),
+                "guard did not report up-managed pref '{expected_key}' as a revert — its arm is \
+                 missing from check_accidental_reverts (lockstep drift)"
+            );
+
+            // (b) `--reset` must restore this field to its default (proves reset covers it too).
+            let mut reset_prefs = prefs.clone();
+            reset_prefs.reset_up_managed_to_default();
+            let d = Prefs::default();
+            match *expected_key {
+                "control_url" => assert_eq!(reset_prefs.control_url, d.control_url),
+                "hostname" => assert_eq!(reset_prefs.hostname, d.hostname),
+                "accept_routes" => assert_eq!(reset_prefs.accept_routes, d.accept_routes),
+                "exit_node" => assert_eq!(reset_prefs.exit_node, d.exit_node),
+                "advertise_exit_node" => {
+                    assert_eq!(reset_prefs.advertise_exit_node, d.advertise_exit_node)
+                }
+                "advertise_routes" => {
+                    assert_eq!(reset_prefs.advertise_routes, d.advertise_routes)
+                }
+                "ssh" => assert_eq!(reset_prefs.ssh_enabled, d.ssh_enabled),
+                "tun" => assert_eq!(reset_prefs.tun_enabled, d.tun_enabled),
+                "tun_name" => assert_eq!(reset_prefs.tun_name, d.tun_name),
+                "tun_mtu" => assert_eq!(reset_prefs.tun_mtu, d.tun_mtu),
+                other => panic!("unclassified up-managed key in test table: {other}"),
+            }
+        }
+    }
+
     /// A node that already advertises routes; the canonical "non-default prefs present" fixture.
     fn configured_prefs() -> Prefs {
         Prefs {
