@@ -1163,6 +1163,13 @@ impl Backend {
                 }
             }
         }
+        // Taildrop receive directory. `Some(dir)` enables RECEIVING (the engine builds its receive
+        // store under this path and accepts inbound `PUT /v0/put/<name>` transfers from peers);
+        // `None` leaves `config.taildrop_dir` at its default of `None`, where the engine is
+        // **fail-closed** — `taildrop_waiting_files` returns an empty list and inbound transfers are
+        // refused. Sending (`file_cp`) does NOT depend on this; only receiving does. The raw pref
+        // string maps straight to the engine's `Option<PathBuf>` (no parse can fail).
+        config.taildrop_dir = self.prefs.taildrop_dir.as_ref().map(PathBuf::from);
         Ok(config)
     }
 
@@ -1385,6 +1392,193 @@ impl Backend {
             Err(e) => crate::localapi::Response::Error {
                 message: format!("ping {ip} failed: {e:?}"),
             },
+        }
+    }
+
+    /// Send a local file to a tailnet peer via Taildrop (the `tnet file cp` / Go `tailscale file cp`
+    /// path). Streams the file over the encrypted overlay to the peer's peerAPI.
+    ///
+    /// Fail-closed on a down node (no engine) and on bad input (an unresolvable peer, an unreadable
+    /// path, or a pathless `path`), each a clear [`Response::Error`] naming the offending value.
+    ///
+    /// ## Why the daemon opens `path` (same-host assumption)
+    ///
+    /// The path is opened by the **daemon**, not the CLI — `tnet` and `tailnetd` run on the same host
+    /// as the same user (the LocalAPI write policy already requires root or the daemon's own UID; see
+    /// [`crate::auth`]), exactly as Go's `tailscale file cp` has `tailscaled` read the file. So a path
+    /// the operator can `cp` is one the daemon can open; there is no cross-host or privilege boundary
+    /// to marshal the bytes across. The send `name` peers see is the path's basename (like Go), so a
+    /// path with no final component (e.g. `/`) is rejected rather than sent under an empty name.
+    ///
+    /// Peer resolution mirrors [`whois`](Backend::whois)/[`ping`](Backend::ping): a `peer` that parses
+    /// as an [`IpAddr`](std::net::IpAddr) is looked up by tailnet IP, otherwise by MagicDNS name. The
+    /// engine derives the destination solely from the resolved peer's own node record, so a raw
+    /// address can never be targeted directly.
+    pub async fn file_cp(&self, path: &str, peer: &str) -> crate::localapi::Response {
+        let Some(dev) = self.device.as_ref() else {
+            return crate::localapi::Response::Error {
+                message: "node is not up".into(),
+            };
+        };
+        // Resolve the peer: a bare IP goes by tailnet-IP lookup, anything else by MagicDNS name —
+        // the same IP-vs-name split the other peer-addressed commands use.
+        let resolved = match peer.parse::<std::net::IpAddr>() {
+            Ok(addr) => dev.peer_by_tailnet_ip(addr).await,
+            Err(_) => dev.peer_by_name(peer).await,
+        };
+        let peer_node = match resolved {
+            Ok(Some(node)) => node,
+            Ok(None) => {
+                return crate::localapi::Response::Error {
+                    message: format!("no tailnet peer matches {peer:?}"),
+                };
+            }
+            Err(e) => {
+                return crate::localapi::Response::Error {
+                    message: format!("resolve peer {peer:?} failed: {e:?}"),
+                };
+            }
+        };
+        // Derive the send name from the path's final component (basename), like Go's `file cp`. A
+        // path with no basename (e.g. `/`) has nothing meaningful to name the transfer — reject it.
+        let Some(name) = std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+        else {
+            return crate::localapi::Response::Error {
+                message: format!("cannot derive a file name from path {path:?}"),
+            };
+        };
+        // The daemon opens the path (same-host/same-user; see the method doc). A read error here
+        // (missing/unreadable file) fails closed, naming the path.
+        let file = match tokio::fs::File::open(path).await {
+            Ok(f) => f,
+            Err(e) => {
+                return crate::localapi::Response::Error {
+                    message: format!("cannot read {path}: {e}"),
+                };
+            }
+        };
+        let content_length = match file.metadata().await {
+            Ok(m) => m.len(),
+            Err(e) => {
+                return crate::localapi::Response::Error {
+                    message: format!("cannot stat {path}: {e}"),
+                };
+            }
+        };
+        match dev.send_file(&peer_node, &name, content_length, file).await {
+            Ok(()) => crate::localapi::Response::Ok {
+                message: format!("sent {name} ({content_length} bytes) to {peer}"),
+            },
+            Err(e) => crate::localapi::Response::Error {
+                message: format!("taildrop send failed: {e:?}"),
+            },
+        }
+    }
+
+    /// List the Taildrop files waiting in this node's receive directory (the `tnet file list` / Go
+    /// `tailscale file get` no-arg path).
+    ///
+    /// Read-only. Fail-closed on a down node. Synchronous because the engine's
+    /// [`taildrop_waiting_files`](tailscale::Device::taildrop_waiting_files) is a non-blocking store
+    /// read, not an actor round-trip. When the receive directory is unset (`prefs.taildrop_dir` =
+    /// `None`), the engine returns an **empty list, not an error** — so an empty `Files` reply simply
+    /// means "receiving is off, or nothing is waiting", never a failure.
+    pub fn file_list(&self) -> crate::localapi::Response {
+        let Some(dev) = self.device.as_ref() else {
+            return crate::localapi::Response::Error {
+                message: "node is not up".into(),
+            };
+        };
+        match dev.taildrop_waiting_files() {
+            Ok(waiting) => {
+                let files = waiting
+                    .into_iter()
+                    .map(|w| crate::localapi::WaitingFileReport {
+                        name: w.name,
+                        size: w.size,
+                    })
+                    .collect();
+                crate::localapi::Response::Files { files }
+            }
+            Err(e) => crate::localapi::Response::Error {
+                message: format!("list taildrop files failed: {e:?}"),
+            },
+        }
+    }
+
+    /// Fetch a waiting Taildrop file by name, writing it to `dest` (the `tnet file get <name>` / Go
+    /// `tailscale file get <name>` path).
+    ///
+    /// Fail-closed on a down node and on a name that matches no waiting file (naming it). The engine
+    /// returns a plain [`std::fs::File`] handle for the received file; we copy it to `dest` inside
+    /// [`spawn_blocking`](tokio::task::spawn_blocking) so the synchronous [`std::io::copy`] never
+    /// stalls the async runtime's worker threads (even though a local file copy is fast).
+    ///
+    /// With `delete_after` set (the Go default), the received file is removed from the receive
+    /// directory after a successful copy. A delete failure is logged as a warning but does **not**
+    /// fail the call — the file was already retrieved to `dest`, which is the operation's success
+    /// condition; a stale leftover in the receive dir is a lesser problem than reporting a spurious
+    /// failure for a fetch that did succeed.
+    pub async fn file_get(
+        &self,
+        name: &str,
+        dest: &str,
+        delete_after: bool,
+    ) -> crate::localapi::Response {
+        let Some(dev) = self.device.as_ref() else {
+            return crate::localapi::Response::Error {
+                message: "node is not up".into(),
+            };
+        };
+        // Open the waiting file in the receive store (path-traversal-validated by the engine). A
+        // missing/invalid name fails closed, naming it.
+        let (mut src, _size) = match dev.taildrop_open_file(name) {
+            Ok(pair) => pair,
+            Err(e) => {
+                return crate::localapi::Response::Error {
+                    message: format!("no waiting file {name:?}: {e:?}"),
+                };
+            }
+        };
+        // Copy off the async runtime: `std::io::copy` over `std::fs` handles is blocking, so do it on
+        // a blocking thread rather than stall an async worker. The `dest` string is moved in.
+        let dest_owned = dest.to_string();
+        let copy_result = tokio::task::spawn_blocking(move || {
+            let mut out = std::fs::File::create(&dest_owned)?;
+            std::io::copy(&mut src, &mut out)?;
+            Ok::<(), std::io::Error>(())
+        })
+        .await;
+        match copy_result {
+            // The blocking task ran and the copy succeeded.
+            Ok(Ok(())) => {}
+            // The copy itself errored (create/write/read failure) — fail closed, naming dest.
+            Ok(Err(e)) => {
+                return crate::localapi::Response::Error {
+                    message: format!("cannot write {dest}: {e}"),
+                };
+            }
+            // The blocking task panicked or was cancelled — surface it rather than claim success.
+            Err(e) => {
+                return crate::localapi::Response::Error {
+                    message: format!("taildrop fetch task failed: {e}"),
+                };
+            }
+        }
+        // The fetch succeeded. Optionally consume the inbound file; a delete failure is non-fatal
+        // (the file is already saved to `dest`) — warn and still report success.
+        if delete_after && let Err(e) = dev.taildrop_delete_file(name) {
+            tracing::warn!(
+                file = name,
+                error = ?e,
+                "taildrop file fetched to dest but could not be deleted from the receive directory"
+            );
+        }
+        crate::localapi::Response::Ok {
+            message: format!("saved {name} to {dest}"),
         }
     }
 
@@ -2867,5 +3061,101 @@ mod tests {
             }
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    // --- Taildrop (tnet file cp / list / get) — offline, no-device + build_config mapping ----------
+    //
+    // The live transfers (send_file / open / delete against a real receive store) need a registered
+    // node + a peer, so they are NOT unit-tested here (integration territory). These pin the PURE
+    // fail-closed surface a device-less `Backend` can exercise — all three commands return the "not
+    // up" Error with no engine — plus the `build_config` mapping of the `taildrop_dir` pref into the
+    // engine `Config` (Some and None), the one piece testable offline (no `Device::new`, no network).
+
+    #[tokio::test]
+    async fn file_cp_without_device_is_not_up_error() {
+        // Sending requires an engine to resolve the peer + stream over the overlay → a device-less
+        // backend fails closed with "not up" (before any path open or peer lookup).
+        let dir = std::env::temp_dir().join(format!("tailnetd-file-cp-{}", std::process::id()));
+        let be = backend_for(&dir);
+        match be.file_cp("/etc/hostname", "100.64.0.1").await {
+            crate::localapi::Response::Error { message } => {
+                assert!(
+                    message.contains("not up"),
+                    "file cp with no device must report the node is not up, got {message:?}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_list_without_device_is_not_up_error() {
+        // Listing waiting files needs the engine's receive store → a device-less backend fails closed.
+        // `file_list` is synchronous (the engine accessor is non-blocking), so this is a plain `#[test]`.
+        let dir = std::env::temp_dir().join(format!("tailnetd-file-list-{}", std::process::id()));
+        let be = backend_for(&dir);
+        match be.file_list() {
+            crate::localapi::Response::Error { message } => {
+                assert!(
+                    message.contains("not up"),
+                    "file list with no device must report the node is not up, got {message:?}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn file_get_without_device_is_not_up_error() {
+        // Fetching a waiting file needs the engine's receive store → a device-less backend fails
+        // closed with "not up" (before opening the receive store or touching dest).
+        let dir = std::env::temp_dir().join(format!("tailnetd-file-get-{}", std::process::id()));
+        let be = backend_for(&dir);
+        match be.file_get("incoming.bin", "/tmp/out.bin", false).await {
+            crate::localapi::Response::Error { message } => {
+                assert!(
+                    message.contains("not up"),
+                    "file get with no device must report the node is not up, got {message:?}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_config_maps_taildrop_dir_some_and_none() {
+        // The receive-enable seam: a `Some(dir)` pref must flow into `Config.taildrop_dir` as the
+        // matching `PathBuf` (the engine then stands up the receive store under it), and the default
+        // `None` pref must leave `Config.taildrop_dir = None` (receiving off, engine fail-closed).
+        // `build_config` touches only the key file (created on demand); it stands up NO engine and
+        // does NO network.
+        let dir = std::env::temp_dir().join(format!("tailnetd-bc-taildrop-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+
+        // None (default prefs) → receiving off.
+        let cfg = be
+            .build_config()
+            .await
+            .expect("build_config (taildrop none)");
+        assert!(
+            cfg.taildrop_dir.is_none(),
+            "a None taildrop_dir pref must leave Config.taildrop_dir = None (receiving off)"
+        );
+
+        // Some(dir) → that exact path is the engine's receive dir.
+        be.prefs.taildrop_dir = Some("/var/lib/tailnetd/taildrop".to_string());
+        let cfg = be
+            .build_config()
+            .await
+            .expect("build_config (taildrop some)");
+        assert_eq!(
+            cfg.taildrop_dir,
+            Some(std::path::PathBuf::from("/var/lib/tailnetd/taildrop")),
+            "a Some(dir) taildrop_dir pref must map to Config.taildrop_dir = Some(PathBuf)"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

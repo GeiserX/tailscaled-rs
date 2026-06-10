@@ -190,6 +190,41 @@ enum Command {
         #[arg(long, value_name = "MS")]
         timeout: Option<u64>,
     },
+    /// Send and receive files over Taildrop (Go `tailscale file`).
+    File {
+        #[command(subcommand)]
+        cmd: FileCmd,
+    },
+}
+
+/// The `tnet file` subcommands (Taildrop). Mirrors Go's `tailscale file cp` / `file get`. Like
+/// `Command`, this deliberately does not derive `Debug` (it travels alongside `Command` through the
+/// same parse path; keeping the choice uniform avoids reintroducing a debug-print surface).
+#[derive(Subcommand)]
+enum FileCmd {
+    /// Send a local file to a tailnet peer (by IP or MagicDNS name).
+    Cp {
+        /// Local filesystem path of the file to send.
+        #[arg(value_name = "PATH")]
+        path: String,
+        /// Destination peer: a tailnet IP or MagicDNS name (e.g. `100.64.0.9` or `peer-b`).
+        #[arg(value_name = "PEER")]
+        peer: String,
+    },
+    /// List files waiting in the Taildrop inbox.
+    List,
+    /// Fetch a waiting file by name and write it locally.
+    Get {
+        /// The waiting file's base name (as shown by `tnet file list`).
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// Local destination path to write the fetched file to.
+        #[arg(value_name = "DEST")]
+        dest: String,
+        /// Delete the file from the Taildrop inbox after a successful fetch (Go's default behavior).
+        #[arg(long)]
+        delete_after: bool,
+    },
 }
 
 /// Map the `--exit-node` / `--clear-exit-node` flag pair to the wire field's double `Option`.
@@ -369,6 +404,22 @@ async fn main() -> Result<()> {
             ip,
             timeout_ms: timeout,
         },
+        // Taildrop. The nested subcommand picks which wire `Request` to send: `cp` and `get` are
+        // writes (the daemon reads/consumes a file) and reply `Ok`; `list` is read-only and replies
+        // `Files`.
+        Command::File { cmd } => match cmd {
+            FileCmd::Cp { path, peer } => Request::FileCp { path, peer },
+            FileCmd::List => Request::FileList,
+            FileCmd::Get {
+                name,
+                dest,
+                delete_after,
+            } => Request::FileGet {
+                name,
+                dest,
+                delete_after,
+            },
+        },
     };
 
     let response = round_trip(&socket, &request)
@@ -393,6 +444,10 @@ async fn main() -> Result<()> {
         }
         // Round-trip time of an overlay ping (`tnet ping`).
         Response::Ping { rtt_ms, ip } => println!("pong from {ip} in {rtt_ms:.1} ms"),
+        // Waiting Taildrop files (`tnet file list`). One line per file; an empty inbox prints a
+        // clear placeholder rather than nothing. The file name is engine/peer-supplied, so it is run
+        // through `sanitize_for_terminal` before printing (a sender could craft a hostile name).
+        Response::Files { files } => print!("{}", format_files(&files)),
         Response::Ok { message } => {
             println!("ok: {message}");
             // Interactive login: an authkey-less `up` succeeds at the daemon, but the node now needs
@@ -474,6 +529,26 @@ fn format_ip(ipv4: Option<&str>, ipv6: Option<&str>) -> String {
     }
     if out.is_empty() {
         out.push_str("(no tailnet address yet)\n");
+    }
+    out
+}
+
+/// Format the `tnet file list` output: one `"{name}  ({size} bytes)"` line per waiting file, or a
+/// placeholder when the inbox is empty (never empty output). Each file name is engine/peer-supplied,
+/// so it is passed through [`sanitize_for_terminal`] before rendering (a malicious sender could craft
+/// a name with terminal escapes). Pure (returns the string, trailing newline included) so it is
+/// unit-testable; the caller `print!`s it.
+fn format_files(files: &[tailscaled_rs::localapi::WaitingFileReport]) -> String {
+    if files.is_empty() {
+        return "(no files waiting)\n".to_string();
+    }
+    let mut out = String::new();
+    for f in files {
+        out.push_str(&format!(
+            "{}  ({} bytes)\n",
+            sanitize_for_terminal(&f.name),
+            f.size
+        ));
     }
     out
 }
@@ -979,6 +1054,123 @@ mod tests {
                 );
             }
             _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn format_files_empty_prints_placeholder() {
+        // An empty Taildrop inbox must print a clear placeholder, never empty output.
+        assert_eq!(format_files(&[]), "(no files waiting)\n");
+    }
+
+    #[test]
+    fn format_files_renders_one_line_per_file() {
+        use tailscaled_rs::localapi::{Response, WaitingFileReport};
+
+        let files = vec![
+            WaitingFileReport {
+                name: "report.pdf".to_string(),
+                size: 2048,
+            },
+            WaitingFileReport {
+                name: "notes.txt".to_string(),
+                size: 17,
+            },
+        ];
+        assert_eq!(
+            format_files(&files),
+            "report.pdf  (2048 bytes)\nnotes.txt  (17 bytes)\n"
+        );
+
+        // The formatter consumes exactly what the `Response::Files` arm feeds it (`&files`).
+        let resp = Response::Files {
+            files: vec![WaitingFileReport {
+                name: "one.bin".to_string(),
+                size: 1,
+            }],
+        };
+        match resp {
+            Response::Files { files } => assert_eq!(format_files(&files), "one.bin  (1 bytes)\n"),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn format_files_sanitizes_peer_supplied_name() {
+        use tailscaled_rs::localapi::WaitingFileReport;
+
+        // The file name arrives from the sending peer (untrusted); a hostile name must not smuggle
+        // terminal escapes through `tnet file list`. `format_files` runs it through
+        // `sanitize_for_terminal`, so the raw ESC/BEL bytes are stripped.
+        let files = vec![WaitingFileReport {
+            name: "evil\x1b[2J\x07name.txt".to_string(),
+            size: 9,
+        }];
+        let out = format_files(&files);
+        assert!(!out.contains('\x1b'), "ESC must be stripped from file name");
+        assert!(!out.contains('\x07'), "BEL must be stripped from file name");
+        // The readable parts survive (just the control bytes become the replacement char).
+        assert!(out.contains("evil") && out.contains("name.txt"));
+        assert!(out.contains("(9 bytes)"));
+    }
+
+    #[test]
+    fn command_file_subcommands_map_to_requests() {
+        // The three `tnet file` subcommands each select the right wire `Request`. Built the same way
+        // `main`'s `Command::File` arm builds them, so the dispatch mapping is covered without
+        // spawning the CLI. `cp`/`get` are writes (reply `Ok`); `list` is read-only (reply `Files`).
+        let cp = match (FileCmd::Cp {
+            path: "/tmp/a.txt".to_string(),
+            peer: "peer-b".to_string(),
+        }) {
+            FileCmd::Cp { path, peer } => Request::FileCp { path, peer },
+            _ => unreachable!(),
+        };
+        match cp {
+            Request::FileCp { path, peer } => {
+                assert_eq!(path, "/tmp/a.txt");
+                assert_eq!(peer, "peer-b");
+            }
+            other => panic!("expected Request::FileCp, got {other:?}"),
+        }
+
+        let list = match FileCmd::List {
+            FileCmd::List => Request::FileList,
+            _ => unreachable!(),
+        };
+        match list {
+            Request::FileList => {}
+            other => panic!("expected Request::FileList, got {other:?}"),
+        }
+
+        // `--delete-after` threads straight through to the wire field; omitting it sends `false`.
+        let get = match (FileCmd::Get {
+            name: "report.pdf".to_string(),
+            dest: "/tmp/out.pdf".to_string(),
+            delete_after: true,
+        }) {
+            FileCmd::Get {
+                name,
+                dest,
+                delete_after,
+            } => Request::FileGet {
+                name,
+                dest,
+                delete_after,
+            },
+            _ => unreachable!(),
+        };
+        match get {
+            Request::FileGet {
+                name,
+                dest,
+                delete_after,
+            } => {
+                assert_eq!(name, "report.pdf");
+                assert_eq!(dest, "/tmp/out.pdf");
+                assert!(delete_after, "--delete-after → true");
+            }
+            other => panic!("expected Request::FileGet, got {other:?}"),
         }
     }
 

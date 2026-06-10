@@ -125,12 +125,20 @@ pub fn requires_write(request: &crate::localapi::Request) -> bool {
     match request {
         // Reads: never gated. `ip`/`whois`/`ping` are diagnostics that mutate no state, so they are
         // classified exactly like `status`/`watch` (ping sends overlay traffic but changes nothing).
+        // `FileList` only enumerates the receive directory — a read, like `status`.
         Request::Status
         | Request::Watch
         | Request::Ip
         | Request::Whois { .. }
-        | Request::Ping { .. } => false,
-        Request::Up { .. } | Request::Set { .. } | Request::Down => true,
+        | Request::Ping { .. }
+        | Request::FileList => false,
+        // Writes: lifecycle/prefs mutations plus the Taildrop transfers. `FileCp` initiates a send
+        // and `FileGet` consumes/deletes an inbound file, so both mutate and gate like `up`/`down`.
+        Request::Up { .. }
+        | Request::Set { .. }
+        | Request::Down
+        | Request::FileCp { .. }
+        | Request::FileGet { .. } => true,
     }
 }
 
@@ -185,6 +193,21 @@ mod tests {
         }
     }
 
+    fn file_cp() -> Request {
+        Request::FileCp {
+            path: "/tmp/send.bin".into(),
+            peer: "100.64.0.2".into(),
+        }
+    }
+
+    fn file_get() -> Request {
+        Request::FileGet {
+            name: "inbound.bin".into(),
+            dest: "/tmp/inbound.bin".into(),
+            delete_after: true,
+        }
+    }
+
     #[test]
     fn root_gets_write() {
         let p = AuthPolicy::with_owner_euid(1000);
@@ -210,6 +233,16 @@ mod tests {
         assert!(requires_write(&Request::Down));
         assert!(requires_write(&up()));
         assert!(requires_write(&set()));
+    }
+
+    #[test]
+    fn taildrop_transfers_require_write() {
+        // `file cp` initiates a send and `file get` consumes/deletes an inbound file — both mutate,
+        // so they classify as writes like `up`/`down`. `file get` with no args (`FileList`) only
+        // enumerates the receive dir, so it stays a read like `status`.
+        assert!(requires_write(&file_cp()));
+        assert!(requires_write(&file_get()));
+        assert!(!requires_write(&Request::FileList));
     }
 
     #[test]
@@ -257,11 +290,16 @@ mod tests {
         assert_eq!(authorize(&Request::Down, Access::ReadOnly), Err(Denied));
         assert_eq!(authorize(&up(), Access::ReadOnly), Err(Denied));
         assert_eq!(authorize(&set(), Access::ReadOnly), Err(Denied));
+        // Taildrop transfers are writes: a read-only caller must be denied both.
+        assert_eq!(authorize(&file_cp(), Access::ReadOnly), Err(Denied));
+        assert_eq!(authorize(&file_get(), Access::ReadOnly), Err(Denied));
     }
 
     #[test]
     fn read_only_caller_may_still_read() {
         assert_eq!(authorize(&Request::Status, Access::ReadOnly), Ok(()));
+        // Listing waiting Taildrop files is a read — allowed without write.
+        assert_eq!(authorize(&Request::FileList, Access::ReadOnly), Ok(()));
     }
 
     #[test]
@@ -270,5 +308,8 @@ mod tests {
         assert_eq!(authorize(&Request::Down, Access::ReadWrite), Ok(()));
         assert_eq!(authorize(&up(), Access::ReadWrite), Ok(()));
         assert_eq!(authorize(&set(), Access::ReadWrite), Ok(()));
+        assert_eq!(authorize(&file_cp(), Access::ReadWrite), Ok(()));
+        assert_eq!(authorize(&Request::FileList, Access::ReadWrite), Ok(()));
+        assert_eq!(authorize(&file_get(), Access::ReadWrite), Ok(()));
     }
 }

@@ -521,5 +521,24 @@ async fn dispatch(
                 },
             }
         }
+        // Taildrop. Each backend method already builds the typed `Response` (including its own error
+        // responses), so we return it verbatim — no `Ok`/`Err` remap. `file_cp`/`file_get` are
+        // writes (gated above); `file_list` is a read.
+        Request::FileCp { path, peer } => {
+            let be = backend.lock().await;
+            be.file_cp(&path, &peer).await
+        }
+        Request::FileList => {
+            let be = backend.lock().await;
+            be.file_list()
+        }
+        Request::FileGet {
+            name,
+            dest,
+            delete_after,
+        } => {
+            let be = backend.lock().await;
+            be.file_get(&name, &dest, delete_after).await
+        }
     }
 }
