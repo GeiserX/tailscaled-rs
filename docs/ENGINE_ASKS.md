@@ -49,6 +49,13 @@ mtu: self.prefs.tun_mtu })` — a one-line change — and `tsd-tth` (TUN data pa
 
 ---
 
+## 2. ✅ FIXED in engine v0.8.0 — `Device::new_with_secret(Option<SecretString>)`
+
+> **DONE.** The engine shipped `Device::new_with_secret(config, auth_key: Option<secrecy::SecretString>)`
+> in **v0.8.0** (`bf07c25`, engine takes a `secrecy = "0.10"` dep matching the daemon's). The daemon's
+> `build_device` now passes the `SecretString` straight in — no more `.expose_secret().to_string()`
+> last-inch plaintext copy in daemon memory. Tracks `tsd-tnv` (now closeable). The original ask:
+
 ## 2. Accept `Option<secrecy::SecretString>` for the pre-auth key on `Device::new`
 
 **Why:** The daemon holds the pre-auth key as `secrecy::SecretString` end-to-end (zeroized on drop,
