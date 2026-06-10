@@ -415,6 +415,11 @@ async fn dispatch(
             let be = backend.lock().await;
             Response::Status(be.status().await)
         }
+        // `version` (Go `tailscale version --daemon` reads `Status.Version`). The daemon's version is
+        // its own compile-time crate version — a constant, needing no backend lock or engine.
+        Request::Version => Response::Version {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        },
         // `logout` (Go `tailscale logout`): deregisters the node key with control, tears down, and
         // discards the on-disk key so the next `up` re-registers fresh — distinct from `down` (which
         // resumes). Backend::logout holds the lock for the whole sequence: the control-plane
