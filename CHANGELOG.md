@@ -25,6 +25,19 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.8.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.7.0...v0.8.0) (2026-06-10)
+
+
+### Features
+
+* **up:** Go-faithful REPLACE semantics via accidental-revert guard + --reset ([#32](https://github.com/GeiserX/tailscaled-rs/issues/32)) ([aa2b3b4](https://github.com/GeiserX/tailscaled-rs/commit/aa2b3b46b103a6600b01d1fbff111d3adbc4e93a))
+
+
+### Bug Fixes
+
+* **localapi:** run read/file engine calls off-lock + harden Taildrop paths ([#28](https://github.com/GeiserX/tailscaled-rs/issues/28)) ([10432e8](https://github.com/GeiserX/tailscaled-rs/commit/10432e81f9121f84af45ef80b3889e78ada8c1aa))
+* **nits:** consistent clear-flag naming, tun resolver helper, comment cleanup ([#31](https://github.com/GeiserX/tailscaled-rs/issues/31)) ([63fa6c7](https://github.com/GeiserX/tailscaled-rs/commit/63fa6c7edc2470db68fd333f004c3564b0da1f71))
+
 ## [0.7.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.6.0...v0.7.0) (2026-06-10)
 
 
