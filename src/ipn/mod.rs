@@ -1454,6 +1454,19 @@ impl Backend {
         diag::ip_report(dev).await
     }
 
+    /// Snapshot client metrics in Prometheus text (the `tnet metrics` path). Thin `pub` shim over
+    /// [`diag::metrics`] so the `server.rs` dispatch call site is uniform with the other diagnostics.
+    pub fn metrics(dev: &tailscale::Device) -> crate::localapi::Response {
+        diag::metrics(dev)
+    }
+
+    /// Report Tailnet Lock status (the `tnet lock status` path). Thin `pub` shim over
+    /// [`diag::lock_status`]. See it for the `tka_status` → [`LockReport`](crate::localapi::LockReport)
+    /// mapping.
+    pub async fn lock_status(dev: &tailscale::Device) -> crate::localapi::Response {
+        diag::lock_status(dev).await
+    }
+
     /// Resolve a tailnet IP to the peer that owns it (the `tnet whois` / Go `tailscale whois` path).
     /// A thin `pub` shim over [`diag::whois`], kept on `Backend` so the `server.rs` dispatch call
     /// site (`Backend::whois(&dev, ..)`) is unchanged. See [`diag::whois`] for the full mapping.

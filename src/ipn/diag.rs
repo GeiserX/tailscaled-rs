@@ -33,6 +33,38 @@ pub(super) async fn ip_report(dev: &tailscale::Device) -> Response {
     Response::Ip { ipv4, ipv6 }
 }
 
+/// Snapshot the node's client metrics in Prometheus text format (the `tnet metrics` / Go `tailscale
+/// metrics` path). Read-only: `Device::metrics` renders the process-global clientmetric registry to
+/// text. Takes the engine handle so the LocalAPI server runs it off-lock (the device-absent branch
+/// lives at the caller). Infallible at the engine layer — always a `Response::Metrics`.
+pub(super) fn metrics(dev: &tailscale::Device) -> Response {
+    Response::Metrics {
+        text: dev.metrics(),
+    }
+}
+
+/// Report Tailnet Lock (TKA) status (the `tnet lock status` / Go `tailscale lock status` read-only
+/// path). Maps the engine's `Device::tka_status()` → `Option<TkaStatus>` to the wire
+/// [`LockReport`](crate::localapi::LockReport): `Some` → enabled with control's authority head +
+/// disablement flag; `None` → not enabled (no TKA info for this node). An engine error surfaces as a
+/// clear [`Response::Error`]. Read-only — enforcement stays engine-side; this only reports status.
+pub(super) async fn lock_status(dev: &tailscale::Device) -> Response {
+    match dev.tka_status().await {
+        Ok(Some(s)) => Response::Lock(crate::localapi::LockReport {
+            enabled: true,
+            head: s.head,
+            disabled: s.disabled,
+        }),
+        Ok(None) => Response::Lock(crate::localapi::LockReport {
+            enabled: false,
+            ..Default::default()
+        }),
+        Err(e) => Response::Error {
+            message: format!("tailnet lock status query failed: {e}"),
+        },
+    }
+}
+
 /// Resolve a tailnet IP to the peer that owns it (the `tnet whois` / Go `tailscale whois` path).
 ///
 /// Read-only: a netmap lookup that mutates nothing. Takes the engine handle as `dev` so the

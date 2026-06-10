@@ -433,6 +433,27 @@ async fn dispatch(
                 profiles: be.list_profiles().await,
             }
         }
+        // `metrics` (Go `tailscale metrics`). Off-lock device call (clone handle, drop lock) like the
+        // other diagnostics; needs the node up (metrics come from the live engine).
+        Request::Metrics => {
+            let dev = { backend.lock().await.device_handle() };
+            match dev {
+                Some(dev) => Backend::metrics(&dev),
+                None => Response::Error {
+                    message: "node is not up".into(),
+                },
+            }
+        }
+        // `lock status` (Go `tailscale lock status`, read-only). Off-lock device call.
+        Request::LockStatus => {
+            let dev = { backend.lock().await.device_handle() };
+            match dev {
+                Some(dev) => Backend::lock_status(&dev).await,
+                None => Response::Error {
+                    message: "node is not up".into(),
+                },
+            }
+        }
         // `switch <id>` (Go `tailscale switch`). Tears down the current device + swaps the active
         // profile under the lock (the teardown is a bounded graceful shutdown, not the multi-second
         // `Device::new` handshake, so holding the lock is correct and keeps the swap atomic). Does NOT
