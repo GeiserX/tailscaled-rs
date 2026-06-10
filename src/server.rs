@@ -426,6 +426,21 @@ async fn dispatch(
                 },
             }
         }
+        // Read-only diagnostics (`ip`/`whois`/`ping`): each is fast under the lock, so take it
+        // directly like `status` and return the backend's `Response` verbatim — the backend methods
+        // already build the typed reply (including their own error responses).
+        Request::Ip => {
+            let be = backend.lock().await;
+            be.ip_report().await
+        }
+        Request::Whois { ip } => {
+            let be = backend.lock().await;
+            be.whois(&ip).await
+        }
+        Request::Ping { ip, timeout_ms } => {
+            let be = backend.lock().await;
+            be.ping(&ip, timeout_ms).await
+        }
         // `up` performs a multi-second control-plane handshake (`Device::new`). Doing that under the
         // backend lock would head-of-line block every concurrent `status`. `ipn::drive_up` runs the
         // three-phase split — lock briefly for begin_up → DROP the lock for the slow handshake →

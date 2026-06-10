@@ -115,14 +115,21 @@ fn current_euid() -> u32 {
 
 /// Whether a given LocalAPI command requires write permission.
 ///
-/// Centralized so the server has one authority on which verbs mutate. Read commands (`status`)
-/// return false; lifecycle/prefs commands (`up`, `set`, `down`) return true. The match is exhaustive
-/// over [`crate::localapi::Request`], so a new command forces an explicit authorization decision at
+/// Centralized so the server has one authority on which verbs mutate. Read commands
+/// (`status`/`watch`, plus the read-only diagnostics `ip`/`whois`/`ping`) return false;
+/// lifecycle/prefs commands (`up`, `set`, `down`) return true. The match is exhaustive over
+/// [`crate::localapi::Request`], so a new command forces an explicit authorization decision at
 /// compile time.
 pub fn requires_write(request: &crate::localapi::Request) -> bool {
     use crate::localapi::Request;
     match request {
-        Request::Status | Request::Watch => false,
+        // Reads: never gated. `ip`/`whois`/`ping` are diagnostics that mutate no state, so they are
+        // classified exactly like `status`/`watch` (ping sends overlay traffic but changes nothing).
+        Request::Status
+        | Request::Watch
+        | Request::Ip
+        | Request::Whois { .. }
+        | Request::Ping { .. } => false,
         Request::Up { .. } | Request::Set { .. } | Request::Down => true,
     }
 }
@@ -203,6 +210,43 @@ mod tests {
         assert!(requires_write(&Request::Down));
         assert!(requires_write(&up()));
         assert!(requires_write(&set()));
+    }
+
+    #[test]
+    fn read_only_diagnostics_do_not_require_write() {
+        // `ip`/`whois`/`ping` mutate no state — they must classify as reads, like `status`/`watch`.
+        assert!(!requires_write(&Request::Ip));
+        assert!(!requires_write(&Request::Whois {
+            ip: "100.64.0.1".into()
+        }));
+        assert!(!requires_write(&Request::Ping {
+            ip: "100.64.0.1".into(),
+            timeout_ms: None,
+        }));
+    }
+
+    #[test]
+    fn read_only_caller_may_run_diagnostics() {
+        assert_eq!(authorize(&Request::Ip, Access::ReadOnly), Ok(()));
+        assert_eq!(
+            authorize(
+                &Request::Whois {
+                    ip: "100.64.0.1".into()
+                },
+                Access::ReadOnly
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            authorize(
+                &Request::Ping {
+                    ip: "100.64.0.1".into(),
+                    timeout_ms: Some(5000),
+                },
+                Access::ReadOnly
+            ),
+            Ok(())
+        );
     }
 
     // The security-critical deny path, tested directly (no socket, no second uid needed). These
