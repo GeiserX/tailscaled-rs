@@ -158,8 +158,36 @@ pub struct StatusReport {
     /// dwelling the full auth-URL poll window implying that login will help.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// A snapshot of the node's persisted configuration intent (its [`Prefs`](crate::prefs::Prefs)),
+    /// so `tnet status` can show the full posture — exit node, advertised routes/exit, accept-routes,
+    /// SSH, TUN — the way Go `tailscale status` reflects the active prefs. Read straight from the
+    /// daemon's prefs (no engine round-trip), so it is always present. `#[serde(default)]` keeps the
+    /// wire backward-compatible with clients that predate this field.
+    #[serde(default)]
+    pub prefs: PrefsView,
     /// Known peers in the netmap.
     pub peers: Vec<PeerReport>,
+}
+
+/// A read-only projection of the node's persisted [`Prefs`](crate::prefs::Prefs) for `status`
+/// output. Mirrors the policy-relevant fields an operator wants to see at a glance (the analogue of
+/// the prefs Go's `tailscale status` surfaces), without exposing the full prefs struct or any secret.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PrefsView {
+    /// The configured exit-node selector (IP or MagicDNS name), or `None` if no exit node is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_node: Option<String>,
+    /// Whether this node advertises itself as an exit node.
+    pub advertise_exit_node: bool,
+    /// Subnet routes (CIDRs) this node advertises to the tailnet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub advertise_routes: Vec<String>,
+    /// Whether this node accepts subnet routes advertised by peers.
+    pub accept_routes: bool,
+    /// Whether the Tailscale SSH server is enabled on this node.
+    pub ssh: bool,
+    /// Whether the node uses the kernel-TUN data path (vs the userspace netstack).
+    pub tun: bool,
 }
 
 /// A single peer entry in a [`StatusReport`].
@@ -269,6 +297,7 @@ mod tests {
             self_name: Some("node-a".to_string()),
             auth_url: None,
             error: None,
+            prefs: Default::default(),
             peers: vec![PeerReport {
                 name: "peer-b".to_string(),
                 ipv4: "100.64.0.2".to_string(),
@@ -309,6 +338,7 @@ mod tests {
             self_name: None,
             auth_url: Some("https://login.example.com/a/abc123".to_string()),
             error: None,
+            prefs: Default::default(),
             peers: vec![],
         };
         let json = serde_json::to_string(&report).unwrap();
@@ -340,6 +370,7 @@ mod tests {
             self_name: None,
             auth_url: None,
             error: Some("authentication rejected by control: invalid key".to_string()),
+            prefs: Default::default(),
             peers: vec![],
         };
         let json = serde_json::to_string(&report).unwrap();
@@ -365,6 +396,7 @@ mod tests {
             self_name: Some("node-a".to_string()),
             auth_url: None,
             error: None,
+            prefs: Default::default(),
             peers: vec![],
         };
         let json = serde_json::to_string(&report).unwrap();
@@ -387,6 +419,7 @@ mod tests {
             self_name: None,
             auth_url: Some("https://login.example.com/a/abc123".to_string()),
             error: None,
+            prefs: Default::default(),
             peers: vec![],
         };
         let pending_json = serde_json::to_string(&pending).unwrap();
@@ -407,6 +440,7 @@ mod tests {
             self_name: None,
             auth_url: None,
             error: Some("authentication rejected by control: invalid key".to_string()),
+            prefs: Default::default(),
             peers: vec![],
         };
         let failed_json = serde_json::to_string(&failed).unwrap();

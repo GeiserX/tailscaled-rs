@@ -277,3 +277,25 @@ change **live** on a running `Device` (no rebuild) vs those that require reconst
 daemon only knows `set_exit_node` is live; if `set_serve_config` / `listen_funnel` / others are also
 live, the daemon's `set` can widen its seamless fast-path instead of triggering a brief reconnect.
 No new engine code needed if the live setters already exist — just the contract.
+
+## 10. `block_incoming` / shields-up Config field (engine bead — to file)
+
+Go `tailscale up --shields-up` / `set --shields-up` drops all inbound connections from peers (the
+node still reaches out). The daemon wants to surface this pref (`tsd-iqq.4`), but the engine `Config`
+has no `block_incoming` / `shields_up` field and no packetfilter posture knob for it.
+
+**Ask:** add `Config.block_incoming: bool` (default false) that, when set, makes the engine refuse
+inbound peer connections (the local packetfilter / accept path drops them) while leaving outbound
+intact — mirroring Go's `ShieldsUp` (`ipn.Prefs.ShieldsUp` → `filter` "shields up" mode). Daemon
+then wires a `shields_up` pref + `--shields-up`/`--no-shields-up` like the other tri-state flags.
+
+## 11. Surface the pushed DNS config on `Device` (engine bead — to file)
+
+For `tnet dns status` (Go `tailscale dns status`) the daemon needs to read the control-pushed DNS
+config. The engine has `ts_control::DnsConfig { magic_dns, search_domains, resolvers }` internally,
+but the `Device` facade exposes no accessor (no `Device::dns_config()` and `Status` carries no DNS).
+
+**Ask:** add `Device::dns_config(&self) -> Option<ts_control::DnsConfig>` (or fold a DNS summary into
+`Status`) so the daemon can render MagicDNS state + search domains + resolvers read-only. Pure
+read-surface; no behavior change. Unblocks the DNS half of `tsd-ioh` (the `accept-dns` *pref* is
+already wirable via the existing Config; this is only the status/diagnostics read).

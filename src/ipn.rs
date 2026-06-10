@@ -1263,6 +1263,16 @@ impl Backend {
             self_name,
             auth_url,
             error,
+            // Project the persisted prefs into the status view so `tnet status` shows the full
+            // configured posture (read straight from prefs — no engine round-trip).
+            prefs: crate::localapi::PrefsView {
+                exit_node: self.prefs.exit_node.clone(),
+                advertise_exit_node: self.prefs.advertise_exit_node,
+                advertise_routes: self.prefs.advertise_routes.clone(),
+                accept_routes: self.prefs.accept_routes,
+                ssh: self.prefs.ssh_enabled,
+                tun: self.prefs.tun_enabled,
+            },
             peers,
         }
     }
