@@ -706,27 +706,57 @@ fn print_version(client: &str, daemon: Option<&str>, json: bool) {
     print!("{}", format_version(client, daemon, json));
 }
 
-/// The canonical `(set-flag name, value-string)` projection of a [`PrefsView`], in the stable order
+/// The canonical `(set-flag name, value)` projection of a [`PrefsView`], in the stable order
 /// `tnet get` displays. The names match the `tnet set`/`tnet up` flags (Go keys its `get` output by
-/// the same set-flag names), and the value strings are what you'd pass back to `set` (a bare CIDR
-/// list for routes, `true`/`false` for bools, the selector for exit-node, empty for an unset
-/// optional). One source so the table, the `--json` map, and single-setting lookup all agree.
-fn get_settings(view: &tailscaled_rs::localapi::PrefsView) -> Vec<(&'static str, String)> {
+/// the same set-flag names). Values are kept **typed** (`serde_json::Value`) rather than pre-
+/// stringified so the `--json` map emits Go-faithful **bare booleans** (`true`, not `"true"`) and so
+/// JSON escaping is handled by serde (a future setting carrying a quote/backslash can't corrupt the
+/// output). The plain-text table/single-value path derives display strings from these via
+/// [`get_value_display`]. One source so the table, the `--json` map, and single-setting lookup agree.
+fn get_settings(
+    view: &tailscaled_rs::localapi::PrefsView,
+) -> Vec<(&'static str, serde_json::Value)> {
+    use serde_json::Value;
     vec![
-        ("exit-node", view.exit_node.clone().unwrap_or_default()),
-        ("advertise-exit-node", view.advertise_exit_node.to_string()),
-        ("advertise-routes", view.advertise_routes.join(",")),
-        ("accept-routes", view.accept_routes.to_string()),
-        ("ssh", view.ssh.to_string()),
-        ("tun", view.tun.to_string()),
+        // An unset exit-node is JSON null (Go uses the empty/zero value); the table renders it empty.
+        (
+            "exit-node",
+            view.exit_node
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        ),
+        ("advertise-exit-node", Value::Bool(view.advertise_exit_node)),
+        // Routes are a comma-joined string (the `--advertise-routes` arg form), matching how you'd
+        // re-pass them to `set`.
+        (
+            "advertise-routes",
+            Value::String(view.advertise_routes.join(",")),
+        ),
+        ("accept-routes", Value::Bool(view.accept_routes)),
+        ("ssh", Value::Bool(view.ssh)),
+        ("tun", Value::Bool(view.tun)),
     ]
+}
+
+/// Plain-text display of a setting's [`serde_json::Value`] for the `get` table / single-value output:
+/// a bare string for strings (no surrounding quotes), `true`/`false` for bools, empty for null, and
+/// the compact JSON form for anything else. Mirrors the value you'd hand back to `tnet set`.
+fn get_value_display(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
 }
 
 /// Render `tnet get` output from a [`PrefsView`] (Go `tailscale get`). `setting` selects a single
 /// setting by its set-flag name (`None` or `"all"` = every setting); `json` selects the flattened
-/// `{ "name": "value" }` map form (matching Go `get --json`, which is a name→value map, NOT a raw
-/// prefs-struct dump). Default (no json) is a `NAME  VALUE` table; a single named setting prints just
-/// its raw value. Returns `Err` for an unknown setting name (Go errors too). Pure → unit-testable.
+/// `{ "name": value }` map form (matching Go `get --json`, a name→value map — NOT a raw prefs-struct
+/// dump — with **typed** values: bare booleans, not quoted). Default (no json) is a `NAME  VALUE`
+/// table; a single named setting prints just its value. Returns `Err` for an unknown setting name (Go
+/// errors too). Pure → unit-testable.
 fn format_get(
     view: &tailscaled_rs::localapi::PrefsView,
     setting: Option<&str>,
@@ -742,29 +772,31 @@ fn format_get(
             anyhow::anyhow!("unknown setting {name:?} (try `tnet get` to list all)")
         })?;
         return Ok(if json {
-            format!("\"{value}\"\n")
+            // The single value as JSON (bare bool / quoted string / null), serde-encoded so escaping
+            // is correct.
+            format!("{}\n", serde_json::to_string(value)?)
         } else {
-            format!("{value}\n")
+            format!("{}\n", get_value_display(value))
         });
     }
 
     // All settings.
     if json {
-        // Flattened name→value map, stable order, hand-built so the shape is dependency-free and
-        // matches Go's name-keyed map (string values, like the set-flag args).
-        let mut out = String::from("{\n");
-        for (i, (name, value)) in settings.iter().enumerate() {
-            let comma = if i + 1 < settings.len() { "," } else { "" };
-            out.push_str(&format!("  \"{name}\": \"{value}\"{comma}\n"));
-        }
-        out.push_str("}\n");
-        Ok(out)
+        // Flattened name→value map, built via serde (a `Map` preserves insertion order with the
+        // `preserve_order` feature; even without it the keys are stable and the values are correct).
+        // Typed values → Go-faithful bare booleans + correct escaping, fixing both the shape and the
+        // hand-built-JSON escaping hazard.
+        let map: serde_json::Map<String, serde_json::Value> = settings
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value))
+            .collect();
+        Ok(format!("{}\n", serde_json::to_string_pretty(&map)?))
     } else {
         // NAME  VALUE table, column-aligned to the widest name.
         let width = settings.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
         let mut out = String::new();
         for (name, value) in &settings {
-            out.push_str(&format!("{name:<width$}  {value}\n"));
+            out.push_str(&format!("{name:<width$}  {}\n", get_value_display(value)));
         }
         Ok(out)
     }
@@ -777,11 +809,19 @@ fn format_get(
 /// only when queried. Pure (returns the string, trailing newline included) so it is unit-testable.
 fn format_version(client: &str, daemon: Option<&str>, json: bool) -> String {
     if json {
-        // Hand-built so the shape is stable and dependency-free; `daemon` omitted unless queried.
-        match daemon {
-            Some(d) => format!("{{\n  \"client\": \"{client}\",\n  \"daemon\": \"{d}\"\n}}\n"),
-            None => format!("{{\n  \"client\": \"{client}\"\n}}\n"),
+        // Built via serde so escaping is correct (version strings are tame today, but this removes
+        // the latent hand-built-JSON hazard and keeps the two `--json` renderers consistent).
+        // `daemon` key present only when queried.
+        let mut map = serde_json::Map::new();
+        map.insert("client".to_string(), client.into());
+        if let Some(d) = daemon {
+            map.insert("daemon".to_string(), d.into());
         }
+        // serde_json serialization of a Map<String, Value> cannot fail; fall back defensively.
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&map).unwrap_or_else(|_| "{}".to_string())
+        )
     } else {
         match daemon {
             // Go prints `Client:`/`Daemon:` when `--daemon` is set.
@@ -1840,16 +1880,31 @@ mod tests {
         // 6 settings → 6 lines.
         assert_eq!(table.lines().count(), 6, "{table}");
 
-        // --json: flattened name→value map (string values), every setting keyed by set-flag name.
+        // --json: flattened name→value map keyed by set-flag name, with GO-FAITHFUL TYPED values —
+        // booleans are bare JSON `true`/`false` (NOT quoted strings), strings are strings. Parse it
+        // and assert on the typed values (more robust than string-matching, and proves the shape).
         let j = format_get(&view, None, true).unwrap();
-        assert!(j.contains("\"accept-routes\": \"true\""), "{j}");
-        assert!(j.contains("\"exit-node\": \"100.64.0.9\""), "{j}");
-        assert!(
-            j.trim_start().starts_with('{') && j.trim_end().ends_with('}'),
+        let parsed: serde_json::Value =
+            serde_json::from_str(&j).expect("get --json must be valid JSON");
+        assert_eq!(
+            parsed["accept-routes"],
+            serde_json::json!(true),
+            "bare bool: {j}"
+        );
+        assert_eq!(parsed["ssh"], serde_json::json!(true), "{j}");
+        assert_eq!(
+            parsed["advertise-exit-node"],
+            serde_json::json!(false),
+            "{j}"
+        );
+        assert_eq!(parsed["exit-node"], serde_json::json!("100.64.0.9"), "{j}");
+        assert_eq!(
+            parsed["advertise-routes"],
+            serde_json::json!("10.0.0.0/8,192.168.1.0/24"),
             "{j}"
         );
 
-        // Single named setting → just its value.
+        // Single named setting → just its value (plain).
         assert_eq!(
             format_get(&view, Some("accept-routes"), false).unwrap(),
             "true\n"
@@ -1858,8 +1913,12 @@ mod tests {
             format_get(&view, Some("advertise-routes"), false).unwrap(),
             "10.0.0.0/8,192.168.1.0/24\n"
         );
-        // Single setting --json → quoted value.
-        assert_eq!(format_get(&view, Some("ssh"), true).unwrap(), "\"true\"\n");
+        // Single setting --json → the typed JSON value (bare bool for a boolean setting).
+        assert_eq!(format_get(&view, Some("ssh"), true).unwrap(), "true\n");
+        assert_eq!(
+            format_get(&view, Some("exit-node"), true).unwrap(),
+            "\"100.64.0.9\"\n"
+        );
 
         // "all" behaves like None (all settings).
         assert_eq!(format_get(&view, Some("all"), false).unwrap(), table);
