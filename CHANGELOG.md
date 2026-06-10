@@ -25,6 +25,15 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.6.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.5.0...v0.6.0) (2026-06-10)
+
+
+### Features
+
+* **diag:** tnet ip / whois / ping diagnostics (tsd-iqq.2 part 1) ([#23](https://github.com/GeiserX/tailscaled-rs/issues/23)) ([9903696](https://github.com/GeiserX/tailscaled-rs/commit/9903696be97de6f7ef623530c38620b6952728e5))
+* **file:** Taildrop send/receive (tsd-qw8) ([#24](https://github.com/GeiserX/tailscaled-rs/issues/24)) ([016e072](https://github.com/GeiserX/tailscaled-rs/commit/016e0728cb800a2610d735f99316c3d45404c2ec))
+* **status:** surface configured posture in status (tsd-iqq.4 part 1) ([#21](https://github.com/GeiserX/tailscaled-rs/issues/21)) ([34ca3a5](https://github.com/GeiserX/tailscaled-rs/commit/34ca3a55cc238d011aa6efc6b4997d73a2520a6b))
+
 ## [0.5.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.4.0...v0.5.0) (2026-06-09)
 
 
