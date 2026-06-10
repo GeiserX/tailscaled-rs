@@ -1501,6 +1501,28 @@ impl Backend {
         diag::metrics(dev)
     }
 
+    /// Build a LOCAL diagnostic marker (the `tnet bugreport` path). Unlike Go's `bugreport`, which
+    /// uploads logs to logtail and returns the server-side log id, this fork has no log-upload
+    /// backend — the marker is a purely local identifier the operator can quote when reporting an
+    /// issue. It carries a `BUG-` prefix, a coarse Unix-seconds stamp (rough ordering/uniqueness),
+    /// the daemon version, the active profile, and the `want_running` intent. Reads only `self` (no
+    /// engine round-trip), so it works whether or not the node is up.
+    pub fn bugreport(&self) -> crate::localapi::Response {
+        // SystemTime is the real std clock; a coarse seconds stamp makes the marker roughly unique +
+        // orderable without adding a uuid dependency.
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let marker = format!(
+            "BUG-{secs}-v{}-profile:{}-want_running:{}",
+            env!("CARGO_PKG_VERSION"),
+            self.current_profile,
+            self.prefs.want_running,
+        );
+        crate::localapi::Response::BugReport { marker }
+    }
+
     /// Report Tailnet Lock status (the `tnet lock status` path). Thin `pub` shim over
     /// [`diag::lock_status`]. See it for the `tka_status` → [`LockReport`](crate::localapi::LockReport)
     /// mapping.

@@ -136,6 +136,7 @@ pub fn requires_write(request: &crate::localapi::Request) -> bool {
         | Request::ProfileList
         | Request::Metrics
         | Request::LockStatus
+        | Request::BugReport
         | Request::FileList => false,
         // Writes: lifecycle/prefs mutations plus the Taildrop transfers. `FileCp` initiates a send
         // and `FileGet` consumes/deletes an inbound file, so both mutate and gate like `up`/`down`.
@@ -292,6 +293,10 @@ mod tests {
         assert!(
             !requires_write(&Request::LockStatus),
             "lock status only reads TKA status — a read"
+        );
+        assert!(
+            !requires_write(&Request::BugReport),
+            "bugreport only reads daemon state into a marker — a read"
         );
         assert!(
             requires_write(&Request::SwitchProfile {

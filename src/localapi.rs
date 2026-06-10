@@ -141,6 +141,11 @@ pub enum Request {
     /// Report Tailnet Lock (TKA) status (Go `tailscale lock status`, read-only subset). Replies with
     /// [`Response::Lock`]. Read-only — gated like [`Status`](Request::Status).
     LockStatus,
+    /// Produce a shareable diagnostic marker (Go `tailscale bugreport`). Replies with
+    /// [`Response::BugReport`]. Read-only. NOTE: Go uploads logs to logtail and returns the log id;
+    /// this fork has no log-upload backend, so the marker is a LOCAL diagnostic identifier only (it is
+    /// not a server-retrievable log id — see the daemon's `bugreport` builder + the CLI note).
+    BugReport,
     /// Switch the active profile (Go `tailscale switch <id>`). The daemon tears down the current
     /// device, swaps to the target profile's prefs/key, and persists the pointer. A WRITE (it changes
     /// node lifecycle + persisted state) — gated like `up`/`down`.
@@ -257,6 +262,12 @@ pub enum Response {
     },
     /// Tailnet Lock (TKA) status (reply to [`Request::LockStatus`]), rendered by `tnet lock status`.
     Lock(LockReport),
+    /// A local diagnostic marker (reply to [`Request::BugReport`]), printed by `tnet bugreport`.
+    BugReport {
+        /// The marker string (a local identifier + daemon version + node state). NOT a server-side
+        /// log id — this fork uploads nothing.
+        marker: String,
+    },
     /// A command succeeded.
     Ok {
         /// Human-readable detail.
