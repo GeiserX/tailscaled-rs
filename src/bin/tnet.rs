@@ -222,6 +222,21 @@ enum Command {
         #[arg(long)]
         watch: bool,
     },
+    /// Block until the node is connected (state `Running` with a tailnet IP), then exit 0. Mirrors
+    /// Go `tailscale wait` — handy in scripts as `tnet wait && start-my-service`.
+    Wait {
+        /// How long to wait, in seconds, before giving up (omitted / `0` = wait forever). On
+        /// timeout, exits non-zero.
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<u64>,
+    },
+    /// Show the machine + user identity of THIS node (Go `tailscale whoami`): equivalent to
+    /// `tnet whois` against the node's own tailnet IP.
+    Whoami {
+        /// Output as JSON (the whois record for this node).
+        #[arg(long)]
+        json: bool,
+    },
     /// Show this node's tailnet IP addresses.
     Ip,
     /// Show which tailnet node owns an IP address.
@@ -503,6 +518,69 @@ async fn main() -> Result<()> {
                 }
             }
             return Ok(());
+        }
+        // `wait` (Go `tailscale wait`): poll until the node is Running with a tailnet IP, honoring an
+        // optional timeout. Handled inline (it loops + has its own exit-code contract), not a
+        // one-shot request.
+        Command::Wait { timeout } => {
+            return wait_for_running(&socket, timeout).await.with_context(|| {
+                format!("waiting for the node to come up at {}", socket.display())
+            });
+        }
+        // `whoami` (Go `tailscale whoami`): resolve this node's own identity — Status to learn the
+        // self tailnet IP, then Whois on that IP. Handled inline because it chains two requests and
+        // its `--json` shape is the whois record. Reuses the same `format_whois` renderer as `whois`.
+        Command::Whoami { json } => {
+            let status = match round_trip(&socket, &Request::Status).await {
+                Ok(Response::Status(s)) => s,
+                Ok(other) => anyhow::bail!("unexpected response to status request: {other:?}"),
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("querying status at {}", socket.display()));
+                }
+            };
+            let Some(self_ip) = status.self_ipv4.clone() else {
+                // No tailnet IP yet → not up (Go errors here too, citing the backend state).
+                eprintln!(
+                    "no current tailnet IP address (state: {}); is the node up?",
+                    status.state
+                );
+                std::process::exit(1);
+            };
+            match round_trip(
+                &socket,
+                &Request::Whois {
+                    ip: self_ip.clone(),
+                },
+            )
+            .await
+            {
+                Ok(Response::Whois(w)) => {
+                    if json {
+                        // The whois record as JSON (Go `whoami --json` emits the WhoIsResponse).
+                        match serde_json::to_string_pretty(&w) {
+                            Ok(s) => println!("{s}"),
+                            Err(e) => {
+                                eprintln!("error: serializing whois: {e}");
+                                std::process::exit(1);
+                            }
+                        }
+                    } else {
+                        print!("{}", format_whois(&w, &self_ip));
+                    }
+                    return Ok(());
+                }
+                Ok(Response::Error { message }) => {
+                    eprintln!("error: {message}");
+                    std::process::exit(1);
+                }
+                Ok(other) => anyhow::bail!("unexpected response to whois request: {other:?}"),
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("resolving self identity at {}", socket.display())
+                    });
+                }
+            }
         }
         // `status --watch` is a long-lived stream, not a one-shot round-trip — handle it here and
         // return. Plain `status` falls through to the one-shot path below.
@@ -992,6 +1070,47 @@ async fn watch_status(socket: &std::path::Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Interval between `status` polls while [`wait_for_running`] waits for the node to come up.
+const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Block until the node reaches `Running` with a tailnet IP, then return `Ok(())` (exit 0). Mirrors
+/// Go `tailscale wait`'s exit-code contract: success on Running, a non-zero exit (here an `Err`) on
+/// timeout. `timeout_secs` of `None`/`Some(0)` waits forever; otherwise it bounds the wait.
+///
+/// We poll `Request::Status` rather than stream the IPN bus: it reuses the existing one-shot
+/// round-trip, and the daemon's derived `state` is authoritative. Go additionally waits for the
+/// kernel TUN interface to actually carry the IP — but this daemon defaults to the userspace
+/// netstack (no OS interface to observe), which is exactly the case Go *also* short-circuits ("if
+/// `!st.TUN` return immediately"), so polling to `Running` + a tailnet IP is the faithful condition.
+async fn wait_for_running(socket: &std::path::Path, timeout_secs: Option<u64>) -> Result<()> {
+    // `None` or `0` → wait forever (Go's "0 means wait indefinitely").
+    let deadline = match timeout_secs {
+        Some(secs) if secs > 0 => {
+            Some(tokio::time::Instant::now() + std::time::Duration::from_secs(secs))
+        }
+        _ => None,
+    };
+    loop {
+        // A failed round-trip (daemon not up yet / socket missing) is NOT fatal — keep waiting, like
+        // Go's backoff loop while tailscaled comes up. Only the timeout ends the wait unsuccessfully.
+        if let Ok(Response::Status(s)) = round_trip(socket, &Request::Status).await
+            && s.state == "Running"
+            && s.self_ipv4.is_some()
+        {
+            return Ok(());
+        }
+        if let Some(deadline) = deadline
+            && tokio::time::Instant::now() >= deadline
+        {
+            anyhow::bail!(
+                "timed out waiting for the node to reach Running (waited {}s)",
+                timeout_secs.unwrap_or(0)
+            );
+        }
+        tokio::time::sleep(WAIT_POLL_INTERVAL).await;
+    }
 }
 
 /// Maximum time to wait, after an interactive `up`, for the control auth URL to appear. Measured
@@ -1747,6 +1866,30 @@ mod tests {
 
         // Unknown setting → error (Go errors too).
         assert!(format_get(&view, Some("no-such-setting"), false).is_err());
+    }
+
+    #[tokio::test]
+    async fn wait_times_out_against_a_dead_socket() {
+        // With a short timeout and no daemon listening, `wait` must give up and return Err (→ the
+        // CLI's non-zero exit), not hang forever. A non-existent socket path makes every poll's
+        // round-trip fail (which `wait` tolerates), so only the timeout ends the loop.
+        let dead = std::path::Path::new("/tmp/tnet-wait-nope-does-not-exist.sock");
+        let start = tokio::time::Instant::now();
+        let r = wait_for_running(dead, Some(1)).await;
+        assert!(
+            r.is_err(),
+            "wait against a dead socket must time out to Err"
+        );
+        assert!(
+            r.unwrap_err().to_string().contains("timed out"),
+            "the error should say it timed out"
+        );
+        // It should give up promptly after ~1s, not run away.
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "wait should honor the ~1s timeout, took {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]
