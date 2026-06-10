@@ -121,6 +121,30 @@ pub enum Request {
         #[serde(default)]
         timeout_ms: Option<u64>,
     },
+    /// Send a local file to a peer via Taildrop (Go `tailscale file cp`). The daemon opens `path`
+    /// itself (tnet + tailnetd are same-host/same-user), resolves `peer` against the netmap, and
+    /// streams it over the encrypted overlay to the peer's peerAPI. A WRITE (it initiates a transfer)
+    /// — gated like `up`/`down`.
+    FileCp {
+        /// Local filesystem path of the file to send (read by the daemon).
+        path: String,
+        /// Destination peer: a tailnet IP or MagicDNS name.
+        peer: String,
+    },
+    /// List Taildrop files waiting in this node's receive directory (Go `tailscale file get` with no
+    /// args). Read-only.
+    FileList,
+    /// Fetch a waiting Taildrop file by name, writing it to `dest` (Go `tailscale file get <name>`).
+    /// A WRITE (it consumes/deletes the inbound file after copying) — gated like `up`/`down`.
+    FileGet {
+        /// The waiting file's base name (from [`FileList`](Request::FileList)).
+        name: String,
+        /// Local destination path the daemon writes the file to.
+        dest: String,
+        /// Delete the file from the receive directory after a successful fetch (Go default).
+        #[serde(default)]
+        delete_after: bool,
+    },
 }
 
 /// The daemon's reply to a [`Request`].
@@ -147,6 +171,11 @@ pub enum Response {
         rtt_ms: f64,
         /// The pinged tailnet IP (echoed for the CLI).
         ip: String,
+    },
+    /// The waiting Taildrop files (reply to [`Request::FileList`]).
+    Files {
+        /// Files in the receive directory, each `(name, size_bytes)`.
+        files: Vec<WaitingFileReport>,
     },
     /// A command succeeded.
     Ok {
@@ -179,6 +208,16 @@ pub struct WhoisReport {
     /// The node's control-granted capabilities (capability name → args).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+}
+
+/// A single waiting Taildrop file, returned by [`Request::FileList`]. Mirrors the engine's
+/// `WaitingFile` (Go `apitype.WaitingFile`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WaitingFileReport {
+    /// The file's base name.
+    pub name: String,
+    /// The file's size in bytes.
+    pub size: u64,
 }
 
 /// A snapshot of daemon + netmap state.

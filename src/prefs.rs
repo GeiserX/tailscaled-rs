@@ -60,6 +60,11 @@ pub struct Prefs {
     /// policy-mapped local user); the daemon fails loudly otherwise. Default `false` — SSH is a
     /// remote-shell surface, opt-in at both build and runtime.
     pub ssh_enabled: bool,
+    /// Directory where inbound Taildrop files are received (Go `tailscale file`). `None` = Taildrop
+    /// receiving is off (the engine refuses inbound transfers, fail-closed). When set, it maps to the
+    /// engine's `Config.taildrop_dir`; peers can then send files to this node and `tnet file
+    /// list`/`get` surface them. Sending (`tnet file cp`) does not require this — only receiving does.
+    pub taildrop_dir: Option<String>,
     /// Use a real kernel TUN interface for the node's data path instead of the userspace netstack.
     ///
     /// `false` (default) = the engine's in-process smoltcp netstack: unprivileged, app reaches the
@@ -89,6 +94,7 @@ impl Default for Prefs {
             advertise_exit_node: false,
             advertise_routes: Vec::new(),
             ssh_enabled: false,
+            taildrop_dir: None,
             tun_enabled: false,
             tun_name: None,
             tun_mtu: None,
