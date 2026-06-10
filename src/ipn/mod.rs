@@ -1224,6 +1224,11 @@ impl Backend {
                                 name: p.display_name,
                                 ipv4: p.ipv4.to_string(),
                                 is_exit_node: p.is_exit_node,
+                                // The engine's StableNodeId → the Go `status --json` Peer-map key
+                                // (see PeerReport::stable_id for the keying-deviation note).
+                                stable_id: p.stable_id.0.clone(),
+                                // Engine-reported liveness (Option<bool>) → Go `PeerStatus.Online`.
+                                online: p.online,
                             })
                             .collect();
                         (ip, name, peers)
