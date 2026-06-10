@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.9.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.8.0...v0.9.0) (2026-06-10)
+
+
+### Features
+
+* **logout:** tnet logout — deregister + discard key (Go parity) ([#33](https://github.com/GeiserX/tailscaled-rs/issues/33)) ([0d5170d](https://github.com/GeiserX/tailscaled-rs/commit/0d5170d1df9e0575af17c7a4e524a11869907fa4))
+
 ## [0.8.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.7.0...v0.8.0) (2026-06-10)
 
 
