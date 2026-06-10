@@ -173,6 +173,23 @@ enum Command {
         #[arg(long)]
         watch: bool,
     },
+    /// Show this node's tailnet IP addresses.
+    Ip,
+    /// Show which tailnet node owns an IP address.
+    Whois {
+        /// The tailnet IP to resolve to its owning node.
+        #[arg(value_name = "IP")]
+        ip: String,
+    },
+    /// Ping a tailnet peer over the overlay and report the round-trip time.
+    Ping {
+        /// The tailnet IP of the peer to ping.
+        #[arg(value_name = "IP")]
+        ip: String,
+        /// Per-attempt timeout in milliseconds (omit for a sensible default).
+        #[arg(long, value_name = "MS")]
+        timeout: Option<u64>,
+    },
 }
 
 /// Map the `--exit-node` / `--clear-exit-node` flag pair to the wire field's double `Option`.
@@ -344,6 +361,14 @@ async fn main() -> Result<()> {
             }
             Request::Status
         }
+        Command::Ip => Request::Ip,
+        Command::Whois { ip } => Request::Whois { ip },
+        // `--timeout` (ms) maps straight to the wire's `timeout_ms`; omitting it sends `None`, which
+        // the daemon reads as "use a sensible default".
+        Command::Ping { ip, timeout } => Request::Ping {
+            ip,
+            timeout_ms: timeout,
+        },
     };
 
     let response = round_trip(&socket, &request)
@@ -352,6 +377,22 @@ async fn main() -> Result<()> {
 
     match response {
         Response::Status(s) => print_status(&s),
+        // This node's own tailnet addresses (`tnet ip`), one per line; a node with no address yet
+        // (no netmap received) prints a clear placeholder rather than nothing.
+        Response::Ip { ipv4, ipv6 } => print!("{}", format_ip(ipv4.as_deref(), ipv6.as_deref())),
+        // The owner of a tailnet IP (`tnet whois`). The node name is control-supplied text, so it is
+        // run through `sanitize_for_terminal` inside the formatter before printing. The queried IP
+        // (needed for the not-found line) is read back from the still-owned `request`.
+        Response::Whois(w) => {
+            let queried_ip = match &request {
+                Request::Whois { ip } => ip.as_str(),
+                // The daemon only sends Whois in reply to a Whois request; fall back gracefully.
+                _ => "",
+            };
+            print!("{}", format_whois(&w, queried_ip));
+        }
+        // Round-trip time of an overlay ping (`tnet ping`).
+        Response::Ping { rtt_ms, ip } => println!("pong from {ip} in {rtt_ms:.1} ms"),
         Response::Ok { message } => {
             println!("ok: {message}");
             // Interactive login: an authkey-less `up` succeeds at the daemon, but the node now needs
@@ -416,6 +457,56 @@ fn sanitize_for_terminal(s: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Format the `tnet ip` output: this node's tailnet addresses, one per line (IPv4 then IPv6), or a
+/// placeholder when the node has no address yet (no netmap received). Pure (returns the string,
+/// including its trailing newline) so the formatting is unit-testable; the caller `print!`s it.
+fn format_ip(ipv4: Option<&str>, ipv6: Option<&str>) -> String {
+    let mut out = String::new();
+    if let Some(v4) = ipv4 {
+        out.push_str(v4);
+        out.push('\n');
+    }
+    if let Some(v6) = ipv6 {
+        out.push_str(v6);
+        out.push('\n');
+    }
+    if out.is_empty() {
+        out.push_str("(no tailnet address yet)\n");
+    }
+    out
+}
+
+/// Format the `tnet whois` output for a [`WhoisReport`]. If the IP matched no node, a single
+/// "no tailnet node owns <ip>" line (the caller passes the queried IP). Otherwise: the owning node's
+/// name, its IPv4, the owning user (when control retained it), and any control-granted capabilities,
+/// each on its own line. The node name is control-supplied, so it is passed through
+/// [`sanitize_for_terminal`] before rendering. Pure (returns the string, trailing newline included)
+/// so it is unit-testable; the caller `print!`s it.
+fn format_whois(w: &tailscaled_rs::localapi::WhoisReport, ip: &str) -> String {
+    if !w.found {
+        return format!("no tailnet node owns {ip}\n");
+    }
+    let mut out = String::new();
+    if let Some(name) = w.node_name.as_deref() {
+        out.push_str(&format!("node:         {}\n", sanitize_for_terminal(name)));
+    }
+    if let Some(v4) = w.node_ipv4.as_deref() {
+        out.push_str(&format!("ipv4:         {v4}\n"));
+    }
+    if let Some(user) = w.user.as_deref() {
+        // `user` originates from control too; sanitize it before printing.
+        out.push_str(&format!("user:         {}\n", sanitize_for_terminal(user)));
+    }
+    if !w.capabilities.is_empty() {
+        out.push_str("capabilities:\n");
+        for cap in &w.capabilities {
+            // Capability names come from control; sanitize each before printing.
+            out.push_str(&format!("  - {}\n", sanitize_for_terminal(cap)));
+        }
+    }
+    out
 }
 
 /// Render a [`StatusReport`] to stdout (the shared one-shot + watch formatter).
@@ -521,8 +612,10 @@ async fn watch_status(socket: &std::path::Path) -> Result<()> {
                 eprintln!("error: {message}");
                 std::process::exit(1);
             }
-            // The watch stream only carries Status frames; an Ok is unexpected but harmless.
-            Response::Ok { message } => println!("ok: {message}"),
+            // The watch stream only carries Status frames; any other reply (an `Ok`, or one of the
+            // diagnostic Ip/Whois/Ping replies) is unexpected on this connection but harmless — note
+            // it and keep streaming.
+            other => eprintln!("warning: unexpected reply on status stream: {other:?}"),
         }
     }
     Ok(())
@@ -650,7 +743,7 @@ async fn round_trip(socket: &std::path::Path, request: &Request) -> Result<Respo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tailscaled_rs::localapi::StatusReport;
+    use tailscaled_rs::localapi::{StatusReport, WhoisReport};
 
     /// Build a minimal `StatusReport` in the given state with no auth_url/error, no peers.
     fn report(state: &str) -> StatusReport {
@@ -856,6 +949,112 @@ mod tests {
             Some(vec!["172.16.0.0/12".to_string()]),
             "an explicit list wins over the clear flag"
         );
+    }
+
+    #[test]
+    fn format_ip_renders_addresses_and_placeholder() {
+        use tailscaled_rs::localapi::Response;
+
+        // Both addresses → IPv4 then IPv6, one per line.
+        assert_eq!(
+            format_ip(Some("100.70.22.12"), Some("fd7a:115c:a1e0::1")),
+            "100.70.22.12\nfd7a:115c:a1e0::1\n"
+        );
+        // IPv4 only (the common case — this fork is IPv4-first).
+        assert_eq!(format_ip(Some("100.70.22.12"), None), "100.70.22.12\n");
+        // No address yet (no netmap received) → a clear placeholder, never empty output.
+        assert_eq!(format_ip(None, None), "(no tailnet address yet)\n");
+
+        // The formatter consumes exactly what the `Response::Ip` arm feeds it (`as_deref()` of the
+        // wire's `Option<String>` fields), so a populated wire reply renders as above.
+        let resp = Response::Ip {
+            ipv4: Some("100.70.22.12".to_string()),
+            ipv6: None,
+        };
+        match resp {
+            Response::Ip { ipv4, ipv6 } => {
+                assert_eq!(
+                    format_ip(ipv4.as_deref(), ipv6.as_deref()),
+                    "100.70.22.12\n"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn format_whois_not_found_names_the_ip() {
+        let w = WhoisReport {
+            found: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            format_whois(&w, "100.64.0.9"),
+            "no tailnet node owns 100.64.0.9\n"
+        );
+    }
+
+    #[test]
+    fn format_whois_renders_node_user_and_capabilities() {
+        let w = WhoisReport {
+            found: true,
+            node_name: Some("peer-b.example.ts.net".to_string()),
+            node_ipv4: Some("100.64.0.2".to_string()),
+            user: Some("alice@example.com".to_string()),
+            capabilities: vec![
+                "https://tailscale.com/cap/is-admin".to_string(),
+                "funnel".to_string(),
+            ],
+        };
+        let out = format_whois(&w, "100.64.0.2");
+        assert!(out.contains("peer-b.example.ts.net"), "node name present");
+        assert!(out.contains("100.64.0.2"), "node ipv4 present");
+        assert!(out.contains("alice@example.com"), "user present when Some");
+        assert!(
+            out.contains("https://tailscale.com/cap/is-admin") && out.contains("funnel"),
+            "every capability present"
+        );
+    }
+
+    #[test]
+    fn format_whois_omits_absent_optional_fields() {
+        // `user` is `None` in this fork by default and capabilities can be empty; neither should
+        // emit a stray line. Only the fields that are present render.
+        let w = WhoisReport {
+            found: true,
+            node_name: Some("peer-b".to_string()),
+            node_ipv4: Some("100.64.0.2".to_string()),
+            user: None,
+            capabilities: vec![],
+        };
+        let out = format_whois(&w, "100.64.0.2");
+        assert!(out.contains("peer-b"));
+        assert!(out.contains("100.64.0.2"));
+        assert!(!out.contains("user:"), "no user line when user is None");
+        assert!(
+            !out.contains("capabilities:"),
+            "no capabilities header when the set is empty"
+        );
+    }
+
+    #[test]
+    fn format_whois_sanitizes_control_supplied_node_name() {
+        // The node name comes from the control server (semi-trusted); a malicious one must not be
+        // able to smuggle terminal escapes through `tnet whois`. `format_whois` runs it through
+        // `sanitize_for_terminal`, so the raw ESC/BEL bytes are stripped.
+        let w = WhoisReport {
+            found: true,
+            node_name: Some("evil\x1b[2J\x07name".to_string()),
+            node_ipv4: Some("100.64.0.2".to_string()),
+            user: None,
+            capabilities: vec![],
+        };
+        let out = format_whois(&w, "100.64.0.2");
+        assert!(!out.contains('\x1b'), "ESC must be stripped from node name");
+        assert!(!out.contains('\x07'), "BEL must be stripped from node name");
+        // The readable parts survive (just the control bytes become the replacement char).
+        assert!(out.contains("evil"));
+        assert!(out.contains("name"));
     }
 
     #[test]

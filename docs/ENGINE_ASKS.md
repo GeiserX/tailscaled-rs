@@ -299,3 +299,15 @@ but the `Device` facade exposes no accessor (no `Device::dns_config()` and `Stat
 `Status`) so the daemon can render MagicDNS state + search domains + resolvers read-only. Pure
 read-surface; no behavior change. Unblocks the DNS half of `tsd-ioh` (the `accept-dns` *pref* is
 already wirable via the existing Config; this is only the status/diagnostics read).
+
+## 12. Surface a netcheck / net-report on `Device` (engine bead — to file)
+
+For `tnet netcheck` (Go `tailscale netcheck`) the daemon needs the node's network conditions — DERP
+latencies, preferred DERP region, NAT/port-mapping detection (UPnP/PMP/PCP), UDP/IPv4/IPv6
+reachability. The engine runs netcheck internally (DERP latency measurement is in the runtime), but
+the `Device` facade exposes no accessor.
+
+**Ask:** add `Device::netcheck(&self) -> Result<NetcheckReport, Error>` (or expose the last
+net-report) summarizing DERP region latencies + preferred region + NAT/mapping flags, so the daemon
+can render it read-only. `tnet ip`/`whois`/`ping` already shipped (engine had those accessors);
+`netcheck` is the one diagnostic still missing an engine read-surface. Mirrors tsnet's netcheck.

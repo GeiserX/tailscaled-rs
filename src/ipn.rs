@@ -1277,6 +1277,117 @@ impl Backend {
         }
     }
 
+    /// Report this node's own tailnet addresses (the `tnet ip` / Go `tailscale ip` path).
+    ///
+    /// Read-only: queries the engine's cheap address accessors and never mutates prefs or bumps the
+    /// [`generation`](Backend::generation). Fail-closed — `ip` only makes sense once the node is up,
+    /// so with no device this returns a clear [`Response::Error`] rather than an empty address pair
+    /// (which a caller could mistake for "up but unaddressed").
+    ///
+    /// Each family is best-effort: [`ipv4_addr`](tailscale::Device::ipv4_addr) /
+    /// [`ipv6_addr`](tailscale::Device::ipv6_addr) `Err` before the netmap assigns the address (and
+    /// IPv6 errs permanently in this v4-only fork), so we map `Err → None` and `Ok → Some(addr)`
+    /// rather than fail the whole call — a node mid-convergence (or v4-only) reports the addresses it
+    /// does have and `None` for the rest.
+    pub async fn ip_report(&self) -> crate::localapi::Response {
+        let Some(dev) = self.device.as_ref() else {
+            return crate::localapi::Response::Error {
+                message: "node is not up".into(),
+            };
+        };
+        // Each family independently: an unassigned (or, for v6, disabled) address errs — that is a
+        // normal "not yet / not in this fork" signal, so it yields `None`, not a failed call.
+        let ipv4 = dev.ipv4_addr().await.ok().map(|a| a.to_string());
+        let ipv6 = dev.ipv6_addr().await.ok().map(|a| a.to_string());
+        crate::localapi::Response::Ip { ipv4, ipv6 }
+    }
+
+    /// Resolve a tailnet IP to the peer that owns it (the `tnet whois` / Go `tailscale whois` path).
+    ///
+    /// Read-only: a netmap lookup that mutates nothing. Fail-closed on bad input (an unparseable
+    /// `ip`, naming the offending value) and on a down node (no engine to query). The owning node's
+    /// display name + IPv4 are extracted via [`tailscale::StatusNode::from_node`] — the SAME mapping
+    /// [`status`](Backend::status) uses to render peers (`fqdn`-or-`hostname` name +
+    /// `tailnet_address.ipv4`), so the two diagnostic surfaces can never drift in how they name a node.
+    ///
+    /// Maps the engine outcome to the wire [`WhoisReport`](crate::localapi::WhoisReport):
+    /// - `Ok(Some(w))` → `found: true` with the node name/IPv4, the owner `user` (always `None` in
+    ///   this fork — the domain node model drops the login), and just the capability *names* (the
+    ///   `(cap, args)` args are dropped — too verbose for a whois summary).
+    /// - `Ok(None)` → `found: false` (the IP matched no known tailnet node), all fields defaulted.
+    /// - `Err(e)` → a clear [`Response::Error`] carrying the engine error.
+    pub async fn whois(&self, ip: &str) -> crate::localapi::Response {
+        // Parse first so a bad IP fails the same way whether or not the node is up — naming the value.
+        let Ok(addr) = ip.parse::<std::net::IpAddr>() else {
+            return crate::localapi::Response::Error {
+                message: format!("invalid IP {ip:?}"),
+            };
+        };
+        let Some(dev) = self.device.as_ref() else {
+            return crate::localapi::Response::Error {
+                message: "node is not up".into(),
+            };
+        };
+        // whois resolves by IP only (the engine ignores the port), so a 0 port is fine.
+        let sock = std::net::SocketAddr::new(addr, 0);
+        match dev.whois(sock).await {
+            Ok(Some(w)) => {
+                // Reuse `StatusNode::from_node` — the exact name+ipv4 derivation `status` renders
+                // peers with — so whois and status agree on a node's identity by construction.
+                let node = tailscale::StatusNode::from_node(&w.node);
+                crate::localapi::Response::Whois(crate::localapi::WhoisReport {
+                    found: true,
+                    node_name: Some(node.display_name),
+                    node_ipv4: Some(node.ipv4.to_string()),
+                    user: w.user,
+                    // Keep just the capability names for the summary; drop the verbose args.
+                    capabilities: w.capabilities.into_iter().map(|(cap, _args)| cap).collect(),
+                })
+            }
+            // No tailnet node owns that IP — a clean negative, not an error.
+            Ok(None) => crate::localapi::Response::Whois(crate::localapi::WhoisReport {
+                found: false,
+                ..Default::default()
+            }),
+            Err(e) => crate::localapi::Response::Error {
+                message: format!("whois failed: {e:?}"),
+            },
+        }
+    }
+
+    /// Ping a tailnet peer over the overlay and report the round-trip time (the `tnet ping` / Go
+    /// `tailscale ping` path).
+    ///
+    /// Read-only in the prefs/lifecycle sense: it sends overlay echo traffic but mutates no state and
+    /// never bumps the [`generation`](Backend::generation). Fail-closed on a bad `ip` (naming the
+    /// value) and on a down node. The per-attempt timeout defaults to 5s when `timeout_ms` is `None`.
+    ///
+    /// `Ok(rtt)` → [`Response::Ping`] with the RTT in milliseconds (and the IP echoed for the CLI);
+    /// `Err(e)` → a clear [`Response::Error`] (e.g. an unreachable peer, an IPv6 destination in this
+    /// v4-only fork, or TUN mode where there is no application netstack to ping from).
+    pub async fn ping(&self, ip: &str, timeout_ms: Option<u64>) -> crate::localapi::Response {
+        let Ok(dst) = ip.parse::<std::net::IpAddr>() else {
+            return crate::localapi::Response::Error {
+                message: format!("invalid IP {ip:?}"),
+            };
+        };
+        let Some(dev) = self.device.as_ref() else {
+            return crate::localapi::Response::Error {
+                message: "node is not up".into(),
+            };
+        };
+        let timeout = Duration::from_millis(timeout_ms.unwrap_or(5000));
+        match dev.ping(dst, timeout).await {
+            Ok(rtt) => crate::localapi::Response::Ping {
+                rtt_ms: rtt.as_secs_f64() * 1000.0,
+                ip: ip.to_string(),
+            },
+            Err(e) => crate::localapi::Response::Error {
+                message: format!("ping {ip} failed: {e:?}"),
+            },
+        }
+    }
+
     /// Derive the reported state from device presence, netmap arrival, and prefs.
     ///
     /// The decision is delegated to the pure [`derive_state_from`] helper so it can be unit-tested
@@ -2663,5 +2774,98 @@ mod tests {
         }
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    // --- read-only diagnostics (ip / whois / ping) — offline, no-device + bad-input paths --------
+    //
+    // The live engine calls (a real address/whois/ping) need a registered node, so they are NOT
+    // unit-tested here (the live drive covers them). These pin the PURE fail-closed surface a
+    // device-less `Backend` can exercise: with no engine, all three return the "not up" Error; and
+    // whois/ping reject an unparseable IP, naming the offending value — both BEFORE any engine call.
+
+    #[tokio::test]
+    async fn ip_report_without_device_is_not_up_error() {
+        // `ip` only makes sense when up → a device-less backend returns a clear "not up" Error
+        // (deliberately not an empty `Ip` pair, which could read as "up but unaddressed").
+        let dir = std::env::temp_dir().join(format!("tailnetd-diag-ip-{}", std::process::id()));
+        let be = backend_for(&dir);
+        match be.ip_report().await {
+            crate::localapi::Response::Error { message } => {
+                assert!(
+                    message.contains("not up"),
+                    "ip with no device must report the node is not up, got {message:?}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn whois_without_device_is_not_up_error() {
+        // A well-formed IP but no engine to resolve against → "not up" Error (the parse succeeds, so
+        // this exercises the device-absence arm specifically, not the bad-input arm).
+        let dir = std::env::temp_dir().join(format!("tailnetd-diag-whois-{}", std::process::id()));
+        let be = backend_for(&dir);
+        match be.whois("100.64.0.1").await {
+            crate::localapi::Response::Error { message } => {
+                assert!(
+                    message.contains("not up"),
+                    "whois with no device must report the node is not up, got {message:?}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn whois_bad_ip_is_error_naming_input() {
+        // A malformed IP fails closed BEFORE any engine call, and the error names the offending
+        // value so the CLI can echo what the operator mistyped.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-diag-whois-bad-{}", std::process::id()));
+        let be = backend_for(&dir);
+        match be.whois("not-an-ip").await {
+            crate::localapi::Response::Error { message } => {
+                assert!(
+                    message.contains("not-an-ip"),
+                    "a bad whois IP must be an Error naming the input, got {message:?}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ping_without_device_is_not_up_error() {
+        // A well-formed IP but no engine → "not up" Error (device-absence arm, parse succeeds).
+        let dir = std::env::temp_dir().join(format!("tailnetd-diag-ping-{}", std::process::id()));
+        let be = backend_for(&dir);
+        match be.ping("100.64.0.1", None).await {
+            crate::localapi::Response::Error { message } => {
+                assert!(
+                    message.contains("not up"),
+                    "ping with no device must report the node is not up, got {message:?}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ping_bad_ip_is_error_naming_input() {
+        // A malformed IP fails closed BEFORE any engine call (and before the timeout default
+        // matters), naming the offending value.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-diag-ping-bad-{}", std::process::id()));
+        let be = backend_for(&dir);
+        match be.ping("999.999.999.999", Some(1000)).await {
+            crate::localapi::Response::Error { message } => {
+                assert!(
+                    message.contains("999.999.999.999"),
+                    "a bad ping IP must be an Error naming the input, got {message:?}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
     }
 }

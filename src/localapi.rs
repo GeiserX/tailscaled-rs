@@ -104,6 +104,23 @@ pub enum Request {
     },
     /// Bring the node down (`WantRunning = false`) without logging out.
     Down,
+    /// Report this node's own tailnet addresses (Go `tailscale ip`). Read-only — gated like
+    /// [`Status`](Request::Status).
+    Ip,
+    /// Resolve a tailnet IP to the peer that owns it (Go `tailscale whois`). Read-only.
+    Whois {
+        /// The tailnet IP to resolve.
+        ip: String,
+    },
+    /// Ping a peer over the tailnet overlay and report the round-trip time (Go `tailscale ping`).
+    /// Read-only (it sends overlay traffic but changes no state) — gated like [`Status`](Request::Status).
+    Ping {
+        /// The tailnet IP to ping.
+        ip: String,
+        /// Per-attempt timeout in milliseconds (`None` → a sensible default).
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    },
 }
 
 /// The daemon's reply to a [`Request`].
@@ -112,6 +129,25 @@ pub enum Request {
 pub enum Response {
     /// A status snapshot.
     Status(StatusReport),
+    /// This node's own tailnet addresses (reply to [`Request::Ip`]).
+    Ip {
+        /// Tailnet IPv4, if assigned.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ipv4: Option<String>,
+        /// Tailnet IPv6, if assigned.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ipv6: Option<String>,
+    },
+    /// The result of a [`Request::Whois`]: the owning peer's identity, or `found: false` if the IP
+    /// matched no known tailnet node.
+    Whois(WhoisReport),
+    /// The result of a [`Request::Ping`]: the measured round-trip time.
+    Ping {
+        /// Round-trip time in milliseconds.
+        rtt_ms: f64,
+        /// The pinged tailnet IP (echoed for the CLI).
+        ip: String,
+    },
     /// A command succeeded.
     Ok {
         /// Human-readable detail.
@@ -122,6 +158,27 @@ pub enum Response {
         /// Human-readable detail.
         message: String,
     },
+}
+
+/// The identity behind a tailnet IP, returned by [`Request::Whois`]. The Rust analogue of tsnet's
+/// `WhoIsResponse` (subset). `user` is always `None` in this fork (the domain node model does not
+/// retain the owner login — see the engine `WhoIs` docs).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WhoisReport {
+    /// Whether the IP resolved to a known tailnet node.
+    pub found: bool,
+    /// The owning node's display name (FQDN if known, else hostname).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_name: Option<String>,
+    /// The owning node's tailnet IPv4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_ipv4: Option<String>,
+    /// The owning user's login/email, if control retained it (always `None` in this fork).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// The node's control-granted capabilities (capability name → args).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
 }
 
 /// A snapshot of daemon + netmap state.
