@@ -866,6 +866,11 @@ async fn main() -> Result<()> {
                         return Err(e).with_context(|| format!("pinging at {}", socket.display()));
                     }
                 }
+                // Pace at ~1 ping/second like Go `tailscale ping`, so `-c N` is a steady stream
+                // rather than a burst. Skip the wait after the final attempt.
+                if seq < n {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
             }
             // Only print a summary for a multi-ping run (a single ping's one line is self-explanatory).
             if n > 1 {

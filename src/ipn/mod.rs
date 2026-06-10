@@ -92,18 +92,40 @@ use state::{derive_state_from, state_from_device};
 /// teardown latency so a wedged engine can't hang the daemon (or an orphaned, superseded `up`).
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Validate `--advertise-tags` values: each must be a `tag:<name>` with a non-empty name (Go rejects
-/// bare names too — a tag is always `tag:`-prefixed). Returns the first offender for a clear error.
-/// Pure so it can guard both `begin_up` and `begin_set` before any pref is mutated/persisted.
+/// Validate `--advertise-tags` values byte-for-byte against Go's `tailcfg.CheckTag` (which `up`/`set`
+/// apply via `Hostinfo.CheckRequestTags`): each must be `tag:<name>` where `<name>` is non-empty,
+/// **starts with an ASCII letter**, and contains only `[A-Za-z0-9-]`. Matching Go's gate exactly
+/// matters because the engine does NOT re-validate — it ships `requested_tags` straight to control —
+/// so this is the *only* client-side check; a too-lax gate lets a malformed tag reach control and be
+/// rejected there with a confusing error instead of failing locally with a precise one. Returns the
+/// first offender. Pure so it can guard both `begin_up` and `begin_set` before any pref is mutated.
 fn validate_advertise_tags(tags: &[String]) -> Result<()> {
     for t in tags {
-        match t.strip_prefix("tag:") {
-            Some(name) if !name.is_empty() => {}
-            _ => {
+        let name = t.strip_prefix("tag:").ok_or_else(|| {
+            anyhow!("invalid tag {t:?}: tags must be of the form tag:<name> (e.g. tag:server)")
+        })?;
+        match name.bytes().next() {
+            None => {
                 return Err(anyhow!(
-                    "invalid tag {t:?}: tags must be of the form tag:<name> (e.g. tag:server)"
+                    "invalid tag {t:?}: the tag name (after 'tag:') is empty"
                 ));
             }
+            // Go requires the first name char to be a letter.
+            Some(b) if !b.is_ascii_alphabetic() => {
+                return Err(anyhow!(
+                    "invalid tag {t:?}: tag names must start with a letter (after 'tag:')"
+                ));
+            }
+            _ => {}
+        }
+        // Go restricts name chars to letters, digits, and '-'.
+        if name
+            .bytes()
+            .any(|b| !b.is_ascii_alphanumeric() && b != b'-')
+        {
+            return Err(anyhow!(
+                "invalid tag {t:?}: tag names may contain only letters, digits, or '-'"
+            ));
         }
     }
     Ok(())
