@@ -1,0 +1,261 @@
+//! The accidental-setting-revert guard — the Rust analogue of Go's
+//! `checkForAccidentalSettingReverts` (`cmd/tailscale/cli/up.go`).
+//!
+//! ## Why this exists (the `up` vs `set` parity story)
+//!
+//! Go's `tailscale up` has REPLACE semantics: a fresh `up` builds a full `Prefs` from the command
+//! line, defaulting *every* flag not passed — so any non-default setting you forget to re-mention
+//! would silently revert. To stop that footgun, Go runs `checkForAccidentalSettingReverts` first: if
+//! the command would revert a non-default pref it didn't mention, it is **rejected** (not silently
+//! applied) with a message telling the operator to either re-mention the setting or pass `--reset`.
+//! `tailscale set`, by contrast, is a pure PATCH and has no such guard.
+//!
+//! This daemon's `begin_up` merge is itself a PATCH (it only overwrites prefs the request named), so
+//! it would never *actually* revert an unmentioned pref. But the **goal is parity with Go's `up`
+//! contract**: a user who runs `tnet up --ssh` on a node that already advertises routes should get
+//! Go's behavior — "mention your routes too, or pass --reset" — not a silent `set`-like patch. This
+//! guard supplies exactly that contract. When it passes (every non-default pref was mentioned), the
+//! PATCH merge and a true REPLACE produce an identical end state, so layering the guard over the safe
+//! PATCH merge is observably equivalent to Go's REPLACE — without the data-loss risk a true wholesale
+//! replace would carry if the guard ever had a hole. `up --reset` is the one path that performs the
+//! genuine wholesale replace (see [`crate::prefs::Prefs::reset_up_managed_to_default`]); it bypasses
+//! this guard by construction (the caller skips it when `reset` is set).
+//!
+//! The guard is a **pure, read-only** function over `(prefs, opts, ever_configured)` so it is
+//! unit-testable without a live `Backend` or engine, and it never mutates state — a tripped guard is
+//! a pre-flight rejection that leaves the node exactly as it was.
+
+use crate::localapi::RevertedPref;
+use crate::prefs::Prefs;
+
+use super::UpOptions;
+
+/// Check whether an `up` described by `opts`, applied to the current `prefs`, would silently revert
+/// any non-default pref the command did not mention — returning the list of such reverts (empty =
+/// the `up` is safe to proceed). The Rust analogue of Go's `checkForAccidentalSettingReverts`.
+///
+/// `ever_configured` is the node's "has been brought up/down before" signal (the daemon derives it
+/// from the prefs-file's existence); it is the analogue of Go's `curPrefs.ControlURL == ""`
+/// fresh-install check.
+///
+/// ## Two exemptions (both mirror Go)
+///
+/// 1. **Fresh node** (`!ever_configured`): a node that was never configured has no settings to
+///    accidentally lose, so the first `up` is never guarded (Go's `curPrefs.ControlURL == ""`
+///    early-return).
+/// 2. **Bare `up`** (`!opts.mentions_any_pref()`): an `up` that names no prefs is "just connect,
+///    change nothing" (Go's `simpleUp`). Our PATCH merge changes nothing in that case, so there is
+///    nothing to revert — guarding it would wrongly flag *every* non-default pref. Skip it.
+///
+/// Otherwise: for each up-managed pref, if the command did **not** mention it AND its current value
+/// differs from the default, it is an accidental revert. The set of prefs checked here is exactly the
+/// set [`Prefs::reset_up_managed_to_default`] resets — they must stay in lockstep.
+///
+/// `caller` note: when `opts.reset` is set the caller must NOT call this (a `--reset` up explicitly
+/// opts into reverting unmentioned prefs to default); this function does not re-check `reset`.
+pub fn check_accidental_reverts(
+    prefs: &Prefs,
+    opts: &UpOptions,
+    ever_configured: bool,
+) -> Vec<RevertedPref> {
+    // Exemption 1: fresh node — nothing to lose.
+    if !ever_configured {
+        return Vec::new();
+    }
+    // Exemption 2: bare `up` (Go's simpleUp) — names no prefs, so changes nothing.
+    if !opts.mentions_any_pref() {
+        return Vec::new();
+    }
+
+    let d = Prefs::default();
+    let mut reverts = Vec::new();
+
+    // Each arm: "the command did NOT mention this pref (the override is the unchanged sentinel) AND
+    // the current value is non-default" → the operator would lose it. The rendered `value` is the
+    // current value as the string they must re-supply to keep it. Field order here is the
+    // deterministic order the CLI receives (it sorts for display).
+    if opts.hostname.is_none()
+        && prefs.hostname != d.hostname
+        && let Some(v) = &prefs.hostname
+    {
+        reverts.push(RevertedPref {
+            key: "hostname".into(),
+            value: v.clone(),
+        });
+    }
+    if opts.control_url.is_none()
+        && prefs.control_url != d.control_url
+        && let Some(v) = &prefs.control_url
+    {
+        reverts.push(RevertedPref {
+            key: "control_url".into(),
+            value: v.clone(),
+        });
+    }
+    if opts.tun.is_none() && prefs.tun_enabled != d.tun_enabled {
+        reverts.push(RevertedPref {
+            key: "tun".into(),
+            value: prefs.tun_enabled.to_string(),
+        });
+    }
+    if opts.tun_name.is_none()
+        && prefs.tun_name != d.tun_name
+        && let Some(v) = &prefs.tun_name
+    {
+        reverts.push(RevertedPref {
+            key: "tun_name".into(),
+            value: v.clone(),
+        });
+    }
+    if opts.tun_mtu.is_none()
+        && prefs.tun_mtu != d.tun_mtu
+        && let Some(v) = prefs.tun_mtu
+    {
+        reverts.push(RevertedPref {
+            key: "tun_mtu".into(),
+            value: v.to_string(),
+        });
+    }
+    if opts.exit_node.is_none()
+        && prefs.exit_node != d.exit_node
+        && let Some(v) = &prefs.exit_node
+    {
+        reverts.push(RevertedPref {
+            key: "exit_node".into(),
+            value: v.clone(),
+        });
+    }
+    if opts.advertise_exit_node.is_none() && prefs.advertise_exit_node != d.advertise_exit_node {
+        reverts.push(RevertedPref {
+            key: "advertise_exit_node".into(),
+            value: prefs.advertise_exit_node.to_string(),
+        });
+    }
+    if opts.advertise_routes.is_none() && prefs.advertise_routes != d.advertise_routes {
+        reverts.push(RevertedPref {
+            key: "advertise_routes".into(),
+            value: prefs.advertise_routes.join(","),
+        });
+    }
+    if opts.accept_routes.is_none() && prefs.accept_routes != d.accept_routes {
+        reverts.push(RevertedPref {
+            key: "accept_routes".into(),
+            value: prefs.accept_routes.to_string(),
+        });
+    }
+    if opts.ssh.is_none() && prefs.ssh_enabled != d.ssh_enabled {
+        reverts.push(RevertedPref {
+            key: "ssh".into(),
+            value: prefs.ssh_enabled.to_string(),
+        });
+    }
+
+    reverts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A node that already advertises routes; the canonical "non-default prefs present" fixture.
+    fn configured_prefs() -> Prefs {
+        Prefs {
+            want_running: true,
+            advertise_routes: vec!["10.0.0.0/8".into()],
+            accept_routes: true,
+            hostname: Some("node-a".into()),
+            ..Prefs::default()
+        }
+    }
+
+    #[test]
+    fn fresh_node_is_never_guarded() {
+        // ever_configured = false → first up is exempt even with mentioned flags + non-default prefs.
+        let prefs = configured_prefs();
+        let opts = UpOptions {
+            ssh: Some(true),
+            ..UpOptions::default()
+        };
+        assert!(check_accidental_reverts(&prefs, &opts, false).is_empty());
+    }
+
+    #[test]
+    fn bare_up_is_exempt_even_with_nondefault_prefs() {
+        // No pref mentioned (Go's simpleUp) → never trips, even though routes/accept/hostname are set.
+        let prefs = configured_prefs();
+        let opts = UpOptions::default();
+        assert!(check_accidental_reverts(&prefs, &opts, true).is_empty());
+    }
+
+    #[test]
+    fn mentioning_only_ssh_trips_on_unmentioned_nondefaults() {
+        // `up --ssh` on a configured node with routes+accept+hostname set → all three are reverts.
+        let prefs = configured_prefs();
+        let opts = UpOptions {
+            ssh: Some(true),
+            ..UpOptions::default()
+        };
+        let reverts = check_accidental_reverts(&prefs, &opts, true);
+        let keys: Vec<&str> = reverts.iter().map(|r| r.key.as_str()).collect();
+        assert!(keys.contains(&"advertise_routes"), "{keys:?}");
+        assert!(keys.contains(&"accept_routes"), "{keys:?}");
+        assert!(keys.contains(&"hostname"), "{keys:?}");
+        // ssh itself was mentioned → not a revert.
+        assert!(!keys.contains(&"ssh"), "{keys:?}");
+        // The advertise_routes value is rendered as the comma-joined current set.
+        let ar = reverts
+            .iter()
+            .find(|r| r.key == "advertise_routes")
+            .unwrap();
+        assert_eq!(ar.value, "10.0.0.0/8");
+    }
+
+    #[test]
+    fn re_mentioning_every_nondefault_passes() {
+        // `up --ssh --advertise-routes=10/8 --accept-routes --hostname=node-a` → nothing unmentioned
+        // is non-default → guard passes (the PATCH merge then == a true replace).
+        let prefs = configured_prefs();
+        let opts = UpOptions {
+            ssh: Some(true),
+            advertise_routes: Some(vec!["10.0.0.0/8".into()]),
+            accept_routes: Some(true),
+            hostname: Some("node-a".into()),
+            ..UpOptions::default()
+        };
+        assert!(check_accidental_reverts(&prefs, &opts, true).is_empty());
+    }
+
+    #[test]
+    fn no_trip_when_only_nondefault_is_the_mentioned_one() {
+        // ssh is the ONLY non-default pref; `up --ssh` mentions it → nothing else to revert → passes.
+        let prefs = Prefs {
+            want_running: true,
+            ssh_enabled: true,
+            ..Prefs::default()
+        };
+        let opts = UpOptions {
+            ssh: Some(true),
+            ..UpOptions::default()
+        };
+        assert!(check_accidental_reverts(&prefs, &opts, true).is_empty());
+    }
+
+    #[test]
+    fn clearing_a_pref_counts_as_mentioning_it() {
+        // `up --clear-exit-node` (exit_node = Some(None)) on a node with an exit node set + routes:
+        // exit_node is mentioned (so not a revert), but advertise_routes is still an accidental revert.
+        let prefs = Prefs {
+            want_running: true,
+            exit_node: Some("100.64.0.9".into()),
+            advertise_routes: vec!["10.0.0.0/8".into()],
+            ..Prefs::default()
+        };
+        let opts = UpOptions {
+            exit_node: Some(None),
+            ..UpOptions::default()
+        };
+        let reverts = check_accidental_reverts(&prefs, &opts, true);
+        let keys: Vec<&str> = reverts.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys, vec!["advertise_routes"], "{keys:?}");
+    }
+}

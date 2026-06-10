@@ -75,6 +75,7 @@ use crate::prefs::Prefs;
 
 mod config;
 mod diag;
+mod revert_guard;
 mod state;
 
 // The reported [`State`] enum lives in [`state`] (with the pure state-derivation helpers) but is
@@ -349,6 +350,36 @@ pub struct UpOptions {
     pub accept_routes: Option<bool>,
     /// Run-SSH-server override (`None` leaves the pref unchanged; `Some(b)` sets it).
     pub ssh: Option<bool>,
+    /// Reset every up-managed pref this command does not mention back to its default before applying
+    /// the named overrides (Go `tailscale up --reset`). The one path where `up` is a true wholesale
+    /// REPLACE rather than a PATCH; also bypasses the accidental-revert guard (the operator is
+    /// explicitly opting into the revert). See [`Backend::begin_up`] and
+    /// [`crate::prefs::Prefs::reset_up_managed_to_default`].
+    pub reset: bool,
+}
+
+impl UpOptions {
+    /// Whether this `up` mentions any **pref** flag (anything that would change persisted prefs).
+    /// `authkey` is deliberately NOT a pref (it authenticates; it does not alter prefs), so a plain
+    /// `tnet up --authkey K` still counts as "mentions no pref" — Go's `simpleUp` (just connect,
+    /// change nothing). Used by the accidental-revert guard to exempt a bare `up` (which, with our
+    /// PATCH merge, changes nothing and so can revert nothing) and by nothing else.
+    ///
+    /// `reset` is intentionally excluded: `--reset` is a directive, not a pref, and it has its own
+    /// guard-bypass path (the caller skips the guard entirely when `reset` is set), so it never needs
+    /// to make a bare `up` look non-bare.
+    pub fn mentions_any_pref(&self) -> bool {
+        self.hostname.is_some()
+            || self.control_url.is_some()
+            || self.tun.is_some()
+            || self.tun_name.is_some()
+            || self.tun_mtu.is_some()
+            || self.exit_node.is_some()
+            || self.advertise_exit_node.is_some()
+            || self.advertise_routes.is_some()
+            || self.accept_routes.is_some()
+            || self.ssh.is_some()
+    }
 }
 
 /// Prefs to patch via [`Backend::set`] (the `tnet set` path) — the live-mutation analogue of
@@ -768,6 +799,21 @@ impl Backend {
         }
     }
 
+    /// Pure, read-only accidental-revert pre-check for an `up` (the Rust analogue of Go's
+    /// `checkForAccidentalSettingReverts`). Returns the list of non-default prefs this `up` would
+    /// silently revert because the command did not mention them — empty means the `up` is safe to
+    /// proceed. Mutates **nothing**: the server calls this BEFORE [`drive_up`]/[`begin_up`], and on a
+    /// non-empty result rejects the `up` outright (returning [`crate::localapi::Response::RevertGuard`])
+    /// so a guarded `up` leaves the node exactly as it was.
+    ///
+    /// The caller must skip this entirely when `opts.reset` is set — a `--reset` up explicitly opts
+    /// into reverting unmentioned prefs to their defaults, so it is never guarded. See
+    /// [`revert_guard::check_accidental_reverts`] for the two exemptions (fresh node / bare `up`) and
+    /// the per-pref logic.
+    pub fn up_revert_guard(&self, opts: &UpOptions) -> Vec<crate::localapi::RevertedPref> {
+        revert_guard::check_accidental_reverts(&self.prefs, opts, self.ever_configured)
+    }
+
     /// Phase 1 of the concurrent bring-up: mutate + persist prefs, build the engine `Config`, and
     /// bump the lifecycle [`generation`](Backend::generation). Returns a [`PendingUp`] describing
     /// *this* attempt. Does **no** network I/O — the caller then performs the slow `Device::new` via
@@ -795,6 +841,18 @@ impl Backend {
 
         // Tear down any existing device first so `up` is idempotent / reconfiguring.
         self.stop_device().await;
+
+        // `--reset` (Go `tailscale up --reset`): the one path where `up` is a true wholesale REPLACE.
+        // Reset every up-managed pref to its default FIRST, then let the overrides below layer on top
+        // — so `up --reset --ssh` ends with only `ssh_enabled` set and every other up-managed pref
+        // back at default. Without `--reset`, the merge below is a PATCH (only mentioned prefs change),
+        // and the accidental-revert guard (run by the server BEFORE this) is what gives `up` its
+        // REPLACE *contract* by refusing to silently drop an unmentioned non-default pref. `--reset`
+        // is exactly the operator opting out of that guard. Lifecycle/registration prefs
+        // (`want_running`/`logged_out`/`ephemeral`) are deliberately preserved by the reset helper.
+        if opts.reset {
+            self.prefs.reset_up_managed_to_default();
+        }
 
         if let Some(h) = opts.hostname {
             self.prefs.hostname = Some(h);
@@ -1775,6 +1833,119 @@ mod tests {
         );
         assert!(!be.prefs.advertise_exit_node);
         assert!(be.prefs.advertise_routes.is_empty());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn begin_up_reset_wipes_unmentioned_prefs_to_default_then_applies_overrides() {
+        // `up --reset --ssh` is the one true wholesale-REPLACE path: every up-managed pref the
+        // command does NOT mention is reset to default FIRST, then the named overrides layer on top.
+        // So a node with routes+accept+exit-node+hostname set, given `--reset --ssh`, ends with ONLY
+        // ssh_enabled set and everything else back at default. Lifecycle prefs (want_running) survive.
+        let dir = std::env::temp_dir().join(format!("tailnetd-bu-reset-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+
+        // Seed a richly-configured node.
+        let _ = be
+            .begin_up(UpOptions {
+                hostname: Some("node-a".to_string()),
+                exit_node: Some(Some("exit-1".to_string())),
+                advertise_exit_node: Some(true),
+                advertise_routes: Some(vec!["10.0.0.0/8".to_string()]),
+                accept_routes: Some(true),
+                ..UpOptions::default()
+            })
+            .await
+            .expect("begin_up seed");
+        assert_eq!(be.prefs.advertise_routes, vec!["10.0.0.0/8".to_string()]);
+
+        // `up --reset --accept-routes`: reset everything unmentioned, set only accept_routes. (We
+        // mention `accept_routes` rather than `ssh` so the assertion holds in BOTH feature configs —
+        // a mentioned `ssh: Some(true)` would trip `build_config`'s SSH-feature/root preflight in the
+        // default no-`ssh` build, which is a separate, already-tested behavior; this test is about the
+        // reset mechanics, not the SSH preflight.)
+        let _ = be
+            .begin_up(UpOptions {
+                accept_routes: Some(true),
+                reset: true,
+                ..UpOptions::default()
+            })
+            .await
+            .expect("begin_up reset");
+
+        assert!(
+            be.prefs.accept_routes,
+            "the mentioned --accept-routes override applies"
+        );
+        assert!(
+            be.prefs.exit_node.is_none(),
+            "--reset wipes the unmentioned exit_node back to default"
+        );
+        assert!(
+            !be.prefs.advertise_exit_node,
+            "--reset wipes advertise_exit_node"
+        );
+        assert!(
+            be.prefs.advertise_routes.is_empty(),
+            "--reset wipes the advertised route set"
+        );
+        assert!(
+            be.prefs.hostname.is_none(),
+            "--reset wipes the unmentioned hostname"
+        );
+        assert!(
+            !be.prefs.ssh_enabled,
+            "--reset wipes ssh_enabled (it was never set here, but proves the reset covers it)"
+        );
+        assert!(
+            be.prefs.want_running,
+            "--reset must NOT touch the lifecycle pref want_running"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn begin_up_reset_keeps_a_mentioned_pref_value() {
+        // `--reset` resets unmentioned prefs but a pref the command DOES mention keeps its new value
+        // (the override layers on AFTER the reset). `up --reset --advertise-routes=192.168.0.0/16`
+        // on a node advertising 10/8 ends advertising ONLY 192.168/16, not the wiped 10/8.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-bu-reset-keep-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+
+        let _ = be
+            .begin_up(UpOptions {
+                advertise_routes: Some(vec!["10.0.0.0/8".to_string()]),
+                accept_routes: Some(true),
+                ..UpOptions::default()
+            })
+            .await
+            .expect("begin_up seed");
+
+        let _ = be
+            .begin_up(UpOptions {
+                advertise_routes: Some(vec!["192.168.0.0/16".to_string()]),
+                reset: true,
+                ..UpOptions::default()
+            })
+            .await
+            .expect("begin_up reset+mention");
+
+        assert_eq!(
+            be.prefs.advertise_routes,
+            vec!["192.168.0.0/16".to_string()],
+            "the mentioned override replaces the set even under --reset"
+        );
+        assert!(
+            !be.prefs.accept_routes,
+            "the unmentioned accept_routes is still wiped by --reset"
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

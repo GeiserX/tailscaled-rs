@@ -71,6 +71,14 @@ pub enum Request {
         /// Requires a daemon built with the `ssh` feature + root; the daemon fails loudly otherwise.
         #[serde(default)]
         ssh: Option<bool>,
+        /// Reset every up-managed pref this command does **not** mention back to its default before
+        /// applying the named overrides (Go `tailscale up --reset`). This is the one path where `up`
+        /// is a true wholesale REPLACE rather than a PATCH. It also SKIPS the accidental-revert guard
+        /// (the operator is explicitly opting into "unmentioned settings revert to defaults"), so the
+        /// daemon never returns [`Response::RevertGuard`] for a `--reset` up. `#[serde(default)]` keeps
+        /// the wire backward-compatible with clients that omit it.
+        #[serde(default)]
+        reset: bool,
     },
     /// Change individual prefs on the node **without** a full up/down cycle (the analogue of Go's
     /// `tailscale set`). Every field is the same "leave unchanged unless named" sentinel as
@@ -187,11 +195,43 @@ pub enum Response {
         /// Human-readable detail.
         message: String,
     },
+    /// An `up` was rejected because it would silently revert one or more non-default prefs the
+    /// command did not mention (the Rust analogue of Go's `checkForAccidentalSettingReverts`). The
+    /// daemon does NOT mutate any state — this is a pre-flight rejection. Each entry names the pref
+    /// the operator would have unintentionally reset and its CURRENT (about-to-be-lost) value, so the
+    /// CLI can render Go's "re-run mentioning the current value of all non-default settings" message
+    /// with a copy-pasteable command. Carrying structured `(pref, value)` pairs rather than a
+    /// pre-rendered string keeps the daemon free of CLI flag spellings (the daemon has no notion of
+    /// `--advertise-routes`); the CLI owns the pref→flag mapping. Bypass with `up --reset` (or by
+    /// mentioning the listed flags).
+    RevertGuard {
+        /// The prefs that would be accidentally reverted, each as `(pref_key, current_value)`. The
+        /// `pref_key` is a stable, CLI-agnostic identifier (e.g. `"advertise_routes"`,
+        /// `"accept_routes"`, `"exit_node"`, `"ssh"`, `"advertise_exit_node"`, `"hostname"`,
+        /// `"control_url"`, `"tun"`) the CLI maps to its flag; `current_value` is the value the
+        /// operator must re-mention to keep (already rendered to a flag-value string by the daemon's
+        /// pref projection — e.g. `"10.0.0.0/8,192.168.1.0/24"`, `"true"`, an exit-node selector).
+        reverts: Vec<RevertedPref>,
+    },
     /// A command failed.
     Error {
         /// Human-readable detail.
         message: String,
     },
+}
+
+/// One pref that an unguarded `up` would have silently reverted to its default, returned inside
+/// [`Response::RevertGuard`]. See that variant for the full rationale.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RevertedPref {
+    /// Stable, CLI-agnostic pref identifier (e.g. `"advertise_routes"`). The CLI maps this to its
+    /// user-facing flag name; the daemon deliberately does not know flag spellings.
+    pub key: String,
+    /// The current value that would be lost, rendered as the string the operator must re-supply to
+    /// keep it (e.g. `"10.0.0.0/8"`, `"true"`, an exit-node selector). For a boolean pref this is
+    /// `"true"`/`"false"`; for a list it is the comma-joined set; for an optional string it is the
+    /// value itself.
+    pub value: String,
 }
 
 /// The identity behind a tailnet IP, returned by [`Request::Whois`]. The Rust analogue of tsnet's
@@ -340,6 +380,7 @@ mod tests {
             advertise_routes: Some(vec!["192.168.1.0/24".to_string()]),
             accept_routes: Some(true),
             ssh: Some(true),
+            reset: true,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&json).unwrap();
@@ -356,7 +397,9 @@ mod tests {
                 advertise_routes,
                 accept_routes,
                 ssh,
+                reset,
             } => {
+                assert!(reset, "reset must survive the wire round-trip when set");
                 assert_eq!(authkey.as_deref(), Some("tskey-auth-xxx"));
                 assert_eq!(hostname.as_deref(), Some("node-a"));
                 assert!(control_url.is_none());
@@ -585,6 +628,7 @@ mod tests {
             advertise_routes: None,
             accept_routes: None,
             ssh: None,
+            reset: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&json).unwrap();
@@ -601,7 +645,9 @@ mod tests {
                 advertise_routes,
                 accept_routes,
                 ssh,
+                reset,
             } => {
+                assert!(!reset);
                 assert!(authkey.is_none());
                 assert!(control_url.is_none());
                 assert!(hostname.is_none());
@@ -658,6 +704,7 @@ mod tests {
             advertise_routes: Some(vec![]),
             accept_routes: None,
             ssh: None,
+            reset: false,
         };
         let json = serde_json::to_string(&clear).unwrap();
         match serde_json::from_str::<Request>(&json).unwrap() {
@@ -733,6 +780,7 @@ mod tests {
             advertise_routes: None,
             accept_routes: None,
             ssh: None,
+            reset: false,
         })
         .unwrap();
         let unchanged_json = serde_json::to_string(&Request::Up {
@@ -747,6 +795,7 @@ mod tests {
             advertise_routes: None,
             accept_routes: None,
             ssh: None,
+            reset: false,
         })
         .unwrap();
         assert!(

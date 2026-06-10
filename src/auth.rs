@@ -180,6 +180,7 @@ mod tests {
             advertise_routes: None,
             accept_routes: None,
             ssh: None,
+            reset: false,
         }
     }
 
