@@ -97,6 +97,15 @@ enum Command {
         // `--advertise-routes-clear` is kept as an alias for backward-compatibility.
         #[arg(long = "clear-advertise-routes", alias = "advertise-routes-clear")]
         advertise_routes_clear: bool,
+        /// Advertise these ACL tags (comma-separated `tag:<name>`, e.g. `tag:server,tag:ci`) at
+        /// registration (Go `--advertise-tags`). Replaces the whole set. Use `--clear-advertise-tags`
+        /// to request none; passing neither leaves the persisted set unchanged.
+        #[arg(long, value_name = "tag:NAME,...", value_delimiter = ',')]
+        advertise_tags: Vec<String>,
+        /// Stop advertising any ACL tags (clears the set). Use this instead of an empty
+        /// `--advertise-tags`, since clap can't distinguish "request none" from the flag being unset.
+        #[arg(long = "clear-advertise-tags")]
+        advertise_tags_clear: bool,
         /// Accept (and route to) subnet routes advertised by peers (Go `tailscale up
         /// --accept-routes`). Mutually exclusive with `--no-accept-routes`; omitting both leaves the
         /// persisted setting unchanged.
@@ -174,6 +183,15 @@ enum Command {
         // `--advertise-routes-clear` is kept as an alias for backward-compatibility.
         #[arg(long = "clear-advertise-routes", alias = "advertise-routes-clear")]
         advertise_routes_clear: bool,
+        /// Advertise these ACL tags (comma-separated `tag:<name>`, e.g. `tag:server,tag:ci`) at
+        /// registration (Go `--advertise-tags`). Replaces the whole set. Use `--clear-advertise-tags`
+        /// to request none; passing neither leaves the persisted set unchanged.
+        #[arg(long, value_name = "tag:NAME,...", value_delimiter = ',')]
+        advertise_tags: Vec<String>,
+        /// Stop advertising any ACL tags (clears the set). Use this instead of an empty
+        /// `--advertise-tags`, since clap can't distinguish "request none" from the flag being unset.
+        #[arg(long = "clear-advertise-tags")]
+        advertise_tags_clear: bool,
         /// Run the Tailscale SSH server on this node (accept tailnet SSH on port 22, authorized by
         /// the control SSH policy). Requires a daemon built with the `ssh` feature and run as root.
         /// Mutually exclusive with `--no-ssh`; omitting both leaves the setting unchanged.
@@ -499,6 +517,8 @@ async fn main() -> Result<()> {
             no_advertise_exit_node,
             advertise_routes,
             advertise_routes_clear,
+            advertise_tags,
+            advertise_tags_clear,
             accept_routes,
             no_accept_routes,
             ssh,
@@ -534,6 +554,9 @@ async fn main() -> Result<()> {
                     advertise_routes,
                     advertise_routes_clear,
                 ),
+                // Passed tags replace the set; `--clear-advertise-tags` empties it; neither leaves it
+                // unchanged. Reuses the same Vec+clear→Option resolver as advertise-routes.
+                advertise_tags: resolve_advertise_routes(advertise_tags, advertise_tags_clear),
                 // `--accept-routes`/`--no-accept-routes` tri-state (mirrors `--tun`); reuses the same
                 // resolver as the `set` arm.
                 accept_routes: resolve_accept_routes(accept_routes, no_accept_routes),
@@ -554,6 +577,8 @@ async fn main() -> Result<()> {
             no_advertise_exit_node,
             advertise_routes,
             advertise_routes_clear,
+            advertise_tags,
+            advertise_tags_clear,
             ssh,
             no_ssh,
         } => Request::Set {
@@ -572,6 +597,8 @@ async fn main() -> Result<()> {
             // Passed routes replace the set; `--advertise-routes-clear` empties it; neither leaves
             // the persisted set unchanged.
             advertise_routes: resolve_advertise_routes(advertise_routes, advertise_routes_clear),
+            // Passed tags replace the set; `--clear-advertise-tags` empties it; neither unchanged.
+            advertise_tags: resolve_advertise_routes(advertise_tags, advertise_tags_clear),
             // `--ssh`/`--no-ssh` tri-state (mirrors `--tun`).
             ssh: resolve_ssh(ssh, no_ssh),
         },
@@ -1107,6 +1134,10 @@ fn get_settings(
         (
             "advertise-routes",
             Value::String(view.advertise_routes.join(",")),
+        ),
+        (
+            "advertise-tags",
+            Value::String(view.advertise_tags.join(",")),
         ),
         ("accept-routes", Value::Bool(view.accept_routes)),
         ("ssh", Value::Bool(view.ssh)),
@@ -1918,6 +1949,7 @@ mod tests {
             exit_node: resolve_exit_node(Some("100.64.0.9".to_string()), false),
             advertise_exit_node: resolve_advertise_exit_node(false, false),
             advertise_routes: resolve_advertise_routes(vec![], false),
+            advertise_tags: None,
             ssh: resolve_ssh(false, false),
         };
         match req {
@@ -1927,6 +1959,7 @@ mod tests {
                 exit_node,
                 advertise_exit_node,
                 advertise_routes,
+                advertise_tags: _,
                 ssh,
             } => {
                 assert_eq!(hostname, Some("laptop".to_string()));
@@ -1956,6 +1989,7 @@ mod tests {
             exit_node: None,
             advertise_exit_node: None,
             advertise_routes: None,
+            advertise_tags: None,
             accept_routes: resolve_accept_routes(true, false),
             ssh: None,
             reset: false,
@@ -1977,6 +2011,7 @@ mod tests {
             exit_node: None,
             advertise_exit_node: None,
             advertise_routes: None,
+            advertise_tags: None,
             accept_routes: resolve_accept_routes(false, true),
             ssh: None,
             reset: false,
@@ -2002,6 +2037,7 @@ mod tests {
             exit_node: None,
             advertise_exit_node: None,
             advertise_routes: None,
+            advertise_tags: None,
             accept_routes: resolve_accept_routes(false, false),
             ssh: None,
             reset: false,
@@ -2026,6 +2062,7 @@ mod tests {
             exit_node: resolve_exit_node(None, true),
             advertise_exit_node: resolve_advertise_exit_node(false, true),
             advertise_routes: resolve_advertise_routes(vec![], true),
+            advertise_tags: None,
             ssh: resolve_ssh(true, false),
         };
         match req {
@@ -2035,6 +2072,7 @@ mod tests {
                 exit_node,
                 advertise_exit_node,
                 advertise_routes,
+                advertise_tags: _,
                 ssh,
             } => {
                 assert_eq!(hostname, None);
@@ -2379,6 +2417,7 @@ mod tests {
             exit_node: Some("100.64.0.9".into()),
             advertise_exit_node: false,
             advertise_routes: vec!["10.0.0.0/8".into(), "192.168.1.0/24".into()],
+            advertise_tags: vec![],
             accept_routes: true,
             ssh: true,
             ssh_running: true,
@@ -2393,8 +2432,10 @@ mod tests {
             table.contains("advertise-routes") && table.contains("10.0.0.0/8,192.168.1.0/24"),
             "{table}"
         );
-        // 6 settings → 6 lines.
-        assert_eq!(table.lines().count(), 6, "{table}");
+        assert!(table.contains("advertise-tags"), "{table}");
+        // 7 settings → 7 lines (exit-node, advertise-exit-node, advertise-routes, advertise-tags,
+        // accept-routes, ssh, tun).
+        assert_eq!(table.lines().count(), 7, "{table}");
 
         // --json: flattened name→value map keyed by set-flag name, with GO-FAITHFUL TYPED values —
         // booleans are bare JSON `true`/`false` (NOT quoted strings), strings are strings. Parse it

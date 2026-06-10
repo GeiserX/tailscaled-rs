@@ -54,6 +54,10 @@ pub struct Prefs {
     /// it (Go `--advertise-routes`). Stored as raw CIDR strings, parsed into `ipnet::IpNet` in
     /// `build_config`. Empty = advertise nothing. v6 prefixes are dropped by the engine (v4-only).
     pub advertise_routes: Vec<String>,
+    /// ACL tags this node requests at registration (Go `--advertise-tags`), each `tag:<name>`.
+    /// Mapped to the engine's `Config.requested_tags`. Empty = request no tags (a user-owned node).
+    /// A tagged node is owned by the tailnet policy rather than a user; control must approve the tags.
+    pub advertise_tags: Vec<String>,
     /// Run the Tailscale SSH server on this node (Go `--ssh`): accept tailnet SSH connections on
     /// `<tailnet-ip>:22`, authorized by the control-pushed SSH policy (fail-closed). Requires a
     /// daemon built with the `ssh` cargo feature AND running as root (to drop privileges to the
@@ -93,6 +97,7 @@ impl Default for Prefs {
             exit_node: None,
             advertise_exit_node: false,
             advertise_routes: Vec::new(),
+            advertise_tags: Vec::new(),
             ssh_enabled: false,
             taildrop_dir: None,
             tun_enabled: false,
@@ -142,6 +147,7 @@ impl Prefs {
         self.exit_node = d.exit_node;
         self.advertise_exit_node = d.advertise_exit_node;
         self.advertise_routes = d.advertise_routes;
+        self.advertise_tags = d.advertise_tags;
         self.ssh_enabled = d.ssh_enabled;
         self.tun_enabled = d.tun_enabled;
         self.tun_name = d.tun_name;

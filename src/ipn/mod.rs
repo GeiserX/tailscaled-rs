@@ -92,6 +92,23 @@ use state::{derive_state_from, state_from_device};
 /// teardown latency so a wedged engine can't hang the daemon (or an orphaned, superseded `up`).
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Validate `--advertise-tags` values: each must be a `tag:<name>` with a non-empty name (Go rejects
+/// bare names too — a tag is always `tag:`-prefixed). Returns the first offender for a clear error.
+/// Pure so it can guard both `begin_up` and `begin_set` before any pref is mutated/persisted.
+fn validate_advertise_tags(tags: &[String]) -> Result<()> {
+    for t in tags {
+        match t.strip_prefix("tag:") {
+            Some(name) if !name.is_empty() => {}
+            _ => {
+                return Err(anyhow!(
+                    "invalid tag {t:?}: tags must be of the form tag:<name> (e.g. tag:server)"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Upper bound on the blocking netmap query inside [`Backend::status`]. The query is held under the
 /// backend lock, so this caps how long a `status` can head-of-line block `up`/`down` in the brief
 /// Running-but-pre-netmap window (or if a Running engine wedges). On elapse we report `Running`
@@ -346,6 +363,10 @@ pub struct UpOptions {
     /// Advertise-routes override. `None` leaves the pref unchanged; `Some(vec)` replaces the set
     /// (`Some(vec![])` clears it). A `Vec` alone could not express "unchanged", hence the `Option`.
     pub advertise_routes: Option<Vec<String>>,
+    /// Advertise-tags override (Go `--advertise-tags`). `None` leaves the pref unchanged; `Some(vec)`
+    /// replaces the set (`Some(vec![])` clears it). Each entry must be `tag:<name>` (validated at the
+    /// CLI/server boundary).
+    pub advertise_tags: Option<Vec<String>>,
     /// Accept-subnet-routes override (`None` leaves the pref unchanged; `Some(b)` sets it). Go's
     /// `tailscale up --accept-routes`; same tri-state as `set`'s `accept_routes`.
     pub accept_routes: Option<bool>,
@@ -378,6 +399,7 @@ impl UpOptions {
             || self.exit_node.is_some()
             || self.advertise_exit_node.is_some()
             || self.advertise_routes.is_some()
+            || self.advertise_tags.is_some()
             || self.accept_routes.is_some()
             || self.ssh.is_some()
     }
@@ -403,6 +425,8 @@ pub struct SetOptions {
     pub advertise_exit_node: Option<bool>,
     /// Subnet routes this node advertises (`None` unchanged; `Some(vec)` replaces).
     pub advertise_routes: Option<Vec<String>>,
+    /// ACL tags this node advertises (`None` unchanged; `Some(vec)` replaces; `tag:<name>` each).
+    pub advertise_tags: Option<Vec<String>>,
     /// Run the Tailscale SSH server (`None` unchanged; `Some(b)` sets it). Toggling SSH is a
     /// device-rebuild change (the SSH server task is tied to the device lifecycle), so it takes the
     /// [`SetAction::Rebuild`] path on a running node — not the live exit-node fast path.
@@ -417,6 +441,7 @@ impl SetOptions {
             && self.exit_node.is_none()
             && self.advertise_exit_node.is_none()
             && self.advertise_routes.is_none()
+            && self.advertise_tags.is_none()
             && self.ssh.is_none()
     }
 
@@ -431,6 +456,7 @@ impl SetOptions {
             && self.accept_routes.is_none()
             && self.advertise_exit_node.is_none()
             && self.advertise_routes.is_none()
+            && self.advertise_tags.is_none()
             && self.ssh.is_none()
     }
 }
@@ -885,6 +911,10 @@ impl Backend {
                     .map_err(|_| anyhow!("invalid advertise route {s:?}"))?;
             }
         }
+        // Same pre-validate-before-persist discipline for advertise-tags (tag:<name> form).
+        if let Some(tags) = opts.advertise_tags.as_ref() {
+            validate_advertise_tags(tags)?;
+        }
 
         // Apply the overrides. Same sentinel semantics as `begin_up`'s override block, restricted to
         // the fields `set` accepts. `exit_node` is the double `Option`: binding `en` (an
@@ -906,6 +936,9 @@ impl Backend {
         }
         if let Some(routes) = opts.advertise_routes {
             self.prefs.advertise_routes = routes;
+        }
+        if let Some(tags) = opts.advertise_tags {
+            self.prefs.advertise_tags = tags;
         }
         // Run-SSH-server override. Toggling SSH is a device-lifecycle change (the server task is
         // bound to the device), so on a running node it must take the Rebuild path, NOT the live
@@ -989,6 +1022,10 @@ impl Backend {
                     .map_err(|_| anyhow!("invalid advertise route {s:?}"))?;
             }
         }
+        // Same pre-validate-before-teardown discipline for advertise-tags (tag:<name> form).
+        if let Some(tags) = opts.advertise_tags.as_ref() {
+            validate_advertise_tags(tags)?;
+        }
 
         // Tear down any existing device first so `up` is idempotent / reconfiguring.
         self.stop_device().await;
@@ -1041,6 +1078,9 @@ impl Backend {
         }
         if let Some(ar) = opts.advertise_routes {
             self.prefs.advertise_routes = ar;
+        }
+        if let Some(tags) = opts.advertise_tags {
+            self.prefs.advertise_tags = tags;
         }
         // Accept-subnet-routes override (Go `up --accept-routes`), same "unchanged unless named"
         // sentinel as `set`'s accept_routes; baked into the engine Config in `build_config`.
@@ -1427,6 +1467,7 @@ impl Backend {
             exit_node: self.prefs.exit_node.clone(),
             advertise_exit_node: self.prefs.advertise_exit_node,
             advertise_routes: self.prefs.advertise_routes.clone(),
+            advertise_tags: self.prefs.advertise_tags.clone(),
             accept_routes: self.prefs.accept_routes,
             ssh: self.prefs.ssh_enabled,
             // SSH *liveness*, distinct from the `ssh_enabled` pref above: the server task is spawned

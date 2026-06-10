@@ -137,6 +137,12 @@ pub fn check_accidental_reverts(
             value: prefs.advertise_routes.join(","),
         });
     }
+    if opts.advertise_tags.is_none() && prefs.advertise_tags != d.advertise_tags {
+        reverts.push(RevertedPref {
+            key: "advertise_tags".into(),
+            value: prefs.advertise_tags.join(","),
+        });
+    }
     if opts.accept_routes.is_none() && prefs.accept_routes != d.accept_routes {
         reverts.push(RevertedPref {
             key: "accept_routes".into(),
@@ -187,6 +193,7 @@ mod tests {
             exit_node: _,
             advertise_exit_node: _,
             advertise_routes: _,
+            advertise_tags: _,
             ssh_enabled: _,
             tun_enabled: _,
             tun_name: _,
@@ -213,6 +220,9 @@ mod tests {
             ("advertise_exit_node", |p| p.advertise_exit_node = true),
             ("advertise_routes", |p| {
                 p.advertise_routes = vec!["10.0.0.0/8".into()]
+            }),
+            ("advertise_tags", |p| {
+                p.advertise_tags = vec!["tag:server".into()]
             }),
             ("ssh", |p| p.ssh_enabled = true),
             ("tun", |p| p.tun_enabled = true),
@@ -263,6 +273,9 @@ mod tests {
                 "advertise_routes" => {
                     assert_eq!(reset_prefs.advertise_routes, d.advertise_routes)
                 }
+                "advertise_tags" => {
+                    assert_eq!(reset_prefs.advertise_tags, d.advertise_tags)
+                }
                 "ssh" => assert_eq!(reset_prefs.ssh_enabled, d.ssh_enabled),
                 "tun" => assert_eq!(reset_prefs.tun_enabled, d.tun_enabled),
                 "tun_name" => assert_eq!(reset_prefs.tun_name, d.tun_name),
@@ -270,6 +283,18 @@ mod tests {
                 other => panic!("unclassified up-managed key in test table: {other}"),
             }
         }
+    }
+
+    #[test]
+    fn advertise_tags_validation() {
+        use super::super::validate_advertise_tags;
+        // Valid: tag:<name> entries.
+        assert!(validate_advertise_tags(&["tag:server".into(), "tag:ci".into()]).is_ok());
+        assert!(validate_advertise_tags(&[]).is_ok());
+        // Invalid: bare name, empty tag name, wrong prefix.
+        assert!(validate_advertise_tags(&["server".into()]).is_err());
+        assert!(validate_advertise_tags(&["tag:".into()]).is_err());
+        assert!(validate_advertise_tags(&["notatag:x".into()]).is_err());
     }
 
     /// A node that already advertises routes; the canonical "non-default prefs present" fixture.

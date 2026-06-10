@@ -186,6 +186,7 @@ mod tests {
             exit_node: None,
             advertise_exit_node: None,
             advertise_routes: None,
+            advertise_tags: None,
             accept_routes: None,
             ssh: None,
             reset: false,
@@ -199,6 +200,7 @@ mod tests {
             exit_node: None,
             advertise_exit_node: None,
             advertise_routes: None,
+            advertise_tags: None,
             ssh: None,
         }
     }

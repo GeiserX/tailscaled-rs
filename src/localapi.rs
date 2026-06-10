@@ -62,6 +62,10 @@ pub enum Request {
         /// replaces the set (`Some([])` clears).
         #[serde(default)]
         advertise_routes: Option<Vec<String>>,
+        /// ACL tags this node requests (Go `--advertise-tags`, each `tag:<name>`). `None` unchanged;
+        /// `Some(vec)` replaces (`Some([])` clears). `#[serde(default)]` keeps the wire back-compatible.
+        #[serde(default)]
+        advertise_tags: Option<Vec<String>>,
         /// Accept (and route to) subnet routes advertised by peers (Go `tailscale up
         /// --accept-routes`). `None` leaves the pref unchanged; `Some(b)` sets it. `#[serde(default)]`
         /// keeps the wire backward-compatible with clients that omit it.
@@ -110,6 +114,10 @@ pub enum Request {
         /// `Some([])` clears).
         #[serde(default)]
         advertise_routes: Option<Vec<String>>,
+        /// ACL tags this node requests (`None` unchanged; `Some(vec)` replaces, `Some([])` clears;
+        /// each `tag:<name>`).
+        #[serde(default)]
+        advertise_tags: Option<Vec<String>>,
         /// Run the Tailscale SSH server (`None` unchanged; `Some(b)` sets it). Toggling SSH via
         /// `set` rebuilds the running device (the SSH server task is tied to the device lifecycle).
         #[serde(default)]
@@ -382,6 +390,9 @@ pub struct PrefsView {
     /// Subnet routes (CIDRs) this node advertises to the tailnet.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub advertise_routes: Vec<String>,
+    /// ACL tags (`tag:<name>`) this node requests at registration.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub advertise_tags: Vec<String>,
     /// Whether this node accepts subnet routes advertised by peers.
     pub accept_routes: bool,
     /// Whether the Tailscale SSH server is *enabled* by the persisted pref (`ssh_enabled`). This is
@@ -473,6 +484,7 @@ mod tests {
             exit_node: Some(Some("100.64.0.9".to_string())),
             advertise_exit_node: Some(true),
             advertise_routes: Some(vec!["192.168.1.0/24".to_string()]),
+            advertise_tags: Some(vec!["tag:server".to_string()]),
             accept_routes: Some(true),
             ssh: Some(true),
             reset: true,
@@ -490,6 +502,7 @@ mod tests {
                 exit_node,
                 advertise_exit_node,
                 advertise_routes,
+                advertise_tags: _,
                 accept_routes,
                 ssh,
                 reset,
@@ -770,6 +783,7 @@ mod tests {
             exit_node: None,
             advertise_exit_node: None,
             advertise_routes: None,
+            advertise_tags: None,
             accept_routes: None,
             ssh: None,
             reset: false,
@@ -787,6 +801,7 @@ mod tests {
                 exit_node,
                 advertise_exit_node,
                 advertise_routes,
+                advertise_tags: _,
                 accept_routes,
                 ssh,
                 reset,
@@ -819,6 +834,7 @@ mod tests {
                 exit_node,
                 advertise_exit_node,
                 advertise_routes,
+                advertise_tags: _,
                 accept_routes,
                 hostname,
                 ..
@@ -846,6 +862,7 @@ mod tests {
             exit_node: Some(None),
             advertise_exit_node: Some(false),
             advertise_routes: Some(vec![]),
+            advertise_tags: None,
             accept_routes: None,
             ssh: None,
             reset: false,
@@ -856,6 +873,7 @@ mod tests {
                 exit_node,
                 advertise_exit_node,
                 advertise_routes,
+                advertise_tags: _,
                 ..
             } => {
                 assert_eq!(
@@ -922,6 +940,7 @@ mod tests {
             exit_node: Some(None),
             advertise_exit_node: None,
             advertise_routes: None,
+            advertise_tags: None,
             accept_routes: None,
             ssh: None,
             reset: false,
@@ -937,6 +956,7 @@ mod tests {
             exit_node: None,
             advertise_exit_node: None,
             advertise_routes: None,
+            advertise_tags: None,
             accept_routes: None,
             ssh: None,
             reset: false,
@@ -1025,6 +1045,7 @@ mod tests {
             exit_node: Some(None),
             advertise_exit_node: None,
             advertise_routes: None,
+            advertise_tags: None,
             ssh: None,
         })
         .unwrap();
@@ -1034,6 +1055,7 @@ mod tests {
             exit_node: None,
             advertise_exit_node: None,
             advertise_routes: None,
+            advertise_tags: None,
             ssh: None,
         })
         .unwrap();

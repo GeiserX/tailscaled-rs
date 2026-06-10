@@ -94,6 +94,10 @@ pub(super) async fn build_config(prefs: &Prefs, key_path: &Path) -> Result<tails
         })
         .collect::<Result<Vec<ipnet::IpNet>>>()?;
     config.advertise_routes = advertise_routes;
+    // ACL tags requested at registration (Go `--advertise-tags`). Stored as raw `tag:<name>` strings
+    // in prefs (validated at the `up`/`set` boundary), mapped verbatim to the engine's
+    // `requested_tags`. Empty = a user-owned node.
+    config.requested_tags = prefs.advertise_tags.clone();
     // Apply a custom control server when prefs carry one; this wins over `TS_CONTROL_URL` and
     // the engine default. A malformed URL fails loudly rather than silently falling back —
     // pointing at the wrong control plane must never be silent. Only `http`/`https` are accepted

@@ -560,6 +560,7 @@ async fn dispatch(
             exit_node,
             advertise_exit_node,
             advertise_routes,
+            advertise_tags,
             accept_routes,
             ssh,
             reset,
@@ -579,6 +580,7 @@ async fn dispatch(
                 exit_node,
                 advertise_exit_node,
                 advertise_routes,
+                advertise_tags,
                 accept_routes,
                 ssh,
                 reset,
@@ -615,6 +617,7 @@ async fn dispatch(
             exit_node,
             advertise_exit_node,
             advertise_routes,
+            advertise_tags,
             ssh,
         } => {
             let opts = ipn::SetOptions {
@@ -623,6 +626,7 @@ async fn dispatch(
                 exit_node,
                 advertise_exit_node,
                 advertise_routes,
+                advertise_tags,
                 ssh,
             };
             // `tailscale set` with no flags names no prefs: reject it as a usage error before touching
