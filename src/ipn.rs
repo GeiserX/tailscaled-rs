@@ -143,20 +143,22 @@ pub struct PendingUp {
     generation: u64,
 }
 
-/// Perform the slow engine handshake (`Device::new`) for a [`PendingUp`], **without** holding the
-/// backend lock. This is the multi-second, network-bound step (control-plane registration); keeping
-/// it off-lock is the whole point of the `begin_up`/`finish_up` split — a concurrent `status` (or
-/// any other LocalAPI call) is not blocked behind an in-flight `up`.
+/// Perform the slow engine handshake for a [`PendingUp`], **without** holding the backend lock.
+/// This is the multi-second, network-bound step (control-plane registration); keeping it off-lock is
+/// the whole point of the `begin_up`/`finish_up` split — a concurrent `status` (or any other LocalAPI
+/// call) is not blocked behind an in-flight `up`.
 ///
-/// The auth-key secret is exposed exactly once, here, for the single engine call that needs the
-/// plaintext; the exposed `String` lives no longer than this call.
+/// The auth-key flows in as a [`secrecy::SecretString`] and is handed to the engine's
+/// [`Device::new_with_secret`](tailscale::Device::new_with_secret) **still wrapped** (engine ask #2 /
+/// `tsd-tnv`, shipped in engine v0.8.0). The daemon never exposes it as a plain `String` — the
+/// plaintext window is confined to the single `.expose_secret()` inside the engine's own
+/// `new_with_secret`, byte-for-byte identical to a direct `new` but with no daemon-side plaintext copy
+/// to linger un-zeroized.
 pub async fn build_device(
     pending: &PendingUp,
     authkey: Option<secrecy::SecretString>,
 ) -> Result<tailscale::Device> {
-    use secrecy::ExposeSecret;
-    let authkey_string = authkey.as_ref().map(|s| s.expose_secret().to_string());
-    tailscale::Device::new(&pending.config, authkey_string)
+    tailscale::Device::new_with_secret(&pending.config, authkey)
         .await
         .map_err(|e| anyhow!("engine start failed: {e:?}"))
 }

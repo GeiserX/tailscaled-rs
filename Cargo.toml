@@ -36,7 +36,7 @@ path = "src/bin/tnet.rs"
 #   paths = ["/path/to/your/tailscale-rs/checkout"]
 # transparently overrides this git dep when the local checkout's version matches the pin —
 # so you can edit the engine and rebuild the daemon with no manifest change. See README.
-tailscale = { package = "geiserx_tailscale", git = "https://github.com/GeiserX/tailscale-rs", rev = "dd4b33e2430f49779991abd0c70df5c0ab3dafd1" }
+tailscale = { package = "geiserx_tailscale", git = "https://github.com/GeiserX/tailscale-rs", rev = "bf07c256f180eb310593e6dd2aa74855d7fe8e19" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
 serde = { version = "1", features = ["derive"] }
