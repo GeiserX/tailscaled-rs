@@ -16,3 +16,7 @@
 
 # oh-my-claudecode session state (local only)
 .omc/
+
+# Local-only working docs — never commit (private direction / coordination)
+docs/GOAL.md
+docs/COORDINATE.md
