@@ -366,7 +366,7 @@ pub struct PrefsView {
 }
 
 /// A single peer entry in a [`StatusReport`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PeerReport {
     /// Display name (FQDN if known, else bare hostname).
     pub name: String,
@@ -374,6 +374,17 @@ pub struct PeerReport {
     pub ipv4: String,
     /// Whether the peer advertises a default route (is an exit-node candidate).
     pub is_exit_node: bool,
+    /// The peer's stable node ID (the engine's `StableNodeId`). Used as the Go `status --json`
+    /// `Peer`-map key. NOTE: Go keys that map by the node *public key* (`nodekey:…`); this fork keys
+    /// by the stable node ID instead, since that is the durable peer identifier the engine surfaces —
+    /// a documented, honest deviation (see the `status --json` renderer). `#[serde(default)]` keeps
+    /// the wire backward-compatible with clients/daemons that predate this field.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stable_id: String,
+    /// Whether the peer is currently online (connected to the control plane), if known. `None` when
+    /// the engine has not reported liveness for this peer. Feeds the Go `PeerStatus.Online` field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub online: Option<bool>,
 }
 
 #[cfg(test)]
@@ -531,6 +542,7 @@ mod tests {
                 name: "peer-b".to_string(),
                 ipv4: "100.64.0.2".to_string(),
                 is_exit_node: true,
+                ..Default::default()
             }],
         });
         let json = serde_json::to_string(&report).unwrap();

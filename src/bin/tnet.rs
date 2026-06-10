@@ -221,6 +221,10 @@ enum Command {
         /// (Ctrl-C). Like `tailscale status --watch`.
         #[arg(long)]
         watch: bool,
+        /// Output as JSON, in the shape of Go's `ipnstate.Status` (a faithful subset). Mirrors
+        /// `tailscale status --json`.
+        #[arg(long)]
+        json: bool,
     },
     /// Block until the node is connected (state `Running` with a tailnet IP), then exit 0. Mirrors
     /// Go `tailscale wait` — handy in scripts as `tnet wait && start-my-service`.
@@ -375,6 +379,9 @@ async fn main() -> Result<()> {
     // successful bring-up we follow with a `status` to surface the control auth URL the operator
     // must visit (it isn't known at `up`-time; it arrives once the engine reaches `NeedsLogin`).
     let mut interactive_up = false;
+    // Track whether the user asked for `status --json`, so the (generic) `Response::Status` render
+    // site below emits the Go `ipnstate.Status`-shaped JSON instead of the human table.
+    let mut status_json = false;
     let request = match cli.command {
         Command::Up {
             authkey,
@@ -584,12 +591,13 @@ async fn main() -> Result<()> {
         }
         // `status --watch` is a long-lived stream, not a one-shot round-trip — handle it here and
         // return. Plain `status` falls through to the one-shot path below.
-        Command::Status { watch } => {
+        Command::Status { watch, json } => {
             if watch {
                 return watch_status(&socket)
                     .await
                     .with_context(|| format!("watching status at {}", socket.display()));
             }
+            status_json = json;
             Request::Status
         }
         Command::Ip => Request::Ip,
@@ -623,7 +631,20 @@ async fn main() -> Result<()> {
         .with_context(|| format!("talking to daemon at {}", socket.display()))?;
 
     match response {
-        Response::Status(s) => print_status(&s),
+        Response::Status(s) => {
+            if status_json {
+                // Go `status --json`: the ipnstate.Status-shaped object (faithful subset).
+                match format_status_json(&s) {
+                    Ok(out) => print!("{out}"),
+                    Err(e) => {
+                        eprintln!("error: serializing status: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                print_status(&s);
+            }
+        }
         // This node's own tailnet addresses (`tnet ip`), one per line; a node with no address yet
         // (no netmap received) prints a clear placeholder rather than nothing.
         Response::Ip { ipv4, ipv6 } => print!("{}", format_ip(ipv4.as_deref(), ipv6.as_deref())),
@@ -1058,6 +1079,71 @@ fn print_status(s: &tailscaled_rs::localapi::StatusReport) {
             if p.is_exit_node { "  [exit]" } else { "" }
         );
     }
+}
+
+/// Render `tnet status --json` as a Go `ipnstate.Status`-shaped object (a faithful subset). Built via
+/// `serde_json` so it is escape-safe and emits bare booleans, 2-space indented like Go.
+///
+/// We populate only fields we can fill truthfully and use Go's exact key names (`BackendState`,
+/// `AuthURL`, `TailscaleIPs`, `Self`, `Peer`, …). `BackendState` is our `state` string, which is
+/// already one of Go's canonical `ipn.State` names (`NoState`/`NeedsLogin`/`NeedsMachineAuth`/
+/// `Stopped`/`Starting`/`Running`). Each `PeerStatus` carries the subset we know: `HostName`/`DNSName`
+/// (our peer name), `TailscaleIPs`, `ExitNodeOption` (our `is_exit_node`), and `Online` when known.
+///
+/// DEVIATION (documented): Go keys the `Peer` map by the node **public key** (`"nodekey:…"`); this
+/// fork keys it by the engine's **StableNodeID** instead, since that is the durable per-peer
+/// identifier the daemon surfaces (see [`tailscaled_rs::localapi::PeerReport::stable_id`]). A peer
+/// missing a stable id (older daemon) falls back to its name as the key.
+fn format_status_json(s: &tailscaled_rs::localapi::StatusReport) -> Result<String> {
+    use serde_json::{Map, Value, json};
+
+    // Self: a PeerStatus subset from the self_* fields.
+    let self_node = if s.self_ipv4.is_some() || s.self_name.is_some() {
+        let mut m = Map::new();
+        if let Some(name) = &s.self_name {
+            m.insert("HostName".into(), json!(name));
+            m.insert("DNSName".into(), json!(name));
+        }
+        m.insert(
+            "TailscaleIPs".into(),
+            json!(s.self_ipv4.iter().collect::<Vec<_>>()),
+        );
+        Value::Object(m)
+    } else {
+        Value::Null
+    };
+
+    // Peer map, keyed by stable id (Go uses the node public key — see the doc note).
+    let mut peers = Map::new();
+    for p in &s.peers {
+        let key = if p.stable_id.is_empty() {
+            p.name.clone()
+        } else {
+            p.stable_id.clone()
+        };
+        let mut pm = Map::new();
+        pm.insert("HostName".into(), json!(p.name));
+        pm.insert("DNSName".into(), json!(p.name));
+        pm.insert("TailscaleIPs".into(), json!([p.ipv4]));
+        pm.insert("ExitNodeOption".into(), json!(p.is_exit_node));
+        if let Some(online) = p.online {
+            pm.insert("Online".into(), json!(online));
+        }
+        peers.insert(key, Value::Object(pm));
+    }
+
+    let mut root = Map::new();
+    root.insert("BackendState".into(), json!(s.state));
+    // AuthURL: Go emits the field always (empty when none); mirror that.
+    root.insert("AuthURL".into(), json!(s.auth_url.as_deref().unwrap_or("")));
+    root.insert(
+        "TailscaleIPs".into(),
+        json!(s.self_ipv4.iter().collect::<Vec<_>>()),
+    );
+    root.insert("Self".into(), self_node);
+    root.insert("Peer".into(), Value::Object(peers));
+
+    Ok(format!("{}\n", serde_json::to_string_pretty(&root)?))
 }
 
 /// Stream status: send `Request::Watch` and print each [`StatusReport`] the daemon pushes (an
@@ -1925,6 +2011,63 @@ mod tests {
 
         // Unknown setting → error (Go errors too).
         assert!(format_get(&view, Some("no-such-setting"), false).is_err());
+    }
+
+    #[test]
+    fn format_status_json_is_go_shaped() {
+        use tailscaled_rs::localapi::{PeerReport, PrefsView, StatusReport};
+        let report = StatusReport {
+            state: "Running".to_string(),
+            want_running: true,
+            self_ipv4: Some("100.70.22.12".to_string()),
+            self_name: Some("node-a".to_string()),
+            auth_url: None,
+            error: None,
+            prefs: PrefsView::default(),
+            peers: vec![
+                PeerReport {
+                    name: "peer-b".to_string(),
+                    ipv4: "100.64.0.2".to_string(),
+                    is_exit_node: true,
+                    stable_id: "nABC123".to_string(),
+                    online: Some(true),
+                },
+                PeerReport {
+                    name: "peer-c".to_string(),
+                    ipv4: "100.64.0.3".to_string(),
+                    is_exit_node: false,
+                    stable_id: String::new(), // missing id → keyed by name (fallback)
+                    online: None,
+                },
+            ],
+        };
+        let out = format_status_json(&report).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&out).expect("status --json must be valid JSON");
+
+        // Go key names + the exact BackendState string.
+        assert_eq!(v["BackendState"], serde_json::json!("Running"));
+        assert_eq!(v["AuthURL"], serde_json::json!("")); // always present, empty when none
+        assert_eq!(v["TailscaleIPs"], serde_json::json!(["100.70.22.12"]));
+        // Self subset.
+        assert_eq!(v["Self"]["HostName"], serde_json::json!("node-a"));
+        assert_eq!(
+            v["Self"]["TailscaleIPs"],
+            serde_json::json!(["100.70.22.12"])
+        );
+        // Peer map keyed by stable_id (with name-fallback for the id-less peer).
+        assert_eq!(
+            v["Peer"]["nABC123"]["HostName"],
+            serde_json::json!("peer-b")
+        );
+        assert_eq!(
+            v["Peer"]["nABC123"]["ExitNodeOption"],
+            serde_json::json!(true)
+        );
+        assert_eq!(v["Peer"]["nABC123"]["Online"], serde_json::json!(true));
+        assert_eq!(v["Peer"]["peer-c"]["HostName"], serde_json::json!("peer-c"));
+        // The id-less peer has no Online key (None → skipped).
+        assert!(v["Peer"]["peer-c"].get("Online").is_none());
     }
 
     #[tokio::test]
