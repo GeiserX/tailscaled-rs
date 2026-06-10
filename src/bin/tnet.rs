@@ -252,8 +252,23 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Show this node's tailnet IP addresses.
-    Ip,
+    /// Show tailnet IP addresses — this node's by default, or a peer's if named. Mirrors Go
+    /// `tailscale ip`.
+    Ip {
+        /// Show only the IPv4 address (Go `-4`). Mutually exclusive with `-6`.
+        #[arg(short = '4', conflicts_with = "v6")]
+        v4: bool,
+        /// Show only the IPv6 address (Go `-6`). Mutually exclusive with `-4`.
+        #[arg(short = '6')]
+        v6: bool,
+        /// Show only the first/primary address (Go `-1`).
+        #[arg(short = '1')]
+        first: bool,
+        /// A peer (by MagicDNS name or IP) whose address to show instead of this node's. Resolved
+        /// against the current netmap (the peer set `status` reports).
+        #[arg(value_name = "PEER")]
+        peer: Option<String>,
+    },
     /// Show which tailnet node owns an IP address.
     Whois {
         /// The tailnet IP to resolve to its owning node.
@@ -625,7 +640,59 @@ async fn main() -> Result<()> {
             };
             Request::Status
         }
-        Command::Ip => Request::Ip,
+        // `ip` (Go `tailscale ip`): self addresses by default, or a peer's if named, with -4/-6/-1
+        // filters. Handled inline because the filters + the optional peer lookup shape the output
+        // (and the peer case fetches Status to resolve by name/IP against the netmap).
+        Command::Ip {
+            v4,
+            v6,
+            first,
+            peer,
+        } => {
+            let sel = IpSelect { v4, v6, first };
+            let out = if let Some(peer) = peer {
+                // Peer address: resolve the named peer against the status peer set (by MagicDNS name
+                // or tailnet IP). We fetch Status (not whois, which is IP-only) so a NAME also works.
+                let status = match round_trip(&socket, &Request::Status).await {
+                    Ok(Response::Status(s)) => s,
+                    Ok(other) => anyhow::bail!("unexpected response to status request: {other:?}"),
+                    Err(e) => {
+                        return Err(e)
+                            .with_context(|| format!("querying status at {}", socket.display()));
+                    }
+                };
+                match status
+                    .peers
+                    .iter()
+                    .find(|p| p.name == peer || p.ipv4 == peer)
+                {
+                    // Peers currently expose only an IPv4 in our PeerReport, so -6 yields nothing.
+                    Some(p) => format_ip_filtered(Some(&p.ipv4), None, sel),
+                    None => {
+                        eprintln!("no peer matching {peer:?} in the current netmap");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                // Self addresses.
+                match round_trip(&socket, &Request::Ip).await {
+                    Ok(Response::Ip { ipv4, ipv6 }) => {
+                        format_ip_filtered(ipv4.as_deref(), ipv6.as_deref(), sel)
+                    }
+                    Ok(Response::Error { message }) => {
+                        eprintln!("error: {message}");
+                        std::process::exit(1);
+                    }
+                    Ok(other) => anyhow::bail!("unexpected response to ip request: {other:?}"),
+                    Err(e) => {
+                        return Err(e)
+                            .with_context(|| format!("querying ip at {}", socket.display()));
+                    }
+                }
+            };
+            print!("{out}");
+            return Ok(());
+        }
         Command::Whois { ip } => Request::Whois { ip },
         // `--timeout` (ms) maps straight to the wire's `timeout_ms`; omitting it sends `None`, which
         // the daemon reads as "use a sensible default".
@@ -675,6 +742,8 @@ async fn main() -> Result<()> {
         }
         // This node's own tailnet addresses (`tnet ip`), one per line; a node with no address yet
         // (no netmap received) prints a clear placeholder rather than nothing.
+        // `ip` is handled inline above (early return) so its -4/-6/-1/peer logic stays in one place;
+        // this arm is exhaustiveness-only. Render unfiltered defensively if one ever reaches here.
         Response::Ip { ipv4, ipv6 } => print!("{}", format_ip(ipv4.as_deref(), ipv6.as_deref())),
         // The owner of a tailnet IP (`tnet whois`). The node name is control-supplied text, so it is
         // run through `sanitize_for_terminal` inside the formatter before printing. The queried IP
@@ -984,6 +1053,44 @@ fn format_ip(ipv4: Option<&str>, ipv6: Option<&str>) -> String {
     }
     if out.is_empty() {
         out.push_str("(no tailnet address yet)\n");
+    }
+    out
+}
+
+/// Address-family / count selection for `tnet ip` (Go `-4`/`-6`/`-1`). `v4`/`v6` are mutually
+/// exclusive (clap enforces). Default = all addresses, both families.
+#[derive(Default, Clone, Copy)]
+struct IpSelect {
+    v4: bool,
+    v6: bool,
+    first: bool,
+}
+
+/// Format `tnet ip` output applying an [`IpSelect`]: `-4` keeps only IPv4, `-6` only IPv6, `-1` only
+/// the first selected address (Go's quad-one). With no flags, both families print (IPv4 then IPv6),
+/// one per line. A placeholder is printed only when nothing is selectable. Pure → unit-testable.
+fn format_ip_filtered(ipv4: Option<&str>, ipv6: Option<&str>, sel: IpSelect) -> String {
+    // Apply family filter: -4 drops v6, -6 drops v4; neither keeps both.
+    let want_v4 = !sel.v6; // -6 hides v4
+    let want_v6 = !sel.v4; // -4 hides v6
+    let mut addrs: Vec<&str> = Vec::new();
+    if want_v4 && let Some(v4) = ipv4 {
+        addrs.push(v4);
+    }
+    if want_v6 && let Some(v6) = ipv6 {
+        addrs.push(v6);
+    }
+    // -1: only the first (Go's quad-one — the primary address).
+    if sel.first {
+        addrs.truncate(1);
+    }
+    if addrs.is_empty() {
+        return "(no matching tailnet address)\n".to_string();
+    }
+    let mut out = String::new();
+    for a in addrs {
+        out.push_str(a);
+        out.push('\n');
     }
     out
 }
@@ -2077,6 +2184,79 @@ mod tests {
 
         // Unknown setting → error (Go errors too).
         assert!(format_get(&view, Some("no-such-setting"), false).is_err());
+    }
+
+    #[test]
+    fn format_ip_filtered_selects_family_and_first() {
+        let v4 = Some("100.64.0.1");
+        let v6 = Some("fd7a::1");
+
+        // No flags → both, v4 then v6.
+        assert_eq!(
+            format_ip_filtered(v4, v6, IpSelect::default()),
+            "100.64.0.1\nfd7a::1\n"
+        );
+        // -4 → only v4.
+        assert_eq!(
+            format_ip_filtered(
+                v4,
+                v6,
+                IpSelect {
+                    v4: true,
+                    ..Default::default()
+                }
+            ),
+            "100.64.0.1\n"
+        );
+        // -6 → only v6.
+        assert_eq!(
+            format_ip_filtered(
+                v4,
+                v6,
+                IpSelect {
+                    v6: true,
+                    ..Default::default()
+                }
+            ),
+            "fd7a::1\n"
+        );
+        // -1 → only the first (v4, since both present).
+        assert_eq!(
+            format_ip_filtered(
+                v4,
+                v6,
+                IpSelect {
+                    first: true,
+                    ..Default::default()
+                }
+            ),
+            "100.64.0.1\n"
+        );
+        // -6 -1 → first of the v6-only set.
+        assert_eq!(
+            format_ip_filtered(
+                v4,
+                v6,
+                IpSelect {
+                    v6: true,
+                    first: true,
+                    ..Default::default()
+                }
+            ),
+            "fd7a::1\n"
+        );
+        // -4 with only v6 available → nothing matches.
+        assert_eq!(
+            format_ip_filtered(
+                None,
+                v6,
+                IpSelect {
+                    v4: true,
+                    ..Default::default()
+                }
+            ),
+            "(no matching tailnet address)\n"
+        );
     }
 
     #[test]
