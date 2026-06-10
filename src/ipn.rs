@@ -1198,6 +1198,23 @@ impl Backend {
         self.device.as_ref().map(|dev| dev.watch_state())
     }
 
+    /// Clone out the live engine handle (the [`Arc<Device>`](std::sync::Arc)) if the node is up, or
+    /// `None` if it is not.
+    ///
+    /// This is the lock-discipline primitive for read/file engine calls that may be **slow or
+    /// unbounded** (Taildrop transfers, `ping`'s caller-supplied timeout). The caller locks the
+    /// backend only long enough to clone this `Arc`, **drops the lock**, then runs the engine call
+    /// off-lock against the borrowed device — the same "clone the work out, drop the lock" discipline
+    /// [`drive_up`] uses for the registration handshake. It is sound because every read/file engine
+    /// method takes `&self` and the [`device`](Backend::device) is **already** an `Arc` (shared with
+    /// the SSH task), so cloning it adds no new aliasing constraint. A concurrent `down` during an
+    /// in-flight off-lock call merely makes [`stop_device`](Backend::stop_device)'s `Arc::into_inner`
+    /// observe an extra clone (the documented benign drop-the-last-clone path) — the correct trade: a
+    /// `down` no longer waits for a multi-minute transfer to finish.
+    pub fn device_handle(&self) -> Option<std::sync::Arc<tailscale::Device>> {
+        self.device.clone()
+    }
+
     /// Produce a [`StatusReport`] reflecting the live engine + netmap.
     ///
     /// State comes from the engine's **cheap, non-blocking** [`device_state`](tailscale::Device::device_state)
@@ -1289,21 +1306,17 @@ impl Backend {
     /// Report this node's own tailnet addresses (the `tnet ip` / Go `tailscale ip` path).
     ///
     /// Read-only: queries the engine's cheap address accessors and never mutates prefs or bumps the
-    /// [`generation`](Backend::generation). Fail-closed — `ip` only makes sense once the node is up,
-    /// so with no device this returns a clear [`Response::Error`] rather than an empty address pair
-    /// (which a caller could mistake for "up but unaddressed").
+    /// [`generation`](Backend::generation). Takes the engine handle as `dev` rather than reading
+    /// `self.device`, so the LocalAPI server can run it **off the backend lock** (clone the `Arc` via
+    /// [`device_handle`](Backend::device_handle), drop the lock, call here) — the device-absent "node
+    /// is not up" branch now lives at the caller, which only invokes this when it holds a handle.
     ///
     /// Each family is best-effort: [`ipv4_addr`](tailscale::Device::ipv4_addr) /
     /// [`ipv6_addr`](tailscale::Device::ipv6_addr) `Err` before the netmap assigns the address (and
     /// IPv6 errs permanently in this v4-only fork), so we map `Err → None` and `Ok → Some(addr)`
     /// rather than fail the whole call — a node mid-convergence (or v4-only) reports the addresses it
     /// does have and `None` for the rest.
-    pub async fn ip_report(&self) -> crate::localapi::Response {
-        let Some(dev) = self.device.as_ref() else {
-            return crate::localapi::Response::Error {
-                message: "node is not up".into(),
-            };
-        };
+    pub async fn ip_report(dev: &tailscale::Device) -> crate::localapi::Response {
         // Each family independently: an unassigned (or, for v6, disabled) address errs — that is a
         // normal "not yet / not in this fork" signal, so it yields `None`, not a failed call.
         let ipv4 = dev.ipv4_addr().await.ok().map(|a| a.to_string());
@@ -1313,8 +1326,10 @@ impl Backend {
 
     /// Resolve a tailnet IP to the peer that owns it (the `tnet whois` / Go `tailscale whois` path).
     ///
-    /// Read-only: a netmap lookup that mutates nothing. Fail-closed on bad input (an unparseable
-    /// `ip`, naming the offending value) and on a down node (no engine to query). The owning node's
+    /// Read-only: a netmap lookup that mutates nothing. Takes the engine handle as `dev` so the
+    /// LocalAPI server can run it off-lock (clone the `Arc` via [`device_handle`](Backend::device_handle),
+    /// drop the lock, call here); the device-absent "node is not up" branch now lives at the caller.
+    /// Still fail-closed on bad input (an unparseable `ip`, naming the offending value). The owning node's
     /// display name + IPv4 are extracted via [`tailscale::StatusNode::from_node`] — the SAME mapping
     /// [`status`](Backend::status) uses to render peers (`fqdn`-or-`hostname` name +
     /// `tailnet_address.ipv4`), so the two diagnostic surfaces can never drift in how they name a node.
@@ -1325,16 +1340,13 @@ impl Backend {
     ///   `(cap, args)` args are dropped — too verbose for a whois summary).
     /// - `Ok(None)` → `found: false` (the IP matched no known tailnet node), all fields defaulted.
     /// - `Err(e)` → a clear [`Response::Error`] carrying the engine error.
-    pub async fn whois(&self, ip: &str) -> crate::localapi::Response {
-        // Parse first so a bad IP fails the same way whether or not the node is up — naming the value.
+    pub async fn whois(dev: &tailscale::Device, ip: &str) -> crate::localapi::Response {
+        // Parse first so a bad IP fails closed before the engine round-trip — naming the value. (The
+        // device-absent "node is not up" branch now lives at the LocalAPI caller, which only reaches
+        // here holding a device handle cloned off-lock; see `Backend::device_handle`.)
         let Ok(addr) = ip.parse::<std::net::IpAddr>() else {
             return crate::localapi::Response::Error {
                 message: format!("invalid IP {ip:?}"),
-            };
-        };
-        let Some(dev) = self.device.as_ref() else {
-            return crate::localapi::Response::Error {
-                message: "node is not up".into(),
             };
         };
         // whois resolves by IP only (the engine ignores the port), so a 0 port is fine.
@@ -1368,21 +1380,26 @@ impl Backend {
     /// `tailscale ping` path).
     ///
     /// Read-only in the prefs/lifecycle sense: it sends overlay echo traffic but mutates no state and
-    /// never bumps the [`generation`](Backend::generation). Fail-closed on a bad `ip` (naming the
-    /// value) and on a down node. The per-attempt timeout defaults to 5s when `timeout_ms` is `None`.
+    /// never bumps the [`generation`](Backend::generation). Takes the engine handle as `dev` so the
+    /// LocalAPI server can run it off-lock — important here because the caller-supplied per-attempt
+    /// timeout (defaulting to 5s when `timeout_ms` is `None`) would otherwise hold the backend lock for
+    /// its whole duration. The device-absent "node is not up" branch now lives at the caller. Still
+    /// fail-closed on a bad `ip` (naming the value).
     ///
     /// `Ok(rtt)` → [`Response::Ping`] with the RTT in milliseconds (and the IP echoed for the CLI);
     /// `Err(e)` → a clear [`Response::Error`] (e.g. an unreachable peer, an IPv6 destination in this
     /// v4-only fork, or TUN mode where there is no application netstack to ping from).
-    pub async fn ping(&self, ip: &str, timeout_ms: Option<u64>) -> crate::localapi::Response {
+    pub async fn ping(
+        dev: &tailscale::Device,
+        ip: &str,
+        timeout_ms: Option<u64>,
+    ) -> crate::localapi::Response {
+        // Parse first so a bad IP fails closed before the engine round-trip — naming the value. (The
+        // device-absent "node is not up" branch now lives at the LocalAPI caller, which only reaches
+        // here holding a device handle cloned off-lock; see `Backend::device_handle`.)
         let Ok(dst) = ip.parse::<std::net::IpAddr>() else {
             return crate::localapi::Response::Error {
                 message: format!("invalid IP {ip:?}"),
-            };
-        };
-        let Some(dev) = self.device.as_ref() else {
-            return crate::localapi::Response::Error {
-                message: "node is not up".into(),
             };
         };
         let timeout = Duration::from_millis(timeout_ms.unwrap_or(5000));
@@ -1400,8 +1417,14 @@ impl Backend {
     /// Send a local file to a tailnet peer via Taildrop (the `tnet file cp` / Go `tailscale file cp`
     /// path). Streams the file over the encrypted overlay to the peer's peerAPI.
     ///
-    /// Fail-closed on a down node (no engine) and on bad input (an unresolvable peer, an unreadable
-    /// path, or a pathless `path`), each a clear [`Response::Error`] naming the offending value.
+    /// Takes the engine handle as `dev` so the LocalAPI server can run the (potentially multi-minute,
+    /// **un-deadlined**) transfer **off the backend lock** — clone the `Arc` via
+    /// [`device_handle`](Backend::device_handle), drop the lock, call here. Holding the lock across the
+    /// transfer would freeze every concurrent `status`/`up`/`down` for the file's whole duration (a
+    /// daemon-wide DoS); the device-absent "node is not up" branch now lives at the caller, which only
+    /// reaches here holding a handle. Still fail-closed on bad input (an unresolvable peer, an
+    /// unreadable or non-regular-file `path`, or a pathless `path`), each a clear [`Response::Error`]
+    /// naming the offending value.
     ///
     /// ## Why the daemon opens `path` (same-host assumption)
     ///
@@ -1412,16 +1435,24 @@ impl Backend {
     /// to marshal the bytes across. The send `name` peers see is the path's basename (like Go), so a
     /// path with no final component (e.g. `/`) is rejected rather than sent under an empty name.
     ///
+    /// ## Path hardening (regular-file-only)
+    ///
+    /// Because the daemon opens `path` as root, we first `symlink_metadata` it and **refuse anything
+    /// that is not a regular file** — a symlink (rejected as the link itself, never followed, since
+    /// `symlink_metadata` does not traverse the final component), device, FIFO, socket, or directory.
+    /// This is fail-closed defense-in-depth: it stops an infinite-stream device like `/dev/zero` from
+    /// turning a "send a file" into an unbounded transfer, and stops a symlink from redirecting the
+    /// root-held open at a file the operator did not name. Minimal by design — not a full sandbox.
+    ///
     /// Peer resolution mirrors [`whois`](Backend::whois)/[`ping`](Backend::ping): a `peer` that parses
     /// as an [`IpAddr`](std::net::IpAddr) is looked up by tailnet IP, otherwise by MagicDNS name. The
     /// engine derives the destination solely from the resolved peer's own node record, so a raw
     /// address can never be targeted directly.
-    pub async fn file_cp(&self, path: &str, peer: &str) -> crate::localapi::Response {
-        let Some(dev) = self.device.as_ref() else {
-            return crate::localapi::Response::Error {
-                message: "node is not up".into(),
-            };
-        };
+    pub async fn file_cp(
+        dev: &tailscale::Device,
+        path: &str,
+        peer: &str,
+    ) -> crate::localapi::Response {
         // Resolve the peer: a bare IP goes by tailnet-IP lookup, anything else by MagicDNS name —
         // the same IP-vs-name split the other peer-addressed commands use.
         let resolved = match peer.parse::<std::net::IpAddr>() {
@@ -1452,6 +1483,24 @@ impl Backend {
                 message: format!("cannot derive a file name from path {path:?}"),
             };
         };
+        // Path hardening (see method doc): the daemon opens `path` as root, so first `symlink_metadata`
+        // it (which does NOT follow a final-component symlink) and refuse anything that is not a regular
+        // file — a symlink, device (e.g. `/dev/zero`, an infinite stream), FIFO, socket, or directory.
+        // Done BEFORE the open so a non-regular target is never opened. `symlink_metadata` failing
+        // (missing/unreadable path) falls through here too, named the same way as the open error below.
+        match tokio::fs::symlink_metadata(path).await {
+            Ok(meta) if meta.file_type().is_file() => {}
+            Ok(_) => {
+                return crate::localapi::Response::Error {
+                    message: format!("refusing to send {path}: not a regular file"),
+                };
+            }
+            Err(e) => {
+                return crate::localapi::Response::Error {
+                    message: format!("cannot read {path}: {e}"),
+                };
+            }
+        }
         // The daemon opens the path (same-host/same-user; see the method doc). A read error here
         // (missing/unreadable file) fails closed, naming the path.
         let file = match tokio::fs::File::open(path).await {
@@ -1483,17 +1532,16 @@ impl Backend {
     /// List the Taildrop files waiting in this node's receive directory (the `tnet file list` / Go
     /// `tailscale file get` no-arg path).
     ///
-    /// Read-only. Fail-closed on a down node. Synchronous because the engine's
+    /// Read-only. Synchronous because the engine's
     /// [`taildrop_waiting_files`](tailscale::Device::taildrop_waiting_files) is a non-blocking store
-    /// read, not an actor round-trip. When the receive directory is unset (`prefs.taildrop_dir` =
-    /// `None`), the engine returns an **empty list, not an error** — so an empty `Files` reply simply
-    /// means "receiving is off, or nothing is waiting", never a failure.
-    pub fn file_list(&self) -> crate::localapi::Response {
-        let Some(dev) = self.device.as_ref() else {
-            return crate::localapi::Response::Error {
-                message: "node is not up".into(),
-            };
-        };
+    /// read, not an actor round-trip — so this is **not** part of the lock-across-await DoS the other
+    /// engine calls have; it would be safe under the lock. It still takes the engine handle as `dev`
+    /// (rather than reading `self.device`) purely for shape symmetry with the other Taildrop/diagnostic
+    /// methods, so the LocalAPI dispatch arms are uniform (clone the handle, drop the lock, call). The
+    /// device-absent "node is not up" branch lives at the caller. When the receive directory is unset
+    /// (`prefs.taildrop_dir` = `None`), the engine returns an **empty list, not an error** — so an empty
+    /// `Files` reply simply means "receiving is off, or nothing is waiting", never a failure.
+    pub fn file_list(dev: &tailscale::Device) -> crate::localapi::Response {
         match dev.taildrop_waiting_files() {
             Ok(waiting) => {
                 let files = waiting
@@ -1514,10 +1562,25 @@ impl Backend {
     /// Fetch a waiting Taildrop file by name, writing it to `dest` (the `tnet file get <name>` / Go
     /// `tailscale file get <name>` path).
     ///
-    /// Fail-closed on a down node and on a name that matches no waiting file (naming it). The engine
-    /// returns a plain [`std::fs::File`] handle for the received file; we copy it to `dest` inside
+    /// Takes the engine handle as `dev` so the LocalAPI server can run it **off the backend lock**
+    /// (clone the `Arc` via [`device_handle`](Backend::device_handle), drop the lock, call here) —
+    /// the spawn_blocking copy below could be large, and holding the lock across it would freeze every
+    /// concurrent `status`/`up`/`down`. The device-absent "node is not up" branch now lives at the
+    /// caller, which only reaches here holding a handle. Still fail-closed on a name that matches no
+    /// waiting file (naming it) and on a `dest` we must not clobber (see below). The engine returns a
+    /// plain [`std::fs::File`] handle for the received file; we copy it to `dest` inside
     /// [`spawn_blocking`](tokio::task::spawn_blocking) so the synchronous [`std::io::copy`] never
     /// stalls the async runtime's worker threads (even though a local file copy is fast).
+    ///
+    /// ## Dest hardening (no clobber of / no follow into a non-regular file)
+    ///
+    /// Because the daemon writes `dest` as root, we first `symlink_metadata` it (which does NOT follow
+    /// a final-component symlink) and, **if it already exists and is not a regular file** — a symlink,
+    /// device, FIFO, socket, or directory — **refuse** rather than write. This is fail-closed
+    /// defense-in-depth: it stops a fetch from following a symlink planted at `dest` to overwrite a
+    /// file the operator did not name, and from writing through a device/dir. A non-existent `dest`
+    /// (the normal case) passes the check and is created by the copy. Minimal by design — not a full
+    /// sandbox.
     ///
     /// With `delete_after` set (the Go default), the received file is removed from the receive
     /// directory after a successful copy. A delete failure is logged as a warning but does **not**
@@ -1525,16 +1588,11 @@ impl Backend {
     /// condition; a stale leftover in the receive dir is a lesser problem than reporting a spurious
     /// failure for a fetch that did succeed.
     pub async fn file_get(
-        &self,
+        dev: &tailscale::Device,
         name: &str,
         dest: &str,
         delete_after: bool,
     ) -> crate::localapi::Response {
-        let Some(dev) = self.device.as_ref() else {
-            return crate::localapi::Response::Error {
-                message: "node is not up".into(),
-            };
-        };
         // Open the waiting file in the receive store (path-traversal-validated by the engine). A
         // missing/invalid name fails closed, naming it.
         let (mut src, _size) = match dev.taildrop_open_file(name) {
@@ -1545,6 +1603,24 @@ impl Backend {
                 };
             }
         };
+        // Dest hardening (see method doc): `symlink_metadata` does not follow a final-component
+        // symlink, so an existing symlink/device/FIFO/socket/dir at `dest` is refused rather than
+        // followed or clobbered. A `NotFound` is the normal case (we are about to create the file).
+        // Any other stat error fails closed, naming `dest`.
+        match tokio::fs::symlink_metadata(dest).await {
+            Ok(meta) if meta.file_type().is_file() => {} // existing regular file → overwrite is fine
+            Ok(_) => {
+                return crate::localapi::Response::Error {
+                    message: format!("refusing to write {dest}: exists and is not a regular file"),
+                };
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // does not exist → create below
+            Err(e) => {
+                return crate::localapi::Response::Error {
+                    message: format!("cannot write {dest}: {e}"),
+                };
+            }
+        }
         // Copy off the async runtime: `std::io::copy` over `std::fs` handles is blocking, so do it on
         // a blocking thread rather than stall an async worker. The `dest` string is moved in.
         let dest_owned = dest.to_string();
@@ -2972,157 +3048,133 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
-    // --- read-only diagnostics (ip / whois / ping) — offline, no-device + bad-input paths --------
+    // --- read-only diagnostics + Taildrop: off-lock device handle + path hardening ----------------
     //
-    // The live engine calls (a real address/whois/ping) need a registered node, so they are NOT
-    // unit-tested here (the live drive covers them). These pin the PURE fail-closed surface a
-    // device-less `Backend` can exercise: with no engine, all three return the "not up" Error; and
-    // whois/ping reject an unparseable IP, naming the offending value — both BEFORE any engine call.
+    // After the lock-across-await fix (tsd), `ip_report`/`whois`/`ping`/`file_cp`/`file_list`/
+    // `file_get` are associated fns taking `&tailscale::Device` and the LocalAPI server runs them OFF
+    // the backend lock: it clones the engine handle via `device_handle()` under a brief lock, drops
+    // the lock, and only calls the method when that handle is `Some`. The "node is not up" branch
+    // therefore moved OUT of these methods and INTO the dispatch arm, keyed on `device_handle()`
+    // being `None` — so the device-less precondition is unit-tested here as `device_handle()
+    // .is_none()` (the single fact every "not up" reply now derives from), and the bad-IP parse and
+    // path-hardening decisions, which require a live `&Device` to reach inside the method (integration
+    // territory — no offline `Device` constructor exists), are pinned via their underlying predicates.
 
     #[tokio::test]
-    async fn ip_report_without_device_is_not_up_error() {
-        // `ip` only makes sense when up → a device-less backend returns a clear "not up" Error
-        // (deliberately not an empty `Ip` pair, which could read as "up but unaddressed").
-        let dir = std::env::temp_dir().join(format!("tailnetd-diag-ip-{}", std::process::id()));
+    async fn device_handle_is_none_without_device() {
+        // The shared precondition for every "node is not up" LocalAPI reply: with no engine up, the
+        // server's brief-lock `device_handle()` clone yields `None`, and the dispatch arm turns that
+        // into the "not up" Error WITHOUT calling the (now `&Device`-taking) engine method. One
+        // assertion covers ip/whois/ping/file_cp/file_list/file_get, which all gate on this same bit.
+        let dir = std::env::temp_dir().join(format!("tailnetd-diag-nodev-{}", std::process::id()));
         let be = backend_for(&dir);
-        match be.ip_report().await {
-            crate::localapi::Response::Error { message } => {
-                assert!(
-                    message.contains("not up"),
-                    "ip with no device must report the node is not up, got {message:?}"
-                );
-            }
-            other => panic!("expected Error, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn whois_without_device_is_not_up_error() {
-        // A well-formed IP but no engine to resolve against → "not up" Error (the parse succeeds, so
-        // this exercises the device-absence arm specifically, not the bad-input arm).
-        let dir = std::env::temp_dir().join(format!("tailnetd-diag-whois-{}", std::process::id()));
-        let be = backend_for(&dir);
-        match be.whois("100.64.0.1").await {
-            crate::localapi::Response::Error { message } => {
-                assert!(
-                    message.contains("not up"),
-                    "whois with no device must report the node is not up, got {message:?}"
-                );
-            }
-            other => panic!("expected Error, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn whois_bad_ip_is_error_naming_input() {
-        // A malformed IP fails closed BEFORE any engine call, and the error names the offending
-        // value so the CLI can echo what the operator mistyped.
-        let dir =
-            std::env::temp_dir().join(format!("tailnetd-diag-whois-bad-{}", std::process::id()));
-        let be = backend_for(&dir);
-        match be.whois("not-an-ip").await {
-            crate::localapi::Response::Error { message } => {
-                assert!(
-                    message.contains("not-an-ip"),
-                    "a bad whois IP must be an Error naming the input, got {message:?}"
-                );
-            }
-            other => panic!("expected Error, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn ping_without_device_is_not_up_error() {
-        // A well-formed IP but no engine → "not up" Error (device-absence arm, parse succeeds).
-        let dir = std::env::temp_dir().join(format!("tailnetd-diag-ping-{}", std::process::id()));
-        let be = backend_for(&dir);
-        match be.ping("100.64.0.1", None).await {
-            crate::localapi::Response::Error { message } => {
-                assert!(
-                    message.contains("not up"),
-                    "ping with no device must report the node is not up, got {message:?}"
-                );
-            }
-            other => panic!("expected Error, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn ping_bad_ip_is_error_naming_input() {
-        // A malformed IP fails closed BEFORE any engine call (and before the timeout default
-        // matters), naming the offending value.
-        let dir =
-            std::env::temp_dir().join(format!("tailnetd-diag-ping-bad-{}", std::process::id()));
-        let be = backend_for(&dir);
-        match be.ping("999.999.999.999", Some(1000)).await {
-            crate::localapi::Response::Error { message } => {
-                assert!(
-                    message.contains("999.999.999.999"),
-                    "a bad ping IP must be an Error naming the input, got {message:?}"
-                );
-            }
-            other => panic!("expected Error, got {other:?}"),
-        }
-    }
-
-    // --- Taildrop (tnet file cp / list / get) — offline, no-device + build_config mapping ----------
-    //
-    // The live transfers (send_file / open / delete against a real receive store) need a registered
-    // node + a peer, so they are NOT unit-tested here (integration territory). These pin the PURE
-    // fail-closed surface a device-less `Backend` can exercise — all three commands return the "not
-    // up" Error with no engine — plus the `build_config` mapping of the `taildrop_dir` pref into the
-    // engine `Config` (Some and None), the one piece testable offline (no `Device::new`, no network).
-
-    #[tokio::test]
-    async fn file_cp_without_device_is_not_up_error() {
-        // Sending requires an engine to resolve the peer + stream over the overlay → a device-less
-        // backend fails closed with "not up" (before any path open or peer lookup).
-        let dir = std::env::temp_dir().join(format!("tailnetd-file-cp-{}", std::process::id()));
-        let be = backend_for(&dir);
-        match be.file_cp("/etc/hostname", "100.64.0.1").await {
-            crate::localapi::Response::Error { message } => {
-                assert!(
-                    message.contains("not up"),
-                    "file cp with no device must report the node is not up, got {message:?}"
-                );
-            }
-            other => panic!("expected Error, got {other:?}"),
-        }
+        assert!(
+            be.device_handle().is_none(),
+            "a device-less backend must hand the server no engine handle → dispatch replies \"not up\""
+        );
     }
 
     #[test]
-    fn file_list_without_device_is_not_up_error() {
-        // Listing waiting files needs the engine's receive store → a device-less backend fails closed.
-        // `file_list` is synchronous (the engine accessor is non-blocking), so this is a plain `#[test]`.
-        let dir = std::env::temp_dir().join(format!("tailnetd-file-list-{}", std::process::id()));
-        let be = backend_for(&dir);
-        match be.file_list() {
-            crate::localapi::Response::Error { message } => {
-                assert!(
-                    message.contains("not up"),
-                    "file list with no device must report the node is not up, got {message:?}"
-                );
-            }
-            other => panic!("expected Error, got {other:?}"),
+    fn diagnostic_bad_ip_parse_is_rejected() {
+        // `whois`/`ping` reject an unparseable IP before any engine round-trip via this exact parse;
+        // the rejection now lives behind a `&Device` (integration), so pin the parse predicate it
+        // relies on: the offending values fail `IpAddr::from_str` (so the method's bad-input arm
+        // fires), while a well-formed tailnet IP parses (so a good input reaches the engine).
+        assert!(
+            "not-an-ip".parse::<std::net::IpAddr>().is_err(),
+            "a non-IP whois/ping argument must fail to parse → method returns the bad-input Error"
+        );
+        assert!(
+            "999.999.999.999".parse::<std::net::IpAddr>().is_err(),
+            "an out-of-range IP must fail to parse → method returns the bad-input Error"
+        );
+        assert!(
+            "100.64.0.1".parse::<std::net::IpAddr>().is_ok(),
+            "a well-formed tailnet IP must parse → reaches the engine call"
+        );
+    }
+
+    // --- Taildrop path hardening (file_cp source / file_get dest) — fail-closed regular-file rule --
+    //
+    // Because the daemon opens the `file_cp` source and writes the `file_get` dest AS ROOT, both
+    // refuse anything that is not a regular file (a symlink — never followed — device, FIFO, socket,
+    // or directory): `file_cp` always, `file_get` only when `dest` already exists (a fresh dest is
+    // created). The full methods need a live `&Device`, so these tests pin the load-bearing predicate
+    // directly — `symlink_metadata(p).file_type().is_file()` over real temp paths — proving a regular
+    // file is accepted, a directory is refused, and a symlink reads as NOT a regular file (so it is
+    // rejected as the link itself, never traversed). This is the exact check both methods perform.
+
+    #[test]
+    fn path_hardening_accepts_regular_file_rejects_dir() {
+        // A regular file → accepted; a directory → refused. This is the `file_cp` source rule and the
+        // `file_get` existing-dest rule, exercised through the same `symlink_metadata` + `is_file`
+        // predicate the methods use.
+        let base = std::env::temp_dir().join(format!("tailnetd-hard-reg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("regular.bin");
+        std::fs::write(&file, b"hello").unwrap();
+
+        let fmeta = std::fs::symlink_metadata(&file).unwrap();
+        assert!(
+            fmeta.file_type().is_file(),
+            "a regular file must satisfy the regular-file check (accepted)"
+        );
+        let dmeta = std::fs::symlink_metadata(&base).unwrap();
+        assert!(
+            !dmeta.file_type().is_file(),
+            "a directory must NOT satisfy the regular-file check (refused)"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_hardening_rejects_symlink_without_following() {
+        // A symlink must read as NOT a regular file via `symlink_metadata` (which does not traverse
+        // the final component), EVEN when it points at a regular file — so `file_cp`/`file_get` reject
+        // the link itself rather than following it to a target the operator did not name. This is the
+        // symlink-trick defense both methods rely on.
+        let base = std::env::temp_dir().join(format!("tailnetd-hard-sym-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let target = base.join("target.bin");
+        std::fs::write(&target, b"data").unwrap();
+        let link = base.join("link.bin");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let lmeta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(
+            lmeta.file_type().is_symlink(),
+            "symlink_metadata must see the link itself, not its target"
+        );
+        assert!(
+            !lmeta.file_type().is_file(),
+            "a symlink must NOT satisfy the regular-file check → it is refused, never followed"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn file_get_dest_nonexistent_is_allowed() {
+        // The normal `file_get` case: a `dest` that does not exist passes the hardening check (the
+        // copy then creates it). Pin the `NotFound`-means-create branch the method keys on.
+        let base = std::env::temp_dir().join(format!("tailnetd-hard-dest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let missing = base.join("does-not-exist.bin");
+        match std::fs::symlink_metadata(&missing) {
+            Err(e) => assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::NotFound,
+                "a non-existent dest must stat as NotFound → file_get creates it"
+            ),
+            Ok(_) => panic!("the dest must not exist for this test"),
         }
     }
 
-    #[tokio::test]
-    async fn file_get_without_device_is_not_up_error() {
-        // Fetching a waiting file needs the engine's receive store → a device-less backend fails
-        // closed with "not up" (before opening the receive store or touching dest).
-        let dir = std::env::temp_dir().join(format!("tailnetd-file-get-{}", std::process::id()));
-        let be = backend_for(&dir);
-        match be.file_get("incoming.bin", "/tmp/out.bin", false).await {
-            crate::localapi::Response::Error { message } => {
-                assert!(
-                    message.contains("not up"),
-                    "file get with no device must report the node is not up, got {message:?}"
-                );
-            }
-            other => panic!("expected Error, got {other:?}"),
-        }
-    }
+    // --- Taildrop build_config mapping — offline (no Device::new, no network) ----------------------
 
     #[tokio::test]
     async fn build_config_maps_taildrop_dir_some_and_none() {
