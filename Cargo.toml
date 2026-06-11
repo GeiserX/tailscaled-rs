@@ -74,10 +74,12 @@ serde_with = "3"
 # `rand 0.9`'s `ThreadRng` does NOT implement (verified: build fails with a CryptoRng trait-bound
 # error on 0.9). Only pulled in with the `ssh` feature; optional so the default build never links it.
 rand = { version = "0.10", optional = true }
-# Enumerate existing network interfaces to pick a free `utunN` for macOS TUN mode (the engine's
-# default name `tailscale0` is Linux-only and macOS's tun-rs needs an explicit free utun index).
-# Already in the dependency tree transitively via the engine; only used on macOS.
-[target.'cfg(target_os = "macos")'.dependencies]
+# Enumerate the host's network interfaces. Two uses, both unix: (1) on macOS, pick a free `utunN`
+# for TUN mode (the engine's default `tailscale0` is Linux-only and tun-rs needs an explicit free
+# utun index); (2) the link-change monitor (`ipn::linkmon`) snapshots non-loopback interface
+# addresses to detect a host network-path change (Wi-Fi switch / sleep-wake) and rebind the engine.
+# Cross-platform crate; already in the tree transitively via the engine.
+[target.'cfg(unix)'.dependencies]
 if-addrs = "0.15"
 
 [features]

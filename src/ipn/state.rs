@@ -320,9 +320,9 @@ mod tests {
     }
 
     // macOS picks an explicit free `utunN` (the engine default `tailscale0` is rejected, and a bare
-    // `utun` fails tun-rs's unit parse). `if_addrs` is a macOS-only dependency, so this test — which
-    // references it — must be `target_os = "macos"`-gated at COMPILE time (a runtime `cfg!()` would
-    // still try to compile the `if_addrs` path on Linux, where the crate isn't present).
+    // `utun` fails tun-rs's unit parse). The utun-picker is macOS-only behavior, so this test —
+    // which exercises it — is `target_os = "macos"`-gated. (`if_addrs` itself is now a general unix
+    // dep, used here on macOS for the utun scan and on all unix for the link-change monitor.)
     #[cfg(all(feature = "tun", target_os = "macos"))]
     #[test]
     fn default_tun_name_is_free_utun_on_macos() {
