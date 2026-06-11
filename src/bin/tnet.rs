@@ -2361,38 +2361,6 @@ const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 /// kernel TUN interface to actually carry the IP — but this daemon defaults to the userspace
 /// netstack (no OS interface to observe), which is exactly the case Go *also* short-circuits ("if
 /// `!st.TUN` return immediately"), so polling to `Running` + a tailnet IP is the faithful condition.
-/// The per-poll decision [`wait_for_running`] makes from a single [`StatusReport`]. Split out as a
-/// pure function ([`wait_decision`]) so the precedence — Running wins over a terminal error, a
-/// terminal error fails fast, everything else (incl. a transient `auth_url`) keeps waiting — is
-/// unit-testable without a live socket.
-#[derive(Debug, PartialEq, Eq)]
-enum WaitStep {
-    /// The node reached `Running` with a tailnet IP — the wait succeeded.
-    Done,
-    /// A terminal registration failure (the reason, already terminal-sanitized) — fail fast; the
-    /// engine will not retry, so waiting longer is futile.
-    Failed(String),
-    /// Nothing actionable yet — keep polling until the deadline. Covers both "not up yet" and a
-    /// pending interactive login (`auth_url` set, which is transient, not a failure).
-    Keep,
-}
-
-/// Decide what a single poll's [`StatusReport`] means for [`wait_for_running`]. **Pure** (no I/O), so
-/// the precedence is unit-testable: `Running` short-circuits to [`Done`](WaitStep::Done) FIRST (a
-/// Running node never carries a terminal error); otherwise a `Some(error)` is a terminal failure
-/// ([`Failed`](WaitStep::Failed), reason [`sanitize_for_terminal`]'d since it is control-influenced);
-/// otherwise — including a pending `auth_url` (interactive login is transient, not a failure) — we
-/// [`Keep`](WaitStep::Keep) waiting.
-fn wait_decision(s: &tailscaled_rs::localapi::StatusReport) -> WaitStep {
-    if s.state == "Running" && s.self_ipv4.is_some() {
-        return WaitStep::Done;
-    }
-    if let Some(reason) = s.error.as_deref() {
-        return WaitStep::Failed(sanitize_for_terminal(reason));
-    }
-    WaitStep::Keep
-}
-
 async fn wait_for_running(socket: &std::path::Path, timeout_secs: Option<u64>) -> Result<()> {
     // `None` or `0` → wait forever (Go's "0 means wait indefinitely").
     let deadline = match timeout_secs {
@@ -2406,11 +2374,18 @@ async fn wait_for_running(socket: &std::path::Path, timeout_secs: Option<u64>) -
         // Go's backoff loop while tailscaled comes up. The per-poll meaning is decided by the pure
         // `wait_decision`: a terminal registration error fails fast (the engine won't retry — the
         // analogue of Go surfacing a backend error promptly rather than burning the whole timeout;
-        // bead tsd-lr6), `Running` succeeds, everything else keeps waiting until the deadline.
+        // bead tsd-lr6), `Running` succeeds, everything else keeps waiting until the deadline. The
+        // failure reason is control-influenced, so sanitize it at the bail site (the decision fn
+        // stays a pure classifier returning the raw reason — same split as `classify_auth`).
         if let Ok(Response::Status(s)) = round_trip(socket, &Request::Status).await {
             match wait_decision(&s) {
                 WaitStep::Done => return Ok(()),
-                WaitStep::Failed(reason) => anyhow::bail!("node registration failed: {reason}"),
+                WaitStep::Failed(reason) => {
+                    anyhow::bail!(
+                        "node registration failed: {}",
+                        sanitize_for_terminal(&reason)
+                    )
+                }
                 WaitStep::Keep => {}
             }
         }
@@ -2424,6 +2399,39 @@ async fn wait_for_running(socket: &std::path::Path, timeout_secs: Option<u64>) -
         }
         tokio::time::sleep(WAIT_POLL_INTERVAL).await;
     }
+}
+
+/// The per-poll decision [`wait_for_running`] makes from a single [`StatusReport`]. Split out as a
+/// pure function ([`wait_decision`]) so the precedence — Running wins over a terminal error, a
+/// terminal error fails fast, everything else (incl. a transient `auth_url`) keeps waiting — is
+/// unit-testable without a live socket.
+#[derive(Debug, PartialEq, Eq)]
+enum WaitStep {
+    /// The node reached `Running` with a tailnet IP — the wait succeeded.
+    Done,
+    /// A terminal registration failure, carrying control's **raw** reason (the caller sanitizes it
+    /// at the print/bail site, like [`classify_auth`]). Fail fast; the engine will not retry, so
+    /// waiting longer is futile.
+    Failed(String),
+    /// Nothing actionable yet — keep polling until the deadline. Covers both "not up yet" and a
+    /// pending interactive login (`auth_url` set, which is transient, not a failure).
+    Keep,
+}
+
+/// Decide what a single poll's [`StatusReport`] means for [`wait_for_running`]. **Pure** (no I/O), so
+/// the precedence is unit-testable: `Running` short-circuits to [`Done`](WaitStep::Done) FIRST (a
+/// Running node never carries a terminal error); otherwise a `Some(error)` is a terminal failure
+/// ([`Failed`](WaitStep::Failed), the raw reason — the caller sanitizes); otherwise — including a
+/// pending `auth_url` (interactive login is transient, not a failure) — we [`Keep`](WaitStep::Keep)
+/// waiting.
+fn wait_decision(s: &tailscaled_rs::localapi::StatusReport) -> WaitStep {
+    if s.state == "Running" && s.self_ipv4.is_some() {
+        return WaitStep::Done;
+    }
+    if let Some(reason) = s.error.as_deref() {
+        return WaitStep::Failed(reason.to_string());
+    }
+    WaitStep::Keep
 }
 
 /// Maximum time to wait, after an interactive `up`, for the control auth URL to appear. Measured
@@ -4786,7 +4794,11 @@ mod tests {
         };
         assert_eq!(wait_decision(&starting), WaitStep::Keep);
 
-        // (e) A hostile error string (control-influenced) → Failed with the ESC/BEL stripped.
+        // (e) A hostile error string (control-influenced): `wait_decision` carries the RAW reason
+        // (it's a pure classifier — the caller sanitizes at the bail site, like `classify_auth`).
+        // Assert the raw reason round-trips here, AND that the caller's `sanitize_for_terminal` step
+        // (what `wait_for_running` applies before bailing) strips the ESC/BEL — the full two-step
+        // contract, not just one half.
         let hostile = StatusReport {
             state: "NeedsLogin".to_string(),
             error: Some("evil\x1b[2J\x07reason".to_string()),
@@ -4794,15 +4806,15 @@ mod tests {
         };
         match wait_decision(&hostile) {
             WaitStep::Failed(reason) => {
-                assert!(
-                    !reason.contains('\x1b'),
-                    "ESC must be stripped from the error reason"
+                assert_eq!(
+                    reason, "evil\x1b[2J\x07reason",
+                    "wait_decision carries the RAW reason (caller sanitizes)"
                 );
-                assert!(
-                    !reason.contains('\x07'),
-                    "BEL must be stripped from the error reason"
-                );
-                assert!(reason.contains("evil") && reason.contains("reason"));
+                // The caller's sanitize step (mirrors wait_for_running's bail site) neutralizes it.
+                let shown = sanitize_for_terminal(&reason);
+                assert!(!shown.contains('\x1b'), "ESC stripped at the bail site");
+                assert!(!shown.contains('\x07'), "BEL stripped at the bail site");
+                assert!(shown.contains("evil") && shown.contains("reason"));
             }
             other => panic!("expected Failed, got {other:?}"),
         }
