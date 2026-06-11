@@ -580,7 +580,7 @@ async fn dispatch(
         // `serve --tcp` / `serve reset` (Go SetServeConfig): persist the new config. (Re-arming the
         // accept loops to match is US-017; for now this persists faithfully — a restart applies it.)
         Request::SetServeConfig { config } => {
-            let be = backend.lock().await;
+            let mut be = backend.lock().await;
             match be.set_serve_config(&config).await {
                 Ok(()) => Response::Ok {
                     message: "serve config updated".to_string(),

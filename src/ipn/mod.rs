@@ -93,6 +93,56 @@ use state::{derive_state_from, state_from_device};
 /// teardown latency so a wedged engine can't hang the daemon (or an orphaned, superseded `up`).
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// One `serve --tcp` accept loop: bind the node's tailnet IPv4 on `port` and splice every inbound
+/// connection to `target` (a localhost `host:port`). Runs forever until the listener errors (engine
+/// torn down) or the task is aborted. Spawns one sub-task per accepted connection so a slow peer
+/// never blocks new accepts. This is the `nc` splice, inbound: `tcp_listen`/`accept` then
+/// `copy_bidirectional` to a `TcpStream::connect`.
+async fn serve_accept_loop(device: std::sync::Arc<tailscale::Device>, port: u16, target: String) {
+    // Bind the node's tailnet IPv4 on the served port. `ipv4_addr` resolves once the netmap assigns
+    // an address; an error means we never got one (engine gone) — log + exit the loop.
+    let ipv4 = match device.ipv4_addr().await {
+        Ok(ip) => ip,
+        Err(e) => {
+            tracing::error!(error = ?e, port, "serve: no tailnet IPv4; listener not started");
+            return;
+        }
+    };
+    let listen_addr = std::net::SocketAddr::from((ipv4, port));
+    let listener = match device.tcp_listen(listen_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(error = ?e, %listen_addr, "serve: failed to listen");
+            return;
+        }
+    };
+    tracing::info!(%listen_addr, %target, "serve: forwarding inbound tailnet TCP to local target");
+    loop {
+        // The engine's `TcpListener::accept` yields the inbound `TcpStream` directly (no peer-addr
+        // tuple, unlike std/tokio).
+        let inbound = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::debug!(error = ?e, %listen_addr, "serve: accept loop ended");
+                return;
+            }
+        };
+        let target = target.clone();
+        tokio::spawn(async move {
+            match tokio::net::TcpStream::connect(&target).await {
+                Ok(mut local) => {
+                    let mut inbound = inbound;
+                    // Bidirectional splice inbound(tailnet) <-> local(target), to EOF either side.
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut local).await;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, %target, "serve: dial to local target failed");
+                }
+            }
+        });
+    }
+}
+
 /// Validate `--advertise-tags` values byte-for-byte against Go's `tailcfg.CheckTag` (which `up`/`set`
 /// apply via `Hostinfo.CheckRequestTags`): each must be `tag:<name>` where `<name>` is non-empty,
 /// **starts with an ASCII letter**, and contains only `[A-Za-z0-9-]`. Matching Go's gate exactly
@@ -519,6 +569,15 @@ pub struct Backend {
     /// the `Arc` for a graceful `shutdown`. Only ever populated in a daemon built with the `ssh`
     /// cargo feature; without it, spawning is a no-op and this stays `None`.
     ssh_task: Option<tokio::task::JoinHandle<()>>,
+    /// The `serve` accept-loop tasks, one per plain-TCP-forward entry in the serve config (Go
+    /// `tailscale serve --tcp`). Each holds an [`Arc`](std::sync::Arc) clone of the device and runs a
+    /// [`Device::tcp_listen`](tailscale::Device::tcp_listen) accept loop splicing each inbound tailnet
+    /// connection to the configured localhost target. Like [`ssh_task`](Backend::ssh_task), they are
+    /// bound to the device lifecycle: spawned on install in [`finish_up`](Backend::finish_up) (and
+    /// re-armed on a serve-config change while up), and **aborted + awaited** in
+    /// [`stop_device`](Backend::stop_device) BEFORE the device `Arc` is reclaimed (their clones must
+    /// be gone first). Empty when the node is down or no plain TCP forward is configured.
+    serve_tasks: Vec<tokio::task::JoinHandle<()>>,
     /// Whether the node has ever been configured (brought `up`/`down`), distinguishing a fresh
     /// `NoState` from an explicit `Stopped`. Persists across restarts: it is derived in
     /// [`Backend::load`] from whether the prefs file exists on disk, not from the live process.
@@ -574,6 +633,7 @@ impl Backend {
             key_path,
             device: None,
             ssh_task: None,
+            serve_tasks: Vec::new(),
             ever_configured,
             generation: 0,
             boot_attempted_up: false,
@@ -1187,7 +1247,10 @@ impl Backend {
         self.device = Some(device.clone());
         // Spawn the SSH server task iff SSH is enabled (and the daemon was built with the `ssh`
         // feature). It outlives this call, running the engine's fail-closed `listen_ssh` accept loop.
-        self.spawn_ssh_task(device);
+        self.spawn_ssh_task(device.clone());
+        // Arm the `serve` accept loops from the persisted serve config (Go `tailscale serve --tcp`).
+        // Like the SSH task, these are bound to the device lifecycle (torn down in `stop_device`).
+        self.spawn_serve(device);
         Ok(None)
     }
 
@@ -1260,6 +1323,61 @@ impl Backend {
                 }
             });
             self.ssh_task = Some(handle);
+        }
+    }
+
+    /// Spawn the `serve` accept-loop tasks for the current profile's serve config (Go `tailscale
+    /// serve --tcp`). One task per **plain TCP forward** entry (`tcp_forward` set, no HTTPS/HTTP/
+    /// TerminateTLS — see [`serve::is_plain_tcp_forward`]); HTTPS/HTTP/TLS entries are logged + skipped
+    /// (recognized, not served by this build). Each task binds the node's tailnet IPv4 on the served
+    /// port via [`Device::tcp_listen`](tailscale::Device::tcp_listen) and splices every inbound
+    /// connection to the configured localhost target (the `nc` splice, inbound). Tasks hold `Arc`
+    /// clones of `device` and are torn down in [`stop_device`](Backend::stop_device) before the device
+    /// is reclaimed. Stores the handles in [`serve_tasks`](Backend::serve_tasks).
+    ///
+    /// Spawn a single supervisor task that loads the serve config and arms one accept loop per
+    /// plain-TCP-forward entry. Sync (spawns + returns) so it can be called from the non-async
+    /// [`finish_up`](Backend::finish_up); the async config read happens INSIDE the supervisor task.
+    /// The supervisor's [`JoinHandle`](tokio::task::JoinHandle) is stored in
+    /// [`serve_tasks`](Backend::serve_tasks); aborting it (in `stop_device`) cancels the supervisor
+    /// and — because they are spawned as its children via a `JoinSet` it owns — all per-port loops.
+    fn spawn_serve(&mut self, device: std::sync::Arc<tailscale::Device>) {
+        let state_dir = self.state_dir.clone();
+        let profile = self.current_profile.clone();
+        let supervisor = tokio::spawn(async move {
+            let cfg = serve::load(&state_dir, &profile).await;
+            // Own the per-port loops in a JoinSet so dropping the supervisor (on abort) drops them.
+            let mut loops: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+            for (port_str, handler) in &cfg.tcp {
+                let Ok(port) = port_str.parse::<u16>() else {
+                    tracing::warn!(port = %port_str, "serve: skipping entry with non-numeric port key");
+                    continue;
+                };
+                if !serve::is_plain_tcp_forward(handler) {
+                    tracing::info!(
+                        port,
+                        "serve: entry is HTTPS/HTTP/TLS-terminated — not served by this build (recognized only)"
+                    );
+                    continue;
+                }
+                let target = handler.tcp_forward.clone();
+                let dev = device.clone();
+                loops.spawn(serve_accept_loop(dev, port, target));
+            }
+            // Keep the supervisor alive while the loops run (so aborting it tears them down). Each
+            // loop only returns on listener error / engine teardown.
+            while loops.join_next().await.is_some() {}
+        });
+        self.serve_tasks.push(supervisor);
+    }
+
+    /// Abort + await all `serve` accept-loop tasks (so their device `Arc` clones are released). Called
+    /// by [`stop_device`](Backend::stop_device) before reclaiming the device, and before re-arming on
+    /// a serve-config change. Idempotent (empty when no serve tasks run).
+    async fn stop_serve_tasks(&mut self) {
+        for task in self.serve_tasks.drain(..) {
+            task.abort();
+            let _ = task.await;
         }
     }
 
@@ -1559,12 +1677,21 @@ impl Backend {
         serve::load(&self.state_dir, &self.current_profile).await
     }
 
-    /// Persist a new serve config for the current profile (the SetServeConfig path). The caller is
-    /// responsible for (re)arming the serve accept loops to match; this only persists.
-    pub async fn set_serve_config(&self, cfg: &serve::ServeConfig) -> Result<()> {
+    /// Persist a new serve config for the current profile (the SetServeConfig path), then re-arm the
+    /// serve accept loops to match if the node is up. `&mut self` because re-arming mutates the task
+    /// list. If the node is down, persisting is the whole job — the loops arm on the next `up` (via
+    /// `finish_up`). The re-arm tears down the old loops + spawns fresh ones from the new config, so a
+    /// removed forward stops listening and an added one starts, without disturbing the device.
+    pub async fn set_serve_config(&mut self, cfg: &serve::ServeConfig) -> Result<()> {
         serve::save(cfg, &self.state_dir, &self.current_profile)
             .await
-            .with_context(|| "persisting serve-config")
+            .with_context(|| "persisting serve-config")?;
+        // Re-arm live if a device is up; otherwise the config applies on the next `up`.
+        if let Some(dev) = self.device.clone() {
+            self.stop_serve_tasks().await;
+            self.spawn_serve(dev);
+        }
+        Ok(())
     }
 
     /// Resolve a tailnet IP to the peer that owns it (the `tnet whois` / Go `tailscale whois` path).
@@ -1691,6 +1818,9 @@ impl Backend {
             // reclaim the device. The result is the expected cancellation `JoinError` — ignore it.
             let _ = task.await;
         }
+        // Step 1b: likewise stop every `serve` accept-loop task — they also hold device `Arc` clones,
+        // so they must be gone before `into_inner` can reclaim the sole `Device`.
+        self.stop_serve_tasks().await;
         // Step 2: reclaim and gracefully shut down the engine. After the abort+await above, the
         // backend holds the only `Arc`, so `into_inner` yields the owned `Device` for `shutdown`.
         if let Some(dev) = self.device.take() {
@@ -1747,6 +1877,7 @@ mod tests {
             key_path: dir.join("node.key.json"),
             device: None,
             ssh_task: None,
+            serve_tasks: Vec::new(),
             ever_configured: false,
             generation: 0,
             boot_attempted_up: false,
@@ -1798,6 +1929,38 @@ mod tests {
         assert!(
             !tokio::fs::try_exists(&be.key_path).await.unwrap(),
             "logout MUST discard the node key file (fresh-login path)"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn serve_config_persists_and_no_device_means_no_loops() {
+        // set_serve_config persists the config and reads back; with no device up, it does NOT spawn
+        // any accept loops (they arm on the next `up` via finish_up). serve_config round-trips.
+        let dir = std::env::temp_dir().join(format!("tailnetd-serve-be-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+
+        // Initially empty.
+        assert!(be.serve_config().await.tcp.is_empty());
+
+        let mut cfg = serve::ServeConfig::default();
+        serve::set_tcp_forward(&mut cfg, 8443, "127.0.0.1:5000".into());
+        be.set_serve_config(&cfg).await.unwrap();
+
+        // Round-trips through the backend.
+        let back = be.serve_config().await;
+        assert_eq!(back, cfg);
+        assert_eq!(
+            back.tcp.get("8443").map(|h| h.tcp_forward.as_str()),
+            Some("127.0.0.1:5000")
+        );
+        // No device up → no accept loops were spawned (they arm on the next `up`).
+        assert!(
+            be.serve_tasks.is_empty(),
+            "set_serve_config on a down node must not spawn serve loops"
         );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
