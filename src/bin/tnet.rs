@@ -47,7 +47,9 @@ enum Command {
         #[arg(long)]
         hostname: Option<String>,
         /// Control server URL override (e.g. a self-hosted Headscale). Applied to the engine on
-        /// `up`; a malformed URL fails loudly rather than silently using the default.
+        /// `up`; a malformed URL fails loudly rather than silently using the default. Changing it on
+        /// a node that is already running requires `--force-reauth` (switching control servers is a
+        /// fresh registration, not an in-place tweak) — the daemon refuses the change otherwise.
         #[arg(long)]
         control_url: Option<String>,
         /// Enable kernel-TUN mode (`TransportMode::Tun`) instead of the userspace netstack. Requires

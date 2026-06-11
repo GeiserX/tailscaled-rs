@@ -373,3 +373,41 @@ is left inferred (the accept loop is inlined, never naming it).
 `pub use ts_runtime::funnel::{FunnelAccepted, FunnelAcceptedReceiver};` to `src/lib.rs` (alongside the
 existing serve re-exports). Pure re-export, no behavior change. Lets the daemon drop the extra
 `ts_control` dep and name the funnel accept loop's type in a free function.
+
+## 14. `accept_dns` / CorpDNS Config gate (engine bead — to file)
+
+The daemon wants `tnet up --accept-dns` / `--no-accept-dns` (Go `tailscale up --accept-dns`, the
+`CorpDNS` pref: accept the tailnet's MagicDNS config onto the host resolver). This is the last
+high-use `up`/`set` flag still unmodeled, and it is engine-blocked **only by a missing Config field** —
+the OS-DNS machinery it gates **already exists**: `ts_host_net::apply_dns` (scutil on macOS,
+resolvectl on Linux) programs the system resolver in TUN mode, called from `ts_runtime/tun_actor.rs`
+when control pushes MagicDNS=on, and an **empty `nameservers` list is already a clean no-op** on both
+platforms (`macos.rs` / `linux.rs` early-return). So `accept_dns=false` just needs to route into that
+existing skip path — a thin gate, NOT greenfield resolver work.
+
+**Ask (mirrors the `accept_routes` threading end-to-end):**
+1. `ts_control/src/config.rs`: add `pub accept_dns: bool` (sibling of `accept_routes`), **default
+   `true`** (Go's CorpDNS is default-on); add to the `Default` impl. `#[serde(default)]` for wire
+   back-compat.
+2. `ts_runtime/src/env.rs`: thread `accept_dns` through `ForwarderConfig`/`Env` + `from_control_config`
+   (exactly as `accept_routes` is threaded).
+3. `ts_runtime/src/tun_actor.rs`: the **one consume site** — where `magic_dns` is computed
+   (`msg.dns_config…d.magic_dns`) and `host_dns_from_dns_config` is called, AND in `env.accept_dns` so
+   that `accept_dns=false` forces the **DNS-apply** path to empty nameservers (the in-netstack
+   100.100.100.100 responder itself stays untouched; also keep the quad-100/32 route-steer consistent
+   with the gated decision so it isn't routed into the TUN when DNS isn't accepted). Do NOT put this in
+   `HostRouteGating` — that gates routes; DNS is a separate decision in the StateUpdate handler.
+
+Suggested engine test: assert `accept_dns=false` ⇒ empty nameservers even with `magic_dns=true`
+(mirror `host_dns_nameservers_point_at_magic_dns_when_enabled`).
+
+**Daemon side once landed (no engine help needed):** `Prefs.accept_dns` (default true) → `build_config`
+maps it onto `Config.accept_dns` → `up`/`set --accept-dns`/`--no-accept-dns` tri-state + the
+revert-guard lockstep + `get`/`status` surfacing (the `tnet status`/`dns status` "Use Tailscale DNS"
+placeholder lines are already present to replace). **Only observable in `--tun` mode** (netstack mode
+never programs the host resolver), so the daemon pref + guard are offline-testable but the actual
+scutil/resolvectl effect wants the live Mac-Mini TUN gate.
+
+> Posted as a heads-up on the engine lane's `docs/COORDINATE.md` board (active engine session,
+> iter36/37). The daemon consumes it via a pin bump after it lands — no blocking; the daemon proceeds
+> with in-lane work meanwhile.

@@ -773,6 +773,18 @@ async fn dispatch(
                     return Response::RevertGuard { reverts };
                 }
             }
+            // Control-URL change guard (Go `up`'s `can't change --login-server without
+            // --force-reauth`): changing which control server a Running node talks to is a
+            // re-registration, so refuse it unless `--force-reauth` (which performs that fresh
+            // registration) is also set. A PURE READ under the brief lock, BEFORE `drive_up`, so a
+            // tripped guard leaves the node exactly as it was (Go returns the error before applying).
+            // Unaffected: a bare `up`, a change on a down node, a default-synonym swap, or `up
+            // --control-url X --force-reauth`.
+            if backend.lock().await.up_control_url_guard(&opts) {
+                return Response::Error {
+                    message: "can't change --login-server without --force-reauth".to_string(),
+                };
+            }
             match ipn::drive_up(backend, authkey, opts).await {
                 Ok(()) => Response::Ok {
                     message: "node brought up".to_string(),
