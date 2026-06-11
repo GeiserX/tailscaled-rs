@@ -136,6 +136,7 @@ pub fn requires_write(request: &crate::localapi::Request) -> bool {
         | Request::ProfileList
         | Request::Metrics
         | Request::LockStatus
+        | Request::DnsStatus
         | Request::BugReport
         | Request::GetServeConfig
         | Request::FileList => false,
@@ -264,6 +265,10 @@ mod tests {
             "debug capture installs a dataplane tap + writes a file — a write"
         );
         assert!(!requires_write(&Request::GetServeConfig));
+        assert!(
+            !requires_write(&Request::DnsStatus),
+            "dns status only reads the control-pushed MagicDNS config — a read, gated like status"
+        );
     }
 
     #[test]

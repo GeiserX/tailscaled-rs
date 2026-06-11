@@ -67,6 +67,60 @@ pub(super) async fn lock_status(dev: &tailscale::Device) -> Response {
     }
 }
 
+/// Report the control-pushed MagicDNS configuration (the `tnet dns status` / Go `tailscale dns
+/// status` read-only path). Maps the engine's `Device::dns_config()` → `Option<DnsConfig>` to the
+/// wire [`DnsStatusReport`](crate::localapi::DnsStatusReport): resolver addresses are pre-rendered
+/// to `addr:port` strings via [`udp_addr`](tailscale::DnsResolver::udp_addr) (so the wire DTO stays
+/// plain strings and never has to name the engine's `ResolverTransport` enum), the split-DNS routes
+/// map its values the same way, and extra records become `(name, addr_string)` pairs; the plain
+/// `Vec<String>` fields
+/// (search/cert/exit-node-filtered) and the `magic_dns` bool are copied through.
+///
+/// `Ok(None)` means no netmap has arrived yet (a freshly-up node) — we return a *default*
+/// [`DnsStatusReport`] (MagicDNS off, every collection empty) so `dns status` renders cleanly rather
+/// than erroring. An engine error surfaces as a clear [`Response::Error`]. Read-only — this only
+/// reports the control-pushed config; it changes nothing.
+pub(super) async fn dns_status(dev: &tailscale::Device) -> Response {
+    match dev.dns_config().await {
+        Ok(Some(cfg)) => Response::DnsStatus(crate::localapi::DnsStatusReport {
+            magic_dns: cfg.magic_dns,
+            search_domains: cfg.search_domains,
+            resolvers: cfg
+                .resolvers
+                .iter()
+                .map(|r| r.udp_addr().to_string())
+                .collect(),
+            routes: cfg
+                .routes
+                .iter()
+                .map(|(suffix, resolvers)| {
+                    (
+                        suffix.clone(),
+                        resolvers.iter().map(|r| r.udp_addr().to_string()).collect(),
+                    )
+                })
+                .collect(),
+            fallback_resolvers: cfg
+                .fallback_resolvers
+                .iter()
+                .map(|r| r.udp_addr().to_string())
+                .collect(),
+            cert_domains: cfg.cert_domains,
+            extra_records: cfg
+                .extra_records
+                .iter()
+                .map(|e| (e.name.clone(), e.addr.to_string()))
+                .collect(),
+            exit_node_filtered_set: cfg.exit_node_filtered_set,
+        }),
+        // No netmap yet → an empty report renders cleanly (not an error).
+        Ok(None) => Response::DnsStatus(crate::localapi::DnsStatusReport::default()),
+        Err(e) => Response::Error {
+            message: format!("dns config query failed: {e:?}"),
+        },
+    }
+}
+
 /// Resolve a tailnet IP to the peer that owns it (the `tnet whois` / Go `tailscale whois` path).
 ///
 /// Read-only: a netmap lookup that mutates nothing. Takes the engine handle as `dev` so the

@@ -566,6 +566,17 @@ async fn dispatch(
                 },
             }
         }
+        // `dns status` (Go `tailscale dns status`, read-only). Off-lock device call; needs the node
+        // up (the MagicDNS config comes from the live engine's netmap).
+        Request::DnsStatus => {
+            let dev = { backend.lock().await.device_handle() };
+            match dev {
+                Some(dev) => Backend::dns_status(&dev).await,
+                None => Response::Error {
+                    message: "node is not up".into(),
+                },
+            }
+        }
         // `bugreport` (Go `tailscale bugreport`). Reads only daemon state under a brief lock (no
         // engine round-trip); works whether or not the node is up.
         Request::BugReport => {
