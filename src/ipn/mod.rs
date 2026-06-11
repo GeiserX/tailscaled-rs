@@ -75,6 +75,7 @@ use crate::prefs::Prefs;
 
 mod config;
 mod diag;
+pub mod install;
 mod linkmon;
 pub mod profile;
 mod revert_guard;

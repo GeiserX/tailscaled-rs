@@ -68,6 +68,40 @@ export TS_RS_EXPERIMENT=this_is_unstable_software
 State (node keys + prefs) lives in `$XDG_STATE_HOME/tailnetd` (override with `TAILNETD_STATE_DIR`);
 the control socket is `<state-dir>/tailnetd.sock` (override with `TAILNETD_SOCKET`).
 
+## Install as a system service
+
+To run `tailnetd` as an always-on boot service instead of a foreground process, install it as a
+system daemon (systemd on Linux, launchd on macOS):
+
+```bash
+# Build, then install the system service (one command; requires root)
+cargo build --release
+sudo ./target/release/tnet install
+
+# …and to remove it later (leaves your node state in place)
+sudo ./target/release/tnet uninstall
+```
+
+`sudo tnet install` does three things: it copies the running `tailnetd` binary to
+`/usr/local/bin/tailnetd`, installs the service unit, and enables it to start at boot. Then check
+`tnet status` (or `sudo tnet status` — as root the CLI resolves the same system state dir).
+
+| | Linux (systemd) | macOS (launchd) |
+| --- | --- | --- |
+| Service unit | `/etc/systemd/system/tailnetd.service` | `/Library/LaunchDaemons/cloud.tailscaled-rs.tailnetd.plist` |
+| Enable / load | `systemctl enable --now tailnetd` | `launchctl bootstrap system <plist>` |
+| State dir | `/var/lib/tailnetd` | `/usr/local/var/tailnetd` |
+
+> [!NOTE]
+> The installed unit sets `TS_RS_EXPERIMENT=this_is_unstable_software` for you — **enabling the
+> service is you opting in to running experimental, unaudited software on purpose** (the daemon does
+> not set that opt-in for itself). Other OSes are not supported; `tnet install` there exits with a
+> clear error.
+
+`tnet uninstall` disables/unloads the service and removes the unit, but **deliberately leaves the
+state dir** (it holds your node's key material), so a later `tnet install` resumes the same node.
+To purge the node entirely, remove the state dir for your OS (above) by hand after uninstalling.
+
 ## Architecture
 
 ```mermaid
