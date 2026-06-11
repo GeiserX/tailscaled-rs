@@ -150,7 +150,10 @@ pub fn requires_write(request: &crate::localapi::Request) -> bool {
         | Request::Nc { .. }
         | Request::SetServeConfig { .. }
         | Request::FileCp { .. }
-        | Request::FileGet { .. } => true,
+        | Request::FileGet { .. }
+        // `DebugCapture` installs a dataplane capture hook and writes a pcap as the daemon's uid —
+        // it taps all plaintext traffic, so it gates like `up`/`down`, never a read.
+        | Request::DebugCapture { .. } => true,
     }
 }
 
@@ -253,6 +256,14 @@ mod tests {
         );
         assert!(requires_write(&up()));
         assert!(requires_write(&set()));
+        assert!(
+            requires_write(&Request::DebugCapture {
+                path: "/tmp/x.pcap".into(),
+                seconds: Some(5)
+            }),
+            "debug capture installs a dataplane tap + writes a file — a write"
+        );
+        assert!(!requires_write(&Request::GetServeConfig));
     }
 
     #[test]

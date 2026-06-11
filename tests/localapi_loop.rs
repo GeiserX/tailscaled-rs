@@ -257,6 +257,38 @@ async fn bad_request_yields_error_and_keeps_serving() {
     harness.shutdown_and_verify().await;
 }
 
+/// 3b. `debug capture` on an offline node (no device) yields "node is not up" — it never creates the
+///     pcap file (the device-absent branch is reached before any file open). Confirms the write-gated
+///     diagnostic degrades cleanly on a down node, like `ping`/`whois`.
+#[tokio::test]
+async fn debug_capture_on_offline_node_is_node_not_up() {
+    let harness = Harness::start().await;
+
+    let path = std::env::temp_dir().join(format!("tnet-capture-test-{}.pcap", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let req = format!(
+        r#"{{"cmd":"debug_capture","path":{:?},"seconds":1}}"#,
+        path.to_string_lossy()
+    );
+    let resp = harness.round_trip(&req).await;
+    match resp {
+        Response::Error { message } => {
+            assert!(
+                message.contains("not up"),
+                "offline capture should say the node is not up, got: {message}"
+            );
+        }
+        other => panic!("expected Response::Error for offline capture, got {other:?}"),
+    }
+    // The device-absent branch must not have created the file.
+    assert!(
+        !path.exists(),
+        "no pcap file should be created when the node is down"
+    );
+
+    harness.shutdown_and_verify().await;
+}
+
 /// 4. wire-format guard: assert the exact on-the-wire bytes of the request/response discriminants
 ///    at the integration boundary. This mirrors the unit tests in `localapi.rs` but guards against
 ///    wire drift from the consumer's side (the bytes the daemon and CLI must agree on).

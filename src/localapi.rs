@@ -229,6 +229,19 @@ pub enum Request {
         #[serde(default)]
         delete_after: bool,
     },
+    /// Capture the dataplane's plaintext packets to a pcap file for `seconds`, then stop (Go
+    /// `tailscale debug capture`). A WRITE: it installs a dataplane capture hook and writes a file as
+    /// the daemon's uid, so it's gated like `up`/`down`. The daemon owns a `BufWriter<File>` at `path`,
+    /// runs the engine's `capture_pcap` for the bounded window, then `stop_capture` (flush + close).
+    DebugCapture {
+        /// Local path the daemon writes the pcap to (a fresh path, or an existing regular file to
+        /// truncate; a non-regular existing target is refused).
+        path: String,
+        /// How long to capture before stopping (bounds the call so the CLI returns). `None` = the
+        /// daemon's dispatch applies a sane default (the `tnet` CLI always sends an explicit value).
+        #[serde(default)]
+        seconds: Option<u64>,
+    },
 }
 
 /// The daemon's reply to a [`Request`].
@@ -708,6 +721,29 @@ mod tests {
             serde_json::from_str::<Request>(r#"{"cmd":"watch"}"#).unwrap(),
             Request::Watch
         ));
+    }
+
+    #[test]
+    fn request_debug_capture_wire_format() {
+        // Pin the `debug_capture` discriminant + field names so daemon + CLI agree.
+        assert_eq!(
+            serde_json::to_string(&Request::DebugCapture {
+                path: "/tmp/x.pcap".into(),
+                seconds: Some(5),
+            })
+            .unwrap(),
+            r#"{"cmd":"debug_capture","path":"/tmp/x.pcap","seconds":5}"#
+        );
+        // An omitted `seconds` (the raw-client case) parses to None (the daemon then defaults it).
+        match serde_json::from_str::<Request>(r#"{"cmd":"debug_capture","path":"/tmp/x.pcap"}"#)
+            .unwrap()
+        {
+            Request::DebugCapture { path, seconds } => {
+                assert_eq!(path, "/tmp/x.pcap");
+                assert_eq!(seconds, None);
+            }
+            other => panic!("expected DebugCapture, got {other:?}"),
+        }
     }
 
     #[test]
