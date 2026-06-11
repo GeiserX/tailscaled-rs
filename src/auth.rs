@@ -130,6 +130,7 @@ pub fn requires_write(request: &crate::localapi::Request) -> bool {
         | Request::Watch
         | Request::Ip
         | Request::Whois { .. }
+        | Request::IdToken { .. }
         | Request::Ping { .. }
         | Request::Version
         | Request::GetPrefs
@@ -297,6 +298,12 @@ mod tests {
         assert!(!requires_write(&Request::Whois {
             ip: "100.64.0.1".into()
         }));
+        assert!(
+            !requires_write(&Request::IdToken {
+                audience: "https://example.com".into()
+            }),
+            "id-token issues/reads identity — a read, gated like whois (it does not mutate prefs)"
+        );
         assert!(!requires_write(&Request::Ping {
             ip: "100.64.0.1".into(),
             timeout_ms: None,

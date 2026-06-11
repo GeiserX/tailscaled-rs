@@ -2,7 +2,9 @@
 
 This lists the changes the downstream daemon (`tailscaled-rs`) needs from the `tailscale-rs`
 library to unblock end-to-end features. Each ask is self-contained, additive, and
-backward-compatible. Verified against the pinned engine rev `e126bba` (released `v0.6.9`).
+backward-compatible. The daemon currently pins engine rev `f42eb70e` (≈`v0.21.2`); individual asks
+note the rev they were verified against (older "verified vs `e126bba`/v0.6.9" notes below predate the
+current pin and are kept as historical context — the SHIPPED markers reflect what the pin provides).
 
 Ranked by leverage: #1 converts ~115 lines of already-written, CI-built, feature-gated daemon code
 into a working feature with a one-line change downstream.
@@ -411,3 +413,22 @@ scutil/resolvectl effect wants the live Mac-Mini TUN gate.
 > Posted as a heads-up on the engine lane's `docs/COORDINATE.md` board (active engine session,
 > iter36/37). The daemon consumes it via a pin bump after it lands — no blocking; the daemon proceeds
 > with in-lane work meanwhile.
+
+## 15. `Device::query_dns(name, qtype)` — a real forwarder DNS query (for a faithful `tnet dns query`)
+
+The daemon wants `tnet dns query <name> [type]` (Go `tailscale dns query`), which resolves a name
+**through the node's DNS path** and prints the answer records, the RCODE, and which resolver(s)
+answered. The engine's only resolution primitive today is `Device::resolve()` (verified at pin
+f42eb70e, `src/lib.rs:500`): an **in-process netmap `dnsMap` lookup** — MagicDNS names only, IPv4
+only, no upstream/forwarder query, no record types, no RCODE, no resolver info, `Ok(None)` for any
+non-tailnet name. Building `dns query` on `resolve()` would ship a command that *looks like* a DNS
+query but silently isn't (no A/AAAA/CNAME/MX/TXT/…, no split-DNS forwarding, no RCODE) — a
+low-fidelity facsimile that violates the honest-omission discipline this daemon holds to. So `dns
+query` is **deferred**, not faked.
+
+**Ask:** add `Device::query_dns(&self, name: &str, qtype: …) -> Result<…wire response + resolvers…>`
+that runs an actual query through the engine's DNS forwarder (the 100.100.100.100 path), returning the
+parsed answer records + RCODE + the resolver(s) consulted — the analogue of Go's `localClient.QueryDNS`
+(`cmd/tailscale/cli/dns-query.go`). Once it lands, the daemon adds `tnet dns query` as a faithful
+read (the `whois`/`id-token` plumbing pattern) consumed via a pin bump. No rush — filed so the gap is
+recorded, not forgotten.

@@ -2112,6 +2112,22 @@ impl Backend {
         diag::whois(dev, ip).await
     }
 
+    /// Fetch an OIDC id-token for this node scoped to `audience` (the `tnet id-token` / Go
+    /// `tailscale id-token` path). A thin `pub` shim over the engine's
+    /// [`Device::fetch_id_token`](tailscale::Device::fetch_id_token), which mints a signed JWT via
+    /// control over the live Noise connection. Kept on `Backend` so the `server.rs` dispatch call
+    /// site is uniform with the other device reads (`Backend::whois`/`ping`). A control-side refusal
+    /// (e.g. the control server's capability is below the id-token version, or any issuance error)
+    /// surfaces as [`Response::Error`](crate::localapi::Response::Error), never a panic.
+    pub async fn id_token(dev: &tailscale::Device, audience: &str) -> crate::localapi::Response {
+        match dev.fetch_id_token(audience).await {
+            Ok(token) => crate::localapi::Response::IdToken { token },
+            Err(e) => crate::localapi::Response::Error {
+                message: format!("id-token request failed: {e}"),
+            },
+        }
+    }
+
     /// Ping a tailnet peer over the overlay and report the round-trip time (the `tnet ping` / Go
     /// `tailscale ping` path). A thin `pub` shim over [`diag::ping`], kept on `Backend` so the
     /// `server.rs` dispatch call site (`Backend::ping(&dev, ..)`) is unchanged. See [`diag::ping`].
