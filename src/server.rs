@@ -736,6 +736,7 @@ async fn dispatch(
             shields_up,
             ssh,
             reset,
+            force_reauth,
         } => {
             // Confine the plaintext authkey to the smallest scope: wrap it into a `SecretString`
             // right at the boundary and hand the engine path the secret. (The wire type stays
@@ -757,6 +758,7 @@ async fn dispatch(
                 shields_up,
                 ssh,
                 reset,
+                force_reauth,
             };
             // Accidental-revert guard (Go `checkForAccidentalSettingReverts`): unless this is a
             // `--reset` up, refuse an `up` that would silently revert a non-default pref it didn't

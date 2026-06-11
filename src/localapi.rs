@@ -88,6 +88,15 @@ pub enum Request {
         /// the wire backward-compatible with clients that omit it.
         #[serde(default)]
         reset: bool,
+        /// Force a fresh re-registration (Go `tailscale up --force-reauth`). When set, the daemon
+        /// discards the persisted node key before the bring-up handshake, so the engine cannot
+        /// resume the old registration and instead registers FRESH — surfacing a new login/auth URL
+        /// for an interactive (authkey-less) up. This is a **lifecycle action, not a pref**: it
+        /// changes no persisted setting, so it is NOT part of the accidental-revert guard / `--reset`
+        /// lockstep, and a bare `up --force-reauth` (no other flags) stays a bare up (never trips the
+        /// guard). `#[serde(default)]` keeps the wire backward-compatible with clients that omit it.
+        #[serde(default)]
+        force_reauth: bool,
     },
     /// Change individual prefs on the node **without** a full up/down cycle (the analogue of Go's
     /// `tailscale set`). Every field is the same "leave unchanged unless named" sentinel as
@@ -810,6 +819,7 @@ mod tests {
             shields_up: Some(true),
             ssh: Some(true),
             reset: true,
+            force_reauth: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&json).unwrap();
@@ -829,6 +839,7 @@ mod tests {
                 shields_up,
                 ssh,
                 reset,
+                force_reauth: _,
             } => {
                 assert!(reset, "reset must survive the wire round-trip when set");
                 assert_eq!(authkey.as_deref(), Some("tskey-auth-xxx"));
@@ -1251,6 +1262,7 @@ mod tests {
             shields_up: None,
             ssh: None,
             reset: false,
+            force_reauth: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&json).unwrap();
@@ -1270,6 +1282,7 @@ mod tests {
                 shields_up,
                 ssh,
                 reset,
+                force_reauth: _,
             } => {
                 assert!(!reset);
                 assert!(authkey.is_none());
@@ -1333,6 +1346,7 @@ mod tests {
             shields_up: None,
             ssh: None,
             reset: false,
+            force_reauth: false,
         };
         let json = serde_json::to_string(&clear).unwrap();
         match serde_json::from_str::<Request>(&json).unwrap() {
@@ -1350,6 +1364,47 @@ mod tests {
                 );
                 assert_eq!(advertise_exit_node, Some(false));
                 assert_eq!(advertise_routes, Some(vec![]));
+            }
+            other => panic!("expected Up, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn request_up_force_reauth_round_trips_and_back_compat() {
+        // (1) BACK-COMPAT: an old client that omits `force_reauth` must still parse, defaulting it to
+        // false (`#[serde(default)]`). A force-reauth must NEVER be silently inferred from an old wire.
+        let old_wire = r#"{"cmd":"up","authkey":null,"hostname":"h"}"#;
+        let parsed = serde_json::from_str::<Request>(old_wire).expect("old wire parses");
+        match parsed {
+            Request::Up { force_reauth, .. } => assert!(
+                !force_reauth,
+                "omitted force_reauth must default to false (never infer a reauth)"
+            ),
+            other => panic!("expected Up, got {other:?}"),
+        }
+
+        // (2) ROUND-TRIP: force_reauth:true survives serialize→deserialize.
+        let req = Request::Up {
+            authkey: None,
+            control_url: None,
+            hostname: None,
+            tun: None,
+            tun_name: None,
+            tun_mtu: None,
+            exit_node: None,
+            advertise_exit_node: None,
+            advertise_routes: None,
+            advertise_tags: None,
+            accept_routes: None,
+            shields_up: None,
+            ssh: None,
+            reset: false,
+            force_reauth: true,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        match serde_json::from_str::<Request>(&json).unwrap() {
+            Request::Up { force_reauth, .. } => {
+                assert!(force_reauth, "force_reauth:true must round-trip")
             }
             other => panic!("expected Up, got {other:?}"),
         }
@@ -1412,6 +1467,7 @@ mod tests {
             shields_up: None,
             ssh: None,
             reset: false,
+            force_reauth: false,
         })
         .unwrap();
         let unchanged_json = serde_json::to_string(&Request::Up {
@@ -1429,6 +1485,7 @@ mod tests {
             shields_up: None,
             ssh: None,
             reset: false,
+            force_reauth: false,
         })
         .unwrap();
         assert!(

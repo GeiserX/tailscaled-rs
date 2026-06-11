@@ -63,7 +63,15 @@ export TS_RS_EXPERIMENT=this_is_unstable_software
 ./target/release/tnet up --authkey tskey-auth-XXXX --hostname my-node
 ./target/release/tnet status
 ./target/release/tnet down
+
+# Force a fresh login (re-register from scratch, keeping your settings):
+./target/release/tnet up --force-reauth
 ```
+
+`tnet up --force-reauth` (Go `tailscale up --force-reauth`) discards this node's key and registers
+fresh, surfacing a new login URL — handy to re-authenticate without changing any settings. It may
+briefly bring the connection down while it re-registers, so avoid running it over a remote SSH/RDP
+session you could lock yourself out of.
 
 State (node keys + prefs) lives in `$XDG_STATE_HOME/tailnetd` (override with `TAILNETD_STATE_DIR`);
 the control socket is `<state-dir>/tailnetd.sock` (override with `TAILNETD_SOCKET`).
