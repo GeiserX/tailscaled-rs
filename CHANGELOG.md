@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.29.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.28.0...v0.29.0) (2026-06-11)
+
+
+### Features
+
+* **whois:** surface ACL tags and node-key expiry ([#85](https://github.com/GeiserX/tailscaled-rs/issues/85)) ([a9a1426](https://github.com/GeiserX/tailscaled-rs/commit/a9a1426ffe5c8b826b9fa8aaa099d3b51bff5b3b))
+
 ## [0.28.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.27.0...v0.28.0) (2026-06-11)
 
 
