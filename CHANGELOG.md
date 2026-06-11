@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.27.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.26.0...v0.27.0) (2026-06-11)
+
+
+### Features
+
+* **up:** add --force-reauth to force a fresh re-registration ([#81](https://github.com/GeiserX/tailscaled-rs/issues/81)) ([17e081c](https://github.com/GeiserX/tailscaled-rs/commit/17e081c7efcfac316c79d1934c17570cc2452d2e))
+
 ## [0.26.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.25.0...v0.26.0) (2026-06-11)
 
 
