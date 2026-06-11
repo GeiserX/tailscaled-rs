@@ -1487,6 +1487,10 @@ impl Backend {
                                     to: backend.clone(),
                                 },
                             };
+                            // `FunnelOptions::default()` = `funnel_only: false`. On this listener that
+                            // flag is a documented no-op (the ingress data path carries only
+                            // relay-delivered PUBLIC traffic regardless), so `default()` is intentional
+                            // — not a security-relevant choice to tighten to `funnel_only: true`.
                             match device
                                 .listen_funnel(&fcfg, ts_control::FunnelOptions::default())
                                 .await
@@ -1506,6 +1510,15 @@ impl Backend {
                                         while let Some(accepted) = rx.recv().await {
                                             let backend = backend.clone();
                                             tokio::spawn(async move {
+                                                // `accepted.target`/`src` are the public ingress
+                                                // host:port hit + the public client's addr (audit/debug
+                                                // trace of who reached the funnel).
+                                                tracing::debug!(
+                                                    target = %accepted.target,
+                                                    src = %accepted.src,
+                                                    %backend,
+                                                    "funnel: proxying public ingress to local backend"
+                                                );
                                                 let mut stream = accepted.stream;
                                                 match tokio::net::TcpStream::connect(&backend).await
                                                 {

@@ -213,6 +213,25 @@ pub fn funnel_ports(cfg: &ServeConfig) -> std::collections::BTreeSet<u16> {
         .collect()
 }
 
+/// The `(host, port)` pairs with Funnel enabled, split from each `true` `host:port` key (port after
+/// the last `:`, host before it — a MagicDNS host has no colon). Lets a renderer show the real
+/// MagicDNS name instead of a placeholder. Sorted by the BTreeMap key order; a bad port key is
+/// skipped.
+pub fn funnel_host_ports(cfg: &ServeConfig) -> Vec<(String, u16)> {
+    cfg.allow_funnel
+        .iter()
+        .filter(|(_, on)| **on)
+        .filter_map(|(hp, _)| {
+            hp.rsplit_once(':').and_then(|(h, p)| {
+                p.parse::<u16>()
+                    .ok()
+                    .filter(|&p| p != 0)
+                    .map(|p| (h.to_string(), p))
+            })
+        })
+        .collect()
+}
+
 /// Path of the serve-config file for `state_dir` + profile id (next to prefs/key). The default
 /// profile uses a top-level `serve-config.json`; named profiles nest under `profiles/<id>/`.
 pub fn config_path(state_dir: &Path, profile_id: &str) -> PathBuf {
@@ -555,6 +574,21 @@ mod tests {
         set_funnel(&mut cfg, "host.example.ts.net", 8443, false);
         assert!(cfg.allow_funnel.is_empty());
         assert!(funnel_ports(&cfg).is_empty());
+    }
+
+    #[test]
+    fn funnel_host_ports_splits_key() {
+        let mut cfg = ServeConfig::default();
+        set_funnel(&mut cfg, "host.example.ts.net", 443, true);
+        set_funnel(&mut cfg, "host.example.ts.net", 8443, true);
+        let hps = funnel_host_ports(&cfg);
+        assert_eq!(
+            hps,
+            vec![
+                ("host.example.ts.net".to_string(), 443),
+                ("host.example.ts.net".to_string(), 8443),
+            ]
+        );
     }
 
     #[test]

@@ -365,10 +365,11 @@ enum Command {
         cmd: ServeCmd,
     },
     /// Expose a tailnet port to the PUBLIC internet via Tailscale Funnel (Go `tailscale funnel`).
-    /// `funnel <port> on` enables Funnel for a port that's already served (`serve https <port> …`);
-    /// `off` disables it. The node must have Funnel enabled for the tailnet (the `https` + `funnel`
-    /// node attributes) and the port must be Funnel-allowed; the public ingress path needs a real
-    /// Tailscale SaaS tailnet (a self-hosted control plane has no ingress relay).
+    /// `funnel <port> on` enables Funnel for a port; `off` disables it. Configure `serve https <port>
+    /// <target>` so there is a proxy backend to expose (order doesn't matter — the funnel lane picks up
+    /// whatever serve exists). The node must have Funnel enabled for the tailnet (the `https` +
+    /// `funnel` node attributes) and the port must be Funnel-allowed; the public ingress path needs a
+    /// real Tailscale SaaS tailnet (a self-hosted control plane has no ingress relay).
     Funnel {
         /// The tailnet port to expose (must already have a `serve https`/`http` handler).
         #[arg(value_name = "PORT")]
@@ -2361,17 +2362,23 @@ async fn run_funnel(socket: &std::path::Path, port: u16, on_off: &str) -> Result
     };
     tailscaled_rs::ipn::serve::set_funnel(&mut cfg, host, port, on);
 
-    // Go warns when funnel is on for a port with no serve config (funnel exposes a serve).
-    let has_serve = cfg
+    // Warn when funnel is on for a port the daemon can't actually expose. The funnel lane proxies a
+    // raw TLS-terminated stream to the port's `tcp_forward` backend, so it needs a web entry WITH a
+    // proxy backend — match that exact arming condition (a `text`/`redirect`/`mounts`-only serve has
+    // no backend to splice to, so it would silently never arm). Stricter than Go's "any serve config"
+    // check because our funnel lane only splices a proxy backend.
+    let has_proxy_backend = cfg
         .tcp
         .get(&port.to_string())
-        .is_some_and(tailscaled_rs::ipn::serve::is_web_serve);
+        .is_some_and(|h| tailscaled_rs::ipn::serve::is_web_serve(h) && !h.tcp_forward.is_empty());
     send_ok_or_die(socket, Request::SetServeConfig { config: cfg }).await?;
     if on {
         println!("funnel enabled for {host}:{port}");
-        if !has_serve {
+        if !has_proxy_backend {
             eprintln!(
-                "warning: funnel=on for {host}:{port}, but no serve config — run `tnet serve https {port} <target>` to expose something"
+                "warning: funnel=on for {host}:{port}, but no proxy backend on that port — run \
+                 `tnet serve https {port} <target>` so there is something to expose (funnel splices to \
+                 the serve's proxy backend)"
             );
         }
     } else {
@@ -2455,12 +2462,14 @@ fn format_serve_status(cfg: &tailscaled_rs::localapi::ServeConfig, _json: bool) 
     }
     // Funnel summary: ports exposed to the PUBLIC internet (Go's "# Funnel on:" section). Listed
     // after the serve entries so the per-port lines stay clean; a funnel port should also appear
-    // above as an https serve (funnel exposes a serve).
-    let funnel = tailscaled_rs::ipn::serve::funnel_ports(cfg);
+    // above as an https serve (funnel exposes a serve). The `host:port` key carries the real MagicDNS
+    // name, so render that (not a `<node>` placeholder, unlike the per-port serve lines whose host the
+    // config doesn't carry).
+    let funnel = tailscaled_rs::ipn::serve::funnel_host_ports(cfg);
     if !funnel.is_empty() {
         out.push_str("Funnel (on the public internet):\n");
-        for port in &funnel {
-            out.push_str(&format!("  https://<node>:{port}\n"));
+        for (host, port) in &funnel {
+            out.push_str(&format!("  https://{host}:{port}\n"));
         }
     }
     out
