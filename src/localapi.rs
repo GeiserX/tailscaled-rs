@@ -412,6 +412,17 @@ pub struct WhoisReport {
     /// its `whois --json`). Back-compatible (omitted when absent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_key_expiry: Option<String>,
+    /// The node's liveness: `Some(true)` = control-connected (online), `Some(false)` = offline,
+    /// `None` = unknown (the same control-plane signal `status` uses for peers). Back-compatible
+    /// (omitted when unknown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub online: Option<bool>,
+    /// When the node was last seen by control, in chrono `DateTime<Utc>` Display form
+    /// (`YYYY-MM-DD HH:MM:SS UTC`, NOT RFC3339), or `None` if never/unknown. Like `status`, this is
+    /// only *meaningful* (and only rendered) when the node is offline — an online node's last-seen is
+    /// "now". Back-compatible (omitted when absent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<String>,
 }
 
 /// A single waiting Taildrop file, returned by [`Request::FileList`]. Mirrors the engine's
@@ -1025,6 +1036,8 @@ mod tests {
             capabilities: vec!["funnel".into()],
             tags: vec!["tag:server".into(), "tag:ci".into()],
             node_key_expiry: Some("2026-09-01 12:00:00 UTC".into()),
+            online: Some(false),
+            last_seen: Some("2026-06-11 05:19:14 UTC".into()),
         };
         let json = serde_json::to_string(&Response::Whois(report.clone())).unwrap();
         match serde_json::from_str::<Response>(&json).unwrap() {
@@ -1034,14 +1047,16 @@ mod tests {
                     r.node_key_expiry, report.node_key_expiry,
                     "node_key_expiry must round-trip"
                 );
+                assert_eq!(r.online, report.online, "online must round-trip");
+                assert_eq!(r.last_seen, report.last_seen, "last_seen must round-trip");
                 assert_eq!(r.capabilities, report.capabilities);
                 assert_eq!(r.node_name, report.node_name);
             }
             other => panic!("expected Whois, got {other:?}"),
         }
 
-        // Back-compat: an old wire with NO tags / node_key_expiry keys still parses, defaulting to
-        // empty Vec / None (a whois never invents tags or an expiry that control did not send).
+        // Back-compat: an old wire with NO tags / node_key_expiry / online / last_seen keys still
+        // parses, defaulting to empty Vec / None (a whois never invents data control did not send).
         let old_wire =
             r#"{"kind":"whois","found":true,"node_name":"peer-b","node_ipv4":"100.64.0.2"}"#;
         match serde_json::from_str::<Response>(old_wire).expect("old wire parses") {
@@ -1051,6 +1066,8 @@ mod tests {
                     r.node_key_expiry.is_none(),
                     "omitted node_key_expiry defaults to None"
                 );
+                assert!(r.online.is_none(), "omitted online defaults to None");
+                assert!(r.last_seen.is_none(), "omitted last_seen defaults to None");
             }
             other => panic!("expected Whois, got {other:?}"),
         }
@@ -1062,10 +1079,13 @@ mod tests {
         }))
         .unwrap();
         // Quoted-key checks (not bare substrings) so this stays correct even if a future field name
-        // happens to contain "tags"/"node_key_expiry" as a substring.
+        // happens to contain one of these as a substring.
         assert!(
-            !empty_json.contains("\"tags\"") && !empty_json.contains("\"node_key_expiry\""),
-            "empty tags/expiry must be omitted from the wire: {empty_json}"
+            !empty_json.contains("\"tags\"")
+                && !empty_json.contains("\"node_key_expiry\"")
+                && !empty_json.contains("\"online\"")
+                && !empty_json.contains("\"last_seen\""),
+            "empty optional fields must be omitted from the wire: {empty_json}"
         );
     }
 
