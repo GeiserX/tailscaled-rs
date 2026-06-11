@@ -343,6 +343,15 @@ enum Command {
         #[command(subcommand)]
         cmd: DnsCmd,
     },
+    /// Show this node's network-conditions report (Go `tailscale netcheck`): the nearest (preferred)
+    /// DERP region and the per-region DERP latency, lowest first. NOTE: this build's net-report
+    /// measures DERP-region latency ONLY — Go's UDP/IPv4/IPv6/MappingVariesByDestIP/PortMapping flags
+    /// are not measured, and DERP regions are shown by id (the engine carries no region name).
+    Netcheck {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Exit-node commands. `list` shows tailnet peers offering to be exit nodes. Mirrors Go
     /// `tailscale exit-node`.
     #[command(name = "exit-node")]
@@ -1136,6 +1145,23 @@ async fn main() -> Result<()> {
             print!("{}", format_dns_status(&report, json));
             return Ok(());
         }
+        // `netcheck` (Go `tailscale netcheck`): fetch + render the net-report (DERP-region latency).
+        Command::Netcheck { json } => {
+            let report = match round_trip(&socket, &Request::Netcheck).await {
+                Ok(Response::Netcheck(r)) => r,
+                Ok(Response::Error { message }) => {
+                    eprintln!("error: {message}");
+                    std::process::exit(1);
+                }
+                Ok(other) => anyhow::bail!("unexpected response to netcheck: {other:?}"),
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("querying netcheck at {}", socket.display()));
+                }
+            };
+            print!("{}", format_netcheck(&report, json));
+            return Ok(());
+        }
         // `exit-node list` (Go `tailscale exit-node list`): reuse Status, filter to exit-node peers.
         Command::ExitNode {
             cmd: ExitNodeCmd::List,
@@ -1267,6 +1293,8 @@ async fn main() -> Result<()> {
         Response::Lock(report) => print!("{}", format_lock_status(&report, false)),
         // `dns status` is handled inline above (early return); this arm is exhaustiveness-only.
         Response::DnsStatus(report) => print!("{}", format_dns_status(&report, false)),
+        // `netcheck` is handled inline above (early return); this arm is exhaustiveness-only.
+        Response::Netcheck(report) => print!("{}", format_netcheck(&report, false)),
         // `serve` is handled inline above (read-modify-write); this arm is exhaustiveness-only.
         Response::ServeConfig(cfg) => print!("{}", format_serve_status(&cfg, false)),
         // `bugreport`: print the local marker + a one-line honesty note (no logs were uploaded).
@@ -1456,6 +1484,71 @@ fn format_dns_status(r: &tailscaled_rs::localapi::DnsStatusReport, json: bool) -
     out.push_str(
         "(note: the 'Use Tailscale DNS' accept-dns line and the 'System DNS configuration' section \
          are not surfaced by this build)\n",
+    );
+    out
+}
+
+/// Render `tnet netcheck` from a [`NetcheckReport`](tailscaled_rs::localapi::NetcheckReport) (Go
+/// `tailscale netcheck`). Human form prints a Go-`printNetCheckReport`-flavored block: a `Report:`
+/// header, the nearest (preferred) DERP region, and the per-region DERP latency lowest-first (each
+/// latency rounded to 0.1ms, e.g. `23.4ms`), with parenthetical none-lines when there is no preferred
+/// region / no measured latency. It then prints a one-line honest note that Go's
+/// UDP/IPv4/IPv6/`MappingVariesByDestIP`/PortMapping flags are not measured by this build, and that
+/// DERP regions are shown by id (the engine carries no region name). `json` emits a `{ "PreferredDERP":
+/// <id|null>, "RegionLatency": [{"RegionID":<id>,"LatencyMs":<f64>}, …] }` object via `serde_json`
+/// (escape-safe, 2-space pretty). Pure (returns the string incl. its trailing newline) → unit-testable.
+fn format_netcheck(r: &tailscaled_rs::localapi::NetcheckReport, json: bool) -> String {
+    if json {
+        use serde_json::{Map, Value, json};
+        let mut root = Map::new();
+        // A None preferred region serializes as JSON null (Go's zero value), not an omitted key.
+        root.insert(
+            "PreferredDERP".into(),
+            match r.preferred_derp {
+                Some(id) => json!(id),
+                None => Value::Null,
+            },
+        );
+        // Per-region latency: an ordered list of {RegionID, LatencyMs} objects (Go `RegionLatency`),
+        // in the engine's latency-ascending order.
+        let regions: Vec<Value> = r
+            .region_latencies
+            .iter()
+            .map(|rl| {
+                let mut m = Map::new();
+                m.insert("RegionID".into(), json!(rl.region_id));
+                m.insert("LatencyMs".into(), json!(rl.latency_ms));
+                Value::Object(m)
+            })
+            .collect();
+        root.insert("RegionLatency".into(), Value::Array(regions));
+        return format!(
+            "{}\n",
+            serde_json::to_string_pretty(&root).unwrap_or_else(|_| "{}".to_string())
+        );
+    }
+
+    let mut out = String::from("Report:\n");
+    match r.preferred_derp {
+        Some(id) => out.push_str(&format!("  * Nearest DERP: region {id}\n")),
+        None => out.push_str("  * Nearest DERP: (none — not measured yet)\n"),
+    }
+    out.push_str("  * DERP latency:\n");
+    if r.region_latencies.is_empty() {
+        out.push_str("      (no DERP latency measured)\n");
+    } else {
+        for rl in &r.region_latencies {
+            // Round to 0.1ms (e.g. 23.4ms), matching Go's terse per-region latency rendering.
+            out.push_str(&format!(
+                "      - region {}: {:.1}ms\n",
+                rl.region_id, rl.latency_ms
+            ));
+        }
+    }
+    out.push_str(
+        "(note: this build's net-report measures DERP-region latency only — Go's \
+         UDP/IPv4/IPv6/MappingVariesByDestIP/PortMapping flags are not measured, and DERP regions \
+         are shown by id as the engine carries no region name)\n",
     );
     out
 }
@@ -3504,6 +3597,67 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&format_dns_status(&empty, true)).unwrap();
         assert_eq!(v["MagicDNS"], serde_json::json!(false));
         assert_eq!(v["Resolvers"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn format_netcheck_populated_human_and_json() {
+        use tailscaled_rs::localapi::{NetcheckReport, RegionLatencyView};
+        let report = NetcheckReport {
+            preferred_derp: Some(1),
+            region_latencies: vec![
+                RegionLatencyView {
+                    region_id: 1,
+                    latency_ms: 23.42,
+                },
+                RegionLatencyView {
+                    region_id: 7,
+                    latency_ms: 41.7,
+                },
+            ],
+        };
+        // Human form: the preferred region, both per-region latency lines (formatted to 0.1ms), in
+        // the engine's ascending order, and the honest omission note.
+        let h = format_netcheck(&report, false);
+        assert!(h.contains("Report:"), "{h}");
+        assert!(h.contains("* Nearest DERP: region 1"), "{h}");
+        assert!(h.contains("- region 1: 23.4ms"), "{h}");
+        assert!(h.contains("- region 7: 41.7ms"), "{h}");
+        // Ordering: region 1's line precedes region 7's (engine emits latency-ascending).
+        assert!(
+            h.find("region 1: 23.4ms").unwrap() < h.find("region 7: 41.7ms").unwrap(),
+            "per-region latency lines must keep the engine's ascending order: {h}"
+        );
+        assert!(
+            h.contains("DERP-region latency only"),
+            "the honest reduced-scope note must be present: {h}"
+        );
+        // JSON form: Go-shaped keys, a bare numeric PreferredDERP, and the ordered RegionLatency list.
+        let j = format_netcheck(&report, true);
+        let v: serde_json::Value = serde_json::from_str(&j).unwrap();
+        assert_eq!(v["PreferredDERP"], serde_json::json!(1));
+        assert_eq!(v["RegionLatency"][0]["RegionID"], serde_json::json!(1));
+        assert_eq!(v["RegionLatency"][0]["LatencyMs"], serde_json::json!(23.42));
+        assert_eq!(v["RegionLatency"][1]["RegionID"], serde_json::json!(7));
+    }
+
+    #[test]
+    fn format_netcheck_empty_renders_none_lines() {
+        use tailscaled_rs::localapi::NetcheckReport;
+        // The pre-measurement / default report: no preferred region + no measured latency → the two
+        // none-lines, plus the honest note.
+        let empty = NetcheckReport::default();
+        let h = format_netcheck(&empty, false);
+        assert!(h.contains("Report:"), "{h}");
+        assert!(
+            h.contains("* Nearest DERP: (none — not measured yet)"),
+            "{h}"
+        );
+        assert!(h.contains("(no DERP latency measured)"), "{h}");
+        assert!(h.contains("DERP-region latency only"), "{h}");
+        // JSON: a default report carries a null PreferredDERP + an empty RegionLatency array.
+        let v: serde_json::Value = serde_json::from_str(&format_netcheck(&empty, true)).unwrap();
+        assert_eq!(v["PreferredDERP"], serde_json::Value::Null);
+        assert_eq!(v["RegionLatency"], serde_json::json!([]));
     }
 
     #[test]

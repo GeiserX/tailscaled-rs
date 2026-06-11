@@ -1909,6 +1909,15 @@ impl Backend {
         diag::dns_status(dev).await
     }
 
+    /// Report the node's network-conditions report (the `tnet netcheck` path). Thin `pub` shim over
+    /// [`diag::netcheck`], kept on `Backend` so the `server.rs` dispatch call site
+    /// (`Backend::netcheck(&dev)`) is uniform with the other off-lock diagnostics. See
+    /// [`diag::netcheck`] for the `netcheck()` → [`NetcheckReport`](crate::localapi::NetcheckReport)
+    /// mapping (and the honest DERP-latency-only scope note).
+    pub async fn netcheck(dev: &tailscale::Device) -> crate::localapi::Response {
+        diag::netcheck(dev).await
+    }
+
     /// Load the current profile's serve config (the `tnet serve status` / GetServeConfig path).
     /// Missing/malformed → empty (no serve). Reads only the profile's serve-config file.
     pub async fn serve_config(&self) -> serve::ServeConfig {

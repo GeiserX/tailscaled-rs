@@ -137,6 +137,7 @@ pub fn requires_write(request: &crate::localapi::Request) -> bool {
         | Request::Metrics
         | Request::LockStatus
         | Request::DnsStatus
+        | Request::Netcheck
         | Request::BugReport
         | Request::GetServeConfig
         | Request::FileList => false,
@@ -268,6 +269,10 @@ mod tests {
         assert!(
             !requires_write(&Request::DnsStatus),
             "dns status only reads the control-pushed MagicDNS config — a read, gated like status"
+        );
+        assert!(
+            !requires_write(&Request::Netcheck),
+            "netcheck only reads the net-report (DERP-region latency) — a read, gated like status"
         );
     }
 
