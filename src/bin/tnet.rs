@@ -415,6 +415,10 @@ enum Command {
         #[command(subcommand)]
         cmd: DebugCmd,
     },
+    /// Install tailnetd as a system service (systemd/launchd) that starts at boot. Requires root.
+    Install,
+    /// Remove the tailnetd system service. Requires root; leaves node state.
+    Uninstall,
 }
 
 /// `tnet debug` subcommands (Go `tailscale debug`).
@@ -843,6 +847,17 @@ async fn main() -> Result<()> {
                 Response::Error { message } => anyhow::bail!("debug capture failed: {message}"),
                 other => anyhow::bail!("unexpected response to debug capture: {other:?}"),
             }
+        }
+        // `install` / `uninstall` (Go `tailscaled install-system-daemon` / `uninstall-system-daemon`):
+        // purely LOCAL, privileged file + service-manager work — they never touch the LocalAPI socket.
+        // Handled inline (early return), root-gated inside `run_install`/`run_uninstall`.
+        Command::Install => {
+            return tailscaled_rs::ipn::install::run_install()
+                .context("installing the tailnetd system service");
+        }
+        Command::Uninstall => {
+            return tailscaled_rs::ipn::install::run_uninstall()
+                .context("removing the tailnetd system service");
         }
         Command::Down => Request::Down,
         Command::Logout => Request::Logout,
