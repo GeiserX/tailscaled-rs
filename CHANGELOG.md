@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.26.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.25.0...v0.26.0) (2026-06-11)
+
+
+### Features
+
+* **install:** tnet install / uninstall — system-daemon bootstrap ([#79](https://github.com/GeiserX/tailscaled-rs/issues/79)) ([9743f2c](https://github.com/GeiserX/tailscaled-rs/commit/9743f2c1cc0fe81a73928e94d06caaee9acaba25))
+
 ## [0.25.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.24.0...v0.25.0) (2026-06-11)
 
 
