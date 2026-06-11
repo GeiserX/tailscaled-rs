@@ -309,6 +309,9 @@ No new engine code needed if the live setters already exist — just the contrac
 
 ## 10. `block_incoming` / shields-up Config field (engine bead — to file)
 
+> ✅ **SHIPPED in engine v0.21.2** (pin bumped 2026-06-11). The engine grew the shields-up knob; the
+> daemon-side `--shields-up` pref + CLI wiring is a future in-repo batch (no further engine work).
+
 Go `tailscale up --shields-up` / `set --shields-up` drops all inbound connections from peers (the
 node still reaches out). The daemon wants to surface this pref (`tsd-iqq.4`), but the engine `Config`
 has no `block_incoming` / `shields_up` field and no packetfilter posture knob for it.
@@ -320,6 +323,9 @@ then wires a `shields_up` pref + `--shields-up`/`--no-shields-up` like the other
 
 ## 11. Surface the pushed DNS config on `Device` (engine bead — to file)
 
+> ✅ **SHIPPED in engine v0.21.2** (`Device::dns_config()`, pin bumped 2026-06-11). `tnet dns status`
+> is now a future in-repo batch.
+
 For `tnet dns status` (Go `tailscale dns status`) the daemon needs to read the control-pushed DNS
 config. The engine has `ts_control::DnsConfig { magic_dns, search_domains, resolvers }` internally,
 but the `Device` facade exposes no accessor (no `Device::dns_config()` and `Status` carries no DNS).
@@ -330,6 +336,9 @@ read-surface; no behavior change. Unblocks the DNS half of `tsd-ioh` (the `accep
 already wirable via the existing Config; this is only the status/diagnostics read).
 
 ## 12. Surface a netcheck / net-report on `Device` (engine bead — to file)
+
+> ✅ **SHIPPED in engine v0.21.2** (`Device::netcheck()`, pin bumped 2026-06-11). `tnet netcheck` is
+> now a future in-repo batch.
 
 For `tnet netcheck` (Go `tailscale netcheck`) the daemon needs the node's network conditions — DERP
 latencies, preferred DERP region, NAT/port-mapping detection (UPnP/PMP/PCP), UDP/IPv4/IPv6

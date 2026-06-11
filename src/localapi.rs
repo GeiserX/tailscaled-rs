@@ -381,7 +381,7 @@ pub struct WaitingFileReport {
 }
 
 /// A snapshot of daemon + netmap state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StatusReport {
     /// The IPN state name. One of the seven [`crate::ipn::State`] variants (the authoritative
     /// list is [`crate::ipn::State::as_str`]): `NoState`, `NeedsLogin`, `NeedsMachineAuth`,
@@ -421,6 +421,19 @@ pub struct StatusReport {
     /// wire backward-compatible with clients that predate this field.
     #[serde(default)]
     pub prefs: PrefsView,
+    /// This node's tailnet IPv6, once a netmap has been received (Go `Status.TailscaleIPs[1]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_ipv6: Option<String>,
+    /// The stable id (resolved to the peer's display name where possible) of the exit node traffic is
+    /// **currently** egressing through, if any (Go `Status.ExitNodeStatus.ID`). `None` when no exit
+    /// node is engaged. Distinct from the *configured* `prefs.exit_node` selector: this is what is
+    /// actually live (the route updater's fail-closed answer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_exit_node: Option<String>,
+    /// The tailnet's MagicDNS suffix (e.g. `tail0123.ts.net`), Go `Status.MagicDNSSuffix`. `None`
+    /// before the first netmap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub magic_dns_suffix: Option<String>,
     /// Known peers in the netmap.
     pub peers: Vec<PeerReport>,
 }
@@ -635,6 +648,30 @@ pub struct PeerReport {
     /// the engine has not reported liveness for this peer. Feeds the Go `PeerStatus.Online` field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub online: Option<bool>,
+    /// The peer's tailnet IPv6 address, if known (Go `PeerStatus.TailscaleIPs[1]`). `#[serde(default)]`
+    /// keeps the wire backward-compatible with clients that predate this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv6: Option<String>,
+    /// The routes this peer accepts traffic for — its own `/32`+`/128` plus any advertised subnet
+    /// routes and the exit-node default route (Go `PeerStatus.AllowedIPs`). Empty when none/unknown.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_routes: Vec<String>,
+    /// When control last saw this peer online, per Go `PeerStatus.LastSeen` — meaningful mainly while
+    /// the peer is offline. `None` when unknown / never seen. Format is the engine `chrono`
+    /// `DateTime<Utc>` Display form (RFC3339-*shaped* but space-separated with a ` UTC` suffix, e.g.
+    /// `2026-06-11 05:19:14 UTC`, not strict RFC3339 `…T…Z`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<String>,
+    /// The peer's current direct UDP endpoint (`host:port`) when a direct path is confirmed (Go
+    /// `PeerStatus.CurAddr`). `Some` ⇒ traffic flows directly; `None` ⇒ it relays via DERP (see
+    /// [`relay`](PeerReport::relay)). Mutually exclusive with `relay` for a routed peer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cur_addr: Option<String>,
+    /// The DERP region code the peer relays through when there is no direct path (Go
+    /// `PeerStatus.Relay`, e.g. `"nyc"`). `Some` ⇔ [`cur_addr`](PeerReport::cur_addr) is `None` and
+    /// the home DERP region is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<String>,
 }
 
 #[cfg(test)]
@@ -813,6 +850,9 @@ mod tests {
             auth_url: None,
             error: None,
             prefs: Default::default(),
+            self_ipv6: None,
+            active_exit_node: None,
+            magic_dns_suffix: None,
             peers: vec![PeerReport {
                 name: "peer-b".to_string(),
                 ipv4: "100.64.0.2".to_string(),
@@ -855,6 +895,9 @@ mod tests {
             auth_url: Some("https://login.example.com/a/abc123".to_string()),
             error: None,
             prefs: Default::default(),
+            self_ipv6: None,
+            active_exit_node: None,
+            magic_dns_suffix: None,
             peers: vec![],
         };
         let json = serde_json::to_string(&report).unwrap();
@@ -887,6 +930,9 @@ mod tests {
             auth_url: None,
             error: Some("authentication rejected by control: invalid key".to_string()),
             prefs: Default::default(),
+            self_ipv6: None,
+            active_exit_node: None,
+            magic_dns_suffix: None,
             peers: vec![],
         };
         let json = serde_json::to_string(&report).unwrap();
@@ -913,6 +959,9 @@ mod tests {
             auth_url: None,
             error: None,
             prefs: Default::default(),
+            self_ipv6: None,
+            active_exit_node: None,
+            magic_dns_suffix: None,
             peers: vec![],
         };
         let json = serde_json::to_string(&report).unwrap();
@@ -936,6 +985,9 @@ mod tests {
             auth_url: Some("https://login.example.com/a/abc123".to_string()),
             error: None,
             prefs: Default::default(),
+            self_ipv6: None,
+            active_exit_node: None,
+            magic_dns_suffix: None,
             peers: vec![],
         };
         let pending_json = serde_json::to_string(&pending).unwrap();
@@ -957,6 +1009,9 @@ mod tests {
             auth_url: None,
             error: Some("authentication rejected by control: invalid key".to_string()),
             prefs: Default::default(),
+            self_ipv6: None,
+            active_exit_node: None,
+            magic_dns_suffix: None,
             peers: vec![],
         };
         let failed_json = serde_json::to_string(&failed).unwrap();
