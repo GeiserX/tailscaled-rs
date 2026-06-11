@@ -186,12 +186,12 @@ pub(super) async fn whois(dev: &tailscale::Device, ip: &str) -> Response {
             // Reuse `StatusNode::from_node` — the exact name+ipv4 derivation `status` renders
             // peers with — so whois and status agree on a node's identity by construction.
             let node = tailscale::StatusNode::from_node(&w.node);
-            // Read the tag set + key-expiry off the full `Node` BEFORE the field moves below
-            // (`user`/`capabilities`). `StatusNode::from_node` only derived name+ipv4, so without
-            // this the daemon would discard both — yet Go surfaces them (tags in `whois` text; the
-            // key-expiry is a superset this fork also exposes). Expiry → its chrono `DateTime<Utc>`
-            // Display form (`YYYY-MM-DD HH:MM:SS UTC`, not RFC3339's `T…Z`), matching how `status`
-            // renders `last_seen`.
+            // Tags + key-expiry are read off the FULL `Node` (not the `StatusNode` projection): the
+            // projection carries name/ipv4/liveness but NOT these two, so without this the daemon
+            // would discard them — yet Go surfaces them (tags in `whois` text; key-expiry is a
+            // superset this fork also exposes). Read before the `user`/`capabilities` moves below.
+            // Expiry → its chrono `DateTime<Utc>` Display form (`YYYY-MM-DD HH:MM:SS UTC`, not
+            // RFC3339's `T…Z`), matching how `status` renders `last_seen`.
             let tags = w.node.tags.clone();
             let node_key_expiry = w.node.node_key_expiry.map(|t| t.to_string());
             // Liveness comes off the StatusNode projection (already computed by `from_node`): the
