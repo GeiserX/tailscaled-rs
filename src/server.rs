@@ -733,6 +733,7 @@ async fn dispatch(
             advertise_routes,
             advertise_tags,
             accept_routes,
+            shields_up,
             ssh,
             reset,
         } => {
@@ -753,6 +754,7 @@ async fn dispatch(
                 advertise_routes,
                 advertise_tags,
                 accept_routes,
+                shields_up,
                 ssh,
                 reset,
             };
@@ -785,6 +787,7 @@ async fn dispatch(
         Request::Set {
             hostname,
             accept_routes,
+            shields_up,
             exit_node,
             advertise_exit_node,
             advertise_routes,
@@ -794,6 +797,7 @@ async fn dispatch(
             let opts = ipn::SetOptions {
                 hostname,
                 accept_routes,
+                shields_up,
                 exit_node,
                 advertise_exit_node,
                 advertise_routes,

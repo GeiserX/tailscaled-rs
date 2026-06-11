@@ -443,6 +443,9 @@ pub struct UpOptions {
     /// Accept-subnet-routes override (`None` leaves the pref unchanged; `Some(b)` sets it). Go's
     /// `tailscale up --accept-routes`; same tri-state as `set`'s `accept_routes`.
     pub accept_routes: Option<bool>,
+    /// Shields-up override (`None` leaves the pref unchanged; `Some(b)` sets it). Go's
+    /// `tailscale up --shields-up`; block inbound peer connections terminating on this node.
+    pub shields_up: Option<bool>,
     /// Run-SSH-server override (`None` leaves the pref unchanged; `Some(b)` sets it).
     pub ssh: Option<bool>,
     /// Reset every up-managed pref this command does not mention back to its default before applying
@@ -474,6 +477,7 @@ impl UpOptions {
             || self.advertise_routes.is_some()
             || self.advertise_tags.is_some()
             || self.accept_routes.is_some()
+            || self.shields_up.is_some()
             || self.ssh.is_some()
     }
 }
@@ -491,6 +495,9 @@ pub struct SetOptions {
     pub hostname: Option<String>,
     /// Accept subnet routes advertised by peers (`None` unchanged).
     pub accept_routes: Option<bool>,
+    /// Shields-up: block inbound peer connections terminating on this node (`None` unchanged). A
+    /// device-rebuild change (it alters the engine's packet-filter posture), like `accept_routes`.
+    pub shields_up: Option<bool>,
     /// Exit-node selector. Double `Option`: `None` unchanged, `Some(None)` clear, `Some(Some(s))`
     /// set. Applied LIVE when a device is up (no reconnect).
     pub exit_node: Option<Option<String>>,
@@ -511,6 +518,7 @@ impl SetOptions {
     pub fn is_empty(&self) -> bool {
         self.hostname.is_none()
             && self.accept_routes.is_none()
+            && self.shields_up.is_none()
             && self.exit_node.is_none()
             && self.advertise_exit_node.is_none()
             && self.advertise_routes.is_none()
@@ -527,6 +535,7 @@ impl SetOptions {
         self.exit_node.is_some()
             && self.hostname.is_none()
             && self.accept_routes.is_none()
+            && self.shields_up.is_none()
             && self.advertise_exit_node.is_none()
             && self.advertise_routes.is_none()
             && self.advertise_tags.is_none()
@@ -1011,6 +1020,9 @@ impl Backend {
         if let Some(ar) = opts.accept_routes {
             self.prefs.accept_routes = ar;
         }
+        if let Some(su) = opts.shields_up {
+            self.prefs.shields_up = su;
+        }
         if let Some(en) = opts.exit_node {
             self.prefs.exit_node = en;
         }
@@ -1169,6 +1181,9 @@ impl Backend {
         // sentinel as `set`'s accept_routes; baked into the engine Config in `build_config`.
         if let Some(ar) = opts.accept_routes {
             self.prefs.accept_routes = ar;
+        }
+        if let Some(su) = opts.shields_up {
+            self.prefs.shields_up = su;
         }
         // Run-SSH-server override (same "unchanged unless named" sentinel). The actual SSH server
         // task is spawned on install in `finish_up` when this is set; `build_config` (below) also
@@ -1839,6 +1854,7 @@ impl Backend {
             advertise_routes: self.prefs.advertise_routes.clone(),
             advertise_tags: self.prefs.advertise_tags.clone(),
             accept_routes: self.prefs.accept_routes,
+            shields_up: self.prefs.shields_up,
             ssh: self.prefs.ssh_enabled,
             // SSH *liveness*, distinct from the `ssh_enabled` pref above: the server task is spawned
             // in `finish_up` and can die at bind time (no tailnet IPv4, `listen_ssh` error). Report

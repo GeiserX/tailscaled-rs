@@ -149,6 +149,12 @@ pub fn check_accidental_reverts(
             value: prefs.accept_routes.to_string(),
         });
     }
+    if opts.shields_up.is_none() && prefs.shields_up != d.shields_up {
+        reverts.push(RevertedPref {
+            key: "shields_up".into(),
+            value: prefs.shields_up.to_string(),
+        });
+    }
     if opts.ssh.is_none() && prefs.ssh_enabled != d.ssh_enabled {
         reverts.push(RevertedPref {
             key: "ssh".into(),
@@ -190,6 +196,7 @@ mod tests {
             control_url: _,
             hostname: _,
             accept_routes: _,
+            shields_up: _,
             exit_node: _,
             advertise_exit_node: _,
             advertise_routes: _,
@@ -216,6 +223,7 @@ mod tests {
             }),
             ("hostname", |p| p.hostname = Some("h".into())),
             ("accept_routes", |p| p.accept_routes = true),
+            ("shields_up", |p| p.shields_up = true),
             ("exit_node", |p| p.exit_node = Some("100.64.0.9".into())),
             ("advertise_exit_node", |p| p.advertise_exit_node = true),
             ("advertise_routes", |p| {
@@ -266,6 +274,7 @@ mod tests {
                 "control_url" => assert_eq!(reset_prefs.control_url, d.control_url),
                 "hostname" => assert_eq!(reset_prefs.hostname, d.hostname),
                 "accept_routes" => assert_eq!(reset_prefs.accept_routes, d.accept_routes),
+                "shields_up" => assert_eq!(reset_prefs.shields_up, d.shields_up),
                 "exit_node" => assert_eq!(reset_prefs.exit_node, d.exit_node),
                 "advertise_exit_node" => {
                     assert_eq!(reset_prefs.advertise_exit_node, d.advertise_exit_node)

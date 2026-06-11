@@ -44,6 +44,9 @@ pub(super) async fn build_config(prefs: &Prefs, key_path: &Path) -> Result<tails
     // A node that must survive reboots and resume from its key alone needs `ephemeral = false`.
     config.ephemeral = prefs.ephemeral;
     config.accept_routes = prefs.accept_routes;
+    // Shields-up (Go `ShieldsUp`): block inbound peer connections terminating on this node. The
+    // engine wraps the live packet filter in its `ShieldsUpFilter` when this is set.
+    config.block_incoming = prefs.shields_up;
     // Exit node: prefs store the raw selector string; parse it into the engine's
     // `ExitNodeSelector`. `FromStr` is infallible (a bare IP → `Ip`, anything else → `Name`),
     // so the parse cannot fail — `Err` is `core::convert::Infallible` and `unwrap` here is
