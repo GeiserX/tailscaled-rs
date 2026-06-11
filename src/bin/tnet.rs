@@ -145,6 +145,14 @@ enum Command {
         /// out. It changes no settings (your prefs are kept); it only forces a new login.
         #[arg(long)]
         force_reauth: bool,
+        /// Wait up to this many seconds for the node to reach the Running state after bringing it up,
+        /// then exit (Go `tailscale up --timeout`). On timeout, exits non-zero. Omitted = don't wait
+        /// (return as soon as the daemon accepts the up); `0` = wait forever. Handy in scripts as
+        /// `tnet up --authkey <KEY> --timeout 30 && start-my-service`. For an interactive (no-authkey)
+        /// up the login URL is printed first, then the wait runs — so a short timeout may elapse
+        /// before a human authorizes.
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<u64>,
     },
     /// Tweak individual prefs on an already-configured node, without an up/down cycle (the analogue
     /// of Go's `tailscale set`). This never (re)authenticates and never changes whether the node is
@@ -691,6 +699,12 @@ async fn main() -> Result<()> {
     // successful bring-up we follow with a `status` to surface the control auth URL the operator
     // must visit (it isn't known at `up`-time; it arrives once the engine reaches `NeedsLogin`).
     let mut interactive_up = false;
+    // Track an `up --timeout`: `None` = this was not an `up` (or no `--timeout` was given), so the
+    // post-`up` success path does NOT wait; `Some(secs)` = an `up` requested a bounded wait for the
+    // node to reach Running (Go `tailscale up --timeout`, a CLIENT-SIDE wait — it never crosses the
+    // socket). `secs == 0` means wait forever (Go's "0 = wait indefinitely"), handled by
+    // `wait_for_running`. Captured here (like `interactive_up`) before the wire `Request` is built.
+    let mut up_timeout: Option<u64> = None;
     // Track whether the user asked for `status --json`, so the (generic) `Response::Status` render
     // site below emits the Go `ipnstate.Status`-shaped JSON instead of the human table.
     let mut status_json = false;
@@ -723,7 +737,12 @@ async fn main() -> Result<()> {
             no_ssh,
             reset,
             force_reauth,
+            timeout,
         } => {
+            // `--timeout` is a CLIENT-SIDE wait, not a pref and not a wire field: capture it so the
+            // post-`up` success path waits for Running (Go `up --timeout`). `None` here means the post-up
+            // path will not wait; `Some(secs)` arms the wait (0 = forever, per `wait_for_running`).
+            up_timeout = timeout;
             // Resolve the secret through the precedence chain and hold it as a `SecretString`
             // (zeroized on drop, never `Debug`-printed). Expose it only here, at the moment we
             // serialize the wire `Request` — the field on the wire stays a plain `Option<String>`.
@@ -1336,6 +1355,18 @@ async fn main() -> Result<()> {
                     }
                     AuthOutcome::None => {}
                 }
+            }
+            // `up --timeout`: bound the wait for the node to reach Running (Go `tailscale up
+            // --timeout`). Only an `up` that passed `--timeout` arms this (`up_timeout` is `None` for
+            // every other command and for an `up` without the flag, preserving the fire-and-return
+            // default). The auth URL above is printed FIRST, so an interactive up still surfaces it
+            // before waiting (Go waits for Running regardless of interactive vs keyed). A timeout is a
+            // non-zero exit — the daemon accepted the up, but the node did not come up in time.
+            if let Some(secs) = up_timeout
+                && let Err(e) = wait_for_running(&socket, Some(secs)).await
+            {
+                eprintln!("{e:#}");
+                std::process::exit(1);
             }
         }
         // The daemon refused an `up` that would silently revert non-default settings the command did
@@ -4498,6 +4529,50 @@ mod tests {
             start.elapsed() < std::time::Duration::from_secs(5),
             "wait should honor the ~1s timeout, took {:?}",
             start.elapsed()
+        );
+    }
+
+    #[test]
+    fn up_timeout_flag_parses_into_command_up() {
+        // `tnet up --timeout 30` parses to `Command::Up { timeout: Some(30), .. }`; omitting the flag
+        // leaves it `None` (the fire-and-return default — no wait). This is the CLI-side contract the
+        // post-`up` path keys on (`up_timeout = timeout`), so pin it at the parse boundary.
+        // `Command` doesn't derive Debug, so extract the field with a helper closure rather than a
+        // `match … => panic!("{other:?}")` arm (which would need Debug).
+        let up_timeout_of = |argv: &[&str]| -> Option<u64> {
+            match Cli::try_parse_from(argv).expect("parses").command {
+                Command::Up { timeout, .. } => timeout,
+                _ => panic!("expected Command::Up from {argv:?}"),
+            }
+        };
+        assert_eq!(up_timeout_of(&["tnet", "up", "--timeout", "30"]), Some(30));
+        assert_eq!(
+            up_timeout_of(&["tnet", "up"]),
+            None,
+            "no --timeout → None (don't wait)"
+        );
+        // `--timeout 0` is the explicit "wait forever" value (Go's 0 = wait indefinitely); it must
+        // parse as Some(0), distinct from absent (None) — `wait_for_running` maps both to no deadline.
+        assert_eq!(up_timeout_of(&["tnet", "up", "--timeout", "0"]), Some(0));
+    }
+
+    #[tokio::test]
+    async fn wait_forever_does_not_return_promptly_against_a_dead_socket() {
+        // `--timeout 0` (and `None`) = wait forever: `wait_for_running` must NOT compute a deadline,
+        // so against a never-Running dead socket it keeps polling rather than erroring out. We can't
+        // wait forever in a test, so assert it is STILL running after a short bound (i.e. it did not
+        // immediately return an Err the way a finite timeout would). Complements
+        // `wait_times_out_against_a_dead_socket`, which covers the finite-timeout Err path.
+        let dead = std::path::Path::new("/tmp/tnet-wait-forever-nope.sock");
+        let res = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            wait_for_running(dead, Some(0)),
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "timeout:0 means wait forever — wait_for_running must still be polling (not returned) \
+             after 300ms against a dead socket, so the outer tokio timeout should elapse"
         );
     }
 
