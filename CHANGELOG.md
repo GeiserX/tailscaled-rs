@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.21.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.20.0...v0.21.0) (2026-06-11)
+
+
+### Features
+
+* **status:** engine bump v0.21.2 + enrich tnet status (relay/direct, last-seen, allowed-routes, active-exit) ([#69](https://github.com/GeiserX/tailscaled-rs/issues/69)) ([eb6c187](https://github.com/GeiserX/tailscaled-rs/commit/eb6c1877258b82b870da670da14989e3c147fa21))
+
 ## [0.20.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.19.0...v0.20.0) (2026-06-11)
 
 
