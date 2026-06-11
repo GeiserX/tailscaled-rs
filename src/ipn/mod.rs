@@ -1143,14 +1143,26 @@ impl Backend {
     /// without `--force-reauth` (Go `up`'s `can't change --login-server without --force-reauth`).
     /// A pure, read-only pre-flight check (delegates to [`control_url::change_blocked`]): the current
     /// control URL is `self.prefs.control_url`, the proposed one is `opts.control_url` (`None` =
-    /// unmentioned = no change), "Running" is "a device is installed" (`self.device.is_some()` — the
-    /// daemon's analogue of Go's `backendState == ipn.Running`), and `--force-reauth` is the escape
-    /// hatch (it re-registers, which is exactly what a control-server change requires).
+    /// unmentioned = no change), and `--force-reauth` is the escape hatch (it re-registers, which is
+    /// exactly what a control-server change requires).
+    ///
+    /// "Running" is the node's **actual** reported state — `state_from_device(dev.device_state()) ==
+    /// State::Running` — NOT merely "a device is installed". A device can be present while the node
+    /// is `Starting`/`NeedsLogin`/`Expired` (e.g. an interactive `up` installs the device before
+    /// login completes); Go gates strictly on `backendState == ipn.Running`, and gating on
+    /// device-presence would over-fire the guard in those non-Running states. Reading
+    /// `device_state()` is a cheap, non-blocking `watch` borrow (the same source `status()` uses).
     pub fn up_control_url_guard(&self, opts: &UpOptions) -> bool {
+        let running = matches!(
+            self.device
+                .as_ref()
+                .map(|dev| state_from_device(dev.device_state()).0),
+            Some(State::Running)
+        );
         control_url::change_blocked(
             self.prefs.control_url.as_deref(),
             opts.control_url.as_deref(),
-            self.device.is_some(),
+            running,
             opts.force_reauth,
         )
     }
@@ -2280,6 +2292,36 @@ mod tests {
             boot_attempted_up: false,
             lifecycle_tx: tokio::sync::watch::channel(0u64).0,
         }
+    }
+
+    #[tokio::test]
+    async fn up_control_url_guard_reads_actual_state_not_device_presence() {
+        // The Backend-level wiring of the control-URL guard. `backend_for` has `device: None`, so the
+        // node is NOT Running → the guard must NEVER fire, even for a genuine control-server change.
+        // This pins that `up_control_url_guard` keys on the node's actual reported state (here:
+        // device absent → not Running), the fix for the device-presence-over-fires divergence — the
+        // pure precedence (synonyms / force-reauth / proposed-None) is covered by control_url's own
+        // unit tests; the device-present-AND-Running path needs a live tailnet (the gated e2e).
+        let dir = std::env::temp_dir().join(format!("tailnetd-ctrlurl-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+        be.prefs.control_url = Some("https://hs.example.com".to_string());
+
+        // A genuine change to a different server, but the node is down (device: None) → not blocked.
+        let opts = UpOptions {
+            control_url: Some("https://other.example.com".to_string()),
+            ..UpOptions::default()
+        };
+        assert!(
+            !be.up_control_url_guard(&opts),
+            "a down (non-Running) node must not be guarded, even for a real control-server change"
+        );
+
+        // A bare up (no --control-url) is never a change regardless of state.
+        assert!(!be.up_control_url_guard(&UpOptions::default()));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]

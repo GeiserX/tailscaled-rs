@@ -55,14 +55,16 @@ fn normalize(url: Option<&str>) -> Option<&str> {
 /// - `proposed` actually changes the control server vs `current` (after [`normalize`] — a synonym
 ///   swap or "default→default" is not a change). A `proposed` of `None` means the `up` did not
 ///   mention `--control-url`, so it changes nothing and never blocks (a bare `up` is unaffected).
-/// - `device_up` — the node is already Running (Go's `backendState == ipn.Running`; the daemon's
-///   equivalent is "a device is installed"). A down node has nothing to re-register away from.
+/// - `running` — the node is actually **Running** (Go's `backendState == ipn.Running`). The caller
+///   passes the node's real reported state, NOT mere device-presence (a device can be installed
+///   while `Starting`/`NeedsLogin`, where Go would not guard). A non-Running node re-registers on its
+///   next `up` anyway, so a server change is harmless there.
 /// - `!force_reauth` — the operator did not opt into the fresh registration that legitimizes the
 ///   change.
 pub fn change_blocked(
     current: Option<&str>,
     proposed: Option<&str>,
-    device_up: bool,
+    running: bool,
     force_reauth: bool,
 ) -> bool {
     // A `proposed` of `None` = "--control-url not mentioned" = no change requested. (This is distinct
@@ -72,7 +74,7 @@ pub fn change_blocked(
         return false;
     };
     let changed = normalize(current) != normalize(proposed);
-    changed && device_up && !force_reauth
+    changed && running && !force_reauth
 }
 
 #[cfg(test)]
@@ -127,9 +129,12 @@ mod tests {
     }
 
     #[test]
-    fn real_change_on_down_node_does_not_block() {
-        // Only Running nodes are guarded (Go's backendState==Running); a down node re-registers on
-        // its next up anyway, so changing the server is fine.
+    fn real_change_on_non_running_node_does_not_block() {
+        // Only Running nodes are guarded (Go's backendState==Running). `running == false` covers a
+        // down node AND a device-present-but-not-yet-Running node (Starting/NeedsLogin/Expired) — the
+        // caller passes the node's REAL state, not device-presence, so the guard never over-fires in
+        // those states (the fidelity point: a device can be installed mid-interactive-login). Such a
+        // node re-registers on its next up anyway, so changing the server is fine.
         assert!(!change_blocked(None, Some(CUSTOM), false, false));
         assert!(!change_blocked(Some(CUSTOM), Some(OTHER), false, false));
     }
