@@ -482,6 +482,15 @@ pub struct UpOptions {
     /// explicitly opting into the revert). See [`Backend::begin_up`] and
     /// [`crate::prefs::Prefs::reset_up_managed_to_default`].
     pub reset: bool,
+    /// Force a fresh re-registration (Go `tailscale up --force-reauth`). When set, [`Backend::begin_up`]
+    /// discards the persisted node key before the handshake so the engine registers FRESH (surfacing a
+    /// new login/auth URL for an interactive up) instead of resuming the old registration. A
+    /// **lifecycle action, not a pref**: it mutates no persisted setting, so — like [`reset`](Self::reset)
+    /// — it is deliberately NOT part of [`mentions_any_pref`](Self::mentions_any_pref) (a bare
+    /// `up --force-reauth` stays a bare up and never trips the accidental-revert guard) and NOT part of
+    /// the guard/`--reset` lockstep. Unlike [`Backend::logout`], it keeps the node's up-intent
+    /// (`want_running`); it only re-keys.
+    pub force_reauth: bool,
 }
 
 impl UpOptions {
@@ -1173,6 +1182,25 @@ impl Backend {
             self.prefs.reset_up_managed_to_default();
         }
 
+        // `--force-reauth` (Go `tailscale up --force-reauth`): discard the persisted node key BEFORE
+        // we persist prefs or build the engine, so the rebuilt device cannot resume the old
+        // registration and must register FRESH (an interactive up then reaches `NeedsLogin` and the
+        // CLI surfaces the new auth URL). Done after `stop_device` (the device that held the old key
+        // is gone) and before `persist_prefs`/`build_config` (so a wipe failure aborts the up before
+        // any state changes). Unlike `logout`, this keeps the node's up-intent — `want_running`/
+        // `logged_out` are set to up below; force-reauth only re-keys, it does not log out. A wipe
+        // failure is FATAL here for the same fail-closed reason as in `logout`: proceeding would bring
+        // the node back up on the very key we meant to rotate.
+        if opts.force_reauth {
+            self.discard_node_key().await.with_context(|| {
+                format!(
+                    "up --force-reauth: could not discard the node key at {} to force a fresh \
+                     registration; bring-up aborted before any state changed",
+                    self.key_path.display()
+                )
+            })?;
+        }
+
         if let Some(h) = opts.hostname {
             self.prefs.hostname = Some(h);
         }
@@ -1664,6 +1692,27 @@ impl Backend {
         Ok(())
     }
 
+    /// Discard the persisted node key so the next bring-up re-registers FRESH instead of resuming the
+    /// old registration. The shared re-keying primitive for both [`logout`](Backend::logout) (which
+    /// additionally flips intent to logged-out) and a force-reauth [`up`](Backend::begin_up) (which
+    /// keeps the node's up-intent and only re-keys). Deleting the key is the daemon's responsibility:
+    /// the engine deliberately leaves it on disk (re-`new` with the same key is its *resume/re-login*
+    /// path), so neither logout nor force-reauth can be expressed engine-side.
+    ///
+    /// A **missing key file is success** (never registered / already fresh). Any other IO error is
+    /// returned so the caller can fail closed — a path that believed it re-keyed when the old key is
+    /// still on disk would silently resume the very registration it meant to end.
+    async fn discard_node_key(&self) -> Result<()> {
+        match tokio::fs::remove_file(&self.key_path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(anyhow!(
+                "could not discard the node key at {}: {e}",
+                self.key_path.display()
+            )),
+        }
+    }
+
     /// Log the node out — the Rust analogue of Go's `tailscale logout`. Distinct from
     /// [`down`](Backend::down): `down` keeps the node key for a seamless resume, whereas `logout`
     /// **ends the registration** and forces the next `up` to re-login from scratch.
@@ -1721,19 +1770,16 @@ impl Backend {
         // done. The node stays as it was (device down from step 2, but prefs unchanged → a retry of
         // `logout` cleanly re-attempts). A missing key file is success (never registered / already
         // logged out). The control-plane deregister in step 1 already ran, so a retry just re-asserts
-        // it (idempotent).
-        match tokio::fs::remove_file(&self.key_path).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(anyhow!(
-                    "logout: could not discard the node key at {} ({e}); logout aborted before \
-                     recording it — remove the file or re-run `tnet logout`. Until the key is gone, \
-                     a later `up` could resume the old registration.",
-                    self.key_path.display()
-                ));
-            }
-        }
+        // it (idempotent). The wipe itself is the shared [`discard_node_key`](Self::discard_node_key)
+        // primitive (force-reauth re-keys with the same step) so the two paths cannot drift.
+        self.discard_node_key().await.with_context(|| {
+            format!(
+                "logout: could not discard the node key at {}; logout aborted before recording it \
+                 — remove the file or re-run `tnet logout`. Until the key is gone, a later `up` \
+                 could resume the old registration.",
+                self.key_path.display()
+            )
+        })?;
 
         // 4. Now that the key is gone, flip intent to logged-out and persist. `logged_out` suppresses
         // auto-start (see `wants_running`); `ever_configured` keeps a post-logout restart reporting
@@ -2343,6 +2389,104 @@ mod tests {
             .expect("logout with no key file must succeed");
         assert!(be.prefs.logged_out);
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn begin_up_force_reauth_discards_key_before_build_but_keeps_up_intent() {
+        // `up --force-reauth` (Go parity): the bring-up must DISCARD the on-disk node key (so the
+        // engine re-registers fresh / surfaces a new login) while KEEPING the node's up-intent —
+        // unlike `logout`, it does NOT set `logged_out` or clear `want_running`.
+        //
+        // The test exploits the load-bearing ORDER: the force-reauth wipe runs BEFORE `build_config`
+        // (which reads the key). We plant an UNPARSEABLE key file and show the two paths diverge on
+        // exactly that file:
+        //   - a PLAIN `begin_up` reaches `build_config`, which tries to parse the key and FAILS
+        //     (`load key file ... KeyFileRead`) — proving the plain path does NOT wipe (it resumes).
+        //   - a force-reauth `begin_up` WIPES the key first, so `build_config` then sees no key and
+        //     registers fresh — succeeding on the very file that broke the plain path.
+        // This both pins the wipe AND its ordering relative to build_config. Driven device-less, like
+        // the logout tests; `begin_up` returns the slow handshake's `PendingUp` (not `Debug`) → match.
+        let dir = std::env::temp_dir().join(format!("tailnetd-reauth-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let bogus_key = b"this is not a valid key file";
+
+        // --- a PLAIN `begin_up` reaches build_config, which chokes on the bogus key (no wipe) ---
+        let mut be = backend_for(&dir);
+        tokio::fs::write(&be.key_path, bogus_key).await.unwrap();
+        match be.begin_up(UpOptions::default()).await {
+            Ok(_) => panic!("a plain up must reach build_config and fail to parse the bogus key"),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                assert!(
+                    msg.contains("load key file"),
+                    "the plain up must fail in build_config's key load (proving it did NOT wipe the \
+                     key first), got {msg:?}"
+                );
+            }
+        }
+        assert!(
+            tokio::fs::try_exists(&be.key_path).await.unwrap(),
+            "a plain `up` must KEEP the node key (seamless resume — only force-reauth/logout wipe it)"
+        );
+
+        // --- `begin_up { force_reauth: true }` WIPES the key first, so build_config registers fresh ---
+        let mut be = backend_for(&dir);
+        // bogus key still present from the plain-up case above.
+        assert!(tokio::fs::try_exists(&be.key_path).await.unwrap());
+        match be
+            .begin_up(UpOptions {
+                force_reauth: true,
+                ..UpOptions::default()
+            })
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => panic!(
+                "force-reauth must wipe the key BEFORE build_config reads it, so the same bogus key \
+                 that broke the plain path is gone and the up succeeds; got {e:#}"
+            ),
+        }
+        // The OLD (bogus) registration is gone. `build_config`'s key load then re-initializes a
+        // FRESH default key file (the engine's load-or-init writes one when none is present), so the
+        // faithful post-condition is "the old key content was discarded", not "no file exists" — the
+        // node now holds a brand-new, unregistered key (a fresh login).
+        let after = tokio::fs::read(&be.key_path).await.unwrap_or_default();
+        assert_ne!(
+            after.as_slice(),
+            bogus_key.as_slice(),
+            "force-reauth MUST discard the OLD node key (the bogus content is gone — registered fresh)"
+        );
+        assert!(
+            be.prefs.want_running,
+            "force-reauth keeps up-intent: want_running stays true (it is an `up`, not a `down`)"
+        );
+        assert!(
+            !be.prefs.logged_out,
+            "force-reauth must NOT set logged_out (it re-logs-in; it does not log out)"
+        );
+        assert!(
+            be.wants_running(),
+            "a force-reauth'd node is still want-running (unlike a logged-out one)"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn up_options_force_reauth_is_not_a_mentioned_pref() {
+        // `force_reauth` is a LIFECYCLE action, not a pref — so (like `reset`) it must NOT count as a
+        // "mentioned pref". This is load-bearing: if it counted, a bare `up --force-reauth` on a node
+        // with any non-default pref would wrongly trip the accidental-revert guard (RevertGuard)
+        // instead of just re-authenticating. Pin that it stays exempt.
+        assert!(
+            !UpOptions {
+                force_reauth: true,
+                ..UpOptions::default()
+            }
+            .mentions_any_pref(),
+            "force_reauth must NOT be a mentioned pref (a bare `up --force-reauth` stays a bare up)"
+        );
     }
 
     #[tokio::test]

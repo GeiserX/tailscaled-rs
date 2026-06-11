@@ -139,6 +139,12 @@ enum Command {
         /// is a true wholesale replace rather than a patch of just the flags you passed.
         #[arg(long)]
         reset: bool,
+        /// Force re-authentication: discard this node's key and register fresh, surfacing a new login
+        /// URL (Go `tailscale up --force-reauth`). WARNING: this may bring the Tailscale connection
+        /// down while it re-registers, so do NOT run it remotely over SSH/RDP — you may lock yourself
+        /// out. It changes no settings (your prefs are kept); it only forces a new login.
+        #[arg(long)]
+        force_reauth: bool,
     },
     /// Tweak individual prefs on an already-configured node, without an up/down cycle (the analogue
     /// of Go's `tailscale set`). This never (re)authenticates and never changes whether the node is
@@ -716,11 +722,16 @@ async fn main() -> Result<()> {
             ssh,
             no_ssh,
             reset,
+            force_reauth,
         } => {
             // Resolve the secret through the precedence chain and hold it as a `SecretString`
             // (zeroized on drop, never `Debug`-printed). Expose it only here, at the moment we
             // serialize the wire `Request` — the field on the wire stays a plain `Option<String>`.
             let authkey = resolve_authkey(authkey, authkey_file).await?;
+            // `--force-reauth` re-registers fresh; with no authkey that is an interactive login (the
+            // daemon wipes the key, the engine reaches NeedsLogin, and the poll below surfaces the new
+            // auth URL) — exactly the keyless-up interactive path, so the same `interactive_up` gate
+            // (authkey absent) drives it. No separate polling logic is needed for force-reauth.
             interactive_up = authkey.is_none();
             Request::Up {
                 authkey: authkey.map(|k| k.expose_secret().to_owned()),
@@ -760,6 +771,9 @@ async fn main() -> Result<()> {
                 // `--reset`: reset unmentioned settings to default + bypass the accidental-revert
                 // guard. A plain bool flag (Go's `--reset`), passed straight through.
                 reset,
+                // `--force-reauth`: discard the node key so the bring-up re-registers fresh (new
+                // login). A plain bool flag (Go's `--force-reauth`), passed straight through.
+                force_reauth,
             }
         }
         Command::Set {
@@ -3073,6 +3087,7 @@ mod tests {
             shields_up: None,
             ssh: None,
             reset: false,
+            force_reauth: false,
         };
         match enabled {
             Request::Up { accept_routes, .. } => {
@@ -3096,6 +3111,7 @@ mod tests {
             shields_up: None,
             ssh: None,
             reset: false,
+            force_reauth: false,
         };
         match disabled {
             Request::Up { accept_routes, .. } => {
@@ -3123,6 +3139,7 @@ mod tests {
             shields_up: None,
             ssh: None,
             reset: false,
+            force_reauth: false,
         };
         match unchanged {
             Request::Up { accept_routes, .. } => assert_eq!(
@@ -3154,6 +3171,7 @@ mod tests {
             shields_up: resolve_shields_up(true, false),
             ssh: None,
             reset: false,
+            force_reauth: false,
         };
         match enabled {
             Request::Up { shields_up, .. } => {
@@ -3177,6 +3195,7 @@ mod tests {
             shields_up: resolve_shields_up(false, true),
             ssh: None,
             reset: false,
+            force_reauth: false,
         };
         match disabled {
             Request::Up { shields_up, .. } => {
@@ -3200,6 +3219,7 @@ mod tests {
             shields_up: resolve_shields_up(false, false),
             ssh: None,
             reset: false,
+            force_reauth: false,
         };
         match unchanged {
             Request::Up { shields_up, .. } => assert_eq!(

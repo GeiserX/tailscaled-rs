@@ -200,6 +200,7 @@ mod tests {
             shields_up: None,
             ssh: None,
             reset: false,
+            force_reauth: false,
         }
     }
 
