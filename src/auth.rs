@@ -197,6 +197,7 @@ mod tests {
             advertise_routes: None,
             advertise_tags: None,
             accept_routes: None,
+            shields_up: None,
             ssh: None,
             reset: false,
         }
@@ -206,6 +207,7 @@ mod tests {
         Request::Set {
             hostname: None,
             accept_routes: None,
+            shields_up: None,
             exit_node: None,
             advertise_exit_node: None,
             advertise_routes: None,

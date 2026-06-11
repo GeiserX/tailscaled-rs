@@ -115,6 +115,14 @@ enum Command {
         /// `--accept-routes`; omitting both leaves the persisted setting unchanged.
         #[arg(long)]
         no_accept_routes: bool,
+        /// Block incoming connections from other nodes (Go `tailscale up --shields-up`). Mutually
+        /// exclusive with `--no-shields-up`; omitting both leaves the persisted setting unchanged.
+        #[arg(long, conflicts_with = "no_shields_up")]
+        shields_up: bool,
+        /// Allow incoming connections from other nodes (default). Mutually exclusive with
+        /// `--shields-up`; omitting both leaves the persisted setting unchanged.
+        #[arg(long)]
+        no_shields_up: bool,
         /// Run the Tailscale SSH server on this node (accept tailnet SSH on port 22, authorized by
         /// the control SSH policy). Requires a daemon built with the `ssh` feature and run as root.
         /// Mutually exclusive with `--no-ssh`; omitting both leaves the setting unchanged.
@@ -150,6 +158,14 @@ enum Command {
         /// `--accept-routes`; omitting both leaves the persisted setting unchanged.
         #[arg(long)]
         no_accept_routes: bool,
+        /// Block incoming connections from other nodes. Mutually exclusive with `--no-shields-up`;
+        /// omitting both leaves the persisted setting unchanged.
+        #[arg(long, conflicts_with = "no_shields_up")]
+        shields_up: bool,
+        /// Allow incoming connections from other nodes (default). Mutually exclusive with
+        /// `--shields-up`; omitting both leaves the persisted setting unchanged.
+        #[arg(long)]
+        no_shields_up: bool,
         /// Route this node's outbound traffic through a peer exit node, named by its tailnet IP or
         /// MagicDNS name (e.g. `100.64.0.9` or `exit-1`). Applied live on a running node — no
         /// reconnect. Mutually exclusive with `--clear-exit-node`; omitting both leaves the persisted
@@ -593,6 +609,18 @@ fn resolve_accept_routes(accept: bool, no_accept: bool) -> Option<bool> {
     }
 }
 
+/// Map the `--shields-up` / `--no-shields-up` flag pair to a tri-state `Option<bool>`.
+/// Enable → `Some(true)`; disable → `Some(false)`; neither → `None` (leave the persisted pref
+/// unchanged). Mirrors the `--tun`/`--no-tun` mapping; clap's `conflicts_with` guarantees the two
+/// are never both set.
+fn resolve_shields_up(shields_up: bool, no_shields_up: bool) -> Option<bool> {
+    match (shields_up, no_shields_up) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        _ => None,
+    }
+}
+
 /// Map the `--tun` / `--no-tun` flag pair to a tri-state `Option<bool>` — enable → `Some(true)`,
 /// disable → `Some(false)`, neither → `None` (leave the persisted pref unchanged). A named helper
 /// for symmetry with the other tri-state resolvers (`resolve_accept_routes` / `resolve_ssh` / …),
@@ -679,6 +707,8 @@ async fn main() -> Result<()> {
             advertise_tags_clear,
             accept_routes,
             no_accept_routes,
+            shields_up,
+            no_shields_up,
             ssh,
             no_ssh,
             reset,
@@ -718,6 +748,9 @@ async fn main() -> Result<()> {
                 // `--accept-routes`/`--no-accept-routes` tri-state (mirrors `--tun`); reuses the same
                 // resolver as the `set` arm.
                 accept_routes: resolve_accept_routes(accept_routes, no_accept_routes),
+                // `--shields-up`/`--no-shields-up` tri-state (mirrors `--tun`); reuses the same
+                // resolver as the `set` arm.
+                shields_up: resolve_shields_up(shields_up, no_shields_up),
                 // `--ssh`/`--no-ssh` tri-state (mirrors `--tun`).
                 ssh: resolve_ssh(ssh, no_ssh),
                 // `--reset`: reset unmentioned settings to default + bypass the accidental-revert
@@ -729,6 +762,8 @@ async fn main() -> Result<()> {
             hostname,
             accept_routes,
             no_accept_routes,
+            shields_up,
+            no_shields_up,
             exit_node,
             clear_exit_node,
             advertise_exit_node,
@@ -743,6 +778,8 @@ async fn main() -> Result<()> {
             hostname,
             // `--accept-routes`/`--no-accept-routes` tri-state (mirrors `--tun`).
             accept_routes: resolve_accept_routes(accept_routes, no_accept_routes),
+            // `--shields-up`/`--no-shields-up` tri-state (mirrors `--tun`).
+            shields_up: resolve_shields_up(shields_up, no_shields_up),
             // `--exit-node <sel>` sets, `--clear-exit-node` stops using one, neither leaves it
             // unchanged; clap's `conflicts_with` guarantees the two are never both set. Reuses the
             // same resolver as the `up` arm.
@@ -1625,6 +1662,7 @@ fn get_settings(
             Value::String(view.advertise_tags.join(",")),
         ),
         ("accept-routes", Value::Bool(view.accept_routes)),
+        ("shields-up", Value::Bool(view.shields_up)),
         ("ssh", Value::Bool(view.ssh)),
         ("tun", Value::Bool(view.tun)),
     ]
@@ -1737,6 +1775,7 @@ fn revert_pref_to_flag(key: &str, value: &str) -> String {
         // Boolean up-managed prefs. The guard only reports these when non-default (i.e. `true`),
         // so the keep-it token is the bare enabling flag; `--no-*` is a defensive fallback.
         "accept_routes" => bool_keep_flag("accept-routes", "no-accept-routes", value),
+        "shields_up" => bool_keep_flag("shields-up", "no-shields-up", value),
         "advertise_exit_node" => {
             bool_keep_flag("advertise-exit-node", "no-advertise-exit-node", value)
         }
@@ -1955,6 +1994,9 @@ fn print_status(s: &tailscaled_rs::localapi::StatusReport) {
     }
     if p.accept_routes {
         println!("accept-routes: on");
+    }
+    if p.shields_up {
+        println!("shields-up:   on");
     }
     if p.ssh {
         // Distinguish the *enabled* pref from the server actually *running*. The task can die at
@@ -2936,6 +2978,16 @@ mod tests {
     }
 
     #[test]
+    fn resolve_shields_up_tristate() {
+        // Enable → Some(true); disable → Some(false); neither → None (unchanged).
+        assert_eq!(resolve_shields_up(true, false), Some(true));
+        assert_eq!(resolve_shields_up(false, true), Some(false));
+        assert_eq!(resolve_shields_up(false, false), None);
+        // Enable wins if both are somehow set (clap's conflicts_with prevents this in practice).
+        assert_eq!(resolve_shields_up(true, true), Some(true));
+    }
+
+    #[test]
     fn resolve_ssh_tristate() {
         // `--ssh` → Some(true) (run the SSH server); `--no-ssh` → Some(false); neither → None
         // (leave the persisted pref unchanged).
@@ -2955,6 +3007,7 @@ mod tests {
         let req = Request::Set {
             hostname: Some("laptop".to_string()),
             accept_routes: resolve_accept_routes(true, false),
+            shields_up: resolve_shields_up(false, false),
             exit_node: resolve_exit_node(Some("100.64.0.9".to_string()), false),
             advertise_exit_node: resolve_advertise_exit_node(false, false),
             advertise_routes: resolve_advertise_routes(vec![], false),
@@ -2965,6 +3018,7 @@ mod tests {
             Request::Set {
                 hostname,
                 accept_routes,
+                shields_up,
                 exit_node,
                 advertise_exit_node,
                 advertise_routes,
@@ -2973,6 +3027,7 @@ mod tests {
             } => {
                 assert_eq!(hostname, Some("laptop".to_string()));
                 assert_eq!(accept_routes, Some(true));
+                assert_eq!(shields_up, None, "unset → unchanged, not flipped");
                 assert_eq!(exit_node, Some(Some("100.64.0.9".to_string())));
                 assert_eq!(advertise_exit_node, None, "unset → unchanged, not flipped");
                 assert_eq!(advertise_routes, None, "unset → unchanged, not cleared");
@@ -3000,6 +3055,7 @@ mod tests {
             advertise_routes: None,
             advertise_tags: None,
             accept_routes: resolve_accept_routes(true, false),
+            shields_up: None,
             ssh: None,
             reset: false,
         };
@@ -3022,6 +3078,7 @@ mod tests {
             advertise_routes: None,
             advertise_tags: None,
             accept_routes: resolve_accept_routes(false, true),
+            shields_up: None,
             ssh: None,
             reset: false,
         };
@@ -3048,12 +3105,90 @@ mod tests {
             advertise_routes: None,
             advertise_tags: None,
             accept_routes: resolve_accept_routes(false, false),
+            shields_up: None,
             ssh: None,
             reset: false,
         };
         match unchanged {
             Request::Up { accept_routes, .. } => assert_eq!(
                 accept_routes, None,
+                "neither flag → None (leave the persisted pref unchanged)"
+            ),
+            other => panic!("expected Request::Up, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn command_up_maps_shields_up_tristate() {
+        // `tnet up` carries `--shields-up`/`--no-shields-up` (Go parity), reusing the same
+        // `resolve_shields_up` tri-state helper as `set`. Pin all three states map into the wire
+        // `Request::Up.shields_up`: enable → Some(true), disable → Some(false), neither → None
+        // (leave unchanged). Built from the same resolver the `Command::Up` arm in `main` uses.
+        let enabled = Request::Up {
+            authkey: None,
+            control_url: None,
+            hostname: None,
+            tun: None,
+            tun_name: None,
+            tun_mtu: None,
+            exit_node: None,
+            advertise_exit_node: None,
+            advertise_routes: None,
+            advertise_tags: None,
+            accept_routes: None,
+            shields_up: resolve_shields_up(true, false),
+            ssh: None,
+            reset: false,
+        };
+        match enabled {
+            Request::Up { shields_up, .. } => {
+                assert_eq!(shields_up, Some(true), "--shields-up → Some(true)")
+            }
+            other => panic!("expected Request::Up, got {other:?}"),
+        }
+
+        let disabled = Request::Up {
+            authkey: None,
+            control_url: None,
+            hostname: None,
+            tun: None,
+            tun_name: None,
+            tun_mtu: None,
+            exit_node: None,
+            advertise_exit_node: None,
+            advertise_routes: None,
+            advertise_tags: None,
+            accept_routes: None,
+            shields_up: resolve_shields_up(false, true),
+            ssh: None,
+            reset: false,
+        };
+        match disabled {
+            Request::Up { shields_up, .. } => {
+                assert_eq!(shields_up, Some(false), "--no-shields-up → Some(false)")
+            }
+            other => panic!("expected Request::Up, got {other:?}"),
+        }
+
+        let unchanged = Request::Up {
+            authkey: None,
+            control_url: None,
+            hostname: None,
+            tun: None,
+            tun_name: None,
+            tun_mtu: None,
+            exit_node: None,
+            advertise_exit_node: None,
+            advertise_routes: None,
+            advertise_tags: None,
+            accept_routes: None,
+            shields_up: resolve_shields_up(false, false),
+            ssh: None,
+            reset: false,
+        };
+        match unchanged {
+            Request::Up { shields_up, .. } => assert_eq!(
+                shields_up, None,
                 "neither flag → None (leave the persisted pref unchanged)"
             ),
             other => panic!("expected Request::Up, got {other:?}"),
@@ -3068,6 +3203,7 @@ mod tests {
         let req = Request::Set {
             hostname: None,
             accept_routes: resolve_accept_routes(false, true),
+            shields_up: resolve_shields_up(true, false),
             exit_node: resolve_exit_node(None, true),
             advertise_exit_node: resolve_advertise_exit_node(false, true),
             advertise_routes: resolve_advertise_routes(vec![], true),
@@ -3078,6 +3214,7 @@ mod tests {
             Request::Set {
                 hostname,
                 accept_routes,
+                shields_up,
                 exit_node,
                 advertise_exit_node,
                 advertise_routes,
@@ -3086,6 +3223,7 @@ mod tests {
             } => {
                 assert_eq!(hostname, None);
                 assert_eq!(accept_routes, Some(false));
+                assert_eq!(shields_up, Some(true), "--shields-up → Some(true)");
                 assert_eq!(exit_node, Some(None), "--clear-exit-node → Some(None)");
                 assert_eq!(advertise_exit_node, Some(false));
                 assert_eq!(
@@ -3393,6 +3531,7 @@ mod tests {
             revert_pref_to_flag("accept_routes", "true"),
             "--accept-routes"
         );
+        assert_eq!(revert_pref_to_flag("shields_up", "true"), "--shields-up");
         assert_eq!(revert_pref_to_flag("tun", "true"), "--tun");
         // Defensive: a false bool renders the disabling flag (shouldn't occur from the guard).
         assert_eq!(revert_pref_to_flag("ssh", "false"), "--no-ssh");
@@ -3428,6 +3567,7 @@ mod tests {
             advertise_routes: vec!["10.0.0.0/8".into(), "192.168.1.0/24".into()],
             advertise_tags: vec![],
             accept_routes: true,
+            shields_up: true,
             ssh: true,
             ssh_running: true,
             tun: false,
@@ -3436,15 +3576,16 @@ mod tests {
         // Default table: one NAME VALUE line per setting, all settings present.
         let table = format_get(&view, None, false).unwrap();
         assert!(table.contains("accept-routes"), "{table}");
+        assert!(table.contains("shields-up"), "{table}");
         assert!(table.contains("true"), "{table}");
         assert!(
             table.contains("advertise-routes") && table.contains("10.0.0.0/8,192.168.1.0/24"),
             "{table}"
         );
         assert!(table.contains("advertise-tags"), "{table}");
-        // 7 settings → 7 lines (exit-node, advertise-exit-node, advertise-routes, advertise-tags,
-        // accept-routes, ssh, tun).
-        assert_eq!(table.lines().count(), 7, "{table}");
+        // 8 settings → 8 lines (exit-node, advertise-exit-node, advertise-routes, advertise-tags,
+        // accept-routes, shields-up, ssh, tun).
+        assert_eq!(table.lines().count(), 8, "{table}");
 
         // --json: flattened name→value map keyed by set-flag name, with GO-FAITHFUL TYPED values —
         // booleans are bare JSON `true`/`false` (NOT quoted strings), strings are strings. Parse it
@@ -3454,6 +3595,11 @@ mod tests {
             serde_json::from_str(&j).expect("get --json must be valid JSON");
         assert_eq!(
             parsed["accept-routes"],
+            serde_json::json!(true),
+            "bare bool: {j}"
+        );
+        assert_eq!(
+            parsed["shields-up"],
             serde_json::json!(true),
             "bare bool: {j}"
         );

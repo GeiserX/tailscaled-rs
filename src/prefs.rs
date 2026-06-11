@@ -29,6 +29,12 @@ pub struct Prefs {
     pub ephemeral: bool,
     /// Accept (and route traffic to) subnet routes advertised by peers.
     pub accept_routes: bool,
+    /// Shields-up (Go `--shields-up` / `ipn.Prefs.ShieldsUp`): block all **inbound** connections
+    /// from peers that terminate on this node, regardless of the control-pushed packet filter, while
+    /// leaving outbound + forwarded subnet/exit transit working. Maps to the engine
+    /// `Config.block_incoming`. Default `false` (use the control filter as provided).
+    #[serde(default)]
+    pub shields_up: bool,
     /// Route this node's traffic out through a peer exit node, selected by IP or MagicDNS name
     /// (the Go `--exit-node` flag). `None` = no exit node (direct egress). Stored as the raw
     /// selector string and parsed into the engine's `ExitNodeSelector` in `build_config`.
@@ -94,6 +100,7 @@ impl Default for Prefs {
             hostname: None,
             ephemeral: true,
             accept_routes: false,
+            shields_up: false,
             exit_node: None,
             advertise_exit_node: false,
             advertise_routes: Vec::new(),
@@ -144,6 +151,7 @@ impl Prefs {
         self.control_url = d.control_url;
         self.hostname = d.hostname;
         self.accept_routes = d.accept_routes;
+        self.shields_up = d.shields_up;
         self.exit_node = d.exit_node;
         self.advertise_exit_node = d.advertise_exit_node;
         self.advertise_routes = d.advertise_routes;
