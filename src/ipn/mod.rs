@@ -1185,20 +1185,19 @@ impl Backend {
         // `--force-reauth` (Go `tailscale up --force-reauth`): discard the persisted node key BEFORE
         // we persist prefs or build the engine, so the rebuilt device cannot resume the old
         // registration and must register FRESH (an interactive up then reaches `NeedsLogin` and the
-        // CLI surfaces the new auth URL). Done after `stop_device` (the device that held the old key
-        // is gone) and before `persist_prefs`/`build_config` (so a wipe failure aborts the up before
-        // any state changes). Unlike `logout`, this keeps the node's up-intent — `want_running`/
-        // `logged_out` are set to up below; force-reauth only re-keys, it does not log out. A wipe
-        // failure is FATAL here for the same fail-closed reason as in `logout`: proceeding would bring
-        // the node back up on the very key we meant to rotate.
+        // CLI surfaces the new auth URL — `build_config`'s key load re-initializes a fresh key, so
+        // the on-disk *content* changes; the file is not left absent). Done after `stop_device` (the
+        // device that held the old key is gone) and before `persist_prefs`/`build_config` (so a wipe
+        // failure aborts the up before anything is persisted — a combined `--reset` has by now mutated
+        // in-memory prefs, but nothing has been written to disk and the live device is already down).
+        // Unlike `logout`, this keeps the node's up-intent — `want_running`/`logged_out` are set to up
+        // below; force-reauth only re-keys, it does not log out. A wipe failure is FATAL here for the
+        // same fail-closed reason as in `logout`: proceeding would bring the node back up on the very
+        // key we meant to rotate.
         if opts.force_reauth {
-            self.discard_node_key().await.with_context(|| {
-                format!(
-                    "up --force-reauth: could not discard the node key at {} to force a fresh \
-                     registration; bring-up aborted before any state changed",
-                    self.key_path.display()
-                )
-            })?;
+            self.discard_node_key()
+                .await
+                .context("up --force-reauth: bring-up aborted before anything was persisted")?;
         }
 
         if let Some(h) = opts.hostname {
@@ -1701,7 +1700,8 @@ impl Backend {
     ///
     /// A **missing key file is success** (never registered / already fresh). Any other IO error is
     /// returned so the caller can fail closed — a path that believed it re-keyed when the old key is
-    /// still on disk would silently resume the very registration it meant to end.
+    /// still on disk would silently resume the very registration it meant to end. The error names the
+    /// key path; callers add their own action context (so the path is not repeated in the chain).
     async fn discard_node_key(&self) -> Result<()> {
         match tokio::fs::remove_file(&self.key_path).await {
             Ok(()) => Ok(()),
@@ -1772,14 +1772,10 @@ impl Backend {
         // logged out). The control-plane deregister in step 1 already ran, so a retry just re-asserts
         // it (idempotent). The wipe itself is the shared [`discard_node_key`](Self::discard_node_key)
         // primitive (force-reauth re-keys with the same step) so the two paths cannot drift.
-        self.discard_node_key().await.with_context(|| {
-            format!(
-                "logout: could not discard the node key at {}; logout aborted before recording it \
-                 — remove the file or re-run `tnet logout`. Until the key is gone, a later `up` \
-                 could resume the old registration.",
-                self.key_path.display()
-            )
-        })?;
+        self.discard_node_key().await.context(
+            "logout: aborted before recording it — remove the key file or re-run `tnet logout`. \
+             Until the key is gone, a later `up` could resume the old registration.",
+        )?;
 
         // 4. Now that the key is gone, flip intent to logged-out and persist. `logged_out` suppresses
         // auto-start (see `wants_running`); `ever_configured` keeps a post-logout restart reporting
@@ -2468,6 +2464,46 @@ mod tests {
         assert!(
             be.wants_running(),
             "a force-reauth'd node is still want-running (unlike a logged-out one)"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn begin_up_force_reauth_wipe_failure_aborts_before_persisting() {
+        // Fail-closed parity with `logout_key_wipe_failure_aborts_before_flipping_logged_out`: if the
+        // force-reauth key wipe FAILS, `begin_up` must abort BEFORE persisting prefs or flipping
+        // `want_running` — never come up on the very key it meant to rotate. Same un-removable-key
+        // trick: make `key_path` a non-empty directory so `remove_file` errors (not NotFound).
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-reauth-wipefail-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+        tokio::fs::create_dir_all(&be.key_path).await.unwrap();
+        tokio::fs::write(be.key_path.join("blocker"), b"x")
+            .await
+            .unwrap();
+
+        let result = be
+            .begin_up(UpOptions {
+                force_reauth: true,
+                ..UpOptions::default()
+            })
+            .await;
+        // PendingUp is not Debug, so check by hand rather than `.is_err()`/`expect_err`.
+        if result.is_ok() {
+            panic!("a force-reauth whose key wipe fails must make begin_up fail");
+        }
+        // The critical invariant: the wipe is BEFORE the prefs mutate/persist, so a failed wipe left
+        // `want_running` un-flipped and nothing on disk.
+        assert!(
+            !be.prefs.want_running,
+            "a wipe-failed force-reauth must NOT have flipped want_running (the wipe precedes it)"
+        );
+        assert!(
+            !tokio::fs::try_exists(dir.join("prefs.json")).await.unwrap(),
+            "a wipe-failed force-reauth must not have persisted prefs.json"
         );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
