@@ -2116,9 +2116,12 @@ impl Backend {
     /// `tailscale id-token` path). A thin `pub` shim over the engine's
     /// [`Device::fetch_id_token`](tailscale::Device::fetch_id_token), which mints a signed JWT via
     /// control over the live Noise connection. Kept on `Backend` so the `server.rs` dispatch call
-    /// site is uniform with the other device reads (`Backend::whois`/`ping`). A control-side refusal
-    /// (e.g. the control server's capability is below the id-token version, or any issuance error)
-    /// surfaces as [`Response::Error`](crate::localapi::Response::Error), never a panic.
+    /// site is uniform with the other off-lock device calls (`Backend::whois`/`ping`). Any issuance
+    /// failure surfaces as [`Response::Error`](crate::localapi::Response::Error), never a panic. NOTE:
+    /// the engine maps every non-2xx control response (including a too-old control server that can't
+    /// issue id-tokens) to one coarse "unsuccessful HTTP request" error, so the message identifies
+    /// *that the request failed*, not always *why* — distinguishing a 403/cap-too-old from a transient
+    /// 5xx would need a finer-grained engine error (a candidate engine ask).
     pub async fn id_token(dev: &tailscale::Device, audience: &str) -> crate::localapi::Response {
         match dev.fetch_id_token(audience).await {
             Ok(token) => crate::localapi::Response::IdToken { token },
