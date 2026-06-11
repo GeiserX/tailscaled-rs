@@ -153,3 +153,109 @@ async fn headscale_join_netmap_down() {
         "self address {addr:?} should be a valid IPv4 from the tailnet pool"
     );
 }
+
+/// Live `debug capture` test: bring a node up against headscale, capture the dataplane to a temp pcap
+/// for a couple seconds while driving self-loopback traffic, then assert the file is a valid pcap (the
+/// classic LE magic `0xA1B2C3D4`) larger than the 24-byte global header (i.e. ≥1 record was written).
+/// Same `#[ignore]` + env gate as the join test — compiles in CI, runs only against a real tailnet.
+#[tokio::test]
+#[ignore = "requires a running headscale (test-support/headscale) + TAILNETD_HS_URL/TAILNETD_HS_AUTHKEY; see docs/TESTING.md"]
+async fn headscale_debug_capture_writes_pcap() {
+    let (hs_url, hs_authkey) = match (
+        std::env::var("TAILNETD_HS_URL"),
+        std::env::var("TAILNETD_HS_AUTHKEY"),
+    ) {
+        (Ok(u), Ok(k)) if !u.is_empty() && !k.is_empty() => (u, k),
+        _ => {
+            eprintln!(
+                "SKIP headscale_debug_capture_writes_pcap: set TAILNETD_HS_URL and \
+                 TAILNETD_HS_AUTHKEY to run it (see docs/TESTING.md)"
+            );
+            return;
+        }
+    };
+    if std::env::var("TS_RS_EXPERIMENT").as_deref() != Ok("this_is_unstable_software") {
+        eprintln!("SKIP headscale_debug_capture_writes_pcap: export TS_RS_EXPERIMENT");
+        return;
+    }
+
+    let state_dir = unique_state_dir();
+    let _ = tokio::fs::remove_dir_all(&state_dir).await;
+    tokio::fs::create_dir_all(&state_dir)
+        .await
+        .expect("state dir");
+    let mut backend = Backend::load(&state_dir).await.expect("Backend::load");
+
+    let authkey = secrecy::SecretString::from(hs_authkey);
+    backend
+        .up(
+            Some(authkey),
+            tailscaled_rs::ipn::UpOptions {
+                hostname: Some("tailscaled-rs-hs-capture".to_string()),
+                control_url: Some(hs_url.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("up() against headscale {hs_url} failed: {e:?}"));
+
+    // Wait for Running so the dataplane is live.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut running = false;
+    while tokio::time::Instant::now() < deadline {
+        if backend.status().await.state == "Running" {
+            running = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // Capture to a temp pcap for ~3s. The engine writes the 24-byte global header on start; any
+    // dataplane traffic in the window adds records. (A freshly-joined node exchanges DERP/DISCO +
+    // map-poll keepalives, so the capture is rarely empty even without injected traffic.)
+    let pcap = state_dir.join("capture.pcap");
+    let outcome = if running {
+        if let Some(dev) = backend.device_handle() {
+            tailscaled_rs::ipn::Backend::debug_capture(&dev, pcap.to_str().unwrap(), 3).await
+        } else {
+            tailscaled_rs::localapi::Response::Error {
+                message: "no device handle".into(),
+            }
+        }
+    } else {
+        tailscaled_rs::localapi::Response::Error {
+            message: "never reached Running".into(),
+        }
+    };
+
+    // Read the file back BEFORE teardown.
+    let bytes = tokio::fs::read(&pcap).await.unwrap_or_default();
+
+    backend.down().await.expect("down()");
+    backend.shutdown().await;
+    let _ = tokio::fs::remove_dir_all(&state_dir).await;
+
+    assert!(
+        running,
+        "node never reached Running against headscale {hs_url}"
+    );
+    assert!(
+        matches!(outcome, tailscaled_rs::localapi::Response::Ok { .. }),
+        "debug_capture should succeed on a Running node, got {outcome:?}"
+    );
+    // Classic pcap global header is 24 bytes starting with the LE magic 0xA1B2C3D4.
+    assert!(
+        bytes.len() >= 24,
+        "pcap must contain at least the 24-byte global header, got {} bytes",
+        bytes.len()
+    );
+    assert_eq!(
+        &bytes[0..4],
+        &[0xD4, 0xC3, 0xB2, 0xA1],
+        "pcap must start with the classic little-endian magic 0xA1B2C3D4"
+    );
+    assert!(
+        bytes.len() > 24,
+        "expected at least one captured record beyond the global header (got exactly the header)"
+    );
+}

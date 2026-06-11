@@ -378,6 +378,28 @@ enum Command {
         #[arg(value_name = "ON_OFF", value_parser = ["on", "off"])]
         on_off: String,
     },
+    /// Debugging tools (Go `tailscale debug`).
+    Debug {
+        #[command(subcommand)]
+        cmd: DebugCmd,
+    },
+}
+
+/// `tnet debug` subcommands (Go `tailscale debug`).
+#[derive(Subcommand)]
+enum DebugCmd {
+    /// Capture the dataplane's plaintext packets to a pcap file (Go `tailscale debug capture`). The
+    /// file is a classic pcap (link-type USER0 + Tailscale's per-packet path preamble) — open it in
+    /// Wireshark, with Tailscale's `ts-dissector.lua` for per-packet direction. Captures for
+    /// `--seconds`, then stops.
+    Capture {
+        /// Local path to write the pcap to (a fresh path, or an existing regular file to overwrite).
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
+        /// How long to capture before stopping, in seconds.
+        #[arg(long, default_value_t = 10)]
+        seconds: u64,
+    },
 }
 
 /// `tnet serve` subcommands. Mirrors the TCP-forward subset of Go `tailscale serve`.
@@ -731,6 +753,31 @@ async fn main() -> Result<()> {
             return run_funnel(&socket, port, &on_off)
                 .await
                 .with_context(|| format!("funnel via {}", socket.display()));
+        }
+        // `debug capture`: send DebugCapture (a long-lived write — the daemon taps the dataplane for
+        // `seconds`, then replies with the byte count). Inline early-return like the other subcommand
+        // groups.
+        Command::Debug {
+            cmd: DebugCmd::Capture { path, seconds },
+        } => {
+            let path = path.to_string_lossy().into_owned();
+            let resp = round_trip(
+                &socket,
+                &Request::DebugCapture {
+                    path: path.clone(),
+                    seconds: Some(seconds),
+                },
+            )
+            .await
+            .with_context(|| format!("debug capture via {}", socket.display()))?;
+            match resp {
+                Response::Ok { message } => {
+                    println!("{message}");
+                    return Ok(());
+                }
+                Response::Error { message } => anyhow::bail!("debug capture failed: {message}"),
+                other => anyhow::bail!("unexpected response to debug capture: {other:?}"),
+            }
         }
         Command::Down => Request::Down,
         Command::Logout => Request::Logout,

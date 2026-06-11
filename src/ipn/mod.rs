@@ -1907,6 +1907,18 @@ impl Backend {
         diag::ping(dev, ip, timeout_ms).await
     }
 
+    /// Capture the dataplane to a pcap file for `seconds` (the `tnet debug capture` / Go `tailscale
+    /// debug capture` path). A thin `pub` shim over [`diag::debug_capture`], kept on `Backend` so the
+    /// `server.rs` dispatch call site (`Backend::debug_capture(&dev, ..)`) matches the other
+    /// off-lock diagnostics. See [`diag::debug_capture`] for the path-hardening + flush-on-stop logic.
+    pub async fn debug_capture(
+        dev: &tailscale::Device,
+        path: &str,
+        seconds: u64,
+    ) -> crate::localapi::Response {
+        diag::debug_capture(dev, path, seconds).await
+    }
+
     /// Send a local file to a tailnet peer via Taildrop (the `tnet file cp` / Go `tailscale file cp`
     /// path). A thin `pub` shim over [`diag::file_cp`], kept on `Backend` so the `server.rs`
     /// dispatch call site (`Backend::file_cp(&dev, ..)`) is unchanged. See [`diag::file_cp`] for the

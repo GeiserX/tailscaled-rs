@@ -681,6 +681,18 @@ async fn dispatch(
                 },
             }
         }
+        // `debug capture` taps the dataplane for `seconds` then writes a pcap. Off-lock (it runs for
+        // multiple seconds — never hold the backend Mutex across it), like `ping`/`whois`/`file_cp`.
+        Request::DebugCapture { path, seconds } => {
+            let dev = { backend.lock().await.device_handle() };
+            match dev {
+                // Default the window to 10s when the client omits it (matches the CLI default).
+                Some(dev) => Backend::debug_capture(&dev, &path, seconds.unwrap_or(10)).await,
+                None => Response::Error {
+                    message: "node is not up".into(),
+                },
+            }
+        }
         // `up` performs a multi-second control-plane handshake (`Device::new`). Doing that under the
         // backend lock would head-of-line block every concurrent `status`. `ipn::drive_up` runs the
         // three-phase split — lock briefly for begin_up → DROP the lock for the slow handshake →

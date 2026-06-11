@@ -229,6 +229,19 @@ pub enum Request {
         #[serde(default)]
         delete_after: bool,
     },
+    /// Capture the dataplane's plaintext packets to a pcap file for `seconds`, then stop (Go
+    /// `tailscale debug capture`). A WRITE: it installs a dataplane capture hook and writes a file as
+    /// the daemon's uid, so it's gated like `up`/`down`. The daemon owns a `BufWriter<File>` at `path`,
+    /// runs the engine's `capture_pcap` for the bounded window, then `stop_capture` (flush + close).
+    DebugCapture {
+        /// Local path the daemon writes the pcap to (a fresh path, or an existing regular file to
+        /// truncate; a non-regular existing target is refused).
+        path: String,
+        /// How long to capture before stopping (bounds the call so the CLI returns). `None` = a
+        /// sane default chosen by the CLI.
+        #[serde(default)]
+        seconds: Option<u64>,
+    },
 }
 
 /// The daemon's reply to a [`Request`].

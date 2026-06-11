@@ -393,6 +393,82 @@ pub(super) async fn file_get(
     }
 }
 
+/// Validate a `debug capture` destination path before the daemon (running as root) creates it:
+/// `Ok(())` if the path is missing (the normal fresh-capture case) or an existing **regular file**
+/// (overwritten); `Err(reason)` if it EXISTS as anything else — a symlink (refused as the link
+/// itself, never followed, since `symlink_metadata` does not traverse the final component), a device,
+/// FIFO, socket, or directory. This stops a planted symlink from redirecting the root daemon's write
+/// and refuses clobbering a non-file. Pure (just a stat) → unit-testable without a device.
+async fn capture_dest_ok(path: &str) -> Result<(), String> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(meta) if meta.file_type().is_file() => Ok(()),
+        Ok(_) => Err(format!("refusing to capture to {path}: not a regular file")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("cannot stat {path}: {e}")),
+    }
+}
+
+/// Capture the dataplane's plaintext packets to a pcap file at `path` for `seconds`, then stop (the
+/// `tnet debug capture` / Go `tailscale debug capture` path).
+///
+/// Opens `path` as a [`BufWriter`](std::io::BufWriter) over a fresh `std::fs::File`, hands it to the
+/// engine's [`capture_pcap`](tailscale::Device::capture_pcap) (which writes the 24-byte pcap global
+/// header on success + installs the dataplane tap), waits `seconds`, then calls
+/// [`stop_capture`](tailscale::Device::stop_capture) — which drops the writer, flushing the buffered
+/// tail. The daemon does NOT hold the writer (it is moved into the engine and driven inline on the
+/// dataplane thread), so the byte count is read back by stat-ing the file after the capture stops.
+///
+/// **Path hardening:** the daemon writes `path` as its own (root) uid, so — like
+/// [`file_get`](file_get) — we `symlink_metadata` it first and refuse anything that EXISTS but is not
+/// a regular file (a symlink — never followed — device, FIFO, socket, or directory), so a planted
+/// symlink can't redirect the write. A missing path is fine (the common case: a fresh capture file).
+///
+/// Off the backend lock (the capture runs for `seconds`); the device-absent branch lives at the
+/// dispatch arm. Takes `&tailscale::Device` like the other diagnostics.
+pub(super) async fn debug_capture(dev: &tailscale::Device, path: &str, seconds: u64) -> Response {
+    // Path hardening: refuse an existing non-regular target (symlink/device/FIFO/socket/dir). A
+    // missing path is the normal case and is allowed — we create it below.
+    if let Err(message) = capture_dest_ok(path).await {
+        return Response::Error { message };
+    }
+
+    // Create/truncate the file and wrap it buffered. capture_pcap takes a blocking std::io::Write +
+    // Send + 'static and MOVES it into the engine, so use a std::fs::File (not tokio's), opened here.
+    let file = match std::fs::File::create(path) {
+        Ok(f) => f,
+        Err(e) => {
+            return Response::Error {
+                message: format!("cannot create {path}: {e}"),
+            };
+        }
+    };
+    let writer = std::io::BufWriter::new(file);
+
+    // Install the tap (writes the global header + starts streaming records into `writer`).
+    if let Err(e) = dev.capture_pcap(writer).await {
+        // Best-effort cleanup of the (header-less / empty) file so a failed start leaves no stub.
+        let _ = tokio::fs::remove_file(path).await;
+        return Response::Error {
+            message: format!("failed to start capture: {e:?}"),
+        };
+    }
+
+    // Run for the bounded window, then stop (dropping the engine-held writer flushes the tail).
+    tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+    if let Err(e) = dev.stop_capture().await {
+        tracing::warn!(error = ?e, "debug capture: stop_capture failed; the file may be incomplete");
+    }
+
+    // The writer was moved into the engine, so read the size back by stat-ing the file.
+    let bytes = tokio::fs::metadata(path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+    Response::Ok {
+        message: format!("captured {bytes} bytes to {path} ({seconds}s)"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // After the lock-across-await fix (tsd), `ip_report`/`whois`/`ping`/`file_cp`/`file_list`/
@@ -423,6 +499,28 @@ mod tests {
             "100.64.0.1".parse::<std::net::IpAddr>().is_ok(),
             "a well-formed tailnet IP must parse → reaches the engine call"
         );
+    }
+
+    #[tokio::test]
+    async fn capture_dest_hardening() {
+        use super::capture_dest_ok;
+        let base = std::env::temp_dir().join(format!("tailnetd-cap-dest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        // A fresh (missing) path is OK — the common case (capture creates it).
+        let fresh = base.join("fresh.pcap");
+        assert!(capture_dest_ok(fresh.to_str().unwrap()).await.is_ok());
+
+        // An existing regular file is OK (overwritten).
+        let reg = base.join("old.pcap");
+        std::fs::write(&reg, b"x").unwrap();
+        assert!(capture_dest_ok(reg.to_str().unwrap()).await.is_ok());
+
+        // A directory is refused (can't be tricked into writing into / through a non-file).
+        assert!(capture_dest_ok(base.to_str().unwrap()).await.is_err());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // --- Taildrop path hardening (file_cp source / file_get dest) — fail-closed regular-file rule --
