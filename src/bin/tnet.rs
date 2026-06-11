@@ -150,7 +150,8 @@ enum Command {
         /// (return as soon as the daemon accepts the up); `0` = wait forever. Handy in scripts as
         /// `tnet up --authkey <KEY> --timeout 30 && start-my-service`. For an interactive (no-authkey)
         /// up the login URL is printed first, then the wait runs — so a short timeout may elapse
-        /// before a human authorizes.
+        /// before a human authorizes. NOTE: this takes integer SECONDS (`--timeout 30`); Go's flag is
+        /// a duration string (`30s`), so a duration suffix is not accepted here.
         #[arg(long, value_name = "SECONDS")]
         timeout: Option<u64>,
     },
@@ -2315,7 +2316,8 @@ const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 
 /// Block until the node reaches `Running` with a tailnet IP, then return `Ok(())` (exit 0). Mirrors
 /// Go `tailscale wait`'s exit-code contract: success on Running, a non-zero exit (here an `Err`) on
-/// timeout. `timeout_secs` of `None`/`Some(0)` waits forever; otherwise it bounds the wait.
+/// timeout. `timeout_secs` of `None`/`Some(0)` waits forever; otherwise it bounds the wait. Shared by
+/// `tnet wait` and `tnet up --timeout` (both want the same "wait for Running, bounded" semantics).
 ///
 /// We poll `Request::Status` rather than stream the IPN bus: it reuses the existing one-shot
 /// round-trip, and the daemon's derived `state` is authoritative. Go additionally waits for the
