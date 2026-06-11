@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.28.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.27.0...v0.28.0) (2026-06-11)
+
+
+### Features
+
+* **up:** add --timeout to wait for the node to reach Running ([#83](https://github.com/GeiserX/tailscaled-rs/issues/83)) ([e3c542f](https://github.com/GeiserX/tailscaled-rs/commit/e3c542fcc0c6225ed38eb8ecb1e1dfbd86fb4fad))
+
 ## [0.27.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.26.0...v0.27.0) (2026-06-11)
 
 
