@@ -1731,14 +1731,46 @@ fn print_status(s: &tailscaled_rs::localapi::StatusReport) {
              key; the same key will keep failing)"
         );
     }
+    // The exit node currently engaged (Go `ExitNodeStatus`), distinct from the *configured* selector
+    // above: this is what traffic actually egresses through right now (the engine's fail-closed answer).
+    if let Some(active) = s.active_exit_node.as_deref() {
+        println!("exit-node:    {active} (active)");
+    }
     println!("peers:        {}", s.peers.len());
     for p in &s.peers {
         println!(
-            "  - {:<28} {:<16}{}",
+            "  - {:<28} {:<16}{}{}",
             p.name,
             p.ipv4,
-            if p.is_exit_node { "  [exit]" } else { "" }
+            if p.is_exit_node { "  [exit]" } else { "" },
+            peer_status_cell(p),
         );
+    }
+}
+
+/// The Go-`printPS`-flavored status cell for a peer: direct-vs-relay + an offline/last-seen suffix.
+/// Pure → unit-testable. Empty when there is nothing informative to add (online peer, no path known).
+fn peer_status_cell(p: &tailscaled_rs::localapi::PeerReport) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    // Path: a confirmed direct endpoint, else the DERP relay region (mutually exclusive, like Go's
+    // CurAddr-vs-Relay). Quote the relay region to match Go's `relay "nyc"`.
+    if let Some(addr) = p.cur_addr.as_deref() {
+        parts.push(format!("direct {addr}"));
+    } else if let Some(region) = p.relay.as_deref() {
+        parts.push(format!("relay {region:?}"));
+    }
+    // Liveness: only call out offline (online is the unremarkable default), appending last-seen when
+    // known — mirrors Go's "; offline, last seen …".
+    if p.online == Some(false) {
+        match p.last_seen.as_deref() {
+            Some(seen) => parts.push(format!("offline, last seen {seen}")),
+            None => parts.push("offline".to_string()),
+        }
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("  ({})", parts.join("; "))
     }
 }
 
@@ -1769,6 +1801,7 @@ impl StatusFilter {
         if self.hide_self {
             s.self_ipv4 = None;
             s.self_name = None;
+            s.self_ipv6 = None;
         }
         if self.hide_peers {
             s.peers.clear();
@@ -1796,17 +1829,17 @@ impl StatusFilter {
 fn format_status_json(s: &tailscaled_rs::localapi::StatusReport) -> Result<String> {
     use serde_json::{Map, Value, json};
 
+    // The self/peer TailscaleIPs slice: IPv4 then (if known) IPv6, like Go's TailscaleIPs.
+    let self_ips: Vec<&String> = s.self_ipv4.iter().chain(s.self_ipv6.iter()).collect();
+
     // Self: a PeerStatus subset from the self_* fields.
-    let self_node = if s.self_ipv4.is_some() || s.self_name.is_some() {
+    let self_node = if !self_ips.is_empty() || s.self_name.is_some() {
         let mut m = Map::new();
         if let Some(name) = &s.self_name {
             m.insert("HostName".into(), json!(name));
             m.insert("DNSName".into(), json!(name));
         }
-        m.insert(
-            "TailscaleIPs".into(),
-            json!(s.self_ipv4.iter().collect::<Vec<_>>()),
-        );
+        m.insert("TailscaleIPs".into(), json!(self_ips));
         Value::Object(m)
     } else {
         Value::Null
@@ -1823,10 +1856,24 @@ fn format_status_json(s: &tailscaled_rs::localapi::StatusReport) -> Result<Strin
         let mut pm = Map::new();
         pm.insert("HostName".into(), json!(p.name));
         pm.insert("DNSName".into(), json!(p.name));
-        pm.insert("TailscaleIPs".into(), json!([p.ipv4]));
+        // TailscaleIPs: IPv4 then IPv6 (Go's per-peer address slice).
+        let ips: Vec<&String> = std::iter::once(&p.ipv4).chain(p.ipv6.iter()).collect();
+        pm.insert("TailscaleIPs".into(), json!(ips));
         pm.insert("ExitNodeOption".into(), json!(p.is_exit_node));
         if let Some(online) = p.online {
             pm.insert("Online".into(), json!(online));
+        }
+        if !p.allowed_routes.is_empty() {
+            pm.insert("AllowedIPs".into(), json!(p.allowed_routes));
+        }
+        if let Some(seen) = &p.last_seen {
+            pm.insert("LastSeen".into(), json!(seen));
+        }
+        if let Some(addr) = &p.cur_addr {
+            pm.insert("CurAddr".into(), json!(addr));
+        }
+        if let Some(region) = &p.relay {
+            pm.insert("Relay".into(), json!(region));
         }
         peers.insert(key, Value::Object(pm));
     }
@@ -1835,11 +1882,16 @@ fn format_status_json(s: &tailscaled_rs::localapi::StatusReport) -> Result<Strin
     root.insert("BackendState".into(), json!(s.state));
     // AuthURL: Go emits the field always (empty when none); mirror that.
     root.insert("AuthURL".into(), json!(s.auth_url.as_deref().unwrap_or("")));
-    root.insert(
-        "TailscaleIPs".into(),
-        json!(s.self_ipv4.iter().collect::<Vec<_>>()),
-    );
+    root.insert("TailscaleIPs".into(), json!(self_ips));
     root.insert("Self".into(), self_node);
+    if let Some(suffix) = &s.magic_dns_suffix {
+        root.insert("MagicDNSSuffix".into(), json!(suffix));
+    }
+    // ExitNodeStatus: Go nests the active exit node under an object keyed by its ID. We carry the
+    // resolved name/id, so emit the same shape (just the ID field) when one is engaged.
+    if let Some(active) = &s.active_exit_node {
+        root.insert("ExitNodeStatus".into(), json!({ "ID": active }));
+    }
     root.insert("Peer".into(), Value::Object(peers));
 
     Ok(format!("{}\n", serde_json::to_string_pretty(&root)?))
@@ -2532,12 +2584,7 @@ mod tests {
         StatusReport {
             state: state.to_string(),
             want_running: true,
-            self_ipv4: None,
-            self_name: None,
-            auth_url: None,
-            error: None,
-            prefs: Default::default(),
-            peers: vec![],
+            ..Default::default()
         }
     }
 
@@ -3649,6 +3696,9 @@ mod tests {
             auth_url: None,
             error: None,
             prefs: PrefsView::default(),
+            self_ipv6: None,
+            active_exit_node: None,
+            magic_dns_suffix: None,
             peers: vec![
                 PeerReport {
                     name: "online-peer".to_string(),
@@ -3656,6 +3706,7 @@ mod tests {
                     is_exit_node: false,
                     stable_id: "n1".to_string(),
                     online: Some(true),
+                    ..Default::default()
                 },
                 PeerReport {
                     name: "offline-peer".to_string(),
@@ -3663,6 +3714,7 @@ mod tests {
                     is_exit_node: false,
                     stable_id: "n2".to_string(),
                     online: Some(false),
+                    ..Default::default()
                 },
                 PeerReport {
                     name: "unknown-peer".to_string(),
@@ -3670,6 +3722,7 @@ mod tests {
                     is_exit_node: false,
                     stable_id: "n3".to_string(),
                     online: None,
+                    ..Default::default()
                 },
             ],
         };
@@ -3727,6 +3780,9 @@ mod tests {
             auth_url: None,
             error: None,
             prefs: PrefsView::default(),
+            self_ipv6: Some("fd7a:115c:a1e0::1".to_string()),
+            active_exit_node: Some("peer-b".to_string()),
+            magic_dns_suffix: Some("tail0123.ts.net".to_string()),
             peers: vec![
                 PeerReport {
                     name: "peer-b".to_string(),
@@ -3734,13 +3790,20 @@ mod tests {
                     is_exit_node: true,
                     stable_id: "nABC123".to_string(),
                     online: Some(true),
+                    ipv6: Some("fd7a:115c:a1e0::2".to_string()),
+                    allowed_routes: vec!["100.64.0.2/32".to_string(), "0.0.0.0/0".to_string()],
+                    cur_addr: Some("192.0.2.5:41641".to_string()),
+                    ..Default::default()
                 },
                 PeerReport {
                     name: "peer-c".to_string(),
                     ipv4: "100.64.0.3".to_string(),
                     is_exit_node: false,
                     stable_id: String::new(), // missing id → keyed by name (fallback)
-                    online: None,
+                    online: Some(false),
+                    relay: Some("nyc".to_string()),
+                    last_seen: Some("2026-06-11 05:19:14 UTC".to_string()),
+                    ..Default::default()
                 },
             ],
         };
@@ -3751,12 +3814,18 @@ mod tests {
         // Go key names + the exact BackendState string.
         assert_eq!(v["BackendState"], serde_json::json!("Running"));
         assert_eq!(v["AuthURL"], serde_json::json!("")); // always present, empty when none
-        assert_eq!(v["TailscaleIPs"], serde_json::json!(["100.70.22.12"]));
+        // TailscaleIPs now carries IPv4 then IPv6.
+        assert_eq!(
+            v["TailscaleIPs"],
+            serde_json::json!(["100.70.22.12", "fd7a:115c:a1e0::1"])
+        );
+        assert_eq!(v["MagicDNSSuffix"], serde_json::json!("tail0123.ts.net"));
+        assert_eq!(v["ExitNodeStatus"]["ID"], serde_json::json!("peer-b"));
         // Self subset.
         assert_eq!(v["Self"]["HostName"], serde_json::json!("node-a"));
         assert_eq!(
             v["Self"]["TailscaleIPs"],
-            serde_json::json!(["100.70.22.12"])
+            serde_json::json!(["100.70.22.12", "fd7a:115c:a1e0::1"])
         );
         // Peer map keyed by stable_id (with name-fallback for the id-less peer).
         assert_eq!(
@@ -3768,9 +3837,61 @@ mod tests {
             serde_json::json!(true)
         );
         assert_eq!(v["Peer"]["nABC123"]["Online"], serde_json::json!(true));
+        assert_eq!(
+            v["Peer"]["nABC123"]["TailscaleIPs"],
+            serde_json::json!(["100.64.0.2", "fd7a:115c:a1e0::2"])
+        );
+        assert_eq!(
+            v["Peer"]["nABC123"]["AllowedIPs"],
+            serde_json::json!(["100.64.0.2/32", "0.0.0.0/0"])
+        );
+        assert_eq!(
+            v["Peer"]["nABC123"]["CurAddr"],
+            serde_json::json!("192.0.2.5:41641")
+        );
         assert_eq!(v["Peer"]["peer-c"]["HostName"], serde_json::json!("peer-c"));
-        // The id-less peer has no Online key (None → skipped).
-        assert!(v["Peer"]["peer-c"].get("Online").is_none());
+        assert_eq!(v["Peer"]["peer-c"]["Online"], serde_json::json!(false));
+        assert_eq!(v["Peer"]["peer-c"]["Relay"], serde_json::json!("nyc"));
+        assert_eq!(
+            v["Peer"]["peer-c"]["LastSeen"],
+            serde_json::json!("2026-06-11 05:19:14 UTC")
+        );
+    }
+
+    #[test]
+    fn peer_status_cell_renders_path_and_offline() {
+        use tailscaled_rs::localapi::PeerReport;
+        // Direct path → "direct <addr>".
+        let direct = PeerReport {
+            cur_addr: Some("192.0.2.5:41641".to_string()),
+            online: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(peer_status_cell(&direct), "  (direct 192.0.2.5:41641)");
+        // No direct path, DERP relay → relay "region" (quoted, like Go).
+        let relayed = PeerReport {
+            relay: Some("nyc".to_string()),
+            online: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(peer_status_cell(&relayed), r#"  (relay "nyc")"#);
+        // Offline with last-seen → appended suffix; relay still shown.
+        let offline = PeerReport {
+            relay: Some("fra".to_string()),
+            online: Some(false),
+            last_seen: Some("2026-06-11 05:19:14 UTC".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            peer_status_cell(&offline),
+            r#"  (relay "fra"; offline, last seen 2026-06-11 05:19:14 UTC)"#
+        );
+        // Online peer with no known path → empty cell.
+        let plain = PeerReport {
+            online: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(peer_status_cell(&plain), "");
     }
 
     #[tokio::test]
