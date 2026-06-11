@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.33.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.32.0...v0.33.0) (2026-06-11)
+
+
+### Features
+
+* **version:** version.Meta JSON shape (incl. cap) + bugreport [note] + version --upstream stub ([#93](https://github.com/GeiserX/tailscaled-rs/issues/93)) ([56b2236](https://github.com/GeiserX/tailscaled-rs/commit/56b223633929aca2ad2bb1f9e2ab42012e1f3f46))
+
 ## [0.32.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.31.0...v0.32.0) (2026-06-11)
 
 
