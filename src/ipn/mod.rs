@@ -1900,6 +1900,15 @@ impl Backend {
         diag::lock_status(dev).await
     }
 
+    /// Report the control-pushed MagicDNS configuration (the `tnet dns status` path). Thin `pub`
+    /// shim over [`diag::dns_status`], kept on `Backend` so the `server.rs` dispatch call site
+    /// (`Backend::dns_status(&dev)`) is uniform with the other off-lock diagnostics. See
+    /// [`diag::dns_status`] for the `dns_config` → [`DnsStatusReport`](crate::localapi::DnsStatusReport)
+    /// mapping.
+    pub async fn dns_status(dev: &tailscale::Device) -> crate::localapi::Response {
+        diag::dns_status(dev).await
+    }
+
     /// Load the current profile's serve config (the `tnet serve status` / GetServeConfig path).
     /// Missing/malformed → empty (no serve). Reads only the profile's serve-config file.
     pub async fn serve_config(&self) -> serve::ServeConfig {

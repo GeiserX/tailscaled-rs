@@ -336,6 +336,13 @@ enum Command {
         #[command(subcommand)]
         cmd: LockCmd,
     },
+    /// DNS commands. Currently `status` (read-only): the control-pushed MagicDNS configuration —
+    /// MagicDNS on/off, resolvers in preference order, split-DNS routes, search/cert domains, extra
+    /// records, and exit-node-filtered suffixes. Mirrors Go `tailscale dns status`.
+    Dns {
+        #[command(subcommand)]
+        cmd: DnsCmd,
+    },
     /// Exit-node commands. `list` shows tailnet peers offering to be exit nodes. Mirrors Go
     /// `tailscale exit-node`.
     #[command(name = "exit-node")]
@@ -486,6 +493,18 @@ enum MetricsCmd {
 #[derive(Subcommand)]
 enum LockCmd {
     /// Show Tailnet Lock status (read-only).
+    Status {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// `tnet dns` subcommands. Currently just `status`; structured as a subcommand group to leave room
+/// for future DNS subcommands (e.g. `query`).
+#[derive(Subcommand)]
+enum DnsCmd {
+    /// Show the control-pushed MagicDNS configuration (read-only).
     Status {
         /// Output as JSON.
         #[arg(long)]
@@ -1098,6 +1117,25 @@ async fn main() -> Result<()> {
             print!("{}", format_lock_status(&report, json));
             return Ok(());
         }
+        // `dns status` (Go `tailscale dns status`): fetch + render the control-pushed MagicDNS config.
+        Command::Dns {
+            cmd: DnsCmd::Status { json },
+        } => {
+            let report = match round_trip(&socket, &Request::DnsStatus).await {
+                Ok(Response::DnsStatus(r)) => r,
+                Ok(Response::Error { message }) => {
+                    eprintln!("error: {message}");
+                    std::process::exit(1);
+                }
+                Ok(other) => anyhow::bail!("unexpected response to dns status: {other:?}"),
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("querying dns status at {}", socket.display()));
+                }
+            };
+            print!("{}", format_dns_status(&report, json));
+            return Ok(());
+        }
         // `exit-node list` (Go `tailscale exit-node list`): reuse Status, filter to exit-node peers.
         Command::ExitNode {
             cmd: ExitNodeCmd::List,
@@ -1227,6 +1265,8 @@ async fn main() -> Result<()> {
         // `metrics`/`lock status` are handled inline above; these arms are exhaustiveness-only.
         Response::Metrics { text } => print!("{text}"),
         Response::Lock(report) => print!("{}", format_lock_status(&report, false)),
+        // `dns status` is handled inline above (early return); this arm is exhaustiveness-only.
+        Response::DnsStatus(report) => print!("{}", format_dns_status(&report, false)),
         // `serve` is handled inline above (read-modify-write); this arm is exhaustiveness-only.
         Response::ServeConfig(cfg) => print!("{}", format_serve_status(&cfg, false)),
         // `bugreport`: print the local marker + a one-line honesty note (no logs were uploaded).
@@ -1291,6 +1331,132 @@ fn format_lock_status(r: &tailscaled_rs::localapi::LockReport, json: bool) -> St
     if r.disabled {
         out.push_str("  status: a disablement is pending (control signalled disable).\n");
     }
+    out
+}
+
+/// Render `tnet dns status` from a [`DnsStatusReport`](tailscaled_rs::localapi::DnsStatusReport)
+/// (Go `tailscale dns status`). Human form prints Go's MagicDNS-configuration sections — MagicDNS
+/// on/off, resolvers in preference order, split-DNS routes, search domains, fallback resolvers,
+/// certificate domains, additional DNS records, and exit-node-filtered suffixes — each empty section
+/// printing a parenthetical none-line, then a one-line honest note that the Go "Use Tailscale DNS"
+/// accept-dns line + the "System DNS configuration" section are not surfaced by this build (no
+/// CorpDNS pref / no engine OS-DNS accessor). `json` emits a `DNSStatusResult`-shaped object with
+/// Go's key names, built via `serde_json` (escape-safe, 2-space pretty). Pure (returns the string
+/// incl. its trailing newline) → unit-testable.
+fn format_dns_status(r: &tailscaled_rs::localapi::DnsStatusReport, json: bool) -> String {
+    if json {
+        use serde_json::{Map, Value, json};
+        let mut root = Map::new();
+        root.insert("MagicDNS".into(), json!(r.magic_dns));
+        root.insert("Resolvers".into(), json!(r.resolvers));
+        // Split-DNS routes: a suffix → list-of-addrs object (Go `SplitDNSRoutes`).
+        let routes: Map<String, Value> = r
+            .routes
+            .iter()
+            .map(|(suffix, addrs)| (suffix.clone(), json!(addrs)))
+            .collect();
+        root.insert("SplitDNSRoutes".into(), Value::Object(routes));
+        root.insert("SearchDomains".into(), json!(r.search_domains));
+        root.insert("FallbackResolvers".into(), json!(r.fallback_resolvers));
+        root.insert("CertDomains".into(), json!(r.cert_domains));
+        // Extra records: a name → addr object (Go `ExtraRecords`).
+        let extra: Map<String, Value> = r
+            .extra_records
+            .iter()
+            .map(|(name, addr)| (name.clone(), json!(addr)))
+            .collect();
+        root.insert("ExtraRecords".into(), Value::Object(extra));
+        root.insert(
+            "ExitNodeFilteredSet".into(),
+            json!(r.exit_node_filtered_set),
+        );
+        return format!(
+            "{}\n",
+            serde_json::to_string_pretty(&root).unwrap_or_else(|_| "{}".to_string())
+        );
+    }
+
+    let mut out = String::from("=== MagicDNS configuration ===\n");
+    if r.magic_dns {
+        out.push_str("MagicDNS: enabled tailnet-wide\n");
+    } else {
+        out.push_str("MagicDNS: disabled tailnet-wide.\n");
+    }
+
+    out.push_str("Resolvers (in preference order):\n");
+    if r.resolvers.is_empty() {
+        out.push_str("  (none configured)\n");
+    } else {
+        for addr in &r.resolvers {
+            out.push_str(&format!("  - {addr}\n"));
+        }
+    }
+
+    out.push_str("Split DNS Routes:\n");
+    if r.routes.is_empty() {
+        out.push_str("  (none)\n");
+    } else {
+        for (suffix, addrs) in &r.routes {
+            if addrs.is_empty() {
+                // A negative route (no upstreams) — names under the suffix are not resolved.
+                out.push_str(&format!("  - {suffix:<30} -> (no resolvers)\n"));
+            } else {
+                for addr in addrs {
+                    out.push_str(&format!("  - {suffix:<30} -> {addr}\n"));
+                }
+            }
+        }
+    }
+
+    out.push_str("Search Domains:\n");
+    if r.search_domains.is_empty() {
+        out.push_str("  (none)\n");
+    } else {
+        for domain in &r.search_domains {
+            out.push_str(&format!("  - {domain}\n"));
+        }
+    }
+
+    out.push_str("Fallback Resolvers:\n");
+    if r.fallback_resolvers.is_empty() {
+        out.push_str("  (none)\n");
+    } else {
+        for addr in &r.fallback_resolvers {
+            out.push_str(&format!("  - {addr}\n"));
+        }
+    }
+
+    out.push_str("Certificate Domains:\n");
+    if r.cert_domains.is_empty() {
+        out.push_str("  (none)\n");
+    } else {
+        for domain in &r.cert_domains {
+            out.push_str(&format!("  - {domain}\n"));
+        }
+    }
+
+    out.push_str("Additional DNS Records:\n");
+    if r.extra_records.is_empty() {
+        out.push_str("  (none)\n");
+    } else {
+        for (name, addr) in &r.extra_records {
+            out.push_str(&format!("  - {name} -> {addr}\n"));
+        }
+    }
+
+    out.push_str("Filtered suffixes (exit-node):\n");
+    if r.exit_node_filtered_set.is_empty() {
+        out.push_str("  (none)\n");
+    } else {
+        for suffix in &r.exit_node_filtered_set {
+            out.push_str(&format!("  - {suffix}\n"));
+        }
+    }
+
+    out.push_str(
+        "(note: the 'Use Tailscale DNS' accept-dns line and the 'System DNS configuration' section \
+         are not surfaced by this build)\n",
+    );
     out
 }
 
@@ -3256,6 +3422,88 @@ mod tests {
         assert_eq!(v["enabled"], serde_json::json!(true));
         assert_eq!(v["head"], serde_json::json!("tka-aumhash-abc"));
         assert_eq!(v["disabled"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn format_dns_status_populated_human_and_json() {
+        use tailscaled_rs::localapi::DnsStatusReport;
+        let report = DnsStatusReport {
+            magic_dns: true,
+            search_domains: vec!["user.ts.net".into()],
+            resolvers: vec!["100.100.100.100:53".into(), "8.8.8.8:53".into()],
+            routes: std::collections::BTreeMap::from([(
+                "corp.example.com".to_string(),
+                vec!["10.0.0.53:53".to_string()],
+            )]),
+            fallback_resolvers: vec!["1.1.1.1:53".into()],
+            cert_domains: vec!["host.user.ts.net".into()],
+            extra_records: vec![("printer.user.ts.net".into(), "100.64.0.7".into())],
+            exit_node_filtered_set: vec![".internal".into()],
+        };
+        // Human form: the populated resolver/route/search lines appear, MagicDNS reads enabled, and
+        // the honest omission note is present.
+        let h = format_dns_status(&report, false);
+        assert!(h.contains("MagicDNS: enabled tailnet-wide"), "{h}");
+        assert!(h.contains("  - 100.100.100.100:53"), "{h}");
+        assert!(h.contains("  - 8.8.8.8:53"), "{h}");
+        assert!(h.contains("corp.example.com"), "{h}");
+        assert!(h.contains("-> 10.0.0.53:53"), "{h}");
+        assert!(h.contains("  - user.ts.net"), "{h}");
+        assert!(h.contains("  - 1.1.1.1:53"), "{h}");
+        assert!(h.contains("host.user.ts.net"), "{h}");
+        assert!(h.contains("printer.user.ts.net -> 100.64.0.7"), "{h}");
+        assert!(h.contains(".internal"), "{h}");
+        assert!(
+            h.contains("not surfaced by this build"),
+            "the honest omission note must be present: {h}"
+        );
+        // JSON form: Go-shaped keys + a bare MagicDNS bool, escape-safe via serde.
+        let j = format_dns_status(&report, true);
+        let v: serde_json::Value = serde_json::from_str(&j).unwrap();
+        assert_eq!(v["MagicDNS"], serde_json::json!(true));
+        assert_eq!(
+            v["Resolvers"],
+            serde_json::json!(["100.100.100.100:53", "8.8.8.8:53"])
+        );
+        assert_eq!(
+            v["SplitDNSRoutes"]["corp.example.com"],
+            serde_json::json!(["10.0.0.53:53"])
+        );
+        assert_eq!(v["SearchDomains"], serde_json::json!(["user.ts.net"]));
+        assert_eq!(v["FallbackResolvers"], serde_json::json!(["1.1.1.1:53"]));
+        assert_eq!(v["CertDomains"], serde_json::json!(["host.user.ts.net"]));
+        assert_eq!(
+            v["ExtraRecords"]["printer.user.ts.net"],
+            serde_json::json!("100.64.0.7")
+        );
+        assert_eq!(v["ExitNodeFilteredSet"], serde_json::json!([".internal"]));
+    }
+
+    #[test]
+    fn format_dns_status_empty_renders_none_lines() {
+        use tailscaled_rs::localapi::DnsStatusReport;
+        // The no-netmap / default report: MagicDNS disabled + every section a parenthetical none-line.
+        let empty = DnsStatusReport::default();
+        let h = format_dns_status(&empty, false);
+        assert!(h.contains("MagicDNS: disabled tailnet-wide"), "{h}");
+        assert!(
+            h.contains("Resolvers (in preference order):\n  (none configured)"),
+            "{h}"
+        );
+        assert!(h.contains("Split DNS Routes:\n  (none)"), "{h}");
+        assert!(h.contains("Search Domains:\n  (none)"), "{h}");
+        assert!(h.contains("Fallback Resolvers:\n  (none)"), "{h}");
+        assert!(h.contains("Certificate Domains:\n  (none)"), "{h}");
+        assert!(h.contains("Additional DNS Records:\n  (none)"), "{h}");
+        assert!(
+            h.contains("Filtered suffixes (exit-node):\n  (none)"),
+            "{h}"
+        );
+        assert!(h.contains("not surfaced by this build"), "{h}");
+        // JSON: a default report still carries a bare MagicDNS:false + empty collections.
+        let v: serde_json::Value = serde_json::from_str(&format_dns_status(&empty, true)).unwrap();
+        assert_eq!(v["MagicDNS"], serde_json::json!(false));
+        assert_eq!(v["Resolvers"], serde_json::json!([]));
     }
 
     #[test]

@@ -141,6 +141,10 @@ pub enum Request {
     /// Report Tailnet Lock (TKA) status (Go `tailscale lock status`, read-only subset). Replies with
     /// [`Response::Lock`]. Read-only — gated like [`Status`](Request::Status).
     LockStatus,
+    /// Report the control-pushed MagicDNS configuration (Go `tailscale dns status`). Replies with
+    /// [`Response::DnsStatus`]. Read-only — gated like [`Status`](Request::Status). Requires the node
+    /// to be up (the config comes from the live engine's netmap).
+    DnsStatus,
     /// Produce a shareable diagnostic marker (Go `tailscale bugreport`). Replies with
     /// [`Response::BugReport`]. Read-only. NOTE: Go uploads logs to logtail and returns the log id;
     /// this fork has no log-upload backend, so the marker is a LOCAL diagnostic identifier only (it is
@@ -296,6 +300,9 @@ pub enum Response {
     },
     /// Tailnet Lock (TKA) status (reply to [`Request::LockStatus`]), rendered by `tnet lock status`.
     Lock(LockReport),
+    /// The control-pushed MagicDNS configuration (reply to [`Request::DnsStatus`]), rendered by
+    /// `tnet dns status`.
+    DnsStatus(DnsStatusReport),
     /// A local diagnostic marker (reply to [`Request::BugReport`]), printed by `tnet bugreport`.
     BugReport {
         /// The marker string (a local identifier + daemon version + node state). NOT a server-side
@@ -617,6 +624,47 @@ pub struct LockReport {
     pub disabled: bool,
 }
 
+/// The control-pushed MagicDNS configuration in a [`Response::DnsStatus`] reply (Go `tailscale dns
+/// status`, the MagicDNS-configuration sections). Mirrors the engine's `tailscale::DnsConfig`, but
+/// stored as this crate's own wire types (resolver addresses pre-rendered to strings via
+/// [`DnsResolver::udp_addr`](tailscale::DnsResolver::udp_addr)) so the CLI renders our DTO and never
+/// the engine's type. The Go "Use Tailscale DNS" accept-dns line + the "System DNS configuration"
+/// section are deliberately NOT carried (no CorpDNS pref / no engine OS-DNS accessor in this fork);
+/// the CLI renderer notes both as not-surfaced-by-this-build.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DnsStatusReport {
+    /// Whether MagicDNS is enabled tailnet-wide (engine `DnsConfig::magic_dns`, Go `Proxied`).
+    #[serde(default)]
+    pub magic_dns: bool,
+    /// The tailnet DNS search suffix(es) (engine `search_domains`), lowercased, no trailing dot.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub search_domains: Vec<String>,
+    /// Global upstream resolvers in preference order (engine `resolvers`), each as an `addr:port`
+    /// string via [`DnsResolver::udp_addr`](tailscale::DnsResolver::udp_addr).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolvers: Vec<String>,
+    /// Split-DNS routes (engine `routes`): DNS suffix → the upstream resolver `addr:port` strings
+    /// that answer that suffix. An empty value list is a negative route (names under the suffix are
+    /// not resolved).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub routes: std::collections::BTreeMap<String, Vec<String>>,
+    /// Fallback resolvers (engine `fallback_resolvers`), preferred over [`resolvers`](DnsStatusReport::resolvers)
+    /// for names matching no route, each as an `addr:port` string.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_resolvers: Vec<String>,
+    /// DNS names control will assist provisioning TLS certs for (engine `cert_domains`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cert_domains: Vec<String>,
+    /// Control-pushed static host records (engine `extra_records`), each as `(name, addr)` with the
+    /// address rendered to a string.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_records: Vec<(String, String)>,
+    /// DNS suffixes this node (when acting as an exit-node DNS proxy) must not answer (engine
+    /// `exit_node_filtered_set`), lowercased, no trailing dot.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exit_node_filtered_set: Vec<String>,
+}
+
 /// One profile in a [`Response::Profiles`] reply (Go `tailscale switch --list`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProfileEntry {
@@ -828,6 +876,55 @@ mod tests {
                 assert!(v.accept_routes);
             }
             other => panic!("expected Prefs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dns_status_request_response_round_trip() {
+        // `dns_status` discriminant + the DnsStatus(DnsStatusReport) reply must survive the wire
+        // (the CLI and daemon are separate processes agreeing only on this JSON format).
+        assert_eq!(
+            serde_json::to_string(&Request::DnsStatus).unwrap(),
+            r#"{"cmd":"dns_status"}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<Request>(r#"{"cmd":"dns_status"}"#).unwrap(),
+            Request::DnsStatus
+        ));
+        let report = DnsStatusReport {
+            magic_dns: true,
+            search_domains: vec!["user.ts.net".into()],
+            resolvers: vec!["100.100.100.100:53".into()],
+            routes: std::collections::BTreeMap::from([(
+                "corp.example.com".to_string(),
+                vec!["10.0.0.53:53".to_string()],
+            )]),
+            fallback_resolvers: vec!["1.1.1.1:53".into()],
+            cert_domains: vec!["host.user.ts.net".into()],
+            extra_records: vec![("printer.user.ts.net".into(), "100.64.0.7".into())],
+            exit_node_filtered_set: vec![".internal".into()],
+        };
+        let resp = Response::DnsStatus(report.clone());
+        let json = serde_json::to_string(&resp).unwrap();
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::DnsStatus(r) => assert_eq!(r, report),
+            other => panic!("expected DnsStatus, got {other:?}"),
+        }
+        // The empty/no-netmap report (every field default) round-trips too, and its empty
+        // collections are omitted from the wire (skip_serializing_if), with `magic_dns` present.
+        let empty = Response::DnsStatus(DnsStatusReport::default());
+        let empty_json = serde_json::to_string(&empty).unwrap();
+        assert!(
+            !empty_json.contains("search_domains"),
+            "empty collections must be omitted: {empty_json}"
+        );
+        assert!(
+            !empty_json.contains("resolvers"),
+            "empty collections must be omitted: {empty_json}"
+        );
+        match serde_json::from_str::<Response>(&empty_json).unwrap() {
+            Response::DnsStatus(r) => assert_eq!(r, DnsStatusReport::default()),
+            other => panic!("expected DnsStatus, got {other:?}"),
         }
     }
 
