@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.23.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.22.0...v0.23.0) (2026-06-11)
+
+
+### Features
+
+* **netcheck:** tnet netcheck — DERP-latency net report ([#73](https://github.com/GeiserX/tailscaled-rs/issues/73)) ([15396ba](https://github.com/GeiserX/tailscaled-rs/commit/15396ba1f45fb8372dbc04ac873f48db4589bc23))
+
 ## [0.22.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.21.0...v0.22.0) (2026-06-11)
 
 
