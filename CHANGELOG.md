@@ -25,6 +25,14 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.16.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.15.0...v0.16.0) (2026-06-11)
+
+
+### Features
+
+* **serve:** ServeConfig model + persistence + tnet serve tcp/status/reset ([#58](https://github.com/GeiserX/tailscaled-rs/issues/58)) ([63d8aa5](https://github.com/GeiserX/tailscaled-rs/commit/63d8aa5ccbf51aefe5cc63f7eceb370ab17c6985))
+* **serve:** TCP-forward accept loops (serve --tcp now serves traffic) ([#60](https://github.com/GeiserX/tailscaled-rs/issues/60)) ([0e65d1d](https://github.com/GeiserX/tailscaled-rs/commit/0e65d1d779c5ddca7d381ea7f1aac208958ba548))
+
 ## [0.15.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.14.0...v0.15.0) (2026-06-10)
 
 
