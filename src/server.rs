@@ -577,6 +577,17 @@ async fn dispatch(
                 },
             }
         }
+        // `netcheck` (Go `tailscale netcheck`, read-only). Off-lock device call; needs the node up
+        // (the net-report measurements come from the live engine).
+        Request::Netcheck => {
+            let dev = { backend.lock().await.device_handle() };
+            match dev {
+                Some(dev) => Backend::netcheck(&dev).await,
+                None => Response::Error {
+                    message: "node is not up".into(),
+                },
+            }
+        }
         // `bugreport` (Go `tailscale bugreport`). Reads only daemon state under a brief lock (no
         // engine round-trip); works whether or not the node is up.
         Request::BugReport => {

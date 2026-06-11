@@ -121,6 +121,39 @@ pub(super) async fn dns_status(dev: &tailscale::Device) -> Response {
     }
 }
 
+/// Report this node's network-conditions report (the `tnet netcheck` / Go `tailscale netcheck`
+/// read-only path). Maps the engine's `Device::netcheck()` → `tailscale::NetcheckReport` to the wire
+/// [`NetcheckReport`](crate::localapi::NetcheckReport): the preferred DERP region id is copied
+/// through, and each per-region latency becomes a [`RegionLatencyView`](crate::localapi::RegionLatencyView)
+/// with the `Duration` pre-rendered to milliseconds (so the wire DTO stays plain numbers and never
+/// has to name the engine's `Duration`). The engine list is already latency-ascending, so it is
+/// emitted in order.
+///
+/// Unlike [`dns_status`], `netcheck` returns the report **directly** (not an `Option`): the engine
+/// defaults to an empty report (no preferred region, empty latency list) before the first
+/// measurement, which renders cleanly. An engine error surfaces as a clear [`Response::Error`].
+/// HONEST REDUCED SCOPE: this fork's net-report measures only DERP-region latency — Go's
+/// UDP/IPv4/IPv6/`MappingVariesByDestIP`/PortMapping flags are not measured, and regions carry no
+/// name — see [`NetcheckReport`](crate::localapi::NetcheckReport). Read-only — measures, mutates nothing.
+pub(super) async fn netcheck(dev: &tailscale::Device) -> Response {
+    match dev.netcheck().await {
+        Ok(report) => Response::Netcheck(crate::localapi::NetcheckReport {
+            preferred_derp: report.preferred_derp,
+            region_latencies: report
+                .region_latencies
+                .iter()
+                .map(|r| crate::localapi::RegionLatencyView {
+                    region_id: r.region_id,
+                    latency_ms: r.latency.as_secs_f64() * 1000.0,
+                })
+                .collect(),
+        }),
+        Err(e) => Response::Error {
+            message: format!("netcheck failed: {e:?}"),
+        },
+    }
+}
+
 /// Resolve a tailnet IP to the peer that owns it (the `tnet whois` / Go `tailscale whois` path).
 ///
 /// Read-only: a netmap lookup that mutates nothing. Takes the engine handle as `dev` so the

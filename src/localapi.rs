@@ -145,6 +145,11 @@ pub enum Request {
     /// [`Response::DnsStatus`]. Read-only — gated like [`Status`](Request::Status). Requires the node
     /// to be up (the config comes from the live engine's netmap).
     DnsStatus,
+    /// Report this node's network-conditions report (Go `tailscale netcheck`). Replies with
+    /// [`Response::Netcheck`]. Read-only — gated like [`Status`](Request::Status). Requires the node
+    /// to be up (the measurements come from the live engine's net-report). NOTE: this fork's
+    /// net-report measures ONLY DERP-region latency (see [`NetcheckReport`]).
+    Netcheck,
     /// Produce a shareable diagnostic marker (Go `tailscale bugreport`). Replies with
     /// [`Response::BugReport`]. Read-only. NOTE: Go uploads logs to logtail and returns the log id;
     /// this fork has no log-upload backend, so the marker is a LOCAL diagnostic identifier only (it is
@@ -303,6 +308,9 @@ pub enum Response {
     /// The control-pushed MagicDNS configuration (reply to [`Request::DnsStatus`]), rendered by
     /// `tnet dns status`.
     DnsStatus(DnsStatusReport),
+    /// The node's network-conditions report (reply to [`Request::Netcheck`]), rendered by
+    /// `tnet netcheck`.
+    Netcheck(NetcheckReport),
     /// A local diagnostic marker (reply to [`Request::BugReport`]), printed by `tnet bugreport`.
     BugReport {
         /// The marker string (a local identifier + daemon version + node state). NOT a server-side
@@ -665,6 +673,44 @@ pub struct DnsStatusReport {
     pub exit_node_filtered_set: Vec<String>,
 }
 
+/// The node's network-conditions report in a [`Response::Netcheck`] reply (Go `tailscale netcheck`).
+/// Mirrors the engine's `tailscale::NetcheckReport`, but as this crate's own wire type with the
+/// per-region latency pre-rendered to milliseconds (so the CLI renders our DTO, never the engine's
+/// `Duration`). HONEST REDUCED SCOPE: this fork's net-report measures ONLY DERP-region latency, so
+/// Go's UDP/IPv4/IPv6/`MappingVariesByDestIP`/PortMapping(UPnP/PMP/PCP) fields are NOT carried, and
+/// DERP regions are identified by id (the engine exposes no region name/code) — the CLI renderer
+/// notes both omissions, mirroring the dns-status/serve honest-omission pattern.
+///
+/// Derives `PartialEq` but **not** `Eq`: [`RegionLatencyView::latency_ms`] is an `f64`, which is not
+/// `Eq` (NaN), so the report cannot be `Eq` either.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct NetcheckReport {
+    /// The id of the preferred (lowest-latency) DERP region this node homes to (engine
+    /// `NetcheckReport::preferred_derp`, Go `Report.PreferredDERP`). `None` before the first
+    /// measurement / when no region was reachable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_derp: Option<u32>,
+    /// Per-region measured latencies, in the engine's latency-ascending order (engine
+    /// `NetcheckReport::region_latencies`, Go `Report.RegionLatency`). The first entry, when present,
+    /// is the [`preferred_derp`](NetcheckReport::preferred_derp) region. Empty before the first
+    /// measurement.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub region_latencies: Vec<RegionLatencyView>,
+}
+
+/// One DERP region's measured latency in a [`NetcheckReport`] (engine `tailscale::RegionLatency`),
+/// with the latency pre-rendered to milliseconds. Derives `PartialEq` but **not** `Eq` (the `f64`
+/// [`latency_ms`](RegionLatencyView::latency_ms) is not `Eq`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RegionLatencyView {
+    /// The DERP region id (engine `RegionLatency::region_id`, Go `tailcfg.DERPRegionID`). The engine
+    /// carries no region name/code, so the CLI renders this id.
+    pub region_id: u32,
+    /// The measured round-trip latency to the region's closest DERP node, in milliseconds (engine
+    /// `RegionLatency::latency`, a `Duration`, rendered via `as_secs_f64() * 1000.0`).
+    pub latency_ms: f64,
+}
+
 /// One profile in a [`Response::Profiles`] reply (Go `tailscale switch --list`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProfileEntry {
@@ -925,6 +971,55 @@ mod tests {
         match serde_json::from_str::<Response>(&empty_json).unwrap() {
             Response::DnsStatus(r) => assert_eq!(r, DnsStatusReport::default()),
             other => panic!("expected DnsStatus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn netcheck_request_response_round_trip() {
+        // `netcheck` discriminant + the Netcheck(NetcheckReport) reply must survive the wire (the CLI
+        // and daemon are separate processes agreeing only on this JSON format).
+        assert_eq!(
+            serde_json::to_string(&Request::Netcheck).unwrap(),
+            r#"{"cmd":"netcheck"}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<Request>(r#"{"cmd":"netcheck"}"#).unwrap(),
+            Request::Netcheck
+        ));
+        let report = NetcheckReport {
+            preferred_derp: Some(1),
+            region_latencies: vec![
+                RegionLatencyView {
+                    region_id: 1,
+                    latency_ms: 23.4,
+                },
+                RegionLatencyView {
+                    region_id: 2,
+                    latency_ms: 41.7,
+                },
+            ],
+        };
+        let resp = Response::Netcheck(report.clone());
+        let json = serde_json::to_string(&resp).unwrap();
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::Netcheck(r) => assert_eq!(r, report),
+            other => panic!("expected Netcheck, got {other:?}"),
+        }
+        // The empty/pre-measurement report (every field default) round-trips too, and its empty
+        // collection + None preferred are omitted from the wire (skip_serializing_if).
+        let empty = Response::Netcheck(NetcheckReport::default());
+        let empty_json = serde_json::to_string(&empty).unwrap();
+        assert!(
+            !empty_json.contains("preferred_derp"),
+            "None preferred_derp must be omitted: {empty_json}"
+        );
+        assert!(
+            !empty_json.contains("region_latencies"),
+            "empty region_latencies must be omitted: {empty_json}"
+        );
+        match serde_json::from_str::<Response>(&empty_json).unwrap() {
+            Response::Netcheck(r) => assert_eq!(r, NetcheckReport::default()),
+            other => panic!("expected Netcheck, got {other:?}"),
         }
     }
 
