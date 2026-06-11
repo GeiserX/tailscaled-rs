@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.19.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.18.0...v0.19.0) (2026-06-11)
+
+
+### Features
+
+* **funnel:** tnet funnel &lt;port&gt; {on|off} via engine listen_funnel ([#65](https://github.com/GeiserX/tailscaled-rs/issues/65)) ([54803b2](https://github.com/GeiserX/tailscaled-rs/commit/54803b20b88c617cfd43bdcc2396f0fba7bf205e))
+
 ## [0.18.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.17.0...v0.18.0) (2026-06-11)
 
 
