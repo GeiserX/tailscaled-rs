@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.18.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.17.0...v0.18.0) (2026-06-11)
+
+
+### Features
+
+* **serve:** rich web handlers — text, --set-path mounts, redirect ([#63](https://github.com/GeiserX/tailscaled-rs/issues/63)) ([2f5f86c](https://github.com/GeiserX/tailscaled-rs/commit/2f5f86ca5c5629f34fac4e1e86e8eeeebdb79aea))
+
 ## [0.17.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.16.0...v0.17.0) (2026-06-11)
 
 
