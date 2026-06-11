@@ -2350,15 +2350,49 @@ async fn watch_status(socket: &std::path::Path) -> Result<()> {
 const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Block until the node reaches `Running` with a tailnet IP, then return `Ok(())` (exit 0). Mirrors
-/// Go `tailscale wait`'s exit-code contract: success on Running, a non-zero exit (here an `Err`) on
-/// timeout. `timeout_secs` of `None`/`Some(0)` waits forever; otherwise it bounds the wait. Shared by
-/// `tnet wait` and `tnet up --timeout` (both want the same "wait for Running, bounded" semantics).
+/// Go `tailscale wait`'s exit-code contract. Three exit conditions: **Running** → `Ok(())`; a
+/// **terminal registration error** → `Err` with the reason (fail fast — the engine will not retry,
+/// so it does not wait out the timeout; see [`wait_decision`]); **timeout** → `Err`. `timeout_secs`
+/// of `None`/`Some(0)` waits forever; otherwise it bounds the wait. Shared by `tnet wait` and
+/// `tnet up --timeout` (both want the same "wait for Running, bounded, fail-fast-on-error" semantics).
 ///
 /// We poll `Request::Status` rather than stream the IPN bus: it reuses the existing one-shot
 /// round-trip, and the daemon's derived `state` is authoritative. Go additionally waits for the
 /// kernel TUN interface to actually carry the IP — but this daemon defaults to the userspace
 /// netstack (no OS interface to observe), which is exactly the case Go *also* short-circuits ("if
 /// `!st.TUN` return immediately"), so polling to `Running` + a tailnet IP is the faithful condition.
+/// The per-poll decision [`wait_for_running`] makes from a single [`StatusReport`]. Split out as a
+/// pure function ([`wait_decision`]) so the precedence — Running wins over a terminal error, a
+/// terminal error fails fast, everything else (incl. a transient `auth_url`) keeps waiting — is
+/// unit-testable without a live socket.
+#[derive(Debug, PartialEq, Eq)]
+enum WaitStep {
+    /// The node reached `Running` with a tailnet IP — the wait succeeded.
+    Done,
+    /// A terminal registration failure (the reason, already terminal-sanitized) — fail fast; the
+    /// engine will not retry, so waiting longer is futile.
+    Failed(String),
+    /// Nothing actionable yet — keep polling until the deadline. Covers both "not up yet" and a
+    /// pending interactive login (`auth_url` set, which is transient, not a failure).
+    Keep,
+}
+
+/// Decide what a single poll's [`StatusReport`] means for [`wait_for_running`]. **Pure** (no I/O), so
+/// the precedence is unit-testable: `Running` short-circuits to [`Done`](WaitStep::Done) FIRST (a
+/// Running node never carries a terminal error); otherwise a `Some(error)` is a terminal failure
+/// ([`Failed`](WaitStep::Failed), reason [`sanitize_for_terminal`]'d since it is control-influenced);
+/// otherwise — including a pending `auth_url` (interactive login is transient, not a failure) — we
+/// [`Keep`](WaitStep::Keep) waiting.
+fn wait_decision(s: &tailscaled_rs::localapi::StatusReport) -> WaitStep {
+    if s.state == "Running" && s.self_ipv4.is_some() {
+        return WaitStep::Done;
+    }
+    if let Some(reason) = s.error.as_deref() {
+        return WaitStep::Failed(sanitize_for_terminal(reason));
+    }
+    WaitStep::Keep
+}
+
 async fn wait_for_running(socket: &std::path::Path, timeout_secs: Option<u64>) -> Result<()> {
     // `None` or `0` → wait forever (Go's "0 means wait indefinitely").
     let deadline = match timeout_secs {
@@ -2369,12 +2403,16 @@ async fn wait_for_running(socket: &std::path::Path, timeout_secs: Option<u64>) -
     };
     loop {
         // A failed round-trip (daemon not up yet / socket missing) is NOT fatal — keep waiting, like
-        // Go's backoff loop while tailscaled comes up. Only the timeout ends the wait unsuccessfully.
-        if let Ok(Response::Status(s)) = round_trip(socket, &Request::Status).await
-            && s.state == "Running"
-            && s.self_ipv4.is_some()
-        {
-            return Ok(());
+        // Go's backoff loop while tailscaled comes up. The per-poll meaning is decided by the pure
+        // `wait_decision`: a terminal registration error fails fast (the engine won't retry — the
+        // analogue of Go surfacing a backend error promptly rather than burning the whole timeout;
+        // bead tsd-lr6), `Running` succeeds, everything else keeps waiting until the deadline.
+        if let Ok(Response::Status(s)) = round_trip(socket, &Request::Status).await {
+            match wait_decision(&s) {
+                WaitStep::Done => return Ok(()),
+                WaitStep::Failed(reason) => anyhow::bail!("node registration failed: {reason}"),
+                WaitStep::Keep => {}
+            }
         }
         if let Some(deadline) = deadline
             && tokio::time::Instant::now() >= deadline
@@ -4692,6 +4730,82 @@ mod tests {
             "timeout:0 means wait forever — wait_for_running must still be polling (not returned) \
              after 300ms against a dead socket, so the outer tokio timeout should elapse"
         );
+    }
+
+    #[test]
+    fn wait_decision_precedence_running_error_authurl_keep() {
+        use tailscaled_rs::localapi::StatusReport;
+
+        // (a) Running + a tailnet IP → Done (the wait succeeded).
+        let running = StatusReport {
+            state: "Running".to_string(),
+            self_ipv4: Some("100.64.0.1".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(wait_decision(&running), WaitStep::Done);
+
+        // Running short-circuits even if (impossibly) an error were also set — Running wins.
+        let running_with_stale_error = StatusReport {
+            state: "Running".to_string(),
+            self_ipv4: Some("100.64.0.1".to_string()),
+            error: Some("stale".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(wait_decision(&running_with_stale_error), WaitStep::Done);
+
+        // (b) A terminal error (and not yet Running) → Failed, carrying the reason.
+        let failed = StatusReport {
+            state: "NeedsLogin".to_string(),
+            error: Some("authkey expired".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            wait_decision(&failed),
+            WaitStep::Failed("authkey expired".to_string()),
+            "a terminal registration error must fail fast with the reason"
+        );
+
+        // (c) auth_url present but NO error → Keep (interactive login is pending = transient, NOT a
+        // failure — failing here would break every interactive `up --timeout`).
+        let pending_login = StatusReport {
+            state: "NeedsLogin".to_string(),
+            auth_url: Some("https://login.example/a/abc123".to_string()),
+            error: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            wait_decision(&pending_login),
+            WaitStep::Keep,
+            "a pending auth_url is transient — keep waiting, do not fail"
+        );
+
+        // (d) A bare not-yet-Running status (no error, no auth_url) → Keep.
+        let starting = StatusReport {
+            state: "Starting".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(wait_decision(&starting), WaitStep::Keep);
+
+        // (e) A hostile error string (control-influenced) → Failed with the ESC/BEL stripped.
+        let hostile = StatusReport {
+            state: "NeedsLogin".to_string(),
+            error: Some("evil\x1b[2J\x07reason".to_string()),
+            ..Default::default()
+        };
+        match wait_decision(&hostile) {
+            WaitStep::Failed(reason) => {
+                assert!(
+                    !reason.contains('\x1b'),
+                    "ESC must be stripped from the error reason"
+                );
+                assert!(
+                    !reason.contains('\x07'),
+                    "BEL must be stripped from the error reason"
+                );
+                assert!(reason.contains("evil") && reason.contains("reason"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 
     #[test]
