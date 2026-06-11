@@ -194,6 +194,12 @@ pub(super) async fn whois(dev: &tailscale::Device, ip: &str) -> Response {
             // renders `last_seen`.
             let tags = w.node.tags.clone();
             let node_key_expiry = w.node.node_key_expiry.map(|t| t.to_string());
+            // Liveness comes off the StatusNode projection (already computed by `from_node`): the
+            // same control-connected `online` signal + `last_seen` time that `status` renders per
+            // peer. Capture into locals before `node.display_name` is moved below. `online` is a
+            // `Copy` bool; `last_seen` → chrono `DateTime<Utc>` Display (`YYYY-MM-DD HH:MM:SS UTC`).
+            let online = node.online;
+            let last_seen = node.last_seen.map(|t| t.to_string());
             Response::Whois(WhoisReport {
                 found: true,
                 node_name: Some(node.display_name),
@@ -203,6 +209,8 @@ pub(super) async fn whois(dev: &tailscale::Device, ip: &str) -> Response {
                 capabilities: w.capabilities.into_iter().map(|(cap, _args)| cap).collect(),
                 tags,
                 node_key_expiry,
+                online,
+                last_seen,
             })
         }
         // No tailnet node owns that IP — a clean negative, not an error.

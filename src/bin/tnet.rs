@@ -2002,11 +2002,13 @@ fn format_files(files: &[tailscaled_rs::localapi::WaitingFileReport]) -> String 
 
 /// Format the `tnet whois` output for a [`WhoisReport`]. If the IP matched no node, a single
 /// "no tailnet node owns <ip>" line (the caller passes the queried IP). Otherwise: the owning node's
-/// name, its IPv4, the owning user (when control retained it), its control-granted ACL `tags` and
-/// node-key `key-expiry` (when present), and any control-granted capabilities, each on its own line.
-/// The node name, tags, and capabilities are control-supplied, so each is passed through
-/// [`sanitize_for_terminal`] before rendering. Pure (returns the string, trailing newline included)
-/// so it is unit-testable; the caller `print!`s it.
+/// name, its IPv4, the owning user (when control retained it), its liveness (`online`, and a
+/// `last-seen` line only when offline — an online node's last-seen is "now", matching `status`), its
+/// control-granted ACL `tags` and node-key `key-expiry` (when present), and any control-granted
+/// capabilities, each on its own line. The node name, tags, and capabilities are control-supplied, so
+/// each is passed through [`sanitize_for_terminal`] before rendering (online/last-seen are a bool +
+/// timestamp, not free-form text). Pure (returns the string, trailing newline included) so it is
+/// unit-testable; the caller `print!`s it.
 fn format_whois(w: &tailscaled_rs::localapi::WhoisReport, ip: &str) -> String {
     if !w.found {
         return format!("no tailnet node owns {ip}\n");
@@ -2021,6 +2023,22 @@ fn format_whois(w: &tailscaled_rs::localapi::WhoisReport, ip: &str) -> String {
     if let Some(user) = w.user.as_deref() {
         // `user` originates from control too; sanitize it before printing.
         out.push_str(&format!("user:         {}\n", sanitize_for_terminal(user)));
+    }
+    // Liveness, following the `status` convention (`peer_status_cell`): show `online:` when the
+    // control-connected state is known (omit when `None` = unknown, like status hides
+    // unknown-liveness peers), and show `last-seen:` only when the node is OFFLINE and the time is
+    // known — an online node's last-seen is "now", so status only surfaces it for offline peers.
+    // `online`/`last_seen` are a bool + a chrono timestamp (not free-form control text), so they need
+    // no terminal sanitization.
+    match w.online {
+        Some(true) => out.push_str("online:       yes\n"),
+        Some(false) => {
+            out.push_str("online:       no\n");
+            if let Some(seen) = w.last_seen.as_deref() {
+                out.push_str(&format!("last-seen:    {seen}\n"));
+            }
+        }
+        None => {}
     }
     if !w.tags.is_empty() {
         // ACL tags are control-supplied; sanitize each before printing (same as capabilities).
@@ -3517,6 +3535,11 @@ mod tests {
             ],
             tags: vec!["tag:server".to_string(), "tag:ci".to_string()],
             node_key_expiry: Some("2026-09-01 12:00:00 UTC".to_string()),
+            // Offline + a known last-seen: status convention is to show BOTH the `online: no` line
+            // and the `last-seen:` line (an online node's last-seen is "now", so it's only shown
+            // when offline).
+            online: Some(false),
+            last_seen: Some("2026-06-11 05:19:14 UTC".to_string()),
         };
         let out = format_whois(&w, "100.64.0.2");
         assert!(out.contains("peer-b.example.ts.net"), "node name present");
@@ -3540,6 +3563,39 @@ mod tests {
             out.contains("key-expiry:") && out.contains("2026-09-01 12:00:00 UTC"),
             "node-key expiry present when Some"
         );
+        // Liveness: offline → `online: no` AND the last-seen line (offline-only, status convention).
+        assert!(
+            out.contains("online:       no"),
+            "offline node shows online: no"
+        );
+        assert!(
+            out.contains("last-seen:    2026-06-11 05:19:14 UTC"),
+            "offline node with known last_seen shows the last-seen line"
+        );
+    }
+
+    #[test]
+    fn format_whois_online_node_shows_online_yes_without_last_seen() {
+        // An ONLINE node shows `online: yes` and NO last-seen line (its last-seen is "now" — status
+        // only surfaces last-seen for offline peers, and whois mirrors that).
+        let w = WhoisReport {
+            found: true,
+            node_name: Some("peer-b".to_string()),
+            node_ipv4: Some("100.64.0.2".to_string()),
+            online: Some(true),
+            // Even if a last_seen is present, an online node must NOT render the last-seen line.
+            last_seen: Some("2026-06-11 05:19:14 UTC".to_string()),
+            ..Default::default()
+        };
+        let out = format_whois(&w, "100.64.0.2");
+        assert!(
+            out.contains("online:       yes"),
+            "online node shows online: yes"
+        );
+        assert!(
+            !out.contains("last-seen:"),
+            "an online node must not render a last-seen line (its last-seen is 'now')"
+        );
     }
 
     #[test]
@@ -3554,6 +3610,8 @@ mod tests {
             capabilities: vec![],
             tags: vec![],
             node_key_expiry: None,
+            online: None,
+            last_seen: None,
         };
         let out = format_whois(&w, "100.64.0.2");
         assert!(out.contains("peer-b"));
@@ -3571,6 +3629,10 @@ mod tests {
             !out.contains("key-expiry:"),
             "no key-expiry line when expiry is None"
         );
+        assert!(
+            !out.contains("online:"),
+            "no online line when liveness is unknown (None)"
+        );
     }
 
     #[test]
@@ -3587,6 +3649,8 @@ mod tests {
             // Tags are also control-supplied — a hostile one must be sanitized just like the name.
             tags: vec!["tag:\x1bevil\x07".to_string()],
             node_key_expiry: None,
+            online: None,
+            last_seen: None,
         };
         let out = format_whois(&w, "100.64.0.2");
         assert!(
