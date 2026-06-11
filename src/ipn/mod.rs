@@ -211,6 +211,17 @@ fn validate_advertise_tags(tags: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Harden an operator-supplied `bugreport` note for embedding in the diagnostic marker: replace every
+/// control character (newlines, tabs, ANSI escapes, etc.) with `_` so the marker stays a single,
+/// clean, copy-pasteable token. The note is free text the operator types, so it is untrusted for
+/// formatting purposes (a stray newline would split the marker; an escape could corrupt a terminal
+/// that later echoes it). All other characters are preserved.
+fn sanitize_marker_note(note: &str) -> String {
+    note.chars()
+        .map(|c| if c.is_control() { '_' } else { c })
+        .collect()
+}
+
 /// Upper bound on the blocking netmap query inside [`Backend::status`]. The query is held under the
 /// backend lock, so this caps how long a `status` can head-of-line block `up`/`down` in the brief
 /// Running-but-pre-netmap window (or if a Running engine wedges). On elapse we report `Running`
@@ -2011,25 +2022,37 @@ impl Backend {
         diag::metrics(dev)
     }
 
+    // (`sanitize_marker_note` is a free fn below — the bugreport marker note hardener.)
+
     /// Build a LOCAL diagnostic marker (the `tnet bugreport` path). Unlike Go's `bugreport`, which
     /// uploads logs to logtail and returns the server-side log id, this fork has no log-upload
     /// backend — the marker is a purely local identifier the operator can quote when reporting an
     /// issue. It carries a `BUG-` prefix, a coarse Unix-seconds stamp (rough ordering/uniqueness),
     /// the daemon version, the active profile, and the `want_running` intent. Reads only `self` (no
     /// engine round-trip), so it works whether or not the node is up.
-    pub fn bugreport(&self) -> crate::localapi::Response {
+    ///
+    /// `note` is the operator's optional free-text note (Go `bugreport [note]`); when present it is
+    /// appended as `-note:<note>`. It is sanitized of control characters first — it is operator-/
+    /// caller-supplied text and the marker is meant to be copy-pasted into an issue, so a stray
+    /// newline/escape must not corrupt it.
+    pub fn bugreport(&self, note: Option<&str>) -> crate::localapi::Response {
         // SystemTime is the real std clock; a coarse seconds stamp makes the marker roughly unique +
         // orderable without adding a uuid dependency.
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let marker = format!(
+        let mut marker = format!(
             "BUG-{secs}-v{}-profile:{}-want_running:{}",
             env!("CARGO_PKG_VERSION"),
             self.current_profile,
             self.prefs.want_running,
         );
+        if let Some(n) = note {
+            // Strip control chars (newlines/escapes) so the appended note keeps the marker a single
+            // clean, copy-pasteable token. `sanitize_marker_note` maps any control char to '_'.
+            marker.push_str(&format!("-note:{}", sanitize_marker_note(n)));
+        }
         crate::localapi::Response::BugReport { marker }
     }
 
@@ -2320,6 +2343,66 @@ mod tests {
 
         // A bare up (no --control-url) is never a change regardless of state.
         assert!(!be.up_control_url_guard(&UpOptions::default()));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn bugreport_marker_appends_sanitized_note() {
+        // `bugreport [note]` (Go parity): the marker carries the operator note when given, omits the
+        // `-note:` segment when not, and strips control chars from the note (it's free operator text
+        // and the marker must stay one clean, copy-pasteable token).
+        let dir = std::env::temp_dir().join(format!("tailnetd-bugreport-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let be = backend_for(&dir);
+
+        // No note → no `-note:` segment.
+        let crate::localapi::Response::BugReport { marker } = be.bugreport(None) else {
+            panic!("expected BugReport");
+        };
+        assert!(
+            marker.starts_with("BUG-"),
+            "marker has the BUG- prefix: {marker}"
+        );
+        assert!(
+            !marker.contains("-note:"),
+            "no note segment when omitted: {marker}"
+        );
+
+        // A note → appended as `-note:<note>`.
+        let crate::localapi::Response::BugReport { marker } = be.bugreport(Some("dns broke"))
+        else {
+            panic!("expected BugReport");
+        };
+        assert!(
+            marker.contains("-note:dns broke"),
+            "note appended: {marker}"
+        );
+
+        // A hostile note (newline + ESC + BEL) → control chars replaced with '_', marker stays one
+        // line/token.
+        let crate::localapi::Response::BugReport { marker } =
+            be.bugreport(Some("evil\n\x1b[2J\x07x"))
+        else {
+            panic!("expected BugReport");
+        };
+        assert!(
+            !marker.contains('\n'),
+            "newline stripped from the note: {marker:?}"
+        );
+        assert!(
+            !marker.contains('\x1b'),
+            "ESC stripped from the note: {marker:?}"
+        );
+        assert!(
+            !marker.contains('\x07'),
+            "BEL stripped from the note: {marker:?}"
+        );
+        assert!(
+            marker.contains("-note:evil"),
+            "readable part survives: {marker}"
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

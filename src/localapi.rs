@@ -172,7 +172,13 @@ pub enum Request {
     /// [`Response::BugReport`]. Read-only. NOTE: Go uploads logs to logtail and returns the log id;
     /// this fork has no log-upload backend, so the marker is a LOCAL diagnostic identifier only (it is
     /// not a server-retrievable log id — see the daemon's `bugreport` builder + the CLI note).
-    BugReport,
+    BugReport {
+        /// An optional operator note (Go `bugreport [note]`) appended to the marker. `None` when the
+        /// positional was omitted. `#[serde(default)]` + `skip_serializing_if` keep the wire
+        /// backward-compatible (an older client sends the bare variant, which deserializes to `None`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
     /// Read the node's serve configuration (Go `GetServeConfig`; `tnet serve status`). Replies with
     /// [`Response::ServeConfig`]. Read-only — gated like [`Status`](Request::Status).
     GetServeConfig,

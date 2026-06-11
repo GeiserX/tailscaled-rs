@@ -590,9 +590,9 @@ async fn dispatch(
         }
         // `bugreport` (Go `tailscale bugreport`). Reads only daemon state under a brief lock (no
         // engine round-trip); works whether or not the node is up.
-        Request::BugReport => {
+        Request::BugReport { note } => {
             let be = backend.lock().await;
-            be.bugreport()
+            be.bugreport(note.as_deref())
         }
         // `serve status` (Go GetServeConfig): read the persisted serve config under a brief lock.
         Request::GetServeConfig => {

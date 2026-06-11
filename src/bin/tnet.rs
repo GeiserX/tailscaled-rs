@@ -262,10 +262,17 @@ enum Command {
         /// answers purely locally and never contacts the daemon.
         #[arg(long)]
         daemon: bool,
-        /// Output as JSON (`{ "client": "..", "daemon": ".." }`; `daemon` present only with
-        /// `--daemon`). Mirrors Go `--json`.
+        /// Output as JSON, in the shape of Go's `version.Meta`: `majorMinorPatch`/`short`/`long`/`cap`
+        /// always, plus `unstableBranch` (when the minor is odd) and `daemonLong` (with `--daemon`).
+        /// Git-stamp fields (`gitCommit`/`gitDirty`/…) are honestly omitted — the fork is not
+        /// git-stamped. Mirrors Go `--json`.
         #[arg(long)]
         json: bool,
+        /// Check for a newer upstream release (Go `--upstream`). This build does not fetch from any
+        /// release server, so it returns "fetching latest version not supported in this build" and
+        /// exits non-zero — faithful to Go's behavior when upstream-checking is unavailable.
+        #[arg(long)]
+        upstream: bool,
     },
     /// Show current preference values (Go `tailscale get`). With no setting name, shows all prefs;
     /// with a name (e.g. `accept-routes`), shows just that one. Setting names match the `tnet set`
@@ -395,7 +402,12 @@ enum Command {
     /// Print a shareable diagnostic marker for bug reports (Go `tailscale bugreport`). NOTE: this
     /// fork uploads no logs — the marker is a LOCAL identifier (id + daemon version + state) to quote
     /// when reporting an issue, not a server-retrievable log id.
-    Bugreport,
+    Bugreport {
+        /// An optional note (Go `bugreport [note]`) appended to the marker — e.g. a short description
+        /// of what went wrong. Control characters are stripped so the marker stays one clean token.
+        #[arg(value_name = "NOTE")]
+        note: Option<String>,
+    },
     /// Connect to a TCP port on a tailnet host and pipe stdin/stdout over the overlay (Go `tailscale
     /// nc`). Like netcat: bytes from stdin go to the peer, the peer's bytes go to stdout, until EOF.
     Nc {
@@ -837,7 +849,7 @@ async fn main() -> Result<()> {
             // `--ssh`/`--no-ssh` tri-state (mirrors `--tun`).
             ssh: resolve_ssh(ssh, no_ssh),
         },
-        Command::Bugreport => Request::BugReport,
+        Command::Bugreport { note } => Request::BugReport { note },
         // `nc` hijacks its connection (the daemon splices to the overlay after a one-line ack), so it
         // is handled by a dedicated piping path, not the generic round-trip.
         Command::Nc { host, port } => {
@@ -937,7 +949,19 @@ async fn main() -> Result<()> {
         // return. WITH `--daemon` it round-trips `Request::Version` to learn the daemon's version,
         // then renders both; we do that inline here (rather than falling through to the generic
         // response printer) so the client/daemon pairing + `--json` shape stay in one place.
-        Command::Version { daemon, json } => {
+        Command::Version {
+            daemon,
+            json,
+            upstream,
+        } => {
+            // `--upstream` would fetch the latest release from a release server; this build does no
+            // such network call, so return Go's verbatim message + a non-zero exit (faithful, offline,
+            // names no infrastructure). Checked before the local render so `version --upstream` never
+            // prints a version line implying success.
+            if upstream {
+                eprintln!("fetching latest version not supported in this build");
+                std::process::exit(1);
+            }
             let client_version = env!("CARGO_PKG_VERSION");
             let daemon_version = if daemon {
                 match round_trip(&socket, &Request::Version).await {
@@ -954,7 +978,10 @@ async fn main() -> Result<()> {
             } else {
                 None
             };
-            print_version(client_version, daemon_version.as_deref(), json);
+            // `cap` = the engine's current capability version (Go `version.Meta.cap`), read from the
+            // engine's `ts_capabilityversion` crate (pinned to the same rev as the engine facade).
+            let cap = u16::from(ts_capabilityversion::CapabilityVersion::CURRENT);
+            print_version(client_version, daemon_version.as_deref(), cap, json);
             return Ok(());
         }
         // `get` (Go `tailscale get`): round-trip GetPrefs, then render. Handled inline (early return)
@@ -1413,8 +1440,9 @@ async fn main() -> Result<()> {
 }
 
 /// Print `tnet version` output (thin wrapper over [`format_version`], which is pure + unit-tested).
-fn print_version(client: &str, daemon: Option<&str>, json: bool) {
-    print!("{}", format_version(client, daemon, json));
+/// `cap` is the engine's current capability version (the `cap` field of Go's `version.Meta`).
+fn print_version(client: &str, daemon: Option<&str>, cap: u16, json: bool) {
+    print!("{}", format_version(client, daemon, cap, json));
 }
 
 /// Send a write `Request` that replies `Ok`/`Error`, printing `ok: <msg>` on success or the error +
@@ -1794,20 +1822,48 @@ fn format_get(
     }
 }
 
+/// Whether a version's minor number is odd — Go's `version.IsUnstableBuild` rule (an odd minor marks
+/// an unstable/development track; even is stable). `minor` is the middle field of `major.minor.patch`.
+/// Pure helper so the `unstableBranch` JSON field is unit-testable independent of the crate version.
+fn is_unstable_minor(minor: u64) -> bool {
+    minor % 2 == 1
+}
+
+/// The minor-version number parsed from a `major.minor.patch[-suffix]` string, or `None` if it isn't
+/// in that shape. Used to derive `unstableBranch` faithfully (Go reads the minor field).
+fn minor_of(version: &str) -> Option<u64> {
+    // Strip any pre-release suffix first (the fork has none today, but be faithful to Go's parse).
+    let core = version.split('-').next().unwrap_or(version);
+    core.split('.').nth(1).and_then(|m| m.parse::<u64>().ok())
+}
+
 /// Render `tnet version` output. `client` is this CLI's crate version; `daemon` is the daemon's
-/// version when `--daemon` was passed (else `None`). `json` selects the JSON object form. Mirrors Go
-/// `tailscale version`: plain prints the bare client version (and a `Client:`/`Daemon:` pair when the
-/// daemon was queried); `--json` emits `{ "client": "..", "daemon": ".." }` with `daemon` present
-/// only when queried. Pure (returns the string, trailing newline included) so it is unit-testable.
-fn format_version(client: &str, daemon: Option<&str>, json: bool) -> String {
+/// version when `--daemon` was passed (else `None`); `cap` is the engine's current capability version
+/// (Go `version.Meta.cap`). `json` selects the JSON object form. Mirrors Go `tailscale version`:
+/// plain prints the bare client version (and a `Client:`/`Daemon:` pair when the daemon was queried);
+/// `--json` emits Go's `version.Meta` shape — `majorMinorPatch`/`short`/`long`/`cap` always, plus
+/// `unstableBranch` when the minor is odd and `daemonLong` when the daemon was queried. The fork is
+/// not git-stamped (no build.rs), so Go's `gitCommit`/`gitDirty`/`gitCommitTime`/`extraGitCommit`/
+/// `osVariant`/`tailscaleGoGitHash`/`isDev` Meta fields are honestly omitted rather than faked (a
+/// fork git SHA is meaningless against Go's tailscale-repo commit semantics). Pure (returns the
+/// string, trailing newline included) so it is unit-testable.
+fn format_version(client: &str, daemon: Option<&str>, cap: u16, json: bool) -> String {
     if json {
-        // Built via serde so escaping is correct (version strings are tame today, but this removes
-        // the latent hand-built-JSON hazard and keeps the two `--json` renderers consistent).
-        // `daemon` key present only when queried.
+        // Built via serde so escaping is correct + the two `--json` renderers stay consistent. The
+        // fork has no pre-release suffix, so majorMinorPatch == short == long == the crate version
+        // (Go's `short`/`long` diverge only when git-stamped, which the fork is not).
         let mut map = serde_json::Map::new();
-        map.insert("client".to_string(), client.into());
+        map.insert("majorMinorPatch".to_string(), client.into());
+        map.insert("short".to_string(), client.into());
+        map.insert("long".to_string(), client.into());
+        map.insert("cap".to_string(), cap.into());
+        // `unstableBranch` only when the minor is odd (Go omitempty — omitted on a stable/even line).
+        if minor_of(client).is_some_and(is_unstable_minor) {
+            map.insert("unstableBranch".to_string(), true.into());
+        }
+        // `daemonLong` only when the daemon was queried (Go omitempty).
         if let Some(d) = daemon {
-            map.insert("daemon".to_string(), d.into());
+            map.insert("daemonLong".to_string(), d.into());
         }
         // serde_json serialization of a Map<String, Value> cannot fail; fall back defensively.
         format!(
@@ -3773,21 +3829,53 @@ mod tests {
 
     #[test]
     fn format_version_shapes() {
-        // Plain, no daemon → bare client version line (Go's first line).
-        assert_eq!(format_version("0.9.0", None, false), "0.9.0\n");
+        // Plain, no daemon → bare client version line (Go's first line). `cap` is irrelevant to the
+        // human form (a stable even minor here so no unstable marker anyway).
+        assert_eq!(format_version("0.10.0", None, 130, false), "0.10.0\n");
         // Plain, with daemon → Client:/Daemon: pair (Go's --daemon form).
         assert_eq!(
-            format_version("0.9.0", Some("0.9.0"), false),
-            "Client: 0.9.0\nDaemon: 0.9.0\n"
+            format_version("0.10.0", Some("0.10.0"), 130, false),
+            "Client: 0.10.0\nDaemon: 0.10.0\n"
         );
-        // JSON, no daemon → object with only client.
-        let j = format_version("0.9.0", None, true);
-        assert!(j.contains("\"client\": \"0.9.0\""), "{j}");
-        assert!(!j.contains("daemon"), "no daemon key without --daemon: {j}");
-        // JSON, with daemon → object with both; valid-enough to parse the two fields.
-        let jd = format_version("0.9.0", Some("0.8.0"), true);
-        assert!(jd.contains("\"client\": \"0.9.0\""), "{jd}");
-        assert!(jd.contains("\"daemon\": \"0.8.0\""), "{jd}");
+        // JSON, no daemon → Go version.Meta shape. Parse it and assert the keys/values.
+        let j: serde_json::Value =
+            serde_json::from_str(format_version("0.10.0", None, 130, true).trim()).unwrap();
+        assert_eq!(j["majorMinorPatch"], "0.10.0");
+        assert_eq!(j["short"], "0.10.0");
+        assert_eq!(j["long"], "0.10.0");
+        assert_eq!(j["cap"], 130, "cap = the engine capability version");
+        assert!(
+            j.get("daemonLong").is_none(),
+            "no daemonLong without --daemon"
+        );
+        assert!(
+            j.get("unstableBranch").is_none(),
+            "even minor (10) is stable → unstableBranch omitted"
+        );
+        // JSON, with daemon → daemonLong present (the queried daemon version).
+        let jd: serde_json::Value =
+            serde_json::from_str(format_version("0.10.0", Some("0.8.0"), 130, true).trim())
+                .unwrap();
+        assert_eq!(jd["majorMinorPatch"], "0.10.0");
+        assert_eq!(jd["daemonLong"], "0.8.0");
+        // JSON, odd minor → unstableBranch:true (Go IsUnstableBuild).
+        let ju: serde_json::Value =
+            serde_json::from_str(format_version("0.11.0", None, 130, true).trim()).unwrap();
+        assert_eq!(ju["unstableBranch"], true, "odd minor (11) is unstable");
+    }
+
+    #[test]
+    fn version_unstable_minor_and_parse() {
+        // Go IsUnstableBuild: odd minor = unstable, even = stable.
+        assert!(is_unstable_minor(11));
+        assert!(is_unstable_minor(1));
+        assert!(!is_unstable_minor(10));
+        assert!(!is_unstable_minor(0));
+        // minor_of parses the middle field, tolerating a (currently-unused) pre-release suffix.
+        assert_eq!(minor_of("0.32.0"), Some(32));
+        assert_eq!(minor_of("1.2.3"), Some(2));
+        assert_eq!(minor_of("0.31.0-dev"), Some(31));
+        assert_eq!(minor_of("garbage"), None);
     }
 
     #[test]
@@ -4827,7 +4915,7 @@ mod tests {
         // The client version `tnet version` prints is the crate version — guards against drift if the
         // print path ever stops using CARGO_PKG_VERSION.
         assert_eq!(
-            format_version(env!("CARGO_PKG_VERSION"), None, false),
+            format_version(env!("CARGO_PKG_VERSION"), None, 130, false),
             format!("{}\n", env!("CARGO_PKG_VERSION"))
         );
     }

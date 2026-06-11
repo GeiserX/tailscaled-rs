@@ -4866,6 +4866,7 @@ dependencies = [
  "anyhow",
  "clap",
  "geiserx_tailscale",
+ "geiserx_ts_capabilityversion",
  "geiserx_ts_control",
  "if-addrs",
  "ipnet",
