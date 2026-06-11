@@ -259,3 +259,88 @@ async fn headscale_debug_capture_writes_pcap() {
         "expected at least one captured record beyond the global header (got exactly the header)"
     );
 }
+
+/// Live `rebind` test (what the link-change monitor calls on a host network-path change): bring a
+/// node up against headscale, call `Device::rebind()` directly, and assert it returns Ok and the
+/// node stays Running — rebind must be non-disruptive (magicsock re-binds its sockets without
+/// tearing down the registration). Same `#[ignore]` + env gate as the join test.
+#[tokio::test]
+#[ignore = "requires a running headscale (test-support/headscale) + TAILNETD_HS_URL/TAILNETD_HS_AUTHKEY; see docs/TESTING.md"]
+async fn headscale_rebind_is_non_disruptive() {
+    let (hs_url, hs_authkey) = match (
+        std::env::var("TAILNETD_HS_URL"),
+        std::env::var("TAILNETD_HS_AUTHKEY"),
+    ) {
+        (Ok(u), Ok(k)) if !u.is_empty() && !k.is_empty() => (u, k),
+        _ => {
+            eprintln!(
+                "SKIP headscale_rebind_is_non_disruptive: set TAILNETD_HS_URL and \
+                 TAILNETD_HS_AUTHKEY to run it (see docs/TESTING.md)"
+            );
+            return;
+        }
+    };
+    if std::env::var("TS_RS_EXPERIMENT").as_deref() != Ok("this_is_unstable_software") {
+        eprintln!("SKIP headscale_rebind_is_non_disruptive: export TS_RS_EXPERIMENT");
+        return;
+    }
+
+    let state_dir = unique_state_dir();
+    let _ = tokio::fs::remove_dir_all(&state_dir).await;
+    tokio::fs::create_dir_all(&state_dir)
+        .await
+        .expect("state dir");
+    let mut backend = Backend::load(&state_dir).await.expect("Backend::load");
+
+    backend
+        .up(
+            Some(secrecy::SecretString::from(hs_authkey)),
+            tailscaled_rs::ipn::UpOptions {
+                hostname: Some("tailscaled-rs-hs-rebind".to_string()),
+                control_url: Some(hs_url.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("up() against headscale {hs_url} failed: {e:?}"));
+
+    // Wait for Running.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut running = false;
+    while tokio::time::Instant::now() < deadline {
+        if backend.status().await.state == "Running" {
+            running = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // Call rebind (what the link monitor does on a network change) and check it's non-disruptive.
+    let rebind_ok = if running {
+        match backend.device_handle() {
+            Some(dev) => dev.rebind().await.is_ok(),
+            None => false,
+        }
+    } else {
+        false
+    };
+    // The node must remain Running after a rebind (it re-binds sockets, not the registration).
+    let still_running = running && backend.status().await.state == "Running";
+
+    backend.down().await.expect("down()");
+    backend.shutdown().await;
+    let _ = tokio::fs::remove_dir_all(&state_dir).await;
+
+    assert!(
+        running,
+        "node never reached Running against headscale {hs_url}"
+    );
+    assert!(
+        rebind_ok,
+        "Device::rebind() should return Ok on a Running node"
+    );
+    assert!(
+        still_running,
+        "rebind must be non-disruptive — the node should stay Running afterward"
+    );
+}

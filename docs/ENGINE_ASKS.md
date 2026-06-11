@@ -116,6 +116,11 @@ re-confirms, IPv4-only invariant preserved, no-op if DERP-only). Daemon work now
 link-change monitor (`tsd-94d`) that calls `Device::rebind()` on Wi-Fi switch / sleep-wake. Rides in
 on the v0.12.0 pin bump.
 
+**✅ CONSUMED (daemon, `tsd-94d`).** The link-change monitor (`ipn::linkmon` + the device-bound
+`spawn_link_monitor` task) now polls the host's interface addresses and calls `Device::rebind()` on a
+network-path change — the first daemon-robustness feature beyond the static netstack. This ask is
+fully closed end-to-end.
+
 ---
 
 ## Already sufficient — no engine change needed (noted to avoid redundant asks)

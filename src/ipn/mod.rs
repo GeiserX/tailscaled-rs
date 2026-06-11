@@ -75,6 +75,7 @@ use crate::prefs::Prefs;
 
 mod config;
 mod diag;
+mod linkmon;
 pub mod profile;
 mod revert_guard;
 pub mod serve;
@@ -92,6 +93,32 @@ use state::{derive_state_from, state_from_device};
 /// How long to wait for a graceful engine shutdown before it is dropped (more violently). Bounds
 /// teardown latency so a wedged engine can't hang the daemon (or an orphaned, superseded `up`).
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The link-change monitor loop (Go `tailscaled`'s netmon → magicsock `Rebind`): every
+/// [`POLL_INTERVAL`](linkmon::POLL_INTERVAL), snapshot the host's interface addresses and, when the
+/// network path changed since the last poll, call [`Device::rebind`](tailscale::Device::rebind) so
+/// magicsock re-STUNs / re-DERPs / re-binds its UDP sockets to the new path. Runs until the task is
+/// aborted (in `stop_device`). The first poll establishes the baseline — the node's own address
+/// coming up during bring-up sets the baseline rather than triggering a spurious rebind. A `rebind`
+/// error is non-fatal (logged; the loop keeps polling) — a transient rebind failure must not kill the
+/// monitor.
+async fn link_monitor_loop(device: std::sync::Arc<tailscale::Device>) {
+    let mut last = linkmon::snapshot();
+    tracing::debug!("linkmon: monitor started; baseline snapshot taken");
+    loop {
+        tokio::time::sleep(linkmon::POLL_INTERVAL).await;
+        let now = linkmon::snapshot();
+        if last.changed(&now) {
+            tracing::info!("linkmon: host network path changed; rebinding the engine");
+            if let Err(e) = device.rebind().await {
+                // Non-fatal: a transient rebind failure must not stop the monitor; the next change
+                // (or the next poll if this one's effect didn't land) will retry.
+                tracing::warn!(error = ?e, "linkmon: rebind failed (will keep monitoring)");
+            }
+            last = now;
+        }
+    }
+}
 
 /// One `serve --tcp` accept loop: bind the node's tailnet IPv4 on `port` and splice every inbound
 /// connection to `target` (a localhost `host:port`). Runs forever until the listener errors (engine
@@ -587,6 +614,13 @@ pub struct Backend {
     /// [`stop_device`](Backend::stop_device) BEFORE the device `Arc` is reclaimed (their clones must
     /// be gone first). Empty when the node is down or no plain TCP forward is configured.
     serve_tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// The link-change monitor task: a poll loop that snapshots the host's interface addresses and
+    /// calls [`Device::rebind`](tailscale::Device::rebind) when the network path changes (Wi-Fi
+    /// switch / sleep-wake), so magicsock re-homes. Like [`ssh_task`](Backend::ssh_task), it holds an
+    /// [`Arc`](std::sync::Arc) clone of the device and is bound to the device lifecycle: spawned on
+    /// install in [`finish_up`](Backend::finish_up) and **aborted + awaited** in
+    /// [`stop_device`](Backend::stop_device) before the device `Arc` is reclaimed. `None` when down.
+    monitor_task: Option<tokio::task::JoinHandle<()>>,
     /// Whether the node has ever been configured (brought `up`/`down`), distinguishing a fresh
     /// `NoState` from an explicit `Stopped`. Persists across restarts: it is derived in
     /// [`Backend::load`] from whether the prefs file exists on disk, not from the live process.
@@ -643,6 +677,7 @@ impl Backend {
             device: None,
             ssh_task: None,
             serve_tasks: Vec::new(),
+            monitor_task: None,
             ever_configured,
             generation: 0,
             boot_attempted_up: false,
@@ -1263,6 +1298,10 @@ impl Backend {
         // Spawn the SSH server task iff SSH is enabled (and the daemon was built with the `ssh`
         // feature). It outlives this call, running the engine's fail-closed `listen_ssh` accept loop.
         self.spawn_ssh_task(device.clone());
+        // Spawn the link-change monitor (Go `tailscaled`'s netmon → rebind): poll the host's
+        // interface addresses and re-bind the engine when the network path changes (Wi-Fi switch /
+        // sleep-wake). Bound to the device lifecycle like the SSH task (torn down in `stop_device`).
+        self.spawn_link_monitor(device.clone());
         // Arm the `serve` accept loops from the persisted serve config (Go `tailscale serve --tcp`).
         // Like the SSH task, these are bound to the device lifecycle (torn down in `stop_device`).
         self.spawn_serve(device);
@@ -1339,6 +1378,19 @@ impl Backend {
             });
             self.ssh_task = Some(handle);
         }
+    }
+
+    /// Spawn the link-change monitor for a freshly-installed `device` (Go `tailscaled`'s netmon →
+    /// rebind). Stores the [`JoinHandle`](tokio::task::JoinHandle) in
+    /// [`monitor_task`](Backend::monitor_task) so [`stop_device`](Backend::stop_device) can abort it.
+    /// Sync (spawns + returns) so it fits the non-async [`finish_up`](Backend::finish_up); the poll
+    /// loop runs inside the task. The task holds an [`Arc`](std::sync::Arc) clone of `device` and calls
+    /// [`Device::rebind`](tailscale::Device::rebind) on a host network-path change. Always spawned
+    /// (unlike the SSH task, this has no pref gate — every up-node wants to re-home on a link change);
+    /// torn down in `stop_device` before the device `Arc` is reclaimed.
+    fn spawn_link_monitor(&mut self, device: std::sync::Arc<tailscale::Device>) {
+        let handle = tokio::spawn(link_monitor_loop(device));
+        self.monitor_task = Some(handle);
     }
 
     /// Spawn the `serve` runtime for the current profile's serve config (Go `tailscale serve`), in
@@ -2096,7 +2148,13 @@ impl Backend {
             // reclaim the device. The result is the expected cancellation `JoinError` — ignore it.
             let _ = task.await;
         }
-        // Step 1b: likewise stop every `serve` accept-loop task — they also hold device `Arc` clones,
+        // Step 1b: likewise stop the link-change monitor — it holds a device `Arc` clone too, so it
+        // must be gone before `into_inner` can reclaim the sole `Device`.
+        if let Some(task) = self.monitor_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        // Step 1c: likewise stop every `serve` accept-loop task — they also hold device `Arc` clones,
         // so they must be gone before `into_inner` can reclaim the sole `Device`.
         self.stop_serve_tasks().await;
         // Step 2: reclaim and gracefully shut down the engine. After the abort+await above, the
@@ -2156,6 +2214,7 @@ mod tests {
             device: None,
             ssh_task: None,
             serve_tasks: Vec::new(),
+            monitor_task: None,
             ever_configured: false,
             generation: 0,
             boot_attempted_up: false,
@@ -3613,6 +3672,21 @@ mod tests {
         assert!(
             be.device_handle().is_none(),
             "a device-less backend must hand the server no engine handle → dispatch replies \"not up\""
+        );
+    }
+
+    #[tokio::test]
+    async fn link_monitor_not_running_without_device() {
+        // The link-change monitor is bound to the device lifecycle: a device-less (down/fresh)
+        // backend has no monitor task. It is spawned in `finish_up` (on up) and aborted in
+        // `stop_device` (on down) — the spawn-and-rebind path needs a live engine, so it is exercised
+        // by the gated headscale e2e; here we pin the down-state half (no device ⇒ no monitor).
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-linkmon-nodev-{}", std::process::id()));
+        let be = backend_for(&dir);
+        assert!(
+            be.monitor_task.is_none(),
+            "a device-less backend must run no link-change monitor (it arms on the next `up`)"
         );
     }
 
