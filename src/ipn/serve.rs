@@ -7,17 +7,79 @@
 //! served/not-served logic as free functions. Persisted per-profile next to `prefs.json` /
 //! `node.key.json` (see [`super::profile`]).
 //!
-//! ## What is (and isn't) served
+//! ## What is (and isn't) served — two lanes
 //!
-//! Only `TCPForward` entries with no `HTTPS`/`HTTP`/`TerminateTLS` are actually served (a raw
-//! accept→dial→splice loop; see the server's serve task). `HTTPS`/`HTTP` need an HTTP reverse-proxy
-//! stack and `TerminateTLS` needs an ACME-provisioned TLS server — neither exists on the engine
-//! facade — so those entries are **persisted faithfully but not served** (recognized + reported as
-//! "not served by this build"), leaving a clean seam for a future HTTP/TLS lane.
+//! - **Plain `TCPForward`** (`tcp_forward` set, no `HTTPS`/`HTTP`/`TerminateTLS`) is served by the
+//!   daemon's own raw accept→dial→splice loop (a [`Device::tcp_listen`](tailscale::Device::tcp_listen)
+//!   per port; see the server's serve task). No TLS, no cert — so it works on any tailnet.
+//! - **`HTTPS`/`HTTP` web** entries are served by **delegating to the engine's native serve stack**
+//!   ([`Device::set_serve_config`](tailscale::Device::set_serve_config) + `ServeState`): the engine
+//!   terminates TLS for the node's MagicDNS name and reverse-proxies each decrypted stream to the
+//!   configured backend. [`build_web_serve_state`] translates the web subset of our DTO into the
+//!   engine's [`ServeState`](tailscale::ServeState). This lane is **fail-closed**: a TLS port never
+//!   downgrades to plaintext, and without an issuable cert (the engine's `acme` feature off, or a
+//!   control plane that 501s on `set-dns`) the engine returns a cert error and nothing binds.
+//!
+//! `TerminateTLS` (raw-TCP-after-TLS-termination) has no engine `ServeTarget` analogue at this pin,
+//! so it remains persisted-but-not-served.
 
 use std::path::{Path, PathBuf};
 
 pub use crate::localapi::{ServeConfig, TcpPortHandler};
+
+/// Whether a handler is an `HTTPS`/`HTTP` web entry served via engine delegation (the
+/// [`build_web_serve_state`] lane), as opposed to the plain-TCP-forward lane
+/// ([`is_plain_tcp_forward`]) or a not-served `TerminateTLS` entry. A web entry needs a non-empty
+/// `tcp_forward` to use as the reverse-proxy backend.
+pub fn is_web_serve(h: &TcpPortHandler) -> bool {
+    (h.https || h.http) && !h.tcp_forward.is_empty()
+}
+
+/// Translate the **web** (`HTTPS`/`HTTP`) subset of a [`ServeConfig`] into the engine's
+/// [`ServeState`](tailscale::ServeState) for [`Device::set_serve_config`](tailscale::Device::set_serve_config).
+///
+/// Each [`is_web_serve`] entry becomes a [`ServeTarget::Proxy`](tailscale::ServeTarget::Proxy) on its
+/// port, reverse-proxying the TLS-terminated stream to the entry's `tcp_forward` backend. (`HTTP` maps
+/// to the same `Proxy` target as `HTTPS`: the engine's `ServeState` has no distinct plaintext-web
+/// variant at this pin — every web `ServeTarget` rides a TLS-terminating port. The daemon records the
+/// `HTTP`-vs-`HTTPS` intent in its own DTO; the engine serves both as TLS proxy.) Plain `tcp_forward`
+/// entries (no `https`/`http`) and `terminate_tls` entries are **excluded** — the former stays on the
+/// daemon's hand-rolled accept loop, the latter is not served.
+///
+/// `name` is the node's MagicDNS name (e.g. `host.tailnet.ts.net`, no trailing dot) — the cert the
+/// engine's TLS-terminating ports share. It is set only when at least one web port is produced; an
+/// input with no web entries yields [`ServeState::default()`](tailscale::ServeState) (empty name + no
+/// ports), which is a valid "serve nothing" config (and, via `set_serve_config`'s REPLACE semantics,
+/// the way to clear a previously-armed web serve). The returned state passes the engine's
+/// `ServeState::validate()` for a valid tailnet `name` + backends.
+pub fn build_web_serve_state(cfg: &ServeConfig, name: &str) -> tailscale::ServeState {
+    let mut ports = std::collections::BTreeMap::new();
+    for (port_str, h) in &cfg.tcp {
+        if !is_web_serve(h) {
+            continue;
+        }
+        let Ok(port) = port_str.parse::<u16>() else {
+            // A non-numeric key can't be a tailnet port; skip (the persistence layer keeps it).
+            continue;
+        };
+        ports.insert(
+            port,
+            tailscale::ServeTarget::Proxy {
+                to: h.tcp_forward.clone(),
+            },
+        );
+    }
+    let name = if ports.is_empty() {
+        // No TLS-terminating port → no cert needed → leave the name empty (and keep ports empty so
+        // this is the canonical "serve nothing / clear" state).
+        String::new()
+    } else {
+        // The engine's TLS ports share this single MagicDNS-name cert. Strip any trailing dot (Go's
+        // ServeConfig names carry none; the engine's `is_tailnet_name` tolerates it but we normalize).
+        name.trim_end_matches('.').to_string()
+    };
+    tailscale::ServeState { name, ports }
+}
 
 /// Whether a handler is a plain TCP forward this daemon can actually serve: a non-empty
 /// `tcp_forward`, no HTTP(S) web handling, and no TLS termination. The serve accept loop runs only
@@ -119,6 +181,86 @@ mod tests {
             ..fwd.clone()
         }));
         assert!(!is_plain_tcp_forward(&TcpPortHandler::default()));
+    }
+
+    #[test]
+    fn web_serve_predicate_classifies_handlers() {
+        // HTTPS web with a backend → web-serve.
+        assert!(is_web_serve(&TcpPortHandler {
+            https: true,
+            tcp_forward: "127.0.0.1:3000".into(),
+            ..Default::default()
+        }));
+        // HTTP web with a backend → web-serve.
+        assert!(is_web_serve(&TcpPortHandler {
+            http: true,
+            tcp_forward: "127.0.0.1:3000".into(),
+            ..Default::default()
+        }));
+        // Plain TCP forward (no https/http) → NOT web-serve (it's the hand-rolled lane).
+        assert!(!is_web_serve(&TcpPortHandler {
+            tcp_forward: "127.0.0.1:22".into(),
+            ..Default::default()
+        }));
+        // Web flag but no backend → NOT web-serve (nothing to proxy to).
+        assert!(!is_web_serve(&TcpPortHandler {
+            https: true,
+            ..Default::default()
+        }));
+        // The two lanes are mutually exclusive.
+        let web = TcpPortHandler {
+            https: true,
+            tcp_forward: "127.0.0.1:3000".into(),
+            ..Default::default()
+        };
+        assert!(is_web_serve(&web) && !is_plain_tcp_forward(&web));
+    }
+
+    #[test]
+    fn build_web_serve_state_maps_only_web_entries_to_proxy() {
+        let mut cfg = ServeConfig::default();
+        // A plain TCP forward (hand-rolled lane) — must be EXCLUDED from the engine state.
+        set_tcp_forward(&mut cfg, 2222, "127.0.0.1:22".into());
+        // An HTTPS web entry — must become a Proxy port.
+        cfg.tcp.insert(
+            "443".into(),
+            TcpPortHandler {
+                https: true,
+                tcp_forward: "127.0.0.1:3000".into(),
+                ..Default::default()
+            },
+        );
+        let state = build_web_serve_state(&cfg, "host.example.ts.net.");
+        // Only the web port is present; the plain forward is excluded.
+        assert_eq!(state.ports.len(), 1);
+        assert_eq!(
+            state.ports.get(&443),
+            Some(&tailscale::ServeTarget::Proxy {
+                to: "127.0.0.1:3000".into()
+            })
+        );
+        assert!(!state.ports.contains_key(&2222));
+        // Name is set (trailing dot stripped) because a TLS-terminating port exists.
+        assert_eq!(state.name, "host.example.ts.net");
+        // The produced state is valid per the engine's fail-closed checks.
+        assert!(state.validate().is_ok());
+    }
+
+    #[test]
+    fn build_web_serve_state_empty_without_web_entries() {
+        // A config with only a plain TCP forward yields the canonical empty "serve nothing" state
+        // (empty name + no ports), which is also how a web serve is cleared via REPLACE semantics.
+        let mut cfg = ServeConfig::default();
+        set_tcp_forward(&mut cfg, 2222, "127.0.0.1:22".into());
+        let state = build_web_serve_state(&cfg, "host.example.ts.net");
+        assert!(state.ports.is_empty());
+        assert!(state.name.is_empty());
+        assert_eq!(state, tailscale::ServeState::default());
+        assert!(state.validate().is_ok());
+
+        // An entirely empty config likewise.
+        let state = build_web_serve_state(&ServeConfig::default(), "host.example.ts.net");
+        assert_eq!(state, tailscale::ServeState::default());
     }
 
     #[tokio::test]

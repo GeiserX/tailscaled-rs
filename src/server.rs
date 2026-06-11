@@ -577,8 +577,9 @@ async fn dispatch(
             let cfg = { backend.lock().await.serve_config().await };
             Response::ServeConfig(cfg)
         }
-        // `serve --tcp` / `serve reset` (Go SetServeConfig): persist the new config. (Re-arming the
-        // accept loops to match is US-017; for now this persists faithfully — a restart applies it.)
+        // `serve tcp|https|http` / `serve reset` (Go SetServeConfig): persist the new config and
+        // re-arm the serve runtime live (both lanes — TCP-forward accept loops + engine web serve)
+        // when the node is up; see `Backend::set_serve_config`.
         Request::SetServeConfig { config } => {
             let mut be = backend.lock().await;
             match be.set_serve_config(&config).await {
