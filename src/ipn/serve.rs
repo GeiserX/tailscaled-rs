@@ -181,6 +181,57 @@ pub fn set_tcp_forward(cfg: &mut ServeConfig, port: u16, forward_to: String) {
     );
 }
 
+/// The Go `HostPort` key (`host:port`) for a funnel entry — the node's MagicDNS name joined to the
+/// port. Matches Go's `net.JoinHostPort(dnsName, port)` for a DNS host (a plain `host:port` concat;
+/// no IPv6 brackets, since a MagicDNS name never contains a colon).
+pub fn funnel_host_port(host: &str, port: u16) -> String {
+    format!("{}:{port}", host.trim_end_matches('.'))
+}
+
+/// Turn Funnel on or off for `host`:`port` (Go `ServeConfig.SetFunnel`). On `on`, inserts the
+/// `host:port` → `true` entry; on `off`, removes the key (so an off port never lingers on the wire,
+/// matching Go's delete-and-nil-when-empty semantics — our `skip_serializing_if` omits an empty map).
+pub fn set_funnel(cfg: &mut ServeConfig, host: &str, port: u16, on: bool) {
+    let hp = funnel_host_port(host, port);
+    if on {
+        cfg.allow_funnel.insert(hp, true);
+    } else {
+        cfg.allow_funnel.remove(&hp);
+    }
+}
+
+/// The set of tailnet ports with Funnel enabled, parsed from the `host:port` keys of
+/// [`allow_funnel`](crate::localapi::ServeConfig::allow_funnel) whose value is `true`. The port is the
+/// substring after the LAST `:` (a MagicDNS host has no colon, so this is unambiguous). A
+/// non-numeric/zero port key is skipped.
+pub fn funnel_ports(cfg: &ServeConfig) -> std::collections::BTreeSet<u16> {
+    cfg.allow_funnel
+        .iter()
+        .filter(|(_, on)| **on)
+        .filter_map(|(hp, _)| hp.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()))
+        .filter(|&p| p != 0)
+        .collect()
+}
+
+/// The `(host, port)` pairs with Funnel enabled, split from each `true` `host:port` key (port after
+/// the last `:`, host before it — a MagicDNS host has no colon). Lets a renderer show the real
+/// MagicDNS name instead of a placeholder. Sorted by the BTreeMap key order; a bad port key is
+/// skipped.
+pub fn funnel_host_ports(cfg: &ServeConfig) -> Vec<(String, u16)> {
+    cfg.allow_funnel
+        .iter()
+        .filter(|(_, on)| **on)
+        .filter_map(|(hp, _)| {
+            hp.rsplit_once(':').and_then(|(h, p)| {
+                p.parse::<u16>()
+                    .ok()
+                    .filter(|&p| p != 0)
+                    .map(|p| (h.to_string(), p))
+            })
+        })
+        .collect()
+}
+
 /// Path of the serve-config file for `state_dir` + profile id (next to prefs/key). The default
 /// profile uses a top-level `serve-config.json`; named profiles nest under `profiles/<id>/`.
 pub fn config_path(state_dir: &Path, profile_id: &str) -> PathBuf {
@@ -496,6 +547,66 @@ mod tests {
         );
         let state = build_web_serve_state(&cfg, "host.example.ts.net");
         assert!(state.ports.is_empty(), "CRLF redirect must be skipped");
+    }
+
+    #[test]
+    fn set_funnel_on_off_and_ports() {
+        let mut cfg = ServeConfig::default();
+        // On: inserts the host:port -> true entry.
+        set_funnel(&mut cfg, "host.example.ts.net", 443, true);
+        set_funnel(&mut cfg, "host.example.ts.net.", 8443, true); // trailing dot stripped
+        assert_eq!(cfg.allow_funnel.get("host.example.ts.net:443"), Some(&true));
+        assert_eq!(
+            cfg.allow_funnel.get("host.example.ts.net:8443"),
+            Some(&true)
+        );
+        assert_eq!(
+            funnel_ports(&cfg),
+            std::collections::BTreeSet::from([443, 8443])
+        );
+
+        // Off: removes the key (never lingers as false).
+        set_funnel(&mut cfg, "host.example.ts.net", 443, false);
+        assert!(!cfg.allow_funnel.contains_key("host.example.ts.net:443"));
+        assert_eq!(funnel_ports(&cfg), std::collections::BTreeSet::from([8443]));
+
+        // Turning the last one off empties the map (so the wire omits AllowFunnel).
+        set_funnel(&mut cfg, "host.example.ts.net", 8443, false);
+        assert!(cfg.allow_funnel.is_empty());
+        assert!(funnel_ports(&cfg).is_empty());
+    }
+
+    #[test]
+    fn funnel_host_ports_splits_key() {
+        let mut cfg = ServeConfig::default();
+        set_funnel(&mut cfg, "host.example.ts.net", 443, true);
+        set_funnel(&mut cfg, "host.example.ts.net", 8443, true);
+        let hps = funnel_host_ports(&cfg);
+        assert_eq!(
+            hps,
+            vec![
+                ("host.example.ts.net".to_string(), 443),
+                ("host.example.ts.net".to_string(), 8443),
+            ]
+        );
+    }
+
+    #[test]
+    fn allow_funnel_wire_matches_go_and_is_omitted_when_empty() {
+        // Empty → omitted (existing wire unchanged).
+        let mut cfg = ServeConfig::default();
+        set_tcp_forward(&mut cfg, 8443, "127.0.0.1:5000".into());
+        assert_eq!(
+            serde_json::to_string(&cfg).unwrap(),
+            r#"{"TCP":{"8443":{"TCPForward":"127.0.0.1:5000"}}}"#
+        );
+        // With funnel → AllowFunnel present, keyed by host:port (Go wire shape).
+        let mut cfg = ServeConfig::default();
+        set_funnel(&mut cfg, "host.example.ts.net", 443, true);
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert_eq!(json, r#"{"AllowFunnel":{"host.example.ts.net:443":true}}"#);
+        let back: ServeConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cfg);
     }
 
     #[test]

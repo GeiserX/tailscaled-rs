@@ -340,3 +340,22 @@ the `Device` facade exposes no accessor.
 net-report) summarizing DERP region latencies + preferred region + NAT/mapping flags, so the daemon
 can render it read-only. `tnet ip`/`whois`/`ping` already shipped (engine had those accessors);
 `netcheck` is the one diagnostic still missing an engine read-surface. Mirrors tsnet's netcheck.
+
+## 13. Re-export the Funnel types at the engine crate root (facade completeness)
+
+`Device::listen_funnel(&self, cfg: &ts_control::ServeConfig, opts: ts_control::FunnelOptions) ->
+Result<ts_runtime::funnel::FunnelAcceptedReceiver, ts_control::FunnelError>` is public, but its
+parameter/return types are NOT re-exported at the `tailscale` crate root. The facade re-exports
+`ServeConfig`/`ServeState`/`ServeTarget`/`CertError` (from `ts_control`) but omits `FunnelOptions`,
+`FunnelError`, and `ts_runtime::funnel::{FunnelAccepted, FunnelAcceptedReceiver}`. Result: an external
+crate cannot name the `opts` argument's type, so `listen_funnel` is effectively uncallable through the
+facade alone — exactly the gap the existing `TransportMode`/`TunConfig` re-export comment calls out.
+
+**Workaround in use (daemon side):** a direct `geiserx_ts_control` dep pinned to the SAME rev as
+`geiserx_tailscale`, so `ts_control::FunnelOptions` unifies to the identical type; the receiver type
+is left inferred (the accept loop is inlined, never naming it).
+
+**Ask:** add `pub use ts_control::{FunnelError, FunnelOptions, MISSING_FUNNEL_RELAY};` and
+`pub use ts_runtime::funnel::{FunnelAccepted, FunnelAcceptedReceiver};` to `src/lib.rs` (alongside the
+existing serve re-exports). Pure re-export, no behavior change. Lets the daemon drop the extra
+`ts_control` dep and name the funnel accept loop's type in a free function.

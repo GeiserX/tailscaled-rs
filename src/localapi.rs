@@ -465,6 +465,17 @@ pub struct ServeConfig {
         skip_serializing_if = "std::collections::BTreeMap::is_empty"
     )]
     pub tcp: std::collections::BTreeMap<String, TcpPortHandler>,
+    /// Ports for which Funnel (public-internet ingress) is enabled (Go `ipn.ServeConfig.AllowFunnel`,
+    /// `map[HostPort]bool`). Keyed by the Go `HostPort` form `host:port` (the node's MagicDNS name +
+    /// `:` + port, e.g. `host.tailnet.ts.net:443`) so the wire matches Go byte-for-byte. A value of
+    /// `true` means funnel is on for that host:port; the key is removed when funnel is turned off
+    /// (so an off port never appears). Empty = no funnel (and the field is omitted from the wire).
+    #[serde(
+        default,
+        rename = "AllowFunnel",
+        skip_serializing_if = "std::collections::BTreeMap::is_empty"
+    )]
+    pub allow_funnel: std::collections::BTreeMap<String, bool>,
 }
 
 /// One served tailnet port (Go `ipn.TCPPortHandler`); only `tcp_forward` is served by this build.
