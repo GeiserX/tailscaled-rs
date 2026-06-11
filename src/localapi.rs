@@ -500,6 +500,66 @@ pub struct TcpPortHandler {
     /// PROXY-protocol version to prepend before forwarding (Go `omitzero`; 0 = none).
     #[serde(default, rename = "ProxyProtocol", skip_serializing_if = "is_zero_i32")]
     pub proxy_protocol: i32,
+    /// Serve a fixed plaintext body on this port instead of proxying (Go `HTTPHandler.Text`; engine
+    /// [`ServeTarget::Text`](tailscale::ServeTarget::Text)). Web entry; TLS-terminated. `None` = not a
+    /// text handler. Mutually exclusive with [`tcp_forward`](TcpPortHandler::tcp_forward) as the
+    /// served target (a port serves one of: proxy / text / redirect / mounts).
+    #[serde(default, rename = "Text", skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Serve an HTTP redirect on this port (engine [`ServeTarget::Redirect`](tailscale::ServeTarget::Redirect)).
+    /// Web entry; TLS-terminated. `None` = not a redirect. (Go's CLI has no redirect path at v1.100.0,
+    /// but the engine serves it, so this is a faithful engine-backed extension.)
+    #[serde(default, rename = "Redirect", skip_serializing_if = "Option::is_none")]
+    pub redirect: Option<RedirectSpec>,
+    /// HTTP path-prefix mounts on this port (Go `WebServerConfig.Handlers`, keyed by mount path →
+    /// engine [`ServeTarget::Path`](tailscale::ServeTarget::Path)). When non-empty, the port serves a
+    /// path-prefix mux (longest-match wins; unmatched = fail-closed 404). A single `/` mount is
+    /// equivalent to a bare proxy/text/redirect on the port. Empty = no mounts.
+    #[serde(
+        default,
+        rename = "Mounts",
+        skip_serializing_if = "std::collections::BTreeMap::is_empty"
+    )]
+    pub mounts: std::collections::BTreeMap<String, WebMount>,
+}
+
+/// An HTTP redirect handler (Go `HTTPHandler.Redirect`; engine
+/// [`ServeTarget::Redirect`](tailscale::ServeTarget::Redirect)). `status` must be in `300..=399` and
+/// `to` must not contain CR/LF (response-splitting guard) — both enforced by the engine's
+/// `validate()` and checked daemon-side before the engine call.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RedirectSpec {
+    /// The `Location:` target. Supports the engine's `${HOST}` / `${REQUEST_URI}` expansion.
+    #[serde(rename = "To")]
+    pub to: String,
+    /// The redirect HTTP status (e.g. 301, 302). Must be in `300..=399`.
+    #[serde(rename = "Status")]
+    pub status: u16,
+}
+
+/// One handler mounted at a path prefix on a web port (the value of [`TcpPortHandler::mounts`]).
+/// Mirrors the engine's non-`Path` [`ServeTarget`](tailscale::ServeTarget) arms (a mount cannot itself
+/// be a nested path mux — the engine bounds `Path` nesting to one level).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum WebMount {
+    /// Reverse-proxy the decrypted stream to a local `host:port` backend.
+    Proxy {
+        /// `host:port` to dial for the proxied backend.
+        to: String,
+    },
+    /// Serve a fixed plaintext body, then close.
+    Text {
+        /// The exact bytes to write.
+        body: String,
+    },
+    /// HTTP redirect response.
+    Redirect {
+        /// The `Location:` target.
+        to: String,
+        /// The redirect status (`300..=399`).
+        status: u16,
+    },
 }
 
 fn is_zero_i32(n: &i32) -> bool {
