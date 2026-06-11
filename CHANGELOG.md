@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.22.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.21.0...v0.22.0) (2026-06-11)
+
+
+### Features
+
+* **dns:** tnet dns status — render the control-pushed MagicDNS config ([#71](https://github.com/GeiserX/tailscaled-rs/issues/71)) ([280ff2b](https://github.com/GeiserX/tailscaled-rs/commit/280ff2bf4f0eb149ec985e7bf0200a5bec399f29))
+
 ## [0.21.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.20.0...v0.21.0) (2026-06-11)
 
 
