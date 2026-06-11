@@ -2106,6 +2106,40 @@ fn mount_suffix(set_path: &Option<String>) -> String {
 /// either `text:<body>` (a fixed-body handler) or a proxy backend (`host:port` / bare port). When
 /// `set_path` names a non-root mount, the handler is stored as a path mount (so multiple mounts can
 /// coexist on the port); otherwise it is the bare web handler. `tls` selects `https` (true) vs `http`.
+/// The existing web handlers on a port, as a mount map — migrating a **bare root** handler (a `text`
+/// body or an `https`/`http` proxy `tcp_forward`) into a `/` mount so it survives when a new
+/// `--set-path` mount is added to the same port (Go `SetWebHandler` accretes; the root is the `/`
+/// handler). Returns the port's existing `mounts` as-is when it already is a mux. A non-web handler
+/// (plain TCP forward / TLS-terminated) yields no web mounts.
+fn existing_as_mounts(
+    h: &tailscaled_rs::localapi::TcpPortHandler,
+) -> std::collections::BTreeMap<String, tailscaled_rs::localapi::WebMount> {
+    use tailscaled_rs::localapi::WebMount;
+    if !h.mounts.is_empty() {
+        return h.mounts.clone();
+    }
+    let mut mounts = std::collections::BTreeMap::new();
+    if let Some(body) = &h.text {
+        mounts.insert("/".to_string(), WebMount::Text { body: body.clone() });
+    } else if let Some(r) = &h.redirect {
+        mounts.insert(
+            "/".to_string(),
+            WebMount::Redirect {
+                to: r.to.clone(),
+                status: r.status,
+            },
+        );
+    } else if (h.https || h.http) && !h.tcp_forward.is_empty() {
+        mounts.insert(
+            "/".to_string(),
+            WebMount::Proxy {
+                to: h.tcp_forward.clone(),
+            },
+        );
+    }
+    mounts
+}
+
 fn build_web_serve(
     mut cfg: tailscaled_rs::localapi::ServeConfig,
     port: u16,
@@ -2135,29 +2169,39 @@ fn build_web_serve(
         ..Default::default()
     };
 
+    // The new handler's web target, as a mount entry (used when this serve participates in a mux).
+    let entry = match is_text {
+        Some(body) => WebMount::Text {
+            body: body.to_string(),
+        },
+        None => WebMount::Proxy {
+            to: normalize_serve_target(target),
+        },
+    };
+
+    // Carry over an existing handler on this port so root + path mounts ACCRETE rather than clobber
+    // (Go `SetWebHandler` keeps both on the port's `WebServerConfig.Handlers`). Any existing bare
+    // root handler (text / https-http proxy) is migrated into a `/` mount so it survives alongside a
+    // new `--set-path` mount, and vice-versa.
+    let existing_mounts = cfg.tcp.get(&port.to_string()).map(existing_as_mounts);
+
     match mount {
-        // Non-root mount: store as a path mount, merging with any existing mounts on the port so
-        // multiple `--set-path` mounts coexist (Go `WebServerConfig.Handlers`). The longest-matching
-        // prefix wins at dispatch.
+        // Non-root mount: merge into the port's existing mounts (migrating any bare root to `/`).
         Some(m) => {
-            // Carry over existing mounts on this port (if the prior handler was also a mux).
-            if let Some(existing) = cfg.tcp.get(&port.to_string()) {
-                handler.mounts = existing.mounts.clone();
-            }
-            let entry = match is_text {
-                Some(body) => WebMount::Text {
-                    body: body.to_string(),
-                },
-                None => WebMount::Proxy {
-                    to: normalize_serve_target(target),
-                },
-            };
+            handler.mounts = existing_mounts.unwrap_or_default();
             handler.mounts.insert(m, entry);
         }
-        // Root: a bare web handler on the port.
-        None => match is_text {
-            Some(body) => handler.text = Some(body.to_string()),
-            None => handler.tcp_forward = normalize_serve_target(target),
+        // Root mount: if the port already has mounts, fold this in as the `/` mount (stay a mux);
+        // otherwise it's a plain bare handler on the port.
+        None => match existing_mounts {
+            Some(mut mounts) if !mounts.is_empty() => {
+                mounts.insert("/".to_string(), entry);
+                handler.mounts = mounts;
+            }
+            _ => match is_text {
+                Some(body) => handler.text = Some(body.to_string()),
+                None => handler.tcp_forward = normalize_serve_target(target),
+            },
         },
     }
 
@@ -2231,6 +2275,9 @@ async fn run_serve(socket: &std::path::Path, cmd: ServeCmd) -> Result<()> {
             Ok(())
         }
         ServeCmd::Redirect { port, to, status } => {
+            if to.trim().is_empty() {
+                anyhow::bail!("redirect target must not be empty");
+            }
             if !(300..=399).contains(&status) {
                 anyhow::bail!("redirect status must be in 300..=399 (got {status})");
             }
@@ -3242,6 +3289,54 @@ mod tests {
             h.mounts.get("/web"),
             Some(&WebMount::Text {
                 body: "hello".into()
+            })
+        );
+    }
+
+    #[test]
+    fn build_web_serve_bare_root_then_mount_accretes() {
+        use tailscaled_rs::localapi::{ServeConfig, WebMount};
+        // A bare root proxy, then a --set-path mount on the SAME port: the root must survive as the
+        // "/" mount (Go SetWebHandler accretes — it must NOT be clobbered).
+        let cfg = build_web_serve(ServeConfig::default(), 443, "3000", None, true).unwrap();
+        let cfg = build_web_serve(cfg, 443, "text:hi", Some("/api"), true).unwrap();
+        let h = cfg.tcp.get("443").unwrap();
+        assert_eq!(h.mounts.len(), 2, "root + /api should coexist");
+        assert_eq!(
+            h.mounts.get("/"),
+            Some(&WebMount::Proxy {
+                to: "127.0.0.1:3000".into()
+            }),
+            "the bare root proxy migrated into the / mount"
+        );
+        assert_eq!(
+            h.mounts.get("/api"),
+            Some(&WebMount::Text { body: "hi".into() })
+        );
+        // The bare fields are cleared once it becomes a mux (the mounts are the source of truth).
+        assert!(h.tcp_forward.is_empty());
+        assert!(h.text.is_none());
+    }
+
+    #[test]
+    fn build_web_serve_mount_then_bare_root_accretes() {
+        use tailscaled_rs::localapi::{ServeConfig, WebMount};
+        // The reverse: a --set-path mount, then a bare root serve on the same port. The root folds in
+        // as the "/" mount rather than wiping the existing mount.
+        let cfg = build_web_serve(ServeConfig::default(), 443, "3000", Some("/api"), true).unwrap();
+        let cfg = build_web_serve(cfg, 443, "9000", None, true).unwrap();
+        let h = cfg.tcp.get("443").unwrap();
+        assert_eq!(h.mounts.len(), 2, "/api + new root should coexist");
+        assert_eq!(
+            h.mounts.get("/api"),
+            Some(&WebMount::Proxy {
+                to: "127.0.0.1:3000".into()
+            })
+        );
+        assert_eq!(
+            h.mounts.get("/"),
+            Some(&WebMount::Proxy {
+                to: "127.0.0.1:9000".into()
             })
         );
     }
