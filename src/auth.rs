@@ -138,7 +138,7 @@ pub fn requires_write(request: &crate::localapi::Request) -> bool {
         | Request::LockStatus
         | Request::DnsStatus
         | Request::Netcheck
-        | Request::BugReport
+        | Request::BugReport { .. }
         | Request::GetServeConfig
         | Request::FileList => false,
         // Writes: lifecycle/prefs mutations plus the Taildrop transfers. `FileCp` initiates a send
@@ -322,7 +322,7 @@ mod tests {
             "lock status only reads TKA status — a read"
         );
         assert!(
-            !requires_write(&Request::BugReport),
+            !requires_write(&Request::BugReport { note: None }),
             "bugreport only reads daemon state into a marker — a read"
         );
         assert!(
