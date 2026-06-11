@@ -186,6 +186,14 @@ pub(super) async fn whois(dev: &tailscale::Device, ip: &str) -> Response {
             // Reuse `StatusNode::from_node` — the exact name+ipv4 derivation `status` renders
             // peers with — so whois and status agree on a node's identity by construction.
             let node = tailscale::StatusNode::from_node(&w.node);
+            // Read the tag set + key-expiry off the full `Node` BEFORE the field moves below
+            // (`user`/`capabilities`). `StatusNode::from_node` only derived name+ipv4, so without
+            // this the daemon would discard both — yet Go surfaces them (tags in `whois` text; the
+            // key-expiry is a superset this fork also exposes). Expiry → its chrono `DateTime<Utc>`
+            // Display form (`YYYY-MM-DD HH:MM:SS UTC`, not RFC3339's `T…Z`), matching how `status`
+            // renders `last_seen`.
+            let tags = w.node.tags.clone();
+            let node_key_expiry = w.node.node_key_expiry.map(|t| t.to_string());
             Response::Whois(WhoisReport {
                 found: true,
                 node_name: Some(node.display_name),
@@ -193,6 +201,8 @@ pub(super) async fn whois(dev: &tailscale::Device, ip: &str) -> Response {
                 user: w.user,
                 // Keep just the capability names for the summary; drop the verbose args.
                 capabilities: w.capabilities.into_iter().map(|(cap, _args)| cap).collect(),
+                tags,
+                node_key_expiry,
             })
         }
         // No tailnet node owns that IP — a clean negative, not an error.
