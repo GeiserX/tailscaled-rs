@@ -74,6 +74,7 @@ use crate::localapi::{PeerReport, StatusReport};
 use crate::prefs::Prefs;
 
 mod config;
+mod control_url;
 mod diag;
 pub mod install;
 mod linkmon;
@@ -1136,6 +1137,22 @@ impl Backend {
     /// the per-pref logic.
     pub fn up_revert_guard(&self, opts: &UpOptions) -> Vec<crate::localapi::RevertedPref> {
         revert_guard::check_accidental_reverts(&self.prefs, opts, self.ever_configured)
+    }
+
+    /// Whether this `up` must be refused for changing the control server on a **Running** node
+    /// without `--force-reauth` (Go `up`'s `can't change --login-server without --force-reauth`).
+    /// A pure, read-only pre-flight check (delegates to [`control_url::change_blocked`]): the current
+    /// control URL is `self.prefs.control_url`, the proposed one is `opts.control_url` (`None` =
+    /// unmentioned = no change), "Running" is "a device is installed" (`self.device.is_some()` — the
+    /// daemon's analogue of Go's `backendState == ipn.Running`), and `--force-reauth` is the escape
+    /// hatch (it re-registers, which is exactly what a control-server change requires).
+    pub fn up_control_url_guard(&self, opts: &UpOptions) -> bool {
+        control_url::change_blocked(
+            self.prefs.control_url.as_deref(),
+            opts.control_url.as_deref(),
+            self.device.is_some(),
+            opts.force_reauth,
+        )
     }
 
     /// Phase 1 of the concurrent bring-up: mutate + persist prefs, build the engine `Config`, and
