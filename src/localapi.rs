@@ -656,8 +656,10 @@ pub struct PeerReport {
     /// routes and the exit-node default route (Go `PeerStatus.AllowedIPs`). Empty when none/unknown.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_routes: Vec<String>,
-    /// When control last saw this peer online (RFC3339), per Go `PeerStatus.LastSeen` — meaningful
-    /// mainly while the peer is offline. `None` when unknown / never seen.
+    /// When control last saw this peer online, per Go `PeerStatus.LastSeen` — meaningful mainly while
+    /// the peer is offline. `None` when unknown / never seen. Format is the engine `chrono`
+    /// `DateTime<Utc>` Display form (RFC3339-*shaped* but space-separated with a ` UTC` suffix, e.g.
+    /// `2026-06-11 05:19:14 UTC`, not strict RFC3339 `…T…Z`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen: Option<String>,
     /// The peer's current direct UDP endpoint (`host:port`) when a direct path is confirmed (Go

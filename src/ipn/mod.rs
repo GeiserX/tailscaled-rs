@@ -1764,8 +1764,10 @@ impl Backend {
                                     ipv4: p.ipv4.to_string(),
                                     is_exit_node: p.is_exit_node,
                                     // The engine's StableNodeId → the Go `status --json` Peer-map key
-                                    // (see PeerReport::stable_id for the keying-deviation note).
-                                    stable_id: p.stable_id.0.clone(),
+                                    // (see PeerReport::stable_id for the keying-deviation note). `p`
+                                    // is owned (into_iter) and the active-exit `find` above already
+                                    // finished borrowing it, so move the inner String rather than clone.
+                                    stable_id: p.stable_id.0,
                                     // Engine-reported liveness (Option<bool>) → Go `PeerStatus.Online`.
                                     online: p.online,
                                     // IPv6 → Go PeerStatus.TailscaleIPs[1] (rendered as a string).
@@ -1784,7 +1786,7 @@ impl Backend {
                                     last_seen: p.last_seen.map(|t| t.to_string()),
                                     // Direct endpoint vs DERP relay (Go CurAddr/Relay; mutually exclusive).
                                     cur_addr: p.cur_addr.map(|a| a.to_string()),
-                                    relay: p.relay.clone(),
+                                    relay: p.relay,
                                 })
                                 .collect();
                             (ip, name, ipv6, active_exit, magic_dns, peers)
