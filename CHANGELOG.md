@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.17.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.16.0...v0.17.0) (2026-06-11)
+
+
+### Features
+
+* **serve:** HTTPS/HTTP web serve via engine delegation ([#61](https://github.com/GeiserX/tailscaled-rs/issues/61)) ([7b458e6](https://github.com/GeiserX/tailscaled-rs/commit/7b458e6003c3bebaefdbb8053f2361e560fb9a66))
+
 ## [0.16.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.15.0...v0.16.0) (2026-06-11)
 
 
