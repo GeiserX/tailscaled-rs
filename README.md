@@ -66,7 +66,14 @@ export TS_RS_EXPERIMENT=this_is_unstable_software
 
 # Force a fresh login (re-register from scratch, keeping your settings):
 ./target/release/tnet up --force-reauth
+
+# Bring up and wait (up to 30s) for the node to reach Running — handy in scripts:
+./target/release/tnet up --authkey tskey-auth-XXXX --timeout 30 && echo connected
 ```
+
+`tnet up --timeout <SECONDS>` (Go `tailscale up --timeout`) waits for the node to reach the Running
+state after bringing it up, exiting non-zero on timeout — useful to gate a follow-up step on
+connectivity. Omit it to return as soon as the daemon accepts the up; `0` waits forever.
 
 `tnet up --force-reauth` (Go `tailscale up --force-reauth`) discards this node's key and registers
 fresh, surfacing a new login URL — handy to re-authenticate without changing any settings. It may
