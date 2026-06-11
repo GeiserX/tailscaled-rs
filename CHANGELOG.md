@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.25.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.24.0...v0.25.0) (2026-06-11)
+
+
+### Features
+
+* **daemon:** link-change monitor → Device::rebind() (laptop-grade re-homing) ([#77](https://github.com/GeiserX/tailscaled-rs/issues/77)) ([ee8f82f](https://github.com/GeiserX/tailscaled-rs/commit/ee8f82f84be3b55e8f14e019f74af8795e0b555a))
+
 ## [0.24.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.23.0...v0.24.0) (2026-06-11)
 
 
