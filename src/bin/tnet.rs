@@ -357,8 +357,9 @@ enum Command {
         #[arg(value_name = "PORT")]
         port: u16,
     },
-    /// Expose a local service on the tailnet (Go `tailscale serve`). This build serves the TCP-forward
-    /// mode (`--tcp`); HTTPS/HTTP/TLS modes need an HTTP/TLS stack this build doesn't have.
+    /// Expose a local service on the tailnet (Go `tailscale serve`): `tcp` (raw TCP forward, the
+    /// daemon's own accept loop) and `https`/`http` (web reverse-proxy, terminated + served by the
+    /// engine for the node's MagicDNS name). HTTPS issuance needs the `acme` feature + a SaaS tailnet.
     Serve {
         #[command(subcommand)]
         cmd: ServeCmd,
@@ -376,6 +377,29 @@ enum ServeCmd {
         #[arg(value_name = "PORT")]
         port: u16,
         /// Local forward target: `host:port`, or a bare port for `127.0.0.1:<port>`.
+        #[arg(value_name = "TARGET")]
+        target: String,
+    },
+    /// Serve HTTPS on a tailnet port, reverse-proxying to a local backend (Go `serve --https`). The
+    /// engine terminates TLS for this node's MagicDNS name and proxies each request to `<TARGET>`.
+    /// Requires the daemon's `acme` feature + a Funnel/HTTPS-enabled SaaS tailnet to issue the cert;
+    /// otherwise the engine fails closed (no plaintext) and `serve status` shows it as not yet active.
+    Https {
+        /// The tailnet port to terminate TLS on.
+        #[arg(value_name = "PORT")]
+        port: u16,
+        /// Local proxy backend: `host:port`, or a bare port for `127.0.0.1:<port>`.
+        #[arg(value_name = "TARGET")]
+        target: String,
+    },
+    /// Serve HTTP on a tailnet port, reverse-proxying to a local backend (Go `serve --http`). Like
+    /// [`Https`](ServeCmd::Https) but records HTTP intent; the engine reverse-proxies via the same
+    /// native serve path.
+    Http {
+        /// The tailnet port to serve on.
+        #[arg(value_name = "PORT")]
+        port: u16,
+        /// Local proxy backend: `host:port`, or a bare port for `127.0.0.1:<port>`.
         #[arg(value_name = "TARGET")]
         target: String,
     },
@@ -2046,6 +2070,38 @@ async fn run_serve(socket: &std::path::Path, cmd: ServeCmd) -> Result<()> {
             println!("serving tailnet :{port} -> {fwd}");
             Ok(())
         }
+        ServeCmd::Https { port, target } => {
+            let mut cfg = get_cfg().await?;
+            let fwd = normalize_serve_target(&target);
+            // `tcp_forward` doubles as the reverse-proxy backend the daemon's web-serve shim reads
+            // (see ipn::serve::build_web_serve_state); `https` marks TLS-terminating web intent.
+            cfg.tcp.insert(
+                port.to_string(),
+                tailscaled_rs::localapi::TcpPortHandler {
+                    https: true,
+                    tcp_forward: fwd.clone(),
+                    ..Default::default()
+                },
+            );
+            send_ok_or_die(socket, Request::SetServeConfig { config: cfg }).await?;
+            println!("serving https://<node>:{port} -> {fwd}");
+            Ok(())
+        }
+        ServeCmd::Http { port, target } => {
+            let mut cfg = get_cfg().await?;
+            let fwd = normalize_serve_target(&target);
+            cfg.tcp.insert(
+                port.to_string(),
+                tailscaled_rs::localapi::TcpPortHandler {
+                    http: true,
+                    tcp_forward: fwd.clone(),
+                    ..Default::default()
+                },
+            );
+            send_ok_or_die(socket, Request::SetServeConfig { config: cfg }).await?;
+            println!("serving http://<node>:{port} -> {fwd}");
+            Ok(())
+        }
         ServeCmd::Reset => {
             send_ok_or_die(
                 socket,
@@ -2061,16 +2117,21 @@ async fn run_serve(socket: &std::path::Path, cmd: ServeCmd) -> Result<()> {
 }
 
 /// Render `tnet serve status` from a [`ServeConfig`](tailscaled_rs::localapi::ServeConfig). Lists each
-/// served TCP forward, and flags any HTTPS/HTTP/TLS-terminated entry as "not served by this build"
-/// (honest — those modes need an HTTP/TLS stack this build lacks). `_json` is handled by the caller.
-/// Pure → unit-testable.
+/// served entry: plain TCP forwards (the daemon's own accept loop) and HTTPS/HTTP web entries (served
+/// by engine delegation). A `TerminateTLS` raw-TCP entry has no engine analogue at this pin and is
+/// flagged "not served by this build". `_json` is handled by the caller. Pure → unit-testable.
 fn format_serve_status(cfg: &tailscaled_rs::localapi::ServeConfig, _json: bool) -> String {
     if cfg.tcp.is_empty() {
         return "No serve config.\n".to_string();
     }
     let mut out = String::new();
     for (port, h) in &cfg.tcp {
-        if !h.tcp_forward.is_empty() && !h.https && !h.http && h.terminate_tls.is_empty() {
+        // Web entries (https/http + a proxy backend) are served via engine delegation. Checked first
+        // so a web entry never falls through to the bare-flag "not served" branch.
+        if (h.https || h.http) && !h.tcp_forward.is_empty() {
+            let scheme = if h.https { "https" } else { "http" };
+            out.push_str(&format!("{scheme}://<node>:{port} -> {}\n", h.tcp_forward));
+        } else if !h.tcp_forward.is_empty() && !h.https && !h.http && h.terminate_tls.is_empty() {
             out.push_str(&format!("tcp :{port} -> {}\n", h.tcp_forward));
         } else if !h.terminate_tls.is_empty() {
             out.push_str(&format!(
@@ -2078,9 +2139,10 @@ fn format_serve_status(cfg: &tailscaled_rs::localapi::ServeConfig, _json: bool) 
                 h.tcp_forward
             ));
         } else if h.https || h.http {
+            // A web flag with no backend to proxy to — can't be served.
             let kind = if h.https { "HTTPS" } else { "HTTP" };
             out.push_str(&format!(
-                ":{port} {kind} web (NOT served by this build — needs an HTTP/TLS stack)\n"
+                ":{port} {kind} web (NOT served — no proxy target configured)\n"
             ));
         } else {
             out.push_str(&format!(":{port} (empty handler)\n"));
@@ -2858,6 +2920,7 @@ mod tests {
         assert!(format_serve_status(&ServeConfig::default(), false).contains("No serve config"));
 
         let mut cfg = ServeConfig::default();
+        // Plain TCP forward (daemon's own accept loop) — served.
         cfg.tcp.insert(
             "8443".to_string(),
             TcpPortHandler {
@@ -2865,13 +2928,33 @@ mod tests {
                 ..Default::default()
             },
         );
+        // HTTPS web with a backend (engine delegation) — served.
         cfg.tcp.insert(
             "443".to_string(),
+            TcpPortHandler {
+                https: true,
+                tcp_forward: "127.0.0.1:3000".into(),
+                ..Default::default()
+            },
+        );
+        // HTTP web with a backend — served.
+        cfg.tcp.insert(
+            "80".to_string(),
+            TcpPortHandler {
+                http: true,
+                tcp_forward: "127.0.0.1:8080".into(),
+                ..Default::default()
+            },
+        );
+        // HTTPS flag with NO backend — can't be served.
+        cfg.tcp.insert(
+            "8444".to_string(),
             TcpPortHandler {
                 https: true,
                 ..Default::default()
             },
         );
+        // TLS-terminated raw TCP — no engine analogue, not served.
         cfg.tcp.insert(
             "9000".to_string(),
             TcpPortHandler {
@@ -2883,11 +2966,18 @@ mod tests {
         let out = format_serve_status(&cfg, false);
         // Plain forward is served.
         assert!(out.contains("tcp :8443 -> 127.0.0.1:5000"), "{out}");
-        // HTTPS + TLS-terminated are flagged as not served by this build.
+        // HTTPS/HTTP web entries with a backend are served (engine delegation).
         assert!(
-            out.contains("443") && out.contains("NOT served by this build"),
+            out.contains("https://<node>:443 -> 127.0.0.1:3000"),
             "{out}"
         );
+        assert!(out.contains("http://<node>:80 -> 127.0.0.1:8080"), "{out}");
+        // HTTPS flag with no proxy target can't be served.
+        assert!(
+            out.contains("8444") && out.contains("no proxy target"),
+            "{out}"
+        );
+        // TLS-terminated raw TCP is flagged as not served by this build.
         assert!(
             out.contains("9000") && out.contains("TLS-terminated"),
             "{out}"

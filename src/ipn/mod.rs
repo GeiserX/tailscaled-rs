@@ -1326,14 +1326,26 @@ impl Backend {
         }
     }
 
-    /// Spawn the `serve` accept-loop tasks for the current profile's serve config (Go `tailscale
-    /// serve --tcp`). One task per **plain TCP forward** entry (`tcp_forward` set, no HTTPS/HTTP/
-    /// TerminateTLS — see [`serve::is_plain_tcp_forward`]); HTTPS/HTTP/TLS entries are logged + skipped
-    /// (recognized, not served by this build). Each task binds the node's tailnet IPv4 on the served
-    /// port via [`Device::tcp_listen`](tailscale::Device::tcp_listen) and splices every inbound
-    /// connection to the configured localhost target (the `nc` splice, inbound). Tasks hold `Arc`
-    /// clones of `device` and are torn down in [`stop_device`](Backend::stop_device) before the device
-    /// is reclaimed. Stores the handles in [`serve_tasks`](Backend::serve_tasks).
+    /// Spawn the `serve` runtime for the current profile's serve config (Go `tailscale serve`), in
+    /// two lanes:
+    /// - **Plain TCP forward** (`tcp_forward` set, no HTTPS/HTTP/TerminateTLS — see
+    ///   [`serve::is_plain_tcp_forward`]): one accept loop per entry, binding the node's tailnet IPv4
+    ///   on the served port via [`Device::tcp_listen`](tailscale::Device::tcp_listen) and splicing
+    ///   every inbound connection to the configured localhost target (the `nc` splice, inbound).
+    /// - **HTTPS/HTTP web** (see [`serve::is_web_serve`]): delegated to the engine's native serve stack
+    ///   via [`Device::set_serve_config`](tailscale::Device::set_serve_config) — the engine terminates
+    ///   TLS for the node's MagicDNS name and reverse-proxies each decrypted stream to the backend
+    ///   (full-replace; fail-closed on cert error, never a plaintext downgrade). The engine's serve
+    ///   loops are owned by the `Device` (torn down on the next `set_serve_config` / device shutdown),
+    ///   so this lane needs no entry in [`serve_tasks`](Backend::serve_tasks); a removed last web entry
+    ///   is cleared with an empty full-replace.
+    ///
+    /// `TerminateTLS` raw-TCP entries have no engine analogue at this pin and are logged + skipped.
+    ///
+    /// The TCP-forward tasks hold `Arc` clones of `device` and are torn down in
+    /// [`stop_device`](Backend::stop_device) before the device is reclaimed; the engine web serve is
+    /// torn down with the device itself. Stores the supervisor handle in
+    /// [`serve_tasks`](Backend::serve_tasks).
     ///
     /// Spawn a single supervisor task that loads the serve config and arms one accept loop per
     /// plain-TCP-forward entry. Sync (spawns + returns) so it can be called from the non-async
@@ -1348,24 +1360,74 @@ impl Backend {
             let cfg = serve::load(&state_dir, &profile).await;
             // Own the per-port loops in a JoinSet so dropping the supervisor (on abort) drops them.
             let mut loops: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+            // LANE 1 — plain TCP-forward: the daemon's own raw accept→dial→splice loops (no TLS).
             for (port_str, handler) in &cfg.tcp {
                 let Ok(port) = port_str.parse::<u16>() else {
                     tracing::warn!(port = %port_str, "serve: skipping entry with non-numeric port key");
                     continue;
                 };
-                if !serve::is_plain_tcp_forward(handler) {
+                if serve::is_plain_tcp_forward(handler) {
+                    let target = handler.tcp_forward.clone();
+                    let dev = device.clone();
+                    loops.spawn(serve_accept_loop(dev, port, target));
+                } else if !serve::is_web_serve(handler) && !handler.terminate_tls.is_empty() {
+                    // TLS-terminated raw TCP has no engine ServeTarget analogue at this pin.
                     tracing::info!(
                         port,
-                        "serve: entry is HTTPS/HTTP/TLS-terminated — not served by this build (recognized only)"
+                        "serve: TLS-terminated TCP entry — not served by this build (recognized only)"
                     );
-                    continue;
                 }
-                let target = handler.tcp_forward.clone();
-                let dev = device.clone();
-                loops.spawn(serve_accept_loop(dev, port, target));
+                // `is_web_serve` entries are handled by LANE 2 below (engine delegation).
             }
-            // Keep the supervisor alive while the loops run (so aborting it tears them down). Each
-            // loop only returns on listener error / engine teardown.
+            // LANE 2 — HTTPS/HTTP web: delegate to the engine's native serve stack (full-replace
+            // reconcile). The engine's `ServeManager` lives in the `Device` (its per-port accept loops
+            // are owned there, torn down on the next `set_serve_config` or on device shutdown — NOT by
+            // the returned receiver), and `Proxy` targets are reverse-proxied entirely inside it, so we
+            // drop the receiver immediately and the serve stays up regardless of this supervisor.
+            // `get_serve_config` is a pure read; reconcile when the new config has web entries OR the
+            // engine still has a web serve bound (so removing the last web entry clears it too).
+            let has_web = cfg.tcp.values().any(serve::is_web_serve);
+            if has_web {
+                // Arm: resolve the node MagicDNS name (the shared TLS cert name) and replace the serve
+                // config. Needs the device running (self_node is a control round-trip).
+                match device.self_node().await {
+                    Ok(node) => {
+                        let fqdn = node.fqdn(false);
+                        let state = serve::build_web_serve_state(&cfg, &fqdn);
+                        match device.set_serve_config(state).await {
+                            Ok(_rx) => tracing::info!(
+                                name = %fqdn,
+                                ports = cfg.tcp.values().filter(|h| serve::is_web_serve(h)).count(),
+                                "serve: armed HTTPS/HTTP web serve via engine delegation"
+                            ),
+                            // Fail-closed in the engine (no plaintext downgrade). Most commonly a cert
+                            // error: the `acme` feature is off, or the control plane 501s on `set-dns`.
+                            // Non-fatal — the TCP-forward loops above keep running.
+                            Err(e) => tracing::warn!(
+                                error = ?e,
+                                "serve: engine web serve failed (cert/serve error — needs the `acme` \
+                                 feature + a SaaS tailnet that answers set-dns); TCP-forward serve continues"
+                            ),
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        error = ?e,
+                        "serve: could not resolve node MagicDNS name for web serve; skipping web lane"
+                    ),
+                }
+            } else if !device.get_serve_config().ports.is_empty() {
+                // No web entries now, but the engine has a web serve bound from a prior config: clear
+                // it with an empty full-replace (no cert / fqdn needed for an empty state).
+                if let Err(e) = device
+                    .set_serve_config(tailscale::ServeState::default())
+                    .await
+                {
+                    tracing::warn!(error = ?e, "serve: clearing engine web serve failed");
+                }
+            }
+            // Keep the supervisor alive while the TCP loops run (so aborting it tears them down). Each
+            // loop only returns on listener error / engine teardown. With no TCP loops the supervisor
+            // exits here — that's fine: the engine web serve is Device-bound, not supervisor-bound.
             while loops.join_next().await.is_some() {}
         });
         self.serve_tasks.push(supervisor);

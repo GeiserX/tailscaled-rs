@@ -86,6 +86,15 @@ tun = ["tailscale/tun"]
 # privilege-dropping login shell). Running the server needs root (to drop privileges to the
 # policy-mapped local user). Build with `cargo build --features ssh`.
 ssh = ["tailscale/ssh", "dep:rand"]
+# Real ACME certificate issuance for `serve https`/funnel (Phase 4). Off by default — issuance is
+# SaaS-only (the node talks Let's Encrypt directly and publishes the DNS-01 challenge via the
+# control plane's `POST /machine/set-dns`, which a self-hosted control plane may 501 on), and it
+# pulls the engine's `acme` feature (adds only `base64` + `rcgen`, both pure-Rust + ring-only — no
+# second crypto backend). WITHOUT it, the engine's serve/TLS path still compiles and is wired, but
+# `Device::set_serve_config` for any TLS-terminating (web) port fails closed with a cert error
+# (never a plaintext downgrade); plain TCP-forward serve is unaffected. Build with
+# `cargo build --features acme` to issue real certs against a Funnel/HTTPS-enabled SaaS tailnet.
+acme = ["tailscale/acme"]
 
 [profile.release]
 strip = true

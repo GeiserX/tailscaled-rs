@@ -470,13 +470,20 @@ pub struct ServeConfig {
 /// One served tailnet port (Go `ipn.TCPPortHandler`); only `tcp_forward` is served by this build.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TcpPortHandler {
-    /// Handle as HTTPS via a Web config (recognized, NOT served — needs an HTTP/TLS stack).
+    /// Serve HTTPS on this port: the engine terminates TLS for the node's MagicDNS name and
+    /// reverse-proxies each request to [`tcp_forward`](TcpPortHandler::tcp_forward) (the proxy
+    /// backend). Served via engine delegation (`crate::ipn::serve::build_web_serve_state` →
+    /// `Device::set_serve_config`); needs an issuable cert (the `acme` feature + a SaaS tailnet).
     #[serde(default, rename = "HTTPS", skip_serializing_if = "core::ops::Not::not")]
     pub https: bool,
-    /// Handle as HTTP via a Web config (recognized, NOT served — needs an HTTP stack).
+    /// Serve HTTP on this port, reverse-proxying to [`tcp_forward`](TcpPortHandler::tcp_forward).
+    /// Like [`https`](TcpPortHandler::https) but records HTTP intent; the engine serves both via the
+    /// same native reverse-proxy path.
     #[serde(default, rename = "HTTP", skip_serializing_if = "core::ops::Not::not")]
     pub http: bool,
-    /// `IP:port` to forward inbound TCP to (the served case). Empty = not a forward.
+    /// `IP:port` to forward/proxy inbound TCP to. For a plain TCP forward (no `https`/`http`) this is
+    /// the raw splice target; for an `https`/`http` web entry it is the reverse-proxy backend. Empty
+    /// = not a forward.
     #[serde(
         default,
         rename = "TCPForward",
