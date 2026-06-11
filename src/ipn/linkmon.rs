@@ -74,8 +74,15 @@ fn is_path_relevant(addr: &IpAddr) -> bool {
         // Our own tailnet overlay address — a consequence of engine state, not a host-path change.
         // CGNAT 100.64.0.0/10: first octet 100, second octet's top 2 bits == 0b01 (64..=127).
         IpAddr::V4(v4) if v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 0x40 => false,
-        // Tailscale ULA fd7a:115c:a1e0::/48.
-        IpAddr::V6(v6) if v6.segments()[0] == 0xfd7a && v6.segments()[1] == 0x115c => false,
+        // Tailscale ULA fd7a:115c:a1e0::/48 — match the full /48 prefix (all three leading
+        // segments), not just /32, so an unrelated underlay ULA in fd7a:115c::/32 isn't over-filtered.
+        IpAddr::V6(v6)
+            if v6.segments()[0] == 0xfd7a
+                && v6.segments()[1] == 0x115c
+                && v6.segments()[2] == 0xa1e0 =>
+        {
+            false
+        }
         _ => true,
     }
 }
@@ -165,6 +172,16 @@ mod tests {
         assert!(
             underlay.changed(&with_real_100),
             "a non-CGNAT 100.x address is a real underlay addr and must count"
+        );
+        // The ULA filter is /48 (fd7a:115c:a1e0::), NOT /32: an unrelated underlay ULA sharing only
+        // fd7a:115c::/32 must be KEPT (it's not the tailnet's overlay range).
+        let with_other_ula = LinkSnapshot::from_addrs([
+            v4(192, 168, 1, 5),
+            IpAddr::V6(Ipv6Addr::new(0xfd7a, 0x115c, 0xbeef, 0, 0, 0, 0, 1)),
+        ]);
+        assert!(
+            underlay.changed(&with_other_ula),
+            "a /32-but-not-/48 ULA is a real underlay addr and must count (not over-filtered)"
         );
     }
 
