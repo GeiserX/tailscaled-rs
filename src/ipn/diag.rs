@@ -10,6 +10,8 @@
 //! these free functions, so the `server.rs` dispatch call sites (`Backend::file_cp(&dev, ..)`, …)
 //! are unchanged by the move.
 
+use std::os::unix::fs::OpenOptionsExt;
+
 use crate::localapi::{Response, WaitingFileReport, WhoisReport};
 
 /// Report this node's own tailnet addresses (the `tnet ip` / Go `tailscale ip` path).
@@ -434,7 +436,17 @@ pub(super) async fn debug_capture(dev: &tailscale::Device, path: &str, seconds: 
 
     // Create/truncate the file and wrap it buffered. capture_pcap takes a blocking std::io::Write +
     // Send + 'static and MOVES it into the engine, so use a std::fs::File (not tokio's), opened here.
-    let file = match std::fs::File::create(path) {
+    // `O_NOFOLLOW` closes the stat→open TOCTOU window: capture_dest_ok already refused an existing
+    // symlink, but a symlink swapped in AFTER the stat (we run as root) would otherwise be followed by
+    // a plain create — with O_NOFOLLOW the open fails (ELOOP) instead, so we never write through a
+    // planted link to an arbitrary file. (write+create+truncate, same as File::create otherwise.)
+    let file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
         Ok(f) => f,
         Err(e) => {
             return Response::Error {

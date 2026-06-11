@@ -764,7 +764,7 @@ async fn main() -> Result<()> {
             let resp = round_trip(
                 &socket,
                 &Request::DebugCapture {
-                    path: path.clone(),
+                    path,
                     seconds: Some(seconds),
                 },
             )
