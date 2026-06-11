@@ -25,33 +25,111 @@
 
 use std::path::{Path, PathBuf};
 
-pub use crate::localapi::{ServeConfig, TcpPortHandler};
+pub use crate::localapi::{RedirectSpec, ServeConfig, TcpPortHandler, WebMount};
 
-/// Whether a handler is an `HTTPS`/`HTTP` web entry served via engine delegation (the
-/// [`build_web_serve_state`] lane), as opposed to the plain-TCP-forward lane
-/// ([`is_plain_tcp_forward`]) or a not-served `TerminateTLS` entry. A web entry needs a non-empty
-/// `tcp_forward` to use as the reverse-proxy backend.
+/// Whether a handler is a web entry served via engine delegation (the [`build_web_serve_state`]
+/// lane), as opposed to the plain-TCP-forward lane ([`is_plain_tcp_forward`]) or a not-served
+/// `TerminateTLS` entry. A handler is web if it carries ANY web aspect: an `https`/`http` proxy (a
+/// non-empty `tcp_forward`), a fixed `text` body, a `redirect`, or path `mounts`.
 pub fn is_web_serve(h: &TcpPortHandler) -> bool {
-    (h.https || h.http) && !h.tcp_forward.is_empty()
+    ((h.https || h.http) && !h.tcp_forward.is_empty())
+        || h.text.is_some()
+        || h.redirect.is_some()
+        || !h.mounts.is_empty()
 }
 
-/// Translate the **web** (`HTTPS`/`HTTP`) subset of a [`ServeConfig`] into the engine's
+/// Translate one [`WebMount`] into the engine's nested [`ServeTarget`](tailscale::ServeTarget).
+/// Errors (as a static reason) on the same conditions the engine's `validate_target` rejects, so an
+/// invalid mount is caught daemon-side before the engine call rather than failing the whole arm.
+fn mount_to_target(m: &WebMount) -> Result<tailscale::ServeTarget, &'static str> {
+    match m {
+        WebMount::Proxy { to } => {
+            if to.trim().is_empty() {
+                return Err("serve proxy target must not be empty");
+            }
+            Ok(tailscale::ServeTarget::Proxy { to: to.clone() })
+        }
+        WebMount::Text { body } => Ok(tailscale::ServeTarget::Text { body: body.clone() }),
+        WebMount::Redirect { to, status } => {
+            validate_redirect(to, *status)?;
+            Ok(tailscale::ServeTarget::Redirect {
+                to: to.clone(),
+                status: *status,
+            })
+        }
+    }
+}
+
+/// Fail-closed redirect validation, matching the engine's `validate_target`: non-empty `to`, no CR/LF
+/// (response-splitting guard), status in `300..=399`.
+fn validate_redirect(to: &str, status: u16) -> Result<(), &'static str> {
+    if to.trim().is_empty() {
+        return Err("serve redirect target must not be empty");
+    }
+    if to.contains(['\r', '\n']) {
+        return Err("serve redirect target must not contain CR/LF");
+    }
+    if !(300..=399).contains(&status) {
+        return Err("serve redirect status must be in 300..=399");
+    }
+    Ok(())
+}
+
+/// Translate one web [`TcpPortHandler`] into the engine [`ServeTarget`](tailscale::ServeTarget) for
+/// its port. Precedence (a port serves exactly one thing): non-empty `mounts` → `Path` (or, if the
+/// only mount is `/`, the bare target it holds); else `text` → `Text`; else `redirect` → `Redirect`;
+/// else the `tcp_forward` proxy backend → `Proxy`. Returns `Err(reason)` if the handler is web-shaped
+/// but produces nothing valid (so the caller can skip + log it rather than emit an invalid state).
+fn handler_to_target(h: &TcpPortHandler) -> Result<tailscale::ServeTarget, &'static str> {
+    if !h.mounts.is_empty() {
+        // A lone "/" mount is just the bare handler it holds (avoids a needless one-level Path mux).
+        if h.mounts.len() == 1
+            && let Some(root) = h.mounts.get("/")
+        {
+            return mount_to_target(root);
+        }
+        let mut handlers = std::collections::BTreeMap::new();
+        for (mount, m) in &h.mounts {
+            handlers.insert(mount.clone(), mount_to_target(m)?);
+        }
+        return Ok(tailscale::ServeTarget::Path { handlers });
+    }
+    if let Some(body) = &h.text {
+        return Ok(tailscale::ServeTarget::Text { body: body.clone() });
+    }
+    if let Some(r) = &h.redirect {
+        validate_redirect(&r.to, r.status)?;
+        return Ok(tailscale::ServeTarget::Redirect {
+            to: r.to.clone(),
+            status: r.status,
+        });
+    }
+    if (h.https || h.http) && !h.tcp_forward.is_empty() {
+        return Ok(tailscale::ServeTarget::Proxy {
+            to: h.tcp_forward.clone(),
+        });
+    }
+    Err("web handler has no servable target")
+}
+
+/// Translate the **web** subset of a [`ServeConfig`] into the engine's
 /// [`ServeState`](tailscale::ServeState) for [`Device::set_serve_config`](tailscale::Device::set_serve_config).
 ///
-/// Each [`is_web_serve`] entry becomes a [`ServeTarget::Proxy`](tailscale::ServeTarget::Proxy) on its
-/// port, reverse-proxying the TLS-terminated stream to the entry's `tcp_forward` backend. (`HTTP` maps
-/// to the same `Proxy` target as `HTTPS`: the engine's `ServeState` has no distinct plaintext-web
-/// variant at this pin — every web `ServeTarget` rides a TLS-terminating port. The daemon records the
-/// `HTTP`-vs-`HTTPS` intent in its own DTO; the engine serves both as TLS proxy.) Plain `tcp_forward`
-/// entries (no `https`/`http`) and `terminate_tls` entries are **excluded** — the former stays on the
-/// daemon's hand-rolled accept loop, the latter is not served.
+/// Each [`is_web_serve`] entry becomes one [`ServeTarget`](tailscale::ServeTarget) on its port via
+/// [`handler_to_target`]: a `text` body → `Text`, a `redirect` → `Redirect`, path `mounts` → `Path`
+/// (or the bare target for a lone `/` mount), and an `https`/`http` proxy → `Proxy` (the existing
+/// behavior; `HTTP` and `HTTPS` both map to `Proxy` — the engine has no distinct plaintext-web variant
+/// at this pin, every web `ServeTarget` rides a TLS-terminating port). Plain `tcp_forward` entries (no
+/// web aspect) and `terminate_tls` entries are **excluded** — the former stays on the daemon's
+/// hand-rolled accept loop, the latter is not served. A web-shaped entry that produces no valid target
+/// (or an invalid mount/redirect) is skipped + logged rather than poisoning the whole state.
 ///
 /// `name` is the node's MagicDNS name (e.g. `host.tailnet.ts.net`, no trailing dot) — the cert the
 /// engine's TLS-terminating ports share. It is set only when at least one web port is produced; an
 /// input with no web entries yields [`ServeState::default()`](tailscale::ServeState) (empty name + no
 /// ports), which is a valid "serve nothing" config (and, via `set_serve_config`'s REPLACE semantics,
 /// the way to clear a previously-armed web serve). The returned state passes the engine's
-/// `ServeState::validate()` for a valid tailnet `name` + backends.
+/// `ServeState::validate()` for valid inputs.
 pub fn build_web_serve_state(cfg: &ServeConfig, name: &str) -> tailscale::ServeState {
     let mut ports = std::collections::BTreeMap::new();
     for (port_str, h) in &cfg.tcp {
@@ -62,12 +140,14 @@ pub fn build_web_serve_state(cfg: &ServeConfig, name: &str) -> tailscale::ServeS
             // A non-numeric key can't be a tailnet port; skip (the persistence layer keeps it).
             continue;
         };
-        ports.insert(
-            port,
-            tailscale::ServeTarget::Proxy {
-                to: h.tcp_forward.clone(),
-            },
-        );
+        match handler_to_target(h) {
+            Ok(target) => {
+                ports.insert(port, target);
+            }
+            Err(reason) => {
+                tracing::warn!(port, reason, "serve: skipping invalid web handler");
+            }
+        }
     }
     let name = if ports.is_empty() {
         // No TLS-terminating port → no cert needed → leave the name empty (and keep ports empty so
@@ -244,6 +324,204 @@ mod tests {
         assert_eq!(state.name, "host.example.ts.net");
         // The produced state is valid per the engine's fail-closed checks.
         assert!(state.validate().is_ok());
+    }
+
+    #[test]
+    fn web_serve_predicate_recognizes_text_redirect_mounts() {
+        // Text-only handler → web.
+        assert!(is_web_serve(&TcpPortHandler {
+            text: Some("hi".into()),
+            ..Default::default()
+        }));
+        // Redirect-only handler → web.
+        assert!(is_web_serve(&TcpPortHandler {
+            redirect: Some(RedirectSpec {
+                to: "https://x.ts.net/".into(),
+                status: 302
+            }),
+            ..Default::default()
+        }));
+        // Mounts → web.
+        let mut mounts = std::collections::BTreeMap::new();
+        mounts.insert(
+            "/api".to_string(),
+            WebMount::Proxy {
+                to: "127.0.0.1:3000".into(),
+            },
+        );
+        assert!(is_web_serve(&TcpPortHandler {
+            mounts,
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn build_web_serve_state_maps_text_and_redirect() {
+        let mut cfg = ServeConfig::default();
+        cfg.tcp.insert(
+            "443".into(),
+            TcpPortHandler {
+                https: true,
+                text: Some("hello world".into()),
+                ..Default::default()
+            },
+        );
+        cfg.tcp.insert(
+            "8443".into(),
+            TcpPortHandler {
+                https: true,
+                redirect: Some(RedirectSpec {
+                    to: "https://dest.ts.net/".into(),
+                    status: 301,
+                }),
+                ..Default::default()
+            },
+        );
+        let state = build_web_serve_state(&cfg, "host.example.ts.net");
+        assert_eq!(
+            state.ports.get(&443),
+            Some(&tailscale::ServeTarget::Text {
+                body: "hello world".into()
+            })
+        );
+        assert_eq!(
+            state.ports.get(&8443),
+            Some(&tailscale::ServeTarget::Redirect {
+                to: "https://dest.ts.net/".into(),
+                status: 301
+            })
+        );
+        assert!(state.validate().is_ok());
+    }
+
+    #[test]
+    fn build_web_serve_state_lone_root_mount_is_bare_target() {
+        // A single "/" mount collapses to the bare target (no needless Path mux).
+        let mut mounts = std::collections::BTreeMap::new();
+        mounts.insert(
+            "/".to_string(),
+            WebMount::Proxy {
+                to: "127.0.0.1:3000".into(),
+            },
+        );
+        let mut cfg = ServeConfig::default();
+        cfg.tcp.insert(
+            "443".into(),
+            TcpPortHandler {
+                https: true,
+                mounts,
+                ..Default::default()
+            },
+        );
+        let state = build_web_serve_state(&cfg, "host.example.ts.net");
+        assert_eq!(
+            state.ports.get(&443),
+            Some(&tailscale::ServeTarget::Proxy {
+                to: "127.0.0.1:3000".into()
+            })
+        );
+        assert!(state.validate().is_ok());
+    }
+
+    #[test]
+    fn build_web_serve_state_multi_mount_is_path_mux() {
+        let mut mounts = std::collections::BTreeMap::new();
+        mounts.insert(
+            "/".to_string(),
+            WebMount::Text {
+                body: "root".into(),
+            },
+        );
+        mounts.insert(
+            "/api".to_string(),
+            WebMount::Proxy {
+                to: "127.0.0.1:3000".into(),
+            },
+        );
+        let mut cfg = ServeConfig::default();
+        cfg.tcp.insert(
+            "443".into(),
+            TcpPortHandler {
+                https: true,
+                mounts,
+                ..Default::default()
+            },
+        );
+        let state = build_web_serve_state(&cfg, "host.example.ts.net");
+        match state.ports.get(&443) {
+            Some(tailscale::ServeTarget::Path { handlers }) => {
+                assert_eq!(handlers.len(), 2);
+                assert_eq!(
+                    handlers.get("/api"),
+                    Some(&tailscale::ServeTarget::Proxy {
+                        to: "127.0.0.1:3000".into()
+                    })
+                );
+            }
+            other => panic!("expected Path mux, got {other:?}"),
+        }
+        assert!(state.validate().is_ok());
+    }
+
+    #[test]
+    fn build_web_serve_state_skips_invalid_redirect() {
+        // A redirect with an out-of-range status / CRLF is fail-closed: skipped, not emitted.
+        let mut cfg = ServeConfig::default();
+        cfg.tcp.insert(
+            "443".into(),
+            TcpPortHandler {
+                https: true,
+                redirect: Some(RedirectSpec {
+                    to: "https://x.ts.net/".into(),
+                    status: 200, // out of 300..=399
+                }),
+                ..Default::default()
+            },
+        );
+        let state = build_web_serve_state(&cfg, "host.example.ts.net");
+        assert!(state.ports.is_empty(), "invalid redirect must be skipped");
+
+        // CRLF in the target is rejected too.
+        let mut cfg = ServeConfig::default();
+        cfg.tcp.insert(
+            "443".into(),
+            TcpPortHandler {
+                https: true,
+                redirect: Some(RedirectSpec {
+                    to: "https://x.ts.net/\r\nSet-Cookie: evil".into(),
+                    status: 302,
+                }),
+                ..Default::default()
+            },
+        );
+        let state = build_web_serve_state(&cfg, "host.example.ts.net");
+        assert!(state.ports.is_empty(), "CRLF redirect must be skipped");
+    }
+
+    #[test]
+    fn new_web_fields_round_trip_and_dont_disturb_existing_wire() {
+        // The existing plain-forward wire is byte-identical (no new keys when the fields are unset).
+        let mut cfg = ServeConfig::default();
+        set_tcp_forward(&mut cfg, 8443, "127.0.0.1:5000".into());
+        assert_eq!(
+            serde_json::to_string(&cfg).unwrap(),
+            r#"{"TCP":{"8443":{"TCPForward":"127.0.0.1:5000"}}}"#
+        );
+
+        // The new fields round-trip when set.
+        let mut cfg = ServeConfig::default();
+        cfg.tcp.insert(
+            "443".into(),
+            TcpPortHandler {
+                https: true,
+                text: Some("hi".into()),
+                ..Default::default()
+            },
+        );
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains(r#""Text":"hi""#), "{json}");
+        let back: ServeConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cfg);
     }
 
     #[test]
