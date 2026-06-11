@@ -2002,8 +2002,9 @@ fn format_files(files: &[tailscaled_rs::localapi::WaitingFileReport]) -> String 
 
 /// Format the `tnet whois` output for a [`WhoisReport`]. If the IP matched no node, a single
 /// "no tailnet node owns <ip>" line (the caller passes the queried IP). Otherwise: the owning node's
-/// name, its IPv4, the owning user (when control retained it), and any control-granted capabilities,
-/// each on its own line. The node name is control-supplied, so it is passed through
+/// name, its IPv4, the owning user (when control retained it), its control-granted ACL `tags` and
+/// node-key `key-expiry` (when present), and any control-granted capabilities, each on its own line.
+/// The node name, tags, and capabilities are control-supplied, so each is passed through
 /// [`sanitize_for_terminal`] before rendering. Pure (returns the string, trailing newline included)
 /// so it is unit-testable; the caller `print!`s it.
 fn format_whois(w: &tailscaled_rs::localapi::WhoisReport, ip: &str) -> String {
@@ -2020,6 +2021,21 @@ fn format_whois(w: &tailscaled_rs::localapi::WhoisReport, ip: &str) -> String {
     if let Some(user) = w.user.as_deref() {
         // `user` originates from control too; sanitize it before printing.
         out.push_str(&format!("user:         {}\n", sanitize_for_terminal(user)));
+    }
+    if !w.tags.is_empty() {
+        // ACL tags are control-supplied; sanitize each before printing (same as capabilities).
+        out.push_str("tags:\n");
+        for tag in &w.tags {
+            out.push_str(&format!("  - {}\n", sanitize_for_terminal(tag)));
+        }
+    }
+    if let Some(expiry) = w.node_key_expiry.as_deref() {
+        // An RFC3339 timestamp from the engine's chrono Display — not free-form control text, but
+        // sanitize defensively anyway (cheap, keeps "every printed node datum is sanitized" uniform).
+        out.push_str(&format!(
+            "key-expiry:   {}\n",
+            sanitize_for_terminal(expiry)
+        ));
     }
     if !w.capabilities.is_empty() {
         out.push_str("capabilities:\n");
@@ -3498,6 +3514,8 @@ mod tests {
                 "https://tailscale.com/cap/is-admin".to_string(),
                 "funnel".to_string(),
             ],
+            tags: vec!["tag:server".to_string(), "tag:ci".to_string()],
+            node_key_expiry: Some("2026-09-01 12:00:00 UTC".to_string()),
         };
         let out = format_whois(&w, "100.64.0.2");
         assert!(out.contains("peer-b.example.ts.net"), "node name present");
@@ -3506,6 +3524,20 @@ mod tests {
         assert!(
             out.contains("https://tailscale.com/cap/is-admin") && out.contains("funnel"),
             "every capability present"
+        );
+        // ACL tags render under a `tags:` header, one bullet each (Go parity).
+        assert!(
+            out.contains("tags:"),
+            "tags header present when tags non-empty"
+        );
+        assert!(
+            out.contains("tag:server") && out.contains("tag:ci"),
+            "every tag present"
+        );
+        // Node-key expiry renders as a single line when present.
+        assert!(
+            out.contains("key-expiry:") && out.contains("2026-09-01 12:00:00 UTC"),
+            "node-key expiry present when Some"
         );
     }
 
@@ -3519,6 +3551,8 @@ mod tests {
             node_ipv4: Some("100.64.0.2".to_string()),
             user: None,
             capabilities: vec![],
+            tags: vec![],
+            node_key_expiry: None,
         };
         let out = format_whois(&w, "100.64.0.2");
         assert!(out.contains("peer-b"));
@@ -3527,6 +3561,14 @@ mod tests {
         assert!(
             !out.contains("capabilities:"),
             "no capabilities header when the set is empty"
+        );
+        assert!(
+            !out.contains("tags:"),
+            "no tags header when the set is empty"
+        );
+        assert!(
+            !out.contains("key-expiry:"),
+            "no key-expiry line when expiry is None"
         );
     }
 
@@ -3541,10 +3583,19 @@ mod tests {
             node_ipv4: Some("100.64.0.2".to_string()),
             user: None,
             capabilities: vec![],
+            // Tags are also control-supplied — a hostile one must be sanitized just like the name.
+            tags: vec!["tag:\x1bevil\x07".to_string()],
+            node_key_expiry: None,
         };
         let out = format_whois(&w, "100.64.0.2");
-        assert!(!out.contains('\x1b'), "ESC must be stripped from node name");
-        assert!(!out.contains('\x07'), "BEL must be stripped from node name");
+        assert!(
+            !out.contains('\x1b'),
+            "ESC must be stripped from node name + tags"
+        );
+        assert!(
+            !out.contains('\x07'),
+            "BEL must be stripped from node name + tags"
+        );
         // The readable parts survive (just the control bytes become the replacement char).
         assert!(out.contains("evil"));
         assert!(out.contains("name"));

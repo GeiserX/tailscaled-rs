@@ -401,6 +401,16 @@ pub struct WhoisReport {
     /// The node's control-granted capabilities (capability name → args).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+    /// The node's control-granted ACL tags (e.g. `tag:server`), if any. `#[serde(default)]` +
+    /// `skip_serializing_if` keep the wire backward-compatible (an older daemon/client simply omits
+    /// the field, which deserializes to an empty set).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// When the node's key expires (RFC3339-shaped, via the engine's chrono `DateTime<Utc>` Display),
+    /// or `None` if the key has no expiry. Surfaced so `whois`/`whoami` can show an upcoming/elapsed
+    /// key expiry the way Go does. Back-compatible (omitted when absent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_key_expiry: Option<String>,
 }
 
 /// A single waiting Taildrop file, returned by [`Request::FileList`]. Mirrors the engine's
@@ -998,6 +1008,62 @@ mod tests {
             Response::DnsStatus(r) => assert_eq!(r, DnsStatusReport::default()),
             other => panic!("expected DnsStatus, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn whois_report_round_trips_with_tags_and_expiry() {
+        // The enriched whois reply (ACL tags + node-key expiry) must survive the wire (CLI and daemon
+        // are separate processes agreeing only on this JSON), and the new fields must be
+        // backward-compatible: an old wire omitting them deserializes to empty/None, and empty fields
+        // are omitted from the serialized JSON (skip_serializing_if).
+        let report = WhoisReport {
+            found: true,
+            node_name: Some("peer-b.example.ts.net".into()),
+            node_ipv4: Some("100.64.0.2".into()),
+            user: None,
+            capabilities: vec!["funnel".into()],
+            tags: vec!["tag:server".into(), "tag:ci".into()],
+            node_key_expiry: Some("2026-09-01 12:00:00 UTC".into()),
+        };
+        let json = serde_json::to_string(&Response::Whois(report.clone())).unwrap();
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::Whois(r) => {
+                assert_eq!(r.tags, report.tags, "tags must round-trip");
+                assert_eq!(
+                    r.node_key_expiry, report.node_key_expiry,
+                    "node_key_expiry must round-trip"
+                );
+                assert_eq!(r.capabilities, report.capabilities);
+                assert_eq!(r.node_name, report.node_name);
+            }
+            other => panic!("expected Whois, got {other:?}"),
+        }
+
+        // Back-compat: an old wire with NO tags / node_key_expiry keys still parses, defaulting to
+        // empty Vec / None (a whois never invents tags or an expiry that control did not send).
+        let old_wire =
+            r#"{"kind":"whois","found":true,"node_name":"peer-b","node_ipv4":"100.64.0.2"}"#;
+        match serde_json::from_str::<Response>(old_wire).expect("old wire parses") {
+            Response::Whois(r) => {
+                assert!(r.tags.is_empty(), "omitted tags default to empty");
+                assert!(
+                    r.node_key_expiry.is_none(),
+                    "omitted node_key_expiry defaults to None"
+                );
+            }
+            other => panic!("expected Whois, got {other:?}"),
+        }
+
+        // Empty fields are omitted from the wire (skip_serializing_if) — no `"tags":[]` noise.
+        let empty_json = serde_json::to_string(&Response::Whois(WhoisReport {
+            found: false,
+            ..Default::default()
+        }))
+        .unwrap();
+        assert!(
+            !empty_json.contains("tags") && !empty_json.contains("node_key_expiry"),
+            "empty tags/expiry must be omitted from the wire: {empty_json}"
+        );
     }
 
     #[test]
