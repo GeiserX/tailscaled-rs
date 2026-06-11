@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.20.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.19.0...v0.20.0) (2026-06-11)
+
+
+### Features
+
+* **debug:** tnet debug capture — packet capture to a pcap file ([#67](https://github.com/GeiserX/tailscaled-rs/issues/67)) ([e30ee03](https://github.com/GeiserX/tailscaled-rs/commit/e30ee0386853e9eb9b27e010166abe49f704f8d4))
+
 ## [0.19.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.18.0...v0.19.0) (2026-06-11)
 
 
