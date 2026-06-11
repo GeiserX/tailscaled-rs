@@ -954,6 +954,37 @@ mod tests {
     }
 
     #[test]
+    fn bug_report_request_wire_is_back_compatible() {
+        // `BugReport` changed from a unit variant to `{ note: Option<String> }`. This LOCKS the wire
+        // back-compat both ways (the riskiest part of that change): a no-note request must serialize
+        // BYTE-IDENTICAL to the old bare unit variant (`skip_serializing_if` is what makes this hold —
+        // no `"note":null`), and the old bare JSON must still deserialize (→ note: None). Mirrors the
+        // per-variant wire-lock convention every sibling request already follows.
+        assert_eq!(
+            serde_json::to_string(&Request::BugReport { note: None }).unwrap(),
+            r#"{"cmd":"bug_report"}"#,
+            "no-note must be byte-identical to the old unit variant's wire form"
+        );
+        // Old client's bare JSON → new struct variant with note: None (forward-compat).
+        assert!(matches!(
+            serde_json::from_str::<Request>(r#"{"cmd":"bug_report"}"#).unwrap(),
+            Request::BugReport { note: None }
+        ));
+        // With a note, the field is present on the wire and round-trips.
+        assert_eq!(
+            serde_json::to_string(&Request::BugReport {
+                note: Some("dns broke".into())
+            })
+            .unwrap(),
+            r#"{"cmd":"bug_report","note":"dns broke"}"#
+        );
+        match serde_json::from_str::<Request>(r#"{"cmd":"bug_report","note":"x"}"#).unwrap() {
+            Request::BugReport { note } => assert_eq!(note.as_deref(), Some("x")),
+            other => panic!("expected BugReport, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn get_prefs_request_response_round_trip() {
         // `get_prefs` discriminant + the Prefs(PrefsView) reply must survive the wire.
         assert_eq!(

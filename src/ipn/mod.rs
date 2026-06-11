@@ -2022,8 +2022,6 @@ impl Backend {
         diag::metrics(dev)
     }
 
-    // (`sanitize_marker_note` is a free fn below — the bugreport marker note hardener.)
-
     /// Build a LOCAL diagnostic marker (the `tnet bugreport` path). Unlike Go's `bugreport`, which
     /// uploads logs to logtail and returns the server-side log id, this fork has no log-upload
     /// backend — the marker is a purely local identifier the operator can quote when reporting an
