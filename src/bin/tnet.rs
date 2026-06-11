@@ -2030,8 +2030,9 @@ fn format_whois(w: &tailscaled_rs::localapi::WhoisReport, ip: &str) -> String {
         }
     }
     if let Some(expiry) = w.node_key_expiry.as_deref() {
-        // An RFC3339 timestamp from the engine's chrono Display — not free-form control text, but
-        // sanitize defensively anyway (cheap, keeps "every printed node datum is sanitized" uniform).
+        // A chrono `DateTime<Utc>` Display timestamp (`YYYY-MM-DD HH:MM:SS UTC`) from the engine —
+        // not free-form control text, but sanitize defensively anyway (cheap, keeps "every printed
+        // node datum is sanitized" uniform).
         out.push_str(&format!(
             "key-expiry:   {}\n",
             sanitize_for_terminal(expiry)

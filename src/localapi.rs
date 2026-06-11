@@ -406,9 +406,10 @@ pub struct WhoisReport {
     /// the field, which deserializes to an empty set).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
-    /// When the node's key expires (RFC3339-shaped, via the engine's chrono `DateTime<Utc>` Display),
-    /// or `None` if the key has no expiry. Surfaced so `whois`/`whoami` can show an upcoming/elapsed
-    /// key expiry the way Go does. Back-compatible (omitted when absent).
+    /// When the node's key expires, in the engine's chrono `DateTime<Utc>` Display form
+    /// (`YYYY-MM-DD HH:MM:SS UTC` — note this is NOT RFC3339's `T…Z`), or `None` if the key has no
+    /// expiry. Surfaced so `whois`/`whoami` can show an upcoming/elapsed key expiry (Go carries it in
+    /// its `whois --json`). Back-compatible (omitted when absent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_key_expiry: Option<String>,
 }
@@ -1060,8 +1061,10 @@ mod tests {
             ..Default::default()
         }))
         .unwrap();
+        // Quoted-key checks (not bare substrings) so this stays correct even if a future field name
+        // happens to contain "tags"/"node_key_expiry" as a substring.
         assert!(
-            !empty_json.contains("tags") && !empty_json.contains("node_key_expiry"),
+            !empty_json.contains("\"tags\"") && !empty_json.contains("\"node_key_expiry\""),
             "empty tags/expiry must be omitted from the wire: {empty_json}"
         );
     }

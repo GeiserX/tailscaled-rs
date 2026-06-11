@@ -188,9 +188,10 @@ pub(super) async fn whois(dev: &tailscale::Device, ip: &str) -> Response {
             let node = tailscale::StatusNode::from_node(&w.node);
             // Read the tag set + key-expiry off the full `Node` BEFORE the field moves below
             // (`user`/`capabilities`). `StatusNode::from_node` only derived name+ipv4, so without
-            // this the daemon would discard both — yet Go's `whois`/`whoami` surface them. Expiry →
-            // its chrono `DateTime<Utc>` Display (RFC3339-shaped), matching how `status` renders
-            // `last_seen`.
+            // this the daemon would discard both — yet Go surfaces them (tags in `whois` text; the
+            // key-expiry is a superset this fork also exposes). Expiry → its chrono `DateTime<Utc>`
+            // Display form (`YYYY-MM-DD HH:MM:SS UTC`, not RFC3339's `T…Z`), matching how `status`
+            // renders `last_seen`.
             let tags = w.node.tags.clone();
             let node_key_expiry = w.node.node_key_expiry.map(|t| t.to_string());
             Response::Whois(WhoisReport {
