@@ -1450,9 +1450,101 @@ impl Backend {
             {
                 tracing::warn!(error = ?e, "serve: fail-closed clear of stale engine web serve failed");
             }
-            // Keep the supervisor alive while the TCP loops run (so aborting it tears them down). Each
-            // loop only returns on listener error / engine teardown. With no TCP loops the supervisor
-            // exits here — that's fine: the engine web serve is Device-bound, not supervisor-bound.
+            // LANE 3 — FUNNEL: expose a port's web serve to the PUBLIC internet (Go `tailscale
+            // funnel`). For each funnel-enabled port that has a web proxy backend, call the engine's
+            // `listen_funnel` (it gates on node-attr + funnel-port + cert, fail-closed) and — because
+            // funnel hands back RAW TLS-terminated streams (NOT internally proxied like LANE 2) — own a
+            // `funnel_accept_loop` that splices each to the local backend. The public ingress data path
+            // is live-only/SaaS-only (no relay against a self-hosted control plane), so a fed loop needs
+            // real Tailscale SaaS + a Funnel ACL; arming + gating is what we do here.
+            let funnel_ports = serve::funnel_ports(&cfg);
+            if !funnel_ports.is_empty() {
+                // Need the node MagicDNS name (the funnel hostname / cert name) + each port's backend.
+                match device.self_node().await {
+                    Ok(node) => {
+                        let fqdn = node.fqdn(false);
+                        for port in funnel_ports {
+                            // Funnel exposes a serve: the port must have a web proxy backend to splice
+                            // to. (Mirrors Go's "funnel=on but no serve config" warning.)
+                            let backend = cfg
+                                .tcp
+                                .get(&port.to_string())
+                                .filter(|h| serve::is_web_serve(h))
+                                .map(|h| h.tcp_forward.clone())
+                                .filter(|b| !b.is_empty());
+                            let Some(backend) = backend else {
+                                tracing::warn!(
+                                    port,
+                                    "funnel: enabled for a port with no web proxy backend — skipping \
+                                     (funnel exposes a serve; configure `serve https <port> <target>` first)"
+                                );
+                                continue;
+                            };
+                            let fcfg = tailscale::ServeConfig {
+                                name: fqdn.clone(),
+                                port,
+                                target: tailscale::ServeTarget::Proxy {
+                                    to: backend.clone(),
+                                },
+                            };
+                            match device
+                                .listen_funnel(&fcfg, ts_control::FunnelOptions::default())
+                                .await
+                            {
+                                Ok(mut rx) => {
+                                    tracing::info!(name = %fqdn, port, "funnel: armed via engine listen_funnel");
+                                    // LANE 3 accept loop (inlined so the receiver type — an
+                                    // engine-internal `ts_runtime::funnel::FunnelAcceptedReceiver` not
+                                    // re-exported at the facade root — is inferred, never named). Funnel
+                                    // hands back RAW TLS-terminated streams (unlike LANE 2's internal
+                                    // proxy), so we splice each to the local backend ourselves. Holding
+                                    // `rx` keeps the listener alive; the loop ends on receiver close /
+                                    // task abort. The public ingress data path is live-only/SaaS-only (no
+                                    // relay against a self-hosted control plane — the loop simply parks).
+                                    let backend = backend.clone();
+                                    loops.spawn(async move {
+                                        while let Some(accepted) = rx.recv().await {
+                                            let backend = backend.clone();
+                                            tokio::spawn(async move {
+                                                let mut stream = accepted.stream;
+                                                match tokio::net::TcpStream::connect(&backend).await
+                                                {
+                                                    Ok(mut local) => {
+                                                        let _ = tokio::io::copy_bidirectional(
+                                                            &mut stream,
+                                                            &mut local,
+                                                        )
+                                                        .await;
+                                                    }
+                                                    Err(e) => tracing::warn!(
+                                                        error = %e, %backend,
+                                                        "funnel: dial to local backend failed"
+                                                    ),
+                                                }
+                                            });
+                                        }
+                                    });
+                                }
+                                // Fail-closed in the engine: node lacks the https/funnel node-attrs, the
+                                // port isn't in the funnel-ports cap, or the cert couldn't be issued
+                                // (acme off / non-SaaS control). Non-fatal — other lanes keep running.
+                                Err(e) => tracing::warn!(
+                                    error = %e, port,
+                                    "funnel: engine listen_funnel failed (node-attr/port/cert gate — needs \
+                                     a Funnel-enabled SaaS tailnet + the `acme` feature); skipping this port"
+                                ),
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        error = ?e,
+                        "funnel: could not resolve node MagicDNS name; skipping funnel lane"
+                    ),
+                }
+            }
+            // Keep the supervisor alive while the TCP/funnel loops run (so aborting it tears them down).
+            // Each loop only returns on listener/receiver close or engine teardown. With no loops the
+            // supervisor exits here — fine: the engine web serve is Device-bound, not supervisor-bound.
             while loops.join_next().await.is_some() {}
         });
         self.serve_tasks.push(supervisor);
@@ -2051,6 +2143,30 @@ mod tests {
         assert!(
             be.serve_tasks.is_empty(),
             "set_serve_config on a down node must not spawn serve loops"
+        );
+
+        // A funnel-enabled config likewise persists + round-trips and arms NO loops while down
+        // (the funnel listener + accept loop arm on the next `up`, in spawn_serve LANE 3).
+        let mut cfg = serve::ServeConfig::default();
+        cfg.tcp.insert(
+            "443".into(),
+            crate::localapi::TcpPortHandler {
+                https: true,
+                tcp_forward: "127.0.0.1:3000".into(),
+                ..Default::default()
+            },
+        );
+        serve::set_funnel(&mut cfg, "host.example.ts.net", 443, true);
+        be.set_serve_config(&cfg).await.unwrap();
+        let back = be.serve_config().await;
+        assert_eq!(back, cfg);
+        assert_eq!(
+            serve::funnel_ports(&back),
+            std::collections::BTreeSet::from([443])
+        );
+        assert!(
+            be.serve_tasks.is_empty(),
+            "set_serve_config with funnel on a down node must not spawn loops"
         );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;

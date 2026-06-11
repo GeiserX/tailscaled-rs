@@ -364,6 +364,19 @@ enum Command {
         #[command(subcommand)]
         cmd: ServeCmd,
     },
+    /// Expose a tailnet port to the PUBLIC internet via Tailscale Funnel (Go `tailscale funnel`).
+    /// `funnel <port> on` enables Funnel for a port that's already served (`serve https <port> …`);
+    /// `off` disables it. The node must have Funnel enabled for the tailnet (the `https` + `funnel`
+    /// node attributes) and the port must be Funnel-allowed; the public ingress path needs a real
+    /// Tailscale SaaS tailnet (a self-hosted control plane has no ingress relay).
+    Funnel {
+        /// The tailnet port to expose (must already have a `serve https`/`http` handler).
+        #[arg(value_name = "PORT")]
+        port: u16,
+        /// `on` to enable Funnel for the port, `off` to disable it.
+        #[arg(value_name = "ON_OFF", value_parser = ["on", "off"])]
+        on_off: String,
+    },
 }
 
 /// `tnet serve` subcommands. Mirrors the TCP-forward subset of Go `tailscale serve`.
@@ -710,6 +723,13 @@ async fn main() -> Result<()> {
             return run_serve(&socket, cmd)
                 .await
                 .with_context(|| format!("serve via {}", socket.display()));
+        }
+        // `funnel <port> on|off`: GET status (for the node's MagicDNS name → the HostPort key) + the
+        // current ServeConfig, toggle AllowFunnel, SET it back. Inline (read-modify-write, like serve).
+        Command::Funnel { port, on_off } => {
+            return run_funnel(&socket, port, &on_off)
+                .await
+                .with_context(|| format!("funnel via {}", socket.display()));
         }
         Command::Down => Request::Down,
         Command::Logout => Request::Logout,
@@ -2314,6 +2334,52 @@ async fn run_serve(socket: &std::path::Path, cmd: ServeCmd) -> Result<()> {
     }
 }
 
+/// Drive `tnet funnel <port> {on|off}` (Go `tailscale funnel`): resolve this node's MagicDNS name
+/// (the Funnel `HostPort` key), then read-modify-write the ServeConfig's `AllowFunnel` via
+/// [`serve::set_funnel`]. On `on` for a port with no serve handler, prints a Go-faithful warning
+/// (Funnel exposes a serve, so a bare funnel-on does nothing until `serve https <port> …` is set).
+async fn run_funnel(socket: &std::path::Path, port: u16, on_off: &str) -> Result<()> {
+    let on = on_off == "on";
+    // The node's MagicDNS name (from Status.self_name) is the Funnel HostPort key. Without it we
+    // can't build the `host:port` key Go uses, so require the node to be up + named.
+    let status = match round_trip(socket, &Request::Status).await {
+        Ok(Response::Status(s)) => s,
+        Ok(other) => anyhow::bail!("unexpected response to status request: {other:?}"),
+        Err(e) => return Err(e).context("querying status"),
+    };
+    let Some(host) = status.self_name.as_deref().filter(|h| !h.is_empty()) else {
+        anyhow::bail!(
+            "no MagicDNS name yet (state: {}); bring the node up before enabling funnel",
+            status.state
+        );
+    };
+
+    let mut cfg = match round_trip(socket, &Request::GetServeConfig).await {
+        Ok(Response::ServeConfig(c)) => c,
+        Ok(other) => anyhow::bail!("unexpected response to get serve config: {other:?}"),
+        Err(e) => return Err(e).context("getting serve config"),
+    };
+    tailscaled_rs::ipn::serve::set_funnel(&mut cfg, host, port, on);
+
+    // Go warns when funnel is on for a port with no serve config (funnel exposes a serve).
+    let has_serve = cfg
+        .tcp
+        .get(&port.to_string())
+        .is_some_and(tailscaled_rs::ipn::serve::is_web_serve);
+    send_ok_or_die(socket, Request::SetServeConfig { config: cfg }).await?;
+    if on {
+        println!("funnel enabled for {host}:{port}");
+        if !has_serve {
+            eprintln!(
+                "warning: funnel=on for {host}:{port}, but no serve config — run `tnet serve https {port} <target>` to expose something"
+            );
+        }
+    } else {
+        println!("funnel disabled for {host}:{port}");
+    }
+    Ok(())
+}
+
 /// Truncate a string for `serve status` display, faithful to Go `serve`'s `elipticallyTruncate`:
 /// `<= max` bytes returned unchanged, else `s[..max-3] + "..."` (ASCII dots, total length `max`). Uses
 /// a char-boundary-safe slice so multibyte UTF-8 is not split (a benign divergence from Go's byte
@@ -2385,6 +2451,16 @@ fn format_serve_status(cfg: &tailscaled_rs::localapi::ServeConfig, _json: bool) 
             ));
         } else {
             out.push_str(&format!(":{port} (empty handler)\n"));
+        }
+    }
+    // Funnel summary: ports exposed to the PUBLIC internet (Go's "# Funnel on:" section). Listed
+    // after the serve entries so the per-port lines stay clean; a funnel port should also appear
+    // above as an https serve (funnel exposes a serve).
+    let funnel = tailscaled_rs::ipn::serve::funnel_ports(cfg);
+    if !funnel.is_empty() {
+        out.push_str("Funnel (on the public internet):\n");
+        for port in &funnel {
+            out.push_str(&format!("  https://<node>:{port}\n"));
         }
     }
     out
@@ -3393,6 +3469,28 @@ mod tests {
         );
         assert!(out.contains("9443 (path mux)"), "{out}");
         assert!(out.contains("/api -> proxy -> 127.0.0.1:3000"), "{out}");
+    }
+
+    #[test]
+    fn format_serve_status_annotates_funnel_ports() {
+        use tailscaled_rs::ipn::serve;
+        use tailscaled_rs::localapi::{ServeConfig, TcpPortHandler};
+        let mut cfg = ServeConfig::default();
+        cfg.tcp.insert(
+            "443".into(),
+            TcpPortHandler {
+                https: true,
+                tcp_forward: "127.0.0.1:3000".into(),
+                ..Default::default()
+            },
+        );
+        // No funnel yet → no funnel section.
+        assert!(!format_serve_status(&cfg, false).contains("Funnel"));
+        // Enable funnel on 443 → the funnel section appears.
+        serve::set_funnel(&mut cfg, "host.example.ts.net", 443, true);
+        let out = format_serve_status(&cfg, false);
+        assert!(out.contains("Funnel (on the public internet):"), "{out}");
+        assert!(out.contains("https://<node>:443"), "{out}");
     }
 
     #[test]
