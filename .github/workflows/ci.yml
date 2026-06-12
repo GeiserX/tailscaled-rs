@@ -45,6 +45,12 @@ jobs:
       - name: Clippy (ssh feature)
         run: cargo clippy --all-targets --features ssh -- -D warnings
 
+      # The `acme` feature is off by default (it pulls the engine's ACME cert-issuance path for
+      # `tnet cert`). Lint it explicitly so the cfg(feature = "acme")-gated code can't silently rot —
+      # the default-config steps only compile the non-acme fail-closed branch.
+      - name: Clippy (acme feature)
+        run: cargo clippy --all-targets --features acme -- -D warnings
+
       - name: Test
         run: cargo test --all-targets
 
