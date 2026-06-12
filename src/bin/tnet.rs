@@ -3994,31 +3994,75 @@ fn elliptically_truncate(s: &str, max: usize) -> String {
     format!("{}...", &s[..end])
 }
 
+/// One-line description of a Go-shaped [`HttpHandler`](tailscaled_rs::localapi::HttpHandler) for
+/// `serve status` (proxy / text / redirect / filesystem-path), mirroring the legacy `WebMount` render.
+/// Control-supplied fields are terminal-sanitized; a long text body is elliptically truncated.
+fn web_handler_desc(h: &tailscaled_rs::localapi::HttpHandler) -> String {
+    if !h.proxy.is_empty() {
+        format!("proxy -> {}", sanitize_for_terminal(&h.proxy))
+    } else if !h.text.is_empty() {
+        format!("text \"{}\"", elliptically_truncate(&h.text, 20))
+    } else if !h.redirect.is_empty() {
+        format!("redirect -> {}", sanitize_for_terminal(&h.redirect))
+    } else if !h.path.is_empty() {
+        format!(
+            "path {} (filesystem serving NOT supported by this build)",
+            sanitize_for_terminal(&h.path)
+        )
+    } else {
+        "(empty handler)".to_string()
+    }
+}
+
 /// Render `tnet serve status` from a [`ServeConfig`](tailscaled_rs::localapi::ServeConfig). Lists each
 /// served entry: plain TCP forwards (the daemon's own accept loop), HTTPS/HTTP web entries (proxy /
-/// text / redirect / path-mux, served by engine delegation), and TLS-terminated raw-TCP forwards
-/// (`--tls-terminated-tcp`, also engine-delegated). A `TerminateTLS` entry with no backend, or one
-/// requesting PROXY-protocol (which the engine `Proxy` target can't write), is flagged "NOT served".
-/// `_json` is handled by the caller. Pure → unit-testable.
+/// text / redirect / path-mux — Go's top-level `Web` map, or the legacy per-handler bodies — served by
+/// engine delegation), and TLS-terminated raw-TCP forwards (`--tls-terminated-tcp`, also
+/// engine-delegated). A `TerminateTLS` entry with no backend, or one requesting PROXY-protocol (which
+/// the engine `Proxy` target can't write), is flagged "NOT served". `_json` is handled by the caller.
+/// Pure → unit-testable.
 fn format_serve_status(cfg: &tailscaled_rs::localapi::ServeConfig, _json: bool) -> String {
     use tailscaled_rs::localapi::WebMount;
     // Go's `isServeConfigEmpty` (cmd/tailscale/cli/serve_status.go) is empty iff `len(TCP)==0 &&
-    // len(Web)==0 && len(Services)==0 && len(AllowFunnel)==0`. This wire model carries only `tcp` +
-    // `allow_funnel` (no `Web`/`Services` — see the ServeConfig DTO + bead tsd-6p4), so checking those
-    // two is exhaustive over everything this build can represent: a funnel-only config (AllowFunnel
-    // set, TCP empty) is correctly NOT empty. ⚠️ If `Web`/`Services` are ever added to ServeConfig,
-    // this `&&` MUST extend or a web/service-only config would silently print "No serve config".
-    // Message matches Go's exact `No serve config` (no trailing period).
-    if cfg.tcp.is_empty() && cfg.allow_funnel.is_empty() {
+    // len(Web)==0 && len(Services)==0 && len(AllowFunnel)==0`. This wire model carries `tcp` + `web`
+    // + `allow_funnel` (no `Services` — see the ServeConfig DTO + bead tsd-6p4); checking those three
+    // is exhaustive over everything this build can represent (a funnel-only or Web-only config is
+    // correctly NOT empty). ⚠️ If `Services` is ever added, this `&&` MUST extend or a service-only
+    // config would silently print "No serve config". Message matches Go's exact `No serve config`.
+    if cfg.tcp.is_empty() && cfg.web.is_empty() && cfg.allow_funnel.is_empty() {
         return "No serve config\n".to_string();
     }
     let mut out = String::new();
     for (port, h) in &cfg.tcp {
         let scheme = if h.http { "http" } else { "https" };
-        // Web entries (served via engine delegation) first, richest kind first, so a web entry never
-        // falls through to the bare-flag "not served" branch.
-        if !h.mounts.is_empty() {
-            // Path-mux: one line per mount (sorted by the BTreeMap key).
+        // Go-shaped Web-map handlers take precedence over the legacy per-handler bodies (when both
+        // somehow coexist, the Web map is the authoritative target — it's what Stage B's translation
+        // serves). Match the port's `Web[host:port]` entry by the `:port` suffix (the key carries the
+        // real MagicDNS host, which we render instead of the `<node>` placeholder).
+        let web_entry = (h.https || h.http)
+            .then(|| {
+                let suffix = format!(":{port}");
+                cfg.web.iter().find(|(k, _)| k.ends_with(&suffix))
+            })
+            .flatten();
+        if let Some((hostport, wsc)) = web_entry {
+            let host = sanitize_for_terminal(hostport);
+            if wsc.handlers.len() == 1
+                && let Some(h0) = wsc.handlers.get("/")
+            {
+                out.push_str(&format!("{scheme}://{host} -> {}\n", web_handler_desc(h0)));
+            } else {
+                out.push_str(&format!("{scheme}://{host} (path mux)\n"));
+                for (mount, hh) in &wsc.handlers {
+                    out.push_str(&format!(
+                        "  {} -> {}\n",
+                        sanitize_for_terminal(mount),
+                        web_handler_desc(hh)
+                    ));
+                }
+            }
+        } else if !h.mounts.is_empty() {
+            // Legacy path-mux: one line per mount (sorted by the BTreeMap key).
             out.push_str(&format!("{scheme}://<node>:{port} (path mux)\n"));
             for (mount, m) in &h.mounts {
                 let desc = match m {
@@ -5716,6 +5760,38 @@ mod tests {
         );
         assert!(out.contains("9443 (path mux)"), "{out}");
         assert!(out.contains("/api -> proxy -> 127.0.0.1:3000"), "{out}");
+    }
+
+    #[test]
+    fn format_serve_status_renders_go_web_map() {
+        // A Go-shaped config (target in the top-level Web map) must render as served, using the real
+        // host from the Web key — and a Web-only config must NOT print "No serve config".
+        let cfg: tailscaled_rs::localapi::ServeConfig = serde_json::from_str(
+            r#"{"TCP":{"443":{"HTTPS":true}},"Web":{"host.ts.net:443":{"Handlers":{"/":{"Proxy":"127.0.0.1:3000"}}}}}"#,
+        )
+        .unwrap();
+        let out = format_serve_status(&cfg, false);
+        assert!(
+            !out.contains("No serve config"),
+            "Web-only config is not empty: {out}"
+        );
+        assert!(
+            out.contains("https://host.ts.net:443 -> proxy -> 127.0.0.1:3000"),
+            "the Web-map proxy must render with its real host: {out}"
+        );
+
+        // Multi-mount Web entry → path mux, rendered from the Web map.
+        let mux: tailscaled_rs::localapi::ServeConfig = serde_json::from_str(
+            r#"{"TCP":{"443":{"HTTPS":true}},"Web":{"h:443":{"Handlers":{"/":{"Proxy":"127.0.0.1:3000"},"/old":{"Redirect":"301:https://h/new"}}}}}"#,
+        )
+        .unwrap();
+        let out = format_serve_status(&mux, false);
+        assert!(out.contains("https://h:443 (path mux)"), "{out}");
+        assert!(out.contains("/ -> proxy -> 127.0.0.1:3000"), "{out}");
+        assert!(
+            out.contains("/old -> redirect -> 301:https://h/new"),
+            "{out}"
+        );
     }
 
     #[test]

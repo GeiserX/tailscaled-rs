@@ -1989,10 +1989,12 @@ impl Backend {
                     let conn_limit =
                         std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_SERVE_CONNECTIONS));
                     loops.spawn(serve_accept_loop(dev, port, target, conn_limit));
-                } else if serve::is_web_serve(handler) || serve::is_terminate_tls_serve(handler) {
-                    // Handled by LANE 2 below (engine delegation): web entries AND servable
-                    // TLS-terminated raw-TCP forwards (the engine terminates TLS + splices to the
-                    // backend — Go's `TerminateTLS`). Nothing to do here.
+                } else if serve::port_is_web_serve(&cfg, port_str, handler)
+                    || serve::is_terminate_tls_serve(handler)
+                {
+                    // Handled by LANE 2 below (engine delegation): web entries (legacy-bodied OR
+                    // Go `Web`-map-bodied) AND servable TLS-terminated raw-TCP forwards (the engine
+                    // terminates TLS + splices to the backend — Go's `TerminateTLS`). Nothing here.
                 } else if !handler.terminate_tls.is_empty() {
                     // A terminate-tls entry we CAN'T serve via the engine `Proxy` target: either no
                     // `tcp_forward` backend to splice to, or `proxy_protocol != 0` (the engine doesn't
@@ -2020,12 +2022,11 @@ impl Backend {
             // drop the receiver immediately and the serve stays up regardless of this supervisor.
             // `get_serve_config` is a pure read; reconcile when the new config has web entries OR the
             // engine still has a web serve bound (so removing the last web entry clears it too).
-            // Arm LANE 2 for web entries AND servable TLS-terminated raw-TCP forwards (both produce
-            // engine `ServeState` ports via `build_web_serve_state`).
-            let has_web = cfg
-                .tcp
-                .values()
-                .any(|h| serve::is_web_serve(h) || serve::is_terminate_tls_serve(h));
+            // Arm LANE 2 for web entries (legacy or Go `Web`-map) AND servable TLS-terminated raw-TCP
+            // forwards (both produce engine `ServeState` ports via `build_web_serve_state`).
+            let has_web = cfg.tcp.iter().any(|(port_str, h)| {
+                serve::port_is_web_serve(&cfg, port_str, h) || serve::is_terminate_tls_serve(h)
+            });
             // Arm the web serve (resolve the node MagicDNS name — the shared TLS cert name — and
             // full-replace the engine serve config). `Ok(())` = armed; `Err` = could not arm (device
             // not yet reporting self_node, or a fail-closed cert/serve error: the `acme` feature is
