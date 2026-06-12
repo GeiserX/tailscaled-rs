@@ -61,7 +61,7 @@ fn normalize(url: Option<&str>) -> Option<&str> {
 ///   next `up` anyway, so a server change is harmless there.
 /// - `!force_reauth` — the operator did not opt into the fresh registration that legitimizes the
 ///   change.
-pub fn change_blocked(
+pub(super) fn change_blocked(
     current: Option<&str>,
     proposed: Option<&str>,
     running: bool,

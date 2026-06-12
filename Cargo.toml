@@ -7,6 +7,12 @@ license = "BSD-3-Clause"
 repository = "https://github.com/GeiserX/tailscaled-rs"
 description = "An independent, from-scratch Rust system daemon that joins a WireGuard-based mesh overlay, speaking the Tailscale control protocol. Wraps the tailscale-rs engine in a long-running, IPC-controlled daemon (the layer the embeddable library omits). Not affiliated with, endorsed by, or sponsored by Tailscale Inc.; 'Tailscale' is a trademark of Tailscale Inc."
 
+# Lint policy. `unreachable_pub` keeps the API surface honest: an item declared `pub` that is not
+# actually reachable outside its module should be `pub(super)`/`pub(crate)` instead. Kept at `warn`
+# (not `deny`) so it surfaces drift in local builds + CI logs without unexpectedly breaking the build.
+[lints.rust]
+unreachable_pub = "warn"
+
 # The publishable crate is `tailscaled-rs` (imported as `tailscaled_rs`). The installed
 # binaries are deliberately `tailnetd` (daemon) + `tnet` (CLI) so they never collide on PATH
 # with an actual Tailscale install. The cryptographic/networking engine is the separate

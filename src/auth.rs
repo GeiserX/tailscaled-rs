@@ -33,7 +33,7 @@ pub enum Access {
 
 impl Access {
     /// Whether this access level may issue mutating commands.
-    pub fn can_write(self) -> bool {
+    pub(crate) fn can_write(self) -> bool {
         matches!(self, Access::ReadWrite)
     }
 }
@@ -63,8 +63,11 @@ impl AuthPolicy {
         }
     }
 
-    /// Construct a policy with an explicit owner uid (tests / future config-driven construction).
-    pub fn with_owner_euid(owner_euid: u32) -> Self {
+    /// Construct a policy with an explicit owner uid. Test-only today (the unit tests below drive
+    /// the uid-policy decision without a real process); `#[cfg(test)]`-gated so it is not dead code
+    /// in the production build. A future config-driven construction would lift the gate.
+    #[cfg(test)]
+    pub(crate) fn with_owner_euid(owner_euid: u32) -> Self {
         Self { owner_euid }
     }
 
@@ -72,7 +75,7 @@ impl AuthPolicy {
     ///
     /// Policy: root (uid 0) or the owner uid → `ReadWrite`; everyone else → `ReadOnly`. Pure, so it
     /// is unit-testable without a socket.
-    pub fn access_for_uid(&self, peer_uid: u32) -> Access {
+    pub(crate) fn access_for_uid(&self, peer_uid: u32) -> Access {
         if peer_uid == 0 || peer_uid == self.owner_euid {
             Access::ReadWrite
         } else {
@@ -120,7 +123,7 @@ fn current_euid() -> u32 {
 /// lifecycle/prefs commands (`up`, `set`, `down`) return true. The match is exhaustive over
 /// [`crate::localapi::Request`], so a new command forces an explicit authorization decision at
 /// compile time.
-pub fn requires_write(request: &crate::localapi::Request) -> bool {
+pub(crate) fn requires_write(request: &crate::localapi::Request) -> bool {
     use crate::localapi::Request;
     match request {
         // Reads: never gated. `ip`/`whois`/`ping` are diagnostics that mutate no state, so they are

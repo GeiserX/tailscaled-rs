@@ -53,7 +53,7 @@ use super::UpOptions;
 ///
 /// `caller` note: when `opts.reset` is set the caller must NOT call this (a `--reset` up explicitly
 /// opts into reverting unmentioned prefs to default); this function does not re-check `reset`.
-pub fn check_accidental_reverts(
+pub(super) fn check_accidental_reverts(
     prefs: &Prefs,
     opts: &UpOptions,
     ever_configured: bool,
