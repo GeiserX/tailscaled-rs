@@ -109,13 +109,17 @@ pub(super) fn lowest_free_utun() -> String {
 /// Pure state-derivation decision, extracted from [`Backend::derive_state`](super::Backend) so it is
 /// unit-testable without a live `Backend` or engine.
 ///
-/// Inputs are the four observable facts the reported [`State`] is a function of:
+/// Inputs are the observable facts the reported [`State`] is a function of:
 /// - `has_device`: an engine [`tailscale::Device`] is currently constructed (the node is "up").
 /// - `have_self_node`: the engine has received a netmap and assigned this node its addresses.
 /// - `want_running` / `logged_out`: the persisted [`Prefs`](crate::prefs::Prefs) intent.
-/// - `ever_configured`: the node has been configured at least once (distinguishes a never-touched
-///   `NoState` from an explicit `Stopped`); persisted across restarts via the prefs file (see
-///   [`Backend::load`](super::Backend::load)).
+/// - `has_node_key`: a usable node key is persisted on disk — the analogue of Go's
+///   `hasNodeKeyLocked()`, which is exactly what Go's `nextStateLocked` gates `Stopped` on
+///   (`ipn/ipnlocal/local.go`: `!wantRunning && !loggedOut && hasNodeKey → Stopped`, else the
+///   no-netmap path → `NoState`). A node configured by `set` but never brought up (so no key was
+///   ever minted) reports `NoState`, matching Go — NOT `Stopped`. `up` persists the key before it
+///   can be brought `down`, and `down` keeps it, so the common up→down→restart path still reports
+///   `Stopped`; only `logout`/force-reauth wipe it (and `logged_out` is checked first).
 ///
 /// See the `// LIMITATION:` note on [`Backend::derive_state`](super::Backend) for why
 /// [`State::NeedsMachineAuth`] and [`State::InUseOtherUser`] are never produced here.
@@ -124,14 +128,16 @@ pub(super) fn derive_state_from(
     have_self_node: bool,
     want_running: bool,
     logged_out: bool,
-    ever_configured: bool,
+    has_node_key: bool,
 ) -> State {
     match has_device {
         true if have_self_node => State::Running,
         true => State::Starting,
         false if logged_out => State::NeedsLogin,
         false if want_running => State::NeedsLogin, // wants up but no engine → needs (re)auth
-        false if ever_configured => State::Stopped,
+        // Go gates `Stopped` on a persisted node key (`hasNodeKeyLocked`); a configured-but-never-
+        // registered node (e.g. `set` then never `up`) has no key → `NoState`, like Go.
+        false if has_node_key => State::Stopped,
         false => State::NoState,
     }
 }
@@ -283,9 +289,10 @@ mod tests {
     }
 
     #[test]
-    fn down_after_ever_configured_is_stopped() {
-        // No device, not logged out, not wanting to run, but configured before → explicitly Stopped
-        // (distinct from the never-configured NoState).
+    fn down_with_persisted_key_is_stopped() {
+        // No device, not logged out, not wanting to run, but a node key IS on disk → explicitly
+        // Stopped (a previously-registered node, intentionally down) — distinct from NoState. This is
+        // the up→down→restart path: `up` minted+persisted the key, `down` kept it.
         assert_eq!(
             derive_state_from(false, false, false, false, true),
             State::Stopped
@@ -293,10 +300,10 @@ mod tests {
     }
 
     #[test]
-    fn ever_configured_is_the_only_no_state_vs_stopped_discriminator() {
-        // With identical (no-device, not-logged-out, not-want-running) inputs, `ever_configured` is
-        // the sole bit that flips NoState ↔ Stopped — the distinction that must survive a daemon
-        // restart (it is persisted via the prefs-file existence). Pin both sides of that single flip.
+    fn has_node_key_is_the_only_no_state_vs_stopped_discriminator() {
+        // With identical (no-device, not-logged-out, not-want-running) inputs, `has_node_key` is the
+        // sole bit that flips NoState ↔ Stopped — Go's `hasNodeKeyLocked()` gate. A node configured
+        // by `set` but never `up` (no key minted) is NoState (matching Go), not Stopped. Pin both.
         assert_eq!(
             derive_state_from(false, false, false, false, false),
             State::NoState

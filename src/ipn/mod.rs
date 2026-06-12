@@ -2626,7 +2626,10 @@ impl Backend {
             have_self_node,
             self.prefs.want_running,
             self.prefs.logged_out,
-            self.ever_configured,
+            // Go gates `Stopped` on `hasNodeKeyLocked()` (a persisted key), not on "ever configured".
+            // `has_node_key` is the cached on-disk-key signal (see the field doc); using it makes a
+            // configured-but-never-upped node report `NoState` like Go, not `Stopped`.
+            self.has_node_key,
         )
     }
 

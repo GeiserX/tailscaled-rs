@@ -1965,9 +1965,14 @@ fn format_lock_status(r: &tailscaled_rs::localapi::LockReport, json: bool) -> St
 /// certificate domains, additional DNS records, and exit-node-filtered suffixes — each empty section
 /// printing a parenthetical none-line, then a one-line honest note that the Go "Use Tailscale DNS"
 /// accept-dns line + the "System DNS configuration" section are not surfaced by this build (no
-/// CorpDNS pref / no engine OS-DNS accessor). `json` emits a `DNSStatusResult`-shaped object with
-/// Go's key names, built via `serde_json` (escape-safe, 2-space pretty). Pure (returns the string
-/// incl. its trailing newline) → unit-testable.
+/// CorpDNS pref / no engine OS-DNS accessor). `json` emits a REDUCED, fork-specific object — NOT
+/// byte-compatible with Go's `jsonoutput.DNSStatusResult`: resolvers/fallback-resolvers are plain
+/// `addr:port` STRINGS (Go nests `DNSResolverInfo{Addr, BootstrapResolution}` objects), MagicDNS-on
+/// is a top-level `MagicDNS` bool (Go nests it as `CurrentTailnet.MagicDNSEnabled`, with a separate
+/// top-level `TailscaleDNS`=accept-dns this build doesn't model), `ExtraRecords` is a name→addr map
+/// (Go: an array of `{Name,Type,Value}`), and there is no `SystemDNS`/`SystemDNSError`. Built via
+/// `serde_json` (escape-safe, 2-space pretty). Pure (returns the string incl. its trailing newline)
+/// → unit-testable.
 fn format_dns_status(r: &tailscaled_rs::localapi::DnsStatusReport, json: bool) -> String {
     if json {
         use serde_json::{Map, Value, json};
