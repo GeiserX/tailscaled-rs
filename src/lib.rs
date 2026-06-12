@@ -100,3 +100,72 @@ pub async fn ensure_state_dir_secure(dir: &std::path::Path) -> std::io::Result<(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A process-id-namespaced temp dir (matches the convention in `tests/localapi_loop.rs`), with a
+    /// nanosecond suffix so parallel tests in this same PID never collide on the path.
+    fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "tailnetd-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_state_dir_secure_tightens_loose_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A pre-existing world/group-accessible (0777) state dir must be tightened to 0700 — it
+        // holds unencrypted key material, so a loose dir is corrected rather than trusted.
+        let dir = unique_temp_dir("statedir-loose");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).expect("chmod 0777");
+
+        ensure_state_dir_secure(&dir)
+            .await
+            .expect("ensure_state_dir_secure");
+
+        let mode = std::fs::metadata(&dir)
+            .expect("stat dir")
+            .permissions()
+            .mode()
+            & 0o777;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(mode, 0o700, "loose state dir must be tightened to 0700");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_state_dir_secure_creates_missing_dir_at_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A non-existent path is CREATED (create_dir_all) and locked to 0700 in one call — the boot
+        // path relies on this so the first key file never lands in a world-readable dir.
+        let dir = unique_temp_dir("statedir-missing");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!dir.exists(), "precondition: dir must not exist yet");
+
+        ensure_state_dir_secure(&dir)
+            .await
+            .expect("ensure_state_dir_secure must create the dir");
+
+        assert!(dir.exists(), "dir must have been created");
+        let mode = std::fs::metadata(&dir)
+            .expect("stat dir")
+            .permissions()
+            .mode()
+            & 0o777;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(mode, 0o700, "freshly-created state dir must be 0700");
+    }
+}

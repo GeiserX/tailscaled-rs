@@ -37,6 +37,7 @@ enum Command {
         /// Pre-auth key for non-interactive registration. Exposes the key in argv/shell history;
         /// prefer `--authkey-file` or the `TS_AUTH_KEY` env var. Precedence:
         /// `--authkey-file` > `--authkey` > `$TS_AUTH_KEY`.
+        /// (INSECURE: visible in `ps`/shell history — prefer --authkey-file or $TS_AUTH_KEY.)
         #[arg(long, conflicts_with = "authkey_file")]
         authkey: Option<String>,
         /// Read the pre-auth key from a file (avoids argv/shell-history exposure). Takes precedence
@@ -1585,7 +1586,12 @@ async fn main() -> Result<()> {
             let queried_ip = match &request {
                 Request::Whois { ip } => ip.as_str(),
                 // The daemon only sends Whois in reply to a Whois request; fall back gracefully.
-                _ => "",
+                // Reaching here means the daemon violated that invariant — note it instead of
+                // staying fully silent, but keep the empty-string fallback so rendering proceeds.
+                _ => {
+                    eprintln!("warning: whois reply to a non-whois request (protocol violation)");
+                    ""
+                }
             };
             print!("{}", format_whois(&w, queried_ip));
         }
@@ -2896,6 +2902,14 @@ async fn round_trip(socket: &std::path::Path, request: &Request) -> Result<Respo
     let mut reader = BufReader::new(read_half);
     let mut response_line = String::new();
     reader.read_line(&mut response_line).await?;
+    // A zero-byte read leaves the buffer empty: the daemon closed the connection without replying
+    // (connection cap hit, or the handler crashed). Surface that plainly instead of falling through
+    // to a confusing "parsing daemon response: EOF" from the empty-string parse below.
+    if response_line.is_empty() {
+        anyhow::bail!(
+            "daemon closed the connection without a reply (is it overloaded, or did the request crash it?)"
+        );
+    }
     let response = serde_json::from_str(response_line.trim())
         .with_context(|| format!("parsing daemon response: {response_line:?}"))?;
     Ok(response)
@@ -3089,10 +3103,17 @@ async fn serve_status_connection(mut conn: tokio::net::TcpStream, socket: &std::
     let (status, body) = match parse_request_target(first_line) {
         Some(("GET", "/")) => match round_trip(socket, &Request::Status).await {
             Ok(Response::Status(s)) => ("200 OK", render_status_html(&s)),
-            Ok(_) | Err(_) => (
-                "500 Internal Server Error",
-                "<!DOCTYPE html><html><body>status unavailable</body></html>".to_string(),
-            ),
+            // Both the wrong-variant and the error case collapse to a 500; on a real error, log the
+            // cause first so the failure isn't swallowed (the page itself stays generic).
+            other => {
+                if let Err(e) = other {
+                    eprintln!("status --web: status fetch failed: {e}");
+                }
+                (
+                    "500 Internal Server Error",
+                    "<!DOCTYPE html><html><body>status unavailable</body></html>".to_string(),
+                )
+            }
         },
         _ => (
             "404 Not Found",

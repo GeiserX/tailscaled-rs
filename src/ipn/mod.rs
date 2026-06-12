@@ -1811,7 +1811,14 @@ impl Backend {
     async fn stop_serve_tasks(&mut self) {
         for task in self.serve_tasks.drain(..) {
             task.abort();
-            let _ = task.await;
+            // A cancelled task (the normal abort case above) resolves to a cancellation `JoinError`
+            // and stays quiet. But a supervisor that *panicked* before we aborted it would otherwise
+            // vanish silently — surface that panic here, on the next teardown/re-arm, so it isn't lost.
+            if let Err(e) = task.await
+                && e.is_panic()
+            {
+                tracing::error!(error = ?e, "serve supervisor task panicked");
+            }
         }
     }
 
@@ -1988,84 +1995,112 @@ impl Backend {
             None => (self.derive_state(false), None, None),
         };
 
+        // The address/peer view derived from the netmap. Bundled into one named struct (rather than a
+        // 6-positional tuple repeated across the arms below) so the "no netmap yet" arms are a single
+        // `NetmapProjection::default()` — one source of truth for "no addresses/peers" — and adding a
+        // field can never silently shift a positional value. `Default` gives every field its empty
+        // value (`None` / empty `Vec`), exactly the old `(None, …, Vec::new())` tuple.
+        #[derive(Default)]
+        struct NetmapProjection {
+            self_ipv4: Option<String>,
+            self_name: Option<String>,
+            self_ipv6: Option<String>,
+            active_exit_node: Option<String>,
+            magic_dns_suffix: Option<String>,
+            peers: Vec<PeerReport>,
+        }
+
         // Query the (blocking) netmap only when Running — the only state with a self-node/peers.
         // Bounded by a timeout so the backend lock is never held indefinitely (see method doc).
-        let (self_ipv4, self_name, self_ipv6, active_exit_node, magic_dns_suffix, peers) =
-            match (state, self.device.as_ref()) {
-                (State::Running, Some(dev)) => {
-                    match tokio::time::timeout(STATUS_QUERY_TIMEOUT, dev.status()).await {
-                        Ok(Ok(s)) => {
-                            let (ip, name, ipv6) = match &s.self_node {
-                                Some(n) => (
-                                    Some(n.ipv4.to_string()),
-                                    Some(n.display_name.clone()),
-                                    Some(n.ipv6.to_string()),
-                                ),
-                                None => (None, None, None),
-                            };
-                            // Resolve the active-exit-node stable id → the peer's display name where we
-                            // can (friendlier than a raw id), falling back to the id (Go shows the id).
-                            let active_exit = s.active_exit_node.as_ref().map(|id| {
-                                s.peers
+        let NetmapProjection {
+            self_ipv4,
+            self_name,
+            self_ipv6,
+            active_exit_node,
+            magic_dns_suffix,
+            peers,
+        } = match (state, self.device.as_ref()) {
+            (State::Running, Some(dev)) => {
+                match tokio::time::timeout(STATUS_QUERY_TIMEOUT, dev.status()).await {
+                    Ok(Ok(s)) => {
+                        let (self_ipv4, self_name, self_ipv6) = match &s.self_node {
+                            Some(n) => (
+                                Some(n.ipv4.to_string()),
+                                Some(n.display_name.clone()),
+                                Some(n.ipv6.to_string()),
+                            ),
+                            None => (None, None, None),
+                        };
+                        // Resolve the active-exit-node stable id → the peer's display name where we
+                        // can (friendlier than a raw id), falling back to the id (Go shows the id).
+                        let active_exit_node = s.active_exit_node.as_ref().map(|id| {
+                            s.peers
+                                .iter()
+                                .find(|p| &p.stable_id == id)
+                                .map(|p| p.display_name.clone())
+                                .unwrap_or_else(|| id.0.clone())
+                        });
+                        let magic_dns_suffix = s.magic_dns_suffix.clone();
+                        let peers = s
+                            .peers
+                            .into_iter()
+                            .map(|p| PeerReport {
+                                name: p.display_name,
+                                ipv4: p.ipv4.to_string(),
+                                is_exit_node: p.is_exit_node,
+                                // The engine's StableNodeId → the Go `status --json` Peer-map key
+                                // (see PeerReport::stable_id for the keying-deviation note). `p`
+                                // is owned (into_iter) and the active-exit `find` above already
+                                // finished borrowing it, so move the inner String rather than clone.
+                                stable_id: p.stable_id.0,
+                                // Engine-reported liveness (Option<bool>) → Go `PeerStatus.Online`.
+                                online: p.online,
+                                // IPv6 → Go PeerStatus.TailscaleIPs[1] (rendered as a string).
+                                ipv6: Some(p.ipv6.to_string()),
+                                // AllowedIPs → Go PeerStatus.AllowedIPs (CIDR strings).
+                                allowed_routes: p
+                                    .allowed_routes
                                     .iter()
-                                    .find(|p| &p.stable_id == id)
-                                    .map(|p| p.display_name.clone())
-                                    .unwrap_or_else(|| id.0.clone())
-                            });
-                            let magic_dns = s.magic_dns_suffix.clone();
-                            let peers = s
-                                .peers
-                                .into_iter()
-                                .map(|p| PeerReport {
-                                    name: p.display_name,
-                                    ipv4: p.ipv4.to_string(),
-                                    is_exit_node: p.is_exit_node,
-                                    // The engine's StableNodeId → the Go `status --json` Peer-map key
-                                    // (see PeerReport::stable_id for the keying-deviation note). `p`
-                                    // is owned (into_iter) and the active-exit `find` above already
-                                    // finished borrowing it, so move the inner String rather than clone.
-                                    stable_id: p.stable_id.0,
-                                    // Engine-reported liveness (Option<bool>) → Go `PeerStatus.Online`.
-                                    online: p.online,
-                                    // IPv6 → Go PeerStatus.TailscaleIPs[1] (rendered as a string).
-                                    ipv6: Some(p.ipv6.to_string()),
-                                    // AllowedIPs → Go PeerStatus.AllowedIPs (CIDR strings).
-                                    allowed_routes: p
-                                        .allowed_routes
-                                        .iter()
-                                        .map(|r| r.to_string())
-                                        .collect(),
-                                    // LastSeen (Go PeerStatus.LastSeen); meaningful when offline. chrono's
-                                    // `DateTime<Utc>` Display is ISO-8601/RFC3339-shaped (`2026-06-11
-                                    // 05:19:14 UTC`) and needs only the always-available Display impl (the
-                                    // `to_rfc3339` formatter needs an extra chrono feature not enabled on
-                                    // the transitive dep), so use `to_string()`.
-                                    last_seen: p.last_seen.map(|t| t.to_string()),
-                                    // Direct endpoint vs DERP relay (Go CurAddr/Relay; mutually exclusive).
-                                    cur_addr: p.cur_addr.map(|a| a.to_string()),
-                                    relay: p.relay,
-                                })
-                                .collect();
-                            (ip, name, ipv6, active_exit, magic_dns, peers)
-                        }
-                        // Transient engine error: log and report no addresses/peers (state stays Running).
-                        Ok(Err(e)) => {
-                            tracing::warn!(error = %e, "engine status query failed");
-                            (None, None, None, None, None, Vec::new())
-                        }
-                        // Pre-netmap window (or a wedged Running engine): don't hold the lock waiting.
-                        // Report Running with no addresses yet; the next status poll fills them in.
-                        Err(_elapsed) => {
-                            tracing::debug!(
-                                "engine status query exceeded {STATUS_QUERY_TIMEOUT:?}; \
-                             reporting Running without addresses (netmap not yet converged)"
-                            );
-                            (None, None, None, None, None, Vec::new())
+                                    .map(|r| r.to_string())
+                                    .collect(),
+                                // LastSeen (Go PeerStatus.LastSeen); meaningful when offline. chrono's
+                                // `DateTime<Utc>` Display is ISO-8601/RFC3339-shaped (`2026-06-11
+                                // 05:19:14 UTC`) and needs only the always-available Display impl (the
+                                // `to_rfc3339` formatter needs an extra chrono feature not enabled on
+                                // the transitive dep), so use `to_string()`.
+                                last_seen: p.last_seen.map(|t| t.to_string()),
+                                // Direct endpoint vs DERP relay (Go CurAddr/Relay; mutually exclusive).
+                                cur_addr: p.cur_addr.map(|a| a.to_string()),
+                                relay: p.relay,
+                            })
+                            .collect();
+                        NetmapProjection {
+                            self_ipv4,
+                            self_name,
+                            self_ipv6,
+                            active_exit_node,
+                            magic_dns_suffix,
+                            peers,
                         }
                     }
+                    // Transient engine error: log and report no addresses/peers (state stays Running).
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, "engine status query failed");
+                        NetmapProjection::default()
+                    }
+                    // Pre-netmap window (or a wedged Running engine): don't hold the lock waiting.
+                    // Report Running with no addresses yet; the next status poll fills them in.
+                    Err(_elapsed) => {
+                        tracing::debug!(
+                            "engine status query exceeded {STATUS_QUERY_TIMEOUT:?}; \
+                             reporting Running without addresses (netmap not yet converged)"
+                        );
+                        NetmapProjection::default()
+                    }
                 }
-                _ => (None, None, None, None, None, Vec::new()),
-            };
+            }
+            _ => NetmapProjection::default(),
+        };
 
         StatusReport {
             state: state.as_str().to_string(),
@@ -2366,6 +2401,8 @@ impl Backend {
     ///    we log and drop — the engine's `Runtime::drop` still kills its actors — rather than leak.
     ///    With the `ssh` feature off there is never a clone, so reclaim is trivially infallible.
     async fn stop_device(&mut self) {
+        // Bounded teardown: the engine shutdown below is capped at SHUTDOWN_TIMEOUT (5s), so a caller
+        // holding the backend lock across this (e.g. the Down/Logout dispatch arms) blocks at most that.
         // Step 1: stop the SSH server task first so its `Arc` clone of the device is released before
         // we try to reclaim sole ownership. Aborting an already-finished task is harmless.
         if let Some(task) = self.ssh_task.take() {

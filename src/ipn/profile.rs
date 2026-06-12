@@ -87,7 +87,8 @@ pub fn profiles_file_path(state_dir: &Path) -> PathBuf {
 /// falls back to [`DEFAULT_PROFILE_ID`] — so a fresh or legacy daemon (no pointer file) is always on
 /// the default profile, which is exactly the legacy top-level layout.
 pub async fn read_current_profile(state_dir: &Path) -> String {
-    match tokio::fs::read_to_string(current_profile_path(state_dir)).await {
+    let path = current_profile_path(state_dir);
+    match tokio::fs::read_to_string(&path).await {
         Ok(s) => {
             let id = s.trim();
             if is_valid_profile_id(id) {
@@ -96,7 +97,11 @@ pub async fn read_current_profile(state_dir: &Path) -> String {
                 DEFAULT_PROFILE_ID.to_string()
             }
         }
-        Err(_) => DEFAULT_PROFILE_ID.to_string(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DEFAULT_PROFILE_ID.to_string(),
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "current-profile pointer unreadable; treating as default");
+            DEFAULT_PROFILE_ID.to_string()
+        }
     }
 }
 
@@ -114,7 +119,11 @@ pub async fn load_profiles_file(state_dir: &Path) -> ProfilesFile {
             tracing::warn!(error = %e, "profiles.json is malformed; treating as empty");
             ProfilesFile::default()
         }),
-        Err(_) => ProfilesFile::default(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ProfilesFile::default(),
+        Err(e) => {
+            tracing::warn!(error = %e, "profiles file unreadable; treating as empty");
+            ProfilesFile::default()
+        }
     }
 }
 

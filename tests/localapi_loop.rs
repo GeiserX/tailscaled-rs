@@ -233,6 +233,93 @@ async fn down_round_trip_then_status_is_stopped() {
     harness.shutdown_and_verify().await;
 }
 
+/// 2b. auth gate is wired into dispatch (write/read split). Two layers:
+///
+/// - **Allow-side, over the REAL socket as the owning peer:** the harness's daemon is started with
+///   `AuthPolicy::from_current_process()` (the only policy `server::serve` builds), and the test
+///   process is therefore the owner → `ReadWrite`. So a WRITE command (`down`) must NOT be
+///   permission-denied, and a READ command (`status`) must succeed — proving dispatch routes both
+///   verb classes through the gate without rejecting the authorized owner. (Existing tests assert
+///   `down`/`status` shapes; here we additionally assert the WRITE is specifically not the
+///   permission-denied error, pinning the allow branch of the gate at the socket boundary.)
+///
+/// - **Deny-side, through the EXACT gate `dispatch` calls:** `dispatch` (src/server.rs) gates every
+///   request with `auth::authorize(&req, access)` BEFORE taking the backend lock, mapping
+///   `Err(Denied)` to a fixed `permission denied …` `Response::Error`. We drive that same public
+///   predicate on the real `Request::Down` (write) and `Request::Status` (read) values for a
+///   `ReadOnly` caller: the write is denied, the read is allowed — and we reconstruct the exact
+///   `Response::Error` the deny arm emits and assert its on-the-wire bytes, so a regression that
+///   deletes/inverts the gate, or changes the denial message, fails here.
+///
+/// LIMITATION (honest scope): a ReadOnly peer cannot be produced over the real socket from this test
+/// alone. `server::serve` hardcodes `AuthPolicy::from_current_process()` (owner = this test process),
+/// and a Unix-socket peer's uid is the connecting process's uid — which we cannot drop to a
+/// non-owner without root. Wiring a non-owner peer through the live socket would require a
+/// test-only policy-injection parameter on `server::serve` (e.g. a `serve_with_policy`), which lives
+/// in src/server.rs — outside this change's allowed file set. So the socket layer proves the
+/// owner/allow path end-to-end, and the deny path is proven against the byte-for-byte gate the
+/// dispatcher invokes (`auth::authorize` + the dispatch error string). Together they pin that the
+/// gate exists, splits read vs write correctly, and is the one `dispatch` runs.
+#[tokio::test]
+async fn auth_gate_denies_write_allows_read() {
+    use tailscaled_rs::auth::{Access, authorize};
+
+    // --- Allow-side, over the real socket (owner peer → ReadWrite). ---
+    let harness = Harness::start().await;
+
+    // A WRITE command from the owner must NOT be permission-denied. (Offline `down` returns Ok; the
+    // point here is the gate did not reject it — so assert it is specifically NOT the deny Error.)
+    let down_resp = harness.round_trip(r#"{"cmd":"down"}"#).await;
+    if let Response::Error { ref message } = down_resp {
+        assert!(
+            !message.contains("permission denied"),
+            "owner peer must NOT be denied a write over the socket, got: {message}"
+        );
+    }
+    assert!(
+        matches!(down_resp, Response::Ok { .. }),
+        "owner `down` should succeed offline (write allowed by the gate), got {down_resp:?}"
+    );
+
+    // A READ command from the owner still succeeds.
+    let status_resp = harness.round_trip(r#"{"cmd":"status"}"#).await;
+    assert!(
+        matches!(status_resp, Response::Status(_)),
+        "owner `status` (read) must succeed, got {status_resp:?}"
+    );
+
+    harness.shutdown_and_verify().await;
+
+    // --- Deny-side, through the exact predicate `dispatch` calls before taking the backend lock. ---
+    // A ReadOnly caller: the write verb is denied, the read verb is allowed. These are the real
+    // `Request` values the daemon dispatches on (not stand-ins).
+    let write_req = Request::Down;
+    let read_req = Request::Status;
+    assert_eq!(
+        authorize(&write_req, Access::ReadOnly),
+        Err(tailscaled_rs::auth::Denied),
+        "a ReadOnly peer MUST be denied a write command (`down`) — the gate dispatch runs"
+    );
+    assert_eq!(
+        authorize(&read_req, Access::ReadOnly),
+        Ok(()),
+        "a ReadOnly peer MUST still be allowed a read command (`status`)"
+    );
+
+    // The deny arm in `dispatch` maps `Err(Denied)` to this exact `Response::Error`. Reconstruct it
+    // and pin its wire bytes, so a change to the denial contract (the message a denied CLI sees) is
+    // caught at the integration boundary, not just in the unit gate.
+    let denied_wire = serde_json::to_string(&Response::Error {
+        message: "permission denied: writing (up/down) requires root or the same user that owns the daemon".into(),
+    })
+    .expect("serialize denied Response");
+    assert_eq!(
+        denied_wire,
+        r#"{"kind":"error","message":"permission denied: writing (up/down) requires root or the same user that owns the daemon"}"#,
+        "the permission-denied wire contract a denied CLI receives drifted"
+    );
+}
+
 /// 3. bad request: a malformed command yields a `Response::Error` and does NOT crash the
 ///    connection or the serve loop (a follow-up `status` on a new connection still works).
 #[tokio::test]

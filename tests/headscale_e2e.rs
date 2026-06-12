@@ -344,3 +344,150 @@ async fn headscale_rebind_is_non_disruptive() {
         "rebind must be non-disruptive — the node should stay Running afterward"
     );
 }
+
+/// Live `set` test (the live-vs-rebuild reconcile dispatch): bring a node up against headscale, then
+/// drive two `set`s and assert each takes the right reconcile path against the *real* engine:
+///
+/// 1. **Live-applicable pref** (`--hostname`): `Backend::set` applies it through the engine's runtime
+///    setter (`set_hostname`) with NO reconnect, so the node must STAY Running with the SAME tailnet
+///    IP — the registration is never torn down. (This is the path manually proven on a Mac Mini:
+///    hostname changes live, IP unchanged, node stays Running.)
+/// 2. **Rebuild-only pref** (`shields_up`, the immutable `Config.block_incoming`): it has no live
+///    setter, so `set` rebuilds the device (a brief reconnect) and the node must RECONVERGE to
+///    Running. We assert reconvergence (poll back to Running), not IP-stability, because a rebuild
+///    re-registers (headscale may re-issue from the pool); the contract is "stays up", not "same IP".
+///
+/// This exercises `Backend::begin_set`'s `SetAction::{Live,Rebuild}` decision end-to-end against a
+/// live netmap — the dispatch that unit tests can only check in isolation. Same `#[ignore]` + env
+/// gate as the join test — compiles in CI, runs only against a real tailnet.
+#[tokio::test]
+#[ignore = "requires a running headscale (test-support/headscale) + TAILNETD_HS_URL/TAILNETD_HS_AUTHKEY; see docs/TESTING.md"]
+async fn headscale_set_live_vs_rebuild_dispatch() {
+    let (hs_url, hs_authkey) = match (
+        std::env::var("TAILNETD_HS_URL"),
+        std::env::var("TAILNETD_HS_AUTHKEY"),
+    ) {
+        (Ok(u), Ok(k)) if !u.is_empty() && !k.is_empty() => (u, k),
+        _ => {
+            eprintln!(
+                "SKIP headscale_set_live_vs_rebuild_dispatch: set TAILNETD_HS_URL and \
+                 TAILNETD_HS_AUTHKEY to run it (see docs/TESTING.md)"
+            );
+            return;
+        }
+    };
+    if std::env::var("TS_RS_EXPERIMENT").as_deref() != Ok("this_is_unstable_software") {
+        eprintln!("SKIP headscale_set_live_vs_rebuild_dispatch: export TS_RS_EXPERIMENT");
+        return;
+    }
+
+    let state_dir = unique_state_dir();
+    let _ = tokio::fs::remove_dir_all(&state_dir).await;
+    tokio::fs::create_dir_all(&state_dir)
+        .await
+        .expect("state dir");
+    let mut backend = Backend::load(&state_dir).await.expect("Backend::load");
+
+    backend
+        .up(
+            Some(secrecy::SecretString::from(hs_authkey)),
+            tailscaled_rs::ipn::UpOptions {
+                hostname: Some("tailscaled-rs-hs-set".to_string()),
+                control_url: Some(hs_url.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("up() against headscale {hs_url} failed: {e:?}"));
+
+    // Wait for the initial Running + capture the tailnet IP the live `set` must preserve.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut running = false;
+    let mut ip_before: Option<String> = None;
+    while tokio::time::Instant::now() < deadline {
+        let report = backend.status().await;
+        if report.state == "Running" {
+            running = true;
+            ip_before = report.self_ipv4.clone();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // 1. LIVE pref: change the hostname. `set` applies it via the engine's `set_hostname` with no
+    //    reconnect, so the node stays Running and the tailnet IP is unchanged.
+    let live_set_ok = if running {
+        backend
+            .set(tailscaled_rs::ipn::SetOptions {
+                hostname: Some("tailscaled-rs-hs-set-live".to_string()),
+                ..Default::default()
+            })
+            .await
+            .is_ok()
+    } else {
+        false
+    };
+    // Read state immediately after the live set — it must NOT have reconnected, so it is Running now
+    // (no reconvergence window) and reports the same IP.
+    let after_live = backend.status().await;
+    let live_still_running = live_set_ok && after_live.state == "Running";
+    let ip_after_live = after_live.self_ipv4.clone();
+
+    // 2. REBUILD-only pref: shields_up has no live setter, so `set` rebuilds (brief reconnect). The
+    //    node must reconverge to Running. Drive the set, then poll back to Running.
+    let rebuild_set_ok = if live_still_running {
+        backend
+            .set(tailscaled_rs::ipn::SetOptions {
+                shields_up: Some(true),
+                ..Default::default()
+            })
+            .await
+            .is_ok()
+    } else {
+        false
+    };
+    let rebuild_reconverged = if rebuild_set_ok {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let mut ok = false;
+        while tokio::time::Instant::now() < deadline {
+            if backend.status().await.state == "Running" {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        ok
+    } else {
+        false
+    };
+
+    // ALWAYS tear down + clean up before asserting, so a failure can't leave a registered node behind.
+    backend.down().await.expect("down()");
+    backend.shutdown().await;
+    let _ = tokio::fs::remove_dir_all(&state_dir).await;
+
+    assert!(
+        running,
+        "node never reached Running against headscale {hs_url}"
+    );
+    assert!(live_set_ok, "live `set --hostname` should return Ok");
+    assert!(
+        live_still_running,
+        "a live (hostname) `set` must NOT reconnect — the node must stay Running immediately after"
+    );
+    // The live path never re-registers, so the self IP must be byte-for-byte unchanged.
+    assert_eq!(
+        ip_after_live, ip_before,
+        "a live `set` must leave the tailnet IP unchanged (no reconnect), before={ip_before:?} \
+         after={ip_after_live:?}"
+    );
+    assert!(
+        rebuild_set_ok,
+        "rebuild-only `set shields_up` should return Ok"
+    );
+    assert!(
+        rebuild_reconverged,
+        "a rebuild-only (shields_up) `set` must reconverge the node back to Running after the brief \
+         reconnect"
+    );
+}
