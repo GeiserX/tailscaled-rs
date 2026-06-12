@@ -300,6 +300,14 @@ pub(super) async fn ping(dev: &tailscale::Device, ip: &str, timeout_ms: Option<u
             // path ⇒ the overlay is DERP-relayed (Go prints `via DERP`). A classification failure is
             // non-fatal: the ping itself succeeded, so degrade to `None` (treated as relayed) rather
             // than turn a good pong into an error.
+            //
+            // FIDELITY NOTE: the returned `rtt_ms` is the netstack-ICMP RTT, but `endpoint` is the
+            // cached disco snapshot — two different measurements. On a peer mid-upgrade the cached
+            // snapshot can still read `None` for up to a probe interval after the ICMP pong arrives,
+            // so `--until-direct` may overshoot Go (which sources both from one disco round-trip) by
+            // a ping or two before it sees the direct path. It still converges. The exact-parity
+            // alternative is to drive `dev.ping_disco(dst, timeout)` for both the RTT and the
+            // endpoint from a single fresh disco probe (a ping backlog item).
             let endpoint = match dev.direct_path(dst).await {
                 Ok(Some((addr, _rtt))) => Some(addr.to_string()),
                 Ok(None) | Err(_) => None,
@@ -310,8 +318,11 @@ pub(super) async fn ping(dev: &tailscale::Device, ip: &str, timeout_ms: Option<u
                 endpoint,
             }
         }
+        // Bare cause only (no `ping <ip> failed:` prefix): the `tnet ping` CLI wraps this with its own
+        // per-attempt `ping <seq>/<count> failed:` label, so prefixing here too would double it. A
+        // non-CLI LocalAPI caller still gets the IP for context via the request it sent.
         Err(e) => Response::Error {
-            message: format!("ping {ip} failed: {e:?}"),
+            message: format!("{e:?}"),
         },
     }
 }

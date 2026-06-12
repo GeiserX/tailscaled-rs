@@ -352,7 +352,12 @@ pub enum Response {
         /// relayed through DERP (Go prints `via DERP`). This is what `tnet ping --until-direct` waits
         /// on: it keeps pinging until this becomes `Some`. Backfilled from the engine's
         /// `Device::direct_path` (a cached snapshot of the last disco probe — no extra network
-        /// round-trip), so a present value cannot disagree with the RTT that was just measured.
+        /// round-trip). NOTE the endpoint and the RTT come from **different** measurements: the RTT
+        /// is the netstack-ICMP echo just sent, while the endpoint is the cached disco-path snapshot
+        /// (up to one probe interval stale). So on a peer mid-upgrade DERP→direct the endpoint can
+        /// briefly lag the RTT — `--until-direct` may take a ping or two longer than Go to notice the
+        /// upgrade (it still converges). Sourcing both from one fresh `ping_disco` is a fidelity
+        /// follow-up (see the ping backlog bead).
         #[serde(default)]
         endpoint: Option<String>,
     },

@@ -1944,7 +1944,7 @@ async fn run_ping(
                 // A per-attempt failure (timeout, transient unreachability) is counted as a miss
                 // but does not abort the run — keep pinging like Go. No sleep after a miss: the
                 // per-attempt timeout already elapsed (matches Go's immediate retry on deadline).
-                eprintln!("{}", format_ping_miss(&message, seq, count));
+                eprintln!("{}", format_ping_miss(&ip, &message, seq, count));
                 if last {
                     break;
                 }
@@ -2032,9 +2032,14 @@ fn format_ping_line(ip: &str, rtt_ms: f64, endpoint: Option<&str>, seq: u32, cou
     )
 }
 
-/// Format a missed-attempt line (a per-attempt failure that does not abort the run). Pure.
-fn format_ping_miss(message: &str, seq: u32, count: u32) -> String {
-    format!("ping {} failed: {message}", ping_seq_label(seq, count))
+/// Format a missed-attempt line (a per-attempt failure that does not abort the run). The daemon
+/// returns a bare cause (no `ping <ip> failed:` prefix — see [`crate::ipn`]'s `diag::ping`), so this
+/// adds the single attempt label + destination IP. Pure → unit-testable.
+fn format_ping_miss(ip: &str, message: &str, seq: u32, count: u32) -> String {
+    format!(
+        "ping {ip} ({}) failed: {message}",
+        ping_seq_label(seq, count)
+    )
 }
 
 /// `metrics` (Go `tailscale metrics`): fetch the Prometheus text, then print or write it. Inline
@@ -6152,9 +6157,16 @@ mod tests {
 
     #[test]
     fn format_ping_miss_labels_attempt() {
+        // The daemon returns a bare cause (no `ping <ip> failed:` prefix), so the CLI line carries
+        // the IP + attempt label exactly once — no doubled `ping … failed: ping … failed:`.
         assert_eq!(
-            format_ping_miss("ping 100.64.0.2 failed: timeout", 2, 10),
-            "ping 2/10 failed: ping 100.64.0.2 failed: timeout"
+            format_ping_miss("100.64.0.2", "timed out", 2, 10),
+            "ping 100.64.0.2 (2/10) failed: timed out"
+        );
+        // Infinite run: attempt label has no denominator.
+        assert_eq!(
+            format_ping_miss("100.64.0.2", "unreachable", 3, 0),
+            "ping 100.64.0.2 (3) failed: unreachable"
         );
     }
 
