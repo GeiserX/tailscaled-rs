@@ -42,7 +42,7 @@ path = "src/bin/tnet.rs"
 #   paths = ["/path/to/your/tailscale-rs/checkout"]
 # transparently overrides this git dep when the local checkout's version matches the pin —
 # so you can edit the engine and rebuild the daemon with no manifest change. See README.
-tailscale = { package = "geiserx_tailscale", git = "https://github.com/GeiserX/tailscale-rs", rev = "81446f885b1e5dcfe74578f9d2c0c2e8f8e41f94" }
+tailscale = { package = "geiserx_tailscale", git = "https://github.com/GeiserX/tailscale-rs", rev = "6035651b62372ee969c385258d14be09ca227645" }
 # The engine's control crate, pinned to the SAME rev as `tailscale` above (Cargo unifies it to the
 # identical crate instance, so its types ARE the ones the `tailscale` facade's signatures use). We
 # need it directly only to NAME `ts_control::FunnelOptions` for `Device::listen_funnel`: the engine
@@ -50,13 +50,13 @@ tailscale = { package = "geiserx_tailscale", git = "https://github.com/GeiserX/t
 # NOT `FunnelOptions`/`FunnelError`, so the funnel listener is otherwise uncallable from outside the
 # engine crate. Keep this rev in lockstep with `tailscale`'s. (TODO: drop this dep once the engine
 # re-exports the Funnel types at its root — coordinated upstream.)
-ts_control = { package = "geiserx_ts_control", git = "https://github.com/GeiserX/tailscale-rs", rev = "81446f885b1e5dcfe74578f9d2c0c2e8f8e41f94" }
+ts_control = { package = "geiserx_ts_control", git = "https://github.com/GeiserX/tailscale-rs", rev = "6035651b62372ee969c385258d14be09ca227645" }
 
 # The engine's capability-version constant (`CapabilityVersion::CURRENT`), needed to report `cap` in
 # `tnet version --json` (Go's `version.Meta.cap`). Already an engine transitive dep + a published
 # crate; the facade does not re-export it, so name it directly — same workaround pattern as the
 # `ts_control` dep above. Keep this rev in lockstep with `tailscale`'s.
-ts_capabilityversion = { package = "geiserx_ts_capabilityversion", git = "https://github.com/GeiserX/tailscale-rs", rev = "81446f885b1e5dcfe74578f9d2c0c2e8f8e41f94" }
+ts_capabilityversion = { package = "geiserx_ts_capabilityversion", git = "https://github.com/GeiserX/tailscale-rs", rev = "6035651b62372ee969c385258d14be09ca227645" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "signal"] }
 serde = { version = "1", features = ["derive"] }
