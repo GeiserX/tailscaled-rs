@@ -3995,10 +3995,11 @@ fn elliptically_truncate(s: &str, max: usize) -> String {
 }
 
 /// Render `tnet serve status` from a [`ServeConfig`](tailscaled_rs::localapi::ServeConfig). Lists each
-/// served entry: plain TCP forwards (the daemon's own accept loop) and HTTPS/HTTP web entries (proxy /
-/// text / redirect / path-mux, served by engine delegation). A `TerminateTLS` raw-TCP entry has no
-/// engine analogue at this pin and is flagged "not served by this build". `_json` is handled by the
-/// caller. Pure → unit-testable.
+/// served entry: plain TCP forwards (the daemon's own accept loop), HTTPS/HTTP web entries (proxy /
+/// text / redirect / path-mux, served by engine delegation), and TLS-terminated raw-TCP forwards
+/// (`--tls-terminated-tcp`, also engine-delegated). A `TerminateTLS` entry with no backend, or one
+/// requesting PROXY-protocol (which the engine `Proxy` target can't write), is flagged "NOT served".
+/// `_json` is handled by the caller. Pure → unit-testable.
 fn format_serve_status(cfg: &tailscaled_rs::localapi::ServeConfig, _json: bool) -> String {
     use tailscaled_rs::localapi::WebMount;
     // Go's `isServeConfigEmpty` (cmd/tailscale/cli/serve_status.go) is empty iff `len(TCP)==0 &&
@@ -4043,9 +4044,23 @@ fn format_serve_status(cfg: &tailscaled_rs::localapi::ServeConfig, _json: bool) 
             out.push_str(&format!("{scheme}://<node>:{port} -> {}\n", h.tcp_forward));
         } else if !h.tcp_forward.is_empty() && !h.https && !h.http && h.terminate_tls.is_empty() {
             out.push_str(&format!("tcp :{port} -> {}\n", h.tcp_forward));
-        } else if !h.terminate_tls.is_empty() {
+        } else if !h.terminate_tls.is_empty() && !h.tcp_forward.is_empty() && h.proxy_protocol == 0
+        {
+            // Servable TLS-terminated raw-TCP forward (engine terminates TLS + splices to the backend).
             out.push_str(&format!(
-                "tcp :{port} -> {} (TLS-terminated; NOT served by this build)\n",
+                "tls+tcp :{port} -> {} (TLS-terminated)\n",
+                h.tcp_forward
+            ));
+        } else if !h.terminate_tls.is_empty() {
+            // Not servable: no backend to splice to, or proxy-protocol requested (engine `Proxy`
+            // doesn't write the PROXY header).
+            let why = if h.tcp_forward.is_empty() {
+                "no backend"
+            } else {
+                "proxy-protocol not supported"
+            };
+            out.push_str(&format!(
+                "tcp :{port} -> {} (TLS-terminated; NOT served — {why})\n",
                 h.tcp_forward
             ));
         } else if h.https || h.http {
@@ -5486,12 +5501,22 @@ mod tests {
                 ..Default::default()
             },
         );
-        // TLS-terminated raw TCP — no engine analogue, not served.
+        // TLS-terminated raw TCP with a backend (no proxy-protocol) — SERVED via engine delegation.
         cfg.tcp.insert(
             "9000".to_string(),
             TcpPortHandler {
                 tcp_forward: "127.0.0.1:9".into(),
                 terminate_tls: "host.ts.net".into(),
+                ..Default::default()
+            },
+        );
+        // TLS-terminated requesting PROXY-protocol — NOT served (engine `Proxy` can't write the header).
+        cfg.tcp.insert(
+            "9001".to_string(),
+            TcpPortHandler {
+                tcp_forward: "127.0.0.1:10".into(),
+                terminate_tls: "host.ts.net".into(),
+                proxy_protocol: 1,
                 ..Default::default()
             },
         );
@@ -5509,9 +5534,14 @@ mod tests {
             out.contains("8444") && out.contains("no proxy target"),
             "{out}"
         );
-        // TLS-terminated raw TCP is flagged as not served by this build.
+        // TLS-terminated raw TCP with a backend IS served now (engine TLS-terminate + splice).
         assert!(
-            out.contains("9000") && out.contains("TLS-terminated"),
+            out.contains("tls+tcp :9000 -> 127.0.0.1:9 (TLS-terminated)"),
+            "{out}"
+        );
+        // The proxy-protocol terminate-tls entry is NOT served (with the reason).
+        assert!(
+            out.contains("9001") && out.contains("NOT served") && out.contains("proxy-protocol"),
             "{out}"
         );
     }
