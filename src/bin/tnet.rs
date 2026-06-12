@@ -706,18 +706,60 @@ enum FileCmd {
     },
     /// List files waiting in the Taildrop inbox.
     List,
-    /// Fetch a waiting file by name and write it locally.
+    /// Receive waiting Taildrop files. Two shapes:
+    ///
+    /// * `get <target-directory>` — drain the ENTIRE inbox into a directory (the Go-faithful
+    ///   `tailscale file get <dir>`). Use `--conflict` to choose what happens when a same-named file
+    ///   already exists. The special target `/dev/null` wipes the inbox without writing anything.
+    /// * `get <name> <dest>` — fetch ONE named waiting file (from `tnet file list`) to an exact path
+    ///   (a fork convenience; not a Go command shape).
+    ///
+    /// Which one runs is decided by the argument count: one positional = directory drain, two = the
+    /// single-file fetch.
     Get {
-        /// The waiting file's base name (as shown by `tnet file list`).
-        #[arg(value_name = "NAME")]
-        name: String,
-        /// Local destination path to write the fetched file to.
+        /// The target directory to drain into, OR (when a second positional is given) the waiting
+        /// file's base name to fetch.
+        #[arg(value_name = "TARGET")]
+        target: String,
+        /// Optional. When present, switches to single-file mode: the local destination path to write
+        /// the file named by `TARGET` to.
         #[arg(value_name = "DEST")]
-        dest: String,
-        /// Delete the file from the Taildrop inbox after a successful fetch (Go's default behavior).
+        dest: Option<String>,
+        /// Directory-drain mode only: what to do when a same-named file already exists in the target
+        /// directory (Go `--conflict`). `skip` (default) never overwrites — it leaves the file in the
+        /// inbox and reports it; `overwrite` replaces the existing file (removing it first, so a
+        /// planted symlink is never followed); `rename` keeps both by writing a numbered variant
+        /// (`name (1).ext`). Ignored in single-file (`get <name> <dest>`) mode.
+        #[arg(long, value_enum, default_value_t = ConflictArg::Skip)]
+        conflict: ConflictArg,
+        /// Single-file mode only: delete the file from the inbox after a successful fetch. (The
+        /// directory-drain mode always removes received files from the inbox, like Go.)
         #[arg(long)]
         delete_after: bool,
     },
+}
+
+/// CLI surface for the `--conflict` flag (Go `onConflict`). Maps to the wire
+/// [`ConflictPolicy`](tailscaled_rs::localapi::ConflictPolicy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum ConflictArg {
+    /// Never overwrite: leave a conflicting file in the inbox and report it (the safe default).
+    Skip,
+    /// Replace an existing file (removed first, so a symlink at the name is not followed).
+    Overwrite,
+    /// Keep both: write a Chrome-style numbered variant, `name (1).ext`.
+    Rename,
+}
+
+impl From<ConflictArg> for tailscaled_rs::localapi::ConflictPolicy {
+    fn from(a: ConflictArg) -> Self {
+        use tailscaled_rs::localapi::ConflictPolicy;
+        match a {
+            ConflictArg::Skip => ConflictPolicy::Skip,
+            ConflictArg::Overwrite => ConflictPolicy::Overwrite,
+            ConflictArg::Rename => ConflictPolicy::Rename,
+        }
+    }
 }
 
 /// Map the `--exit-node` / `--clear-exit-node` flag pair to the wire field's double `Option`.
@@ -2247,13 +2289,22 @@ async fn run_file(socket: &std::path::Path, cmd: FileCmd) -> Result<()> {
         FileCmd::Cp { path, peer } => Request::FileCp { path, peer },
         FileCmd::List => Request::FileList,
         FileCmd::Get {
-            name,
+            target,
             dest,
+            conflict,
             delete_after,
-        } => Request::FileGet {
-            name,
-            dest,
-            delete_after,
+        } => match dest {
+            // Two positionals (`get <name> <dest>`) → the single-file fetch (fork convenience).
+            Some(dest) => Request::FileGet {
+                name: target,
+                dest,
+                delete_after,
+            },
+            // One positional (`get <dir>`) → the Go-faithful inbox drain into a directory.
+            None => Request::FileGetDir {
+                dir: target,
+                conflict: conflict.into(),
+            },
         },
     };
     let response = round_trip(socket, &request)
@@ -2263,6 +2314,14 @@ async fn run_file(socket: &std::path::Path, cmd: FileCmd) -> Result<()> {
         // Waiting Taildrop files (`tnet file list`). One line per file; an empty inbox prints a
         // clear placeholder rather than nothing.
         Response::Files { files } => print!("{}", format_files(&files)),
+        // Inbox-drain outcomes (`tnet file get <dir>`). Print one line per file; exit non-zero if any
+        // file failed (Go returns the last error), so scripts can detect a partial drain.
+        Response::FilesGot { results } => {
+            print!("{}", format_files_got(&results));
+            if results.iter().any(|r| r.error.is_some()) {
+                std::process::exit(1);
+            }
+        }
         Response::Ok { message } => {
             println!("ok: {message}");
         }
@@ -2937,6 +2996,40 @@ fn format_files(files: &[tailscaled_rs::localapi::WaitingFileReport]) -> String 
             sanitize_for_terminal(&f.name),
             f.size
         ));
+    }
+    out
+}
+
+/// Render the per-file outcomes of `tnet file get <dir>` (a [`Response::FilesGot`]). One line per
+/// file: a success shows where it landed + the byte count (`wrote <name> -> <path> (<n> bytes)`,
+/// noting a `rename` that landed at a different name), a failure shows the reason (`error: <name>:
+/// <reason>`) and leaves the file in the inbox. An empty inbox prints a clear placeholder. All
+/// control-supplied names/paths are sanitized for terminal display. Pure → unit-testable.
+fn format_files_got(results: &[tailscaled_rs::localapi::FileGotReport]) -> String {
+    if results.is_empty() {
+        return "(no files waiting)\n".to_string();
+    }
+    let mut out = String::new();
+    for r in results {
+        let name = sanitize_for_terminal(&r.name);
+        match (&r.written, &r.error) {
+            // Success: written somewhere. Note the actual path (differs from the name under `rename`).
+            (Some(path), _) => {
+                out.push_str(&format!(
+                    "wrote {name} -> {} ({} bytes)\n",
+                    sanitize_for_terminal(path),
+                    r.size
+                ));
+            }
+            // Failure: report the reason; the file stays in the inbox.
+            (None, Some(err)) => {
+                out.push_str(&format!("error: {name}: {}\n", sanitize_for_terminal(err)));
+            }
+            // Neither (should not happen — the daemon always sets one) — surface defensively.
+            (None, None) => {
+                out.push_str(&format!("error: {name}: unknown outcome\n"));
+            }
+        }
     }
     out
 }
@@ -5050,24 +5143,43 @@ mod tests {
             other => panic!("expected Request::FileList, got {other:?}"),
         }
 
-        // `--delete-after` threads straight through to the wire field; omitting it sends `false`.
-        let get = match (FileCmd::Get {
-            name: "report.pdf".to_string(),
-            dest: "/tmp/out.pdf".to_string(),
-            delete_after: true,
-        }) {
-            FileCmd::Get {
-                name,
+        // `get` has two shapes, decided by whether a second positional (DEST) is present — this is the
+        // exact branch in `run_file`. Replicate it so both map to the right wire request.
+        let build_get = |target: String, dest: Option<String>, conflict: ConflictArg, da: bool| {
+            // Mirror run_file's match on `dest`.
+            match (FileCmd::Get {
+                target,
                 dest,
-                delete_after,
-            } => Request::FileGet {
-                name,
-                dest,
-                delete_after,
-            },
-            _ => unreachable!(),
+                conflict,
+                delete_after: da,
+            }) {
+                FileCmd::Get {
+                    target,
+                    dest,
+                    conflict,
+                    delete_after,
+                } => match dest {
+                    Some(dest) => Request::FileGet {
+                        name: target,
+                        dest,
+                        delete_after,
+                    },
+                    None => Request::FileGetDir {
+                        dir: target,
+                        conflict: conflict.into(),
+                    },
+                },
+                _ => unreachable!(),
+            }
         };
-        match get {
+
+        // Two positionals (`get <name> <dest> --delete-after`) → single-file FileGet.
+        match build_get(
+            "report.pdf".to_string(),
+            Some("/tmp/out.pdf".to_string()),
+            ConflictArg::Skip,
+            true,
+        ) {
             Request::FileGet {
                 name,
                 dest,
@@ -5079,6 +5191,70 @@ mod tests {
             }
             other => panic!("expected Request::FileGet, got {other:?}"),
         }
+
+        // One positional (`get <dir> --conflict=rename`) → directory-drain FileGetDir.
+        match build_get(
+            "/tmp/downloads".to_string(),
+            None,
+            ConflictArg::Rename,
+            false,
+        ) {
+            Request::FileGetDir { dir, conflict } => {
+                assert_eq!(dir, "/tmp/downloads");
+                assert_eq!(
+                    conflict,
+                    tailscaled_rs::localapi::ConflictPolicy::Rename,
+                    "--conflict=rename maps to the wire policy"
+                );
+            }
+            other => panic!("expected Request::FileGetDir, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn format_files_got_renders_success_and_failure_lines() {
+        use tailscaled_rs::localapi::FileGotReport;
+        // A drain with one success (written elsewhere under rename), one failure (left in inbox).
+        let results = vec![
+            FileGotReport {
+                name: "a.txt".to_string(),
+                size: 12,
+                written: Some("/tmp/dl/a (1).txt".to_string()),
+                error: None,
+            },
+            FileGotReport {
+                name: "b.txt".to_string(),
+                size: 0,
+                written: None,
+                error: Some("refusing to overwrite /tmp/dl/b.txt: file already exists".to_string()),
+            },
+        ];
+        let out = format_files_got(&results);
+        assert!(
+            out.contains("wrote a.txt -> /tmp/dl/a (1).txt (12 bytes)"),
+            "success line: {out}"
+        );
+        assert!(
+            out.contains("error: b.txt: refusing to overwrite"),
+            "failure line: {out}"
+        );
+        // Empty drain → placeholder.
+        assert_eq!(format_files_got(&[]), "(no files waiting)\n");
+    }
+
+    #[test]
+    fn format_files_got_sanitizes_peer_supplied_name() {
+        use tailscaled_rs::localapi::FileGotReport;
+        // The inbox name comes from the sending peer (untrusted); terminal escapes must be stripped.
+        let results = vec![FileGotReport {
+            name: "evil\x1b[2J\x07.txt".to_string(),
+            size: 1,
+            written: Some("/tmp/evil\x1b[2J.txt".to_string()),
+            error: None,
+        }];
+        let out = format_files_got(&results);
+        assert!(!out.contains('\x1b'), "ESC stripped from drain line");
+        assert!(!out.contains('\x07'), "BEL stripped from drain line");
     }
 
     #[test]
