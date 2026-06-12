@@ -69,6 +69,9 @@ export TS_RS_EXPERIMENT=this_is_unstable_software
 
 # Bring up and wait (up to 30s) for the node to reach Running — handy in scripts:
 ./target/release/tnet up --authkey tskey-auth-XXXX --timeout 30 && echo connected
+
+# Serve a live HTML status page (default http://127.0.0.1:8384; opens a browser):
+./target/release/tnet status --web            # add --no-browser / --listen ADDR to customize
 ```
 
 `tnet up --timeout <SECONDS>` (Go `tailscale up --timeout`) waits for the node to reach the Running

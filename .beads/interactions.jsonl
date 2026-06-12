@@ -58,3 +58,4 @@
 {"id":"int-59e73e3ca416856534f62b48475afbc0","kind":"field_change","created_at":"2026-06-11T13:47:19.410042Z","actor":"GeiserX","issue_id":"tsd-nbs","extra":{"field":"status","new_value":"closed","old_value":"open","reason":"Closed"}}
 {"id":"int-bc016df8137cb41ca9c8db2d8f51a67e","kind":"field_change","created_at":"2026-06-11T18:12:25.130923Z","actor":"GeiserX","issue_id":"tsd-6wy","extra":{"field":"status","new_value":"closed","old_value":"open","reason":"Closed"}}
 {"id":"int-64945557bd9fb37e6f2f9d151a998e9a","kind":"field_change","created_at":"2026-06-11T22:30:19.132395Z","actor":"GeiserX","issue_id":"tsd-9bm","extra":{"field":"status","new_value":"closed","old_value":"open","reason":"Closed"}}
+{"id":"int-c22640a728c14de738bd78031a2a101e","kind":"field_change","created_at":"2026-06-12T01:09:51.536196Z","actor":"GeiserX","issue_id":"tsd-eqx","extra":{"field":"status","new_value":"closed","old_value":"open","reason":"Closed"}}
