@@ -841,19 +841,21 @@ async fn refuse_ssh_toggle_risk_if_needed(
         }
     };
     match ssh_toggle_refusal(Some(want), have, true, accepted) {
+        // Go's `presentSSHToggleRisk` strings, verbatim (up.go), so the operator-facing wording
+        // matches upstream exactly; the override hint is added (Go prompts interactively; this CLI
+        // refuses fail-closed and points at the same `--accept-risk=lose-ssh` escape hatch).
         Some(true) => {
             eprintln!(
-                "refusing to enable the Tailscale SSH server: you appear to be connected over a \
-                 Tailscale SSH session, and this reroutes SSH to Tailscale SSH — your session will \
-                 disconnect."
+                "You are connected over Tailscale; this action will reroute SSH traffic to \
+                 Tailscale SSH and will result in your session disconnecting."
             );
             eprintln!("To override, re-run with --accept-risk=lose-ssh");
             std::process::exit(1);
         }
         Some(false) => {
             eprintln!(
-                "refusing to disable the Tailscale SSH server: you appear to be connected using \
-                 Tailscale SSH, and this will disconnect your session."
+                "You are connected using Tailscale SSH; this action will result in your session \
+                 disconnecting."
             );
             eprintln!("To override, re-run with --accept-risk=lose-ssh");
             std::process::exit(1);
@@ -3512,6 +3514,40 @@ mod tests {
         assert_eq!(ssh_toggle_refusal(Some(true), false, true, ""), Some(true));
         // Refuse DISABLE: want SSH off, currently on, over SSH, not accepted → Some(false).
         assert_eq!(ssh_toggle_refusal(Some(false), true, true, ""), Some(false));
+    }
+
+    #[tokio::test]
+    async fn ssh_toggle_gate_short_circuits_without_a_round_trip() {
+        // The load-bearing guarantee: the gate must NOT hit the daemon on the common path. We point it
+        // at a dead socket — a real GetPrefs round-trip would return Err (connect fails) — and assert
+        // Ok(()), which proves the short-circuit returned before the round-trip. Cases that must skip:
+        let dead = std::path::Path::new("/tmp/tnet-ssh-toggle-nope.sock");
+        // (a) toggle not mentioned (want_ssh None) → no round-trip.
+        assert!(
+            refuse_ssh_toggle_risk_if_needed(dead, None, None)
+                .await
+                .is_ok(),
+            "no --ssh/--no-ssh must skip the round-trip"
+        );
+        // (b) toggle mentioned + risk pre-accepted → no round-trip (accepted short-circuits).
+        assert!(
+            refuse_ssh_toggle_risk_if_needed(dead, Some(true), Some("lose-ssh"))
+                .await
+                .is_ok(),
+            "an accepted risk must skip the round-trip"
+        );
+        // (c) toggle mentioned but NOT over a Tailscale SSH session → no round-trip. In a normal test
+        // process SSH_CLIENT is unset (or not a tailnet IP), so is_ssh_over_tailscale() is false; the
+        // gate returns Ok before the round-trip. (This relies on the test env not being an actual
+        // Tailscale SSH session, which CI/dev shells are not.)
+        if !is_ssh_over_tailscale() {
+            assert!(
+                refuse_ssh_toggle_risk_if_needed(dead, Some(true), None)
+                    .await
+                    .is_ok(),
+                "not over Tailscale SSH must skip the round-trip"
+            );
+        }
     }
 
     #[test]
