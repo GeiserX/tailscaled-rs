@@ -11,8 +11,8 @@ A Tailscale-style node divides cleanly into two layers with very different shape
 
 | Layer | Responsibility | Where it lives |
 |---|---|---|
-| **Engine** | Cryptography + data plane: the Noise control handshake, the network-map client, magicsock (direct UDP + disco NAT traversal), DERP relay, the WireGuard tunnel, the userspace netstack, packet filtering. | `tailscale-rs` (an embeddable library) |
-| **Daemon** | Lifecycle + intent + control surface: a state machine, persisted preferences, a local IPC socket, a CLI, and (eventually) per-OS routing/DNS/service integration. | **this project** |
+| **Engine** | Cryptography + data plane: the Noise control handshake, the network-map client, magicsock (direct UDP + disco NAT traversal), DERP relay, the WireGuard tunnel, the userspace netstack, packet filtering, and — in TUN mode — the **host route/DNS programming** (`ts_host_net`: the OS routing table + system resolver, the analogue of Go's `wgengine/router` + DNS manager). | `tailscale-rs` (an embeddable library) |
+| **Daemon** | Lifecycle + intent + control surface: a state machine, persisted preferences, a local IPC socket, a CLI, service install (systemd/launchd), and the TUN-mode *selection* (transport mode + privilege preflight + interface-name default). The per-OS routing/DNS *mechanism* itself lives in the engine (above), not here — the daemon has no routing seam. | **this project** |
 
 The engine is `tsnet`-shaped: you construct an immutable node from a config and it runs in-process.
 The daemon is `tailscaled`-shaped: a long-running service you reconfigure at runtime and control
@@ -99,7 +99,7 @@ service packaging.
 |---|---|---|
 | **1 — MVP** *(done)* | userspace-networking node: authkey join, `status`/`up`/`down` over LocalAPI, `SO_PEERCRED` LocalAPI authorization (read for all, write for root/same-UID), persisted prefs in a `0700` state dir, zeroized secret handling | A node joins a tailnet and answers `status` |
 | **2 — Daemonize** | service install (systemd/launchd), `netmon`-driven re-bind on network change, Linux OS-DNS | Survives reboot + link-change as a managed service |
-| **3 — Platform breadth** | TUN mode + per-OS router/DNS (Linux/macOS/Windows), port mapping | Transparent OS-wide connectivity on three platforms |
+| **3 — Platform breadth** | TUN-mode selection + privilege preflight + per-OS interface-name defaults (the daemon's part); the per-OS **host route/DNS programming itself is engine-owned** (`ts_host_net`, Linux + macOS shipped, wired into the TUN datapath — the daemon has no routing seam by design); port mapping | Transparent OS-wide connectivity (Linux/macOS done via the engine; Windows host-net is an engine gap) |
 | **4 — Feature parity** | MagicDNS, exit/subnet routing, Serve/Funnel, SSH, Tailnet Lock enforcement | Approaches `tailscaled` feature parity |
 
 ## Hard problems (tracked honestly)
