@@ -60,7 +60,13 @@ jobs:
           tool: cross
 
       - name: Build release binaries
-        run: cross build --release --bins --target ${{ matrix.target }}
+        # Ship a FULL-FEATURED daemon, matching Go's model (one `tailscaled` binary that does
+        # everything; capabilities gate at RUNTIME, not build time). Without these, a downloaded
+        # release silently can't run `tnet ssh` (server), TUN mode, `tnet cert`, or `serve --https`/
+        # `funnel` — they fail closed because the features were compiled out. `tun`+`ssh` still need
+        # root at runtime, and `acme` (cert/HTTPS-serve) still needs a SaaS tailnet — those runtime
+        # gates are unchanged; this only stops the binary from being incapable of them by construction.
+        run: cross build --release --bins --features tun,ssh,acme --target ${{ matrix.target }}
 
       - name: Package archive + checksum
         id: package
