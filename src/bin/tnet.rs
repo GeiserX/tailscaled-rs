@@ -2310,11 +2310,13 @@ fn format_files(files: &[tailscaled_rs::localapi::WaitingFileReport]) -> String 
 /// "no tailnet node owns <ip>" line (the caller passes the queried IP). Otherwise: the owning node's
 /// name, its IPv4, the owning user (when control retained it), its liveness (`online`, and a
 /// `last-seen` line only when offline — an online node's last-seen is "now", matching `status`), its
-/// control-granted ACL `tags` and node-key `key-expiry` (when present), and any control-granted
-/// capabilities, each on its own line. The node name, tags, and capabilities are control-supplied, so
-/// each is passed through [`sanitize_for_terminal`] before rendering (online/last-seen are a bool +
-/// timestamp, not free-form text). Pure (returns the string, trailing newline included) so it is
-/// unit-testable; the caller `print!`s it.
+/// control-granted ACL `tags` and node-key `key-expiry` (when present), any control-granted node-level
+/// capabilities, and the flow-scoped `cap-grants` (Go `WhoIsResponse.CapMap` — the peer-capability
+/// grants for this-node → queried-IP, name + values), each on its own line. The node name, tags,
+/// node-level capabilities, and every cap-grant name + value are control-supplied, so each is passed
+/// through [`sanitize_for_terminal`] before rendering (online/last-seen are a bool + timestamp, not
+/// free-form text). Pure (returns the string, trailing newline included) so it is unit-testable; the
+/// caller `print!`s it.
 fn format_whois(w: &tailscaled_rs::localapi::WhoisReport, ip: &str) -> String {
     if !w.found {
         return format!("no tailnet node owns {ip}\n");
@@ -2367,6 +2369,27 @@ fn format_whois(w: &tailscaled_rs::localapi::WhoisReport, ip: &str) -> String {
         for cap in &w.capabilities {
             // Capability names come from control; sanitize each before printing.
             out.push_str(&format!("  - {}\n", sanitize_for_terminal(cap)));
+        }
+    }
+    // Flow-scoped peer-capability grants (Go `WhoIsResponse.CapMap`), distinct from the node-level
+    // `capabilities` above — these are the grants control's packet-filter authorizes for traffic from
+    // this node to the queried IP, so they carry per-cap arg values (mirroring Go's `tailscale whois`
+    // CapMap block). The map is a `BTreeMap`, so iteration is sorted by cap name → deterministic
+    // output. Unlike Go, which prints a single `json.MarshalIndent` blob of the values, we render each
+    // grant value on its own line, individually sanitized — both the cap name and every value are
+    // control-supplied, and one-sanitized-value-per-line is this fork's terminal-injection-safe
+    // discipline (no raw control bytes can reach the operator's terminal).
+    if !w.cap_map.is_empty() {
+        out.push_str("cap-grants:\n");
+        for (cap, vals) in &w.cap_map {
+            if vals.is_empty() {
+                out.push_str(&format!("  - {}\n", sanitize_for_terminal(cap)));
+            } else {
+                out.push_str(&format!("  - {}:\n", sanitize_for_terminal(cap)));
+                for v in vals {
+                    out.push_str(&format!("      - {}\n", sanitize_for_terminal(v)));
+                }
+            }
         }
     }
     out
@@ -4249,6 +4272,15 @@ mod tests {
                 "https://tailscale.com/cap/is-admin".to_string(),
                 "funnel".to_string(),
             ],
+            // Flow-scoped peer-cap grants (Go `WhoIsResponse.CapMap`): one cap WITH a raw-JSON value
+            // and one value-less cap, to exercise both render shapes.
+            cap_map: std::collections::BTreeMap::from([
+                (
+                    "https://tailscale.com/cap/file-sharing".to_string(),
+                    vec!["{\"foo\":1}".to_string()],
+                ),
+                ("cap/is-admin".to_string(), vec![]),
+            ]),
             tags: vec!["tag:server".to_string(), "tag:ci".to_string()],
             node_key_expiry: Some("2026-09-01 12:00:00 UTC".to_string()),
             // Offline + a known last-seen: status convention is to show BOTH the `online: no` line
@@ -4264,6 +4296,32 @@ mod tests {
         assert!(
             out.contains("https://tailscale.com/cap/is-admin") && out.contains("funnel"),
             "every capability present"
+        );
+        // Flow-scoped grants render under their own `cap-grants:` header (distinct from the
+        // node-level `capabilities:` block), with the cap name and — for a cap that has values —
+        // each value on its own indented line.
+        assert!(
+            out.contains("cap-grants:"),
+            "cap-grants header present when cap_map non-empty"
+        );
+        assert!(
+            out.contains("https://tailscale.com/cap/file-sharing") && out.contains("cap/is-admin"),
+            "every cap-grant name present (value-bearing and value-less)"
+        );
+        // `cap_map` is a BTreeMap, so the render order is the keys' sorted order (deterministic — the
+        // production renderer relies on this for stable output). Within the `cap-grants:` section,
+        // `cap/is-admin` < `https://…/cap/file-sharing` lexicographically, so the value-less cap
+        // renders before the value-bearing one. (Compare positions WITHIN the cap-grants block: the
+        // node-level `capabilities:` block above also contains a `.../cap/is-admin` entry, so anchor
+        // the search at the `cap-grants:` header to avoid matching that earlier occurrence.)
+        let grants = out.split_once("cap-grants:").unwrap().1;
+        assert!(
+            grants.find("cap/is-admin").unwrap() < grants.find("cap/file-sharing").unwrap(),
+            "cap-grants render in BTreeMap-sorted key order"
+        );
+        assert!(
+            out.contains("{\"foo\":1}"),
+            "the cap-grant's raw-JSON value renders on its own line"
         );
         // ACL tags render under a `tags:` header, one bullet each (Go parity).
         assert!(
@@ -4324,6 +4382,7 @@ mod tests {
             node_ipv4: Some("100.64.0.2".to_string()),
             user: None,
             capabilities: vec![],
+            cap_map: std::collections::BTreeMap::new(),
             tags: vec![],
             node_key_expiry: None,
             online: None,
@@ -4336,6 +4395,10 @@ mod tests {
         assert!(
             !out.contains("capabilities:"),
             "no capabilities header when the set is empty"
+        );
+        assert!(
+            !out.contains("cap-grants:"),
+            "no cap-grants header when the flow-scoped cap_map is empty"
         );
         assert!(
             !out.contains("tags:"),
@@ -4362,6 +4425,12 @@ mod tests {
             node_ipv4: Some("100.64.0.2".to_string()),
             user: None,
             capabilities: vec![],
+            // Flow-scoped cap grants are control-supplied too — BOTH the cap NAME and each grant VALUE
+            // must be sanitized. Smuggle a terminal escape into a cap name AND into a value.
+            cap_map: std::collections::BTreeMap::from([(
+                "cap/\x1b]0;pwned\x07evil".to_string(),
+                vec!["bad\x1b[2Jvalue".to_string()],
+            )]),
             // Tags are also control-supplied — a hostile one must be sanitized just like the name.
             tags: vec!["tag:\x1bevil\x07".to_string()],
             node_key_expiry: None,
@@ -4371,15 +4440,20 @@ mod tests {
         let out = format_whois(&w, "100.64.0.2");
         assert!(
             !out.contains('\x1b'),
-            "ESC must be stripped from node name + tags"
+            "ESC must be stripped from node name + tags + cap-grant name/value"
         );
         assert!(
             !out.contains('\x07'),
-            "BEL must be stripped from node name + tags"
+            "BEL must be stripped from node name + tags + cap-grant name/value"
         );
         // The readable parts survive (just the control bytes become the replacement char).
         assert!(out.contains("evil"));
         assert!(out.contains("name"));
+        // The cap-grant's readable fragments survive sanitization too (control bytes replaced).
+        assert!(
+            out.contains("value"),
+            "cap-grant value's readable text survives"
+        );
     }
 
     #[test]

@@ -167,7 +167,10 @@ pub(super) async fn netcheck(dev: &tailscale::Device) -> Response {
 /// Maps the engine outcome to the wire [`WhoisReport`](crate::localapi::WhoisReport):
 /// - `Ok(Some(w))` → `found: true` with the node name/IPv4, the owner `user` (always `None` in
 ///   this fork — the domain node model drops the login), and just the capability *names* (the
-///   `(cap, args)` args are dropped — too verbose for a whois summary).
+///   `(cap, args)` args are dropped — too verbose for a whois summary). The flow-scoped peer-cap
+///   grants `cap_map` (Go `WhoIsResponse.CapMap`) are also surfaced verbatim — name → raw
+///   (JSON-encoded) value strings, which the daemon never parses — distinct from the node-level
+///   capability names.
 /// - `Ok(None)` → `found: false` (the IP matched no known tailnet node), all fields defaulted.
 /// - `Err(e)` → a clear [`Response::Error`] carrying the engine error.
 pub(super) async fn whois(dev: &tailscale::Device, ip: &str) -> Response {
@@ -207,6 +210,9 @@ pub(super) async fn whois(dev: &tailscale::Device, ip: &str) -> Response {
                 user: w.user,
                 // Keep just the capability names for the summary; drop the verbose args.
                 capabilities: w.capabilities.into_iter().map(|(cap, _args)| cap).collect(),
+                // Flow-scoped peer-cap grants (Go `WhoIsResponse.CapMap`): surfaced verbatim
+                // (name → raw-JSON arg values), distinct from the node-level capability names above.
+                cap_map: w.cap_map,
                 tags,
                 node_key_expiry,
                 online,
