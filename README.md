@@ -50,8 +50,13 @@ the kernel. See [`docs/DESIGN.md`](docs/DESIGN.md) for the full architecture and
 ## Quick start
 
 ```bash
-# Build
+# Build (lean default: userspace networking, no TLS-cert/SSH-server/TUN).
 cargo build --release
+# …or build a FULL-featured daemon (what the released binaries ship) — adds kernel-TUN mode,
+# the Tailscale SSH server, and ACME cert issuance for `cert`/`serve --https`/`funnel`. Each still
+# gates at runtime (TUN/SSH need root; cert/funnel need a SaaS tailnet):
+#   cargo build --release --features tun,ssh,acme
+# (Prebuilt release downloads are already built with all three.)
 
 # The engine requires an explicit acknowledgement that it is experimental:
 export TS_RS_EXPERIMENT=this_is_unstable_software
