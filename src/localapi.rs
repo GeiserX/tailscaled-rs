@@ -521,6 +521,13 @@ pub struct StatusReport {
     /// clients that predate this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// Whether this node holds a persisted node key (Go `Status.HaveNodeKey`). The daemon computes
+    /// this directly from the on-disk key (`has_persisted_node_key`), the analogue of Go's
+    /// `hasNodeKeyLocked` — NOT a proxy for the IPN state. (An *expired* node still holds its key on
+    /// disk, so it must report `true` even while the state is `NeedsLogin`; only `logout`/`force-reauth`
+    /// discard the key.) `#[serde(default)]` keeps the wire backward-compatible.
+    #[serde(default)]
+    pub have_node_key: bool,
 }
 
 /// A read-only projection of the node's persisted [`Prefs`](crate::prefs::Prefs) for `status`
@@ -1258,6 +1265,7 @@ mod tests {
                 ..Default::default()
             }],
             version: None,
+            have_node_key: false,
         });
         let json = serde_json::to_string(&report).unwrap();
         let back: Response = serde_json::from_str(&json).unwrap();
@@ -1299,6 +1307,7 @@ mod tests {
             magic_dns_suffix: None,
             peers: vec![],
             version: None,
+            have_node_key: false,
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("auth_url"));
@@ -1335,6 +1344,7 @@ mod tests {
             magic_dns_suffix: None,
             peers: vec![],
             version: None,
+            have_node_key: false,
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"error\""));
@@ -1365,6 +1375,7 @@ mod tests {
             magic_dns_suffix: None,
             peers: vec![],
             version: None,
+            have_node_key: false,
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(
@@ -1392,6 +1403,7 @@ mod tests {
             magic_dns_suffix: None,
             peers: vec![],
             version: None,
+            have_node_key: false,
         };
         let pending_json = serde_json::to_string(&pending).unwrap();
         assert!(pending_json.contains("auth_url"));
@@ -1417,6 +1429,7 @@ mod tests {
             magic_dns_suffix: None,
             peers: vec![],
             version: None,
+            have_node_key: false,
         };
         let failed_json = serde_json::to_string(&failed).unwrap();
         assert!(failed_json.contains("\"error\""));

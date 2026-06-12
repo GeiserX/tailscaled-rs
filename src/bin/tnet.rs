@@ -2565,12 +2565,17 @@ fn format_status_json(s: &tailscaled_rs::localapi::StatusReport) -> Result<Strin
         root.insert("Version".into(), json!(v));
     }
     // TUN (Go `Status.TUN`): whether the node runs on a kernel TUN interface vs the userspace
-    // netstack. The persisted pref is the daemon's answer (the human `status` already prints it); the
-    // JSON dropped it. Go emits the bare bool always.
+    // netstack. We report the configured pref (the human `status` already prints it); Go reports the
+    // runtime reality. These agree on every success path (netstack default → false; `--tun` up → true)
+    // and diverge only if a requested `--tun` failed to initialize (pref true, datapath netstack) —
+    // the fork has no `tun_running` liveness signal today, so the pref is the answer. Go emits the
+    // bare bool always.
     root.insert("TUN".into(), json!(s.prefs.tun));
-    // HaveNodeKey (Go `Status.HaveNodeKey`, omitempty): the node holds a registered node key — true
-    // once it is past the pre-login states. Go omits it when false, so only emit it when true.
-    if !matches!(s.state.as_str(), "NoState" | "NeedsLogin") {
+    // HaveNodeKey (Go `Status.HaveNodeKey`, omitempty): whether a node key is on disk — taken from the
+    // daemon's `have_node_key` (the analogue of Go's `hasNodeKeyLocked`, read from the key file), NOT
+    // inferred from `state` (an expired node reports `NeedsLogin` but still holds its key). Go omits it
+    // when false, so only emit it when true.
+    if s.have_node_key {
         root.insert("HaveNodeKey".into(), json!(true));
     }
     // AuthURL: Go emits the field always (empty when none); mirror that.
@@ -4959,6 +4964,7 @@ mod tests {
                 },
             ],
             version: None,
+            have_node_key: true,
         };
 
         // No filter → everything.
@@ -5041,6 +5047,7 @@ mod tests {
                 },
             ],
             version: Some("0.36.0".to_string()),
+            have_node_key: true,
         };
         let out = format_status_json(&report).unwrap();
         let v: serde_json::Value =
@@ -5095,6 +5102,30 @@ mod tests {
         assert_eq!(
             v["Peer"]["peer-c"]["LastSeen"],
             serde_json::json!("2026-06-11 05:19:14 UTC")
+        );
+    }
+
+    #[test]
+    fn format_status_json_omits_have_node_key_when_false() {
+        use tailscaled_rs::localapi::StatusReport;
+        // The omitempty half of Go-fidelity: HaveNodeKey is OMITTED when the node holds no key (Go's
+        // `json:",omitempty"`), while TUN is ALWAYS present (Go's bare bool) — even on a keyless node.
+        let report = StatusReport {
+            state: "NeedsLogin".to_string(),
+            have_node_key: false,
+            version: Some("0.36.0".to_string()),
+            ..Default::default()
+        };
+        let out = format_status_json(&report).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            v.get("HaveNodeKey").is_none(),
+            "HaveNodeKey must be omitted when false (Go omitempty): {out}"
+        );
+        assert_eq!(
+            v["TUN"],
+            serde_json::json!(false),
+            "TUN is always present even when HaveNodeKey is omitted (Go bare bool)"
         );
     }
 

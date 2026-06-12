@@ -1978,6 +1978,10 @@ impl Backend {
             // The daemon's own version (Go `Status.Version`) — the same crate version the `version`
             // request reports, surfaced here so `status --json` carries it too.
             version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            // Whether a node key is on disk (Go `Status.HaveNodeKey` / `hasNodeKeyLocked`) — read
+            // straight from the key file, NOT inferred from `state` (an expired node reports
+            // `NeedsLogin` but still holds its key). `has_persisted_node_key` is a pure read.
+            have_node_key: self.has_persisted_node_key().await,
         }
     }
 
