@@ -346,6 +346,16 @@ enum Command {
         #[arg(value_name = "IP")]
         ip: String,
     },
+    /// Fetch an OIDC id-token for this node, scoped to an audience (Go `tailscale id-token <aud>`).
+    /// Control mints a signed JWT identifying this machine; prints the raw token. Requires the node
+    /// to be up and a control server new enough to issue id-tokens.
+    #[command(name = "id-token")]
+    IdToken {
+        /// The OIDC audience (the token's `aud` claim) — typically the URL/identifier of the service
+        /// that will verify the token.
+        #[arg(value_name = "AUDIENCE")]
+        audience: String,
+    },
     /// Ping a tailnet peer over the overlay and report the round-trip time.
     Ping {
         /// The tailnet IP of the peer to ping.
@@ -1148,6 +1158,7 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Command::Whois { ip } => Request::Whois { ip },
+        Command::IdToken { audience } => Request::IdToken { audience },
         // `ping` (Go `tailscale ping [-c N]`): the engine pings one-at-a-time, so `-c` is a CLI-side
         // loop over `Request::Ping`. Handled inline (the loop + summary + exit-code contract); each
         // attempt prints a result line, a failure is counted but does not abort the rest, and the
@@ -1410,6 +1421,10 @@ async fn main() -> Result<()> {
         // `--daemon` was passed), so a `Response::Version` never reaches here. This arm exists only
         // for match exhaustiveness; treat a stray one defensively rather than panicking.
         Response::Version { version } => println!("{version}"),
+        // `id-token`: print the raw JWT on its own line (Go's `outln(tr.IDToken)`) for easy capture
+        // into a variable / piping to a verifier. The token is opaque base64url — no sanitization
+        // needed (it is control-minted, not free-form text).
+        Response::IdToken { token } => println!("{token}"),
         // `get` is likewise handled inline above (early return); this arm is only for exhaustiveness.
         // Render the all-prefs table defensively if one ever reaches here.
         Response::Prefs(view) => print!("{}", format_get(&view, None, false).unwrap_or_default()),
@@ -4808,6 +4823,24 @@ mod tests {
         // `--timeout 0` is the explicit "wait forever" value (Go's 0 = wait indefinitely); it must
         // parse as Some(0), distinct from absent (None) — `wait_for_running` maps both to no deadline.
         assert_eq!(up_timeout_of(&["tnet", "up", "--timeout", "0"]), Some(0));
+    }
+
+    #[test]
+    fn id_token_command_parses_audience() {
+        // `tnet id-token <aud>` parses to Command::IdToken { audience } (the subcommand spelling is
+        // the hyphenated `id-token`, matching Go); the audience positional is required.
+        match Cli::try_parse_from(["tnet", "id-token", "https://example.com"])
+            .expect("parses")
+            .command
+        {
+            Command::IdToken { audience } => assert_eq!(audience, "https://example.com"),
+            _ => panic!("expected Command::IdToken"),
+        }
+        // Missing the required audience is a parse error (not a panic / empty token).
+        assert!(
+            Cli::try_parse_from(["tnet", "id-token"]).is_err(),
+            "audience is required"
+        );
     }
 
     #[tokio::test]

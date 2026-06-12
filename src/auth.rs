@@ -153,6 +153,12 @@ pub fn requires_write(request: &crate::localapi::Request) -> bool {
         | Request::SetServeConfig { .. }
         | Request::FileCp { .. }
         | Request::FileGet { .. }
+        // `IdToken` MINTS a bearer credential: control signs an OIDC JWT whose subject is this node's
+        // identity, which a relying party (e.g. cloud workload-identity federation) accepts as proof
+        // this machine is who it claims. That is materially more sensitive than a status read — Go's
+        // LocalAPI gates `serveIDToken` on `PermitWrite` (not `PermitRead`, unlike `whois`), so a
+        // local user who is not root / not the daemon's uid must not be able to mint a node credential.
+        | Request::IdToken { .. }
         // `DebugCapture` installs a dataplane capture hook and writes a pcap as the daemon's uid —
         // it taps all plaintext traffic, so it gates like `up`/`down`, never a read.
         | Request::DebugCapture { .. } => true,
@@ -267,6 +273,13 @@ mod tests {
                 seconds: Some(5)
             }),
             "debug capture installs a dataplane tap + writes a file — a write"
+        );
+        assert!(
+            requires_write(&Request::IdToken {
+                audience: "https://example.com".into()
+            }),
+            "id-token mints a node-identity bearer credential — a write (Go gates it PermitWrite, \
+             unlike the PermitRead whois), so a non-root/non-owner local user can't mint one"
         );
         assert!(!requires_write(&Request::GetServeConfig));
         assert!(

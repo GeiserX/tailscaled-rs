@@ -229,6 +229,16 @@ pub enum Request {
         /// The tailnet IP to resolve.
         ip: String,
     },
+    /// Fetch an OIDC id-token for this node, scoped to `audience` (Go `tailscale id-token <aud>`).
+    /// The daemon asks control to mint a signed JWT; replies with [`Response::IdToken`]. A WRITE: it
+    /// MINTS a bearer credential identifying this node (Go gates `serveIDToken` on `PermitWrite`, not
+    /// the `PermitRead` it uses for `whois`), so it is gated like `up`/`down` — a non-root/non-owner
+    /// local user must not be able to mint a node credential. Requires the node to be up (the issuance
+    /// goes over the live control connection).
+    IdToken {
+        /// The OIDC audience (`aud` claim) the token is minted for.
+        audience: String,
+    },
     /// Ping a peer over the tailnet overlay and report the round-trip time (Go `tailscale ping`).
     /// Read-only (it sends overlay traffic but changes no state) — gated like [`Status`](Request::Status).
     Ping {
@@ -312,6 +322,12 @@ pub enum Response {
     Version {
         /// The daemon binary's version (its crate version, `CARGO_PKG_VERSION`).
         version: String,
+    },
+    /// The OIDC id-token minted by control (reply to [`Request::IdToken`]), printed by
+    /// `tnet id-token`.
+    IdToken {
+        /// The signed JWT (an OIDC id-token scoped to the requested audience).
+        token: String,
     },
     /// The node's current preferences (reply to [`Request::GetPrefs`]) — a [`PrefsView`] projection
     /// of the persisted prefs, rendered by `tnet get`.
@@ -950,6 +966,36 @@ mod tests {
         match serde_json::from_str::<Response>(&json).unwrap() {
             Response::Version { version } => assert_eq!(version, "0.9.0"),
             other => panic!("expected Version, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn id_token_request_response_round_trip() {
+        // `id_token` discriminant + the IdToken(token) reply must survive the wire (CLI and daemon
+        // are separate processes agreeing only on this JSON). The audience round-trips on the request.
+        let req = Request::IdToken {
+            audience: "https://example.com".into(),
+        };
+        let rj = serde_json::to_string(&req).unwrap();
+        assert!(
+            rj.contains(r#""cmd":"id_token""#),
+            "snake_case discriminant: {rj}"
+        );
+        match serde_json::from_str::<Request>(&rj).unwrap() {
+            Request::IdToken { audience } => assert_eq!(audience, "https://example.com"),
+            other => panic!("expected IdToken, got {other:?}"),
+        }
+        let resp = Response::IdToken {
+            token: "header.payload.sig".into(),
+        };
+        let pj = serde_json::to_string(&resp).unwrap();
+        assert!(
+            pj.contains(r#""kind":"id_token""#),
+            "response discriminant locked: {pj}"
+        );
+        match serde_json::from_str::<Response>(&pj).unwrap() {
+            Response::IdToken { token } => assert_eq!(token, "header.payload.sig"),
+            other => panic!("expected IdToken, got {other:?}"),
         }
     }
 

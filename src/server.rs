@@ -694,6 +694,19 @@ async fn dispatch(
                 },
             }
         }
+        // `id-token` (Go `tailscale id-token <aud>`): mint an OIDC JWT for this node via control.
+        // Needs the live device (the issuance goes over the Noise connection), so it uses the same
+        // off-lock `device_handle` clone as `whois`/`ping`; a control refusal becomes `Response::Error`
+        // inside `Backend::id_token`, not a panic.
+        Request::IdToken { audience } => {
+            let dev = { backend.lock().await.device_handle() };
+            match dev {
+                Some(dev) => Backend::id_token(&dev, &audience).await,
+                None => Response::Error {
+                    message: "node is not up".into(),
+                },
+            }
+        }
         Request::Ping { ip, timeout_ms } => {
             let dev = { backend.lock().await.device_handle() };
             match dev {
