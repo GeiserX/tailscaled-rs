@@ -219,6 +219,7 @@ mod tests {
             ssh: None,
             reset: false,
             force_reauth: false,
+            ephemeral: None,
         }
     }
 

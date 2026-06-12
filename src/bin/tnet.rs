@@ -159,6 +159,18 @@ enum Command {
         /// out. It changes no settings (your prefs are kept); it only forces a new login.
         #[arg(long)]
         force_reauth: bool,
+        /// Register as an ephemeral node: control garbage-collects it shortly after it disconnects
+        /// (Go `tailscale up --ephemeral`). Useful for short-lived CI jobs / containers. WARNING: an
+        /// ephemeral node will NOT rejoin after a reboot without a fresh auth key (control will have
+        /// GC'd it). Mutually exclusive with `--no-ephemeral`; omitting both leaves the setting
+        /// unchanged. The default for a fresh node is PERSISTENT (survives reboots).
+        #[arg(long, conflicts_with = "no_ephemeral")]
+        ephemeral: bool,
+        /// Register as a persistent node (the default): keeps its registration across reboots and
+        /// resumes from its key alone. Mutually exclusive with `--ephemeral`; omitting both leaves the
+        /// setting unchanged.
+        #[arg(long)]
+        no_ephemeral: bool,
         /// Wait up to this many seconds for the node to reach the Running state after bringing it up,
         /// then exit (Go `tailscale up --timeout`). On timeout, exits non-zero. Omitted = don't wait
         /// (return as soon as the daemon accepts the up); `0` = wait forever. Handy in scripts as
@@ -728,6 +740,17 @@ fn resolve_accept_dns(accept: bool, no_accept: bool) -> Option<bool> {
     }
 }
 
+/// Map the `--ephemeral` / `--no-ephemeral` flag pair to a tri-state `Option<bool>`.
+/// Enable → `Some(true)`; disable → `Some(false)`; neither → `None` (leave the persisted pref
+/// unchanged). clap's `conflicts_with` guarantees the two are never both set.
+fn resolve_ephemeral(ephemeral: bool, no_ephemeral: bool) -> Option<bool> {
+    match (ephemeral, no_ephemeral) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        _ => None,
+    }
+}
+
 /// Map the `--shields-up` / `--no-shields-up` flag pair to a tri-state `Option<bool>`.
 /// Enable → `Some(true)`; disable → `Some(false)`; neither → `None` (leave the persisted pref
 /// unchanged). Mirrors the `--tun`/`--no-tun` mapping; clap's `conflicts_with` guarantees the two
@@ -974,6 +997,8 @@ async fn main() -> Result<()> {
             no_ssh,
             reset,
             force_reauth,
+            ephemeral,
+            no_ephemeral,
             timeout,
             accept_risk,
         } => {
@@ -1005,6 +1030,8 @@ async fn main() -> Result<()> {
                 no_ssh,
                 reset,
                 force_reauth,
+                ephemeral,
+                no_ephemeral,
                 timeout,
                 accept_risk,
             )
@@ -1270,6 +1297,8 @@ async fn run_up(
     no_ssh: bool,
     reset: bool,
     force_reauth: bool,
+    ephemeral: bool,
+    no_ephemeral: bool,
     timeout: Option<u64>,
     accept_risk: Option<String>,
 ) -> Result<()> {
@@ -1350,6 +1379,8 @@ async fn run_up(
         // `--force-reauth`: discard the node key so the bring-up re-registers fresh (new
         // login). A plain bool flag (Go's `--force-reauth`), passed straight through.
         force_reauth,
+        // `--ephemeral`/`--no-ephemeral` tri-state (registration-time intent; default persistent).
+        ephemeral: resolve_ephemeral(ephemeral, no_ephemeral),
     };
     let response = round_trip(socket, &request)
         .await
@@ -4298,6 +4329,16 @@ mod tests {
     }
 
     #[test]
+    fn resolve_ephemeral_tristate() {
+        // --ephemeral → Some(true); --no-ephemeral → Some(false); neither → None (unchanged, so a
+        // fresh node keeps the persistent default).
+        assert_eq!(resolve_ephemeral(true, false), Some(true));
+        assert_eq!(resolve_ephemeral(false, true), Some(false));
+        assert_eq!(resolve_ephemeral(false, false), None);
+        assert_eq!(resolve_ephemeral(true, true), Some(true));
+    }
+
+    #[test]
     fn resolve_shields_up_tristate() {
         // Enable → Some(true); disable → Some(false); neither → None (unchanged).
         assert_eq!(resolve_shields_up(true, false), Some(true));
@@ -4510,6 +4551,7 @@ mod tests {
             ssh: None,
             reset: false,
             force_reauth: false,
+            ephemeral: None,
         };
         match enabled {
             Request::Up { accept_routes, .. } => {
@@ -4535,6 +4577,7 @@ mod tests {
             ssh: None,
             reset: false,
             force_reauth: false,
+            ephemeral: None,
         };
         match disabled {
             Request::Up { accept_routes, .. } => {
@@ -4564,6 +4607,7 @@ mod tests {
             ssh: None,
             reset: false,
             force_reauth: false,
+            ephemeral: None,
         };
         match unchanged {
             Request::Up { accept_routes, .. } => assert_eq!(
@@ -4597,6 +4641,7 @@ mod tests {
             ssh: None,
             reset: false,
             force_reauth: false,
+            ephemeral: None,
         };
         match enabled {
             Request::Up { shields_up, .. } => {
@@ -4622,6 +4667,7 @@ mod tests {
             ssh: None,
             reset: false,
             force_reauth: false,
+            ephemeral: None,
         };
         match disabled {
             Request::Up { shields_up, .. } => {
@@ -4647,6 +4693,7 @@ mod tests {
             ssh: None,
             reset: false,
             force_reauth: false,
+            ephemeral: None,
         };
         match unchanged {
             Request::Up { shields_up, .. } => assert_eq!(
