@@ -153,8 +153,10 @@ pub enum Request {
     /// Read-only — gated like [`Status`](Request::Status).
     ProfileList,
     /// Snapshot the node's client metrics in Prometheus text format (Go `tailscale metrics`). Replies
-    /// with [`Response::Metrics`]. Read-only — gated like [`Status`](Request::Status). Requires the
-    /// node to be up (metrics come from the live engine).
+    /// with [`Response::Metrics`]. A WRITE for authorization purposes — Go gates `serveMetrics` on
+    /// `PermitWrite` ("out of paranoia that the metrics might contain something sensitive"), so it is
+    /// gated like `up`/`down` (root/same-uid), not like a status read. Requires the node to be up
+    /// (metrics come from the live engine).
     Metrics,
     /// Report Tailnet Lock (TKA) status (Go `tailscale lock status`, read-only subset). Replies with
     /// [`Response::Lock`]. Read-only — gated like [`Status`](Request::Status).

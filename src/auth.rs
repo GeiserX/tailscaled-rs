@@ -134,7 +134,6 @@ pub fn requires_write(request: &crate::localapi::Request) -> bool {
         | Request::Version
         | Request::GetPrefs
         | Request::ProfileList
-        | Request::Metrics
         | Request::LockStatus
         | Request::DnsStatus
         | Request::Netcheck
@@ -159,6 +158,11 @@ pub fn requires_write(request: &crate::localapi::Request) -> bool {
         // LocalAPI gates `serveIDToken` on `PermitWrite` (not `PermitRead`, unlike `whois`), so a
         // local user who is not root / not the daemon's uid must not be able to mint a node credential.
         | Request::IdToken { .. }
+        // `Metrics` scrapes this node's Prometheus counters, which can carry sensitive operational
+        // data. Go gates `serveMetrics` on `PermitWrite` — explicitly "out of paranoia that the
+        // metrics might contain something sensitive" — NOT `PermitRead`, so a socket-reachable local
+        // user who is not root / not the daemon's uid must not be able to scrape them.
+        | Request::Metrics
         // `DebugCapture` installs a dataplane capture hook and writes a pcap as the daemon's uid —
         // it taps all plaintext traffic, so it gates like `up`/`down`, never a read.
         | Request::DebugCapture { .. } => true,
@@ -281,6 +285,11 @@ mod tests {
             "id-token mints a node-identity bearer credential — a write (Go gates it PermitWrite, \
              unlike the PermitRead whois), so a non-root/non-owner local user can't mint one"
         );
+        assert!(
+            requires_write(&Request::Metrics),
+            "metrics may expose sensitive operational data — a write (Go gates serveMetrics on \
+             PermitWrite 'out of paranoia', not PermitRead), so a non-root/non-owner can't scrape it"
+        );
         assert!(!requires_write(&Request::GetServeConfig));
         assert!(
             !requires_write(&Request::DnsStatus),
@@ -325,10 +334,6 @@ mod tests {
         assert!(
             !requires_write(&Request::ProfileList),
             "switch --list only reads the profile set — a read"
-        );
-        assert!(
-            !requires_write(&Request::Metrics),
-            "metrics only snapshots counters — a read"
         );
         assert!(
             !requires_write(&Request::LockStatus),
