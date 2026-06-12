@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.34.1](https://github.com/GeiserX/tailscaled-rs/compare/v0.34.0...v0.34.1) (2026-06-12)
+
+
+### Bug Fixes
+
+* **auth:** gate `metrics` as a write (Go PermitWrite), not a read ([#97](https://github.com/GeiserX/tailscaled-rs/issues/97)) ([2dcd3e3](https://github.com/GeiserX/tailscaled-rs/commit/2dcd3e3bb5d317a402296b3e38996dcb199f27ff))
+
 ## [0.34.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.33.0...v0.34.0) (2026-06-12)
 
 
