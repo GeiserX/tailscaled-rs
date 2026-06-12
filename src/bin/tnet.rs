@@ -243,8 +243,8 @@ enum Command {
         no_ssh: bool,
         /// Pre-accept a named risk (Go `--accept-risk`), e.g. `lose-ssh` or `all`. Accepted for parity
         /// and forward-compatibility; the `set`-side enforcement (refusing an SSH toggle over a
-        /// Tailscale SSH session) is a tracked follow-up, so today this flag parses but is otherwise
-        /// inert on `set`.
+        /// Tailscale SSH session) is a tracked follow-up (bead tsd-eqx), so today this flag parses but
+        /// is otherwise inert on `set`.
         #[arg(long, value_name = "RISK")]
         accept_risk: Option<String>,
     },
@@ -743,7 +743,10 @@ fn is_tailscale_ip(ip: std::net::IpAddr) -> bool {
 /// unparseable value (or a non-tailnet client) → false. Split out from [`is_ssh_over_tailscale`] so it
 /// is testable without mutating the process environment. Pure.
 fn ssh_client_is_tailscale(ssh_client: &str) -> bool {
-    let Some(ip_str) = ssh_client.split(' ').next() else {
+    // `split_once(' ')` mirrors Go's `strings.Cut(sshClient, " ")` + its `!ok` (no-space) → false:
+    // a well-formed SSH_CLIENT is always `<ip> <client-port> <server-port>`, so a value with no space
+    // is malformed and rejected (rather than parsing a bare IP).
+    let Some((ip_str, _rest)) = ssh_client.split_once(' ') else {
         return false;
     };
     ip_str
@@ -755,9 +758,11 @@ fn ssh_client_is_tailscale(ssh_client: &str) -> bool {
 /// Whether this CLI is running over a Tailscale-SSH session (Go `isSSHOverTailscale`): reads
 /// `$SSH_CLIENT` and delegates to [`ssh_client_is_tailscale`]. Reads the process environment, so it is
 /// not pure — but the decision logic it wraps is. (Go additionally walks `/proc/<sid>/environ` under
-/// sudo; this fork reads only `$SSH_CLIENT`, a documented minor deviation — a sudo'd session that
-/// scrubbed `SSH_CLIENT` would not trip the risk gate, the same fail-*open* direction the operator
-/// can always close explicitly with `--accept-risk`.)
+/// sudo; this fork reads only `$SSH_CLIENT`. Concretely: `sudo` strips `SSH_CLIENT` from the
+/// environment, so `sudo tnet up --force-reauth` over a Tailscale SSH session will NOT be refused
+/// here even though Go's would. That is the fail-*open* direction — the gate is advisory, not a
+/// security boundary (the operator can always bypass it with `--accept-risk` anyway), so a missed
+/// refusal costs only a warning, and the lock-out it guards against is recoverable out-of-band.)
 fn is_ssh_over_tailscale() -> bool {
     std::env::var("SSH_CLIENT")
         .map(|c| ssh_client_is_tailscale(&c))
@@ -765,13 +770,13 @@ fn is_ssh_over_tailscale() -> bool {
 }
 
 /// Whether a named `risk` is in the operator's `--accept-risk` value — the Rust analogue of Go's
-/// `isRiskAccepted`: split on `,`, trim, and accept if any token equals the risk name or the catch-all
-/// `all`. Pure.
+/// `isRiskAccepted`: split on `,` and accept if any token equals the risk name or the catch-all `all`.
+/// Like Go, tokens are matched **raw** (NOT trimmed): Go compares `strings.SplitSeq(accepted, ",")`
+/// members verbatim, so `--accept-risk="foo, lose-ssh"` does NOT accept `lose-ssh` there (the token is
+/// `" lose-ssh"`); use `foo,lose-ssh` (no spaces) or `all`. Matching Go is the safer default for a
+/// safety gate (fewer accidental accepts). Pure.
 fn risk_accepted(accepted: &str, risk: &str) -> bool {
-    accepted
-        .split(',')
-        .map(str::trim)
-        .any(|r| r == risk || r == "all")
+    accepted.split(',').any(|r| r == risk || r == "all")
 }
 
 /// Map the `--advertise-routes` / `--advertise-routes-clear` flags to the wire field's
@@ -928,8 +933,8 @@ async fn main() -> Result<()> {
             ssh,
             no_ssh,
             // Parsed for parity + forward-compat; the `set`-side ssh-toggle-over-SSH enforcement that
-            // will consume it is a tracked follow-up (needs a pre-flight GetPrefs for `haveSSH`), so
-            // it is inert here today.
+            // will consume it is a tracked follow-up (bead tsd-eqx — needs a pre-flight GetPrefs for
+            // `haveSSH`), so it is inert here today.
             accept_risk: _,
         } => Request::Set {
             hostname,
@@ -3344,11 +3349,14 @@ mod tests {
 
     #[test]
     fn risk_accepted_matches_go_isriskaccepted() {
-        // Comma list; accept on exact name or the catch-all `all`; trimmed.
+        // Comma list; accept on exact name or the catch-all `all`. Matched RAW (no trim), like Go's
+        // isRiskAccepted (strings.SplitSeq members compared verbatim).
         assert!(risk_accepted("lose-ssh", "lose-ssh"));
         assert!(risk_accepted("all", "lose-ssh"));
-        assert!(risk_accepted("foo, lose-ssh", "lose-ssh")); // trimmed member of a list
+        assert!(risk_accepted("foo,lose-ssh", "lose-ssh")); // no-space comma list member
         assert!(risk_accepted("foo,all", "lose-ssh")); // `all` anywhere in the list
+        // A space-padded member does NOT match (faithful to Go — the token is " lose-ssh").
+        assert!(!risk_accepted("foo, lose-ssh", "lose-ssh"));
         assert!(!risk_accepted("", "lose-ssh"));
         assert!(!risk_accepted("other", "lose-ssh"));
     }
