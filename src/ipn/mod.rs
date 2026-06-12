@@ -2662,6 +2662,19 @@ impl Backend {
         diag::file_get(dev, name, dest, delete_after).await
     }
 
+    /// Drain the whole Taildrop inbox into a directory under a conflict policy (the `tnet file get
+    /// <dir>` / Go `tailscale file get <target-directory>` path). A thin `pub` shim over
+    /// [`diag::file_get_dir`], kept on `Backend` so the `server.rs` dispatch call site matches the
+    /// other off-lock Taildrop methods. See [`diag::file_get_dir`] for the drain loop + conflict
+    /// policy + quarantine + delete-after rationale.
+    pub async fn file_get_dir(
+        dev: &tailscale::Device,
+        dir: &str,
+        conflict: crate::localapi::ConflictPolicy,
+    ) -> crate::localapi::Response {
+        diag::file_get_dir(dev, dir, conflict).await
+    }
+
     /// Derive the reported state from device presence, netmap arrival, and prefs.
     ///
     /// The decision is delegated to the pure [`derive_state_from`] helper so it can be unit-tested

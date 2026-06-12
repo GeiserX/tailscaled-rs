@@ -938,6 +938,17 @@ async fn dispatch(
                 },
             }
         }
+        // `file get <dir>` drains the whole inbox into a directory under a conflict policy. Off-lock
+        // (the per-file copies can be large), like `file_get`/`file_cp`.
+        Request::FileGetDir { dir, conflict } => {
+            let dev = { backend.lock().await.device_handle() };
+            match dev {
+                Some(dev) => Backend::file_get_dir(&dev, &dir, conflict).await,
+                None => Response::Error {
+                    message: "node is not up".into(),
+                },
+            }
+        }
     }
 }
 

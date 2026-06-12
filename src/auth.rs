@@ -155,6 +155,9 @@ pub(crate) fn requires_write(request: &crate::localapi::Request) -> bool {
         | Request::SetServeConfig { .. }
         | Request::FileCp { .. }
         | Request::FileGet { .. }
+        // `file get <dir>` drains the inbox: writes files as the daemon's uid AND deletes the
+        // received files from the receive store — a write, gated like `up`/`down`/`file get`.
+        | Request::FileGetDir { .. }
         // `IdToken` MINTS a bearer credential: control signs an OIDC JWT whose subject is this node's
         // identity, which a relying party (e.g. cloud workload-identity federation) accepts as proof
         // this machine is who it claims. That is materially more sensitive than a status read — Go's

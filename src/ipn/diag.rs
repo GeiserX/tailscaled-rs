@@ -12,7 +12,7 @@
 
 use std::os::unix::fs::OpenOptionsExt;
 
-use crate::localapi::{Response, WaitingFileReport, WhoisReport};
+use crate::localapi::{ConflictPolicy, FileGotReport, Response, WaitingFileReport, WhoisReport};
 
 /// Report this node's own tailnet addresses (the `tnet ip` / Go `tailscale ip` path).
 ///
@@ -580,6 +580,422 @@ pub(super) async fn file_get(
     }
 }
 
+/// Drain the **entire** Taildrop inbox into `dir`, applying `conflict` per file — the faithful
+/// analogue of Go's `tailscale file get <target-directory>` (`runFileGetOneBatch` in
+/// `cmd/tailscale/cli/file.go`). Returns [`Response::FilesGot`] with one [`FileGotReport`] per
+/// attempted file (in inbox order) so the CLI can render Go-style lines and decide its exit code.
+///
+/// The special `dir == "/dev/null"` **wipes** the inbox (delete every waiting file, write nothing) —
+/// Go's `wipeInbox`. Otherwise `dir` must already exist and be a directory (validated here, matching
+/// Go's `os.Stat`+`IsDir`); a missing/!dir target is a single fail-closed [`Response::Error`].
+///
+/// Per file (Go's loop): receive `<dir>/<name>` under the conflict policy → set the quarantine
+/// attribute → on success remove it from the inbox (so a re-drain does not re-fetch it). A file that
+/// fails to receive is **left in the inbox** and recorded with an `error`; the drain continues to the
+/// next file (one bad file never blocks the rest). Like Go we stop early if errors pile up past a
+/// sanity bound (a sign everything is broken — e.g. an unwritable target dir).
+///
+/// Takes the engine handle as `dev` so the LocalAPI server runs it **off the backend lock** (the
+/// copies can be large); the device-absent branch lives at the caller. Each file's blocking copy
+/// runs on [`spawn_blocking`](tokio::task::spawn_blocking), and the create uses `O_EXCL`/`O_NOFOLLOW`
+/// so the daemon (often root) never writes *through* a planted symlink or clobbers under `skip`.
+pub(super) async fn file_get_dir(
+    dev: &tailscale::Device,
+    dir: &str,
+    conflict: ConflictPolicy,
+) -> Response {
+    // `/dev/null` → wipe the inbox (Go `wipeInbox`): delete every waiting file, write nothing.
+    if dir == "/dev/null" {
+        return wipe_inbox(dev);
+    }
+
+    // The target must already exist and be a directory (Go `os.Stat`+`IsDir`). Fail closed otherwise —
+    // a typo'd or not-yet-created dir must not silently no-op.
+    match tokio::fs::symlink_metadata(dir).await {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            return Response::Error {
+                message: format!("{dir:?} is not a directory"),
+            };
+        }
+        Err(e) => {
+            return Response::Error {
+                message: format!("{dir:?} is not a directory: {e}"),
+            };
+        }
+    }
+
+    let waiting = match dev.taildrop_waiting_files() {
+        Ok(w) => w,
+        Err(e) => {
+            return Response::Error {
+                message: format!("list taildrop files failed: {e:?}"),
+            };
+        }
+    };
+
+    let mut results: Vec<FileGotReport> = Vec::with_capacity(waiting.len());
+    let mut error_count = 0usize;
+    for wf in waiting {
+        // Sanity bound mirroring Go's `len(errs) > 100` batch abort: if this many files have already
+        // failed, something systemic is wrong (unwritable dir, full disk) — stop rather than churn
+        // through the whole inbox failing every one.
+        if error_count > 100 {
+            results.push(FileGotReport {
+                name: wf.name.clone(),
+                error: Some("too many errors draining the inbox; stopping".to_string()),
+                ..Default::default()
+            });
+            break;
+        }
+        match receive_one(dev, dir, &wf.name, conflict).await {
+            // Copied to disk AND removed from the inbox — a clean success.
+            ReceiveOutcome::Received { written, size } => {
+                results.push(FileGotReport {
+                    name: wf.name,
+                    size,
+                    written: Some(written),
+                    error: None,
+                });
+            }
+            // Copied to disk but the inbox delete failed — Go-faithfully an error (a re-drain would
+            // re-fetch it forever), but carry `written` so the operator still sees where it landed.
+            ReceiveOutcome::NotConsumed {
+                written,
+                size,
+                reason,
+            } => {
+                error_count += 1;
+                results.push(FileGotReport {
+                    name: wf.name,
+                    size,
+                    written: Some(written),
+                    error: Some(reason),
+                });
+            }
+            // Could not copy at all — left in the inbox.
+            ReceiveOutcome::Failed(reason) => {
+                error_count += 1;
+                results.push(FileGotReport {
+                    name: wf.name,
+                    size: 0,
+                    written: None,
+                    error: Some(reason),
+                });
+            }
+        }
+    }
+
+    Response::FilesGot { results }
+}
+
+/// Wipe the Taildrop inbox without writing anything (Go `wipeInbox`, the `/dev/null` target). Each
+/// deleted file is reported as a zero-byte success with `written: Some("/dev/null")` so the CLI can
+/// show what was discarded; a delete failure is recorded as that file's error.
+///
+/// DELIBERATE DEVIATION from Go: Go's `wipeInbox` returns on the FIRST delete error (fail-fast),
+/// stopping the wipe. This instead attempts EVERY file and reports per-file outcomes (report-all),
+/// because the `FilesGot` model already gives the operator a full picture and "delete one file
+/// failed" should not leave the rest of the inbox un-wiped. The CLI still exits non-zero if any
+/// delete failed, so a script sees the failure either way.
+fn wipe_inbox(dev: &tailscale::Device) -> Response {
+    let waiting = match dev.taildrop_waiting_files() {
+        Ok(w) => w,
+        Err(e) => {
+            return Response::Error {
+                message: format!("list taildrop files failed: {e:?}"),
+            };
+        }
+    };
+    let results = waiting
+        .into_iter()
+        .map(|wf| match dev.taildrop_delete_file(&wf.name) {
+            Ok(()) => FileGotReport {
+                name: wf.name,
+                size: 0,
+                written: Some("/dev/null".to_string()),
+                error: None,
+            },
+            Err(e) => FileGotReport {
+                name: wf.name,
+                size: 0,
+                written: None,
+                error: Some(format!("delete failed: {e:?}")),
+            },
+        })
+        .collect();
+    Response::FilesGot { results }
+}
+
+/// The outcome of [`receive_one`] for a single inbox file, modelling Go's three end-states so the
+/// drain loop can report each faithfully:
+/// - `Received { written, size }` — copied to disk AND removed from the inbox. A clean success.
+/// - `NotConsumed { written, size, reason }` — copied to disk but the inbox delete FAILED. Go treats
+///   this as an error (`deleted` is not incremented and a re-drain would re-fetch the file forever —
+///   "persistently stuck files are basically an error"), so the loop records it as an error WHILE
+///   still surfacing where the bytes landed.
+/// - `Failed(reason)` — could not even copy the file; it is left in the inbox. An error.
+enum ReceiveOutcome {
+    Received {
+        written: String,
+        size: u64,
+    },
+    NotConsumed {
+        written: String,
+        size: u64,
+        reason: String,
+    },
+    Failed(String),
+}
+
+/// Receive ONE inbox file `name` into `dir` under `conflict`. Factored out of the drain loop so the
+/// per-file logic (open inbox file → resolve the target path under the conflict policy → copy
+/// off-runtime → quarantine → delete-from-inbox) reads linearly. Never returns `Err`: every failure
+/// mode maps to a [`ReceiveOutcome`] variant the loop turns into a [`FileGotReport`].
+async fn receive_one(
+    dev: &tailscale::Device,
+    dir: &str,
+    name: &str,
+    conflict: ConflictPolicy,
+) -> ReceiveOutcome {
+    // Open the waiting file in the receive store (path-traversal-validated by the engine). The
+    // engine reports a size here, but we report the bytes `io::copy` actually wrote below (the
+    // ground truth), so the open's size is unused.
+    let (mut src, _size) = match dev.taildrop_open_file(name) {
+        Ok(pair) => pair,
+        Err(e) => return ReceiveOutcome::Failed(format!("opening inbox file {name:?}: {e:?}")),
+    };
+
+    // Resolve the on-disk target under the conflict policy and open it. `skip` refuses an existing
+    // target (leaving the inbox file); `overwrite` removes-then-exclusive-creates (symlink-safe);
+    // `rename` finds the next free `name (N).ext`. Runs on a blocking thread with the copy.
+    let dir_owned = dir.to_string();
+    let name_owned = name.to_string();
+    let copy_result = tokio::task::spawn_blocking(move || -> std::io::Result<(String, u64)> {
+        let (mut out, written_path) = open_target_under_policy(&dir_owned, &name_owned, conflict)?;
+        let n = std::io::copy(&mut src, &mut out)?;
+        Ok((written_path, n))
+    })
+    .await;
+
+    let (written_path, copied) = match copy_result {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => return ReceiveOutcome::Failed(humanize_write_err(dir, name, conflict, &e)),
+        Err(e) => return ReceiveOutcome::Failed(format!("receive task failed: {e}")),
+    };
+
+    // Apply the quarantine attribute (defense-in-depth: mark the received file untrusted, matching
+    // Go's `quarantine.SetOnFile`). A failure here is non-fatal — the bytes are already written —
+    // so warn and still count the file as received.
+    if let Err(e) = set_quarantine(&written_path) {
+        tracing::warn!(
+            file = name,
+            path = %written_path,
+            error = %e,
+            "diag: taildrop file written but quarantine attribute could not be set"
+        );
+    }
+
+    // Received → remove from the inbox so a re-drain does not re-fetch it (Go deletes after a
+    // successful receive, counting `deleted++` only on a successful delete). A delete FAILURE is
+    // Go-faithfully an ERROR: the bytes are on disk, but the file is still in the inbox, so the next
+    // drain would re-fetch it indefinitely ("persistently stuck files are basically an error"). We
+    // surface it as `NotConsumed` — carrying `written` so the operator still sees where it landed,
+    // but flagged as an error so the CLI exits non-zero.
+    if let Err(e) = dev.taildrop_delete_file(name) {
+        tracing::warn!(
+            file = name,
+            error = ?e,
+            "diag: taildrop file received but could not be deleted from the inbox (will re-fetch)"
+        );
+        return ReceiveOutcome::NotConsumed {
+            written: written_path,
+            size: copied,
+            reason: format!("saved but could not be removed from the inbox: {e:?}"),
+        };
+    }
+    ReceiveOutcome::Received {
+        written: written_path,
+        size: copied,
+    }
+}
+
+/// Map a raw write error to a Go-faithful, policy-aware message. Under `skip` an `AlreadyExists`
+/// (the `O_EXCL` create hitting an existing file) becomes Go's "refusing to overwrite" wording; other
+/// errors are reported with the target for context.
+fn humanize_write_err(
+    dir: &str,
+    name: &str,
+    conflict: ConflictPolicy,
+    e: &std::io::Error,
+) -> String {
+    let target = std::path::Path::new(dir).join(name);
+    let target = target.display();
+    if conflict == ConflictPolicy::Skip && e.kind() == std::io::ErrorKind::AlreadyExists {
+        format!("refusing to overwrite {target}: file already exists (left in inbox)")
+    } else {
+        format!("failed to write {target}: {e}")
+    }
+}
+
+/// Open the on-disk target for an incoming file `base` in `dir` under `conflict`, returning the open
+/// file + the path it will be written to. The analogue of Go's `openFileOrSubstitute`:
+///
+/// - [`Skip`](ConflictPolicy::Skip): `O_CREATE|O_EXCL|O_NOFOLLOW` at `<dir>/<base>` — an existing
+///   file makes the create fail `AlreadyExists` (surfaced as "refusing to overwrite"), so we never
+///   clobber.
+/// - [`Overwrite`](ConflictPolicy::Overwrite): `remove` the target FIRST (best-effort; ignore
+///   `NotFound`), then the same exclusive create. Removing first means we never open-truncate a file
+///   an attacker symlinked at `<base>` — the `remove` breaks the link and the exclusive create makes
+///   a fresh regular file (Go does exactly this, with the same stated rationale).
+/// - [`Rename`](ConflictPolicy::Rename): the plain `<base>` first, then `base (1).ext`, `base (2).ext`
+///   … via exclusive create, up to a bounded number of attempts (Chrome-Downloads style).
+///
+/// All creates use `O_NOFOLLOW` so a symlink at the final component fails the open (`ELOOP`) rather
+/// than being followed — the root daemon never writes through a planted link. Synchronous (called
+/// from inside `spawn_blocking`).
+fn open_target_under_policy(
+    dir: &str,
+    base: &str,
+    conflict: ConflictPolicy,
+) -> std::io::Result<(std::fs::File, String)> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // DEFENSE-IN-DEPTH: reject anything that is not a bare leaf BEFORE joining it onto `dir`. The
+    // engine's `validate_base_name` already guarantees inbox names are single components (no `/`,
+    // `\`, NUL, `.`, `..`), so this is unreachable today — but it makes this function self-defending
+    // rather than relying on an invariant enforced in another crate: a `base` with an embedded
+    // separator would otherwise let `Path::join` escape `dir`. Cheap, and the join below is only
+    // sound given it. (The `O_NOFOLLOW` create still blocks a symlink write either way.)
+    if base.is_empty()
+        || base == "."
+        || base == ".."
+        || base.contains('/')
+        || base.contains('\\')
+        || base.contains('\0')
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing unsafe taildrop file name {base:?}"),
+        ));
+    }
+
+    let excl_create = |path: &std::path::Path| -> std::io::Result<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true) // O_CREAT|O_EXCL
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+    };
+
+    let target = std::path::Path::new(dir).join(base);
+    match conflict {
+        ConflictPolicy::Skip => {
+            let f = excl_create(&target)?;
+            Ok((f, target.to_string_lossy().into_owned()))
+        }
+        ConflictPolicy::Overwrite => {
+            // Remove first so we never write through a symlink planted at the target name; ignore a
+            // NotFound (the normal no-conflict case), propagate any other remove error.
+            match std::fs::remove_file(&target) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            let f = excl_create(&target)?;
+            Ok((f, target.to_string_lossy().into_owned()))
+        }
+        ConflictPolicy::Rename => {
+            // Try the plain name, then numbered variants. Bounded like Go (it gives up after 100).
+            match excl_create(&target) {
+                Ok(f) => return Ok((f, target.to_string_lossy().into_owned())),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
+            }
+            for i in 1..MAX_RENAME_ATTEMPTS {
+                let candidate = std::path::Path::new(dir).join(numbered_file_name(base, i));
+                match excl_create(&candidate) {
+                    Ok(f) => return Ok((f, candidate.to_string_lossy().into_owned())),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "could not find a free numbered name for {base:?} after {MAX_RENAME_ATTEMPTS} attempts"
+                ),
+            ))
+        }
+    }
+}
+
+/// Upper bound on `rename`-policy numbering attempts (Go's `maxAttempts = 100`).
+const MAX_RENAME_ATTEMPTS: u32 = 100;
+
+/// Build the Chrome-Downloads-style numbered variant of a base file name: `name (i).ext`, splitting
+/// on the FINAL extension (Go's `numberedFileName`: `TrimSuffix(name, ext) + " (i)" + ext`). A name
+/// with no `.` just gets ` (i)` appended. Pure → unit-testable.
+fn numbered_file_name(base: &str, i: u32) -> String {
+    // Match Go's `path.Ext` EXACTLY: it scans back to the LAST '.' in the final path element and
+    // returns the suffix from there — with NO special case for a leading dot. So `path.Ext(".bashrc")`
+    // is `".bashrc"` (the whole name is the extension; NOT `""` as `os.path.splitext` would give),
+    // hence Go's `numberedFileName(".bashrc", 1)` is `" (1).bashrc"` (empty stem + a leading space).
+    // We reproduce that verbatim — `rfind('.')` with no `idx > 0` filter. `base` is a validated single
+    // path element (the inbox name); `.`/`..` cannot reach here (engine-rejected + the leaf guard in
+    // `open_target_under_policy`), so the only leading-dot inputs are real dotfiles like `.bashrc`.
+    match base.rfind('.') {
+        Some(idx) => {
+            let (stem, ext) = base.split_at(idx); // ext includes the leading '.'
+            format!("{stem} ({i}){ext}")
+        }
+        None => format!("{base} ({i})"),
+    }
+}
+
+/// Set the platform "downloaded from the network, treat as untrusted" quarantine marker on a freshly
+/// received Taildrop file (Go's `quarantine.SetOnFile`). Best-effort defense-in-depth; the caller
+/// treats a failure as non-fatal (the file is already written).
+///
+/// - macOS: the `com.apple.quarantine` extended attribute (Gatekeeper reads it). The value format is
+///   `<flags>;<timestamp-hex>;<agent>;<uuid>`; we write a minimal well-formed marker (flags `0081` =
+///   "quarantined, not yet approved"), with no timestamp/UUID — Gatekeeper only requires the attr to
+///   be present to treat the file as quarantined.
+/// - Linux/other: there is no OS quarantine concept; this is a no-op success (Go also only sets it on
+///   platforms that support it).
+#[cfg(target_os = "macos")]
+fn set_quarantine(path: &str) -> std::io::Result<()> {
+    // `0081` = QTN_FLAG_DOWNLOAD(0x01) | QTN_FLAG_QUARANTINE(0x80)? — Gatekeeper treats any present
+    // value as quarantined; we use a minimal marker naming the agent. The semicolons are required
+    // field separators even when the timestamp/UUID are empty.
+    let value = b"0081;00000000;tailnetd;";
+    let c_path = std::ffi::CString::new(path)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has NUL byte"))?;
+    let name = c"com.apple.quarantine";
+    // SAFETY: `setxattr` reads `c_path`/`name` as NUL-terminated C strings (both valid for the call)
+    // and `value`/len as a byte buffer; all are live for the duration. No aliasing or lifetime issue.
+    let rc = unsafe {
+        libc::setxattr(
+            c_path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr() as *const libc::c_void,
+            value.len(),
+            0,
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// No OS quarantine concept off macOS — a no-op success (matches Go setting it only where supported).
+#[cfg(not(target_os = "macos"))]
+fn set_quarantine(_path: &str) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Validate a `debug capture` destination path before the daemon (running as root) creates it:
 /// `Ok(())` if the path is missing (the normal fresh-capture case) or an existing **regular file**
 /// (overwritten); `Err(reason)` if it EXISTS as anything else — a symlink (refused as the link
@@ -939,6 +1355,122 @@ mod tests {
             b"data",
             "the symlink target must be untouched by the refused opens"
         );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn numbered_file_name_matches_go_path_ext() {
+        use super::numbered_file_name;
+        // Splits on the FINAL extension: stem + " (i)" + ext (Go numberedFileName + path.Ext).
+        assert_eq!(numbered_file_name("report.pdf", 1), "report (1).pdf");
+        assert_eq!(numbered_file_name("a.b.txt", 3), "a.b (3).txt");
+        assert_eq!(
+            numbered_file_name("archive.tar.gz", 1),
+            "archive.tar (1).gz"
+        );
+        // No '.' at all → just append " (i)".
+        assert_eq!(numbered_file_name("README", 2), "README (2)");
+        // A leading-dot dotfile: Go's path.Ext(".bashrc") == ".bashrc" (the WHOLE name, NOT "" —
+        // Go has no leading-dot special case, unlike Python splitext). So the stem is empty and the
+        // result is " (1).bashrc" (a leading space). Verified against `go run` upstream.
+        assert_eq!(numbered_file_name(".bashrc", 1), " (1).bashrc");
+    }
+
+    #[test]
+    fn open_target_skip_refuses_existing_leaves_it_intact() {
+        use super::{ConflictPolicy, open_target_under_policy};
+        let base = std::env::temp_dir().join(format!("tailnetd-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = base.to_str().unwrap();
+
+        // Pre-existing file with known contents.
+        let existing = base.join("f.bin");
+        std::fs::write(&existing, b"OLD").unwrap();
+
+        // skip → AlreadyExists, and the existing file is untouched.
+        let err = open_target_under_policy(dir, "f.bin", ConflictPolicy::Skip).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(&existing).unwrap(),
+            b"OLD",
+            "skip must not clobber"
+        );
+
+        // A NON-conflicting name under skip succeeds.
+        let (_f, path) = open_target_under_policy(dir, "new.bin", ConflictPolicy::Skip).unwrap();
+        assert_eq!(path, base.join("new.bin").to_string_lossy());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn open_target_overwrite_replaces_and_is_symlink_safe() {
+        use super::{ConflictPolicy, open_target_under_policy};
+        use std::io::Write;
+        let base = std::env::temp_dir().join(format!("tailnetd-ow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = base.to_str().unwrap();
+
+        // (a) Plain overwrite of an existing regular file: we get a fresh, empty, writable handle.
+        let existing = base.join("f.bin");
+        std::fs::write(&existing, b"OLD").unwrap();
+        let (mut f, path) =
+            open_target_under_policy(dir, "f.bin", ConflictPolicy::Overwrite).unwrap();
+        f.write_all(b"NEW").unwrap();
+        drop(f);
+        assert_eq!(path, existing.to_string_lossy());
+        assert_eq!(
+            std::fs::read(&existing).unwrap(),
+            b"NEW",
+            "overwrite must replace contents"
+        );
+
+        // (b) Symlink-safety: a symlink planted at the target name must NOT be written through —
+        // overwrite removes the link first then exclusive-creates, so the link's target is untouched.
+        let outside = base.join("outside-secret");
+        std::fs::write(&outside, b"SECRET").unwrap();
+        let link = base.join("link.bin");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let (mut f, _p) =
+            open_target_under_policy(dir, "link.bin", ConflictPolicy::Overwrite).unwrap();
+        f.write_all(b"FROM_TAILDROP").unwrap();
+        drop(f);
+        assert_eq!(
+            std::fs::read(&outside).unwrap(),
+            b"SECRET",
+            "overwrite must not write through a planted symlink to its target"
+        );
+        // `link.bin` is now a fresh regular file (the link was removed + recreated), not a symlink.
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "the target name must now be a regular file, not the symlink"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn open_target_rename_creates_numbered_variants() {
+        use super::{ConflictPolicy, open_target_under_policy};
+        let base = std::env::temp_dir().join(format!("tailnetd-rn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = base.to_str().unwrap();
+
+        // First rename call with no conflict → the plain name.
+        let (_f0, p0) = open_target_under_policy(dir, "doc.txt", ConflictPolicy::Rename).unwrap();
+        assert_eq!(p0, base.join("doc.txt").to_string_lossy());
+        // Second → "doc (1).txt"; third → "doc (2).txt".
+        let (_f1, p1) = open_target_under_policy(dir, "doc.txt", ConflictPolicy::Rename).unwrap();
+        assert_eq!(p1, base.join("doc (1).txt").to_string_lossy());
+        let (_f2, p2) = open_target_under_policy(dir, "doc.txt", ConflictPolicy::Rename).unwrap();
+        assert_eq!(p2, base.join("doc (2).txt").to_string_lossy());
 
         let _ = std::fs::remove_dir_all(&base);
     }

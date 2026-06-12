@@ -9,6 +9,26 @@
 
 use serde::{Deserialize, Serialize};
 
+/// What [`Request::FileGetDir`] does when a same-named file already exists in the target directory —
+/// the faithful analogue of Go's `--conflict=(skip|overwrite|rename)` (`onConflict` in
+/// `cmd/tailscale/cli/file.go`). The default is [`Skip`](ConflictPolicy::Skip), matching Go: never
+/// silently clobber an existing file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictPolicy {
+    /// Refuse to overwrite: leave the conflicting file in the inbox and report an error for it, while
+    /// still receiving any non-conflicting files (Go `skip`, the default). The safe choice.
+    #[default]
+    Skip,
+    /// Replace the existing file. The daemon `remove`s the target FIRST and then exclusively creates
+    /// it anew, so it never writes *through* a symlink an attacker planted at a known name (Go
+    /// `overwrite`, which removes-then-`O_CREATE|O_EXCL` for exactly this reason).
+    Overwrite,
+    /// Keep both: write to an alternately-numbered name in the style of Chrome Downloads —
+    /// `name (1).ext`, `name (2).ext`, … — up to a bounded number of attempts (Go `rename`).
+    Rename,
+}
+
 /// A command sent by the CLI to the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -307,6 +327,24 @@ pub enum Request {
         #[serde(default)]
         delete_after: bool,
     },
+    /// Drain the **entire** Taildrop inbox into a directory — the faithful analogue of Go's
+    /// `tailscale file get <target-directory>` (`runFileGetOneBatch`). For each waiting file the
+    /// daemon writes `<dir>/<name>` under the [`conflict`](Request::FileGetDir::conflict) policy, then
+    /// (on success) removes it from the inbox, so a second drain does not re-fetch it. A WRITE (it
+    /// writes files as the daemon's uid and consumes the inbox) — gated like `up`/`down`. The reply is
+    /// a per-file [`Response::FilesGot`] so the CLI can render Go-style result lines and set its exit
+    /// code from the outcomes. This is distinct from the per-file [`FileGet`](Request::FileGet) (kept
+    /// as a fork convenience for fetching one named file to an exact path).
+    FileGetDir {
+        /// Target directory the inbox is drained into (must already exist and be a directory — the
+        /// daemon validates, matching Go's `os.Stat`+`IsDir` check). The special value `/dev/null`
+        /// **wipes** the inbox without writing anything (Go's `wipeInbox`).
+        dir: String,
+        /// What to do when `<dir>/<name>` already exists. Defaults to [`ConflictPolicy::Skip`] (Go's
+        /// default — never clobber: refuse the conflicting file and leave it in the inbox).
+        #[serde(default)]
+        conflict: ConflictPolicy,
+    },
     /// Capture the dataplane's plaintext packets to a pcap file for `seconds`, then stop (Go
     /// `tailscale debug capture`). A WRITE: it installs a dataplane capture hook and writes a file as
     /// the daemon's uid, so it's gated like `up`/`down`. The daemon owns a `BufWriter<File>` at `path`,
@@ -365,6 +403,13 @@ pub enum Response {
     Files {
         /// Files in the receive directory, each `(name, size_bytes)`.
         files: Vec<WaitingFileReport>,
+    },
+    /// Per-file outcomes of draining the inbox (reply to [`Request::FileGetDir`]). One entry per file
+    /// the daemon attempted, in inbox order, so the CLI can print Go-style result/error lines and
+    /// decide its exit code (non-zero if any file failed, or if nothing moved while files waited).
+    FilesGot {
+        /// One outcome per attempted file.
+        results: Vec<FileGotReport>,
     },
     /// The daemon's own version (reply to [`Request::Version`]) — the analogue of Go's
     /// `ipnstate.Status.Version`, used by `tnet version --daemon`.
@@ -525,6 +570,26 @@ pub struct WaitingFileReport {
     pub name: String,
     /// The file's size in bytes.
     pub size: u64,
+}
+
+/// The outcome of receiving one inbox file during a [`Request::FileGetDir`] drain. On success
+/// `written` names the actual path the file landed at (which differs from `<dir>/<name>` under the
+/// `rename` policy) and `error` is `None`; on failure `error` carries the reason and `written` is
+/// `None` (the file is left in the inbox). `name` is always the inbox base name so the CLI can
+/// attribute the line either way.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FileGotReport {
+    /// The inbox file's base name.
+    pub name: String,
+    /// Bytes written (meaningful only on success).
+    #[serde(default)]
+    pub size: u64,
+    /// The path the file was written to on success (may be a numbered variant under `rename`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written: Option<String>,
+    /// The failure reason when this file could not be received (then it stays in the inbox).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// A snapshot of daemon + netmap state.
