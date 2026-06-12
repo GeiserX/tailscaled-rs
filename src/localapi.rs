@@ -637,14 +637,16 @@ pub struct PrefsView {
 /// [`Request::SetServeConfig`] / [`Response::ServeConfig`]. Persistence + the served/not-served logic
 /// live in `crate::ipn::serve`.
 ///
-/// **Wire-shape fidelity is exact for the TCP-forward path only.** A plain TCP forward round-trips
-/// byte-for-byte with Go (PascalCase, `omitempty`), e.g. `{"TCP":{"8443":{"TCPForward":
-/// "127.0.0.1:5000"}}}`, as does the `AllowFunnel` map. It is NOT byte-compatible with Go for web
-/// (HTTP/HTTPS/text/redirect/path) handlers: Go stores those handler bodies in a top-level
-/// `Web map[HostPort]*WebServerConfig`, whereas this fork carries them as `Text`/`Redirect`/`Mounts`
-/// directly on the per-port handler and has no `Web`/`Services`/`Foreground` fields. So a *web* serve
-/// config written by an upstream `tailscaled` would not deserialize its targets here (and vice-versa);
-/// adding the Go `Web` map is tracked as a follow-up. (See `bd` `tsd-serve-web`.)
+/// **Wire shape.** Plain TCP forward + `AllowFunnel` round-trip byte-for-byte with Go (PascalCase,
+/// `omitempty`), e.g. `{"TCP":{"8443":{"TCPForward":"127.0.0.1:5000"}}}`. As of the `Web`-map work
+/// (`tsd-6p4`, Stage A), the Go top-level [`web`](ServeConfig::web) map
+/// (`Web map[HostPort]*WebServerConfig`) is ALSO modelled, so a *web* serve config written by an
+/// upstream `tailscaled` (`{"TCP":{"443":{"HTTPS":true}},"Web":{"host:443":{"Handlers":{"/":
+/// {"Proxy":"…"}}}}}`) now deserializes its handler bodies here instead of silently dropping them.
+/// The legacy per-handler [`text`](TcpPortHandler::text)/[`redirect`](TcpPortHandler::redirect)/
+/// [`mounts`](TcpPortHandler::mounts) fields are RETAINED for read-compat with serve-config files this
+/// fork already wrote (Stage A is additive — the translation reads both; Stage B moves the CLI to
+/// write only the `Web` map). Go's `Services`/`Foreground` remain unmodeled (out of scope).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServeConfig {
     /// Per-tailnet-port handler, keyed by the tailnet listen port AS A STRING. The key is a string
@@ -670,6 +672,18 @@ pub struct ServeConfig {
         skip_serializing_if = "std::collections::BTreeMap::is_empty"
     )]
     pub allow_funnel: std::collections::BTreeMap<String, bool>,
+    /// Web handlers keyed by the Go `HostPort` form `host:port` (the node's MagicDNS name + `:` + port,
+    /// e.g. `host.tailnet.ts.net:443`) — Go `ipn.ServeConfig.Web` (`map[HostPort]*WebServerConfig`). A
+    /// `TCP[port]` handler with `HTTPS`/`HTTP` set points at the `Web[host:port]` entry, which holds the
+    /// per-mount-path [`HttpHandler`]s (proxy / text / redirect / path). Empty = no web serve (omitted
+    /// from the wire). This is the Go-faithful location for web-handler bodies; the legacy
+    /// `TcpPortHandler.{text,redirect,mounts}` fields are kept only for read-compat (see the struct doc).
+    #[serde(
+        default,
+        rename = "Web",
+        skip_serializing_if = "std::collections::BTreeMap::is_empty"
+    )]
+    pub web: std::collections::BTreeMap<String, WebServerConfig>,
 }
 
 /// One served tailnet port (Go `ipn.TCPPortHandler`); only `tcp_forward` is served by this build.
@@ -742,9 +756,55 @@ pub struct RedirectSpec {
     pub status: u16,
 }
 
+/// The set of HTTP handlers for one web `host:port` (Go `ipn.WebServerConfig`), keyed by mount path
+/// (`/`, `/foo`, …) → [`HttpHandler`]. The value type of [`ServeConfig::web`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebServerConfig {
+    /// Mount-point → handler (Go `WebServerConfig.Handlers`, `map[string]*HTTPHandler`). A single `/`
+    /// entry is a bare handler on the port; multiple are a longest-match path mux.
+    #[serde(
+        default,
+        rename = "Handlers",
+        skip_serializing_if = "std::collections::BTreeMap::is_empty"
+    )]
+    pub handlers: std::collections::BTreeMap<String, HttpHandler>,
+}
+
+/// One HTTP handler at a mount point (Go `ipn.HTTPHandler`). Exactly one of `proxy`/`text`/`path`/
+/// `redirect` is set. Field names + `omitempty` match Go's wire JSON so a handler authored by an
+/// upstream `tailscaled` round-trips. `redirect` is Go's **string** form (`"https://…"`, or
+/// `"<code>:https://…"` to pick the status) — NOT this fork's older `RedirectSpec{To,Status}` object
+/// (which stays only on the legacy [`TcpPortHandler::redirect`] read-compat field); the translation
+/// parses this string into the engine's `ServeTarget::Redirect{to,status}`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HttpHandler {
+    /// Absolute path to a directory/file to serve (Go `HTTPHandler.Path`). Engine
+    /// [`ServeTarget::Path`] is a path-MUX, not a filesystem server — a filesystem `Path` handler has
+    /// no engine analogue at this pin and is recognized-but-not-served; carried for wire fidelity.
+    #[serde(default, rename = "Path", skip_serializing_if = "String::is_empty")]
+    pub path: String,
+    /// Reverse-proxy backend (`http://localhost:3000/`, `localhost:3030`, `3030`) — Go
+    /// `HTTPHandler.Proxy`; engine [`ServeTarget::Proxy`](tailscale::ServeTarget::Proxy).
+    #[serde(default, rename = "Proxy", skip_serializing_if = "String::is_empty")]
+    pub proxy: String,
+    /// Fixed plaintext body to serve (Go `HTTPHandler.Text`; engine
+    /// [`ServeTarget::Text`](tailscale::ServeTarget::Text)).
+    #[serde(default, rename = "Text", skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    /// HTTP redirect target (Go `HTTPHandler.Redirect`). The Go string form: a bare URL redirects 302,
+    /// or `"<httpcode>:<url>"` picks the status. Empty = not a redirect. Parsed into
+    /// [`ServeTarget::Redirect`](tailscale::ServeTarget::Redirect) by the translation.
+    #[serde(default, rename = "Redirect", skip_serializing_if = "String::is_empty")]
+    pub redirect: String,
+}
+
 /// One handler mounted at a path prefix on a web port (the value of [`TcpPortHandler::mounts`]).
 /// Mirrors the engine's non-`Path` [`ServeTarget`](tailscale::ServeTarget) arms (a mount cannot itself
 /// be a nested path mux — the engine bounds `Path` nesting to one level).
+///
+/// **Legacy/read-compat only.** This fork-native (`{kind,…}`) shape predates the Go `Web` map; it is
+/// retained so a serve-config.json this fork already wrote still deserializes. New configs use
+/// [`HttpHandler`] under [`ServeConfig::web`]. See the [`ServeConfig`] doc.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum WebMount {
