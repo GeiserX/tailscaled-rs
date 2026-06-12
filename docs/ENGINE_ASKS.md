@@ -12,7 +12,8 @@ what the pin provides).
 > PR #126 — supersedes the "did NOT land" note below), **#16 `cert_pair`** (PEM cert+key export;
 > consumed by `tnet cert` PR #127), and **#19** (the TUN peer-AllowedIPs host-route bug; consumed for
 > free — engine owns routing). Still OPEN: **#15 `query_dns`** (→ `tnet dns query`), **#17 TKA
-> mutation** (→ `tnet lock` write-ops), **#18** Windows host-net, plus #8/#9/#13 (minor). v0.29.2
+> mutation** (→ `tnet lock` write-ops), **#18** Windows host-net, **#20** Taildrop file-arrival bus
+> signal (→ `tnet file get --wait`/`--loop`), plus #8/#9/#13 (minor). v0.29.2
 > (engine-internal MagicDNS qtype fix) is intentionally NOT pinned — taken on the next meaningful bump.
 
 > **Pin bump f42eb70e (v0.21.2) → 81446f88 (v0.28.2), 2026-06-12.** API-surface diff (both revs'
@@ -545,3 +546,23 @@ programming, ask #18 / the closed router beads). The daemon consumes the fix via
 Linux TUN e2e (this repro) then passes A4 (peer connectivity). Filed with full live evidence; the
 daemon's Phase-3 "transparent OS-wide connectivity" claim is blocked on this for the peer-reachability
 half (the device/self-addr/MagicDNS half already works). — daemon lane
+
+## 20. A Taildrop **file-arrival** signal on the IPN bus (for `tnet file get --wait` / `--loop`)
+
+**Why:** Go's `tailscale file get` has `--wait` (block until ≥1 file arrives if the inbox is empty)
+and `--loop` (drain forever, receiving files as they come in). Both rest on Go's `waitForFile`, which
+long-polls the LocalAPI `IPNBusWatcher` for an `IncomingFiles` notification and returns when the inbox
+becomes non-empty. The daemon shipped the inbox **drain** (`tnet file get <dir>` + `--conflict`, PR
+#136) over the engine's existing `taildrop_waiting_files`/`open_file`/`delete_file` primitives — but
+`--wait`/`--loop` are **deferred** because the engine's `watch_ipn_bus` (verified at pin `6035651`,
+`src/lib.rs:1405`) carries only `state` / `net_map` / `browse_to_url` in its `Notify` — there is **no**
+`IncomingFiles` / file-arrival event. A daemon-side poll loop (re-list every N seconds) is possible but
+wasteful and racy, so it's not built; the feature waits on an honest signal.
+
+**Ask:** surface a Taildrop file-arrival notification — either (a) add an `incoming_files:
+Option<Vec<WaitingFile>>` field to the existing `watch_ipn_bus` `Notify` (the Go shape — Go's
+`ipn.Notify.IncomingFiles`), fired whenever the receive store gains a file; or (b) a dedicated
+`Device::watch_incoming_files() -> watch::Receiver<Vec<WaitingFile>>` analogous to `watch_netmap`. Once
+it lands, the daemon adds `--wait` (await the first non-empty signal, then drain once) and `--loop`
+(drain on every signal) to `tnet file get`, consumed via a pin bump. No rush — recorded so the gap is
+not forgotten; the drain itself is already faithful without it. — daemon lane

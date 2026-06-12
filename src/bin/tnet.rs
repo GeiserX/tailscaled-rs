@@ -3013,8 +3013,20 @@ fn format_files_got(results: &[tailscaled_rs::localapi::FileGotReport]) -> Strin
     for r in results {
         let name = sanitize_for_terminal(&r.name);
         match (&r.written, &r.error) {
-            // Success: written somewhere. Note the actual path (differs from the name under `rename`).
-            (Some(path), _) => {
+            // Saved but with an error (the "not consumed" case: copied to disk yet the inbox delete
+            // failed). Surface BOTH — where it landed AND that it could not be cleared — so the
+            // operator knows the file will re-appear on the next drain. Error is checked before the
+            // plain-success arm so this never reads as a clean success.
+            (Some(path), Some(err)) => {
+                out.push_str(&format!(
+                    "wrote {name} -> {} ({} bytes), but: {}\n",
+                    sanitize_for_terminal(path),
+                    r.size,
+                    sanitize_for_terminal(err)
+                ));
+            }
+            // Clean success: written, no error. Note the actual path (differs under `rename`).
+            (Some(path), None) => {
                 out.push_str(&format!(
                     "wrote {name} -> {} ({} bytes)\n",
                     sanitize_for_terminal(path),
@@ -5240,6 +5252,33 @@ mod tests {
         );
         // Empty drain → placeholder.
         assert_eq!(format_files_got(&[]), "(no files waiting)\n");
+    }
+
+    #[test]
+    fn format_files_got_shows_saved_but_not_consumed_as_error() {
+        use tailscaled_rs::localapi::FileGotReport;
+        // The "not consumed" case: written to disk AND an error (inbox delete failed). The line must
+        // surface BOTH — where it landed and that it could not be cleared — and must NOT read as a
+        // clean success (so a script sees the non-zero exit the CLI derives from `error.is_some()`).
+        let results = vec![FileGotReport {
+            name: "c.txt".to_string(),
+            size: 7,
+            written: Some("/tmp/dl/c.txt".to_string()),
+            error: Some("saved but could not be removed from the inbox: Io(...)".to_string()),
+        }];
+        let out = format_files_got(&results);
+        assert!(
+            out.contains("wrote c.txt -> /tmp/dl/c.txt (7 bytes)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("but:"),
+            "must surface the delete failure: {out}"
+        );
+        assert!(
+            out.contains("could not be removed from the inbox"),
+            "must name the reason: {out}"
+        );
     }
 
     #[test]

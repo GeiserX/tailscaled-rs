@@ -649,9 +649,8 @@ pub(super) async fn file_get_dir(
             break;
         }
         match receive_one(dev, dir, &wf.name, conflict).await {
-            Ok((written, size)) => {
-                // Received + (best-effort) deleted from the inbox. A delete failure after a good copy
-                // is recorded on the report but does not mark the file as failed — it is already saved.
+            // Copied to disk AND removed from the inbox — a clean success.
+            ReceiveOutcome::Received { written, size } => {
                 results.push(FileGotReport {
                     name: wf.name,
                     size,
@@ -659,13 +658,29 @@ pub(super) async fn file_get_dir(
                     error: None,
                 });
             }
-            Err(e) => {
+            // Copied to disk but the inbox delete failed — Go-faithfully an error (a re-drain would
+            // re-fetch it forever), but carry `written` so the operator still sees where it landed.
+            ReceiveOutcome::NotConsumed {
+                written,
+                size,
+                reason,
+            } => {
+                error_count += 1;
+                results.push(FileGotReport {
+                    name: wf.name,
+                    size,
+                    written: Some(written),
+                    error: Some(reason),
+                });
+            }
+            // Could not copy at all — left in the inbox.
+            ReceiveOutcome::Failed(reason) => {
                 error_count += 1;
                 results.push(FileGotReport {
                     name: wf.name,
                     size: 0,
                     written: None,
-                    error: Some(e),
+                    error: Some(reason),
                 });
             }
         }
@@ -677,6 +692,12 @@ pub(super) async fn file_get_dir(
 /// Wipe the Taildrop inbox without writing anything (Go `wipeInbox`, the `/dev/null` target). Each
 /// deleted file is reported as a zero-byte success with `written: Some("/dev/null")` so the CLI can
 /// show what was discarded; a delete failure is recorded as that file's error.
+///
+/// DELIBERATE DEVIATION from Go: Go's `wipeInbox` returns on the FIRST delete error (fail-fast),
+/// stopping the wipe. This instead attempts EVERY file and reports per-file outcomes (report-all),
+/// because the `FilesGot` model already gives the operator a full picture and "delete one file
+/// failed" should not leave the rest of the inbox un-wiped. The CLI still exits non-zero if any
+/// delete failed, so a script sees the failure either way.
 fn wipe_inbox(dev: &tailscale::Device) -> Response {
     let waiting = match dev.taildrop_waiting_files() {
         Ok(w) => w,
@@ -706,22 +727,44 @@ fn wipe_inbox(dev: &tailscale::Device) -> Response {
     Response::FilesGot { results }
 }
 
-/// Receive ONE inbox file `name` into `dir` under `conflict`, returning `(written_path, size)` on
-/// success or a human error string on failure (leaving the file in the inbox). Factored out of the
-/// drain loop so the per-file logic (open inbox file → resolve the target path under the conflict
-/// policy → copy off-runtime → quarantine → delete-from-inbox) reads linearly.
+/// The outcome of [`receive_one`] for a single inbox file, modelling Go's three end-states so the
+/// drain loop can report each faithfully:
+/// - `Received { written, size }` — copied to disk AND removed from the inbox. A clean success.
+/// - `NotConsumed { written, size, reason }` — copied to disk but the inbox delete FAILED. Go treats
+///   this as an error (`deleted` is not incremented and a re-drain would re-fetch the file forever —
+///   "persistently stuck files are basically an error"), so the loop records it as an error WHILE
+///   still surfacing where the bytes landed.
+/// - `Failed(reason)` — could not even copy the file; it is left in the inbox. An error.
+enum ReceiveOutcome {
+    Received {
+        written: String,
+        size: u64,
+    },
+    NotConsumed {
+        written: String,
+        size: u64,
+        reason: String,
+    },
+    Failed(String),
+}
+
+/// Receive ONE inbox file `name` into `dir` under `conflict`. Factored out of the drain loop so the
+/// per-file logic (open inbox file → resolve the target path under the conflict policy → copy
+/// off-runtime → quarantine → delete-from-inbox) reads linearly. Never returns `Err`: every failure
+/// mode maps to a [`ReceiveOutcome`] variant the loop turns into a [`FileGotReport`].
 async fn receive_one(
     dev: &tailscale::Device,
     dir: &str,
     name: &str,
     conflict: ConflictPolicy,
-) -> Result<(String, u64), String> {
+) -> ReceiveOutcome {
     // Open the waiting file in the receive store (path-traversal-validated by the engine). The
     // engine reports a size here, but we report the bytes `io::copy` actually wrote below (the
     // ground truth), so the open's size is unused.
-    let (mut src, _size) = dev
-        .taildrop_open_file(name)
-        .map_err(|e| format!("opening inbox file {name:?}: {e:?}"))?;
+    let (mut src, _size) = match dev.taildrop_open_file(name) {
+        Ok(pair) => pair,
+        Err(e) => return ReceiveOutcome::Failed(format!("opening inbox file {name:?}: {e:?}")),
+    };
 
     // Resolve the on-disk target under the conflict policy and open it. `skip` refuses an existing
     // target (leaving the inbox file); `overwrite` removes-then-exclusive-creates (symlink-safe);
@@ -737,8 +780,8 @@ async fn receive_one(
 
     let (written_path, copied) = match copy_result {
         Ok(Ok(pair)) => pair,
-        Ok(Err(e)) => return Err(humanize_write_err(dir, name, conflict, &e)),
-        Err(e) => return Err(format!("receive task failed: {e}")),
+        Ok(Err(e)) => return ReceiveOutcome::Failed(humanize_write_err(dir, name, conflict, &e)),
+        Err(e) => return ReceiveOutcome::Failed(format!("receive task failed: {e}")),
     };
 
     // Apply the quarantine attribute (defense-in-depth: mark the received file untrusted, matching
@@ -753,17 +796,28 @@ async fn receive_one(
         );
     }
 
-    // Received successfully → remove from the inbox so a re-drain does not re-fetch it (Go deletes
-    // after a successful receive). A delete failure is logged but does not fail the file — it is
-    // already saved to `dir`.
+    // Received → remove from the inbox so a re-drain does not re-fetch it (Go deletes after a
+    // successful receive, counting `deleted++` only on a successful delete). A delete FAILURE is
+    // Go-faithfully an ERROR: the bytes are on disk, but the file is still in the inbox, so the next
+    // drain would re-fetch it indefinitely ("persistently stuck files are basically an error"). We
+    // surface it as `NotConsumed` — carrying `written` so the operator still sees where it landed,
+    // but flagged as an error so the CLI exits non-zero.
     if let Err(e) = dev.taildrop_delete_file(name) {
         tracing::warn!(
             file = name,
             error = ?e,
-            "diag: taildrop file received but could not be deleted from the inbox"
+            "diag: taildrop file received but could not be deleted from the inbox (will re-fetch)"
         );
+        return ReceiveOutcome::NotConsumed {
+            written: written_path,
+            size: copied,
+            reason: format!("saved but could not be removed from the inbox: {e:?}"),
+        };
     }
-    Ok((written_path, copied))
+    ReceiveOutcome::Received {
+        written: written_path,
+        size: copied,
+    }
 }
 
 /// Map a raw write error to a Go-faithful, policy-aware message. Under `skip` an `AlreadyExists`
@@ -806,6 +860,26 @@ fn open_target_under_policy(
     conflict: ConflictPolicy,
 ) -> std::io::Result<(std::fs::File, String)> {
     use std::os::unix::fs::OpenOptionsExt;
+
+    // DEFENSE-IN-DEPTH: reject anything that is not a bare leaf BEFORE joining it onto `dir`. The
+    // engine's `validate_base_name` already guarantees inbox names are single components (no `/`,
+    // `\`, NUL, `.`, `..`), so this is unreachable today — but it makes this function self-defending
+    // rather than relying on an invariant enforced in another crate: a `base` with an embedded
+    // separator would otherwise let `Path::join` escape `dir`. Cheap, and the join below is only
+    // sound given it. (The `O_NOFOLLOW` create still blocks a symlink write either way.)
+    if base.is_empty()
+        || base == "."
+        || base == ".."
+        || base.contains('/')
+        || base.contains('\\')
+        || base.contains('\0')
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing unsafe taildrop file name {base:?}"),
+        ));
+    }
+
     let excl_create = |path: &std::path::Path| -> std::io::Result<std::fs::File> {
         std::fs::OpenOptions::new()
             .write(true)
@@ -861,15 +935,16 @@ const MAX_RENAME_ATTEMPTS: u32 = 100;
 
 /// Build the Chrome-Downloads-style numbered variant of a base file name: `name (i).ext`, splitting
 /// on the FINAL extension (Go's `numberedFileName`: `TrimSuffix(name, ext) + " (i)" + ext`). A name
-/// with no extension just gets ` (i)` appended; a dotfile like `.bashrc` is treated as all-stem (no
-/// extension, matching `path.Ext` returning the leading-dot segment only for `a.b`, not `.b`). Pure →
-/// unit-testable.
+/// with no `.` just gets ` (i)` appended. Pure → unit-testable.
 fn numbered_file_name(base: &str, i: u32) -> String {
-    // Match Go's `path.Ext`: the extension is the suffix from the LAST '.' in the final path element,
-    // but a leading dot (dotfile, no other dot) is NOT an extension. We operate on `base` directly
-    // (it is already a single path element — the inbox name).
-    let ext_start = base.rfind('.').filter(|&idx| idx > 0);
-    match ext_start {
+    // Match Go's `path.Ext` EXACTLY: it scans back to the LAST '.' in the final path element and
+    // returns the suffix from there — with NO special case for a leading dot. So `path.Ext(".bashrc")`
+    // is `".bashrc"` (the whole name is the extension; NOT `""` as `os.path.splitext` would give),
+    // hence Go's `numberedFileName(".bashrc", 1)` is `" (1).bashrc"` (empty stem + a leading space).
+    // We reproduce that verbatim — `rfind('.')` with no `idx > 0` filter. `base` is a validated single
+    // path element (the inbox name); `.`/`..` cannot reach here (engine-rejected + the leaf guard in
+    // `open_target_under_policy`), so the only leading-dot inputs are real dotfiles like `.bashrc`.
+    match base.rfind('.') {
         Some(idx) => {
             let (stem, ext) = base.split_at(idx); // ext includes the leading '.'
             format!("{stem} ({i}){ext}")
@@ -1287,13 +1362,19 @@ mod tests {
     #[test]
     fn numbered_file_name_matches_go_path_ext() {
         use super::numbered_file_name;
-        // Splits on the FINAL extension: stem + " (i)" + ext (Go numberedFileName).
+        // Splits on the FINAL extension: stem + " (i)" + ext (Go numberedFileName + path.Ext).
         assert_eq!(numbered_file_name("report.pdf", 1), "report (1).pdf");
         assert_eq!(numbered_file_name("a.b.txt", 3), "a.b (3).txt");
-        // No extension → just append " (i)".
+        assert_eq!(
+            numbered_file_name("archive.tar.gz", 1),
+            "archive.tar (1).gz"
+        );
+        // No '.' at all → just append " (i)".
         assert_eq!(numbered_file_name("README", 2), "README (2)");
-        // A leading-dot dotfile has NO extension (Go's path.Ext: ".bashrc" → ""), so it is all stem.
-        assert_eq!(numbered_file_name(".bashrc", 1), ".bashrc (1)");
+        // A leading-dot dotfile: Go's path.Ext(".bashrc") == ".bashrc" (the WHOLE name, NOT "" —
+        // Go has no leading-dot special case, unlike Python splitext). So the stem is empty and the
+        // result is " (1).bashrc" (a leading space). Verified against `go run` upstream.
+        assert_eq!(numbered_file_name(".bashrc", 1), " (1).bashrc");
     }
 
     #[test]
