@@ -444,3 +444,38 @@ parsed answer records + RCODE + the resolver(s) consulted — the analogue of Go
 (`cmd/tailscale/cli/dns-query.go`). Once it lands, the daemon adds `tnet dns query` as a faithful
 read (the `whois`/`id-token` plumbing pattern) consumed via a pin bump. No rush — filed so the gap is
 recorded, not forgotten.
+
+## 16. `Device::cert_pair(name, min_validity)` — PEM cert **and private key** (for a faithful `tnet cert`)
+
+The daemon wants `tnet cert <domain>` (Go `tailscale cert`), which writes BOTH `<domain>.crt` and
+`<domain>.key` PEM files to disk (the key at mode `0600`) — Go's `localClient.CertPairWithValidity`
+returns `(certPEM, keyPEM)` (`cmd/tailscale/cli/cert.go:123`). The engine's only cert accessor at the
+current pin (v0.28.2) is `Device::get_certificate(name) -> CertifiedKey` (`src/lib.rs:1471/1478`),
+which returns a `rustls::sign::CertifiedKey` (`ts_control/src/cert.rs:80`): the certificate **chain**
+is recoverable as PEM (DER → re-encode), but the **private key is consumed into an opaque `rustls`
+`SigningKey`** and is not retrievable as PEM — `issue_certificate` (`ts_control/src/acme.rs`) returns
+only the assembled `CertifiedKey`. So the daemon could write a usable `.crt` but **not** the `.key` —
+a half-feature the honest-omission discipline forbids. So `cert` is **deferred**, not faked.
+
+**Ask:** add `Device::cert_pair(&self, name: &str, min_validity: Option<Duration>) -> Result<(cert_pem:
+String, key_pem: String)>` (the analogue of Go's `CertPairWithValidity`) — surface the ACME-issued
+leaf private key as PEM alongside the chain, so the daemon can write the Go-faithful `.crt` + `.key`
+pair. Once it lands, the daemon adds `tnet cert` (consumed via a pin bump). Tracked in the daemon as
+bead `tsd-xkq`.
+
+## 17. TKA mutation — `Device::tka_{init,sign,disable,…}` (for `tnet lock` write-ops)
+
+The daemon ships `tnet lock status` (read-only) faithfully, but the **write half** of Go's
+`tailscale lock` (`init` / `add` / `remove` / `sign` / `disable` / `local-disable` / `revoke-keys` —
+`cmd/tailscale/cli/tailnet-lock.go`) has no engine surface. At v0.28.2 the only TKA primitive is
+`Device::tka_status() -> Option<TkaStatus>` (`src/lib.rs:1129`), a **read-only carrier**: `TkaStatus`
+(`ts_control/src/tka.rs`) exposes only the authority head + disablement signal, and the module doc
+states the actual signature/verification logic lives in the `ts_tka` crate with **no `Device` method
+to sign an AUM, initialize the authority, or mutate the trusted-key set**. Building the write-ops on
+the current surface is impossible without faking the cryptographic signing — forbidden.
+
+**Ask:** add the TKA mutation methods to `Device` (init the authority, sign/co-sign an AUM, add/remove
+a trusted key, disable/local-disable, revoke keys) — the analogues of Go's `localClient.NetworkLock*`
+calls — backed by the `ts_tka` crate's signing. Once they land, the daemon adds `tnet lock`
+init/sign/add/remove/disable/revoke (consumed via a pin bump). Tracked in the daemon as bead
+`tsd-1r6` (the enforcement epic). No rush — filed so the frontier is recorded.
