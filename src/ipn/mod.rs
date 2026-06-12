@@ -384,6 +384,30 @@ fn validate_advertise_tags(tags: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Reject an `auto:`-prefixed exit-node selector (Go `tailscale up/set --exit-node auto:any`, which
+/// enables *automatic* exit-node selection via `ipn.Prefs.AutoExitNode`).
+///
+/// This build models the exit node as a single concrete selector (`tailscale::ExitNodeSelector`: a
+/// bare IP → `Ip`, anything else → `Name`) and has **no** auto-selection machinery. Without this
+/// guard, `--exit-node auto:any` would parse — silently — as a request to route through a peer
+/// *named* `"auto:any"`, which matches nothing, so exit routing would break with no error (the
+/// `FromStr` is infallible). Fail loudly and honestly instead, so the operator isn't left with a
+/// silently-broken exit. (Go: `ipn.ParseAutoExitNodeString` / `AnyExitNode = "any"`,
+/// `cmd/tailscale/cli/up.go` `prefsFromUpArgs` + `set.go` `runSet`.) Pure, so it can pre-validate
+/// both `begin_up` and `begin_set` before any pref is mutated. `None`/cleared and concrete
+/// IP/name/MagicDNS selectors pass through unchanged.
+fn validate_exit_node_selector(exit_node: Option<&str>) -> Result<()> {
+    if let Some(sel) = exit_node
+        && sel.starts_with("auto:")
+    {
+        return Err(anyhow!(
+            "exit node {sel:?}: automatic exit-node selection (`auto:`…) is not supported by this \
+             build — pass a concrete exit node by tailnet IP, MagicDNS name, or stable node ID"
+        ));
+    }
+    Ok(())
+}
+
 /// Harden an operator-supplied `bugreport` note for embedding in the diagnostic marker: replace every
 /// control character (newlines, tabs, ANSI escapes, etc.) with `_` so the marker stays a single,
 /// clean, copy-pasteable token. The note is free text the operator types, so it is untrusted for
@@ -1381,6 +1405,11 @@ impl Backend {
         if let Some(tags) = opts.advertise_tags.as_ref() {
             validate_advertise_tags(tags)?;
         }
+        // And reject an `auto:` exit-node selector before persisting (this build has no auto-selection;
+        // a silent fall-through to `Name("auto:any")` would break exit routing with no error).
+        if let Some(Some(sel)) = opts.exit_node.as_ref() {
+            validate_exit_node_selector(Some(sel))?;
+        }
 
         // Apply the overrides. Same sentinel semantics as `begin_up`'s override block, restricted to
         // the fields `set` accepts. `exit_node` is the double `Option`: binding `en` (an
@@ -1592,6 +1621,11 @@ impl Backend {
         // Same pre-validate-before-teardown discipline for advertise-tags (tag:<name> form).
         if let Some(tags) = opts.advertise_tags.as_ref() {
             validate_advertise_tags(tags)?;
+        }
+        // And reject an `auto:` exit-node selector before teardown/persist (no auto-selection in this
+        // build; a silent fall-through to `Name("auto:any")` would break exit routing with no error).
+        if let Some(Some(sel)) = opts.exit_node.as_ref() {
+            validate_exit_node_selector(Some(sel))?;
         }
 
         // Tear down any existing device first so `up` is idempotent / reconfiguring.
@@ -3599,6 +3633,103 @@ mod tests {
         assert!(
             !tokio::fs::try_exists(dir.join("prefs.json")).await.unwrap(),
             "a set rejected for a bad CIDR must not have persisted prefs.json"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn validate_exit_node_selector_rejects_auto_passes_concrete() {
+        // Go `--exit-node auto:any` enables automatic exit-node selection (ipn.AutoExitNode); this
+        // build has no such machinery, so an `auto:`-prefixed value must be REJECTED loudly rather
+        // than silently parsed as a peer named "auto:any" (which matches nothing → broken exit).
+        // Concrete selectors (IP / MagicDNS name / stable id) and None/cleared pass through.
+        assert!(
+            validate_exit_node_selector(Some("auto:any")).is_err(),
+            "`auto:any` (automatic selection) must be rejected — this build has no auto-selection"
+        );
+        assert!(
+            validate_exit_node_selector(Some("auto:foo")).is_err(),
+            "any `auto:`-prefixed selector must be rejected"
+        );
+        let msg = format!(
+            "{:#}",
+            validate_exit_node_selector(Some("auto:any")).unwrap_err()
+        );
+        assert!(
+            msg.contains("auto:any") && msg.to_lowercase().contains("not supported"),
+            "the error must name the value + say it's unsupported, got {msg:?}"
+        );
+        // Concrete selectors are fine.
+        assert!(validate_exit_node_selector(Some("100.64.0.9")).is_ok());
+        assert!(validate_exit_node_selector(Some("exit-node.example.ts.net")).is_ok());
+        assert!(validate_exit_node_selector(Some("nABC123")).is_ok());
+        // None (unchanged / cleared) is fine.
+        assert!(validate_exit_node_selector(None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn begin_up_rejects_auto_exit_node_without_persisting() {
+        // `up --exit-node auto:any` must be rejected up-front (before teardown/persist), so a failed
+        // up never tears down the device or writes prefs.json for an unsupported auto-selection.
+        let dir = std::env::temp_dir().join(format!("tailnetd-up-autoexit-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+
+        // `begin_up` returns `Result<PendingUp>` and `PendingUp` is not `Debug`, so `expect_err`
+        // (which would format the `Ok` value) won't compile — match by hand.
+        let err = match be
+            .begin_up(UpOptions {
+                exit_node: Some(Some("auto:any".to_string())),
+                ..UpOptions::default()
+            })
+            .await
+        {
+            Ok(_) => panic!("up --exit-node auto:any must fail (no auto-selection in this build)"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("auto:any"),
+            "the error must name the rejected selector"
+        );
+        assert!(
+            be.prefs.exit_node.is_none(),
+            "a rejected auto: exit node must not have been applied to prefs"
+        );
+        assert!(
+            !tokio::fs::try_exists(dir.join("prefs.json")).await.unwrap(),
+            "an up rejected for auto: exit node must not have persisted prefs.json"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn begin_set_rejects_auto_exit_node_without_persisting() {
+        // `set --exit-node auto:any` must be rejected up-front, leaving prefs untouched + unpersisted.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-set-autoexit-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+
+        let err = be
+            .begin_set(SetOptions {
+                exit_node: Some(Some("auto:any".to_string())),
+                accept_routes: Some(true),
+                ..SetOptions::default()
+            })
+            .await
+            .expect_err("set --exit-node auto:any must fail");
+        assert!(format!("{err:#}").contains("auto:any"));
+        assert!(
+            be.prefs.exit_node.is_none() && !be.prefs.accept_routes,
+            "a rejected set must not have applied exit_node OR the co-named accept_routes"
+        );
+        assert!(
+            !tokio::fs::try_exists(dir.join("prefs.json")).await.unwrap(),
+            "a set rejected for auto: exit node must not have persisted prefs.json"
         );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
