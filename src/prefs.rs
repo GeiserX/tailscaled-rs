@@ -29,6 +29,14 @@ pub struct Prefs {
     pub ephemeral: bool,
     /// Accept (and route traffic to) subnet routes advertised by peers.
     pub accept_routes: bool,
+    /// Accept the tailnet's MagicDNS configuration pushed by control (Go `--accept-dns` /
+    /// `ipn.Prefs.CorpDNS`). Maps to the engine `Config.accept_dns`. **Default `true`** (Go's
+    /// default): the node uses tailnet DNS. Set `false` to ignore the pushed DNS config and keep the
+    /// system resolver. Default `true` is honored on upgrade by the container-level `#[serde(default)]`
+    /// above (a `prefs.json` written before this field existed has no `accept_dns` key → it falls back
+    /// to `Prefs::default()`'s `true`, NOT `false`), so a daemon update never silently switches an
+    /// existing node off tailnet DNS.
+    pub accept_dns: bool,
     /// Shields-up (Go `--shields-up` / `ipn.Prefs.ShieldsUp`): block all **inbound** connections
     /// from peers that terminate on this node, regardless of the control-pushed packet filter, while
     /// leaving outbound + forwarded subnet/exit transit working. Maps to the engine
@@ -100,6 +108,7 @@ impl Default for Prefs {
             hostname: None,
             ephemeral: true,
             accept_routes: false,
+            accept_dns: true,
             shields_up: false,
             exit_node: None,
             advertise_exit_node: false,
@@ -151,6 +160,7 @@ impl Prefs {
         self.control_url = d.control_url;
         self.hostname = d.hostname;
         self.accept_routes = d.accept_routes;
+        self.accept_dns = d.accept_dns;
         self.shields_up = d.shields_up;
         self.exit_node = d.exit_node;
         self.advertise_exit_node = d.advertise_exit_node;
@@ -221,6 +231,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn accept_dns_defaults_on() {
+        // Go's CorpDNS / `--accept-dns` is on by default — a fresh node uses tailnet DNS.
+        assert!(
+            Prefs::default().accept_dns,
+            "accept_dns must default to true (Go CorpDNS default-on)"
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_dns_migrates_to_true_for_prefs_without_the_field() {
+        // MIGRATION: a prefs.json written before `accept_dns` existed has no such key. It MUST load as
+        // `true` (the Go default) — NOT `false` — so a daemon UPGRADE never silently switches an
+        // existing node off tailnet DNS. (Container `#[serde(default)]` fills the missing field from
+        // `Prefs::default()`, whose `accept_dns` is true.)
+        let dir = std::env::temp_dir().join(format!("tailnetd-prefs-adns-{}", std::process::id()));
+        let path = dir.join("prefs.json");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        // An "old" prefs file: valid JSON, real fields, but no `accept_dns` key.
+        tokio::fs::write(
+            &path,
+            br#"{"want_running":true,"logged_out":false,"accept_routes":true}"#,
+        )
+        .await
+        .unwrap();
+
+        let loaded = Prefs::load(&path).await.expect("load old prefs");
+        assert!(loaded.want_running);
+        assert!(loaded.accept_routes);
+        assert!(
+            loaded.accept_dns,
+            "an upgraded prefs file with no accept_dns key must load as true, not false"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
     #[tokio::test]
     async fn missing_file_yields_default() {
         let dir =
@@ -229,6 +277,8 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         let loaded = Prefs::load(&path).await.expect("load missing");
         assert!(!loaded.want_running);
+        // A missing file → Prefs::default() → accept_dns on.
+        assert!(loaded.accept_dns);
     }
 
     #[tokio::test]
