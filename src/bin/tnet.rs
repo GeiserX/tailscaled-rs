@@ -3723,48 +3723,93 @@ fn mount_suffix(set_path: &Option<String>) -> String {
 /// `--set-path` mount is added to the same port (Go `SetWebHandler` accretes; the root is the `/`
 /// handler). Returns the port's existing `mounts` as-is when it already is a mux. A non-web handler
 /// (plain TCP forward / TLS-terminated) yields no web mounts.
-fn existing_as_mounts(
-    h: &tailscaled_rs::localapi::TcpPortHandler,
-) -> std::collections::BTreeMap<String, tailscaled_rs::localapi::WebMount> {
-    use tailscaled_rs::localapi::WebMount;
-    if !h.mounts.is_empty() {
-        return h.mounts.clone();
+/// The existing Go-`Web`-map handlers for `host:port`, MIGRATING any legacy per-handler bodies
+/// (text/redirect/mounts/tcp_forward on the `TcpPortHandler`) into the equivalent `HttpHandler` map
+/// so root + path mounts ACCRETE across `tnet serve` calls (Go `SetWebHandler` keeps both on the
+/// port's `WebServerConfig.Handlers`). Prefers an already-present `Web[host:port]` entry; else folds a
+/// legacy handler's bodies into a `/`-keyed (or per-mount) `HttpHandler` map. Empty when the port has
+/// no web entry yet.
+fn existing_web_handlers(
+    cfg: &tailscaled_rs::localapi::ServeConfig,
+    host: &str,
+    port: u16,
+) -> std::collections::BTreeMap<String, tailscaled_rs::localapi::HttpHandler> {
+    use tailscaled_rs::localapi::{HttpHandler, WebMount};
+    let hostport = format!("{host}:{port}");
+    // Already migrated to the Web map → reuse it.
+    if let Some(wsc) = cfg.web.get(&hostport) {
+        return wsc.handlers.clone();
     }
-    let mut mounts = std::collections::BTreeMap::new();
-    if let Some(body) = &h.text {
-        mounts.insert("/".to_string(), WebMount::Text { body: body.clone() });
-    } else if let Some(r) = &h.redirect {
-        mounts.insert(
+    // Else migrate the legacy per-handler bodies on this port.
+    let mut handlers = std::collections::BTreeMap::new();
+    let Some(h) = cfg.tcp.get(&port.to_string()) else {
+        return handlers;
+    };
+    let mount_to_handler = |m: &WebMount| match m {
+        WebMount::Proxy { to } => HttpHandler {
+            proxy: to.clone(),
+            ..Default::default()
+        },
+        WebMount::Text { body } => HttpHandler {
+            text: body.clone(),
+            ..Default::default()
+        },
+        WebMount::Redirect { to, status } => HttpHandler {
+            redirect: format!("{status}:{to}"),
+            ..Default::default()
+        },
+    };
+    if !h.mounts.is_empty() {
+        for (mount, m) in &h.mounts {
+            handlers.insert(mount.clone(), mount_to_handler(m));
+        }
+    } else if let Some(body) = &h.text {
+        handlers.insert(
             "/".to_string(),
-            WebMount::Redirect {
-                to: r.to.clone(),
-                status: r.status,
+            HttpHandler {
+                text: body.clone(),
+                ..Default::default()
+            },
+        );
+    } else if let Some(r) = &h.redirect {
+        handlers.insert(
+            "/".to_string(),
+            HttpHandler {
+                redirect: format!("{}:{}", r.status, r.to),
+                ..Default::default()
             },
         );
     } else if (h.https || h.http) && !h.tcp_forward.is_empty() {
-        mounts.insert(
+        handlers.insert(
             "/".to_string(),
-            WebMount::Proxy {
-                to: h.tcp_forward.clone(),
+            HttpHandler {
+                proxy: h.tcp_forward.clone(),
+                ..Default::default()
             },
         );
     }
-    mounts
+    handlers
 }
 
+/// Build a web serve into Go's top-level `Web` map (Go `SetWebHandler`): set `TCP[port]={HTTPS|HTTP}`
+/// (a flag pointing at `Web`, NO body on the handler) and write the handler under
+/// `Web["{host}:{port}"].Handlers[mount]`. `host` is the node's MagicDNS name (resolved by the caller
+/// from `status`). Root + path mounts accrete via [`existing_web_handlers`] (migrating any legacy
+/// bodies on the way). A lone `/` mount stays a bare handler set; a `--set-path` adds a mux entry.
 fn build_web_serve(
     mut cfg: tailscaled_rs::localapi::ServeConfig,
+    host: &str,
     port: u16,
     target: &str,
     set_path: Option<&str>,
     tls: bool,
 ) -> Result<tailscaled_rs::localapi::ServeConfig> {
-    use tailscaled_rs::localapi::{TcpPortHandler, WebMount};
+    use tailscaled_rs::localapi::{HttpHandler, TcpPortHandler, WebServerConfig};
 
-    // Resolve `--set-path` to a cleaned mount; None / "/" mean the root (bare handler, no mux).
+    // Resolve `--set-path` to a cleaned mount; None / "/" mean the root.
     let mount = match set_path {
-        None | Some("") | Some("/") => None,
-        Some(m) => Some(clean_url_path(m)?),
+        None | Some("") | Some("/") => "/".to_string(),
+        Some(m) => clean_url_path(m)?,
     };
 
     // Parse the target: `text:<body>` → a text handler; anything else → a proxy backend.
@@ -3774,56 +3819,57 @@ fn build_web_serve(
     {
         anyhow::bail!("unable to serve; text cannot be an empty string");
     }
-
-    let mut handler = TcpPortHandler {
-        https: tls,
-        http: !tls,
-        ..Default::default()
-    };
-
-    // The new handler's web target, as a mount entry (used when this serve participates in a mux).
     let entry = match is_text {
-        Some(body) => WebMount::Text {
-            body: body.to_string(),
+        Some(body) => HttpHandler {
+            text: body.to_string(),
+            ..Default::default()
         },
-        None => WebMount::Proxy {
-            to: normalize_serve_target(target),
+        None => HttpHandler {
+            proxy: normalize_serve_target(target),
+            ..Default::default()
         },
     };
 
-    // Carry over an existing handler on this port so root + path mounts ACCRETE rather than clobber
-    // (Go `SetWebHandler` keeps both on the port's `WebServerConfig.Handlers`). Any existing bare
-    // root handler (text / https-http proxy) is migrated into a `/` mount so it survives alongside a
-    // new `--set-path` mount, and vice-versa.
-    let existing_mounts = cfg.tcp.get(&port.to_string()).map(existing_as_mounts);
+    // Accrete onto the port's existing handlers (migrating any legacy bodies), then add/replace ours.
+    let mut handlers = existing_web_handlers(&cfg, host, port);
+    handlers.insert(mount, entry);
 
-    match mount {
-        // Non-root mount: merge into the port's existing mounts (migrating any bare root to `/`).
-        Some(m) => {
-            handler.mounts = existing_mounts.unwrap_or_default();
-            handler.mounts.insert(m, entry);
-        }
-        // Root mount: if the port already has mounts, fold this in as the `/` mount (stay a mux);
-        // otherwise it's a plain bare handler on the port.
-        None => match existing_mounts {
-            Some(mut mounts) if !mounts.is_empty() => {
-                mounts.insert("/".to_string(), entry);
-                handler.mounts = mounts;
-            }
-            _ => match is_text {
-                Some(body) => handler.text = Some(body.to_string()),
-                None => handler.tcp_forward = normalize_serve_target(target),
-            },
+    // The port handler is just the HTTPS/HTTP flag (Go shape); the body lives in the Web map.
+    cfg.tcp.insert(
+        port.to_string(),
+        TcpPortHandler {
+            https: tls,
+            http: !tls,
+            ..Default::default()
         },
-    }
-
-    cfg.tcp.insert(port.to_string(), handler);
+    );
+    cfg.web
+        .insert(format!("{host}:{port}"), WebServerConfig { handlers });
     Ok(cfg)
 }
 
 /// Drive `tnet serve <sub>`: `tcp`/`https`/`http`/`redirect` and `reset` read-modify-write the
 /// ServeConfig (GET → mutate → SET); `status` GETs + renders. The ServeConfig is replaced wholesale on
 /// SET (matching Go's SetServeConfig), so each set first fetches the current config and adds its entry.
+/// Resolve the node's MagicDNS name (the `host` part of a Go `Web` key, and the shared TLS cert
+/// name) by querying `status`. A web serve needs it before the node has a name yet — fail with a
+/// clear message rather than authoring a `Web` key with an empty/placeholder host. Mirrors
+/// `run_funnel`'s resolution.
+async fn serve_host(socket: &std::path::Path) -> Result<String> {
+    let status = match round_trip(socket, &Request::Status).await {
+        Ok(Response::Status(s)) => s,
+        Ok(other) => anyhow::bail!("unexpected response to status request: {other:?}"),
+        Err(e) => return Err(e).context("querying status"),
+    };
+    match status.self_name.as_deref().filter(|h| !h.is_empty()) {
+        Some(h) => Ok(h.trim_end_matches('.').to_string()),
+        None => anyhow::bail!(
+            "no MagicDNS name yet (state: {}); bring the node up before configuring a web serve",
+            status.state
+        ),
+    }
+}
+
 async fn run_serve(socket: &std::path::Path, cmd: ServeCmd) -> Result<()> {
     use tailscaled_rs::localapi::ServeConfig;
     // Fetch the current config (GetServeConfig is read-only; always replies ServeConfig).
@@ -3863,11 +3909,12 @@ async fn run_serve(socket: &std::path::Path, cmd: ServeCmd) -> Result<()> {
             target,
             set_path,
         } => {
+            let host = serve_host(socket).await?;
             let cfg = get_cfg().await?;
-            let cfg = build_web_serve(cfg, port, &target, set_path.as_deref(), true)?;
+            let cfg = build_web_serve(cfg, &host, port, &target, set_path.as_deref(), true)?;
             send_ok_or_die(socket, Request::SetServeConfig { config: cfg }).await?;
             println!(
-                "serving https://<node>:{port}{} -> {target}",
+                "serving https://{host}:{port}{} -> {target}",
                 mount_suffix(&set_path)
             );
             Ok(())
@@ -3877,11 +3924,12 @@ async fn run_serve(socket: &std::path::Path, cmd: ServeCmd) -> Result<()> {
             target,
             set_path,
         } => {
+            let host = serve_host(socket).await?;
             let cfg = get_cfg().await?;
-            let cfg = build_web_serve(cfg, port, &target, set_path.as_deref(), false)?;
+            let cfg = build_web_serve(cfg, &host, port, &target, set_path.as_deref(), false)?;
             send_ok_or_die(socket, Request::SetServeConfig { config: cfg }).await?;
             println!(
-                "serving http://<node>:{port}{} -> {target}",
+                "serving http://{host}:{port}{} -> {target}",
                 mount_suffix(&set_path)
             );
             Ok(())
@@ -3896,20 +3944,31 @@ async fn run_serve(socket: &std::path::Path, cmd: ServeCmd) -> Result<()> {
             if to.contains(['\r', '\n']) {
                 anyhow::bail!("redirect target must not contain CR or LF");
             }
+            let host = serve_host(socket).await?;
             let mut cfg = get_cfg().await?;
+            // Write into the Go Web map: TCP[port]={HTTPS:true} flag + a `/` redirect handler in the
+            // Go string form `<status>:<to>`, accreting onto any existing handlers on the port.
+            let mut handlers = existing_web_handlers(&cfg, &host, port);
+            handlers.insert(
+                "/".to_string(),
+                tailscaled_rs::localapi::HttpHandler {
+                    redirect: format!("{status}:{to}"),
+                    ..Default::default()
+                },
+            );
             cfg.tcp.insert(
                 port.to_string(),
                 tailscaled_rs::localapi::TcpPortHandler {
                     https: true,
-                    redirect: Some(tailscaled_rs::localapi::RedirectSpec {
-                        to: to.clone(),
-                        status,
-                    }),
                     ..Default::default()
                 },
             );
+            cfg.web.insert(
+                format!("{host}:{port}"),
+                tailscaled_rs::localapi::WebServerConfig { handlers },
+            );
             send_ok_or_die(socket, Request::SetServeConfig { config: cfg }).await?;
-            println!("serving https://<node>:{port} -> redirect {status} -> {to}");
+            println!("serving https://{host}:{port} -> redirect {status} -> {to}");
             Ok(())
         }
         ServeCmd::Reset => {
@@ -5616,96 +5675,100 @@ mod tests {
         assert_eq!(t.len(), 20);
     }
 
+    // The build_web_serve tests now author Go's `Web` map: TCP[port]={HTTPS flag} (no body) + the
+    // handler under web["{host}:{port}"].handlers[mount]. `H` is the host the CLI resolves from status.
+    const H: &str = "host.ts.net";
+
     #[test]
     fn build_web_serve_text_and_proxy_root() {
         use tailscaled_rs::localapi::ServeConfig;
-        // text: target → text handler, no proxy backend.
+        // text: target → a text handler at "/" in the Web map; the TCP handler is the bare HTTPS flag.
         let cfg =
-            build_web_serve(ServeConfig::default(), 443, "text:hi there", None, true).unwrap();
-        let h = cfg.tcp.get("443").unwrap();
-        assert_eq!(h.text.as_deref(), Some("hi there"));
-        assert!(h.tcp_forward.is_empty());
-        assert!(h.https);
+            build_web_serve(ServeConfig::default(), H, 443, "text:hi there", None, true).unwrap();
+        let th = cfg.tcp.get("443").unwrap();
+        assert!(
+            th.https && th.tcp_forward.is_empty(),
+            "TCP handler is the flag, no body"
+        );
+        let wh = &cfg.web["host.ts.net:443"].handlers["/"];
+        assert_eq!(wh.text, "hi there");
+        assert!(wh.proxy.is_empty());
 
-        // proxy target (bare port normalized) at root → tcp_forward backend.
-        let cfg = build_web_serve(ServeConfig::default(), 443, "3000", None, true).unwrap();
-        let h = cfg.tcp.get("443").unwrap();
-        assert_eq!(h.tcp_forward, "127.0.0.1:3000");
-        assert!(h.text.is_none());
+        // proxy target (bare port normalized) at root → proxy handler.
+        let cfg = build_web_serve(ServeConfig::default(), H, 443, "3000", None, true).unwrap();
+        assert_eq!(
+            cfg.web["host.ts.net:443"].handlers["/"].proxy,
+            "127.0.0.1:3000"
+        );
 
         // empty text body is rejected (Go parity).
-        assert!(build_web_serve(ServeConfig::default(), 443, "text:", None, true).is_err());
+        assert!(build_web_serve(ServeConfig::default(), H, 443, "text:", None, true).is_err());
     }
 
     #[test]
     fn build_web_serve_set_path_mounts_accumulate() {
-        use tailscaled_rs::localapi::{ServeConfig, WebMount};
-        // First mount at /api.
-        let cfg = build_web_serve(ServeConfig::default(), 443, "3000", Some("/api"), true).unwrap();
-        // Second mount at /web on the same port — must accumulate, not clobber.
-        let cfg = build_web_serve(cfg, 443, "text:hello", Some("/web"), true).unwrap();
-        let h = cfg.tcp.get("443").unwrap();
-        assert_eq!(h.mounts.len(), 2, "mounts should accumulate");
-        assert_eq!(
-            h.mounts.get("/api"),
-            Some(&WebMount::Proxy {
-                to: "127.0.0.1:3000".into()
-            })
-        );
-        assert_eq!(
-            h.mounts.get("/web"),
-            Some(&WebMount::Text {
-                body: "hello".into()
-            })
-        );
+        use tailscaled_rs::localapi::ServeConfig;
+        // First mount at /api, then /web on the same port — must accumulate in the Web map, not clobber.
+        let cfg =
+            build_web_serve(ServeConfig::default(), H, 443, "3000", Some("/api"), true).unwrap();
+        let cfg = build_web_serve(cfg, H, 443, "text:hello", Some("/web"), true).unwrap();
+        let h = &cfg.web["host.ts.net:443"].handlers;
+        assert_eq!(h.len(), 2, "mounts should accumulate");
+        assert_eq!(h["/api"].proxy, "127.0.0.1:3000");
+        assert_eq!(h["/web"].text, "hello");
     }
 
     #[test]
     fn build_web_serve_bare_root_then_mount_accretes() {
-        use tailscaled_rs::localapi::{ServeConfig, WebMount};
+        use tailscaled_rs::localapi::ServeConfig;
         // A bare root proxy, then a --set-path mount on the SAME port: the root must survive as the
-        // "/" mount (Go SetWebHandler accretes — it must NOT be clobbered).
-        let cfg = build_web_serve(ServeConfig::default(), 443, "3000", None, true).unwrap();
-        let cfg = build_web_serve(cfg, 443, "text:hi", Some("/api"), true).unwrap();
-        let h = cfg.tcp.get("443").unwrap();
-        assert_eq!(h.mounts.len(), 2, "root + /api should coexist");
+        // "/" handler (Go SetWebHandler accretes — must NOT be clobbered).
+        let cfg = build_web_serve(ServeConfig::default(), H, 443, "3000", None, true).unwrap();
+        let cfg = build_web_serve(cfg, H, 443, "text:hi", Some("/api"), true).unwrap();
+        let h = &cfg.web["host.ts.net:443"].handlers;
+        assert_eq!(h.len(), 2, "root + /api should coexist");
         assert_eq!(
-            h.mounts.get("/"),
-            Some(&WebMount::Proxy {
-                to: "127.0.0.1:3000".into()
-            }),
-            "the bare root proxy migrated into the / mount"
+            h["/"].proxy, "127.0.0.1:3000",
+            "the bare root proxy stayed as /"
         );
-        assert_eq!(
-            h.mounts.get("/api"),
-            Some(&WebMount::Text { body: "hi".into() })
-        );
-        // The bare fields are cleared once it becomes a mux (the mounts are the source of truth).
-        assert!(h.tcp_forward.is_empty());
-        assert!(h.text.is_none());
+        assert_eq!(h["/api"].text, "hi");
     }
 
     #[test]
     fn build_web_serve_mount_then_bare_root_accretes() {
-        use tailscaled_rs::localapi::{ServeConfig, WebMount};
+        use tailscaled_rs::localapi::ServeConfig;
         // The reverse: a --set-path mount, then a bare root serve on the same port. The root folds in
-        // as the "/" mount rather than wiping the existing mount.
-        let cfg = build_web_serve(ServeConfig::default(), 443, "3000", Some("/api"), true).unwrap();
-        let cfg = build_web_serve(cfg, 443, "9000", None, true).unwrap();
-        let h = cfg.tcp.get("443").unwrap();
-        assert_eq!(h.mounts.len(), 2, "/api + new root should coexist");
-        assert_eq!(
-            h.mounts.get("/api"),
-            Some(&WebMount::Proxy {
-                to: "127.0.0.1:3000".into()
-            })
+        // as the "/" handler rather than wiping the existing mount.
+        let cfg =
+            build_web_serve(ServeConfig::default(), H, 443, "3000", Some("/api"), true).unwrap();
+        let cfg = build_web_serve(cfg, H, 443, "9000", None, true).unwrap();
+        let h = &cfg.web["host.ts.net:443"].handlers;
+        assert_eq!(h.len(), 2, "/api + new root should coexist");
+        assert_eq!(h["/api"].proxy, "127.0.0.1:3000");
+        assert_eq!(h["/"].proxy, "127.0.0.1:9000");
+    }
+
+    #[test]
+    fn build_web_serve_migrates_legacy_handler_to_web_map() {
+        use tailscaled_rs::localapi::{ServeConfig, TcpPortHandler};
+        // A legacy on-disk config (body on the TCP handler). A new serve on that port must MIGRATE the
+        // legacy body into the Web map (accrete), not silently drop it.
+        let mut cfg = ServeConfig::default();
+        cfg.tcp.insert(
+            "443".into(),
+            TcpPortHandler {
+                https: true,
+                tcp_forward: "127.0.0.1:3000".into(),
+                ..Default::default()
+            },
         );
+        let cfg = build_web_serve(cfg, H, 443, "text:hi", Some("/api"), true).unwrap();
+        let h = &cfg.web["host.ts.net:443"].handlers;
         assert_eq!(
-            h.mounts.get("/"),
-            Some(&WebMount::Proxy {
-                to: "127.0.0.1:9000".into()
-            })
+            h["/"].proxy, "127.0.0.1:3000",
+            "legacy root proxy migrated to /"
         );
+        assert_eq!(h["/api"].text, "hi");
     }
 
     #[test]
