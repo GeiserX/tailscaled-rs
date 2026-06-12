@@ -330,6 +330,57 @@ mod tests {
             "{}"
         );
         assert!(ServeConfig::default().tcp.is_empty());
+        // The new Web map is also empty + omitted from the wire on a default config.
+        assert!(ServeConfig::default().web.is_empty());
+    }
+
+    #[test]
+    fn go_authored_web_map_deserializes_without_dropping_targets() {
+        // THE tsd-6p4 gap: a web serve config authored by a real Go `tailscaled` carries the handler
+        // body in a top-level `Web` map (TCP[port]={HTTPS:true} merely flags it). Before Stage A the
+        // `Web` key was silently dropped (serde ignore-unknown) and the proxy target was LOST. Now it
+        // must deserialize intact.
+        let go_json = r#"{"TCP":{"443":{"HTTPS":true}},"Web":{"host.tailnet.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:3000"}}}}}"#;
+        let cfg: ServeConfig = serde_json::from_str(go_json).expect("Go web config must parse");
+        // The HTTPS flag survived on the port handler.
+        assert!(cfg.tcp.get("443").is_some_and(|h| h.https));
+        // The Web map carried the handler body (NOT dropped).
+        let wsc = cfg
+            .web
+            .get("host.tailnet.ts.net:443")
+            .expect("Web[host:443] entry must be present");
+        assert_eq!(
+            wsc.handlers.get("/").map(|h| h.proxy.as_str()),
+            Some("http://127.0.0.1:3000"),
+            "the proxy target must survive deserialize: {cfg:?}"
+        );
+        // And it round-trips back to byte-identical Go wire (PascalCase, omitempty, no extra keys).
+        assert_eq!(serde_json::to_string(&cfg).unwrap(), go_json);
+    }
+
+    #[test]
+    fn web_handler_text_and_redirect_round_trip() {
+        // Text + the Go string-form Redirect (`<code>:<url>`) round-trip in the Web map.
+        let go_json = r#"{"TCP":{"443":{"HTTPS":true}},"Web":{"h:443":{"Handlers":{"/info":{"Text":"hi"},"/old":{"Redirect":"301:https://h/new"}}}}}"#;
+        let cfg: ServeConfig = serde_json::from_str(go_json).expect("parse");
+        let h = &cfg.web["h:443"].handlers;
+        assert_eq!(h["/info"].text, "hi");
+        assert_eq!(h["/old"].redirect, "301:https://h/new");
+        assert!(h.get("/missing").is_none(), "absent mount has no handler");
+        assert!(h["/info"].proxy.is_empty() && h["/info"].redirect.is_empty());
+        assert_eq!(serde_json::to_string(&cfg).unwrap(), go_json);
+    }
+
+    #[test]
+    fn legacy_handler_bodies_still_deserialize() {
+        // Read-compat: a serve-config.json this fork ALREADY wrote (web bodies on the per-port handler
+        // via the legacy Text/Redirect/Mounts fields) must still deserialize after Stage A — removing
+        // those fields would silently drop existing users' web serves on upgrade.
+        let legacy = r#"{"TCP":{"443":{"HTTPS":true,"Text":"hello"}}}"#;
+        let cfg: ServeConfig =
+            serde_json::from_str(legacy).expect("legacy config must still parse");
+        assert_eq!(cfg.tcp["443"].text.as_deref(), Some("hello"));
+        assert!(cfg.web.is_empty(), "legacy shape has no Web map");
     }
 
     #[test]
