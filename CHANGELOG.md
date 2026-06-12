@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.35.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.34.1...v0.35.0) (2026-06-12)
+
+
+### Features
+
+* **up:** --accept-risk + enforce lose-ssh on force-reauth over Tailscale SSH ([#99](https://github.com/GeiserX/tailscaled-rs/issues/99)) ([c30c1d8](https://github.com/GeiserX/tailscaled-rs/commit/c30c1d821289d8b37348d3db27d7a3c886fe3047))
+
 ## [0.34.1](https://github.com/GeiserX/tailscaled-rs/compare/v0.34.0...v0.34.1) (2026-06-12)
 
 
