@@ -206,6 +206,145 @@ async fn serve_accept_loop(
     }
 }
 
+/// LANE 3 of [`spawn_serve`](Backend::spawn_serve) — arm Funnel (Go `tailscale funnel`): expose each
+/// funnel-enabled port's web serve to the PUBLIC internet. Extracted as a free fn (it was the deepest
+/// nest in the supervisor) — it runs off the backend lock (holds only the device `Arc`) and pushes
+/// its accept loops into the supervisor-owned `loops` so abort tears them down, exactly as inline.
+///
+/// For each funnel port with a web proxy backend it calls the engine's `listen_funnel` (fail-closed:
+/// gates on node-attr + funnel-port cap + cert) and — because funnel hands back RAW TLS-terminated
+/// streams (NOT internally proxied like LANE 2) — spawns a [`funnel_accept_loop`] that splices each
+/// public connection to the local backend. The public ingress data path is live-only/SaaS-only (no
+/// relay against a self-hosted control plane), so a fed loop needs a real Funnel-enabled SaaS tailnet;
+/// arming + gating is what happens here. Non-fatal throughout — a failure logs and the other lanes
+/// (TCP-forward, web) keep running.
+async fn arm_funnel_lane(
+    device: &std::sync::Arc<tailscale::Device>,
+    cfg: &serve::ServeConfig,
+    loops: &mut tokio::task::JoinSet<()>,
+) {
+    let funnel_ports = serve::funnel_ports(cfg);
+    if funnel_ports.is_empty() {
+        return;
+    }
+    // Need the node MagicDNS name (the funnel hostname / cert name) + each port's backend.
+    let fqdn = match device.self_node().await {
+        Ok(node) => node.fqdn(false),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "funnel: could not resolve node MagicDNS name; skipping funnel lane"
+            );
+            return;
+        }
+    };
+    for port in funnel_ports {
+        // Funnel exposes a serve: the port must have a web proxy backend to splice to. (Mirrors Go's
+        // "funnel=on but no serve config" warning.)
+        let backend = cfg
+            .tcp
+            .get(&port.to_string())
+            .filter(|h| serve::is_web_serve(h))
+            .map(|h| h.tcp_forward.clone())
+            .filter(|b| !b.is_empty());
+        let Some(backend) = backend else {
+            tracing::warn!(
+                port,
+                "funnel: enabled for a port with no web proxy backend — skipping \
+                 (funnel exposes a serve; configure `serve https <port> <target>` first)"
+            );
+            continue;
+        };
+        let fcfg = tailscale::ServeConfig {
+            name: fqdn.clone(),
+            port,
+            target: tailscale::ServeTarget::Proxy {
+                to: backend.clone(),
+            },
+        };
+        // `FunnelOptions::default()` = `funnel_only: false`. On this listener that flag is a documented
+        // no-op (the ingress data path carries only relay-delivered PUBLIC traffic regardless), so
+        // `default()` is intentional — not a security-relevant choice to tighten to `funnel_only: true`.
+        match device
+            .listen_funnel(&fcfg, ts_control::FunnelOptions::default())
+            .await
+        {
+            Ok(mut rx) => {
+                tracing::info!(name = %fqdn, port, "funnel: armed via engine listen_funnel");
+                // Funnel hands back RAW TLS-terminated streams (unlike LANE 2's internal proxy), so
+                // splice each to the local backend ourselves. The accept loop is spawned as a closure
+                // (not a named fn) because the receiver type — `ts_runtime::funnel::FunnelAcceptedReceiver`
+                // — is an engine-internal type not re-exported at the facade root, and `ts_runtime` is
+                // only a transitive dep here; inferring it in the closure avoids a direct dependency.
+                // Holding `rx` keeps the listener alive; the loop ends on receiver close / task abort.
+                let backend = backend.clone();
+                loops.spawn(async move {
+                    // Per-funnel-loop splice cap. Funnel is PUBLIC-internet-facing, so a slow-loris of
+                    // idle public connections must not spawn splice tasks (leaking fds) without bound —
+                    // at cap a new connection is dropped (shed, not queued). See `MAX_SERVE_CONNECTIONS`.
+                    let conn_limit =
+                        std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_SERVE_CONNECTIONS));
+                    while let Some(accepted) = rx.recv().await {
+                        // Acquire a splice permit before spawning; drop the connection if the cap is
+                        // exhausted. Moved into the task, released when the splice ends.
+                        let Ok(permit) = std::sync::Arc::clone(&conn_limit).try_acquire_owned()
+                        else {
+                            tracing::warn!(
+                                %backend,
+                                "funnel: connection cap reached; dropping public connection"
+                            );
+                            continue;
+                        };
+                        let backend = backend.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            // `accepted.target`/`src` are the public ingress host:port hit + the public
+                            // client's addr (audit/debug trace of who reached the funnel).
+                            tracing::debug!(
+                                target = %accepted.target,
+                                src = %accepted.src,
+                                %backend,
+                                "funnel: proxying public ingress to local backend"
+                            );
+                            let mut stream = accepted.stream;
+                            match tokio::net::TcpStream::connect(&backend).await {
+                                Ok(mut local) => {
+                                    // Bounded by SPLICE_TIMEOUT so an abandoned public peer can't pin
+                                    // the task/permit/fds forever; on elapse, drop.
+                                    match tokio::time::timeout(
+                                        SPLICE_TIMEOUT,
+                                        tokio::io::copy_bidirectional(&mut stream, &mut local),
+                                    )
+                                    .await
+                                    {
+                                        Ok(_) => {}
+                                        Err(_) => tracing::debug!(
+                                            %backend,
+                                            "funnel: splice exceeded SPLICE_TIMEOUT; dropping idle/abandoned connection"
+                                        ),
+                                    }
+                                }
+                                Err(e) => tracing::warn!(
+                                    error = %e, %backend,
+                                    "funnel: dial to local backend failed"
+                                ),
+                            }
+                        });
+                    }
+                });
+            }
+            // Fail-closed in the engine: node lacks the https/funnel node-attrs, the port isn't in the
+            // funnel-ports cap, or the cert couldn't be issued (acme off / non-SaaS control). Non-fatal
+            // — other lanes keep running.
+            Err(e) => tracing::warn!(
+                error = %e, port,
+                "funnel: engine listen_funnel failed (node-attr/port/cert gate — needs \
+                 a Funnel-enabled SaaS tailnet + the `acme` feature); skipping this port"
+            ),
+        }
+    }
+}
+
 /// Validate `--advertise-tags` values byte-for-byte against Go's `tailcfg.CheckTag` (which `up`/`set`
 /// apply via `Hostinfo.CheckRequestTags`): each must be `tag:<name>` where `<name>` is non-empty,
 /// **starts with an ASCII letter**, and contains only `[A-Za-z0-9-]`. Matching Go's gate exactly
@@ -1869,144 +2008,10 @@ impl Backend {
                 tracing::warn!(error = %e, "serve: fail-closed clear of stale engine web serve failed");
             }
             // LANE 3 — FUNNEL: expose a port's web serve to the PUBLIC internet (Go `tailscale
-            // funnel`). For each funnel-enabled port that has a web proxy backend, call the engine's
-            // `listen_funnel` (it gates on node-attr + funnel-port + cert, fail-closed) and — because
-            // funnel hands back RAW TLS-terminated streams (NOT internally proxied like LANE 2) — own a
-            // `funnel_accept_loop` that splices each to the local backend. The public ingress data path
-            // is live-only/SaaS-only (no relay against a self-hosted control plane), so a fed loop needs
-            // real Tailscale SaaS + a Funnel ACL; arming + gating is what we do here.
-            let funnel_ports = serve::funnel_ports(&cfg);
-            if !funnel_ports.is_empty() {
-                // Need the node MagicDNS name (the funnel hostname / cert name) + each port's backend.
-                match device.self_node().await {
-                    Ok(node) => {
-                        let fqdn = node.fqdn(false);
-                        for port in funnel_ports {
-                            // Funnel exposes a serve: the port must have a web proxy backend to splice
-                            // to. (Mirrors Go's "funnel=on but no serve config" warning.)
-                            let backend = cfg
-                                .tcp
-                                .get(&port.to_string())
-                                .filter(|h| serve::is_web_serve(h))
-                                .map(|h| h.tcp_forward.clone())
-                                .filter(|b| !b.is_empty());
-                            let Some(backend) = backend else {
-                                tracing::warn!(
-                                    port,
-                                    "funnel: enabled for a port with no web proxy backend — skipping \
-                                     (funnel exposes a serve; configure `serve https <port> <target>` first)"
-                                );
-                                continue;
-                            };
-                            let fcfg = tailscale::ServeConfig {
-                                name: fqdn.clone(),
-                                port,
-                                target: tailscale::ServeTarget::Proxy {
-                                    to: backend.clone(),
-                                },
-                            };
-                            // `FunnelOptions::default()` = `funnel_only: false`. On this listener that
-                            // flag is a documented no-op (the ingress data path carries only
-                            // relay-delivered PUBLIC traffic regardless), so `default()` is intentional
-                            // — not a security-relevant choice to tighten to `funnel_only: true`.
-                            match device
-                                .listen_funnel(&fcfg, ts_control::FunnelOptions::default())
-                                .await
-                            {
-                                Ok(mut rx) => {
-                                    tracing::info!(name = %fqdn, port, "funnel: armed via engine listen_funnel");
-                                    // LANE 3 accept loop (inlined so the receiver type — an
-                                    // engine-internal `ts_runtime::funnel::FunnelAcceptedReceiver` not
-                                    // re-exported at the facade root — is inferred, never named). Funnel
-                                    // hands back RAW TLS-terminated streams (unlike LANE 2's internal
-                                    // proxy), so we splice each to the local backend ourselves. Holding
-                                    // `rx` keeps the listener alive; the loop ends on receiver close /
-                                    // task abort. The public ingress data path is live-only/SaaS-only (no
-                                    // relay against a self-hosted control plane — the loop simply parks).
-                                    let backend = backend.clone();
-                                    loops.spawn(async move {
-                                        // Per-funnel-loop splice cap. Funnel is PUBLIC-internet-facing,
-                                        // so a slow-loris of idle public connections must not spawn
-                                        // splice tasks (leaking fds) without bound — at cap a new
-                                        // connection is dropped (shed, not queued). See
-                                        // `MAX_SERVE_CONNECTIONS`.
-                                        let conn_limit = std::sync::Arc::new(
-                                            tokio::sync::Semaphore::new(MAX_SERVE_CONNECTIONS),
-                                        );
-                                        while let Some(accepted) = rx.recv().await {
-                                            // Acquire a splice permit before spawning; drop the
-                                            // connection if the cap is exhausted. Moved into the task,
-                                            // released when the splice ends.
-                                            let Ok(permit) =
-                                                std::sync::Arc::clone(&conn_limit).try_acquire_owned()
-                                            else {
-                                                tracing::warn!(
-                                                    %backend,
-                                                    "funnel: connection cap reached; dropping public connection"
-                                                );
-                                                continue;
-                                            };
-                                            let backend = backend.clone();
-                                            tokio::spawn(async move {
-                                                let _permit = permit;
-                                                // `accepted.target`/`src` are the public ingress
-                                                // host:port hit + the public client's addr (audit/debug
-                                                // trace of who reached the funnel).
-                                                tracing::debug!(
-                                                    target = %accepted.target,
-                                                    src = %accepted.src,
-                                                    %backend,
-                                                    "funnel: proxying public ingress to local backend"
-                                                );
-                                                let mut stream = accepted.stream;
-                                                match tokio::net::TcpStream::connect(&backend).await
-                                                {
-                                                    Ok(mut local) => {
-                                                        // Bounded by SPLICE_TIMEOUT so an abandoned
-                                                        // public peer can't pin the task/permit/fds
-                                                        // forever; on elapse, drop.
-                                                        match tokio::time::timeout(
-                                                            SPLICE_TIMEOUT,
-                                                            tokio::io::copy_bidirectional(
-                                                                &mut stream,
-                                                                &mut local,
-                                                            ),
-                                                        )
-                                                        .await
-                                                        {
-                                                            Ok(_) => {}
-                                                            Err(_) => tracing::debug!(
-                                                                %backend,
-                                                                "funnel: splice exceeded SPLICE_TIMEOUT; dropping idle/abandoned connection"
-                                                            ),
-                                                        }
-                                                    }
-                                                    Err(e) => tracing::warn!(
-                                                        error = %e, %backend,
-                                                        "funnel: dial to local backend failed"
-                                                    ),
-                                                }
-                                            });
-                                        }
-                                    });
-                                }
-                                // Fail-closed in the engine: node lacks the https/funnel node-attrs, the
-                                // port isn't in the funnel-ports cap, or the cert couldn't be issued
-                                // (acme off / non-SaaS control). Non-fatal — other lanes keep running.
-                                Err(e) => tracing::warn!(
-                                    error = %e, port,
-                                    "funnel: engine listen_funnel failed (node-attr/port/cert gate — needs \
-                                     a Funnel-enabled SaaS tailnet + the `acme` feature); skipping this port"
-                                ),
-                            }
-                        }
-                    }
-                    Err(e) => tracing::warn!(
-                        error = %e,
-                        "funnel: could not resolve node MagicDNS name; skipping funnel lane"
-                    ),
-                }
-            }
+            // funnel`). Extracted to `arm_funnel_lane` (it was the deepest nest in this supervisor);
+            // it resolves the node's MagicDNS name, arms each funnel-enabled port via the engine's
+            // fail-closed `listen_funnel`, and spawns a public-ingress splice loop into `loops`.
+            arm_funnel_lane(&device, &cfg, &mut loops).await;
             // Keep the supervisor alive while the TCP/funnel loops run (so aborting it tears them down).
             // Each loop only returns on listener/receiver close or engine teardown. With no loops the
             // supervisor exits here — fine: the engine web serve is Device-bound, not supervisor-bound.
