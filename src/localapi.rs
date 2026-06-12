@@ -340,12 +340,26 @@ pub enum Response {
     /// The result of a [`Request::Whois`]: the owning peer's identity, or `found: false` if the IP
     /// matched no known tailnet node.
     Whois(WhoisReport),
-    /// The result of a [`Request::Ping`]: the measured round-trip time.
+    /// The result of a [`Request::Ping`]: the measured round-trip time and the path it took.
     Ping {
         /// Round-trip time in milliseconds.
         rtt_ms: f64,
         /// The pinged tailnet IP (echoed for the CLI).
         ip: String,
+        /// The direct underlay endpoint the peer answered on — the analogue of Go's
+        /// `ipnstate.PingResult.Endpoint`. `Some(addr)` ⇒ a **direct** path is established (the
+        /// `ip:port` the data plane reaches the peer at); `None` ⇒ no direct path, so the overlay is
+        /// relayed through DERP (Go prints `via DERP`). This is what `tnet ping --until-direct` waits
+        /// on: it keeps pinging until this becomes `Some`. Backfilled from the engine's
+        /// `Device::direct_path` (a cached snapshot of the last disco probe — no extra network
+        /// round-trip). NOTE the endpoint and the RTT come from **different** measurements: the RTT
+        /// is the netstack-ICMP echo just sent, while the endpoint is the cached disco-path snapshot
+        /// (up to one probe interval stale). So on a peer mid-upgrade DERP→direct the endpoint can
+        /// briefly lag the RTT — `--until-direct` may take a ping or two longer than Go to notice the
+        /// upgrade (it still converges). Sourcing both from one fresh `ping_disco` is a fidelity
+        /// follow-up (see the ping backlog bead).
+        #[serde(default)]
+        endpoint: Option<String>,
     },
     /// The waiting Taildrop files (reply to [`Request::FileList`]).
     Files {
