@@ -241,10 +241,10 @@ enum Command {
         /// omitting both leaves the setting unchanged.
         #[arg(long)]
         no_ssh: bool,
-        /// Pre-accept a named risk (Go `--accept-risk`), e.g. `lose-ssh` or `all`. Accepted for parity
-        /// and forward-compatibility; the `set`-side enforcement (refusing an SSH toggle over a
-        /// Tailscale SSH session) is a tracked follow-up (bead tsd-eqx), so today this flag parses but
-        /// is otherwise inert on `set`.
+        /// Pre-accept a named risk and skip its safety refusal (Go `--accept-risk`), e.g. `lose-ssh`
+        /// or `all`. On `set` the enforced risk is `lose-ssh`: toggling the Tailscale SSH server
+        /// (`--ssh`/`--no-ssh`) over a Tailscale SSH session reroutes/drops that session, so it is
+        /// refused unless you pass `--accept-risk=lose-ssh`.
         #[arg(long, value_name = "RISK")]
         accept_risk: Option<String>,
     },
@@ -779,6 +779,91 @@ fn risk_accepted(accepted: &str, risk: &str) -> bool {
     accepted.split(',').any(|r| r == risk || r == "all")
 }
 
+/// The pure decision behind the SSH-server-toggle `lose-ssh` risk — the Rust analogue of Go's
+/// `presentSSHToggleRisk` (`up.go`). Returns the *direction* of a refusal, or `None` to allow:
+/// - `None` (allow) when the toggle isn't mentioned (`want` is `None`), or we're not over a Tailscale
+///   SSH session (`!over_ssh`), or the operator pre-accepted the risk (`lose-ssh`/`all`), or the
+///   toggle is a no-op (`want == Some(have)`) — Go's `!isSSHOverTailscale() || wantSSH == haveSSH`.
+/// - `Some(true)` when ENABLING the SSH server (`want = Some(true)`, `have = false`) — Go reroutes SSH
+///   traffic to Tailscale SSH and the current session disconnects.
+/// - `Some(false)` when DISABLING it (`want = Some(false)`, `have = true`) — the session over Tailscale
+///   SSH disconnects.
+///
+/// Pure (no I/O), so the branch logic is unit-testable; the async [`refuse_ssh_toggle_risk_if_needed`]
+/// supplies `over_ssh` (the env probe) + `have` (a `GetPrefs` round-trip) and renders the message.
+fn ssh_toggle_refusal(
+    want: Option<bool>,
+    have: bool,
+    over_ssh: bool,
+    accepted: &str,
+) -> Option<bool> {
+    let want = want?;
+    if !over_ssh || want == have || risk_accepted(accepted, "lose-ssh") {
+        return None;
+    }
+    Some(want) // want == true → enabling refusal; false → disabling refusal
+}
+
+/// Refuse an SSH-server toggle that would drop the operator's own Tailscale SSH session, unless they
+/// pre-accepted `lose-ssh` (Go's `presentSSHToggleRisk`, enforced fail-closed). Shared by the `up` and
+/// `set` handlers. **Short-circuits cheaply**: it only performs the `GetPrefs` round-trip (to learn the
+/// current `ssh` pref = `haveSSH`) when the toggle is actually mentioned AND we're over a Tailscale SSH
+/// session AND the risk wasn't pre-accepted — so the common path (no `--ssh`/`--no-ssh`, or not over
+/// SSH) makes no extra daemon call. On a real refusal it prints the direction-appropriate message +
+/// the `--accept-risk=lose-ssh` override and exits non-zero, before the caller builds/sends its
+/// request. `want_ssh` is `resolve_ssh(ssh, no_ssh)` (the mentioned toggle, or `None`).
+async fn refuse_ssh_toggle_risk_if_needed(
+    socket: &std::path::Path,
+    want_ssh: Option<bool>,
+    accept_risk: Option<&str>,
+) -> Result<()> {
+    let accepted = accept_risk.unwrap_or("");
+    // Cheap pre-conditions first — avoid the GetPrefs round-trip unless a refusal is even possible.
+    let Some(want) = want_ssh else { return Ok(()) };
+    if !is_ssh_over_tailscale() || risk_accepted(accepted, "lose-ssh") {
+        return Ok(());
+    }
+    // Now learn haveSSH (the persisted ssh pref) via the same one-shot read the `get` command uses.
+    let have = match round_trip(socket, &Request::GetPrefs).await {
+        Ok(Response::Prefs(v)) => v.ssh,
+        Ok(Response::Error { message }) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        Ok(other) => anyhow::bail!("unexpected response to get-prefs (ssh-risk check): {other:?}"),
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "reading prefs for the ssh-toggle risk check at {}",
+                    socket.display()
+                )
+            });
+        }
+    };
+    match ssh_toggle_refusal(Some(want), have, true, accepted) {
+        // Go's `presentSSHToggleRisk` strings, verbatim (up.go), so the operator-facing wording
+        // matches upstream exactly; the override hint is added (Go prompts interactively; this CLI
+        // refuses fail-closed and points at the same `--accept-risk=lose-ssh` escape hatch).
+        Some(true) => {
+            eprintln!(
+                "You are connected over Tailscale; this action will reroute SSH traffic to \
+                 Tailscale SSH and will result in your session disconnecting."
+            );
+            eprintln!("To override, re-run with --accept-risk=lose-ssh");
+            std::process::exit(1);
+        }
+        Some(false) => {
+            eprintln!(
+                "You are connected using Tailscale SSH; this action will result in your session \
+                 disconnecting."
+            );
+            eprintln!("To override, re-run with --accept-risk=lose-ssh");
+            std::process::exit(1);
+        }
+        None => Ok(()),
+    }
+}
+
 /// Map the `--advertise-routes` / `--advertise-routes-clear` flags to the wire field's
 /// `Option<Vec<String>>`. Any routes passed → `Some(routes)` (replace the set); else
 /// `--advertise-routes-clear` → `Some(vec![])` (advertise none); else `None` (leave the persisted
@@ -860,6 +945,17 @@ async fn main() -> Result<()> {
                 eprintln!("To override, re-run with --accept-risk=lose-ssh");
                 std::process::exit(1);
             }
+            // Risk gate 2 (Go `presentSSHToggleRisk`): toggling the Tailscale SSH server over a
+            // Tailscale SSH session reroutes/drops that session. Refuse unless `--accept-risk=lose-ssh`.
+            // Short-circuits (no daemon call) unless `--ssh`/`--no-ssh` is mentioned, we're over SSH,
+            // and the risk wasn't accepted; only then does it read `haveSSH` to compare. Runs before
+            // the request is built, so a refusal changes nothing on the node. (bead tsd-eqx)
+            refuse_ssh_toggle_risk_if_needed(
+                &socket,
+                resolve_ssh(ssh, no_ssh),
+                accept_risk.as_deref(),
+            )
+            .await?;
             // `--timeout` is a CLIENT-SIDE wait, not a pref and not a wire field: capture it so the
             // post-`up` success path waits for Running (Go `up --timeout`). `None` here means the post-up
             // path will not wait; `Some(secs)` arms the wait (0 = forever, per `wait_for_running`).
@@ -932,33 +1028,46 @@ async fn main() -> Result<()> {
             advertise_tags_clear,
             ssh,
             no_ssh,
-            // Parsed for parity + forward-compat; the `set`-side ssh-toggle-over-SSH enforcement that
-            // will consume it is a tracked follow-up (bead tsd-eqx — needs a pre-flight GetPrefs for
-            // `haveSSH`), so it is inert here today.
-            accept_risk: _,
-        } => Request::Set {
-            hostname,
-            // `--accept-routes`/`--no-accept-routes` tri-state (mirrors `--tun`).
-            accept_routes: resolve_accept_routes(accept_routes, no_accept_routes),
-            // `--shields-up`/`--no-shields-up` tri-state (mirrors `--tun`).
-            shields_up: resolve_shields_up(shields_up, no_shields_up),
-            // `--exit-node <sel>` sets, `--clear-exit-node` stops using one, neither leaves it
-            // unchanged; clap's `conflicts_with` guarantees the two are never both set. Reuses the
-            // same resolver as the `up` arm.
-            exit_node: resolve_exit_node(exit_node, clear_exit_node),
-            // `--advertise-exit-node`/`--no-advertise-exit-node` tri-state (mirrors `--tun`).
-            advertise_exit_node: resolve_advertise_exit_node(
-                advertise_exit_node,
-                no_advertise_exit_node,
-            ),
-            // Passed routes replace the set; `--advertise-routes-clear` empties it; neither leaves
-            // the persisted set unchanged.
-            advertise_routes: resolve_advertise_routes(advertise_routes, advertise_routes_clear),
-            // Passed tags replace the set; `--clear-advertise-tags` empties it; neither unchanged.
-            advertise_tags: resolve_advertise_routes(advertise_tags, advertise_tags_clear),
-            // `--ssh`/`--no-ssh` tri-state (mirrors `--tun`).
-            ssh: resolve_ssh(ssh, no_ssh),
-        },
+            accept_risk,
+        } => {
+            // Risk gate (Go `presentSSHToggleRisk`, the `set` call site): toggling the Tailscale SSH
+            // server over a Tailscale SSH session reroutes/drops that session — refuse unless
+            // `--accept-risk=lose-ssh`. Short-circuits (no daemon call) unless `--ssh`/`--no-ssh` is
+            // mentioned, we're over SSH, and the risk wasn't accepted. Runs before the request is
+            // built, so a refusal changes nothing. (bead tsd-eqx — same enforcement as the `up` path.)
+            refuse_ssh_toggle_risk_if_needed(
+                &socket,
+                resolve_ssh(ssh, no_ssh),
+                accept_risk.as_deref(),
+            )
+            .await?;
+            Request::Set {
+                hostname,
+                // `--accept-routes`/`--no-accept-routes` tri-state (mirrors `--tun`).
+                accept_routes: resolve_accept_routes(accept_routes, no_accept_routes),
+                // `--shields-up`/`--no-shields-up` tri-state (mirrors `--tun`).
+                shields_up: resolve_shields_up(shields_up, no_shields_up),
+                // `--exit-node <sel>` sets, `--clear-exit-node` stops using one, neither leaves it
+                // unchanged; clap's `conflicts_with` guarantees the two are never both set. Reuses the
+                // same resolver as the `up` arm.
+                exit_node: resolve_exit_node(exit_node, clear_exit_node),
+                // `--advertise-exit-node`/`--no-advertise-exit-node` tri-state (mirrors `--tun`).
+                advertise_exit_node: resolve_advertise_exit_node(
+                    advertise_exit_node,
+                    no_advertise_exit_node,
+                ),
+                // Passed routes replace the set; `--advertise-routes-clear` empties it; neither leaves
+                // the persisted set unchanged.
+                advertise_routes: resolve_advertise_routes(
+                    advertise_routes,
+                    advertise_routes_clear,
+                ),
+                // Passed tags replace the set; `--clear-advertise-tags` empties it; neither unchanged.
+                advertise_tags: resolve_advertise_routes(advertise_tags, advertise_tags_clear),
+                // `--ssh`/`--no-ssh` tri-state (mirrors `--tun`).
+                ssh: resolve_ssh(ssh, no_ssh),
+            }
+        }
         Command::Bugreport { note } => Request::BugReport { note },
         // `nc` hijacks its connection (the daemon splices to the overlay after a one-line ack), so it
         // is handled by a dedicated piping path, not the generic round-trip.
@@ -3381,6 +3490,64 @@ mod tests {
         // Allow: the operator pre-accepted the risk (by name or `all`).
         assert!(!refuse(true, "100.64.0.7 1 22", "lose-ssh"));
         assert!(!refuse(true, "100.64.0.7 1 22", "all"));
+    }
+
+    #[test]
+    fn ssh_toggle_refusal_decision() {
+        // The pure ssh-toggle risk decision (Go presentSSHToggleRisk): None = allow, Some(true) =
+        // refuse-an-enable, Some(false) = refuse-a-disable. over_ssh + accepted are the modifiers.
+        // Allow: toggle not mentioned.
+        assert_eq!(ssh_toggle_refusal(None, false, true, ""), None);
+        assert_eq!(ssh_toggle_refusal(None, true, true, ""), None);
+        // Allow: no-op toggle (want == have).
+        assert_eq!(ssh_toggle_refusal(Some(true), true, true, ""), None);
+        assert_eq!(ssh_toggle_refusal(Some(false), false, true, ""), None);
+        // Allow: not over a Tailscale SSH session.
+        assert_eq!(ssh_toggle_refusal(Some(true), false, false, ""), None);
+        // Allow: risk pre-accepted (by name or `all`).
+        assert_eq!(
+            ssh_toggle_refusal(Some(true), false, true, "lose-ssh"),
+            None
+        );
+        assert_eq!(ssh_toggle_refusal(Some(false), true, true, "all"), None);
+        // Refuse ENABLE: want SSH on, currently off, over SSH, not accepted → Some(true).
+        assert_eq!(ssh_toggle_refusal(Some(true), false, true, ""), Some(true));
+        // Refuse DISABLE: want SSH off, currently on, over SSH, not accepted → Some(false).
+        assert_eq!(ssh_toggle_refusal(Some(false), true, true, ""), Some(false));
+    }
+
+    #[tokio::test]
+    async fn ssh_toggle_gate_short_circuits_without_a_round_trip() {
+        // The load-bearing guarantee: the gate must NOT hit the daemon on the common path. We point it
+        // at a dead socket — a real GetPrefs round-trip would return Err (connect fails) — and assert
+        // Ok(()), which proves the short-circuit returned before the round-trip. Cases that must skip:
+        let dead = std::path::Path::new("/tmp/tnet-ssh-toggle-nope.sock");
+        // (a) toggle not mentioned (want_ssh None) → no round-trip.
+        assert!(
+            refuse_ssh_toggle_risk_if_needed(dead, None, None)
+                .await
+                .is_ok(),
+            "no --ssh/--no-ssh must skip the round-trip"
+        );
+        // (b) toggle mentioned + risk pre-accepted → no round-trip (accepted short-circuits).
+        assert!(
+            refuse_ssh_toggle_risk_if_needed(dead, Some(true), Some("lose-ssh"))
+                .await
+                .is_ok(),
+            "an accepted risk must skip the round-trip"
+        );
+        // (c) toggle mentioned but NOT over a Tailscale SSH session → no round-trip. In a normal test
+        // process SSH_CLIENT is unset (or not a tailnet IP), so is_ssh_over_tailscale() is false; the
+        // gate returns Ok before the round-trip. (This relies on the test env not being an actual
+        // Tailscale SSH session, which CI/dev shells are not.)
+        if !is_ssh_over_tailscale() {
+            assert!(
+                refuse_ssh_toggle_risk_if_needed(dead, Some(true), None)
+                    .await
+                    .is_ok(),
+                "not over Tailscale SSH must skip the round-trip"
+            );
+        }
     }
 
     #[test]
