@@ -30,17 +30,17 @@ use anyhow::{Context, Result, bail};
 /// [`include_str!`] of the committed packaging file, so the embedded unit ships with the binary and
 /// stays in lockstep with the repo. The argv vectors are full command lines (`argv[0]` is the program,
 /// the rest are arguments), executed in order by [`apply_install`] / [`apply_uninstall`].
-pub struct InstallPlan {
+pub(crate) struct InstallPlan {
     /// Where the `tailnetd` binary is copied to (the canonical path both units reference).
-    pub bin_dest: PathBuf,
+    pub(crate) bin_dest: PathBuf,
     /// Where the service unit file is written.
-    pub unit_path: PathBuf,
+    pub(crate) unit_path: PathBuf,
     /// The embedded unit file content (the committed packaging file, via [`include_str!`]).
-    pub unit_content: &'static str,
+    pub(crate) unit_content: &'static str,
     /// Commands to enable/load the service at boot, run in order after the unit is written.
-    pub enable_argv: Vec<Vec<String>>,
+    pub(crate) enable_argv: Vec<Vec<String>>,
     /// Commands to disable/unload the service, run in order before the unit is removed.
-    pub disable_argv: Vec<Vec<String>>,
+    pub(crate) disable_argv: Vec<Vec<String>>,
 }
 
 /// Build the install/uninstall [`InstallPlan`] for the current OS — **pure** (no I/O).
@@ -51,7 +51,7 @@ pub struct InstallPlan {
 /// - **macOS (launchd):** write `/Library/LaunchDaemons/cloud.tailscaled-rs.tailnetd.plist`, then
 ///   `launchctl bootstrap system <plist>`.
 /// - **Other:** a clear "unsupported OS" error (no daemon manager to target).
-pub fn plan() -> Result<InstallPlan> {
+pub(crate) fn plan() -> Result<InstallPlan> {
     #[cfg(target_os = "linux")]
     {
         Ok(InstallPlan {
@@ -126,7 +126,7 @@ fn run_step(argv: &[String], context: &str) -> Result<()> {
 /// unit write, or enable command bails) so a partial install reports exactly what succeeded.
 ///
 /// Must run as root — the CLI ([`run_install`]) gates on `geteuid()==0` before calling this.
-pub fn apply_install(plan: &InstallPlan) -> Result<()> {
+pub(crate) fn apply_install(plan: &InstallPlan) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     // Copy the *running* tailnetd binary to the canonical path. `current_exe` is the binary the
@@ -189,7 +189,7 @@ pub fn apply_install(plan: &InstallPlan) -> Result<()> {
 /// node key material, so uninstall deliberately leaves it for a later `install` to resume from.
 ///
 /// Must run as root — the CLI ([`run_uninstall`]) gates on `geteuid()==0` before calling this.
-pub fn apply_uninstall(plan: &InstallPlan) -> Result<()> {
+pub(crate) fn apply_uninstall(plan: &InstallPlan) -> Result<()> {
     // Disable/unload best-effort: the service may already be stopped (so `disable --now` /
     // `bootout` returns non-zero), which must not abort the uninstall. Log + continue.
     for argv in &plan.disable_argv {

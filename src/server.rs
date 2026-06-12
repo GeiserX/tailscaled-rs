@@ -620,9 +620,12 @@ async fn dispatch(
         Request::SwitchProfile { target } => {
             let mut be = backend.lock().await;
             match be.switch_profile(&target).await {
-                Ok(()) => Response::Ok {
-                    message: format!("switched to profile {target}"),
-                },
+                Ok(()) => {
+                    tracing::info!(profile = %target, "switched profile (device torn down; run `up` to connect)");
+                    Response::Ok {
+                        message: format!("switched to profile {target}"),
+                    }
+                }
                 Err(e) => Response::Error {
                     message: format!("{e:#}"),
                 },
@@ -649,9 +652,12 @@ async fn dispatch(
         Request::Logout => {
             let mut be = backend.lock().await;
             match be.logout().await {
-                Ok(()) => Response::Ok {
-                    message: "node logged out".to_string(),
-                },
+                Ok(()) => {
+                    tracing::info!("logout: node deregistered + key wiped");
+                    Response::Ok {
+                        message: "node logged out".to_string(),
+                    }
+                }
                 Err(e) => Response::Error {
                     message: format!("{e:#}"),
                 },
@@ -660,9 +666,12 @@ async fn dispatch(
         Request::Down => {
             let mut be = backend.lock().await;
             match be.down().await {
-                Ok(()) => Response::Ok {
-                    message: "node brought down".to_string(),
-                },
+                Ok(()) => {
+                    tracing::info!("node down");
+                    Response::Ok {
+                        message: "node brought down".to_string(),
+                    }
+                }
                 Err(e) => Response::Error {
                     message: format!("{e:#}"),
                 },
@@ -701,7 +710,12 @@ async fn dispatch(
         Request::IdToken { audience } => {
             let dev = { backend.lock().await.device_handle() };
             match dev {
-                Some(dev) => Backend::id_token(&dev, &audience).await,
+                Some(dev) => {
+                    // Audit the GRANT of a sensitive op (minting an OIDC credential): the deny path is
+                    // already logged at the auth gate above; log the successful grant too.
+                    tracing::info!(peer_uid = ?peer_uid, %audience, "minted id-token");
+                    Backend::id_token(&dev, &audience).await
+                }
                 None => Response::Error {
                     message: "node is not up".into(),
                 },
@@ -722,7 +736,12 @@ async fn dispatch(
             let dev = { backend.lock().await.device_handle() };
             match dev {
                 // Default the window to 10s when the client omits it (matches the CLI default).
-                Some(dev) => Backend::debug_capture(&dev, &path, seconds.unwrap_or(10)).await,
+                Some(dev) => {
+                    // Audit the GRANT of a sensitive op (installing a dataplane packet tap).
+                    let secs = seconds.unwrap_or(10);
+                    tracing::info!(peer_uid = ?peer_uid, path = %path, seconds = secs, "debug capture started");
+                    Backend::debug_capture(&dev, &path, secs).await
+                }
                 None => Response::Error {
                     message: "node is not up".into(),
                 },
@@ -799,9 +818,12 @@ async fn dispatch(
                 };
             }
             match ipn::drive_up(backend, authkey, opts).await {
-                Ok(()) => Response::Ok {
-                    message: "node brought up".to_string(),
-                },
+                Ok(()) => {
+                    tracing::info!("node up requested");
+                    Response::Ok {
+                        message: "node brought up".to_string(),
+                    }
+                }
                 Err(e) => Response::Error {
                     message: format!("{e:#}"),
                 },
@@ -839,9 +861,15 @@ async fn dispatch(
                 };
             }
             match ipn::drive_set(backend, opts).await {
-                Ok(()) => Response::Ok {
-                    message: "preferences updated".to_string(),
-                },
+                Ok(()) => {
+                    // The Live-vs-Rebuild reconcile decision (the "why did my set reconnect?" signal)
+                    // is logged inside `begin_set`, where the `SetAction` is decided — dispatch only
+                    // sees `Ok(())` here. This line marks that the operator's `set` completed.
+                    tracing::info!("set reconciled");
+                    Response::Ok {
+                        message: "preferences updated".to_string(),
+                    }
+                }
                 Err(e) => Response::Error {
                     message: format!("{e:#}"),
                 },

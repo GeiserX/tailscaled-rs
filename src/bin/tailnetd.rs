@@ -80,6 +80,23 @@ async fn main() -> Result<()> {
 
     let mut backend = Backend::load(&state_dir).await?;
 
+    // Describe the daemon's effective posture once at boot so an operator tailing the log knows which
+    // control plane it talks to, which data path it uses, and the exact build — without having to run
+    // `tnet status`/`version`. (`control_url = None` → the engine default, Tailscale SaaS; `transport`
+    // is the kernel-TUN data path vs the userspace netstack.)
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        control_url = backend.prefs_control_url().unwrap_or("default"),
+        transport = if backend.prefs_tun() {
+            "tun"
+        } else {
+            "netstack"
+        },
+        ephemeral = backend.prefs_ephemeral(),
+        ssh = backend.prefs_ssh(),
+        "tailnetd posture"
+    );
+
     // Auto-start if the persisted intent was "up".
     auto_start(&mut backend).await;
 
@@ -306,9 +323,20 @@ async fn auto_start(backend: &mut Backend) {
     // Auto-start uses persisted prefs as-is (no overrides) — TUN/hostname/control-url all come from
     // the stored prefs the user set via `tnet up`, not from the boot path. No external lock is held
     // at boot (this runs before `serve`), so the inline `up` is fine here.
-    if let Err(e) = backend.up(authkey, ipn::UpOptions::default()).await {
-        // Non-fatal: come up in a needs-login/stopped state and let the CLI drive `up`.
-        tracing::warn!(error = %format!("{e:#}"), "auto-start failed; awaiting `tnet up`");
+    match backend.up(authkey, ipn::UpOptions::default()).await {
+        // Boot success was previously silent — log it so an operator tailing the log sees the node
+        // came up at boot (the node then converges to Running once the netmap arrives).
+        Ok(()) => tracing::info!("auto-start: node is up"),
+        Err(e) => {
+            // Non-fatal: come up in a needs-login/stopped state and let the CLI drive `up`. Append the
+            // resulting state so the warn says *what* state we're awaiting `up` from (e.g. NeedsLogin).
+            let state = backend.status().await.state;
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                state = %state,
+                "auto-start failed; awaiting `tnet up`"
+            );
+        }
     }
 }
 

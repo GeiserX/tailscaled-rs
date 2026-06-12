@@ -28,13 +28,13 @@ use std::time::Duration;
 /// How often the monitor re-snapshots the host's interface addresses. A change is acted on within
 /// one interval. 5s balances responsiveness (re-home a few seconds after a network switch) against
 /// the cost of an `if-addrs` enumeration (cheap, but not free to do in a tight loop).
-pub const POLL_INTERVAL: Duration = Duration::from_secs(5);
+pub(super) const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// A canonical snapshot of the host's usable local interface addresses — the signal the monitor
 /// diffs to decide whether the network path changed. A [`BTreeSet`] so equality/comparison is
 /// order-independent and cheap, and so the snapshot is deterministic regardless of enumeration order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct LinkSnapshot {
+pub(super) struct LinkSnapshot {
     addrs: BTreeSet<IpAddr>,
 }
 
@@ -43,14 +43,14 @@ impl LinkSnapshot {
     /// [`snapshot`] uses: drop loopback and IPv6 link-local (`fe80::/10`) addresses, which are
     /// present in every interface state and do not signal a real path change. Pure → unit-testable
     /// without touching the OS.
-    pub fn from_addrs(addrs: impl IntoIterator<Item = IpAddr>) -> Self {
+    pub(super) fn from_addrs(addrs: impl IntoIterator<Item = IpAddr>) -> Self {
         let addrs = addrs.into_iter().filter(is_path_relevant).collect();
         Self { addrs }
     }
 
     /// Whether the network path changed since `self` — i.e. the usable-address set differs. The
     /// monitor rebinds exactly when this is true. Pure.
-    pub fn changed(&self, other: &LinkSnapshot) -> bool {
+    pub(super) fn changed(&self, other: &LinkSnapshot) -> bool {
         self.addrs != other.addrs
     }
 }
@@ -91,7 +91,7 @@ fn is_path_relevant(addr: &IpAddr) -> bool {
 /// On a failure to enumerate interfaces, returns an empty snapshot + logs — an enumeration error
 /// must not crash the monitor; the next poll retries, and an empty-vs-nonempty transition simply
 /// reads as a change (a conservative rebind, not a missed one).
-pub fn snapshot() -> LinkSnapshot {
+pub(super) fn snapshot() -> LinkSnapshot {
     match if_addrs::get_if_addrs() {
         Ok(ifaces) => LinkSnapshot::from_addrs(ifaces.into_iter().map(|i| i.ip())),
         Err(e) => {

@@ -26,30 +26,30 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 /// The reserved id of the always-present default profile (lives at the legacy top-level paths).
-pub const DEFAULT_PROFILE_ID: &str = "default";
+pub(super) const DEFAULT_PROFILE_ID: &str = "default";
 
 /// One profile's metadata (the analogue of the parts of Go's `ipn.LoginProfile` we can fill). The
 /// prefs + node key themselves live in the profile's files, not here.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ProfileMeta {
+pub(super) struct ProfileMeta {
     /// User-visible display name. Defaults to the id when unset.
     #[serde(default)]
-    pub name: String,
+    pub(super) name: String,
 }
 
 /// The on-disk `profiles.json` metadata map (id → [`ProfileMeta`]). The default profile is implicit
 /// (it always exists) and is included here once it has been touched, so `--list` can show it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ProfilesFile {
+pub(super) struct ProfilesFile {
     /// All known profiles, keyed by id. The default profile may or may not appear; callers always
     /// treat [`DEFAULT_PROFILE_ID`] as existing regardless.
     #[serde(default)]
-    pub profiles: std::collections::BTreeMap<String, ProfileMeta>,
+    pub(super) profiles: std::collections::BTreeMap<String, ProfileMeta>,
 }
 
 /// Whether `id` is a syntactically valid profile id: non-empty, and only `[A-Za-z0-9_-]` so it is a
 /// safe single path component (no traversal, no separators). The reserved `default` is valid.
-pub fn is_valid_profile_id(id: &str) -> bool {
+pub(super) fn is_valid_profile_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
         && id
@@ -61,7 +61,7 @@ pub fn is_valid_profile_id(id: &str) -> bool {
 /// maps to the legacy top-level paths (so existing installs are untouched); every other profile maps
 /// under `profiles/<id>/`. `id` MUST already be validated by [`is_valid_profile_id`] — this joins it
 /// as a path component.
-pub fn profile_paths(state_dir: &Path, id: &str) -> (PathBuf, PathBuf) {
+pub(super) fn profile_paths(state_dir: &Path, id: &str) -> (PathBuf, PathBuf) {
     if id == DEFAULT_PROFILE_ID {
         (
             state_dir.join("prefs.json"),
@@ -74,19 +74,19 @@ pub fn profile_paths(state_dir: &Path, id: &str) -> (PathBuf, PathBuf) {
 }
 
 /// Path of the `current-profile` pointer file.
-pub fn current_profile_path(state_dir: &Path) -> PathBuf {
+pub(super) fn current_profile_path(state_dir: &Path) -> PathBuf {
     state_dir.join("current-profile")
 }
 
 /// Path of the `profiles.json` metadata file.
-pub fn profiles_file_path(state_dir: &Path) -> PathBuf {
+pub(super) fn profiles_file_path(state_dir: &Path) -> PathBuf {
     state_dir.join("profiles.json")
 }
 
 /// Read the current profile id from the pointer file. A missing/empty/unreadable/invalid pointer
 /// falls back to [`DEFAULT_PROFILE_ID`] — so a fresh or legacy daemon (no pointer file) is always on
 /// the default profile, which is exactly the legacy top-level layout.
-pub async fn read_current_profile(state_dir: &Path) -> String {
+pub(super) async fn read_current_profile(state_dir: &Path) -> String {
     let path = current_profile_path(state_dir);
     match tokio::fs::read_to_string(&path).await {
         Ok(s) => {
@@ -106,14 +106,14 @@ pub async fn read_current_profile(state_dir: &Path) -> String {
 }
 
 /// Atomically-enough persist the current profile pointer.
-pub async fn write_current_profile(state_dir: &Path, id: &str) -> std::io::Result<()> {
+pub(super) async fn write_current_profile(state_dir: &Path, id: &str) -> std::io::Result<()> {
     tokio::fs::create_dir_all(state_dir).await?;
     tokio::fs::write(current_profile_path(state_dir), id.as_bytes()).await
 }
 
 /// Load the `profiles.json` metadata map (missing/malformed → empty, with the malformed case logged
 /// — the default profile still works without it).
-pub async fn load_profiles_file(state_dir: &Path) -> ProfilesFile {
+pub(super) async fn load_profiles_file(state_dir: &Path) -> ProfilesFile {
     match tokio::fs::read(profiles_file_path(state_dir)).await {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
             tracing::warn!(error = %e, "profiles.json is malformed; treating as empty");
@@ -128,7 +128,7 @@ pub async fn load_profiles_file(state_dir: &Path) -> ProfilesFile {
 }
 
 /// Persist the `profiles.json` metadata map.
-pub async fn save_profiles_file(state_dir: &Path, f: &ProfilesFile) -> std::io::Result<()> {
+pub(super) async fn save_profiles_file(state_dir: &Path, f: &ProfilesFile) -> std::io::Result<()> {
     tokio::fs::create_dir_all(state_dir).await?;
     let bytes = serde_json::to_vec_pretty(f).expect("profiles file serialize");
     tokio::fs::write(profiles_file_path(state_dir), bytes).await

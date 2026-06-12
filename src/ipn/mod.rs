@@ -78,7 +78,7 @@ mod control_url;
 mod diag;
 pub mod install;
 mod linkmon;
-pub mod profile;
+mod profile;
 mod revert_guard;
 pub mod serve;
 mod state;
@@ -115,7 +115,7 @@ async fn link_monitor_loop(device: std::sync::Arc<tailscale::Device>) {
             if let Err(e) = device.rebind().await {
                 // Non-fatal: a transient rebind failure must not stop the monitor; the next change
                 // (or the next poll if this one's effect didn't land) will retry.
-                tracing::warn!(error = ?e, "linkmon: rebind failed (will keep monitoring)");
+                tracing::warn!(error = %e, "linkmon: rebind failed (will keep monitoring)");
             }
             last = now;
         }
@@ -127,13 +127,25 @@ async fn link_monitor_loop(device: std::sync::Arc<tailscale::Device>) {
 /// torn down) or the task is aborted. Spawns one sub-task per accepted connection so a slow peer
 /// never blocks new accepts. This is the `nc` splice, inbound: `tcp_listen`/`accept` then
 /// `copy_bidirectional` to a `TcpStream::connect`.
-async fn serve_accept_loop(device: std::sync::Arc<tailscale::Device>, port: u16, target: String) {
+///
+/// The detached splice tasks are bounded two ways so a flood of idle peers can't leak tasks/fds
+/// unboundedly (the accept loop itself is in the supervisor's `JoinSet`, but the per-connection
+/// splices are not): a shared [`Semaphore`](tokio::sync::Semaphore) caps the in-flight count
+/// ([`MAX_SERVE_CONNECTIONS`]) and a [`SPLICE_TIMEOUT`] caps each splice's lifetime. At cap, a new
+/// connection is dropped (shed, not queued). The `conn_limit` is per-accept-loop (each plain-TCP
+/// forward entry gets its own), passed in so the bound is visible at the spawn site.
+async fn serve_accept_loop(
+    device: std::sync::Arc<tailscale::Device>,
+    port: u16,
+    target: String,
+    conn_limit: std::sync::Arc<tokio::sync::Semaphore>,
+) {
     // Bind the node's tailnet IPv4 on the served port. `ipv4_addr` resolves once the netmap assigns
     // an address; an error means we never got one (engine gone) — log + exit the loop.
     let ipv4 = match device.ipv4_addr().await {
         Ok(ip) => ip,
         Err(e) => {
-            tracing::error!(error = ?e, port, "serve: no tailnet IPv4; listener not started");
+            tracing::error!(error = %e, port, "serve: no tailnet IPv4; listener not started");
             return;
         }
     };
@@ -141,7 +153,7 @@ async fn serve_accept_loop(device: std::sync::Arc<tailscale::Device>, port: u16,
     let listener = match device.tcp_listen(listen_addr).await {
         Ok(l) => l,
         Err(e) => {
-            tracing::error!(error = ?e, %listen_addr, "serve: failed to listen");
+            tracing::error!(error = %e, %listen_addr, "serve: failed to listen");
             return;
         }
     };
@@ -156,13 +168,35 @@ async fn serve_accept_loop(device: std::sync::Arc<tailscale::Device>, port: u16,
                 return;
             }
         };
+        // Acquire a splice permit BEFORE spawning; if the per-loop cap is exhausted, drop this
+        // connection (closing it) rather than queueing unboundedly. The permit is moved into the task
+        // and released when the splice ends — so the cap bounds the live splice count, shedding a
+        // flood instead of leaking tasks/fds.
+        let Ok(permit) = std::sync::Arc::clone(&conn_limit).try_acquire_owned() else {
+            tracing::warn!(%target, "serve: connection cap reached; dropping connection");
+            continue;
+        };
         let target = target.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             match tokio::net::TcpStream::connect(&target).await {
                 Ok(mut local) => {
                     let mut inbound = inbound;
-                    // Bidirectional splice inbound(tailnet) <-> local(target), to EOF either side.
-                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut local).await;
+                    // Bidirectional splice inbound(tailnet) <-> local(target), to EOF either side,
+                    // bounded by SPLICE_TIMEOUT so an abandoned/dead idle peer can't pin the task (and
+                    // its permit + fds) forever. On elapse, drop (the streams close on task exit).
+                    match tokio::time::timeout(
+                        SPLICE_TIMEOUT,
+                        tokio::io::copy_bidirectional(&mut inbound, &mut local),
+                    )
+                    .await
+                    {
+                        Ok(_) => {}
+                        Err(_) => tracing::debug!(
+                            %target,
+                            "serve: splice exceeded SPLICE_TIMEOUT; dropping idle/abandoned connection"
+                        ),
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, %target, "serve: dial to local target failed");
@@ -221,6 +255,24 @@ fn sanitize_marker_note(note: &str) -> String {
         .map(|c| if c.is_control() { '_' } else { c })
         .collect()
 }
+
+/// Max concurrent in-flight splice tasks **per serve/funnel accept loop**. Defense-in-depth against a
+/// connection flood: `serve --tcp` is tailnet-facing and funnel is PUBLIC-internet-facing, so a
+/// slow-loris of idle connections must not be able to spawn splice tasks (and leak fds) without
+/// bound. Matches the LocalAPI server's `MAX_CONNECTIONS` precedent (`server.rs`). A permit is held
+/// for a splice's whole lifetime; when the loop is at cap a new connection is dropped (not queued),
+/// so a flood is *shed*, not absorbed.
+const MAX_SERVE_CONNECTIONS: usize = 128;
+
+/// Hard total cap on a single serve/funnel splice. A `copy_bidirectional`/`copy` runs until either
+/// side EOFs, so a peer that connects and then goes silent forever would otherwise pin a task + its
+/// permit + fds indefinitely. This is a *total* bound (not idle) — chosen long enough (10 minutes)
+/// that it does not cut a legitimately long-lived stream (e.g. an SSH-over-serve session or a slow
+/// SSE backend), yet short enough to reap a truly abandoned/dead idle peer and return its permit to
+/// the cap. On elapse we log at debug and drop. (A precise *idle* timeout would need read-activity
+/// tracking that `copy_bidirectional` does not expose; a generous total bound is the proportionate
+/// hardening — it only ever catches connections that are effectively dead.)
+const SPLICE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// Upper bound on the blocking netmap query inside [`Backend::status`]. The query is held under the
 /// backend lock, so this caps how long a `status` can head-of-line block `up`/`down` in the brief
@@ -713,6 +765,59 @@ pub struct Backend {
     /// `prefs.json` intent flip" — the latter must not silently resurrect a node, so reload only
     /// retries when this is `true`.
     boot_attempted_up: bool,
+    /// **Cache** of "is there a persisted node key on disk for the current profile" — the
+    /// [`have_node_key`](crate::localapi::StatusReport::have_node_key) fact reported by `status`. It
+    /// mirrors what [`has_persisted_node_key`](Backend::has_persisted_node_key) would compute, but
+    /// avoids re-reading + JSON-parsing + Ed25519-deriving the key file on every `status` call:
+    /// `status` runs under the central backend lock and on the `stream_watch` hot path fires on EVERY
+    /// engine connection-state transition — where the node-key-present fact never changes.
+    ///
+    /// **Invariant**: it MUST stay consistent with the on-disk key file at `key_path`. The fact only
+    /// changes on a key persist or wipe — exactly three transitions, plus the active profile changing
+    /// out from under it:
+    ///   - initialized from an actual disk check ONCE in [`load`](Backend::load) (startup, not hot);
+    ///   - set `true` after [`begin_up`](Backend::begin_up)'s `build_config` succeeds (its key load
+    ///     create-on-missing-writes the file — true for a plain up *and* a force-reauth up, whose
+    ///     wipe-then-rebuild ends with a fresh file present);
+    ///   - set `false` in [`discard_node_key`](Backend::discard_node_key) after the wipe succeeds (the
+    ///     shared primitive behind both `logout` and a force-reauth up — a force-reauth then flips it
+    ///     back to `true` via the `build_config` rebuild above);
+    ///   - re-derived for the target profile in [`switch_profile`](Backend::switch_profile), which
+    ///     repoints `key_path` at a different profile's key file.
+    has_node_key: bool,
+}
+
+/// Whether the key file at `key_path` holds a usable persisted node key — a **pure, side-effect-free**
+/// read (the on-disk source of truth behind both [`Backend::has_persisted_node_key`] and the
+/// [`has_node_key`](Backend::has_node_key) cache). One source of truth so the cache's startup seed
+/// ([`Backend::load`]), its profile re-derivation ([`Backend::switch_profile`]), and the auto-start
+/// probe can never disagree about how the key file is parsed.
+///
+/// Do NOT call `tailscale::config::load_key_file` here: it create-on-missing-WRITES a fresh key file
+/// as a side effect, and merely *checking* must never manufacture a key. We read the bytes and confirm
+/// they parse into the engine's own `{ "key_state": <PersistState> }` shape (reusing its
+/// `Deserialize`, so this can't drift if the key-state layout changes). A parseable `PersistState`
+/// always carries a (32-byte, non-empty) node key, so a successful parse is exactly the "node key
+/// present" condition; we derive the public node key both to *use* the parsed state and as a final
+/// structural sanity check that the private key material is well-formed. A missing/unreadable/malformed
+/// file reads as "no persisted key" (the daemon then falls back to fresh auth rather than trusting
+/// garbage).
+async fn key_file_has_node_key(key_path: &std::path::Path) -> bool {
+    let Ok(bytes) = tokio::fs::read(key_path).await else {
+        // Missing (fresh node) or unreadable → treat as "no persisted key".
+        return false;
+    };
+    #[derive(serde::Deserialize)]
+    struct KeyFile {
+        key_state: tailscale::keys::PersistState,
+    }
+    match serde_json::from_slice::<KeyFile>(&bytes) {
+        Ok(kf) => {
+            let _node_public = kf.key_state.node_key.public_key();
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 impl Backend {
@@ -738,7 +843,7 @@ impl Backend {
             .await
             .with_context(|| format!("loading prefs from {}", prefs_path.display()))?;
         let (lifecycle_tx, _) = tokio::sync::watch::channel(0u64);
-        Ok(Self {
+        let mut backend = Self {
             prefs,
             state_dir: state_dir.to_path_buf(),
             current_profile,
@@ -752,7 +857,13 @@ impl Backend {
             generation: 0,
             boot_attempted_up: false,
             lifecycle_tx,
-        })
+            // Seed the cache once, at startup, from an actual on-disk check — startup is not the hot
+            // path, and every later mutation is tracked at its transition (see the field doc's
+            // invariant). `has_persisted_node_key` reads only `key_path`, which is already set above.
+            has_node_key: false,
+        };
+        backend.has_node_key = backend.has_persisted_node_key().await;
+        Ok(backend)
     }
 
     /// List the known profiles (the analogue of Go `tailscale switch --list`). Returns one entry per
@@ -820,6 +931,10 @@ impl Backend {
         // (matching the unchanged on-disk pointer) rather than diverging — in-memory ahead of disk.
         let (prefs_path, key_path) = profile::profile_paths(&self.state_dir, target);
         let ever_configured = tokio::fs::try_exists(&prefs_path).await.unwrap_or(false);
+        // Re-derive the node-key cache for the TARGET profile (we are about to repoint `key_path` at
+        // its key file). Computed here, into a local, alongside the other target state so it is only
+        // committed to `self` after every fallible write succeeds (the D1 ordering above).
+        let has_node_key = key_file_has_node_key(&key_path).await;
         let prefs = Prefs::load(&prefs_path)
             .await
             .with_context(|| format!("loading prefs for profile {target:?}"))?;
@@ -849,6 +964,8 @@ impl Backend {
         self.current_profile = target.to_string();
         // This process has not attempted a boot-up for the newly-active profile.
         self.boot_attempted_up = false;
+        // Adopt the target profile's node-key fact (computed above against the new `key_path`).
+        self.has_node_key = has_node_key;
         Ok(())
     }
 
@@ -935,6 +1052,25 @@ impl Backend {
         self.prefs.ephemeral
     }
 
+    /// The persisted control-server URL, or `None` to use the engine default (Tailscale SaaS). Exposed
+    /// (alongside [`prefs_ephemeral`](Backend::prefs_ephemeral)) so the daemon can log its effective
+    /// posture at boot — which control plane it will talk to.
+    pub fn prefs_control_url(&self) -> Option<&str> {
+        self.prefs.control_url.as_deref()
+    }
+
+    /// Whether the node uses the kernel-TUN data path (vs the userspace netstack). Exposed for the
+    /// daemon's boot-posture log line.
+    pub fn prefs_tun(&self) -> bool {
+        self.prefs.tun_enabled
+    }
+
+    /// Whether the Tailscale SSH server is enabled by the persisted pref. Exposed for the daemon's
+    /// boot-posture log line.
+    pub fn prefs_ssh(&self) -> bool {
+        self.prefs.ssh_enabled
+    }
+
     /// Whether a usable persisted node key exists on disk — the signal the daemon uses to decide
     /// whether it can *resume* a prior registration without an auth key (see `tailnetd`'s auto-start).
     ///
@@ -962,31 +1098,11 @@ impl Backend {
     /// that authoritatively (re-`POST /machine/register` with this node key; `auth` omitted when no
     /// authkey), so this method is a cheap *pre-flight* to pick the resume path, never a guarantee.
     pub async fn has_persisted_node_key(&self) -> bool {
-        // Pure read: do NOT call `tailscale::config::load_key_file`, which create-on-missing-writes a
-        // fresh key file as a side effect — checking must never manufacture a key.
-        let Ok(bytes) = tokio::fs::read(&self.key_path).await else {
-            // Missing (fresh node) or unreadable → treat as "no persisted key".
-            return false;
-        };
-        // The on-disk shape is `{ "key_state": <PersistState> }`. Reuse the engine's own
-        // `PersistState` Deserialize (rather than hand-rolling the field set) so this can't drift if
-        // the engine's key-state layout changes. A parse failure (truncated/corrupt file) reads as
-        // "no persisted key" — the daemon then falls back to fresh auth rather than trusting garbage.
-        #[derive(serde::Deserialize)]
-        struct KeyFile {
-            key_state: tailscale::keys::PersistState,
-        }
-        // A parseable `PersistState` always carries a (32-byte, non-empty) node key, so a successful
-        // parse is exactly the "node key present" condition. We derive the public node key from it
-        // both to *use* the parsed state (not just discard it) and as a final structural sanity check
-        // that the private key material is well-formed.
-        match serde_json::from_slice::<KeyFile>(&bytes) {
-            Ok(kf) => {
-                let _node_public = kf.key_state.node_key.public_key();
-                true
-            }
-            Err(_) => false,
-        }
+        // The on-disk source of truth for the [`has_node_key`](Backend::has_node_key) cache. Kept as a
+        // method (still called at startup by [`load`](Backend::load) and by `tailnetd`'s auto-start);
+        // the per-`status` hot path now reads the cached bool instead. Delegates to the free
+        // [`key_file_has_node_key`] so `switch_profile`'s re-derivation shares the exact same logic.
+        key_file_has_node_key(&self.key_path).await
     }
 
     /// Bring the node up in a single call (the auto-start / single-owner path).
@@ -1102,6 +1218,11 @@ impl Backend {
         let named_accept_routes = opts.accept_routes.is_some();
         let named_advertise_routes = opts.advertise_routes.is_some();
         let named_advertise_exit_node = opts.advertise_exit_node.is_some();
+        // The rebuild-only fields (no live setter), captured for the reconcile-decision log below —
+        // these are what force the `SetAction::Rebuild` (brief-reconnect) path on a running node.
+        let opts_shields_up_named = opts.shields_up.is_some();
+        let opts_ssh_named = opts.ssh.is_some();
+        let opts_advertise_tags_named = opts.advertise_tags.is_some();
 
         // PRE-VALIDATE the advertised CIDRs BEFORE mutating/persisting prefs. `build_config` is the
         // final authority (it re-parses the same way; see its `advertise_routes` block), but it only
@@ -1168,12 +1289,29 @@ impl Backend {
         // Reconcile against the live engine. This is the only step that needs the device.
         match self.device.as_ref() {
             // No engine to reconcile — persisting above is the whole job; prefs apply on next `up`.
-            None => Ok(SetAction::PersistedOnly),
+            None => {
+                tracing::info!(
+                    action = "persisted-only",
+                    "set: reconcile decided (node down; prefs apply on next up)"
+                );
+                Ok(SetAction::PersistedOnly)
+            }
             // A rebuild-only pref (shields_up / ssh / advertise_tags — no live setter) changed on a
             // running node: the engine Config is immutable, so the caller must rebuild the device
             // from the updated prefs (a brief reconnect). A `set` that ALSO named live-applicable
             // prefs still rebuilds wholesale — the rebuild re-applies them from the persisted prefs.
-            Some(_) if needs_rebuild => Ok(SetAction::Rebuild),
+            Some(_) if needs_rebuild => {
+                // THE "why did my set reconnect?" signal: a rebuild-only pref forces a device rebuild
+                // (brief reconnect). Name which one(s) triggered it.
+                tracing::info!(
+                    action = "rebuild",
+                    shields_up = opts_shields_up_named,
+                    ssh = opts_ssh_named,
+                    advertise_tags = opts_advertise_tags_named,
+                    "set: reconcile decided (rebuild-only pref changed on a running node → brief reconnect)"
+                );
+                Ok(SetAction::Rebuild)
+            }
             // Fast path: every changed pref is live-applicable and a device is up → apply each named
             // change LIVE via the engine's runtime setters, no rebuild, no reconnect (Go's `set` =
             // one live `EditPrefs`). Each call is awaited under the (brief) lock the caller holds: the
@@ -1237,6 +1375,9 @@ impl Backend {
                         .map_err(|e| anyhow!("set advertise-exit-node failed: {e:?}"))?;
                     ops.push(LiveSetOp::AdvertiseExitNode(self.prefs.advertise_exit_node));
                 }
+                // Live path: every changed pref applied in place via engine setters — NO reconnect.
+                // Record what was issued so the operator can see the set took the seamless path.
+                tracing::info!(action = "live", ops = ?ops, "set: reconcile decided (applied live, no reconnect)");
                 Ok(SetAction::Live(ops))
             }
         }
@@ -1407,6 +1548,13 @@ impl Backend {
         self.persist_prefs().await?;
 
         let config = self.build_config().await?;
+        // `build_config`'s key load (`load_key_file`) create-on-missing-WROTE the key file, so a node
+        // key is now persisted — update the cache. This holds for a plain up AND a force-reauth up:
+        // force-reauth wiped the old key above (→ cache false) and this rebuild just minted a fresh
+        // one (→ cache true), the correct end state. Set only after `build_config` SUCCEEDS — on its
+        // failure (e.g. a bad CIDR or unparseable key on a plain up) no fresh file was written and the
+        // cache must not be flipped true. (See the `has_node_key` field invariant.)
+        self.has_node_key = true;
         // Bump + capture the generation: `finish_up` installs its device only if this is still the
         // current generation (no later `up`/`down` superseded it while the lock was released). The
         // bump also notifies status watchers (so one watching a replaced device re-derives).
@@ -1480,6 +1628,13 @@ impl Backend {
         // Arm the `serve` accept loops from the persisted serve config (Go `tailscale serve --tcp`).
         // Like the SSH task, these are bound to the device lifecycle (torn down in `stop_device`).
         self.spawn_serve(device);
+        // Known lifecycle transition (the IPN state is derived fresh per `status()`, never stored, so
+        // transitions are otherwise unlogged): the engine is up and the device is installed. The node
+        // converges to Running once the netmap arrives.
+        tracing::info!(
+            generation = self.generation,
+            "engine started, device installed"
+        );
         Ok(None)
     }
 
@@ -1539,7 +1694,7 @@ impl Backend {
                 let ipv4 = match device.ipv4_addr().await {
                     Ok(ip) => ip,
                     Err(e) => {
-                        tracing::error!(error = ?e, "ssh: could not resolve tailnet IPv4; SSH server not started");
+                        tracing::error!(error = %e, "ssh: could not resolve tailnet IPv4; SSH server not started");
                         return;
                     }
                 };
@@ -1548,7 +1703,7 @@ impl Backend {
                 // Runs the accept loop forever; only returns on a bind/setup error (or when this task
                 // is aborted by `stop_device`, which drops the future). Either way, log the outcome.
                 if let Err(e) = device.listen_ssh(config, listen_addr).await {
-                    tracing::error!(error = ?e, "ssh: server exited with error");
+                    tracing::error!(error = %e, "ssh: server exited with error");
                 }
             });
             self.ssh_task = Some(handle);
@@ -1611,7 +1766,10 @@ impl Backend {
                 if serve::is_plain_tcp_forward(handler) {
                     let target = handler.tcp_forward.clone();
                     let dev = device.clone();
-                    loops.spawn(serve_accept_loop(dev, port, target));
+                    // Per-loop splice cap (see `serve_accept_loop` / `MAX_SERVE_CONNECTIONS`).
+                    let conn_limit =
+                        std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_SERVE_CONNECTIONS));
+                    loops.spawn(serve_accept_loop(dev, port, target, conn_limit));
                 } else if serve::is_web_serve(handler) {
                     // Handled by LANE 2 below (engine delegation); nothing to do here.
                 } else if !handler.terminate_tls.is_empty() {
@@ -1658,7 +1816,7 @@ impl Backend {
                             }
                             Err(e) => {
                                 tracing::warn!(
-                                    error = ?e,
+                                    error = %e,
                                     "serve: engine web serve failed (cert/serve error — needs the `acme` \
                                      feature + a SaaS tailnet that answers set-dns); TCP-forward serve continues"
                                 );
@@ -1668,7 +1826,7 @@ impl Backend {
                     }
                     Err(e) => {
                         tracing::warn!(
-                            error = ?e,
+                            error = %e,
                             "serve: could not resolve node MagicDNS name for web serve; skipping web lane"
                         );
                         false
@@ -1690,7 +1848,7 @@ impl Backend {
                     .set_serve_config(tailscale::ServeState::default())
                     .await
             {
-                tracing::warn!(error = ?e, "serve: fail-closed clear of stale engine web serve failed");
+                tracing::warn!(error = %e, "serve: fail-closed clear of stale engine web serve failed");
             }
             // LANE 3 — FUNNEL: expose a port's web serve to the PUBLIC internet (Go `tailscale
             // funnel`). For each funnel-enabled port that has a web proxy backend, call the engine's
@@ -1749,9 +1907,30 @@ impl Backend {
                                     // relay against a self-hosted control plane — the loop simply parks).
                                     let backend = backend.clone();
                                     loops.spawn(async move {
+                                        // Per-funnel-loop splice cap. Funnel is PUBLIC-internet-facing,
+                                        // so a slow-loris of idle public connections must not spawn
+                                        // splice tasks (leaking fds) without bound — at cap a new
+                                        // connection is dropped (shed, not queued). See
+                                        // `MAX_SERVE_CONNECTIONS`.
+                                        let conn_limit = std::sync::Arc::new(
+                                            tokio::sync::Semaphore::new(MAX_SERVE_CONNECTIONS),
+                                        );
                                         while let Some(accepted) = rx.recv().await {
+                                            // Acquire a splice permit before spawning; drop the
+                                            // connection if the cap is exhausted. Moved into the task,
+                                            // released when the splice ends.
+                                            let Ok(permit) =
+                                                std::sync::Arc::clone(&conn_limit).try_acquire_owned()
+                                            else {
+                                                tracing::warn!(
+                                                    %backend,
+                                                    "funnel: connection cap reached; dropping public connection"
+                                                );
+                                                continue;
+                                            };
                                             let backend = backend.clone();
                                             tokio::spawn(async move {
+                                                let _permit = permit;
                                                 // `accepted.target`/`src` are the public ingress
                                                 // host:port hit + the public client's addr (audit/debug
                                                 // trace of who reached the funnel).
@@ -1765,11 +1944,24 @@ impl Backend {
                                                 match tokio::net::TcpStream::connect(&backend).await
                                                 {
                                                     Ok(mut local) => {
-                                                        let _ = tokio::io::copy_bidirectional(
-                                                            &mut stream,
-                                                            &mut local,
+                                                        // Bounded by SPLICE_TIMEOUT so an abandoned
+                                                        // public peer can't pin the task/permit/fds
+                                                        // forever; on elapse, drop.
+                                                        match tokio::time::timeout(
+                                                            SPLICE_TIMEOUT,
+                                                            tokio::io::copy_bidirectional(
+                                                                &mut stream,
+                                                                &mut local,
+                                                            ),
                                                         )
-                                                        .await;
+                                                        .await
+                                                        {
+                                                            Ok(_) => {}
+                                                            Err(_) => tracing::debug!(
+                                                                %backend,
+                                                                "funnel: splice exceeded SPLICE_TIMEOUT; dropping idle/abandoned connection"
+                                                            ),
+                                                        }
                                                     }
                                                     Err(e) => tracing::warn!(
                                                         error = %e, %backend,
@@ -1792,7 +1984,7 @@ impl Backend {
                         }
                     }
                     Err(e) => tracing::warn!(
-                        error = ?e,
+                        error = %e,
                         "funnel: could not resolve node MagicDNS name; skipping funnel lane"
                     ),
                 }
@@ -1856,10 +2048,23 @@ impl Backend {
     /// returned so the caller can fail closed — a path that believed it re-keyed when the old key is
     /// still on disk would silently resume the very registration it meant to end. The error names the
     /// key path; callers add their own action context (so the path is not repeated in the chain).
-    async fn discard_node_key(&self) -> Result<()> {
+    async fn discard_node_key(&mut self) -> Result<()> {
         match tokio::fs::remove_file(&self.key_path).await {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            // Key file removed, or it was already absent — either way no node key is on disk now, so
+            // the cache is `false`. Set only AFTER a successful wipe (mirrors logout's wipe-before-
+            // persist crash-safety: never record "no key" while the file might still be there). A
+            // force-reauth up immediately re-mints a key in `build_config` and flips this back to
+            // `true`; a `logout` leaves it `false`. (See the `has_node_key` field invariant.)
+            Ok(()) => {
+                self.has_node_key = false;
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.has_node_key = false;
+                Ok(())
+            }
+            // Wipe FAILED: the file may still be present, so leave the cache untouched (the caller
+            // fails closed on this error rather than proceeding as if re-keyed).
             Err(e) => Err(anyhow!(
                 "could not discard the node key at {}: {e}",
                 self.key_path.display()
@@ -1899,7 +2104,7 @@ impl Backend {
             // Non-fatal: proceed with the local logout regardless (never leave the operator wedged
             // half-logged-in on a transient control error). Go behaves the same.
             tracing::warn!(
-                error = ?e,
+                error = %e,
                 "logout: control-plane deregistration failed; proceeding with local logout \
                  (key wipe + intent flip) anyway"
             );
@@ -2120,10 +2325,13 @@ impl Backend {
             // The daemon's own version (Go `Status.Version`) — the same crate version the `version`
             // request reports, surfaced here so `status --json` carries it too.
             version: Some(env!("CARGO_PKG_VERSION").to_string()),
-            // Whether a node key is on disk (Go `Status.HaveNodeKey` / `hasNodeKeyLocked`) — read
-            // straight from the key file, NOT inferred from `state` (an expired node reports
-            // `NeedsLogin` but still holds its key). `has_persisted_node_key` is a pure read.
-            have_node_key: self.has_persisted_node_key().await,
+            // Whether a node key is on disk (Go `Status.HaveNodeKey` / `hasNodeKeyLocked`), NOT
+            // inferred from `state` (an expired node reports `NeedsLogin` but still holds its key).
+            // Read from the cached `has_node_key` rather than re-reading + parsing + Ed25519-deriving
+            // the key file on every call: `status` runs under the backend lock and on the
+            // `stream_watch` hot path fires on EVERY engine state transition, where this fact never
+            // changes (it only moves on key persist/wipe — see the `has_node_key` field invariant).
+            have_node_key: self.has_node_key,
         }
     }
 
@@ -2427,6 +2635,10 @@ impl Backend {
                 Some(owned) => {
                     // `shutdown` consumes the device; bounded so a wedged engine can't hang the daemon.
                     let _ = owned.shutdown(Some(SHUTDOWN_TIMEOUT)).await;
+                    // Known lifecycle transition: a live device was just torn down (the node left
+                    // Running/Starting). Logged only when a device was actually present, so a no-op
+                    // teardown (already-down node) stays quiet.
+                    tracing::info!("engine stopped, device torn down");
                 }
                 None => {
                     // Should not happen after the SSH task was aborted and awaited above (the backend
@@ -2482,6 +2694,9 @@ mod tests {
             generation: 0,
             boot_attempted_up: false,
             lifecycle_tx: tokio::sync::watch::channel(0u64).0,
+            // Cache starts `false` (a fresh backend, no key checked yet). Tests that need a key
+            // present drive the real wipe/build paths, which keep the cache consistent on their own.
+            has_node_key: false,
         }
     }
 

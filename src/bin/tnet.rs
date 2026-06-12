@@ -3020,11 +3020,22 @@ fn parse_request_target(request_line: &str) -> Option<(&str, &str)> {
     Some((method, path))
 }
 
+/// Max concurrent in-flight `status --web` connection handlers. Defense-in-depth against a connection
+/// flood: each accepted connection spawns a detached handler, so without a cap a flood of clients
+/// could spawn handlers (and leak fds) without bound. The per-handler 5s read-deadline already bounds
+/// a *slow* client; this bounds the COUNT. At cap a new connection is dropped (shed, not queued).
+/// This is a local diagnostic server (default `127.0.0.1`), so 64 is far above normal single-user use.
+const MAX_WEB_CONNECTIONS: usize = 64;
+
 /// `tnet status --web`: serve an HTML status page from an embedded HTTP server (Go `tailscale status
 /// --web`). Binds a TCP listener on `listen` (default `127.0.0.1:8384`), optionally opens a browser at
 /// the URL, then accepts connections until interrupted: each request re-fetches the live status
 /// ([`Request::Status`]) and, for `GET /`, replies `200 text/html` with [`render_status_html`]; any
 /// other path is a `404`. Reuses the existing daemon read — no new daemon/engine surface.
+///
+/// Each connection is handled on its own detached task, bounded by a [`Semaphore`](tokio::sync::Semaphore)
+/// cap ([`MAX_WEB_CONNECTIONS`]) so a flood can't leak handler tasks/fds without bound (the count
+/// bound; the per-handler 5s read-deadline is the slow-client bound).
 async fn run_status_web(socket: &std::path::Path, listen: &str, browser: bool) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(listen)
         .await
@@ -3047,6 +3058,10 @@ async fn run_status_web(socket: &std::path::Path, listen: &str, browser: bool) -
     if browser {
         open_browser_best_effort(&url);
     }
+    // Cap concurrent connection handlers; a permit is held for a handler's whole lifetime. Defense-in-
+    // depth against a flood (the count bound — the 5s read-deadline in the handler is the slow-client
+    // bound). At cap, a new connection is dropped (shed, not queued).
+    let conn_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_WEB_CONNECTIONS));
     loop {
         let (conn, _peer) = match listener.accept().await {
             Ok(c) => c,
@@ -3055,11 +3070,18 @@ async fn run_status_web(socket: &std::path::Path, listen: &str, browser: bool) -
                 continue;
             }
         };
+        // Acquire a handler permit BEFORE spawning; if the cap is exhausted, drop the connection
+        // (closing it) rather than spawning unboundedly. Moved into the task, released when it ends.
+        let Ok(permit) = std::sync::Arc::clone(&conn_limit).try_acquire_owned() else {
+            eprintln!("status --web: connection cap reached; dropping connection");
+            continue;
+        };
         // Handle each connection on its own task. Go's `http.Serve` is goroutine-per-connection, so a
         // single slow or silent client can't head-of-line-block every other status request; the read
         // deadline inside the handler is what actually bounds a stalled client.
         let socket = socket.to_path_buf();
         tokio::spawn(async move {
+            let _permit = permit;
             serve_status_connection(conn, &socket).await;
         });
     }
