@@ -34,14 +34,12 @@ pub(super) async fn build_config(prefs: &Prefs, key_path: &Path) -> Result<tails
         .await
         .map_err(|e| anyhow!("load key file {}: {e:?}", key_path.display()))?;
     config.requested_hostname = prefs.hostname.clone();
-    // Ephemeral defaults to `true` (see `Prefs::default` / `tailscale::Config.ephemeral`). We
-    // deliberately do NOT override it to `false` here just to make persisted-key resume more
-    // reliable: ephemeral vs. persistent is a node-identity *intent* decision that belongs to
-    // prefs/config, not a silent default the daemon flips behind the operator's back. The
-    // consequence — surfaced honestly by `tailnetd`'s auto-start logging — is that an ephemeral
-    // node is garbage-collected by control shortly after it disconnects, so after a reboot its
-    // persisted node key may already be gone from control and a resume-without-authkey will fail.
-    // A node that must survive reboots and resume from its key alone needs `ephemeral = false`.
+    // Ephemeral defaults to `false` (persistent), matching Go `tailscaled` — a persistent node keeps
+    // its registration across reboots and resumes from its key alone. The operator opts INTO an
+    // ephemeral node with `tnet up --ephemeral` (short-lived CI/containers); control then GCs it
+    // shortly after disconnect, so an ephemeral node will NOT rejoin after a reboot without a fresh
+    // auth key — `tailnetd`'s auto-start logging surfaces that honestly. Either way it is a
+    // registration-time *intent* carried verbatim from prefs, never flipped silently by the daemon.
     config.ephemeral = prefs.ephemeral;
     config.accept_routes = prefs.accept_routes;
     // Accept-MagicDNS (Go `CorpDNS` / `--accept-dns`, default-on): gate the engine's MagicDNS

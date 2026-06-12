@@ -25,7 +25,12 @@ pub struct Prefs {
     pub control_url: Option<String>,
     /// Requested hostname, or `None` to use the OS hostname.
     pub hostname: Option<String>,
-    /// Register as an ephemeral node (garbage-collected by control shortly after disconnect).
+    /// Register as an ephemeral node (control garbage-collects it shortly after disconnect). **Default
+    /// `false`** (persistent), matching Go `tailscaled`: a persistent node keeps its registration across
+    /// reboots and resumes from its key alone. `true` opts into an ephemeral node (`tnet up
+    /// --ephemeral`) — useful for short-lived CI/containers, but it will NOT rejoin after a reboot
+    /// without a fresh auth key (control will have GC'd it). Set at registration via `up`; like Go it is
+    /// a registration-time property, not a live-`set` pref.
     pub ephemeral: bool,
     /// Accept (and route traffic to) subnet routes advertised by peers.
     pub accept_routes: bool,
@@ -106,7 +111,7 @@ impl Default for Prefs {
             logged_out: false,
             control_url: None,
             hostname: None,
-            ephemeral: true,
+            ephemeral: false,
             accept_routes: false,
             accept_dns: true,
             shields_up: false,
@@ -226,8 +231,9 @@ mod tests {
         assert!(!p.want_running, "a fresh node must not auto-connect");
         assert!(!p.logged_out);
         assert!(
-            p.ephemeral,
-            "ephemeral is the safe default for short-lived nodes"
+            !p.ephemeral,
+            "a fresh node defaults to PERSISTENT (Go-faithful) so it survives reboots; \
+             ephemeral is opt-in via `up --ephemeral`"
         );
     }
 

@@ -756,6 +756,12 @@ pub struct UpOptions {
     /// the guard/`--reset` lockstep. Unlike [`Backend::logout`], it keeps the node's up-intent
     /// (`want_running`); it only re-keys.
     pub force_reauth: bool,
+    /// Ephemeral-node override (Go `tailscale up --ephemeral`). `None` leaves the pref unchanged;
+    /// `Some(b)` sets it. A **registration-time intent** (the engine only acts on it when registering
+    /// FRESH), so — like Go and like the prefs-layer treatment — it is deliberately NOT part of the
+    /// accidental-revert guard / `--reset` lockstep (changing it on an already-registered node is a
+    /// no-op until a fresh register). Default for a fresh node is `false` (persistent).
+    pub ephemeral: Option<bool>,
 }
 
 impl UpOptions {
@@ -780,6 +786,7 @@ impl UpOptions {
             || self.advertise_tags.is_some()
             || self.accept_routes.is_some()
             || self.accept_dns.is_some()
+            || self.ephemeral.is_some()
             || self.shields_up.is_some()
             || self.ssh.is_some()
     }
@@ -1733,6 +1740,11 @@ impl Backend {
         // engine Config in `build_config`.
         if let Some(ad) = opts.accept_dns {
             self.prefs.accept_dns = ad;
+        }
+        // Ephemeral-node override (Go `up --ephemeral`). Registration-time intent; baked into the
+        // engine Config in `build_config` and only acted on at a fresh register.
+        if let Some(eph) = opts.ephemeral {
+            self.prefs.ephemeral = eph;
         }
         if let Some(su) = opts.shields_up {
             self.prefs.shields_up = su;

@@ -101,6 +101,11 @@ pub enum Request {
         /// guard). `#[serde(default)]` keeps the wire backward-compatible with clients that omit it.
         #[serde(default)]
         force_reauth: bool,
+        /// Register as an ephemeral node (Go `tailscale up --ephemeral`). `None` leaves the pref
+        /// unchanged; `Some(b)` sets it. A registration-time intent (default-false/persistent for a
+        /// fresh node). `#[serde(default)]` keeps the wire backward-compatible with clients that omit it.
+        #[serde(default)]
+        ephemeral: Option<bool>,
     },
     /// Change individual prefs on the node **without** a full up/down cycle (the analogue of Go's
     /// `tailscale set`). Every field is the same "leave unchanged unless named" sentinel as
@@ -1022,6 +1027,7 @@ mod tests {
             ssh: Some(true),
             reset: true,
             force_reauth: false,
+            ephemeral: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&json).unwrap();
@@ -1043,6 +1049,7 @@ mod tests {
                 ssh,
                 reset,
                 force_reauth: _,
+                ephemeral: _,
             } => {
                 assert!(reset, "reset must survive the wire round-trip when set");
                 assert_eq!(authkey.as_deref(), Some("tskey-auth-xxx"));
@@ -1748,6 +1755,7 @@ mod tests {
             ssh: None,
             reset: false,
             force_reauth: false,
+            ephemeral: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&json).unwrap();
@@ -1769,6 +1777,7 @@ mod tests {
                 ssh,
                 reset,
                 force_reauth: _,
+                ephemeral: _,
             } => {
                 assert!(!reset);
                 assert!(authkey.is_none());
@@ -1835,6 +1844,7 @@ mod tests {
             ssh: None,
             reset: false,
             force_reauth: false,
+            ephemeral: None,
         };
         let json = serde_json::to_string(&clear).unwrap();
         match serde_json::from_str::<Request>(&json).unwrap() {
@@ -1889,6 +1899,7 @@ mod tests {
             ssh: None,
             reset: false,
             force_reauth: true,
+            ephemeral: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         match serde_json::from_str::<Request>(&json).unwrap() {
@@ -1958,6 +1969,7 @@ mod tests {
             ssh: None,
             reset: false,
             force_reauth: false,
+            ephemeral: None,
         })
         .unwrap();
         let unchanged_json = serde_json::to_string(&Request::Up {
@@ -1977,6 +1989,7 @@ mod tests {
             ssh: None,
             reset: false,
             force_reauth: false,
+            ephemeral: None,
         })
         .unwrap();
         assert!(
