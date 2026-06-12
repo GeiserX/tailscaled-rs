@@ -119,6 +119,10 @@ async fn main() -> Result<()> {
 /// tunnel on a config re-read).
 async fn shutdown_signal() {
     use tokio::signal::unix::{SignalKind, signal};
+    // PROOF: `signal()` registration only fails on resource exhaustion (out of memory/fds) or for a
+    // reserved signal already overridden by a non-default disposition; neither is reachable for
+    // SIGINT/SIGTERM at daemon startup (first handler install, on a fresh process), so the expect is
+    // safe — an early panic here is the correct response to an impossible-in-practice OS failure.
     let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
     let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
     tokio::select! {

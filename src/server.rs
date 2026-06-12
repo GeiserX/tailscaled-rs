@@ -894,3 +894,117 @@ async fn dispatch(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::UnixStream;
+
+    /// Drive `read_capped_line` with `input`: write the bytes into one end of a `UnixStream` pair
+    /// (off-task so a write larger than the socket buffer cannot deadlock against the reader), drop
+    /// the writer so EOF is observable, then read exactly one line from the other end's read half.
+    ///
+    /// `read_capped_line`'s reader parameter is the *concrete* `BufReader<OwnedReadHalf>` the server
+    /// uses (not a generic `AsyncBufRead`), so it can only be exercised over a real `UnixStream` —
+    /// an in-memory `Cursor` would not typecheck. This mirrors the integration harness in
+    /// `tests/localapi_loop.rs`, which also drives the server over a real `UnixStream`.
+    async fn read_one(input: Vec<u8>) -> (LineResult, Vec<u8>) {
+        let (client, server) = UnixStream::pair().expect("UnixStream::pair");
+        // Writer side: push all bytes, then drop to signal EOF. Spawned so a >socket-buffer write
+        // (the over-cap case sends 64KiB+) never blocks waiting for the reader to drain.
+        let writer = tokio::spawn(async move {
+            let (_r, mut w) = client.into_split();
+            w.write_all(&input).await.expect("write input");
+            w.flush().await.expect("flush input");
+            // `w`/`client` dropped here → the read half observes EOF after the buffered bytes.
+        });
+
+        let (read_half, _write_half) = server.into_split();
+        let mut reader = BufReader::new(read_half);
+        let mut out = Vec::new();
+        let result = read_capped_line(&mut reader, &mut out)
+            .await
+            .expect("read_capped_line");
+        writer.await.expect("writer task");
+        (result, out)
+    }
+
+    #[tokio::test]
+    async fn read_capped_line_returns_under_cap_line() {
+        // An under-cap line ending in '\n' yields `Line`, with the trailing '\n' stripped.
+        let (result, out) = read_one(b"hello\n".to_vec()).await;
+        assert!(matches!(result, LineResult::Line), "expected Line");
+        assert_eq!(
+            out, b"hello",
+            "trailing newline must be stripped, not stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_capped_line_allows_exactly_max_bytes() {
+        // The cap is INCLUSIVE: a line of exactly MAX_LINE_BYTES (plus its '\n') is still accepted.
+        // This pins the load-bearing strict `>` boundary the function documents.
+        let mut input = vec![b'a'; MAX_LINE_BYTES];
+        input.push(b'\n');
+        let (result, out) = read_one(input).await;
+        assert!(
+            matches!(result, LineResult::Line),
+            "a line of exactly MAX_LINE_BYTES must be allowed (inclusive cap)"
+        );
+        assert_eq!(out.len(), MAX_LINE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn read_capped_line_refuses_over_cap_line() {
+        // A newline-less line exceeding MAX_LINE_BYTES is refused with `TooLong` (the DoS guard:
+        // a single connection must not be able to grow the read buffer without bound).
+        let input = vec![b'a'; MAX_LINE_BYTES + 1];
+        let (result, _out) = read_one(input).await;
+        assert!(
+            matches!(result, LineResult::TooLong),
+            "a line over MAX_LINE_BYTES must be refused as TooLong"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_capped_line_reports_clean_eof() {
+        // A peer that closes without sending anything is a clean EOF, not an error or a line.
+        let (result, out) = read_one(Vec::new()).await;
+        assert!(matches!(result, LineResult::Eof), "empty stream is Eof");
+        assert!(out.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_dir_0700_tightens_loose_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A process-id-namespaced temp dir (matches the harness convention in tests/localapi_loop.rs)
+        // created world/group-accessible (0777) must be tightened to 0700 — it is the reach gate for
+        // the control socket.
+        let dir = std::env::temp_dir().join(format!(
+            "tailnetd-ensure0700-{}-{}",
+            std::process::id(),
+            // A nanosecond suffix keeps parallel tests in this same PID from colliding on the path.
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).expect("chmod 0777");
+
+        ensure_dir_0700(&dir).await.expect("ensure_dir_0700");
+
+        let mode = std::fs::metadata(&dir)
+            .expect("stat dir")
+            .permissions()
+            .mode()
+            & 0o777;
+        // Best-effort cleanup before the assertion so a failure still removes the dir.
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(mode, 0o700, "loose socket dir must be tightened to 0700");
+    }
+}

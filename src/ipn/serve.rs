@@ -254,7 +254,11 @@ pub async fn load(state_dir: &Path, profile_id: &str) -> ServeConfig {
             tracing::warn!(error = %e, path = %path.display(), "serve-config is malformed; treating as empty (no serve)");
             ServeConfig::default()
         }),
-        Err(_) => ServeConfig::default(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ServeConfig::default(),
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "serve-config unreadable; treating as empty");
+            ServeConfig::default()
+        }
     }
 }
 

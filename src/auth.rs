@@ -315,6 +315,10 @@ mod tests {
     fn read_only_diagnostics_do_not_require_write() {
         // `ip`/`whois`/`ping`/`version` mutate no state — they must classify as reads, like
         // `status`/`watch`.
+        assert!(
+            !requires_write(&Request::Watch),
+            "watch only streams status snapshots — a read, gated exactly like status"
+        );
         assert!(!requires_write(&Request::Ip));
         assert!(!requires_write(&Request::Whois {
             ip: "100.64.0.1".into()

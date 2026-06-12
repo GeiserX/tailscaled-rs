@@ -472,7 +472,13 @@ pub struct WaitingFileReport {
 }
 
 /// A snapshot of daemon + netmap state.
+///
+/// Container-level `#[serde(default)]`: every field is omittable on the wire and falls back to
+/// [`StatusReport::default`], so a JSON document missing any field (e.g. an older client's status
+/// line) deserializes instead of hard-erroring. Fields keep their `skip_serializing_if` so the
+/// emitted wire still drops empty optionals.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StatusReport {
     /// The IPN state name. One of the seven [`crate::ipn::State`] variants (the authoritative
     /// list is [`crate::ipn::State::as_str`]): `NoState`, `NeedsLogin`, `NeedsMachineAuth`,
@@ -489,7 +495,7 @@ pub struct StatusReport {
     /// engine reported `DeviceState::NeedsLogin(url)` — i.e. an `up` with no usable auth key needs a
     /// human to authorize the node in a browser. `None` in every other state. The CLI prints this so
     /// `tnet up` (no `--authkey`) yields a clickable login link.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_url: Option<String>,
     /// A terminal registration-failure reason, set only when the engine reported
     /// `DeviceState::Failed(RegistrationError)` — a **permanent** failure (e.g. a bad/expired/unknown
@@ -503,65 +509,68 @@ pub struct StatusReport {
     /// *hard-failed and re-running with the same key will loop forever* (terminal — the operator must
     /// re-authenticate). The CLI prints this and, on an interactive `up`, bails early instead of
     /// dwelling the full auth-URL poll window implying that login will help.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// A snapshot of the node's persisted configuration intent (its [`Prefs`](crate::prefs::Prefs)),
     /// so `tnet status` can show the full posture — exit node, advertised routes/exit, accept-routes,
     /// SSH, TUN — the way Go `tailscale status` reflects the active prefs. Read straight from the
-    /// daemon's prefs (no engine round-trip), so it is always present. `#[serde(default)]` keeps the
-    /// wire backward-compatible with clients that predate this field.
-    #[serde(default)]
+    /// daemon's prefs (no engine round-trip), so it is always present. The container-level
+    /// `#[serde(default)]` keeps the wire backward-compatible with clients that predate this field.
     pub prefs: PrefsView,
     /// This node's tailnet IPv6, once a netmap has been received (Go `Status.TailscaleIPs[1]`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub self_ipv6: Option<String>,
     /// The stable id (resolved to the peer's display name where possible) of the exit node traffic is
     /// **currently** egressing through, if any (Go `Status.ExitNodeStatus.ID`). `None` when no exit
     /// node is engaged. Distinct from the *configured* `prefs.exit_node` selector: this is what is
     /// actually live (the route updater's fail-closed answer).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub active_exit_node: Option<String>,
     /// The tailnet's MagicDNS suffix (e.g. `tail0123.ts.net`), Go `Status.MagicDNSSuffix`. `None`
     /// before the first netmap.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub magic_dns_suffix: Option<String>,
     /// Known peers in the netmap.
     pub peers: Vec<PeerReport>,
     /// The daemon's own version (its crate version), Go `Status.Version`. Carried so `status --json`
     /// can surface it the way Go does (and the way `tnet version --daemon` already reports it
-    /// separately). `#[serde(default)]` + `skip_serializing_if` keep the wire backward-compatible with
-    /// clients that predate this field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// separately). The container-level `#[serde(default)]` + `skip_serializing_if` keep the wire
+    /// backward-compatible with clients that predate this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     /// Whether this node holds a persisted node key (Go `Status.HaveNodeKey`). The daemon computes
     /// this directly from the on-disk key (`has_persisted_node_key`), the analogue of Go's
     /// `hasNodeKeyLocked` — NOT a proxy for the IPN state. (An *expired* node still holds its key on
     /// disk, so it must report `true` even while the state is `NeedsLogin`; only `logout`/`force-reauth`
-    /// discard the key.) `#[serde(default)]` keeps the wire backward-compatible.
-    #[serde(default)]
+    /// discard the key.) The container-level `#[serde(default)]` keeps the wire backward-compatible.
     pub have_node_key: bool,
 }
 
 /// A read-only projection of the node's persisted [`Prefs`](crate::prefs::Prefs) for `status`
 /// output. Mirrors the policy-relevant fields an operator wants to see at a glance (the analogue of
 /// the prefs Go's `tailscale status` surfaces), without exposing the full prefs struct or any secret.
+///
+/// Container-level `#[serde(default)]` (matching [`crate::prefs::Prefs`]): every field is omittable
+/// on the wire and falls back to [`PrefsView::default`], so a JSON projection missing any field
+/// deserializes instead of hard-erroring. Fields keep their `skip_serializing_if` so empty
+/// optionals/collections are still dropped from the emitted wire.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PrefsView {
     /// The configured exit-node selector (IP or MagicDNS name), or `None` if no exit node is set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_node: Option<String>,
     /// Whether this node advertises itself as an exit node.
     pub advertise_exit_node: bool,
     /// Subnet routes (CIDRs) this node advertises to the tailnet.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub advertise_routes: Vec<String>,
     /// ACL tags (`tag:<name>`) this node requests at registration.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub advertise_tags: Vec<String>,
     /// Whether this node accepts subnet routes advertised by peers.
     pub accept_routes: bool,
     /// Whether shields-up is on (block inbound peer connections terminating on this node).
-    #[serde(default)]
     pub shields_up: bool,
     /// Whether the Tailscale SSH server is *enabled* by the persisted pref (`ssh_enabled`). This is
     /// the configured *intent*, NOT proof the server is actually accepting connections — see
@@ -573,8 +582,8 @@ pub struct PrefsView {
     /// case `ssh` stays `true` but `ssh_running` reads `false` — so an operator is not misled into
     /// thinking SSH is serving when the task has exited. Always `false` when SSH is not enabled, when
     /// the node is down, or in a daemon built without the `ssh` feature (no task is ever spawned).
-    /// `#[serde(default)]` keeps the wire backward-compatible with clients that predate this field.
-    #[serde(default)]
+    /// The container-level `#[serde(default)]` keeps the wire backward-compatible with clients that
+    /// predate this field.
     pub ssh_running: bool,
     /// Whether the node uses the kernel-TUN data path (vs the userspace netstack).
     pub tun: bool,
@@ -712,15 +721,19 @@ fn is_zero_i32(n: &i32) -> bool {
 
 /// Tailnet Lock (TKA) status in a [`Response::Lock`] reply (Go `tailscale lock status`, read-only
 /// subset). Mirrors the engine's `ts_control::TkaStatus`.
+///
+/// Container-level `#[serde(default)]`: every field is omittable on the wire and falls back to
+/// [`LockReport::default`], so a JSON document missing any field deserializes instead of
+/// hard-erroring. `head` keeps its `skip_serializing_if` so an empty hash is dropped on the wire.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LockReport {
     /// Whether Tailnet Lock is in use (control sent TKA info for this node).
     pub enabled: bool,
     /// The base32 `AUMHash` of control's latest authority head (empty when none / not enabled).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub head: String,
     /// Whether control believes Tailnet Lock should be disabled (a disablement is pending).
-    #[serde(default)]
     pub disabled: bool,
 }
 
@@ -731,37 +744,42 @@ pub struct LockReport {
 /// the engine's type. The Go "Use Tailscale DNS" accept-dns line + the "System DNS configuration"
 /// section are deliberately NOT carried (no CorpDNS pref / no engine OS-DNS accessor in this fork);
 /// the CLI renderer notes both as not-surfaced-by-this-build.
+///
+/// Container-level `#[serde(default)]`: every field is omittable on the wire and falls back to
+/// [`DnsStatusReport::default`], so a JSON document missing any field deserializes instead of
+/// hard-erroring. The collection fields keep their `skip_serializing_if` so empty collections are
+/// still dropped from the emitted wire.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct DnsStatusReport {
     /// Whether MagicDNS is enabled tailnet-wide (engine `DnsConfig::magic_dns`, Go `Proxied`).
-    #[serde(default)]
     pub magic_dns: bool,
     /// The tailnet DNS search suffix(es) (engine `search_domains`), lowercased, no trailing dot.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub search_domains: Vec<String>,
     /// Global upstream resolvers in preference order (engine `resolvers`), each as an `addr:port`
     /// string via [`DnsResolver::udp_addr`](tailscale::DnsResolver::udp_addr).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub resolvers: Vec<String>,
     /// Split-DNS routes (engine `routes`): DNS suffix → the upstream resolver `addr:port` strings
     /// that answer that suffix. An empty value list is a negative route (names under the suffix are
     /// not resolved).
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub routes: std::collections::BTreeMap<String, Vec<String>>,
     /// Fallback resolvers (engine `fallback_resolvers`), preferred over [`resolvers`](DnsStatusReport::resolvers)
     /// for names matching no route, each as an `addr:port` string.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub fallback_resolvers: Vec<String>,
     /// DNS names control will assist provisioning TLS certs for (engine `cert_domains`).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub cert_domains: Vec<String>,
     /// Control-pushed static host records (engine `extra_records`), each as `(name, addr)` with the
     /// address rendered to a string.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub extra_records: Vec<(String, String)>,
     /// DNS suffixes this node (when acting as an exit-node DNS proxy) must not answer (engine
     /// `exit_node_filtered_set`), lowercased, no trailing dot.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub exit_node_filtered_set: Vec<String>,
 }
 
@@ -1203,6 +1221,104 @@ mod tests {
                 && !empty_json.contains("\"last_seen\"")
                 && !empty_json.contains("\"cap_map\""),
             "empty optional fields must be omitted from the wire: {empty_json}"
+        );
+    }
+
+    #[test]
+    fn prefs_view_tolerates_omitted_fields_on_the_wire() {
+        // Wire-compat: the container-level `#[serde(default)]` makes every PrefsView field omittable,
+        // so an older/partial JSON projection that omits the previously-non-defaulted fields
+        // (`advertise_exit_node`, `accept_routes`, `ssh`, `tun`, and the bools that only had a
+        // field-level default) deserializes to PrefsView::default() instead of hard-erroring. This
+        // fails if the container default is removed (a missing non-defaulted field would error).
+
+        // (1) The empty document parses entirely to defaults.
+        let empty = serde_json::from_str::<PrefsView>(r#"{}"#)
+            .expect("an empty PrefsView document must parse with the container default");
+        assert_eq!(empty.exit_node, None, "omitted exit_node defaults to None");
+        assert!(
+            !empty.advertise_exit_node,
+            "omitted advertise_exit_node defaults to false"
+        );
+        assert!(
+            empty.advertise_routes.is_empty(),
+            "omitted advertise_routes defaults to empty"
+        );
+        assert!(
+            empty.advertise_tags.is_empty(),
+            "omitted advertise_tags defaults to empty"
+        );
+        assert!(
+            !empty.accept_routes,
+            "omitted accept_routes defaults to false"
+        );
+        assert!(!empty.shields_up, "omitted shields_up defaults to false");
+        assert!(!empty.ssh, "omitted ssh defaults to false");
+        assert!(!empty.ssh_running, "omitted ssh_running defaults to false");
+        assert!(!empty.tun, "omitted tun defaults to false");
+
+        // (2) A partial document sets the present fields and defaults the omitted ones — in
+        //     particular the previously-non-defaulted `tun`/`ssh`/`advertise_exit_node` are absent
+        //     yet still parse.
+        let partial =
+            serde_json::from_str::<PrefsView>(r#"{"accept_routes":true,"shields_up":true}"#)
+                .expect("a partial PrefsView document must parse");
+        assert!(partial.accept_routes, "present accept_routes is honored");
+        assert!(partial.shields_up, "present shields_up is honored");
+        assert!(
+            !partial.advertise_exit_node,
+            "omitted advertise_exit_node still defaults to false"
+        );
+        assert!(!partial.ssh, "omitted ssh still defaults to false");
+        assert!(!partial.tun, "omitted tun still defaults to false");
+    }
+
+    #[test]
+    fn status_report_tolerates_omitted_fields_on_the_wire() {
+        // Wire-compat: the container-level `#[serde(default)]` makes every StatusReport field
+        // omittable, so a JSON status line that omits the previously-non-defaulted fields
+        // (`want_running`, `peers`, and the nested `prefs`) deserializes to StatusReport::default()
+        // instead of hard-erroring. This fails if the container default is removed.
+
+        // (1) The empty document parses entirely to defaults (including the nested PrefsView).
+        let empty = serde_json::from_str::<StatusReport>(r#"{}"#)
+            .expect("an empty StatusReport document must parse with the container default");
+        assert_eq!(empty.state, "", "omitted state defaults to empty");
+        assert!(
+            !empty.want_running,
+            "omitted want_running defaults to false"
+        );
+        assert_eq!(empty.self_ipv4, None, "omitted self_ipv4 defaults to None");
+        assert_eq!(empty.auth_url, None, "omitted auth_url defaults to None");
+        assert_eq!(empty.error, None, "omitted error defaults to None");
+        assert!(empty.peers.is_empty(), "omitted peers defaults to empty");
+        assert_eq!(empty.version, None, "omitted version defaults to None");
+        assert!(
+            !empty.have_node_key,
+            "omitted have_node_key defaults to false"
+        );
+        // The nested `prefs` also defaults (PrefsView does not derive PartialEq, so check a field).
+        assert_eq!(
+            empty.prefs.exit_node, None,
+            "omitted prefs defaults to PrefsView::default()"
+        );
+        assert!(
+            !empty.prefs.accept_routes,
+            "omitted prefs defaults to PrefsView::default()"
+        );
+
+        // (2) A partial document with only the IPN state still parses, defaulting the rest — the
+        //     previously-non-defaulted `want_running`/`peers` are absent yet do not error.
+        let partial = serde_json::from_str::<StatusReport>(r#"{"state":"Running"}"#)
+            .expect("a partial StatusReport document must parse");
+        assert_eq!(partial.state, "Running", "present state is honored");
+        assert!(
+            !partial.want_running,
+            "omitted want_running still defaults to false"
+        );
+        assert!(
+            partial.peers.is_empty(),
+            "omitted peers still defaults to empty"
         );
     }
 

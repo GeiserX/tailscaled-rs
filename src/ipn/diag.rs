@@ -332,23 +332,14 @@ pub(super) async fn file_cp(dev: &tailscale::Device, path: &str, peer: &str) -> 
             message: format!("cannot derive a file name from path {path:?}"),
         };
     };
-    // Path hardening (see method doc): the daemon opens `path` as root, so first `symlink_metadata`
-    // it (which does NOT follow a final-component symlink) and refuse anything that is not a regular
-    // file — a symlink, device (e.g. `/dev/zero`, an infinite stream), FIFO, socket, or directory.
-    // Done BEFORE the open so a non-regular target is never opened. `symlink_metadata` failing
-    // (missing/unreadable path) falls through here too, named the same way as the open error below.
-    match tokio::fs::symlink_metadata(path).await {
-        Ok(meta) if meta.file_type().is_file() => {}
-        Ok(_) => {
-            return Response::Error {
-                message: format!("refusing to send {path}: not a regular file"),
-            };
-        }
-        Err(e) => {
-            return Response::Error {
-                message: format!("cannot read {path}: {e}"),
-            };
-        }
+    // Path hardening (see method doc): the daemon opens `path` as root, so first stat it (via
+    // `taildrop_source_ok`, which `symlink_metadata`s WITHOUT following a final-component symlink)
+    // and refuse anything that is not a regular file — a symlink, device (e.g. `/dev/zero`, an
+    // infinite stream), FIFO, socket, directory, or a missing/unreadable path. Done BEFORE the open
+    // so a non-regular target is never opened. This predicate is the stat half; the `O_NOFOLLOW` open
+    // below is the TOCTOU-closing second half. The same check is unit-tested directly on the predicate.
+    if let Err(message) = taildrop_source_ok(path).await {
+        return Response::Error { message };
     }
     // The daemon opens the path (same-host/same-user; see the method doc). A read error here
     // (missing/unreadable file) fails closed, naming the path. `O_NOFOLLOW` closes the stat→open
@@ -463,23 +454,13 @@ pub(super) async fn file_get(
             };
         }
     };
-    // Dest hardening (see method doc): `symlink_metadata` does not follow a final-component
-    // symlink, so an existing symlink/device/FIFO/socket/dir at `dest` is refused rather than
-    // followed or clobbered. A `NotFound` is the normal case (we are about to create the file).
-    // Any other stat error fails closed, naming `dest`.
-    match tokio::fs::symlink_metadata(dest).await {
-        Ok(meta) if meta.file_type().is_file() => {} // existing regular file → overwrite is fine
-        Ok(_) => {
-            return Response::Error {
-                message: format!("refusing to write {dest}: exists and is not a regular file"),
-            };
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // does not exist → create below
-        Err(e) => {
-            return Response::Error {
-                message: format!("cannot write {dest}: {e}"),
-            };
-        }
+    // Dest hardening (see method doc): `taildrop_dest_ok` `symlink_metadata`s `dest` WITHOUT
+    // following a final-component symlink, so an existing symlink/device/FIFO/socket/dir is refused
+    // rather than followed or clobbered; a `NotFound` is the normal case (we are about to create the
+    // file). This predicate is the stat half; the `O_NOFOLLOW` create below is the TOCTOU-closing
+    // second half. The same check is unit-tested directly on the predicate.
+    if let Err(message) = taildrop_dest_ok(dest).await {
+        return Response::Error { message };
     }
     // Copy off the async runtime: `std::io::copy` over `std::fs` handles is blocking, so do it on
     // a blocking thread rather than stall an async worker. The `dest` string is moved in. The create
@@ -541,6 +522,43 @@ async fn capture_dest_ok(path: &str) -> Result<(), String> {
         Ok(_) => Err(format!("refusing to capture to {path}: not a regular file")),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("cannot stat {path}: {e}")),
+    }
+}
+
+/// Validate a `file cp` **source** path before the daemon (running as root) opens it for reading:
+/// `Ok(())` only if the path EXISTS and is a **regular file**; `Err(reason)` otherwise — a symlink
+/// (refused as the link itself, never followed, since `symlink_metadata` does not traverse the final
+/// component), device (e.g. `/dev/zero`, an infinite stream), FIFO, socket, directory, or a
+/// missing/unreadable path. Unlike [`capture_dest_ok`]/[`taildrop_dest_ok`] a *missing* path is an
+/// ERROR here (there is nothing to send), so the absent case is folded into the same fail-closed
+/// message the open would produce. This is the stat half of `file_cp`'s hardening; the open it gates
+/// also uses `O_NOFOLLOW` to close the stat→open TOCTOU window. Pure (just a stat) → unit-testable
+/// without a device.
+async fn taildrop_source_ok(path: &str) -> Result<(), String> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(meta) if meta.file_type().is_file() => Ok(()),
+        Ok(_) => Err(format!("refusing to send {path}: not a regular file")),
+        // A missing/unreadable source has nothing to send — named the same way as the open error.
+        Err(e) => Err(format!("cannot read {path}: {e}")),
+    }
+}
+
+/// Validate a `file get` **dest** path before the daemon (running as root) creates/overwrites it:
+/// `Ok(())` if the path is missing (the normal fresh-fetch case) or an existing **regular file**
+/// (overwritten); `Err(reason)` if it EXISTS as anything else — a symlink (refused as the link
+/// itself, never followed, since `symlink_metadata` does not traverse the final component), device,
+/// FIFO, socket, or directory. Same shape as [`capture_dest_ok`] (a missing dest is allowed and the
+/// copy creates it), only the message differs. This is the stat half of `file_get`'s hardening; the
+/// create it gates also uses `O_NOFOLLOW` to close the stat→create TOCTOU window. Pure (just a stat)
+/// → unit-testable without a device.
+async fn taildrop_dest_ok(dest: &str) -> Result<(), String> {
+    match tokio::fs::symlink_metadata(dest).await {
+        Ok(meta) if meta.file_type().is_file() => Ok(()), // existing regular file → overwrite is fine
+        Ok(_) => Err(format!(
+            "refusing to write {dest}: exists and is not a regular file"
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()), // does not exist → create below
+        Err(e) => Err(format!("cannot write {dest}: {e}")),
     }
 }
 
@@ -673,45 +691,55 @@ mod tests {
     //
     // Because the daemon opens the `file_cp` source and writes the `file_get` dest AS ROOT, both
     // refuse anything that is not a regular file (a symlink — never followed — device, FIFO, socket,
-    // or directory): `file_cp` always, `file_get` only when `dest` already exists (a fresh dest is
-    // created). The full methods need a live `&Device`, so these tests pin the load-bearing predicate
-    // directly — `symlink_metadata(p).file_type().is_file()` over real temp paths — proving a regular
-    // file is accepted, a directory is refused, and a symlink reads as NOT a regular file (so it is
-    // rejected as the link itself, never traversed). This is the exact check both methods perform.
+    // or directory). That stat-check half is now an extracted pure predicate that the production
+    // methods CALL — `taildrop_source_ok` (file_cp: source must EXIST as a regular file) and
+    // `taildrop_dest_ok` (file_get: dest must be a regular file OR absent) — mirroring how
+    // `debug_capture` calls `capture_dest_ok`. These tests therefore exercise the SAME code the
+    // methods run (no re-implementation), over real temp paths: a regular file is accepted, a symlink
+    // is rejected as the link itself (never traversed), a directory is refused, and the absent case
+    // differs by predicate (source → error, dest → ok). The `O_NOFOLLOW` open that closes the
+    // stat→open TOCTOU window is the load-bearing SECOND half, pinned separately below.
 
-    #[test]
-    fn path_hardening_accepts_regular_file_rejects_dir() {
-        // A regular file → accepted; a directory → refused. This is the `file_cp` source rule and the
-        // `file_get` existing-dest rule, exercised through the same `symlink_metadata` + `is_file`
-        // predicate the methods use.
-        let base = std::env::temp_dir().join(format!("tailnetd-hard-reg-{}", std::process::id()));
+    #[tokio::test]
+    async fn taildrop_source_ok_accepts_regular_rejects_dir_and_missing() {
+        // `file_cp` source rule, via the production predicate: a regular file → Ok; a directory →
+        // Err; a missing path → Err (nothing to send). This is the exact check `file_cp` now calls.
+        use super::taildrop_source_ok;
+        let base = std::env::temp_dir().join(format!("tailnetd-src-ok-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
+
         let file = base.join("regular.bin");
         std::fs::write(&file, b"hello").unwrap();
-
-        let fmeta = std::fs::symlink_metadata(&file).unwrap();
         assert!(
-            fmeta.file_type().is_file(),
-            "a regular file must satisfy the regular-file check (accepted)"
+            taildrop_source_ok(file.to_str().unwrap()).await.is_ok(),
+            "a regular file must be accepted as a file_cp source"
         );
-        let dmeta = std::fs::symlink_metadata(&base).unwrap();
+
+        // A directory is refused (can't be sent / can't be tricked into reading through a non-file).
         assert!(
-            !dmeta.file_type().is_file(),
-            "a directory must NOT satisfy the regular-file check (refused)"
+            taildrop_source_ok(base.to_str().unwrap()).await.is_err(),
+            "a directory must be refused as a file_cp source"
+        );
+
+        // A missing source is an error (unlike a dest, there is nothing to send).
+        let missing = base.join("does-not-exist.bin");
+        assert!(
+            taildrop_source_ok(missing.to_str().unwrap()).await.is_err(),
+            "a missing source must be refused (nothing to send)"
         );
 
         let _ = std::fs::remove_dir_all(&base);
     }
 
     #[cfg(unix)]
-    #[test]
-    fn path_hardening_rejects_symlink_without_following() {
-        // A symlink must read as NOT a regular file via `symlink_metadata` (which does not traverse
-        // the final component), EVEN when it points at a regular file — so `file_cp`/`file_get` reject
-        // the link itself rather than following it to a target the operator did not name. This is the
-        // symlink-trick defense both methods rely on.
-        let base = std::env::temp_dir().join(format!("tailnetd-hard-sym-{}", std::process::id()));
+    #[tokio::test]
+    async fn taildrop_source_ok_rejects_symlink_without_following() {
+        // A symlink at the source must be refused as the LINK itself (not followed to its target),
+        // EVEN when it points at a regular file — `symlink_metadata` does not traverse the final
+        // component. Pinned through the production predicate `file_cp` calls.
+        use super::taildrop_source_ok;
+        let base = std::env::temp_dir().join(format!("tailnetd-src-sym-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         let target = base.join("target.bin");
@@ -719,34 +747,72 @@ mod tests {
         let link = base.join("link.bin");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        let lmeta = std::fs::symlink_metadata(&link).unwrap();
         assert!(
-            lmeta.file_type().is_symlink(),
-            "symlink_metadata must see the link itself, not its target"
+            taildrop_source_ok(link.to_str().unwrap()).await.is_err(),
+            "a symlink source must be refused as the link itself, never followed to its target"
         );
+        // The target must be untouched — the predicate only stats, never reads through the link.
+        assert_eq!(std::fs::read(&target).unwrap(), b"data");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn taildrop_dest_ok_accepts_regular_and_missing_rejects_dir() {
+        // `file_get` dest rule, via the production predicate: a missing dest → Ok (the copy creates
+        // it — the normal case), an existing regular file → Ok (overwritten), a directory → Err.
+        // This is the exact check `file_get` now calls (same shape as `capture_dest_ok`).
+        use super::taildrop_dest_ok;
+        let base = std::env::temp_dir().join(format!("tailnetd-dest-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        // The normal fresh-fetch case: a non-existent dest passes (created by the copy).
+        let missing = base.join("does-not-exist.bin");
         assert!(
-            !lmeta.file_type().is_file(),
-            "a symlink must NOT satisfy the regular-file check → it is refused, never followed"
+            taildrop_dest_ok(missing.to_str().unwrap()).await.is_ok(),
+            "a non-existent dest must be allowed (file_get creates it)"
+        );
+
+        // An existing regular file is OK (overwritten).
+        let reg = base.join("old.bin");
+        std::fs::write(&reg, b"x").unwrap();
+        assert!(
+            taildrop_dest_ok(reg.to_str().unwrap()).await.is_ok(),
+            "an existing regular-file dest must be allowed (overwrite)"
+        );
+
+        // A directory is refused (can't clobber / write through a non-file).
+        assert!(
+            taildrop_dest_ok(base.to_str().unwrap()).await.is_err(),
+            "a directory dest must be refused"
         );
 
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    #[test]
-    fn file_get_dest_nonexistent_is_allowed() {
-        // The normal `file_get` case: a `dest` that does not exist passes the hardening check (the
-        // copy then creates it). Pin the `NotFound`-means-create branch the method keys on.
-        let base = std::env::temp_dir().join(format!("tailnetd-hard-dest-{}", std::process::id()));
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn taildrop_dest_ok_rejects_existing_symlink_without_following() {
+        // An EXISTING symlink at the dest must be refused as the link itself (not followed/clobbered),
+        // even when it points at a regular file. Pinned through the production predicate `file_get` calls.
+        use super::taildrop_dest_ok;
+        let base = std::env::temp_dir().join(format!("tailnetd-dest-sym-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
-        let missing = base.join("does-not-exist.bin");
-        match std::fs::symlink_metadata(&missing) {
-            Err(e) => assert_eq!(
-                e.kind(),
-                std::io::ErrorKind::NotFound,
-                "a non-existent dest must stat as NotFound → file_get creates it"
-            ),
-            Ok(_) => panic!("the dest must not exist for this test"),
-        }
+        std::fs::create_dir_all(&base).unwrap();
+        let target = base.join("target.bin");
+        std::fs::write(&target, b"data").unwrap();
+        let link = base.join("link.bin");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(
+            taildrop_dest_ok(link.to_str().unwrap()).await.is_err(),
+            "an existing symlink dest must be refused as the link itself, never followed/clobbered"
+        );
+        // The target must be untouched — the predicate only stats, never writes through the link.
+        assert_eq!(std::fs::read(&target).unwrap(), b"data");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[cfg(unix)]
