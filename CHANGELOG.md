@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.40.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.39.0...v0.40.0) (2026-06-12)
+
+
+### Features
+
+* **set:** apply hostname/accept-routes/advertise-* live (no reconnect) ([#110](https://github.com/GeiserX/tailscaled-rs/issues/110)) ([9290e0c](https://github.com/GeiserX/tailscaled-rs/commit/9290e0cac4858c14f5844cffbeff83d604d20813))
+
 ## [0.39.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.38.0...v0.39.0) (2026-06-12)
 
 
