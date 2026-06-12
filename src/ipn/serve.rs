@@ -30,17 +30,38 @@
 
 use std::path::{Path, PathBuf};
 
-pub use crate::localapi::{RedirectSpec, ServeConfig, TcpPortHandler, WebMount};
+pub use crate::localapi::{
+    HttpHandler, RedirectSpec, ServeConfig, TcpPortHandler, WebMount, WebServerConfig,
+};
 
 /// Whether a handler is a web entry served via engine delegation (the [`build_web_serve_state`]
 /// lane), as opposed to the plain-TCP-forward lane ([`is_plain_tcp_forward`]) or a not-served
-/// `TerminateTLS` entry. A handler is web if it carries ANY web aspect: an `https`/`http` proxy (a
-/// non-empty `tcp_forward`), a fixed `text` body, a `redirect`, or path `mounts`.
+/// `TerminateTLS` entry, **judging the handler alone**: it carries a *legacy* web aspect — an
+/// `https`/`http` proxy (a non-empty `tcp_forward`), a fixed `text` body, a `redirect`, or path
+/// `mounts`. NOTE: a Go-shaped web port keeps its target in the top-level `Web` map (the per-port
+/// handler is just `HTTPS:true` with no `tcp_forward`), so this handler-only predicate misses it —
+/// use [`port_is_web_serve`] when the [`ServeConfig`] is available (LANE dispatch / `has_web`).
 pub fn is_web_serve(h: &TcpPortHandler) -> bool {
     ((h.https || h.http) && !h.tcp_forward.is_empty())
         || h.text.is_some()
         || h.redirect.is_some()
         || !h.mounts.is_empty()
+}
+
+/// Whether the port keyed `port_str` is a servable web entry, judged against the WHOLE
+/// [`ServeConfig`] (so it sees the top-level `Web` map, unlike the handler-only [`is_web_serve`]). A
+/// port is a web serve if its handler carries a legacy web aspect ([`is_web_serve`]) OR it has an
+/// `HTTPS`/`HTTP` flag set AND a matching `Web[host:port]` entry exists (any `host`, matched by the
+/// `:port` suffix — the LANE dispatch doesn't resolve the node FQDN, and a port is unique per config).
+pub fn port_is_web_serve(cfg: &ServeConfig, port_str: &str, h: &TcpPortHandler) -> bool {
+    if is_web_serve(h) {
+        return true;
+    }
+    if h.https || h.http {
+        let suffix = format!(":{port_str}");
+        return cfg.web.keys().any(|k| k.ends_with(&suffix));
+    }
+    false
 }
 
 /// Translate one [`WebMount`] into the engine's nested [`ServeTarget`](tailscale::ServeTarget).
@@ -117,6 +138,74 @@ fn handler_to_target(h: &TcpPortHandler) -> Result<tailscale::ServeTarget, &'sta
     Err("web handler has no servable target")
 }
 
+/// Parse Go's `HTTPHandler.Redirect` **string** form into `(to, status)`. A bare URL redirects with
+/// 302 (Go's default); a `"<code>:<url>"` prefix picks the status (Go `ipn/serve.go`'s redirect
+/// parsing). The split is on the FIRST `:` only when the prefix before it is all-ASCII-digits — so a
+/// bare `https://…` (whose scheme has a `:`) is NOT mistaken for a status prefix. Validated by the
+/// caller via [`validate_redirect`] (non-empty, no CR/LF, 300..=399).
+fn parse_go_redirect(redirect: &str) -> (String, u16) {
+    if let Some((maybe_code, rest)) = redirect.split_once(':')
+        && !maybe_code.is_empty()
+        && maybe_code.chars().all(|c| c.is_ascii_digit())
+        && let Ok(code) = maybe_code.parse::<u16>()
+    {
+        return (rest.to_string(), code);
+    }
+    (redirect.to_string(), 302)
+}
+
+/// Translate one Go-shaped [`HttpHandler`] into the engine's [`ServeTarget`](tailscale::ServeTarget),
+/// with the same precedence Go gives (exactly one of proxy/text/redirect is set): `proxy` → `Proxy`,
+/// `text` → `Text`, `redirect` → `Redirect` (parsing the Go string form). Go's `path` (filesystem
+/// directory serving) has no engine analogue at this pin → `Err` (recognized, not served). Returns
+/// `Err(reason)` for an empty/unservable handler so the caller can skip + log it.
+fn http_handler_to_target(h: &HttpHandler) -> Result<tailscale::ServeTarget, &'static str> {
+    if !h.proxy.is_empty() {
+        return Ok(tailscale::ServeTarget::Proxy {
+            to: h.proxy.clone(),
+        });
+    }
+    if !h.text.is_empty() {
+        return Ok(tailscale::ServeTarget::Text {
+            body: h.text.clone(),
+        });
+    }
+    if !h.redirect.is_empty() {
+        let (to, status) = parse_go_redirect(&h.redirect);
+        validate_redirect(&to, status)?;
+        return Ok(tailscale::ServeTarget::Redirect { to, status });
+    }
+    if !h.path.is_empty() {
+        // Go's `Path` serves a filesystem directory/file; the engine `ServeTarget::Path` is a
+        // path-prefix MUX, not a static-file server — no faithful analogue at this pin.
+        return Err("filesystem Path handlers are not served by this build");
+    }
+    Err("web handler has no servable target (no proxy/text/redirect)")
+}
+
+/// Translate a Go [`WebServerConfig`] (a `host:port`'s mount→handler map) into the engine
+/// [`ServeTarget`](tailscale::ServeTarget) for its port: a lone `/` mount is the bare handler it holds
+/// (no needless one-level mux); multiple mounts become a `Path` mux (longest-match). Mirrors
+/// [`handler_to_target`]'s mount logic but over the Go-shaped [`HttpHandler`] map. `Err` if it
+/// produces no valid target.
+fn web_server_config_to_target(
+    wsc: &WebServerConfig,
+) -> Result<tailscale::ServeTarget, &'static str> {
+    if wsc.handlers.is_empty() {
+        return Err("web server config has no handlers");
+    }
+    if wsc.handlers.len() == 1
+        && let Some(root) = wsc.handlers.get("/")
+    {
+        return http_handler_to_target(root);
+    }
+    let mut handlers = std::collections::BTreeMap::new();
+    for (mount, h) in &wsc.handlers {
+        handlers.insert(mount.clone(), http_handler_to_target(h)?);
+    }
+    Ok(tailscale::ServeTarget::Path { handlers })
+}
+
 /// Translate the **web** subset of a [`ServeConfig`] into the engine's
 /// [`ServeState`](tailscale::ServeState) for [`Device::set_serve_config`](tailscale::Device::set_serve_config).
 ///
@@ -139,25 +228,36 @@ fn handler_to_target(h: &TcpPortHandler) -> Result<tailscale::ServeTarget, &'sta
 /// the way to clear a previously-armed web serve). The returned state passes the engine's
 /// `ServeState::validate()` for valid inputs.
 pub fn build_web_serve_state(cfg: &ServeConfig, name: &str) -> tailscale::ServeState {
+    let host = name.trim_end_matches('.');
     let mut ports = std::collections::BTreeMap::new();
     for (port_str, h) in &cfg.tcp {
+        let Ok(port) = port_str.parse::<u16>() else {
+            // A non-numeric key can't be a tailnet port; skip (the persistence layer keeps it).
+            continue;
+        };
         // Both web entries and TLS-terminated raw-TCP forwards ride this engine-delegation lane: the
         // engine terminates TLS with the node cert and (for a `Proxy` target) verbatim-splices to the
-        // backend, which is exactly Go's `TerminateTLS`. A terminate-tls handler maps straight to
-        // `Proxy { to: tcp_forward }` (no web precedence to resolve); web handlers go through
-        // `handler_to_target`. Everything else (plain TCP forward, proxy-protocol terminate-tls,
-        // backendless web) is excluded here and handled/logged by the LANE dispatch in `spawn_serve`.
+        // backend, which is exactly Go's `TerminateTLS`. Everything else (plain TCP forward,
+        // proxy-protocol terminate-tls, backendless web) is excluded here and handled/logged by the
+        // LANE dispatch in `spawn_serve`.
         let target = if is_terminate_tls_serve(h) {
+            // A terminate-tls handler maps straight to `Proxy { to: tcp_forward }` (no web mounts).
             Ok(tailscale::ServeTarget::Proxy {
                 to: h.tcp_forward.clone(),
             })
+        } else if h.https || h.http {
+            // A web port (HTTPS/HTTP flag). Prefer the Go-shaped `Web[host:port]` handlers; fall back
+            // to the legacy per-handler fields (text/redirect/mounts/tcp_forward) when this port has no
+            // `Web` entry — the deprecation window where an older on-disk config still arms.
+            let hostport = format!("{host}:{port}");
+            match cfg.web.get(&hostport) {
+                Some(wsc) => web_server_config_to_target(wsc),
+                None => handler_to_target(h),
+            }
         } else if is_web_serve(h) {
+            // No HTTPS/HTTP flag but legacy web bodies present (a pre-flag on-disk config): legacy path.
             handler_to_target(h)
         } else {
-            continue;
-        };
-        let Ok(port) = port_str.parse::<u16>() else {
-            // A non-numeric key can't be a tailnet port; skip (the persistence layer keeps it).
             continue;
         };
         match target {
@@ -512,6 +612,114 @@ mod tests {
         );
         assert_eq!(state.name, "host.ts.net");
         assert!(state.validate().is_ok());
+    }
+
+    #[test]
+    fn parse_go_redirect_forms() {
+        // Bare URL → 302 (Go default).
+        assert_eq!(
+            parse_go_redirect("https://h/new"),
+            ("https://h/new".into(), 302)
+        );
+        // "<code>:<url>" picks the status.
+        assert_eq!(
+            parse_go_redirect("301:https://h/new"),
+            ("https://h/new".into(), 301)
+        );
+        // A bare https URL must NOT be mistaken for a status prefix (the scheme's `:` is not numeric).
+        assert_eq!(parse_go_redirect("http://h/x"), ("http://h/x".into(), 302));
+    }
+
+    #[test]
+    fn build_web_serve_state_reads_the_go_web_map() {
+        // A Go-shaped config: TCP[443]={HTTPS:true} + the target in Web[host:443].Handlers["/"].
+        // build_web_serve_state must derive the host:port key from `name` and serve the Web handler.
+        let go_json = r#"{"TCP":{"443":{"HTTPS":true}},"Web":{"host.ts.net:443":{"Handlers":{"/":{"Proxy":"127.0.0.1:3000"}}}}}"#;
+        let cfg: ServeConfig = serde_json::from_str(go_json).unwrap();
+        let state = build_web_serve_state(&cfg, "host.ts.net.");
+        assert_eq!(
+            state.ports.get(&443),
+            Some(&tailscale::ServeTarget::Proxy {
+                to: "127.0.0.1:3000".into()
+            }),
+            "the Web[host:443] proxy handler must be served, not dropped"
+        );
+        assert_eq!(state.name, "host.ts.net");
+        assert!(state.validate().is_ok());
+    }
+
+    #[test]
+    fn build_web_serve_state_web_map_multi_mount_and_redirect() {
+        // Multiple mounts → Path mux; the Go string-form redirect is parsed. The Web key host must be
+        // a real tailnet name (the engine's validate() requires is_tailnet_name on a TLS port).
+        let go_json = r#"{"TCP":{"443":{"HTTPS":true}},"Web":{"host.ts.net:443":{"Handlers":{"/":{"Proxy":"127.0.0.1:3000"},"/old":{"Redirect":"301:https://host.ts.net/new"}}}}}"#;
+        let cfg: ServeConfig = serde_json::from_str(go_json).unwrap();
+        let state = build_web_serve_state(&cfg, "host.ts.net");
+        match state.ports.get(&443) {
+            Some(tailscale::ServeTarget::Path { handlers }) => {
+                assert_eq!(
+                    handlers.get("/"),
+                    Some(&tailscale::ServeTarget::Proxy {
+                        to: "127.0.0.1:3000".into()
+                    })
+                );
+                assert_eq!(
+                    handlers.get("/old"),
+                    Some(&tailscale::ServeTarget::Redirect {
+                        to: "https://host.ts.net/new".into(),
+                        status: 301
+                    })
+                );
+            }
+            other => panic!("expected a Path mux, got {other:?}"),
+        }
+        assert!(state.validate().is_ok());
+    }
+
+    #[test]
+    fn build_web_serve_state_legacy_fallback_when_no_web_entry() {
+        // A legacy-shaped config (HTTPS flag + tcp_forward on the handler, NO Web map) still arms via
+        // the deprecation-window fallback to handler_to_target.
+        let mut cfg = ServeConfig::default();
+        cfg.tcp.insert(
+            "443".into(),
+            TcpPortHandler {
+                https: true,
+                tcp_forward: "127.0.0.1:3000".into(),
+                ..Default::default()
+            },
+        );
+        let state = build_web_serve_state(&cfg, "h");
+        assert_eq!(
+            state.ports.get(&443),
+            Some(&tailscale::ServeTarget::Proxy {
+                to: "127.0.0.1:3000".into()
+            }),
+            "legacy handler with no Web entry must still serve (fallback)"
+        );
+    }
+
+    #[test]
+    fn port_is_web_serve_consults_the_web_map() {
+        // A Go-shaped port (HTTPS flag, target only in Web) has a handler that is_web_serve misses,
+        // but port_is_web_serve sees via the Web map.
+        let cfg: ServeConfig = serde_json::from_str(
+            r#"{"TCP":{"443":{"HTTPS":true}},"Web":{"h:443":{"Handlers":{"/":{"Text":"hi"}}}}}"#,
+        )
+        .unwrap();
+        let h = &cfg.tcp["443"];
+        assert!(
+            !is_web_serve(h),
+            "handler-only predicate misses the Web map"
+        );
+        assert!(
+            port_is_web_serve(&cfg, "443", h),
+            "config-aware predicate must see the Web[h:443] entry"
+        );
+        // A flag-set port with NO matching Web entry is not a web serve (nothing to serve).
+        let orphan: ServeConfig =
+            serde_json::from_str(r#"{"TCP":{"8443":{"HTTPS":true}}}"#).unwrap();
+        assert!(!port_is_web_serve(&orphan, "8443", &orphan.tcp["8443"]));
     }
 
     #[test]
