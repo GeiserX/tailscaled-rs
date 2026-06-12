@@ -498,3 +498,41 @@ macOS `lowest_free_utun` + root check it already does). The routing/DNS itself m
 `ts_host_net/src/windows.rs` mirroring Go `router_windows.go` (route table via the Windows routing
 API / `netsh`, DNS via the NRPT or per-interface resolver). Filed so the gap is recorded; the daemon
 consumes it for free (it's automatic in the TUN datapath) once it lands. No rush. — daemon lane
+
+## 19. (BUG — TUN mode has no peer connectivity) `host_routes_from_node` omits peer AllowedIPs
+
+**Severity: HIGH for `--tun` mode** (TUN-mode nodes can reach MagicDNS but NOT their tailnet peers).
+**Found via a live Linux TUN end-to-end on a fresh ARM64 VM (2026-06-12)** — the first live `--tun`
+drive of the daemon (userspace mode was the only path previously verified).
+
+**Repro (Linux ARM64, Ubuntu 24.04, engine pin 81446f88 / v0.28.2):** `tailnetd` (root) +
+`tnet up --tun` joins the tailnet and reaches `Running`, `TUN: True`, self `100.64.0.1` (illustrative
+CGNAT addr). The kernel `tailscale0` iface is created and carries `inet 100.64.0.1/32` (✅ device +
+self-addr work). But:
+- `ip -4 route show` has **only** `100.100.100.100 dev tailscale0` (the MagicDNS /32). **No per-peer
+  `100.x/32` routes** — even though `tnet status --json` shows peers online with e.g.
+  `AllowedIPs: ['100.64.0.2/32']`.
+- `ip route get 100.64.0.2` → `via <gateway> dev <eth>` (the **physical** iface, not the TUN).
+- `ping -c3 100.64.0.2` → 100% loss. TUN-mode peer connectivity is broken.
+
+**Root cause (read `ts_runtime/src/tun_actor.rs` `host_routes_from_node` @ 81446f88):** the host route
+set is built **solely from `node.accepted_routes`** (the subnet-routes-this-node-accepts set, gated on
+`--accept-routes`) + the MagicDNS `/32`. It **never adds the peers' AllowedIPs** (the per-peer tailnet
+`/32`s). Go `tailscaled` feeds the router `Config.Routes` = the **union of every peer's AllowedIPs**
+(`wgengine` → `router.Set`), so each peer's `100.x/32` is routed via the tailscale iface. Our engine
+omits that union entirely, so the OS has no route to any peer over the TUN — traffic falls through to
+the default (physical) route.
+
+**Ask (the Go-parity fix):** in `host_routes_from_node`, ALSO install each peer's AllowedIPs (the
+per-peer `100.x/32` + any peer-advertised subnet the node accepts) as routes `dev <tun>` — the union
+Go's `wgengine` passes to the router. The peer set is in the netmap the `tun_actor` already holds
+(the same source `status` reads peers + AllowedIPs from). Keep IPv4-only + the self-`/32` exclusion +
+the `/0`-only-if-exit-node gating as-is; this is purely ADDING the peer-AllowedIPs union that's
+currently missing. Suggested test: a TUN node with ≥1 peer ⇒ `ip route` has a `dev <tun>` route for
+that peer's `/32`, and `ip route get <peer_v4>` selects the TUN.
+
+**Daemon impact:** none on the daemon side (the daemon just selects TUN; the engine owns route
+programming, ask #18 / the closed router beads). The daemon consumes the fix via a pin bump and the
+Linux TUN e2e (this repro) then passes A4 (peer connectivity). Filed with full live evidence; the
+daemon's Phase-3 "transparent OS-wide connectivity" claim is blocked on this for the peer-reachability
+half (the device/self-addr/MagicDNS half already works). — daemon lane

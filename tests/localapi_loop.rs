@@ -273,9 +273,15 @@ async fn status_round_trip_reports_offline_state() {
 }
 
 /// 2. down round-trip: `down` succeeds offline (no engine to tear down, just persists intent), and
-///    a subsequent `status` reports the node as explicitly Stopped and not wanting to run.
+///    a subsequent `status` reports `want_running=false`. Because this harness *never registers*
+///    (no auth key, no `up` — see the module docs), no node key was ever minted, so the derived
+///    state is **`NoState`**, NOT `Stopped`: Go's `nextStateLocked` gates the no-netmap `Stopped`
+///    return on `hasNodeKeyLocked()` (`ipn/ipnlocal/local.go`: `!wantRunning && !loggedOut &&
+///    !blocked && hasNodeKey → Stopped`, else the `netMap==nil`/`state==NoState` path → `NoState`).
+///    A never-registered node down is `NoState` in Go too. (The `has_node_key → Stopped` path — the
+///    real up→down→restart case — is pinned by the `down_with_persisted_key_is_stopped` unit test.)
 #[tokio::test]
-async fn down_round_trip_then_status_is_stopped() {
+async fn down_round_trip_then_status_is_no_state() {
     let harness = Harness::start().await;
 
     let down_resp = harness.round_trip(r#"{"cmd":"down"}"#).await;
@@ -286,7 +292,8 @@ async fn down_round_trip_then_status_is_stopped() {
         other => panic!("expected Response::Ok from down, got {other:?}"),
     }
 
-    // After an explicit `down`, the node is configured-but-stopped.
+    // After `down` on a never-registered node, want_running is false and — with no persisted node
+    // key — the derived state is NoState (matching Go's hasNodeKeyLocked() gate), not Stopped.
     let status_resp = harness.round_trip(r#"{"cmd":"status"}"#).await;
     match status_resp {
         Response::Status(report) => {
@@ -295,8 +302,8 @@ async fn down_round_trip_then_status_is_stopped() {
                 "after down, want_running must be false"
             );
             assert_eq!(
-                report.state, "Stopped",
-                "after an explicit down, the node should derive to Stopped"
+                report.state, "NoState",
+                "a never-registered node (no node key) derives to NoState after down, like Go"
             );
         }
         other => panic!("expected Response::Status after down, got {other:?}"),
