@@ -515,6 +515,12 @@ pub struct StatusReport {
     pub magic_dns_suffix: Option<String>,
     /// Known peers in the netmap.
     pub peers: Vec<PeerReport>,
+    /// The daemon's own version (its crate version), Go `Status.Version`. Carried so `status --json`
+    /// can surface it the way Go does (and the way `tnet version --daemon` already reports it
+    /// separately). `#[serde(default)]` + `skip_serializing_if` keep the wire backward-compatible with
+    /// clients that predate this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 /// A read-only projection of the node's persisted [`Prefs`](crate::prefs::Prefs) for `status`
@@ -1251,6 +1257,7 @@ mod tests {
                 is_exit_node: true,
                 ..Default::default()
             }],
+            version: None,
         });
         let json = serde_json::to_string(&report).unwrap();
         let back: Response = serde_json::from_str(&json).unwrap();
@@ -1291,6 +1298,7 @@ mod tests {
             active_exit_node: None,
             magic_dns_suffix: None,
             peers: vec![],
+            version: None,
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("auth_url"));
@@ -1326,6 +1334,7 @@ mod tests {
             active_exit_node: None,
             magic_dns_suffix: None,
             peers: vec![],
+            version: None,
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"error\""));
@@ -1355,6 +1364,7 @@ mod tests {
             active_exit_node: None,
             magic_dns_suffix: None,
             peers: vec![],
+            version: None,
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(
@@ -1381,6 +1391,7 @@ mod tests {
             active_exit_node: None,
             magic_dns_suffix: None,
             peers: vec![],
+            version: None,
         };
         let pending_json = serde_json::to_string(&pending).unwrap();
         assert!(pending_json.contains("auth_url"));
@@ -1405,6 +1416,7 @@ mod tests {
             active_exit_node: None,
             magic_dns_suffix: None,
             peers: vec![],
+            version: None,
         };
         let failed_json = serde_json::to_string(&failed).unwrap();
         assert!(failed_json.contains("\"error\""));

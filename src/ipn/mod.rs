@@ -1975,6 +1975,9 @@ impl Backend {
             active_exit_node,
             magic_dns_suffix,
             peers,
+            // The daemon's own version (Go `Status.Version`) — the same crate version the `version`
+            // request reports, surfaced here so `status --json` carries it too.
+            version: Some(env!("CARGO_PKG_VERSION").to_string()),
         }
     }
 

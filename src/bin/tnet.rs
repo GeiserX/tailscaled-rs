@@ -2559,6 +2559,20 @@ fn format_status_json(s: &tailscaled_rs::localapi::StatusReport) -> Result<Strin
 
     let mut root = Map::new();
     root.insert("BackendState".into(), json!(s.state));
+    // Version (Go `Status.Version`): the daemon's own version, carried on the report. Surfaced here
+    // so `status --json | jq .Version` answers the way `version --daemon` does.
+    if let Some(v) = &s.version {
+        root.insert("Version".into(), json!(v));
+    }
+    // TUN (Go `Status.TUN`): whether the node runs on a kernel TUN interface vs the userspace
+    // netstack. The persisted pref is the daemon's answer (the human `status` already prints it); the
+    // JSON dropped it. Go emits the bare bool always.
+    root.insert("TUN".into(), json!(s.prefs.tun));
+    // HaveNodeKey (Go `Status.HaveNodeKey`, omitempty): the node holds a registered node key — true
+    // once it is past the pre-login states. Go omits it when false, so only emit it when true.
+    if !matches!(s.state.as_str(), "NoState" | "NeedsLogin") {
+        root.insert("HaveNodeKey".into(), json!(true));
+    }
     // AuthURL: Go emits the field always (empty when none); mirror that.
     root.insert("AuthURL".into(), json!(s.auth_url.as_deref().unwrap_or("")));
     root.insert("TailscaleIPs".into(), json!(self_ips));
@@ -4944,6 +4958,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            version: None,
         };
 
         // No filter → everything.
@@ -5025,6 +5040,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            version: Some("0.36.0".to_string()),
         };
         let out = format_status_json(&report).unwrap();
         let v: serde_json::Value =
@@ -5040,6 +5056,11 @@ mod tests {
         );
         assert_eq!(v["MagicDNSSuffix"], serde_json::json!("tail0123.ts.net"));
         assert_eq!(v["ExitNodeStatus"]["ID"], serde_json::json!("peer-b"));
+        // Version (Go `Status.Version`) + TUN (Go `Status.TUN`) now surfaced; HaveNodeKey true once
+        // past the pre-login states (this report is Running). All Go-cased field names.
+        assert_eq!(v["Version"], serde_json::json!("0.36.0"));
+        assert_eq!(v["TUN"], serde_json::json!(false)); // PrefsView::default() → netstack
+        assert_eq!(v["HaveNodeKey"], serde_json::json!(true));
         // Self subset.
         assert_eq!(v["Self"]["HostName"], serde_json::json!("node-a"));
         assert_eq!(
