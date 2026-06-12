@@ -1957,7 +1957,12 @@ fn format_lock_status(r: &tailscaled_rs::localapi::LockReport, json: bool) -> St
     // engine's read-only `tka_status` carries only the authority head + a pending-disablement signal
     // (ENGINE_ASKS #17). `authority head` is itself a fork-specific extra (Go has no such line).
     if !r.head.is_empty() {
-        out.push_str(&format!("  authority head: {}\n", r.head));
+        // `head` is control's AUMHash, copied verbatim from the engine with no daemon-side charset
+        // check — sanitize before terminal display (defense-in-depth, like the dns/file formatters).
+        out.push_str(&format!(
+            "  authority head: {}\n",
+            sanitize_for_terminal(&r.head)
+        ));
     }
     if r.disabled {
         out.push_str("  status: a disablement is pending (control signalled disable).\n");
@@ -2019,12 +2024,16 @@ fn format_dns_status(r: &tailscaled_rs::localapi::DnsStatusReport, json: bool) -
         out.push_str("MagicDNS: disabled tailnet-wide.\n");
     }
 
+    // Every resolver/suffix/domain/record below is CONTROL-PUSHED (from the netmap DNS config), so it
+    // is run through `sanitize_for_terminal` before rendering — a malicious/compromised control server
+    // could otherwise smuggle ANSI/OSC escape sequences into the operator's terminal. Mirrors the
+    // hardening already applied to `format_files`/`format_whois`. The `--json` path is serde-escaped.
     out.push_str("Resolvers (in preference order):\n");
     if r.resolvers.is_empty() {
         out.push_str("  (none configured)\n");
     } else {
         for addr in &r.resolvers {
-            out.push_str(&format!("  - {addr}\n"));
+            out.push_str(&format!("  - {}\n", sanitize_for_terminal(addr)));
         }
     }
 
@@ -2033,12 +2042,16 @@ fn format_dns_status(r: &tailscaled_rs::localapi::DnsStatusReport, json: bool) -
         out.push_str("  (none)\n");
     } else {
         for (suffix, addrs) in &r.routes {
+            let suffix = sanitize_for_terminal(suffix);
             if addrs.is_empty() {
                 // A negative route (no upstreams) — names under the suffix are not resolved.
                 out.push_str(&format!("  - {suffix:<30} -> (no resolvers)\n"));
             } else {
                 for addr in addrs {
-                    out.push_str(&format!("  - {suffix:<30} -> {addr}\n"));
+                    out.push_str(&format!(
+                        "  - {suffix:<30} -> {}\n",
+                        sanitize_for_terminal(addr)
+                    ));
                 }
             }
         }
@@ -2049,7 +2062,7 @@ fn format_dns_status(r: &tailscaled_rs::localapi::DnsStatusReport, json: bool) -
         out.push_str("  (none)\n");
     } else {
         for domain in &r.search_domains {
-            out.push_str(&format!("  - {domain}\n"));
+            out.push_str(&format!("  - {}\n", sanitize_for_terminal(domain)));
         }
     }
 
@@ -2058,7 +2071,7 @@ fn format_dns_status(r: &tailscaled_rs::localapi::DnsStatusReport, json: bool) -
         out.push_str("  (none)\n");
     } else {
         for addr in &r.fallback_resolvers {
-            out.push_str(&format!("  - {addr}\n"));
+            out.push_str(&format!("  - {}\n", sanitize_for_terminal(addr)));
         }
     }
 
@@ -2067,7 +2080,7 @@ fn format_dns_status(r: &tailscaled_rs::localapi::DnsStatusReport, json: bool) -
         out.push_str("  (none)\n");
     } else {
         for domain in &r.cert_domains {
-            out.push_str(&format!("  - {domain}\n"));
+            out.push_str(&format!("  - {}\n", sanitize_for_terminal(domain)));
         }
     }
 
@@ -2076,7 +2089,11 @@ fn format_dns_status(r: &tailscaled_rs::localapi::DnsStatusReport, json: bool) -
         out.push_str("  (none)\n");
     } else {
         for (name, addr) in &r.extra_records {
-            out.push_str(&format!("  - {name} -> {addr}\n"));
+            out.push_str(&format!(
+                "  - {} -> {}\n",
+                sanitize_for_terminal(name),
+                sanitize_for_terminal(addr)
+            ));
         }
     }
 
@@ -2085,7 +2102,7 @@ fn format_dns_status(r: &tailscaled_rs::localapi::DnsStatusReport, json: bool) -
         out.push_str("  (none)\n");
     } else {
         for suffix in &r.exit_node_filtered_set {
-            out.push_str(&format!("  - {suffix}\n"));
+            out.push_str(&format!("  - {}\n", sanitize_for_terminal(suffix)));
         }
     }
 
@@ -2104,15 +2121,16 @@ fn format_dns_status(r: &tailscaled_rs::localapi::DnsStatusReport, json: bool) -
 /// UDP/IPv4/IPv6/`MappingVariesByDestIP`/PortMapping flags are not measured by this build, and that
 /// DERP regions are shown by id (the engine carries no region name).
 ///
-/// `json` emits the two fields this build can populate **in Go's exact `net/netcheck.Report` wire
-/// shape**, so an upstream JSON consumer parses them: `PreferredDERP` is a plain integer (Go's
-/// `int`, `0` for unknown — never `null`), and `RegionLatency` is a **map keyed by stringified DERP
-/// region id with integer-nanosecond values** (Go's `map[int]time.Duration`, marshalled as ns;
-/// emitted via a `BTreeMap` so keys sort numerically). The many other Go `Report` fields
-/// (UDP/IPv4/IPv6/PortMapping/GlobalV4…) are genuinely not measured by this build and are simply
-/// absent — a reduction, not a renamed/reshaped field. (Go itself prints `# Warning: this JSON
-/// format is not yet considered a stable interface` to stderr for `--format=json`.) Pure (returns
-/// the string incl. its trailing newline) → unit-testable.
+/// `json` emits the two fields this build can populate **with Go's field names + value encoding**, so
+/// an upstream JSON consumer parses them: `PreferredDERP` is a plain integer (Go's `int`, `0` for
+/// unknown — never `null`), and `RegionLatency` is a **map keyed by stringified DERP region id with
+/// integer-nanosecond values** (Go's `map[int]time.Duration`, marshalled as ns). The many other Go
+/// `Report` fields (UDP/IPv4/IPv6/PortMapping/GlobalV4…) are genuinely not measured by this build and
+/// are simply absent — a reduction, not a renamed/reshaped field. Two honest non-byte-exact notes vs
+/// Go's `json.MarshalIndent(report, "", "\t")`: the indent is a TAB (matching Go), but JSON object
+/// **key order is `serde_json`'s lexicographic string order** (`"10"` before `"2"`), not Go's numeric
+/// map order — immaterial, since JSON object key order is non-semantic (and Go marks this format
+/// unstable). Pure (returns the string incl. its trailing newline) → unit-testable.
 fn format_netcheck(r: &tailscaled_rs::localapi::NetcheckReport, json: bool) -> String {
     if json {
         use serde_json::{Map, Value, json};
@@ -2120,9 +2138,11 @@ fn format_netcheck(r: &tailscaled_rs::localapi::NetcheckReport, json: bool) -> S
         // Go's `PreferredDERP int // or 0 for unknown` — a plain number, 0 when unknown (never null).
         root.insert("PreferredDERP".into(), json!(r.preferred_derp.unwrap_or(0)));
         // Go's `RegionLatency map[int]time.Duration`: a JSON object keyed by the stringified region
-        // id, values being the duration as integer NANOSECONDS (how Go marshals `time.Duration`). A
-        // BTreeMap gives deterministic numeric-ascending key order. The engine carries latency as f64
-        // milliseconds, so ns = round(ms * 1e6).
+        // id, values being the duration as integer NANOSECONDS (how Go marshals `time.Duration`). The
+        // engine carries latency as f64 milliseconds, so ns = round(ms * 1e6). A BTreeMap dedups any
+        // repeated region_id (last write wins) and gives a deterministic build; the FINAL on-the-wire
+        // key order is serde_json's (lexicographic by string), which is fine — object key order is
+        // non-semantic.
         let mut region_latency: std::collections::BTreeMap<u32, i64> =
             std::collections::BTreeMap::new();
         for rl in &r.region_latencies {
@@ -2133,9 +2153,10 @@ fn format_netcheck(r: &tailscaled_rs::localapi::NetcheckReport, json: bool) -> S
             latency_obj.insert(id.to_string(), json!(ns));
         }
         root.insert("RegionLatency".into(), Value::Object(latency_obj));
+        // Tab indent, matching Go's `json.MarshalIndent(report, "", "\t")`.
         return format!(
             "{}\n",
-            serde_json::to_string_pretty(&root).unwrap_or_else(|_| "{}".to_string())
+            to_string_pretty_tabs(&root).unwrap_or_else(|_| "{}".to_string())
         );
     }
 
@@ -2301,14 +2322,17 @@ fn format_get(
             .collect();
         Ok(format!("{}\n", serde_json::to_string_pretty(&map)?))
     } else {
-        // NAME  VALUE table (Go `getOutputTable` prints a literal `NAME\tVALUE` header first),
-        // column-aligned to the widest of the header and the setting names.
+        // NAME/VALUE table. Go `getOutputTable` emits a `NAME\tVALUE` header through a `tabwriter`
+        // (tab-elastic columns, 2-space padding); we produce the visually-equivalent layout by
+        // space-padding the NAME column to the widest of the header and the setting names (so this is
+        // column-faithful to Go, not byte-identical tab output). The `chain(once(4))` guarantees a
+        // non-empty iterator, so `max()` is always `Some` (width ≥ 4, never the empty fallback).
         let width = settings
             .iter()
             .map(|(n, _)| n.len())
             .chain(std::iter::once("NAME".len()))
             .max()
-            .unwrap_or(0);
+            .unwrap_or(4);
         let mut out = format!("{:<width$}  VALUE\n", "NAME");
         for (name, value) in &settings {
             out.push_str(&format!("{name:<width$}  {}\n", get_value_display(value)));
@@ -2462,6 +2486,20 @@ fn sanitize_for_terminal(s: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Serialize a JSON value pretty-printed with a **TAB** indent, matching Go's
+/// `json.MarshalIndent(v, "", "\t")` (the indent `tailscale netcheck --format=json` uses).
+/// `serde_json::to_string_pretty` is hard-wired to a two-space indent and cannot be configured, so we
+/// drive a `PrettyFormatter::with_indent(b"\t")` directly.
+fn to_string_pretty_tabs<T: serde::Serialize>(value: &T) -> Result<String, serde_json::Error> {
+    let mut buf = Vec::new();
+    let mut ser = serde_json::Serializer::with_formatter(
+        &mut buf,
+        serde_json::ser::PrettyFormatter::with_indent(b"\t"),
+    );
+    value.serialize(&mut ser)?;
+    Ok(String::from_utf8(buf).expect("serde_json emits valid UTF-8"))
 }
 
 /// Format the `tnet ip` output: this node's tailnet addresses, one per line (IPv4 then IPv6), or a
@@ -3808,10 +3846,13 @@ fn elliptically_truncate(s: &str, max: usize) -> String {
 /// caller. Pure → unit-testable.
 fn format_serve_status(cfg: &tailscaled_rs::localapi::ServeConfig, _json: bool) -> String {
     use tailscaled_rs::localapi::WebMount;
-    // Go's `isServeConfigEmpty` treats a config as empty only when there is NO serve handler AND no
-    // funnel exposure — a funnel-only config (AllowFunnel set, TCP empty) is NOT empty. Mirror that
-    // over the two maps this wire model carries (tcp + allow_funnel). Message matches Go's exact
-    // `No serve config` (no trailing period).
+    // Go's `isServeConfigEmpty` (cmd/tailscale/cli/serve_status.go) is empty iff `len(TCP)==0 &&
+    // len(Web)==0 && len(Services)==0 && len(AllowFunnel)==0`. This wire model carries only `tcp` +
+    // `allow_funnel` (no `Web`/`Services` — see the ServeConfig DTO + bead tsd-6p4), so checking those
+    // two is exhaustive over everything this build can represent: a funnel-only config (AllowFunnel
+    // set, TCP empty) is correctly NOT empty. ⚠️ If `Web`/`Services` are ever added to ServeConfig,
+    // this `&&` MUST extend or a web/service-only config would silently print "No serve config".
+    // Message matches Go's exact `No serve config` (no trailing period).
     if cfg.tcp.is_empty() && cfg.allow_funnel.is_empty() {
         return "No serve config\n".to_string();
     }
@@ -3871,7 +3912,11 @@ fn format_serve_status(cfg: &tailscaled_rs::localapi::ServeConfig, _json: bool) 
     if !funnel.is_empty() {
         out.push_str("Funnel (on the public internet):\n");
         for (host, port) in &funnel {
-            out.push_str(&format!("  https://{host}:{port}\n"));
+            // `host` is the control-assigned MagicDNS name — sanitize before terminal display.
+            out.push_str(&format!(
+                "  https://{}:{port}\n",
+                sanitize_for_terminal(host)
+            ));
         }
     }
     out
@@ -5058,6 +5103,9 @@ mod tests {
     #[test]
     fn format_netcheck_populated_human_and_json() {
         use tailscaled_rs::localapi::{NetcheckReport, RegionLatencyView};
+        // Region 10 included DELIBERATELY: it distinguishes serde's lexicographic key order
+        // ("1" < "10" < "7") from numeric order (1 < 7 < 10), so the ordering assertion below is not
+        // vacuous. A duplicate region_id (7) is included to pin the BTreeMap's dedup (last write wins).
         let report = NetcheckReport {
             preferred_derp: Some(1),
             region_latencies: vec![
@@ -5067,38 +5115,52 @@ mod tests {
                 },
                 RegionLatencyView {
                     region_id: 7,
-                    latency_ms: 41.7,
+                    latency_ms: 99.9, // superseded by the dedup entry below
+                },
+                RegionLatencyView {
+                    region_id: 10,
+                    latency_ms: 5.0,
+                },
+                RegionLatencyView {
+                    region_id: 7,
+                    latency_ms: 41.7, // last write for region 7 wins
                 },
             ],
         };
-        // Human form: the preferred region, both per-region latency lines (formatted to 0.1ms), in
-        // the engine's ascending order, and the honest omission note.
+        // Human form: the preferred region, per-region latency lines (formatted to 0.1ms), and the
+        // honest omission note.
         let h = format_netcheck(&report, false);
         assert!(h.contains("Report:"), "{h}");
         assert!(h.contains("* Nearest DERP: region 1"), "{h}");
         assert!(h.contains("- region 1: 23.4ms"), "{h}");
-        assert!(h.contains("- region 7: 41.7ms"), "{h}");
-        // Ordering: region 1's line precedes region 7's (engine emits latency-ascending).
-        assert!(
-            h.find("region 1: 23.4ms").unwrap() < h.find("region 7: 41.7ms").unwrap(),
-            "per-region latency lines must keep the engine's ascending order: {h}"
-        );
+        assert!(h.contains("- region 10: 5.0ms"), "{h}");
         assert!(
             h.contains("DERP-region latency only"),
             "the honest reduced-scope note must be present: {h}"
         );
-        // JSON form: Go's `net/netcheck.Report` shape — a bare numeric PreferredDERP and a
+        // JSON form: Go's field names + value encoding — a bare numeric PreferredDERP and a
         // RegionLatency map keyed by stringified region id with integer-NANOSECOND values
         // (`map[int]time.Duration` marshalled as ns). 23.42ms = 23_420_000ns; 41.7ms = 41_700_000ns.
         let j = format_netcheck(&report, true);
         let v: serde_json::Value = serde_json::from_str(&j).unwrap();
         assert_eq!(v["PreferredDERP"], serde_json::json!(1));
         assert_eq!(v["RegionLatency"]["1"], serde_json::json!(23_420_000_i64));
+        // Dedup: region 7's LAST entry (41.7ms) wins over the earlier 99.9ms.
         assert_eq!(v["RegionLatency"]["7"], serde_json::json!(41_700_000_i64));
-        // Numeric-ascending key order (BTreeMap): region 1's key precedes region 7's in the bytes.
+        assert_eq!(v["RegionLatency"]["10"], serde_json::json!(5_000_000_i64));
+        // Exactly 3 distinct keys (the duplicate 7 was deduped).
+        assert_eq!(v["RegionLatency"].as_object().unwrap().len(), 3, "{j}");
+        // Key order is serde_json's LEXICOGRAPHIC string order ("1" < "10" < "7"), NOT numeric — and
+        // that is fine (JSON object key order is non-semantic). Pin the real behavior so the claim and
+        // the test agree: "10" precedes "7" in the emitted bytes.
         assert!(
-            j.find("\"1\":").unwrap() < j.find("\"7\":").unwrap(),
-            "RegionLatency keys must be numeric-ascending: {j}"
+            j.find("\"10\":").unwrap() < j.find("\"7\":").unwrap(),
+            "RegionLatency keys are serde lexicographic order (\"10\" before \"7\"): {j}"
+        );
+        // Indent is a TAB, matching Go's `json.MarshalIndent(report, "", \"\\t\")`.
+        assert!(
+            j.contains("\n\t\"PreferredDERP\""),
+            "netcheck JSON must use tab indent like Go: {j:?}"
         );
     }
 

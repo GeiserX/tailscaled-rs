@@ -3367,6 +3367,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restart_with_persisted_key_and_wantrunning_false_loads_as_stopped() {
+        // The up→down→RESTART leg of the `has_node_key` gate, end-to-end through the REAL `load` path
+        // (not the synthetic `derive_state_from` args). `up` persists a node key + leaves
+        // want_running=true; `down` keeps the key and flips want_running=false; the daemon then
+        // restarts. We reconstruct exactly that on-disk state (a real minted key file + a saved
+        // want_running=false prefs in the default-profile paths), `Backend::load` it fresh, and assert
+        // the node re-seeds `has_node_key=true` from disk and derives `Stopped` (Go's hasNodeKeyLocked
+        // gate) — NOT `NoState`. This pins the `load`→`has_persisted_node_key` reseed that only the
+        // synthetic unit test covered before; a regression in the load-path key re-read would flip
+        // this to NoState and be caught here.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-restart-stopped-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        // Default-profile layout: <dir>/node.key.json + <dir>/prefs.json.
+        let key_path = dir.join("node.key.json");
+        tailscale::config::load_key_file(&key_path, Default::default())
+            .await
+            .expect("mint a persisted node key (what `up` writes)");
+        // What `down` leaves behind: a persisted prefs with want_running=false, not logged out.
+        let prefs = Prefs {
+            want_running: false,
+            logged_out: false,
+            ..Prefs::default()
+        };
+        prefs
+            .save(&dir.join("prefs.json"))
+            .await
+            .expect("persist the down prefs");
+
+        // Restart: a fresh load from the same state dir (no engine, device-less).
+        let be = Backend::load(&dir).await.expect("reload the daemon state");
+        assert!(
+            be.has_node_key,
+            "load must re-seed has_node_key=true from the persisted key file"
+        );
+        assert!(!be.prefs.want_running, "down left want_running=false");
+        assert!(!be.prefs.logged_out, "down did not log out");
+        assert_eq!(
+            be.derive_state(false),
+            State::Stopped,
+            "a restarted node with a persisted key + want_running=false must derive Stopped (Go's \
+             hasNodeKeyLocked gate), not NoState"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
     async fn has_persisted_node_key_false_for_malformed_file() {
         // A truncated/corrupt key file must read as "no persisted key" so the daemon falls back to
         // fresh auth rather than trusting garbage (mirrors prefs' malformed-file fail-safe).
