@@ -168,7 +168,11 @@ pub(crate) fn requires_write(request: &crate::localapi::Request) -> bool {
         | Request::Metrics
         // `DebugCapture` installs a dataplane capture hook and writes a pcap as the daemon's uid —
         // it taps all plaintext traffic, so it gates like `up`/`down`, never a read.
-        | Request::DebugCapture { .. } => true,
+        | Request::DebugCapture { .. }
+        // `Cert` provisions a TLS cert and returns its PRIVATE KEY — a sensitive credential, and an
+        // ACME control round-trip (not a passive read). Go gates `serveCert` on write; a
+        // socket-reachable non-owner must not be able to mint a cert/key. Gates like `up`/`IdToken`.
+        | Request::Cert { .. } => true,
     }
 }
 

@@ -178,6 +178,17 @@ pub enum Request {
     /// to be up (the measurements come from the live engine's net-report). NOTE: this fork's
     /// net-report measures ONLY DERP-region latency (see [`NetcheckReport`]).
     Netcheck,
+    /// Provision (or fetch) a TLS certificate + key for `domain` via the tailnet's ACME flow (Go
+    /// `tailscale cert <domain>`). Replies with [`Response::Cert`] carrying the leaf+chain and the
+    /// private key as PEM. Requires the node to be up (issuance goes through the live engine's
+    /// control connection) AND a daemon built with the `acme` cargo feature; without it the daemon
+    /// fails closed with a clear error (never a self-signed cert). Gated like [`Status`](Request::Status)
+    /// for read; issuance itself is a control round-trip, not a local mutation of node prefs.
+    Cert {
+        /// The DNS name to certify — must be one of the tailnet's `CertDomains` (Go validates the
+        /// same; an arbitrary domain is refused by control/ACME).
+        domain: String,
+    },
     /// Produce a shareable diagnostic marker (Go `tailscale bugreport`). Replies with
     /// [`Response::BugReport`]. Read-only. NOTE: Go uploads logs to logtail and returns the log id;
     /// this fork has no log-upload backend, so the marker is a LOCAL diagnostic identifier only (it is
@@ -370,6 +381,15 @@ pub enum Response {
     /// The node's network-conditions report (reply to [`Request::Netcheck`]), rendered by
     /// `tnet netcheck`.
     Netcheck(NetcheckReport),
+    /// An issued TLS certificate (reply to [`Request::Cert`]), written out by `tnet cert`. Both fields
+    /// are PEM text: `cert_pem` is the leaf + intermediate chain, `key_pem` is the private key. The
+    /// key is sensitive — the CLI writes it `0600` and the daemon never logs it.
+    Cert {
+        /// The leaf certificate + intermediate chain, PEM-encoded.
+        cert_pem: String,
+        /// The private key, PEM-encoded. Sensitive: written `0600`, never logged.
+        key_pem: String,
+    },
     /// A local diagnostic marker (reply to [`Request::BugReport`]), printed by `tnet bugreport`.
     BugReport {
         /// The marker string (a local identifier + daemon version + node state). NOT a server-side
@@ -1186,6 +1206,37 @@ mod tests {
         match serde_json::from_str::<Response>(&empty_json).unwrap() {
             Response::DnsStatus(r) => assert_eq!(r, DnsStatusReport::default()),
             other => panic!("expected DnsStatus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cert_request_response_round_trip() {
+        // The `cert` request (carrying the domain) and the `Cert { cert_pem, key_pem }` reply must
+        // survive the wire intact — the CLI writes the PEMs the daemon issued, so neither may be
+        // mangled or truncated. Pin the request discriminant + field and the reply's two PEM bodies.
+        let req = Request::Cert {
+            domain: "host.user.ts.net".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains(r#""cmd":"cert""#) && json.contains(r#""domain":"host.user.ts.net""#),
+            "{json}"
+        );
+        match serde_json::from_str::<Request>(&json).unwrap() {
+            Request::Cert { domain } => assert_eq!(domain, "host.user.ts.net"),
+            other => panic!("expected Cert, got {other:?}"),
+        }
+        let resp = Response::Cert {
+            cert_pem: "-----BEGIN CERTIFICATE-----\nMII...\n-----END CERTIFICATE-----\n".into(),
+            key_pem: "-----BEGIN PRIVATE KEY-----\nMII...\n-----END PRIVATE KEY-----\n".into(),
+        };
+        let rjson = serde_json::to_string(&resp).unwrap();
+        match serde_json::from_str::<Response>(&rjson).unwrap() {
+            Response::Cert { cert_pem, key_pem } => {
+                assert!(cert_pem.contains("BEGIN CERTIFICATE"), "{cert_pem}");
+                assert!(key_pem.contains("BEGIN PRIVATE KEY"), "{key_pem}");
+            }
+            other => panic!("expected Cert, got {other:?}"),
         }
     }
 

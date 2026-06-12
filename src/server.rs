@@ -588,6 +588,18 @@ async fn dispatch(
                 },
             }
         }
+        // `cert <domain>` (Go `tailscale cert`): issue a TLS cert+key via the tailnet ACME flow.
+        // Off-lock device call (issuance is a control round-trip, potentially slow). Needs the node up
+        // (issuance goes through the live engine's control connection); fail-closed without `acme`.
+        Request::Cert { domain } => {
+            let dev = { backend.lock().await.device_handle() };
+            match dev {
+                Some(dev) => Backend::cert_pair(&dev, &domain).await,
+                None => Response::Error {
+                    message: "node is not up".into(),
+                },
+            }
+        }
         // `bugreport` (Go `tailscale bugreport`). Reads only daemon state under a brief lock (no
         // engine round-trip); works whether or not the node is up.
         Request::BugReport { note } => {

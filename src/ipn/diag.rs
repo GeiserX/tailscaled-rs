@@ -121,6 +121,41 @@ pub(super) async fn dns_status(dev: &tailscale::Device) -> Response {
     }
 }
 
+/// Provision (or fetch) a TLS cert+key for `domain` via the tailnet ACME flow (the `tnet cert` / Go
+/// `tailscale cert <domain>` path). Calls the engine's `Device::cert_pair`, which issues against the
+/// tailnet CA through the live control connection and returns `(cert_pem, key_pem)`.
+///
+/// **Fail-closed, two layers:**
+/// 1. Built WITHOUT the `acme` cargo feature: `Device::cert_pair` does not exist, so this returns a
+///    clear "built without acme" [`Response::Error`] (the daemon never fabricates a self-signed cert).
+/// 2. WITH `acme`: any ACME/HTTP/validation failure surfaces as a clear error (the engine's
+///    `cert_pair` is itself fail-closed — never a partial or self-signed pair).
+///
+/// `min_validity` is passed as `None` (Go's default: a freshly issued, full-lifetime cert). The key
+/// PEM is sensitive: it is carried in [`Response::Cert`] and written `0600` by the CLI; it is never
+/// logged here.
+pub(super) async fn cert_pair(dev: &tailscale::Device, domain: &str) -> Response {
+    #[cfg(feature = "acme")]
+    {
+        match dev.cert_pair(domain, None).await {
+            Ok((cert_pem, key_pem)) => Response::Cert { cert_pem, key_pem },
+            Err(e) => Response::Error {
+                message: format!("cert issuance for {domain:?} failed: {e}"),
+            },
+        }
+    }
+    #[cfg(not(feature = "acme"))]
+    {
+        // Reference `dev`/`domain` so the non-acme build has no unused-variable warnings.
+        let _ = (dev, domain);
+        Response::Error {
+            message: "this daemon was built without the `acme` feature; rebuild with \
+                      `--features acme` to issue TLS certificates"
+                .to_string(),
+        }
+    }
+}
+
 /// Report this node's network-conditions report (the `tnet netcheck` / Go `tailscale netcheck`
 /// read-only path). Maps the engine's `Device::netcheck()` → `tailscale::NetcheckReport` to the wire
 /// [`NetcheckReport`](crate::localapi::NetcheckReport): the preferred DERP region id is copied

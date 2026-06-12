@@ -464,6 +464,25 @@ enum Command {
         #[arg(value_name = "NOTE")]
         note: Option<String>,
     },
+    /// Provision a TLS certificate + key for a tailnet domain via ACME (Go `tailscale cert`). The
+    /// domain must be one of your tailnet's cert domains (`tnet dns status` lists them). Requires a
+    /// daemon built with the `acme` feature; without it the command fails with a clear error rather
+    /// than emitting a self-signed cert. By default writes `DOMAIN.crt` + `DOMAIN.key` in the current
+    /// directory; override the paths with `--cert-file`/`--key-file`, or pass `-` for either to write
+    /// that PEM to stdout instead.
+    Cert {
+        /// The DNS name to certify (one of the tailnet's cert domains).
+        #[arg(value_name = "DOMAIN")]
+        domain: String,
+        /// Output path for the cert (leaf + chain) PEM, or `-` for stdout. Defaults to `DOMAIN.crt`
+        /// when neither `--cert-file` nor `--key-file` is given.
+        #[arg(long, value_name = "PATH")]
+        cert_file: Option<String>,
+        /// Output path for the private-key PEM, or `-` for stdout. Defaults to `DOMAIN.key` when
+        /// neither `--cert-file` nor `--key-file` is given. Written with `0600` permissions.
+        #[arg(long, value_name = "PATH")]
+        key_file: Option<String>,
+    },
     /// Connect to a TCP port on a tailnet host and pipe stdin/stdout over the overlay (Go `tailscale
     /// nc`). Like netcat: bytes from stdin go to the peer, the peer's bytes go to stdout, until EOF.
     Nc {
@@ -1035,6 +1054,11 @@ async fn main() -> Result<()> {
             .await
         }
         Command::Bugreport { note } => dispatch_simple(&socket, Request::BugReport { note }).await,
+        Command::Cert {
+            domain,
+            cert_file,
+            key_file,
+        } => run_cert(&socket, domain, cert_file, key_file).await,
         // `nc` hijacks its connection (the daemon splices to the overlay after a one-line ack), so it
         // is handled by a dedicated piping path, not the generic round-trip.
         Command::Nc { host, port } => run_nc(&socket, &host, port)
@@ -1902,6 +1926,91 @@ async fn run_netcheck(socket: &std::path::Path, json: bool) -> Result<()> {
         }
     };
     print!("{}", format_netcheck(&report, json));
+    Ok(())
+}
+
+/// `cert <domain>` (Go `tailscale cert`): round-trip a [`Request::Cert`], then write the issued
+/// cert+key PEMs. File handling mirrors Go's `runCert`: when neither `--cert-file` nor `--key-file`
+/// is given, default to `DOMAIN.crt` + `DOMAIN.key` in the cwd (with `*.` → `wildcard_.` so a wildcard
+/// domain is a legal filename); `-` writes that PEM to stdout instead of a file. The cert is written
+/// `0644` (public), the key `0600` (Go's perms — the private key must not be world-readable). A
+/// daemon built without `acme`, a down node, or any ACME failure comes back as a `Response::Error`
+/// that we print and exit non-zero on (never a partial write).
+async fn run_cert(
+    socket: &std::path::Path,
+    domain: String,
+    cert_file: Option<String>,
+    key_file: Option<String>,
+) -> Result<()> {
+    let (cert_pem, key_pem) = match round_trip(
+        socket,
+        &Request::Cert {
+            domain: domain.clone(),
+        },
+    )
+    .await
+    {
+        Ok(Response::Cert { cert_pem, key_pem }) => (cert_pem, key_pem),
+        Ok(Response::Error { message }) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        Ok(other) => anyhow::bail!("unexpected response to cert: {other:?}"),
+        Err(e) => {
+            return Err(e).with_context(|| format!("requesting cert at {}", socket.display()));
+        }
+    };
+
+    // Go's default-filename rule: only when BOTH flags are unset. `*.` → `wildcard_.` keeps a wildcard
+    // domain a legal path.
+    let (cert_path, key_path) = match (cert_file, key_file) {
+        (None, None) => {
+            let base = domain.replacen("*.", "wildcard_.", 1);
+            (Some(format!("{base}.crt")), Some(format!("{base}.key")))
+        }
+        (c, k) => (c, k),
+    };
+
+    // Write one PEM to a path (mode-controlled) or to stdout for "-". A missing path (only one of the
+    // two flags was given) skips that output, matching Go (each is written only when its path is set).
+    fn emit(path: Option<&str>, pem: &str, mode: u32, label: &str) -> Result<()> {
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        match path {
+            None => Ok(()),
+            Some("-") => {
+                std::io::stdout()
+                    .write_all(pem.as_bytes())
+                    .with_context(|| format!("writing {label} to stdout"))?;
+                Ok(())
+            }
+            Some(p) => {
+                // truncate+create with the exact mode (0644 cert / 0600 key). O_NOFOLLOW refuses to
+                // follow a pre-planted symlink at the destination (the daemon — and this CLI — may run
+                // as root), so the PEM can't be written through a link to an arbitrary target.
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(mode)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(p)
+                    .with_context(|| format!("opening {label} file {p}"))?;
+                f.write_all(pem.as_bytes())
+                    .with_context(|| format!("writing {label} file {p}"))?;
+                // create() does not re-chmod an EXISTING file to `mode`; enforce it explicitly so a
+                // pre-existing key file can't stay world-readable.
+                f.set_permissions(std::fs::Permissions::from_mode(mode))
+                    .with_context(|| format!("setting {label} file mode on {p}"))?;
+                // (The "-" case is handled by the earlier arm, so `p` here is always a real path.)
+                println!("Wrote {label} to {p}");
+                Ok(())
+            }
+        }
+    }
+
+    emit(cert_path.as_deref(), &cert_pem, 0o644, "public cert")?;
+    emit(key_path.as_deref(), &key_pem, 0o600, "private key")?;
     Ok(())
 }
 
