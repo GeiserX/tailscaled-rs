@@ -71,6 +71,8 @@ enum Command {
         /// Route this node's outbound traffic through a peer exit node, named by its tailnet IP or
         /// MagicDNS name (e.g. `100.64.0.9` or `exit-1`). Mutually exclusive with
         /// `--clear-exit-node`; omitting both leaves the persisted exit-node setting unchanged.
+        /// (Automatic selection — Go's `--exit-node auto:any` — is not supported by this build; pass
+        /// a concrete exit node.)
         #[arg(long, value_name = "IP|NAME", conflicts_with = "clear_exit_node")]
         exit_node: Option<String>,
         /// Stop routing through any exit node (clears the exit-node setting). Use this instead of an
