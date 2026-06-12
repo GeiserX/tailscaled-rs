@@ -73,7 +73,7 @@ pub(super) async fn build_config(prefs: &Prefs, key_path: &Path) -> Result<tails
         //   that without TUN. Warn so the expectation gap is visible, not silent.
         if !prefs.tun_enabled {
             tracing::warn!(
-                "exit node configured in netstack mode (TUN off): only traffic routed THROUGH \
+                "config: exit node configured in netstack mode (TUN off): only traffic routed THROUGH \
                  this daemon uses the exit — the OS default route and resolver are untouched, \
                  so this is NOT machine-wide egress. Enable TUN (`--tun`, root) for OS-wide, \
                  DNS-leak-free exit."

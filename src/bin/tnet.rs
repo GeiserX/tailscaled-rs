@@ -897,23 +897,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let socket = cli.socket.unwrap_or_else(tailscaled_rs::socket_path);
 
-    // Track whether this is an `up` with no auth key — the interactive-login case, where after a
-    // successful bring-up we follow with a `status` to surface the control auth URL the operator
-    // must visit (it isn't known at `up`-time; it arrives once the engine reaches `NeedsLogin`).
-    let mut interactive_up = false;
-    // Track an `up --timeout`: `None` = this was not an `up` (or no `--timeout` was given), so the
-    // post-`up` success path does NOT wait; `Some(secs)` = an `up` requested a bounded wait for the
-    // node to reach Running (Go `tailscale up --timeout`, a CLIENT-SIDE wait — it never crosses the
-    // socket). `secs == 0` means wait forever (Go's "0 = wait indefinitely"), handled by
-    // `wait_for_running`. Captured here (like `interactive_up`) before the wire `Request` is built.
-    let mut up_timeout: Option<u64> = None;
-    // Track whether the user asked for `status --json`, so the (generic) `Response::Status` render
-    // site below emits the Go `ipnstate.Status`-shaped JSON instead of the human table.
-    let mut status_json = false;
-    // `status` filtering flags (--active / --no-peers / --self), applied client-side to the report
-    // before either renderer. Default = show everything.
-    let mut status_filter = StatusFilter::default();
-    let request = match cli.command {
+    match cli.command {
         Command::Up {
             authkey,
             authkey_file,
@@ -942,89 +926,36 @@ async fn main() -> Result<()> {
             timeout,
             accept_risk,
         } => {
-            // Risk gate (Go `--accept-risk`/`riskLoseSSH`): `--force-reauth` re-registers the node,
-            // which can drop the very Tailscale-SSH session you're typing from. Refuse it over such a
-            // session unless the operator pre-accepted `lose-ssh` (or `all`). Detected entirely
-            // CLI-side from `$SSH_CLIENT` (like Go's `isSSHOverTailscale`), BEFORE anything reaches the
-            // daemon. Unlike Go's interactive y/N, this daemon CLI refuses non-interactively (it has no
-            // TTY-prompt path) — faithful to Go's own non-interactive branch + the same flag/values.
-            if force_reauth
-                && is_ssh_over_tailscale()
-                && !risk_accepted(accept_risk.as_deref().unwrap_or(""), "lose-ssh")
-            {
-                eprintln!(
-                    "refusing --force-reauth: you appear to be connected over a Tailscale SSH \
-                     session, and re-registering the node may drop it (you could lock yourself out)."
-                );
-                eprintln!("To override, re-run with --accept-risk=lose-ssh");
-                std::process::exit(1);
-            }
-            // Risk gate 2 (Go `presentSSHToggleRisk`): toggling the Tailscale SSH server over a
-            // Tailscale SSH session reroutes/drops that session. Refuse unless `--accept-risk=lose-ssh`.
-            // Short-circuits (no daemon call) unless `--ssh`/`--no-ssh` is mentioned, we're over SSH,
-            // and the risk wasn't accepted; only then does it read `haveSSH` to compare. Runs before
-            // the request is built, so a refusal changes nothing on the node. (bead tsd-eqx)
-            refuse_ssh_toggle_risk_if_needed(
+            run_up(
                 &socket,
-                resolve_ssh(ssh, no_ssh),
-                accept_risk.as_deref(),
-            )
-            .await?;
-            // `--timeout` is a CLIENT-SIDE wait, not a pref and not a wire field: capture it so the
-            // post-`up` success path waits for Running (Go `up --timeout`). `None` here means the post-up
-            // path will not wait; `Some(secs)` arms the wait (0 = forever, per `wait_for_running`).
-            up_timeout = timeout;
-            // Resolve the secret through the precedence chain and hold it as a `SecretString`
-            // (zeroized on drop, never `Debug`-printed). Expose it only here, at the moment we
-            // serialize the wire `Request` — the field on the wire stays a plain `Option<String>`.
-            let authkey = resolve_authkey(authkey, authkey_file).await?;
-            // `--force-reauth` re-registers fresh; with no authkey that is an interactive login (the
-            // daemon wipes the key, the engine reaches NeedsLogin, and the poll below surfaces the new
-            // auth URL) — exactly the keyless-up interactive path, so the same `interactive_up` gate
-            // (authkey absent) drives it. No separate polling logic is needed for force-reauth.
-            interactive_up = authkey.is_none();
-            Request::Up {
-                authkey: authkey.map(|k| k.expose_secret().to_owned()),
-                control_url,
+                authkey,
+                authkey_file,
                 hostname,
-                // `--tun` → Some(true) (enable); `--no-tun` → Some(false) (disable); neither →
-                // None (leave the pref unchanged), so `tnet up` without either flag never silently
-                // flips a TUN node. clap's `conflicts_with` guarantees the two are never both set.
-                tun: resolve_tun(tun, no_tun),
+                control_url,
+                tun,
+                no_tun,
                 tun_name,
                 tun_mtu,
-                // `--exit-node <sel>` sets, `--clear-exit-node` stops using one, neither leaves it
-                // unchanged; clap's `conflicts_with` guarantees the two are never both set.
-                exit_node: resolve_exit_node(exit_node, clear_exit_node),
-                // `--advertise-exit-node`/`--no-advertise-exit-node` tri-state (mirrors `--tun`).
-                advertise_exit_node: resolve_advertise_exit_node(
-                    advertise_exit_node,
-                    no_advertise_exit_node,
-                ),
-                // Passed routes replace the set; `--advertise-routes-clear` empties it; neither
-                // leaves the persisted set unchanged.
-                advertise_routes: resolve_advertise_routes(
-                    advertise_routes,
-                    advertise_routes_clear,
-                ),
-                // Passed tags replace the set; `--clear-advertise-tags` empties it; neither leaves it
-                // unchanged. Reuses the same Vec+clear→Option resolver as advertise-routes.
-                advertise_tags: resolve_advertise_routes(advertise_tags, advertise_tags_clear),
-                // `--accept-routes`/`--no-accept-routes` tri-state (mirrors `--tun`); reuses the same
-                // resolver as the `set` arm.
-                accept_routes: resolve_accept_routes(accept_routes, no_accept_routes),
-                // `--shields-up`/`--no-shields-up` tri-state (mirrors `--tun`); reuses the same
-                // resolver as the `set` arm.
-                shields_up: resolve_shields_up(shields_up, no_shields_up),
-                // `--ssh`/`--no-ssh` tri-state (mirrors `--tun`).
-                ssh: resolve_ssh(ssh, no_ssh),
-                // `--reset`: reset unmentioned settings to default + bypass the accidental-revert
-                // guard. A plain bool flag (Go's `--reset`), passed straight through.
+                exit_node,
+                clear_exit_node,
+                advertise_exit_node,
+                no_advertise_exit_node,
+                advertise_routes,
+                advertise_routes_clear,
+                advertise_tags,
+                advertise_tags_clear,
+                accept_routes,
+                no_accept_routes,
+                shields_up,
+                no_shields_up,
+                ssh,
+                no_ssh,
                 reset,
-                // `--force-reauth`: discard the node key so the bring-up re-registers fresh (new
-                // login). A plain bool flag (Go's `--force-reauth`), passed straight through.
                 force_reauth,
-            }
+                timeout,
+                accept_risk,
+            )
+            .await
         }
         Command::Set {
             hostname,
@@ -1044,139 +975,62 @@ async fn main() -> Result<()> {
             no_ssh,
             accept_risk,
         } => {
-            // Risk gate (Go `presentSSHToggleRisk`, the `set` call site): toggling the Tailscale SSH
-            // server over a Tailscale SSH session reroutes/drops that session — refuse unless
-            // `--accept-risk=lose-ssh`. Short-circuits (no daemon call) unless `--ssh`/`--no-ssh` is
-            // mentioned, we're over SSH, and the risk wasn't accepted. Runs before the request is
-            // built, so a refusal changes nothing. (bead tsd-eqx — same enforcement as the `up` path.)
-            refuse_ssh_toggle_risk_if_needed(
+            run_set(
                 &socket,
-                resolve_ssh(ssh, no_ssh),
-                accept_risk.as_deref(),
-            )
-            .await?;
-            Request::Set {
                 hostname,
-                // `--accept-routes`/`--no-accept-routes` tri-state (mirrors `--tun`).
-                accept_routes: resolve_accept_routes(accept_routes, no_accept_routes),
-                // `--shields-up`/`--no-shields-up` tri-state (mirrors `--tun`).
-                shields_up: resolve_shields_up(shields_up, no_shields_up),
-                // `--exit-node <sel>` sets, `--clear-exit-node` stops using one, neither leaves it
-                // unchanged; clap's `conflicts_with` guarantees the two are never both set. Reuses the
-                // same resolver as the `up` arm.
-                exit_node: resolve_exit_node(exit_node, clear_exit_node),
-                // `--advertise-exit-node`/`--no-advertise-exit-node` tri-state (mirrors `--tun`).
-                advertise_exit_node: resolve_advertise_exit_node(
-                    advertise_exit_node,
-                    no_advertise_exit_node,
-                ),
-                // Passed routes replace the set; `--advertise-routes-clear` empties it; neither leaves
-                // the persisted set unchanged.
-                advertise_routes: resolve_advertise_routes(
-                    advertise_routes,
-                    advertise_routes_clear,
-                ),
-                // Passed tags replace the set; `--clear-advertise-tags` empties it; neither unchanged.
-                advertise_tags: resolve_advertise_routes(advertise_tags, advertise_tags_clear),
-                // `--ssh`/`--no-ssh` tri-state (mirrors `--tun`).
-                ssh: resolve_ssh(ssh, no_ssh),
-            }
+                accept_routes,
+                no_accept_routes,
+                shields_up,
+                no_shields_up,
+                exit_node,
+                clear_exit_node,
+                advertise_exit_node,
+                no_advertise_exit_node,
+                advertise_routes,
+                advertise_routes_clear,
+                advertise_tags,
+                advertise_tags_clear,
+                ssh,
+                no_ssh,
+                accept_risk,
+            )
+            .await
         }
-        Command::Bugreport { note } => Request::BugReport { note },
+        Command::Bugreport { note } => dispatch_simple(&socket, Request::BugReport { note }).await,
         // `nc` hijacks its connection (the daemon splices to the overlay after a one-line ack), so it
         // is handled by a dedicated piping path, not the generic round-trip.
-        Command::Nc { host, port } => {
-            return run_nc(&socket, &host, port)
-                .await
-                .with_context(|| format!("nc to {host}:{port} via {}", socket.display()));
-        }
+        Command::Nc { host, port } => run_nc(&socket, &host, port)
+            .await
+            .with_context(|| format!("nc to {host}:{port} via {}", socket.display())),
         // `serve`: read-modify-write the ServeConfig (tcp/reset) or render it (status). Inline because
         // tcp/reset must GET the current config, mutate, then SET it.
-        Command::Serve { cmd } => {
-            return run_serve(&socket, cmd)
-                .await
-                .with_context(|| format!("serve via {}", socket.display()));
-        }
+        Command::Serve { cmd } => run_serve(&socket, cmd)
+            .await
+            .with_context(|| format!("serve via {}", socket.display())),
         // `funnel <port> on|off`: GET status (for the node's MagicDNS name → the HostPort key) + the
         // current ServeConfig, toggle AllowFunnel, SET it back. Inline (read-modify-write, like serve).
-        Command::Funnel { port, on_off } => {
-            return run_funnel(&socket, port, &on_off)
-                .await
-                .with_context(|| format!("funnel via {}", socket.display()));
-        }
+        Command::Funnel { port, on_off } => run_funnel(&socket, port, &on_off)
+            .await
+            .with_context(|| format!("funnel via {}", socket.display())),
         // `debug capture`: send DebugCapture (a long-lived write — the daemon taps the dataplane for
         // `seconds`, then replies with the byte count). Inline early-return like the other subcommand
         // groups.
         Command::Debug {
             cmd: DebugCmd::Capture { path, seconds },
-        } => {
-            let path = path.to_string_lossy().into_owned();
-            let resp = round_trip(
-                &socket,
-                &Request::DebugCapture {
-                    path,
-                    seconds: Some(seconds),
-                },
-            )
-            .await
-            .with_context(|| format!("debug capture via {}", socket.display()))?;
-            match resp {
-                Response::Ok { message } => {
-                    println!("{message}");
-                    return Ok(());
-                }
-                Response::Error { message } => anyhow::bail!("debug capture failed: {message}"),
-                other => anyhow::bail!("unexpected response to debug capture: {other:?}"),
-            }
-        }
+        } => run_debug_capture(&socket, path, seconds).await,
         // `install` / `uninstall` (Go `tailscaled install-system-daemon` / `uninstall-system-daemon`):
         // purely LOCAL, privileged file + service-manager work — they never touch the LocalAPI socket.
         // Handled inline (early return), root-gated inside `run_install`/`run_uninstall`.
-        Command::Install => {
-            return tailscaled_rs::ipn::install::run_install()
-                .context("installing the tailnetd system service");
-        }
-        Command::Uninstall => {
-            return tailscaled_rs::ipn::install::run_uninstall()
-                .context("removing the tailnetd system service");
-        }
-        Command::Down => Request::Down,
-        Command::Logout => Request::Logout,
+        Command::Install => tailscaled_rs::ipn::install::run_install()
+            .context("installing the tailnetd system service"),
+        Command::Uninstall => tailscaled_rs::ipn::install::run_uninstall()
+            .context("removing the tailnetd system service"),
+        Command::Down => dispatch_simple(&socket, Request::Down).await,
+        Command::Logout => dispatch_simple(&socket, Request::Logout).await,
         // `switch` (Go `tailscale switch`): --list renders a table; `remove <id>` deletes; a bare
         // `<target>` switches. Handled inline — `--list` renders the Profiles reply, and the three
         // modes map to different requests.
-        Command::Switch { list, target, cmd } => {
-            // `switch remove <id>` (subcommand) takes precedence.
-            if let Some(SwitchCmd::Remove { target }) = cmd {
-                return send_ok_or_die(&socket, Request::DeleteProfile { target }).await;
-            }
-            if list {
-                match round_trip(&socket, &Request::ProfileList).await {
-                    Ok(Response::Profiles { profiles }) => {
-                        print!("{}", format_profiles(&profiles));
-                        return Ok(());
-                    }
-                    Ok(Response::Error { message }) => {
-                        eprintln!("error: {message}");
-                        std::process::exit(1);
-                    }
-                    Ok(other) => anyhow::bail!("unexpected response to profile list: {other:?}"),
-                    Err(e) => {
-                        return Err(e)
-                            .with_context(|| format!("listing profiles at {}", socket.display()));
-                    }
-                }
-            }
-            match target {
-                Some(target) => {
-                    return send_ok_or_die(&socket, Request::SwitchProfile { target }).await;
-                }
-                None => {
-                    eprintln!("usage: tnet switch <profile> | --list | remove <profile>");
-                    std::process::exit(1);
-                }
-            }
-        }
+        Command::Switch { list, target, cmd } => run_switch(&socket, list, target, cmd).await,
         // `version` answers from the CLI's own crate version. WITHOUT `--daemon` it never contacts
         // the daemon (Go also prints the client version with no LocalAPI call) — handle it here and
         // return. WITH `--daemon` it round-trips `Request::Version` to learn the daemon's version,
@@ -1186,127 +1040,23 @@ async fn main() -> Result<()> {
             daemon,
             json,
             upstream,
-        } => {
-            // `--upstream` would fetch the latest release from a release server; this build does no
-            // such network call, so return Go's verbatim message + a non-zero exit (faithful, offline,
-            // names no infrastructure). Checked before the local render so `version --upstream` never
-            // prints a version line implying success.
-            if upstream {
-                eprintln!("fetching latest version not supported in this build");
-                std::process::exit(1);
-            }
-            let client_version = env!("CARGO_PKG_VERSION");
-            let daemon_version = if daemon {
-                match round_trip(&socket, &Request::Version).await {
-                    Ok(Response::Version { version }) => Some(version),
-                    Ok(other) => {
-                        anyhow::bail!("unexpected response to version request: {other:?}")
-                    }
-                    Err(e) => {
-                        return Err(e).with_context(|| {
-                            format!("querying daemon version at {}", socket.display())
-                        });
-                    }
-                }
-            } else {
-                None
-            };
-            // `cap` = the engine's current capability version (Go `version.Meta.cap`), read from the
-            // engine's `ts_capabilityversion` crate (pinned to the same rev as the engine facade).
-            let cap = u16::from(ts_capabilityversion::CapabilityVersion::CURRENT);
-            print_version(client_version, daemon_version.as_deref(), cap, json);
-            return Ok(());
-        }
+        } => run_version(&socket, daemon, json, upstream).await,
         // `get` (Go `tailscale get`): round-trip GetPrefs, then render. Handled inline (early return)
         // because its `setting`/`json` args shape the output and are not part of the wire request —
         // keeping the projection→render in one place, like `version`.
-        Command::Get { setting, json } => {
-            let view = match round_trip(&socket, &Request::GetPrefs).await {
-                Ok(Response::Prefs(v)) => v,
-                Ok(Response::Error { message }) => {
-                    eprintln!("error: {message}");
-                    std::process::exit(1);
-                }
-                Ok(other) => anyhow::bail!("unexpected response to get request: {other:?}"),
-                Err(e) => {
-                    return Err(e)
-                        .with_context(|| format!("getting prefs at {}", socket.display()));
-                }
-            };
-            match format_get(&view, setting.as_deref(), json) {
-                Ok(out) => print!("{out}"),
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    std::process::exit(1);
-                }
-            }
-            return Ok(());
-        }
+        Command::Get { setting, json } => run_get(&socket, setting, json).await,
         // `wait` (Go `tailscale wait`): poll until the node is Running with a tailnet IP, honoring an
         // optional timeout. Handled inline (it loops + has its own exit-code contract), not a
         // one-shot request.
-        Command::Wait { timeout } => {
-            return wait_for_running(&socket, timeout).await.with_context(|| {
-                format!("waiting for the node to come up at {}", socket.display())
-            });
-        }
+        Command::Wait { timeout } => wait_for_running(&socket, timeout)
+            .await
+            .with_context(|| format!("waiting for the node to come up at {}", socket.display())),
         // `whoami` (Go `tailscale whoami`): resolve this node's own identity — Status to learn the
         // self tailnet IP, then Whois on that IP. Handled inline because it chains two requests and
         // its `--json` shape is the whois record. Reuses the same `format_whois` renderer as `whois`.
-        Command::Whoami { json } => {
-            let status = match round_trip(&socket, &Request::Status).await {
-                Ok(Response::Status(s)) => s,
-                Ok(other) => anyhow::bail!("unexpected response to status request: {other:?}"),
-                Err(e) => {
-                    return Err(e)
-                        .with_context(|| format!("querying status at {}", socket.display()));
-                }
-            };
-            let Some(self_ip) = status.self_ipv4.clone() else {
-                // No tailnet IP yet → not up (Go errors here too, citing the backend state).
-                eprintln!(
-                    "no current tailnet IP address (state: {}); is the node up?",
-                    status.state
-                );
-                std::process::exit(1);
-            };
-            match round_trip(
-                &socket,
-                &Request::Whois {
-                    ip: self_ip.clone(),
-                },
-            )
-            .await
-            {
-                Ok(Response::Whois(w)) => {
-                    if json {
-                        // The whois record as JSON (Go `whoami --json` emits the WhoIsResponse).
-                        match serde_json::to_string_pretty(&w) {
-                            Ok(s) => println!("{s}"),
-                            Err(e) => {
-                                eprintln!("error: serializing whois: {e}");
-                                std::process::exit(1);
-                            }
-                        }
-                    } else {
-                        print!("{}", format_whois(&w, &self_ip));
-                    }
-                    return Ok(());
-                }
-                Ok(Response::Error { message }) => {
-                    eprintln!("error: {message}");
-                    std::process::exit(1);
-                }
-                Ok(other) => anyhow::bail!("unexpected response to whois request: {other:?}"),
-                Err(e) => {
-                    return Err(e).with_context(|| {
-                        format!("resolving self identity at {}", socket.display())
-                    });
-                }
-            }
-        }
-        // `status --watch` is a long-lived stream, not a one-shot round-trip — handle it here and
-        // return. Plain `status` falls through to the one-shot path below.
+        Command::Whoami { json } => run_whoami(&socket, json).await,
+        // `status` (Go `tailscale status`): plain status round-trips one `Status`; `--web`/`--watch`
+        // are long-lived and return inside `run_status`.
         Command::Status {
             watch,
             json,
@@ -1317,26 +1067,10 @@ async fn main() -> Result<()> {
             listen,
             no_browser,
         } => {
-            // `status --web` is a long-lived embedded HTTP server, not a one-shot — handle it here and
-            // return (like --watch). Default listen 127.0.0.1:8384; browser opens unless --no-browser.
-            if web {
-                let listen = listen.unwrap_or_else(|| "127.0.0.1:8384".to_string());
-                return run_status_web(&socket, &listen, !no_browser)
-                    .await
-                    .with_context(|| format!("serving status --web on {listen}"));
-            }
-            if watch {
-                return watch_status(&socket)
-                    .await
-                    .with_context(|| format!("watching status at {}", socket.display()));
-            }
-            status_json = json;
-            status_filter = StatusFilter {
-                active_only: active,
-                hide_peers: no_peers,
-                hide_self: no_self,
-            };
-            Request::Status
+            run_status(
+                &socket, watch, json, active, no_peers, no_self, web, listen, no_browser,
+            )
+            .await
         }
         // `ip` (Go `tailscale ip`): self addresses by default, or a peer's if named, with -4/-6/-1
         // filters. Handled inline because the filters + the optional peer lookup shape the output
@@ -1346,262 +1080,215 @@ async fn main() -> Result<()> {
             v6,
             first,
             peer,
-        } => {
-            let sel = IpSelect { v4, v6, first };
-            let out = if let Some(peer) = peer {
-                // Peer address: resolve the named peer against the status peer set (by MagicDNS name
-                // or tailnet IP). We fetch Status (not whois, which is IP-only) so a NAME also works.
-                let status = match round_trip(&socket, &Request::Status).await {
-                    Ok(Response::Status(s)) => s,
-                    Ok(other) => anyhow::bail!("unexpected response to status request: {other:?}"),
-                    Err(e) => {
-                        return Err(e)
-                            .with_context(|| format!("querying status at {}", socket.display()));
-                    }
-                };
-                match status
-                    .peers
-                    .iter()
-                    .find(|p| p.name == peer || p.ipv4 == peer)
-                {
-                    // Peers currently expose only an IPv4 in our PeerReport, so -6 yields nothing.
-                    Some(p) => format_ip_filtered(Some(&p.ipv4), None, sel),
-                    None => {
-                        eprintln!("no peer matching {peer:?} in the current netmap");
-                        std::process::exit(1);
-                    }
-                }
-            } else {
-                // Self addresses.
-                match round_trip(&socket, &Request::Ip).await {
-                    Ok(Response::Ip { ipv4, ipv6 }) => {
-                        format_ip_filtered(ipv4.as_deref(), ipv6.as_deref(), sel)
-                    }
-                    Ok(Response::Error { message }) => {
-                        eprintln!("error: {message}");
-                        std::process::exit(1);
-                    }
-                    Ok(other) => anyhow::bail!("unexpected response to ip request: {other:?}"),
-                    Err(e) => {
-                        return Err(e)
-                            .with_context(|| format!("querying ip at {}", socket.display()));
-                    }
-                }
-            };
-            print!("{out}");
-            return Ok(());
+        } => run_ip(&socket, v4, v6, first, peer).await,
+        Command::Whois { ip } => run_whois(&socket, ip).await,
+        Command::IdToken { audience } => {
+            dispatch_simple(&socket, Request::IdToken { audience }).await
         }
-        Command::Whois { ip } => Request::Whois { ip },
-        Command::IdToken { audience } => Request::IdToken { audience },
         // `ping` (Go `tailscale ping [-c N]`): the engine pings one-at-a-time, so `-c` is a CLI-side
         // loop over `Request::Ping`. Handled inline (the loop + summary + exit-code contract); each
         // attempt prints a result line, a failure is counted but does not abort the rest, and the
         // command exits non-zero only if NOTHING was received.
-        Command::Ping { ip, timeout, count } => {
-            let n = count.max(1);
-            let mut received = 0u32;
-            for seq in 1..=n {
-                match round_trip(
-                    &socket,
-                    &Request::Ping {
-                        ip: ip.clone(),
-                        timeout_ms: timeout,
-                    },
-                )
-                .await
-                {
-                    Ok(Response::Ping { rtt_ms, ip }) => {
-                        received += 1;
-                        println!("pong from {ip} in {rtt_ms:.1} ms  (seq {seq}/{n})");
-                    }
-                    Ok(Response::Error { message }) => {
-                        eprintln!("ping {seq}/{n} failed: {message}");
-                    }
-                    Ok(other) => anyhow::bail!("unexpected response to ping: {other:?}"),
-                    Err(e) => {
-                        return Err(e).with_context(|| format!("pinging at {}", socket.display()));
-                    }
-                }
-                // Pace at ~1 ping/second like Go `tailscale ping`, so `-c N` is a steady stream
-                // rather than a burst. Skip the wait after the final attempt.
-                if seq < n {
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                }
-            }
-            // Only print a summary for a multi-ping run (a single ping's one line is self-explanatory).
-            if n > 1 {
-                println!("{}", format_ping_summary(n, received));
-            }
-            // Exit non-zero only if nothing came back at all (Go: success if any reply).
-            if received == 0 {
-                std::process::exit(1);
-            }
-            return Ok(());
-        }
+        Command::Ping { ip, timeout, count } => run_ping(&socket, ip, timeout, count).await,
         // Taildrop. The nested subcommand picks which wire `Request` to send: `cp` and `get` are
         // writes (the daemon reads/consumes a file) and reply `Ok`; `list` is read-only and replies
         // `Files`.
         // `metrics` (Go `tailscale metrics`): fetch the Prometheus text, then print or write it.
         // Inline because `write <path>` chooses a file sink over stdout.
-        Command::Metrics { cmd } => {
-            let text = match round_trip(&socket, &Request::Metrics).await {
-                Ok(Response::Metrics { text }) => text,
-                Ok(Response::Error { message }) => {
-                    eprintln!("error: {message}");
-                    std::process::exit(1);
-                }
-                Ok(other) => anyhow::bail!("unexpected response to metrics: {other:?}"),
-                Err(e) => {
-                    return Err(e)
-                        .with_context(|| format!("querying metrics at {}", socket.display()));
-                }
-            };
-            match cmd {
-                Some(MetricsCmd::Write { path }) => {
-                    tokio::fs::write(&path, text.as_bytes())
-                        .await
-                        .with_context(|| format!("writing metrics to {}", path.display()))?;
-                    println!("wrote metrics to {}", path.display());
-                }
-                None => print!("{text}"),
-            }
-            return Ok(());
-        }
+        Command::Metrics { cmd } => run_metrics(&socket, cmd).await,
         // `lock status` (Go `tailscale lock status`): fetch + render the TKA status.
         Command::Lock {
             cmd: LockCmd::Status { json },
-        } => {
-            let report = match round_trip(&socket, &Request::LockStatus).await {
-                Ok(Response::Lock(r)) => r,
-                Ok(Response::Error { message }) => {
-                    eprintln!("error: {message}");
-                    std::process::exit(1);
-                }
-                Ok(other) => anyhow::bail!("unexpected response to lock status: {other:?}"),
-                Err(e) => {
-                    return Err(e)
-                        .with_context(|| format!("querying lock status at {}", socket.display()));
-                }
-            };
-            print!("{}", format_lock_status(&report, json));
-            return Ok(());
-        }
+        } => run_lock_status(&socket, json).await,
         // `dns status` (Go `tailscale dns status`): fetch + render the control-pushed MagicDNS config.
         Command::Dns {
             cmd: DnsCmd::Status { json },
-        } => {
-            let report = match round_trip(&socket, &Request::DnsStatus).await {
-                Ok(Response::DnsStatus(r)) => r,
-                Ok(Response::Error { message }) => {
-                    eprintln!("error: {message}");
-                    std::process::exit(1);
-                }
-                Ok(other) => anyhow::bail!("unexpected response to dns status: {other:?}"),
-                Err(e) => {
-                    return Err(e)
-                        .with_context(|| format!("querying dns status at {}", socket.display()));
-                }
-            };
-            print!("{}", format_dns_status(&report, json));
-            return Ok(());
-        }
+        } => run_dns_status(&socket, json).await,
         // `netcheck` (Go `tailscale netcheck`): fetch + render the net-report (DERP-region latency).
-        Command::Netcheck { json } => {
-            let report = match round_trip(&socket, &Request::Netcheck).await {
-                Ok(Response::Netcheck(r)) => r,
-                Ok(Response::Error { message }) => {
-                    eprintln!("error: {message}");
-                    std::process::exit(1);
-                }
-                Ok(other) => anyhow::bail!("unexpected response to netcheck: {other:?}"),
-                Err(e) => {
-                    return Err(e)
-                        .with_context(|| format!("querying netcheck at {}", socket.display()));
-                }
-            };
-            print!("{}", format_netcheck(&report, json));
-            return Ok(());
-        }
+        Command::Netcheck { json } => run_netcheck(&socket, json).await,
         // `exit-node list` (Go `tailscale exit-node list`): reuse Status, filter to exit-node peers.
         Command::ExitNode {
             cmd: ExitNodeCmd::List,
-        } => {
-            let status = match round_trip(&socket, &Request::Status).await {
-                Ok(Response::Status(s)) => s,
-                Ok(other) => anyhow::bail!("unexpected response to status: {other:?}"),
-                Err(e) => {
-                    return Err(e)
-                        .with_context(|| format!("querying status at {}", socket.display()));
-                }
-            };
-            print!("{}", format_exit_node_list(&status.peers));
-            return Ok(());
-        }
-        Command::File { cmd } => match cmd {
-            FileCmd::Cp { path, peer } => Request::FileCp { path, peer },
-            FileCmd::List => Request::FileList,
-            FileCmd::Get {
-                name,
-                dest,
-                delete_after,
-            } => Request::FileGet {
-                name,
-                dest,
-                delete_after,
-            },
-        },
-    };
+        } => run_exit_node_list(&socket).await,
+        Command::File { cmd } => run_file(&socket, cmd).await,
+    }
+}
 
-    let response = round_trip(&socket, &request)
+/// Print `tnet version` output (thin wrapper over [`format_version`], which is pure + unit-tested).
+/// `cap` is the engine's current capability version (the `cap` field of Go's `version.Meta`).
+fn print_version(client: &str, daemon: Option<&str>, cap: u16, json: bool) {
+    print!("{}", format_version(client, daemon, cap, json));
+}
+
+/// Send a write `Request` that replies `Ok`/`Error`, printing `ok: <msg>` on success or the error +
+/// exit 1 on failure. Used by the `switch`/`switch remove` inline arms (they're plain writes whose
+/// success is just an acknowledgement). Returns `Ok(())` so the caller can `return` it directly.
+async fn send_ok_or_die(socket: &std::path::Path, request: Request) -> Result<()> {
+    match round_trip(socket, &request).await {
+        Ok(Response::Ok { message }) => {
+            println!("ok: {message}");
+            Ok(())
+        }
+        Ok(Response::Error { message }) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        Ok(other) => anyhow::bail!("unexpected response: {other:?}"),
+        Err(e) => Err(e).with_context(|| format!("talking to daemon at {}", socket.display())),
+    }
+}
+
+/// Round-trip a one-shot `Request` whose reply is rendered with no command-specific state, then
+/// return. Covers the truly-generic writes — `down`/`logout` (reply `Ok`), `bugreport` (reply
+/// `BugReport`), and `id-token` (reply `IdToken`) — distributing the former shared post-match render
+/// arms for those response shapes into one place. Models its error/exit handling on
+/// [`send_ok_or_die`]: a `Response::Error` prints `error: <msg>` and exits 1; a transport error is
+/// returned with the same "talking to daemon" context the old fall-through block used.
+async fn dispatch_simple(socket: &std::path::Path, request: Request) -> Result<()> {
+    let response = round_trip(socket, &request)
         .await
         .with_context(|| format!("talking to daemon at {}", socket.display()))?;
-
     match response {
-        Response::Status(s) => {
-            // Apply the client-side --active / --no-peers / --no-self filters before rendering, so
-            // both the human and --json paths honor them identically.
-            let s = status_filter.apply(s);
-            if status_json {
-                // Go `status --json`: the ipnstate.Status-shaped object (faithful subset).
-                match format_status_json(&s) {
-                    Ok(out) => print!("{out}"),
-                    Err(e) => {
-                        eprintln!("error: serializing status: {e}");
-                        std::process::exit(1);
-                    }
-                }
-            } else {
-                print_status(&s);
-            }
+        Response::Ok { message } => {
+            println!("ok: {message}");
         }
-        // This node's own tailnet addresses (`tnet ip`), one per line; a node with no address yet
-        // (no netmap received) prints a clear placeholder rather than nothing.
-        // `ip` is handled inline above (early return) so its -4/-6/-1/peer logic stays in one place;
-        // this arm is exhaustiveness-only. Render unfiltered defensively if one ever reaches here.
-        Response::Ip { ipv4, ipv6 } => print!("{}", format_ip(ipv4.as_deref(), ipv6.as_deref())),
-        // The owner of a tailnet IP (`tnet whois`). The node name is control-supplied text, so it is
-        // run through `sanitize_for_terminal` inside the formatter before printing. The queried IP
-        // (needed for the not-found line) is read back from the still-owned `request`.
-        Response::Whois(w) => {
-            let queried_ip = match &request {
-                Request::Whois { ip } => ip.as_str(),
-                // The daemon only sends Whois in reply to a Whois request; fall back gracefully.
-                // Reaching here means the daemon violated that invariant — note it instead of
-                // staying fully silent, but keep the empty-string fallback so rendering proceeds.
-                _ => {
-                    eprintln!("warning: whois reply to a non-whois request (protocol violation)");
-                    ""
-                }
-            };
-            print!("{}", format_whois(&w, queried_ip));
+        // `bugreport`: print the local marker + a one-line honesty note (no logs were uploaded).
+        Response::BugReport { marker } => {
+            println!("{marker}");
+            eprintln!(
+                "(local diagnostic marker — this client uploads no logs; quote it when reporting an issue)"
+            );
         }
-        // Round-trip time of an overlay ping (`tnet ping`).
-        // `ping` is handled inline above (the -c loop); this arm is exhaustiveness-only.
-        Response::Ping { rtt_ms, ip } => println!("pong from {ip} in {rtt_ms:.1} ms"),
-        // Waiting Taildrop files (`tnet file list`). One line per file; an empty inbox prints a
-        // clear placeholder rather than nothing. The file name is engine/peer-supplied, so it is run
-        // through `sanitize_for_terminal` before printing (a sender could craft a hostile name).
-        Response::Files { files } => print!("{}", format_files(&files)),
+        // `id-token`: print the raw JWT on its own line (Go's `outln(tr.IDToken)`) for easy capture
+        // into a variable / piping to a verifier. The token is opaque base64url — no sanitization
+        // needed (it is control-minted, not free-form text).
+        Response::IdToken { token } => println!("{token}"),
+        Response::Error { message } => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+/// `up` (Go `tailscale up`): bring the node up / re-apply prefs. Runs the two SSH-risk pre-flight
+/// gates, resolves the auth key, builds the wire `Request::Up`, round-trips it, then renders the
+/// reply. On a successful `Ok`, a keyless (interactive) up polls `status` to surface the login URL,
+/// and `--timeout` bounds a client-side wait for Running. The accidental-revert guard
+/// (`RevertGuard`) and `Error` both exit non-zero without changing the node. The pre-flight ORDER is
+/// load-bearing: force-reauth refusal → SSH-toggle gate → `--timeout` capture → authkey resolution →
+/// interactive flag → build request.
+#[allow(clippy::too_many_arguments)]
+async fn run_up(
+    socket: &std::path::Path,
+    authkey: Option<String>,
+    authkey_file: Option<std::path::PathBuf>,
+    hostname: Option<String>,
+    control_url: Option<String>,
+    tun: bool,
+    no_tun: bool,
+    tun_name: Option<String>,
+    tun_mtu: Option<u16>,
+    exit_node: Option<String>,
+    clear_exit_node: bool,
+    advertise_exit_node: bool,
+    no_advertise_exit_node: bool,
+    advertise_routes: Vec<String>,
+    advertise_routes_clear: bool,
+    advertise_tags: Vec<String>,
+    advertise_tags_clear: bool,
+    accept_routes: bool,
+    no_accept_routes: bool,
+    shields_up: bool,
+    no_shields_up: bool,
+    ssh: bool,
+    no_ssh: bool,
+    reset: bool,
+    force_reauth: bool,
+    timeout: Option<u64>,
+    accept_risk: Option<String>,
+) -> Result<()> {
+    // Risk gate (Go `--accept-risk`/`riskLoseSSH`): `--force-reauth` re-registers the node,
+    // which can drop the very Tailscale-SSH session you're typing from. Refuse it over such a
+    // session unless the operator pre-accepted `lose-ssh` (or `all`). Detected entirely
+    // CLI-side from `$SSH_CLIENT` (like Go's `isSSHOverTailscale`), BEFORE anything reaches the
+    // daemon. Unlike Go's interactive y/N, this daemon CLI refuses non-interactively (it has no
+    // TTY-prompt path) — faithful to Go's own non-interactive branch + the same flag/values.
+    if force_reauth
+        && is_ssh_over_tailscale()
+        && !risk_accepted(accept_risk.as_deref().unwrap_or(""), "lose-ssh")
+    {
+        eprintln!(
+            "refusing --force-reauth: you appear to be connected over a Tailscale SSH \
+             session, and re-registering the node may drop it (you could lock yourself out)."
+        );
+        eprintln!("To override, re-run with --accept-risk=lose-ssh");
+        std::process::exit(1);
+    }
+    // Risk gate 2 (Go `presentSSHToggleRisk`): toggling the Tailscale SSH server over a
+    // Tailscale SSH session reroutes/drops that session. Refuse unless `--accept-risk=lose-ssh`.
+    // Short-circuits (no daemon call) unless `--ssh`/`--no-ssh` is mentioned, we're over SSH,
+    // and the risk wasn't accepted; only then does it read `haveSSH` to compare. Runs before
+    // the request is built, so a refusal changes nothing on the node. (bead tsd-eqx)
+    refuse_ssh_toggle_risk_if_needed(socket, resolve_ssh(ssh, no_ssh), accept_risk.as_deref())
+        .await?;
+    // `--timeout` is a CLIENT-SIDE wait, not a pref and not a wire field: capture it so the
+    // post-`up` success path waits for Running (Go `up --timeout`). `None` here means the post-up
+    // path will not wait; `Some(secs)` arms the wait (0 = forever, per `wait_for_running`).
+    let up_timeout = timeout;
+    // Resolve the secret through the precedence chain and hold it as a `SecretString`
+    // (zeroized on drop, never `Debug`-printed). Expose it only here, at the moment we
+    // serialize the wire `Request` — the field on the wire stays a plain `Option<String>`.
+    let authkey = resolve_authkey(authkey, authkey_file).await?;
+    // `--force-reauth` re-registers fresh; with no authkey that is an interactive login (the
+    // daemon wipes the key, the engine reaches NeedsLogin, and the poll below surfaces the new
+    // auth URL) — exactly the keyless-up interactive path, so the same `interactive_up` gate
+    // (authkey absent) drives it. No separate polling logic is needed for force-reauth.
+    let interactive_up = authkey.is_none();
+    let request = Request::Up {
+        authkey: authkey.map(|k| k.expose_secret().to_owned()),
+        control_url,
+        hostname,
+        // `--tun` → Some(true) (enable); `--no-tun` → Some(false) (disable); neither →
+        // None (leave the pref unchanged), so `tnet up` without either flag never silently
+        // flips a TUN node. clap's `conflicts_with` guarantees the two are never both set.
+        tun: resolve_tun(tun, no_tun),
+        tun_name,
+        tun_mtu,
+        // `--exit-node <sel>` sets, `--clear-exit-node` stops using one, neither leaves it
+        // unchanged; clap's `conflicts_with` guarantees the two are never both set.
+        exit_node: resolve_exit_node(exit_node, clear_exit_node),
+        // `--advertise-exit-node`/`--no-advertise-exit-node` tri-state (mirrors `--tun`).
+        advertise_exit_node: resolve_advertise_exit_node(
+            advertise_exit_node,
+            no_advertise_exit_node,
+        ),
+        // Passed routes replace the set; `--advertise-routes-clear` empties it; neither
+        // leaves the persisted set unchanged.
+        advertise_routes: resolve_advertise_routes(advertise_routes, advertise_routes_clear),
+        // Passed tags replace the set; `--clear-advertise-tags` empties it; neither leaves it
+        // unchanged. Reuses the same Vec+clear→Option resolver as advertise-routes.
+        advertise_tags: resolve_advertise_routes(advertise_tags, advertise_tags_clear),
+        // `--accept-routes`/`--no-accept-routes` tri-state (mirrors `--tun`); reuses the same
+        // resolver as the `set` arm.
+        accept_routes: resolve_accept_routes(accept_routes, no_accept_routes),
+        // `--shields-up`/`--no-shields-up` tri-state (mirrors `--tun`); reuses the same
+        // resolver as the `set` arm.
+        shields_up: resolve_shields_up(shields_up, no_shields_up),
+        // `--ssh`/`--no-ssh` tri-state (mirrors `--tun`).
+        ssh: resolve_ssh(ssh, no_ssh),
+        // `--reset`: reset unmentioned settings to default + bypass the accidental-revert
+        // guard. A plain bool flag (Go's `--reset`), passed straight through.
+        reset,
+        // `--force-reauth`: discard the node key so the bring-up re-registers fresh (new
+        // login). A plain bool flag (Go's `--force-reauth`), passed straight through.
+        force_reauth,
+    };
+    let response = round_trip(socket, &request)
+        .await
+        .with_context(|| format!("talking to daemon at {}", socket.display()))?;
+    match response {
         Response::Ok { message } => {
             println!("ok: {message}");
             // Interactive login: an authkey-less `up` succeeds at the daemon, but the node now needs
@@ -1609,7 +1296,7 @@ async fn main() -> Result<()> {
             // the engine reaches `NeedsLogin` — so poll `status` briefly to surface it (or a
             // terminal registration failure).
             if interactive_up {
-                match poll_for_auth_url(&socket).await {
+                match poll_for_auth_url(socket).await {
                     AuthOutcome::Url(url) => {
                         println!();
                         println!("To authenticate this node, visit:");
@@ -1638,16 +1325,17 @@ async fn main() -> Result<()> {
             }
             // `up --timeout`: bound the wait for the node to reach Running (Go `tailscale up
             // --timeout`). Only an `up` that passed `--timeout` arms this (`up_timeout` is `None` for
-            // every other command and for an `up` without the flag, preserving the fire-and-return
-            // default). The auth URL above is printed FIRST, so an interactive up still surfaces it
-            // before waiting (Go waits for Running regardless of interactive vs keyed). A timeout is a
-            // non-zero exit — the daemon accepted the up, but the node did not come up in time.
+            // an `up` without the flag, preserving the fire-and-return default). The auth URL above is
+            // printed FIRST, so an interactive up still surfaces it before waiting (Go waits for
+            // Running regardless of interactive vs keyed). A timeout is a non-zero exit — the daemon
+            // accepted the up, but the node did not come up in time.
             if let Some(secs) = up_timeout
-                && let Err(e) = wait_for_running(&socket, Some(secs)).await
+                && let Err(e) = wait_for_running(socket, Some(secs)).await
             {
                 eprintln!("{e:#}");
                 std::process::exit(1);
             }
+            Ok(())
         }
         // The daemon refused an `up` that would silently revert non-default settings the command did
         // not mention (Go's accidental-revert guard). Render Go's guidance with a copy-pasteable
@@ -1656,65 +1344,590 @@ async fn main() -> Result<()> {
             eprint!("{}", format_revert_guard(&reverts));
             std::process::exit(1);
         }
-        // `version` is fully handled inline above (it early-returns before this match, whether or not
-        // `--daemon` was passed), so a `Response::Version` never reaches here. This arm exists only
-        // for match exhaustiveness; treat a stray one defensively rather than panicking.
-        Response::Version { version } => println!("{version}"),
-        // `id-token`: print the raw JWT on its own line (Go's `outln(tr.IDToken)`) for easy capture
-        // into a variable / piping to a verifier. The token is opaque base64url — no sanitization
-        // needed (it is control-minted, not free-form text).
-        Response::IdToken { token } => println!("{token}"),
-        // `get` is likewise handled inline above (early return); this arm is only for exhaustiveness.
-        // Render the all-prefs table defensively if one ever reaches here.
-        Response::Prefs(view) => print!("{}", format_get(&view, None, false).unwrap_or_default()),
-        // `switch --list` is handled inline above; this arm is exhaustiveness-only.
-        Response::Profiles { profiles } => print!("{}", format_profiles(&profiles)),
-        // `metrics`/`lock status` are handled inline above; these arms are exhaustiveness-only.
-        Response::Metrics { text } => print!("{text}"),
-        Response::Lock(report) => print!("{}", format_lock_status(&report, false)),
-        // `dns status` is handled inline above (early return); this arm is exhaustiveness-only.
-        Response::DnsStatus(report) => print!("{}", format_dns_status(&report, false)),
-        // `netcheck` is handled inline above (early return); this arm is exhaustiveness-only.
-        Response::Netcheck(report) => print!("{}", format_netcheck(&report, false)),
-        // `serve` is handled inline above (read-modify-write); this arm is exhaustiveness-only.
-        Response::ServeConfig(cfg) => print!("{}", format_serve_status(&cfg, false)),
-        // `bugreport`: print the local marker + a one-line honesty note (no logs were uploaded).
-        Response::BugReport { marker } => {
-            println!("{marker}");
-            eprintln!(
-                "(local diagnostic marker — this client uploads no logs; quote it when reporting an issue)"
-            );
+        Response::Error { message } => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        other => anyhow::bail!("unexpected response to up: {other:?}"),
+    }
+}
+
+/// `set` (Go `tailscale set`): patch individual prefs on an already-configured node — never
+/// (re)authenticates, never changes up/down. Runs the SSH-toggle risk gate BEFORE building the
+/// request (so a refusal changes nothing), builds the wire `Request::Set`, round-trips it, then
+/// renders the reply: `Ok` acknowledges, the accidental-revert guard (`RevertGuard`) and `Error`
+/// both exit non-zero without changing the node.
+#[allow(clippy::too_many_arguments)]
+async fn run_set(
+    socket: &std::path::Path,
+    hostname: Option<String>,
+    accept_routes: bool,
+    no_accept_routes: bool,
+    shields_up: bool,
+    no_shields_up: bool,
+    exit_node: Option<String>,
+    clear_exit_node: bool,
+    advertise_exit_node: bool,
+    no_advertise_exit_node: bool,
+    advertise_routes: Vec<String>,
+    advertise_routes_clear: bool,
+    advertise_tags: Vec<String>,
+    advertise_tags_clear: bool,
+    ssh: bool,
+    no_ssh: bool,
+    accept_risk: Option<String>,
+) -> Result<()> {
+    // Risk gate (Go `presentSSHToggleRisk`, the `set` call site): toggling the Tailscale SSH
+    // server over a Tailscale SSH session reroutes/drops that session — refuse unless
+    // `--accept-risk=lose-ssh`. Short-circuits (no daemon call) unless `--ssh`/`--no-ssh` is
+    // mentioned, we're over SSH, and the risk wasn't accepted. Runs before the request is
+    // built, so a refusal changes nothing. (bead tsd-eqx — same enforcement as the `up` path.)
+    refuse_ssh_toggle_risk_if_needed(socket, resolve_ssh(ssh, no_ssh), accept_risk.as_deref())
+        .await?;
+    let request = Request::Set {
+        hostname,
+        // `--accept-routes`/`--no-accept-routes` tri-state (mirrors `--tun`).
+        accept_routes: resolve_accept_routes(accept_routes, no_accept_routes),
+        // `--shields-up`/`--no-shields-up` tri-state (mirrors `--tun`).
+        shields_up: resolve_shields_up(shields_up, no_shields_up),
+        // `--exit-node <sel>` sets, `--clear-exit-node` stops using one, neither leaves it
+        // unchanged; clap's `conflicts_with` guarantees the two are never both set. Reuses the
+        // same resolver as the `up` arm.
+        exit_node: resolve_exit_node(exit_node, clear_exit_node),
+        // `--advertise-exit-node`/`--no-advertise-exit-node` tri-state (mirrors `--tun`).
+        advertise_exit_node: resolve_advertise_exit_node(
+            advertise_exit_node,
+            no_advertise_exit_node,
+        ),
+        // Passed routes replace the set; `--advertise-routes-clear` empties it; neither leaves
+        // the persisted set unchanged.
+        advertise_routes: resolve_advertise_routes(advertise_routes, advertise_routes_clear),
+        // Passed tags replace the set; `--clear-advertise-tags` empties it; neither unchanged.
+        advertise_tags: resolve_advertise_routes(advertise_tags, advertise_tags_clear),
+        // `--ssh`/`--no-ssh` tri-state (mirrors `--tun`).
+        ssh: resolve_ssh(ssh, no_ssh),
+    };
+    let response = round_trip(socket, &request)
+        .await
+        .with_context(|| format!("talking to daemon at {}", socket.display()))?;
+    match response {
+        Response::Ok { message } => {
+            println!("ok: {message}");
+            Ok(())
+        }
+        // The daemon refused a `set` that would silently revert non-default settings the command did
+        // not mention (Go's accidental-revert guard). Render Go's guidance + exit non-zero — nothing
+        // was changed on the node.
+        Response::RevertGuard { reverts } => {
+            eprint!("{}", format_revert_guard(&reverts));
+            std::process::exit(1);
         }
         Response::Error { message } => {
             eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        other => anyhow::bail!("unexpected response to set: {other:?}"),
+    }
+}
+
+/// `status` (Go `tailscale status`): render the node + peer table. `--web` serves a long-lived
+/// embedded HTTP page and `--watch` streams updates (both return without the one-shot path); plain
+/// `status` round-trips one `Status`, applies the client-side `--active`/`--no-peers`/`--no-self`
+/// filters, then renders the human table or (`--json`) the Go `ipnstate.Status`-shaped object.
+#[allow(clippy::too_many_arguments)]
+async fn run_status(
+    socket: &std::path::Path,
+    watch: bool,
+    json: bool,
+    active: bool,
+    no_peers: bool,
+    no_self: bool,
+    web: bool,
+    listen: Option<String>,
+    no_browser: bool,
+) -> Result<()> {
+    // `status --web` is a long-lived embedded HTTP server, not a one-shot — handle it here and
+    // return (like --watch). Default listen 127.0.0.1:8384; browser opens unless --no-browser.
+    if web {
+        let listen = listen.unwrap_or_else(|| "127.0.0.1:8384".to_string());
+        return run_status_web(socket, &listen, !no_browser)
+            .await
+            .with_context(|| format!("serving status --web on {listen}"));
+    }
+    if watch {
+        return watch_status(socket)
+            .await
+            .with_context(|| format!("watching status at {}", socket.display()));
+    }
+    let status_filter = StatusFilter {
+        active_only: active,
+        hide_peers: no_peers,
+        hide_self: no_self,
+    };
+    let response = round_trip(socket, &Request::Status)
+        .await
+        .with_context(|| format!("talking to daemon at {}", socket.display()))?;
+    match response {
+        Response::Status(s) => {
+            // Apply the client-side --active / --no-peers / --no-self filters before rendering, so
+            // both the human and --json paths honor them identically.
+            let s = status_filter.apply(s);
+            if json {
+                // Go `status --json`: the ipnstate.Status-shaped object (faithful subset).
+                match format_status_json(&s) {
+                    Ok(out) => print!("{out}"),
+                    Err(e) => {
+                        eprintln!("error: serializing status: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                print_status(&s);
+            }
+            Ok(())
+        }
+        Response::Error { message } => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        other => anyhow::bail!("unexpected response to status: {other:?}"),
+    }
+}
+
+/// `debug capture`: send DebugCapture (a long-lived write — the daemon taps the dataplane for
+/// `seconds`, then replies with the byte count).
+async fn run_debug_capture(
+    socket: &std::path::Path,
+    path: std::path::PathBuf,
+    seconds: u64,
+) -> Result<()> {
+    let path = path.to_string_lossy().into_owned();
+    let resp = round_trip(
+        socket,
+        &Request::DebugCapture {
+            path,
+            seconds: Some(seconds),
+        },
+    )
+    .await
+    .with_context(|| format!("debug capture via {}", socket.display()))?;
+    match resp {
+        Response::Ok { message } => {
+            println!("{message}");
+            Ok(())
+        }
+        Response::Error { message } => anyhow::bail!("debug capture failed: {message}"),
+        other => anyhow::bail!("unexpected response to debug capture: {other:?}"),
+    }
+}
+
+/// `switch` (Go `tailscale switch`): `--list` renders a table; `remove <id>` deletes; a bare
+/// `<target>` switches. `--list` renders the Profiles reply, and the three modes map to different
+/// requests.
+async fn run_switch(
+    socket: &std::path::Path,
+    list: bool,
+    target: Option<String>,
+    cmd: Option<SwitchCmd>,
+) -> Result<()> {
+    // `switch remove <id>` (subcommand) takes precedence.
+    if let Some(SwitchCmd::Remove { target }) = cmd {
+        return send_ok_or_die(socket, Request::DeleteProfile { target }).await;
+    }
+    if list {
+        match round_trip(socket, &Request::ProfileList).await {
+            Ok(Response::Profiles { profiles }) => {
+                print!("{}", format_profiles(&profiles));
+                return Ok(());
+            }
+            Ok(Response::Error { message }) => {
+                eprintln!("error: {message}");
+                std::process::exit(1);
+            }
+            Ok(other) => anyhow::bail!("unexpected response to profile list: {other:?}"),
+            Err(e) => {
+                return Err(e).with_context(|| format!("listing profiles at {}", socket.display()));
+            }
+        }
+    }
+    match target {
+        Some(target) => send_ok_or_die(socket, Request::SwitchProfile { target }).await,
+        None => {
+            eprintln!("usage: tnet switch <profile> | --list | remove <profile>");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `version` answers from the CLI's own crate version. WITHOUT `--daemon` it never contacts the
+/// daemon (Go also prints the client version with no LocalAPI call). WITH `--daemon` it round-trips
+/// `Request::Version` to learn the daemon's version, then renders both inline (rather than falling
+/// through to the generic response printer) so the client/daemon pairing + `--json` shape stay in
+/// one place.
+async fn run_version(
+    socket: &std::path::Path,
+    daemon: bool,
+    json: bool,
+    upstream: bool,
+) -> Result<()> {
+    // `--upstream` would fetch the latest release from a release server; this build does no
+    // such network call, so return Go's verbatim message + a non-zero exit (faithful, offline,
+    // names no infrastructure). Checked before the local render so `version --upstream` never
+    // prints a version line implying success.
+    if upstream {
+        eprintln!("fetching latest version not supported in this build");
+        std::process::exit(1);
+    }
+    let client_version = env!("CARGO_PKG_VERSION");
+    let daemon_version = if daemon {
+        match round_trip(socket, &Request::Version).await {
+            Ok(Response::Version { version }) => Some(version),
+            Ok(other) => {
+                anyhow::bail!("unexpected response to version request: {other:?}")
+            }
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("querying daemon version at {}", socket.display()));
+            }
+        }
+    } else {
+        None
+    };
+    // `cap` = the engine's current capability version (Go `version.Meta.cap`), read from the
+    // engine's `ts_capabilityversion` crate (pinned to the same rev as the engine facade).
+    let cap = u16::from(ts_capabilityversion::CapabilityVersion::CURRENT);
+    print_version(client_version, daemon_version.as_deref(), cap, json);
+    Ok(())
+}
+
+/// `get` (Go `tailscale get`): round-trip GetPrefs, then render. Inline because its `setting`/`json`
+/// args shape the output and are not part of the wire request — keeping the projection→render in one
+/// place, like `version`.
+async fn run_get(socket: &std::path::Path, setting: Option<String>, json: bool) -> Result<()> {
+    let view = match round_trip(socket, &Request::GetPrefs).await {
+        Ok(Response::Prefs(v)) => v,
+        Ok(Response::Error { message }) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        Ok(other) => anyhow::bail!("unexpected response to get request: {other:?}"),
+        Err(e) => {
+            return Err(e).with_context(|| format!("getting prefs at {}", socket.display()));
+        }
+    };
+    match format_get(&view, setting.as_deref(), json) {
+        Ok(out) => print!("{out}"),
+        Err(e) => {
+            eprintln!("error: {e}");
             std::process::exit(1);
         }
     }
     Ok(())
 }
 
-/// Print `tnet version` output (thin wrapper over [`format_version`], which is pure + unit-tested).
-/// `cap` is the engine's current capability version (the `cap` field of Go's `version.Meta`).
-fn print_version(client: &str, daemon: Option<&str>, cap: u16, json: bool) {
-    print!("{}", format_version(client, daemon, cap, json));
-}
-
-/// Send a write `Request` that replies `Ok`/`Error`, printing `ok: <msg>` on success or the error +
-/// exit 1 on failure. Used by the `switch`/`switch remove` inline arms (they're plain writes whose
-/// success is just an acknowledgement). Returns `Ok(())` so the caller can `return` it directly.
-async fn send_ok_or_die(socket: &std::path::Path, request: Request) -> Result<()> {
-    match round_trip(socket, &request).await {
-        Ok(Response::Ok { message }) => {
-            println!("ok: {message}");
+/// `whoami` (Go `tailscale whoami`): resolve this node's own identity — Status to learn the self
+/// tailnet IP, then Whois on that IP. Inline because it chains two requests and its `--json` shape is
+/// the whois record. Reuses the same `format_whois` renderer as `whois`.
+async fn run_whoami(socket: &std::path::Path, json: bool) -> Result<()> {
+    let status = match round_trip(socket, &Request::Status).await {
+        Ok(Response::Status(s)) => s,
+        Ok(other) => anyhow::bail!("unexpected response to status request: {other:?}"),
+        Err(e) => {
+            return Err(e).with_context(|| format!("querying status at {}", socket.display()));
+        }
+    };
+    let Some(self_ip) = status.self_ipv4.clone() else {
+        // No tailnet IP yet → not up (Go errors here too, citing the backend state).
+        eprintln!(
+            "no current tailnet IP address (state: {}); is the node up?",
+            status.state
+        );
+        std::process::exit(1);
+    };
+    match round_trip(
+        socket,
+        &Request::Whois {
+            ip: self_ip.clone(),
+        },
+    )
+    .await
+    {
+        Ok(Response::Whois(w)) => {
+            if json {
+                // The whois record as JSON (Go `whoami --json` emits the WhoIsResponse).
+                match serde_json::to_string_pretty(&w) {
+                    Ok(s) => println!("{s}"),
+                    Err(e) => {
+                        eprintln!("error: serializing whois: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                print!("{}", format_whois(&w, &self_ip));
+            }
             Ok(())
         }
         Ok(Response::Error { message }) => {
             eprintln!("error: {message}");
             std::process::exit(1);
         }
-        Ok(other) => anyhow::bail!("unexpected response: {other:?}"),
-        Err(e) => Err(e).with_context(|| format!("talking to daemon at {}", socket.display())),
+        Ok(other) => anyhow::bail!("unexpected response to whois request: {other:?}"),
+        Err(e) => {
+            Err(e).with_context(|| format!("resolving self identity at {}", socket.display()))
+        }
     }
+}
+
+/// `ip` (Go `tailscale ip`): self addresses by default, or a peer's if named, with -4/-6/-1
+/// filters. Inline because the filters + the optional peer lookup shape the output (and the peer
+/// case fetches Status to resolve by name/IP against the netmap).
+async fn run_ip(
+    socket: &std::path::Path,
+    v4: bool,
+    v6: bool,
+    first: bool,
+    peer: Option<String>,
+) -> Result<()> {
+    let sel = IpSelect { v4, v6, first };
+    let out = if let Some(peer) = peer {
+        // Peer address: resolve the named peer against the status peer set (by MagicDNS name
+        // or tailnet IP). We fetch Status (not whois, which is IP-only) so a NAME also works.
+        let status = match round_trip(socket, &Request::Status).await {
+            Ok(Response::Status(s)) => s,
+            Ok(other) => anyhow::bail!("unexpected response to status request: {other:?}"),
+            Err(e) => {
+                return Err(e).with_context(|| format!("querying status at {}", socket.display()));
+            }
+        };
+        match status
+            .peers
+            .iter()
+            .find(|p| p.name == peer || p.ipv4 == peer)
+        {
+            // Peers currently expose only an IPv4 in our PeerReport, so -6 yields nothing.
+            Some(p) => format_ip_filtered(Some(&p.ipv4), None, sel),
+            None => {
+                eprintln!("no peer matching {peer:?} in the current netmap");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        // Self addresses.
+        match round_trip(socket, &Request::Ip).await {
+            Ok(Response::Ip { ipv4, ipv6 }) => {
+                format_ip_filtered(ipv4.as_deref(), ipv6.as_deref(), sel)
+            }
+            Ok(Response::Error { message }) => {
+                eprintln!("error: {message}");
+                std::process::exit(1);
+            }
+            Ok(other) => anyhow::bail!("unexpected response to ip request: {other:?}"),
+            Err(e) => {
+                return Err(e).with_context(|| format!("querying ip at {}", socket.display()));
+            }
+        }
+    };
+    print!("{out}");
+    Ok(())
+}
+
+/// `ping` (Go `tailscale ping [-c N]`): the engine pings one-at-a-time, so `-c` is a CLI-side
+/// loop over `Request::Ping`. Inline (the loop + summary + exit-code contract); each attempt prints
+/// a result line, a failure is counted but does not abort the rest, and the command exits non-zero
+/// only if NOTHING was received.
+async fn run_ping(
+    socket: &std::path::Path,
+    ip: String,
+    timeout: Option<u64>,
+    count: u32,
+) -> Result<()> {
+    let n = count.max(1);
+    let mut received = 0u32;
+    for seq in 1..=n {
+        match round_trip(
+            socket,
+            &Request::Ping {
+                ip: ip.clone(),
+                timeout_ms: timeout,
+            },
+        )
+        .await
+        {
+            Ok(Response::Ping { rtt_ms, ip }) => {
+                received += 1;
+                println!("pong from {ip} in {rtt_ms:.1} ms  (seq {seq}/{n})");
+            }
+            Ok(Response::Error { message }) => {
+                eprintln!("ping {seq}/{n} failed: {message}");
+            }
+            Ok(other) => anyhow::bail!("unexpected response to ping: {other:?}"),
+            Err(e) => {
+                return Err(e).with_context(|| format!("pinging at {}", socket.display()));
+            }
+        }
+        // Pace at ~1 ping/second like Go `tailscale ping`, so `-c N` is a steady stream
+        // rather than a burst. Skip the wait after the final attempt.
+        if seq < n {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    }
+    // Only print a summary for a multi-ping run (a single ping's one line is self-explanatory).
+    if n > 1 {
+        println!("{}", format_ping_summary(n, received));
+    }
+    // Exit non-zero only if nothing came back at all (Go: success if any reply).
+    if received == 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// `metrics` (Go `tailscale metrics`): fetch the Prometheus text, then print or write it. Inline
+/// because `write <path>` chooses a file sink over stdout.
+async fn run_metrics(socket: &std::path::Path, cmd: Option<MetricsCmd>) -> Result<()> {
+    let text = match round_trip(socket, &Request::Metrics).await {
+        Ok(Response::Metrics { text }) => text,
+        Ok(Response::Error { message }) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        Ok(other) => anyhow::bail!("unexpected response to metrics: {other:?}"),
+        Err(e) => {
+            return Err(e).with_context(|| format!("querying metrics at {}", socket.display()));
+        }
+    };
+    match cmd {
+        Some(MetricsCmd::Write { path }) => {
+            tokio::fs::write(&path, text.as_bytes())
+                .await
+                .with_context(|| format!("writing metrics to {}", path.display()))?;
+            println!("wrote metrics to {}", path.display());
+        }
+        None => print!("{text}"),
+    }
+    Ok(())
+}
+
+/// `lock status` (Go `tailscale lock status`): fetch + render the TKA status.
+async fn run_lock_status(socket: &std::path::Path, json: bool) -> Result<()> {
+    let report = match round_trip(socket, &Request::LockStatus).await {
+        Ok(Response::Lock(r)) => r,
+        Ok(Response::Error { message }) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        Ok(other) => anyhow::bail!("unexpected response to lock status: {other:?}"),
+        Err(e) => {
+            return Err(e).with_context(|| format!("querying lock status at {}", socket.display()));
+        }
+    };
+    print!("{}", format_lock_status(&report, json));
+    Ok(())
+}
+
+/// `dns status` (Go `tailscale dns status`): fetch + render the control-pushed MagicDNS config.
+async fn run_dns_status(socket: &std::path::Path, json: bool) -> Result<()> {
+    let report = match round_trip(socket, &Request::DnsStatus).await {
+        Ok(Response::DnsStatus(r)) => r,
+        Ok(Response::Error { message }) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        Ok(other) => anyhow::bail!("unexpected response to dns status: {other:?}"),
+        Err(e) => {
+            return Err(e).with_context(|| format!("querying dns status at {}", socket.display()));
+        }
+    };
+    print!("{}", format_dns_status(&report, json));
+    Ok(())
+}
+
+/// `netcheck` (Go `tailscale netcheck`): fetch + render the net-report (DERP-region latency).
+async fn run_netcheck(socket: &std::path::Path, json: bool) -> Result<()> {
+    let report = match round_trip(socket, &Request::Netcheck).await {
+        Ok(Response::Netcheck(r)) => r,
+        Ok(Response::Error { message }) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        Ok(other) => anyhow::bail!("unexpected response to netcheck: {other:?}"),
+        Err(e) => {
+            return Err(e).with_context(|| format!("querying netcheck at {}", socket.display()));
+        }
+    };
+    print!("{}", format_netcheck(&report, json));
+    Ok(())
+}
+
+/// `exit-node list` (Go `tailscale exit-node list`): reuse Status, filter to exit-node peers.
+async fn run_exit_node_list(socket: &std::path::Path) -> Result<()> {
+    let status = match round_trip(socket, &Request::Status).await {
+        Ok(Response::Status(s)) => s,
+        Ok(other) => anyhow::bail!("unexpected response to status: {other:?}"),
+        Err(e) => {
+            return Err(e).with_context(|| format!("querying status at {}", socket.display()));
+        }
+    };
+    print!("{}", format_exit_node_list(&status.peers));
+    Ok(())
+}
+
+/// `whois` (Go `tailscale whois <ip>`): round-trip Whois for the given tailnet IP, then render the
+/// owner. The node name is control-supplied text, so it is run through `sanitize_for_terminal` inside
+/// the formatter before printing. The queried `ip` is owned here (it is the not-found line's
+/// subject), so the render needs no read-back from the request.
+async fn run_whois(socket: &std::path::Path, ip: String) -> Result<()> {
+    let response = round_trip(socket, &Request::Whois { ip: ip.clone() })
+        .await
+        .with_context(|| format!("talking to daemon at {}", socket.display()))?;
+    match response {
+        Response::Whois(w) => {
+            print!("{}", format_whois(&w, &ip));
+            Ok(())
+        }
+        Response::Error { message } => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        other => anyhow::bail!("unexpected response to whois request: {other:?}"),
+    }
+}
+
+/// Taildrop (`tnet file`). The nested subcommand picks the wire `Request`: `cp` and `get` are writes
+/// (the daemon reads/consumes a file) and reply `Ok`; `list` is read-only and replies `Files`. The
+/// file name in a `list` reply is engine/peer-supplied, so it is run through `sanitize_for_terminal`
+/// inside `format_files` before printing (a sender could craft a hostile name).
+async fn run_file(socket: &std::path::Path, cmd: FileCmd) -> Result<()> {
+    let request = match cmd {
+        FileCmd::Cp { path, peer } => Request::FileCp { path, peer },
+        FileCmd::List => Request::FileList,
+        FileCmd::Get {
+            name,
+            dest,
+            delete_after,
+        } => Request::FileGet {
+            name,
+            dest,
+            delete_after,
+        },
+    };
+    let response = round_trip(socket, &request)
+        .await
+        .with_context(|| format!("talking to daemon at {}", socket.display()))?;
+    match response {
+        // Waiting Taildrop files (`tnet file list`). One line per file; an empty inbox prints a
+        // clear placeholder rather than nothing.
+        Response::Files { files } => print!("{}", format_files(&files)),
+        Response::Ok { message } => {
+            println!("ok: {message}");
+        }
+        Response::Error { message } => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        other => anyhow::bail!("unexpected response to file request: {other:?}"),
+    }
+    Ok(())
 }
 
 /// Render `tnet lock status` from a [`LockReport`](tailscaled_rs::localapi::LockReport). Human form
@@ -2226,6 +2439,11 @@ fn sanitize_for_terminal(s: &str) -> String {
 /// Format the `tnet ip` output: this node's tailnet addresses, one per line (IPv4 then IPv6), or a
 /// placeholder when the node has no address yet (no netmap received). Pure (returns the string,
 /// including its trailing newline) so the formatting is unit-testable; the caller `print!`s it.
+//
+// `tnet ip` itself renders through `format_ip_filtered` (it always carries an `IpSelect`), so this
+// unfiltered variant now has no production call site — it is retained as the tested baseline
+// renderer (see the `format_ip` unit tests). `allow(dead_code)` only outside `cfg(test)`.
+#[cfg_attr(not(test), allow(dead_code))]
 fn format_ip(ipv4: Option<&str>, ipv6: Option<&str>) -> String {
     let mut out = String::new();
     if let Some(v4) = ipv4 {

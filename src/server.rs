@@ -88,17 +88,17 @@ pub async fn serve(
                         // Acquire a connection permit; if the cap is exhausted, drop the connection
                         // (closing it) rather than queueing unboundedly. Held for the handler's life.
                         let Ok(permit) = Arc::clone(&conn_limit).try_acquire_owned() else {
-                            tracing::warn!("connection cap reached; dropping connection");
+                            tracing::warn!("LocalAPI: connection cap reached; dropping connection");
                             continue;
                         };
                         conns.spawn(async move {
                             let _permit = permit;
                             if let Err(e) = handle_conn(stream, access, peer_uid, backend).await {
-                                tracing::warn!(error = %e, "LocalAPI connection error");
+                                tracing::warn!(error = %e, "LocalAPI: connection error");
                             }
                         });
                     }
-                    Err(e) => tracing::warn!(error = %e, "accept failed"),
+                    Err(e) => tracing::warn!(error = %e, "LocalAPI: accept failed"),
                 }
             }
         }
@@ -141,7 +141,7 @@ async fn ensure_dir_0700(dir: &Path) -> Result<()> {
             tracing::warn!(
                 path = %dir.display(),
                 found = format!("{mode:o}"),
-                "socket dir not 0700; tightening (it gates who can reach the control socket)"
+                "LocalAPI: socket dir not 0700; tightening (it gates who can reach the control socket)"
             );
             let mut perms = meta.permissions();
             perms.set_mode(0o700);

@@ -86,7 +86,7 @@ pub(super) fn profiles_file_path(state_dir: &Path) -> PathBuf {
 /// Read the current profile id from the pointer file. A missing/empty/unreadable/invalid pointer
 /// falls back to [`DEFAULT_PROFILE_ID`] — so a fresh or legacy daemon (no pointer file) is always on
 /// the default profile, which is exactly the legacy top-level layout.
-pub(super) async fn read_current_profile(state_dir: &Path) -> String {
+pub(super) async fn load_current_profile(state_dir: &Path) -> String {
     let path = current_profile_path(state_dir);
     match tokio::fs::read_to_string(&path).await {
         Ok(s) => {
@@ -99,16 +99,18 @@ pub(super) async fn read_current_profile(state_dir: &Path) -> String {
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => DEFAULT_PROFILE_ID.to_string(),
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "current-profile pointer unreadable; treating as default");
+            tracing::warn!(error = %e, path = %path.display(), "profile: current-profile pointer unreadable; treating as default");
             DEFAULT_PROFILE_ID.to_string()
         }
     }
 }
 
-/// Atomically-enough persist the current profile pointer.
-pub(super) async fn write_current_profile(state_dir: &Path, id: &str) -> std::io::Result<()> {
+/// Atomically persist the current profile pointer (crash-safe via temp-then-rename — see
+/// [`atomic_write`]). A torn pointer would otherwise be read back as invalid and silently fall back
+/// to the default profile, losing the active selection.
+pub(super) async fn save_current_profile(state_dir: &Path, id: &str) -> std::io::Result<()> {
     tokio::fs::create_dir_all(state_dir).await?;
-    tokio::fs::write(current_profile_path(state_dir), id.as_bytes()).await
+    atomic_write(&current_profile_path(state_dir), id.as_bytes()).await
 }
 
 /// Load the `profiles.json` metadata map (missing/malformed → empty, with the malformed case logged
@@ -116,22 +118,50 @@ pub(super) async fn write_current_profile(state_dir: &Path, id: &str) -> std::io
 pub(super) async fn load_profiles_file(state_dir: &Path) -> ProfilesFile {
     match tokio::fs::read(profiles_file_path(state_dir)).await {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "profiles.json is malformed; treating as empty");
+            tracing::warn!(error = %e, "profile: profiles.json is malformed; treating as empty");
             ProfilesFile::default()
         }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => ProfilesFile::default(),
         Err(e) => {
-            tracing::warn!(error = %e, "profiles file unreadable; treating as empty");
+            tracing::warn!(error = %e, "profile: profiles file unreadable; treating as empty");
             ProfilesFile::default()
         }
     }
 }
 
-/// Persist the `profiles.json` metadata map.
+/// Persist the `profiles.json` metadata map (crash-safe via temp-then-rename — see [`atomic_write`],
+/// so a crash mid-write can never truncate the map into the malformed-→-empty fallback).
 pub(super) async fn save_profiles_file(state_dir: &Path, f: &ProfilesFile) -> std::io::Result<()> {
     tokio::fs::create_dir_all(state_dir).await?;
     let bytes = serde_json::to_vec_pretty(f).expect("profiles file serialize");
-    tokio::fs::write(profiles_file_path(state_dir), bytes).await
+    atomic_write(&profiles_file_path(state_dir), &bytes).await
+}
+
+/// Write `bytes` to `path` atomically: stage them in a temp file in the *same* directory, then
+/// [`tokio::fs::rename`] it over `path` (atomic on POSIX within one filesystem). On any failure the
+/// temp file is removed best-effort so no stray `.tmp` is left behind. Same-dir staging is required —
+/// a cross-filesystem rename is neither atomic nor guaranteed to succeed. Both profile writers set no
+/// explicit file mode, so the temp file (created in the same state dir) carries the same umask/dir
+/// perms the previous in-place write produced.
+async fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    let mut tmp_name = file_name;
+    tmp_name.push(format!(".tmp.{}", std::process::id()));
+    let tmp = dir.join(tmp_name);
+
+    if let Err(e) = tokio::fs::write(&tmp, bytes).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e);
+    }
+    if let Err(e) = tokio::fs::rename(&tmp, path).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -174,15 +204,15 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
         // Missing pointer → default.
-        assert_eq!(read_current_profile(&dir).await, DEFAULT_PROFILE_ID);
+        assert_eq!(load_current_profile(&dir).await, DEFAULT_PROFILE_ID);
         // Round-trip a real id.
-        write_current_profile(&dir, "work").await.unwrap();
-        assert_eq!(read_current_profile(&dir).await, "work");
+        save_current_profile(&dir, "work").await.unwrap();
+        assert_eq!(load_current_profile(&dir).await, "work");
         // A garbage pointer falls back to default (never an invalid path component).
         tokio::fs::write(current_profile_path(&dir), b"../evil")
             .await
             .unwrap();
-        assert_eq!(read_current_profile(&dir).await, DEFAULT_PROFILE_ID);
+        assert_eq!(load_current_profile(&dir).await, DEFAULT_PROFILE_ID);
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
