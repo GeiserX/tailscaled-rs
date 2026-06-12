@@ -57,7 +57,7 @@ pub struct HardenReport {
 pub fn harden_process() -> anyhow::Result<HardenReport> {
     if harden_disabled(std::env::var(NO_HARDEN_VAR).ok().as_deref()) {
         tracing::info!(
-            "{NO_HARDEN_VAR}=1; skipping OS-level hardening \
+            "hardening: {NO_HARDEN_VAR}=1; skipping OS-level hardening \
              (coredumps/ptrace/swap protection NOT applied)"
         );
         return Ok(HardenReport {
@@ -85,7 +85,7 @@ pub fn harden_process() -> anyhow::Result<HardenReport> {
     {
         // No hardening primitives wired for non-unix targets; the daemon's deployment targets are
         // Linux (systemd) and macOS (launchd), both unix. Report nothing-applied rather than lie.
-        tracing::info!("process hardening is a no-op on this non-unix target");
+        tracing::info!("hardening: process hardening is a no-op on this non-unix target");
     }
 
     Ok(report)
@@ -104,7 +104,7 @@ fn set_undumpable() -> bool {
         true
     } else {
         let err = std::io::Error::last_os_error();
-        tracing::warn!(error = %err, "prctl(PR_SET_DUMPABLE, 0) failed; coredumps not disabled via prctl");
+        tracing::warn!(error = %err, "hardening: prctl(PR_SET_DUMPABLE, 0) failed; coredumps not disabled via prctl");
         false
     }
 }
@@ -132,7 +132,7 @@ fn zero_core_limit() -> bool {
         true
     } else {
         let err = std::io::Error::last_os_error();
-        tracing::warn!(error = %err, "setrlimit(RLIMIT_CORE, 0) failed; a coredump may still be written");
+        tracing::warn!(error = %err, "hardening: setrlimit(RLIMIT_CORE, 0) failed; a coredump may still be written");
         false
     }
 }
@@ -155,7 +155,7 @@ fn lock_all_memory() -> bool {
         let err = std::io::Error::last_os_error();
         tracing::warn!(
             error = %err,
-            "mlockall(MCL_CURRENT | MCL_FUTURE) failed; secret pages may be swapped to disk \
+            "hardening: mlockall(MCL_CURRENT | MCL_FUTURE) failed; secret pages may be swapped to disk \
              (grant CAP_IPC_LOCK / raise RLIMIT_MEMLOCK, or set {NO_HARDEN_VAR}=1 to silence)"
         );
         false

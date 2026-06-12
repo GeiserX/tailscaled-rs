@@ -502,7 +502,7 @@ pub(super) async fn file_get(
         tracing::warn!(
             file = name,
             error = ?e,
-            "taildrop file fetched to dest but could not be deleted from the receive directory"
+            "diag: taildrop file fetched to dest but could not be deleted from the receive directory"
         );
     }
     Response::Ok {

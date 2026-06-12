@@ -42,6 +42,10 @@ fn unique_state_dir() -> PathBuf {
 struct Harness {
     state_dir: PathBuf,
     socket_path: PathBuf,
+    /// The shared backend the `serve` task runs on. Retained so a test can drive backend-level
+    /// lifecycle transitions (e.g. a generation bump via the public API) and observe how the live
+    /// `stream_watch` server code reacts over the socket — used by the watch wake-edge regression.
+    backend: Arc<Mutex<Backend>>,
     /// Fire to ask `serve` to stop.
     shutdown_tx: oneshot::Sender<()>,
     /// The spawned `serve` task; await (with a timeout) to confirm clean exit.
@@ -84,6 +88,7 @@ impl Harness {
         Harness {
             state_dir,
             socket_path,
+            backend,
             shutdown_tx,
             serve_task,
         }
@@ -123,12 +128,43 @@ impl Harness {
         })
     }
 
+    /// Open a long-lived `Watch` stream over a fresh connection and read the FIRST snapshot.
+    ///
+    /// Unlike [`round_trip`](Harness::round_trip), `Watch` is terminal for the connection: the daemon
+    /// hands the socket to `stream_watch`, which streams a `Response::Status` line per device epoch /
+    /// lifecycle change. Returns the still-open write half (held by the caller so the connection stays
+    /// open for the lifetime of the watch), the still-open reader (to read further snapshots as the
+    /// backend transitions), and the first decoded snapshot. `stream_watch` emits the first snapshot
+    /// unconditionally before it ever parks on a `changed()`, so this initial read returns promptly.
+    async fn open_watch_stream(
+        &self,
+    ) -> (
+        tokio::net::unix::OwnedWriteHalf,
+        BufReader<tokio::net::unix::OwnedReadHalf>,
+        Response,
+    ) {
+        let stream = UnixStream::connect(&self.socket_path)
+            .await
+            .expect("CLI connect to LocalAPI socket for watch");
+        let (read_half, mut write_half) = stream.into_split();
+        write_half
+            .write_all(b"{\"cmd\":\"watch\"}\n")
+            .await
+            .expect("write watch request");
+        write_half.flush().await.expect("flush watch request");
+
+        let mut reader = BufReader::new(read_half);
+        let first = read_watch_status(&mut reader).await;
+        (write_half, reader, first)
+    }
+
     /// Fire shutdown, await the serve task with a timeout (a hang fails the test instead of
     /// blocking forever), assert the socket file was removed, and best-effort-clean the state dir.
     async fn shutdown_and_verify(self) {
         let Harness {
             state_dir,
             socket_path,
+            backend: _,
             shutdown_tx,
             serve_task,
         } = self;
@@ -164,6 +200,42 @@ async fn wait_for_socket(socket_path: &std::path::Path) {
         "LocalAPI socket never became connectable: {}",
         socket_path.display()
     );
+}
+
+/// Read exactly one `Response::Status` line from an open `Watch` stream, asserting it is a status
+/// (the only thing `stream_watch` ever emits). Used for the first snapshot, which always arrives
+/// promptly; for the "did a NEW snapshot arrive?" assertion use [`try_read_watch_status`] instead.
+async fn read_watch_status(reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>) -> Response {
+    let mut line = String::new();
+    let n = reader
+        .read_line(&mut line)
+        .await
+        .expect("read watch status line");
+    assert!(n > 0, "watch stream closed unexpectedly");
+    serde_json::from_str::<Response>(line.trim_end())
+        .unwrap_or_else(|e| panic!("watch line was not valid Response JSON ({e}): {line:?}"))
+}
+
+/// Try to read one more snapshot from an open `Watch` stream within `dur`. Returns `Some(Response)`
+/// if a fresh line arrived, `None` if it timed out. This is the crux of the lost-wakeup regression:
+/// a BOUNDED read so the test FAILS (returns `None` → assertion fires) rather than HANGS forever if
+/// the wake edge is missing and no second snapshot is ever emitted.
+async fn try_read_watch_status(
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    dur: Duration,
+) -> Option<Response> {
+    let mut line = String::new();
+    match tokio::time::timeout(dur, reader.read_line(&mut line)).await {
+        Ok(Ok(n)) if n > 0 => Some(
+            serde_json::from_str::<Response>(line.trim_end()).unwrap_or_else(|e| {
+                panic!("watch line was not valid Response JSON ({e}): {line:?}")
+            }),
+        ),
+        // EOF (n == 0) or a read error: the stream ended — treat as "no new snapshot".
+        Ok(_) => None,
+        // Timed out: no new snapshot arrived within the window (the lost-wakeup symptom).
+        Err(_) => None,
+    }
 }
 
 /// 1. status round-trip: a fresh, never-configured node reports an unauthenticated, not-running
@@ -409,4 +481,185 @@ async fn wire_format_discriminants_are_stable() {
     assert!(matches!(parsed, Request::Status));
     let parsed: Request = serde_json::from_str(r#"{"cmd":"down"}"#).expect("parse down request");
     assert!(matches!(parsed, Request::Down));
+}
+
+/// 5. WATCH wake-edge regression (the lost-wakeup fix in `Backend::finish_up`).
+///
+/// ## The bug this guards
+///
+/// The lifecycle watch channel (advanced by `bump_generation`) is the ONLY thing that makes
+/// `stream_watch` (src/server.rs) re-derive a fresh per-device state receiver. A `status --watch`
+/// parked on `watch_lifecycle()` while the node is down has taken the device-less (`None`) arm and is
+/// NOT attached to any device's own state receiver — so the ONLY way it ever learns a device appeared
+/// is a lifecycle bump waking its outer loop to re-derive.
+///
+/// `begin_up` bumps the generation while `self.device` is still `None` (the device is built off-lock
+/// and installed later in `finish_up`). Before the fix, `finish_up` installed the device with NO
+/// bump. The losing interleaving: the parked watcher wakes on `begin_up`'s bump, re-derives while the
+/// device is STILL absent (emits another device-less snapshot, re-parks), then `finish_up` installs
+/// the device silently — and the watcher waits forever for a generation change that already fired,
+/// deaf to the device's own state receiver it never attached to. The Connecting→Running transition
+/// (which flows only on that unattached receiver) never reaches the watch: it silently hangs on a
+/// stale device-less snapshot. The fix makes the device-installed transition its own wake edge by
+/// bumping the generation in `finish_up` right after the device is installed.
+///
+/// ## What this test proves (and its honest scope)
+///
+/// This test exercises the WAKE MECHANISM end-to-end through the real `server::serve` →
+/// `stream_watch` path over the socket: it parks a real `Watch` stream on a down node, then drives a
+/// real lifecycle generation bump on the shared backend via the public API and asserts that a NEW
+/// snapshot is delivered to the parked watcher **within a bounded timeout** — i.e. the watcher woke,
+/// its outer loop re-derived, and it re-snapshotted. A regression that breaks lifecycle-bump-driven
+/// re-derivation (the class of bug the fix lives in) makes the second read TIME OUT, and the bounded
+/// read turns that into a test FAILURE instead of an infinite hang.
+///
+/// Scope: this harness deliberately never joins a tailnet, so it cannot install a real
+/// `tailscale::Device` (the engine handshake is a live network call with no offline/mock constructor),
+/// and `finish_up`'s SUCCESS path — the exact line the fix adds — is only reachable with a live
+/// device. The full "watch across a real `up`, observe Connecting→Running after the device installs"
+/// assertion therefore belongs to the headscale-gated e2e (tests/headscale_e2e.rs), where a real
+/// device IS installed. Here we pin the underlying invariant the fix depends on: a lifecycle bump
+/// (the same kind `finish_up` now emits on device install) is an observable wake edge that drives
+/// `stream_watch` to deliver a fresh snapshot to an already-parked watcher.
+#[tokio::test]
+async fn watch_redrives_on_lifecycle_bump_after_parking_on_down_node() {
+    let harness = Harness::start().await;
+
+    // Park a Watch stream on the DOWN node and read the first (device-less) snapshot. A fresh,
+    // never-up'd node derives to NoState/Stopped with no engine; `stream_watch` emits this snapshot
+    // unconditionally, then takes its `None` (no-device) arm and parks on `life.changed()`.
+    let (_watch_write, mut watch_reader, first) = harness.open_watch_stream().await;
+    let first_state = match first {
+        Response::Status(report) => {
+            assert!(
+                report.state == "NoState" || report.state == "Stopped",
+                "the first watch snapshot on a down node must be a device-less state, got {:?}",
+                report.state
+            );
+            assert!(
+                report.self_ipv4.is_none(),
+                "a device-less watch snapshot has no tailnet IPv4"
+            );
+            report.state
+        }
+        other => panic!("expected a Response::Status as the first watch snapshot, got {other:?}"),
+    };
+
+    // Before doing anything else, prove no SECOND snapshot arrives on its own: with no lifecycle
+    // change, the watcher stays correctly parked (this also makes the post-bump arrival meaningful —
+    // it is the bump that wakes it, not noise).
+    assert!(
+        try_read_watch_status(&mut watch_reader, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "a parked watcher must NOT emit a second snapshot without a lifecycle change"
+    );
+
+    // Drive a REAL lifecycle generation bump on the shared backend via the public API. `begin_up`
+    // bumps the generation (exactly as it does at the start of a real `up`, and the same kind of bump
+    // the fix now also emits from `finish_up` when the device is installed). We do this directly on
+    // the retained backend handle rather than over the socket so the test needs no engine: `begin_up`
+    // only prepares config + persists prefs + bumps — no network, no device. (It leaves `device:
+    // None`, faithfully mirroring the window in a real `up` between `begin_up` and `finish_up`.)
+    {
+        let mut be = harness.backend.lock().await;
+        let _pending = be
+            .begin_up(tailscaled_rs::ipn::UpOptions::default())
+            .await
+            .expect("begin_up prepares config + bumps generation offline (no engine)");
+        // (We intentionally drop `_pending` without a matching `finish_up`: this test isolates the
+        // WAKE edge, not a full bring-up. A real `finish_up` is what the headscale e2e exercises.)
+    }
+
+    // The crux: the parked watcher must wake on that bump, re-derive at the top of its outer loop,
+    // and deliver a NEW snapshot — within a bounded window. Before the class of fix this guards, a
+    // missing wake edge would leave it parked and this read would HANG; the bounded read turns a
+    // regression into a prompt FAILURE.
+    let second = try_read_watch_status(&mut watch_reader, Duration::from_secs(5))
+        .await
+        .expect(
+            "after a lifecycle bump, the parked watcher MUST deliver a new snapshot (lost wakeup: \
+             the watch hung waiting for a wake edge that never came)",
+        );
+    match second {
+        Response::Status(report) => {
+            // The node is still device-less here (no `finish_up`/engine). `begin_up` set the intent to
+            // up with no device installed, which derives to `NeedsLogin` ("wants up but no engine →
+            // needs (re)auth") — notably the very stale state the bug would hang the watch on. The
+            // POINT is that a fresh snapshot was DELIVERED AT ALL, proving the wake edge fired and the
+            // watcher re-derived; and it reflects the NEW intent (`want_running`), proving it really
+            // re-snapshotted post-bump rather than replaying the first.
+            assert_eq!(
+                report.state, "NeedsLogin",
+                "post-begin_up the device-less node wants up with no engine → NeedsLogin, got {:?}",
+                report.state
+            );
+            assert!(
+                report.want_running,
+                "after begin_up the intent is up, so the re-derived snapshot must report want_running"
+            );
+            assert!(
+                report.self_ipv4.is_none(),
+                "the re-derived snapshot is still device-less, so it has no tailnet IPv4"
+            );
+        }
+        other => panic!("expected a Response::Status as the second watch snapshot, got {other:?}"),
+    }
+
+    // Sanity: the first snapshot was a real, decoded status (not an artifact) — keeps the unused
+    // binding meaningful and documents that we compared the same response shape across both reads.
+    assert!(
+        first_state == "NoState" || first_state == "Stopped",
+        "first watch state should have been device-less"
+    );
+
+    // Drop the watch connection before tearing down so `stream_watch` observes the client hangup and
+    // its task ends cleanly (otherwise the lingering reader could outlive the serve task).
+    drop(watch_reader);
+    drop(_watch_write);
+    harness.shutdown_and_verify().await;
+}
+
+/// 6. WATCH wake-edge invariant, unit-pinned: a fresh `watch_lifecycle()` subscriber observes the
+/// generation ADVANCE across the up path's bump — the observable wake edge the `finish_up` fix relies
+/// on. This is the narrow, engine-free assertion that pins the mechanism the fix builds on: that the
+/// lifecycle channel a parked `stream_watch` subscribes to genuinely fires (and carries a strictly
+/// greater generation) when the up path bumps. `begin_up` is the reachable offline bump; the fix adds
+/// a second bump of the SAME kind in `finish_up` on device install (covered end-to-end where a real
+/// device can be installed: tests/headscale_e2e.rs).
+#[tokio::test]
+async fn lifecycle_subscriber_observes_generation_advance_on_up_path() {
+    let harness = Harness::start().await;
+
+    // A fresh subscriber starts synced to the current generation (it only wakes on strictly later
+    // events) — exactly how `stream_watch` subscribes before its first snapshot.
+    let mut life = {
+        let be = harness.backend.lock().await;
+        be.watch_lifecycle()
+    };
+    let gen_before = *life.borrow_and_update();
+
+    // Drive the reachable offline bump (the start-of-`up` edge).
+    {
+        let mut be = harness.backend.lock().await;
+        be.begin_up(tailscaled_rs::ipn::UpOptions::default())
+            .await
+            .expect("begin_up bumps the generation offline");
+    }
+
+    // The subscriber must see a change, carrying a strictly greater generation. Bounded so a broken
+    // notification FAILS rather than hangs.
+    tokio::time::timeout(Duration::from_secs(5), life.changed())
+        .await
+        .expect("watch_lifecycle subscriber must wake on the up-path bump (no wake edge = hang)")
+        .expect("lifecycle sender must still be live");
+    let gen_after = *life.borrow();
+    assert!(
+        gen_after > gen_before,
+        "the up-path bump must advance the generation a parked watcher sees ({gen_before} -> \
+         {gen_after}); this wake edge is what the finish_up fix adds for the device-installed \
+         transition"
+    );
+
+    harness.shutdown_and_verify().await;
 }

@@ -164,7 +164,7 @@ async fn serve_accept_loop(
         let inbound = match listener.accept().await {
             Ok(conn) => conn,
             Err(e) => {
-                tracing::debug!(error = ?e, %listen_addr, "serve: accept loop ended");
+                tracing::debug!(error = %e, %listen_addr, "serve: accept loop ended");
                 return;
             }
         };
@@ -827,7 +827,7 @@ impl Backend {
     /// the legacy top-level `prefs.json`/`node.key.json` layout — so a pre-profiles state dir loads
     /// exactly as before). Per-profile paths come from [`profile::profile_paths`].
     pub async fn load(state_dir: &std::path::Path) -> Result<Self> {
-        let current_profile = profile::read_current_profile(state_dir).await;
+        let current_profile = profile::load_current_profile(state_dir).await;
         let (prefs_path, key_path) = profile::profile_paths(state_dir, &current_profile);
         // `ever_configured` distinguishes a never-touched node (`NoState`) from one explicitly
         // brought down (`Stopped`), and must survive a daemon restart. It is derived from the
@@ -952,7 +952,7 @@ impl Backend {
         }
         // (2) Persist the pointer. On failure, `self` is still on the old profile (we have not
         // touched it yet) and so is the on-disk pointer — coherent, recoverable by retry.
-        profile::write_current_profile(&self.state_dir, target)
+        profile::save_current_profile(&self.state_dir, target)
             .await
             .with_context(|| "persisting current-profile pointer")?;
 
@@ -1618,6 +1618,24 @@ impl Backend {
         // the `Arc` BEFORE any SSH-task clone so the task and the backend share one engine handle.
         let device = std::sync::Arc::new(device?);
         self.device = Some(device.clone());
+        // Make the device-installed transition its OWN lifecycle wake edge. `begin_up` already bumped
+        // the generation while `self.device` was STILL `None` (the device is built off-lock and only
+        // installed here), so a `status --watch` parked on `watch_lifecycle()` could wake on THAT
+        // bump, re-derive while the device was still absent (emitting another device-less snapshot and
+        // taking `stream_watch`'s `None` arm — it never attaches to the device's own state receiver),
+        // then re-park. Without this second bump the device-installed edge has no wake signal, and the
+        // Connecting→Running transition — which flows ONLY on the device's own (unattached) state
+        // receiver — never reaches that watcher: the stream silently hangs on a stale device-less
+        // snapshot. Bumping here re-wakes the parked watcher so its outer loop re-derives, takes the
+        // `Some` branch, snapshots, and attaches to the device's state receiver.
+        //
+        // SAFETY (the generation now advances twice per `up`): the stale-check above
+        // (`pending.generation != self.generation`) already ran and compared `pending.generation`
+        // (captured in `begin_up`) against the generation as it stood ON ENTRY to `finish_up`. This
+        // bump happens strictly AFTER that comparison, only on the current (non-superseded) success
+        // path, so it cannot cause `finish_up` to reject its own device. (The superseded-orphan
+        // early-return above never reaches here, so a discarded stale build never bumps.)
+        self.bump_generation();
         // Spawn the SSH server task iff SSH is enabled (and the daemon was built with the `ssh`
         // feature). It outlives this call, running the engine's fail-closed `listen_ssh` accept loop.
         self.spawn_ssh_task(device.clone());
@@ -3130,7 +3148,7 @@ mod tests {
         be.prefs.hostname = Some("default-host".into());
         be.persist_prefs().await.unwrap();
 
-        // Sabotage: make the pointer path a directory so `write_current_profile` fails.
+        // Sabotage: make the pointer path a directory so `save_current_profile` fails.
         tokio::fs::create_dir_all(profile::current_profile_path(&dir))
             .await
             .unwrap();

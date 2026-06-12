@@ -100,7 +100,7 @@ impl AuthPolicy {
                 (self.access_for_uid(uid), Some(uid))
             }
             Err(e) => {
-                tracing::warn!(error = %e, "peer_cred lookup failed; defaulting to read-only");
+                tracing::warn!(error = %e, "auth: peer_cred lookup failed; defaulting to read-only");
                 (Access::ReadOnly, None)
             }
         }

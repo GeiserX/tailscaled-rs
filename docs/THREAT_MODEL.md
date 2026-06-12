@@ -68,7 +68,7 @@ flowchart TB
 | # | Boundary | Transport | Who is trusted on the far side |
 |---|---|---|---|
 | ① | **LocalAPI socket** | Local IPC (Unix domain socket, newline-delimited JSON) | **Reads:** anyone who can reach the socket. **Writes:** only root or the daemon's own UID. Enforced by `SO_PEERCRED` (`src/auth.rs`) behind a `0700` directory (`src/lib.rs`, `src/server.rs`). |
-| ② | **Control-plane connection** | Noise control protocol (engine) | The control plane is **operator-trusted but not blindly trusted**: the engine talks Noise to it, but Tailnet Lock is **inert** (§5), so a compromised control plane *can* inject peer keys. The control URL is operator-chosen (`src/ipn.rs:188`). |
+| ② | **Control-plane connection** | Noise control protocol (engine) | The control plane is **operator-trusted but not blindly trusted**: the engine talks Noise to it, but Tailnet Lock is **inert** (§5), so a compromised control plane *can* inject peer keys. The control URL is operator-chosen (scheme-validated at `src/ipn/config.rs:110`, change-gated at `src/ipn/control_url.rs:64`). |
 | ③ | **Data plane** | WireGuard over direct UDP or DERP relay (engine) | Peers are authenticated by WireGuard keys distributed via the netmap. Trust here is only as strong as the (unaudited) handshake and the (un-enforced) Tailnet Lock. |
 | ④ | **On-disk state dir** | Filesystem | Trusted to the owning UID only — enforced by `0700` (`src/lib.rs:60`). **Not** trusted against root or anyone who can read the raw disk; keys are stored **without at-rest encryption**. |
 
@@ -149,14 +149,16 @@ Pre-auth keys are carried as `secrecy::SecretString` (depends on `zeroize`; `Car
 which means **no `Debug`/`Display` rendering, no `serde` serialization, and zeroize-on-drop**:
 
 - In the CLI, the key is resolved into a `SecretString` and exposed exactly once — at the moment
-  the wire `Request` is serialized (`resolve_authkey`, `src/bin/tnet.rs:122`; expose at
-  `src/bin/tnet.rs:77`). Neither `Cli` nor `Command` derives `Debug`, specifically to keep the key
+  the wire `Request` is serialized (`resolve_authkey`, `src/bin/tnet.rs:3074`; expose at
+  `src/bin/tnet.rs:1250`). Neither `Cli` nor `Command` derives `Debug`, specifically to keep the key
   off any accidental `{:?}` path (note at `src/bin/tnet.rs:30`).
 - In the daemon, the plaintext key from the wire is re-wrapped into a `SecretString` immediately at
-  the dispatch boundary, confining it to the smallest scope (`src/server.rs:289`).
-- The key is **never stored** on the `Backend`; it flows through `up()` and is exposed exactly once,
-  for the single engine registration call that needs the plaintext (`src/ipn.rs:152-156`). The
-  exposed `String` lives no longer than that `up` call.
+  the dispatch boundary, confining it to the smallest scope (`src/server.rs:776`).
+- The key is **never stored** on the `Backend`; it flows through `up()` as a `SecretString` and is
+  handed to the engine **still wrapped** via `Device::new_with_secret`
+  (`src/ipn/mod.rs:310`). The daemon no longer materializes a plaintext `String` for the engine call
+  — the only plaintext window is the single `.expose_secret()` *inside* the engine's own
+  `new_with_secret` (engine ask #2, shipped in engine v0.8.0).
 
 This does not make secrets *safe* in RAM (see §5/§6) — it eliminates the **accidental-copy and
 accidental-log** bug classes and shortens the in-memory lifetime.
@@ -181,7 +183,7 @@ connection flood is separately bounded by a 128-permit semaphore (`MAX_CONNECTIO
 In-flight LocalAPI handlers are drained on a `JoinSet`, but only for a bounded 2 s; a wedged handler
 is then aborted so it cannot keep the daemon from exiting (`DRAIN_TIMEOUT`, `src/server.rs:40`,
 drain logic `src/server.rs:110`). The engine teardown is likewise bounded (5 s) so a wedged engine
-can't hang the daemon (`stop_device`, `src/ipn.rs:303`).
+can't hang the daemon (`stop_device`, `src/ipn/mod.rs:2611`).
 
 ### 4.7 Best-effort swap / coredump hardening — adversary (e)
 
@@ -269,40 +271,48 @@ The engine does **not enforce Tailnet Lock**. A malicious or compromised control
 **inject peer node-keys** into this node's netmap — i.e. add an attacker-controlled "peer" the node
 will trust and route to — and the node has no key-pinning signature check to reject it. The control
 URL is operator-chosen and validated only for scheme (`http`/`https`) before being handed to the
-engine (`src/ipn.rs:188-199`); there is no cryptographic attestation that the control plane is the
+engine (`src/ipn/config.rs:110-114`); there is no cryptographic attestation that the control plane is the
 expected one beyond the Noise handshake itself.
 
-### 5.5 The engine's `String` API forces an un-zeroized last-mile authkey copy — tracked bead
+### 5.5 The `String`-typed LocalAPI wire field forces an un-zeroized authkey copy on the CLI side — narrow residual
 
-The daemon holds the auth key in a `SecretString` and exposes it for the **single** engine call. But
-`tailscale::Device::new` takes an `Option<String>`, so `up()` must materialize a plain `String` copy
-of the plaintext to make that call (`expose_secret().to_string()`, `src/ipn.rs:153`); the same
-`String`-typed wire field forces a copy on the CLI side (`src/bin/tnet.rs:77`) and at the dispatch
-boundary before re-wrapping (`src/server.rs:289`). The daemon's own env path is the same shape: on
-auto-start `auth_key_from_env()` hands back a plain `String` that lives transiently before it is
-wrapped into a `SecretString` (`src/bin/tailnetd.rs`). Those last-mile `String`s are **not**
-zeroized on drop — only the `SecretString` wrappers are. Closing this fully requires the engine to
-accept a zeroizing secret type at its registration boundary; until then this is a **tracked bead**,
-and a
-narrow residual copy of the auth key exists transiently in process memory (which §5.1/§5.2 already
-say is readable by a privileged attacker).
+The daemon no longer makes a plaintext copy of the auth key. The engine's registration boundary now
+accepts a zeroizing secret type — `tailscale::Device::new_with_secret` takes an
+`Option<SecretString>` (engine ask #2, shipped in engine **v0.8.0**) — so `up()` hands the key to the
+engine **still wrapped**, with no daemon-side `expose_secret().to_string()` (`build_device` →
+`Device::new_with_secret`, `src/ipn/mod.rs:310`). The only plaintext exposure on the engine path is
+the single `.expose_secret()` *inside* the engine's own `new_with_secret`, below this daemon's layer.
+
+The one forced un-zeroized copy that remains is **CLI-side**, not daemon-side: the LocalAPI wire
+`Request::Up { authkey, .. }` field is typed `Option<String>` (because `SecretString` does not
+serialize), so the CLI must expose its `SecretString` into a plain `String` at the moment it
+serializes the request (`authkey.map(|k| k.expose_secret().to_owned())`, `src/bin/tnet.rs:1250`).
+The daemon symmetrically re-wraps that wire `String` back into a `SecretString` the instant it
+dispatches the request (`authkey.map(secrecy::SecretString::from)`, `src/server.rs:776`), confining
+the daemon-side plaintext to the wire-deserialization buffer rather than `up()`. The daemon's own
+auto-start env path carries **no** such bare `String`: `env_authkey()` wraps `$TS_AUTH_KEY` into a
+`SecretString` at the point of read and threads it through `resume_decision` as a `SecretString`
+end-to-end (`src/bin/tailnetd.rs:366`).
+
+That CLI-side wire `String` is **not** zeroized on drop — only the `SecretString` wrappers on either
+side of it are. Closing this fully requires a zeroizing type on the LocalAPI wire contract itself;
+until then a narrow residual plaintext copy of the auth key exists transiently in the CLI process
+(and, for the deserialization instant, in the daemon's read buffer) — which §5.1/§5.2 already say is
+readable by a privileged attacker. Note this residual is now the **CLI**'s, scoped to wire
+serialization; the daemon's `up()` last-inch plaintext copy described by earlier revisions of this
+section no longer exists.
 
 ### 5.6 A write-authed caller can repoint the control plane — operator-trusted, authz-gated
 
-A caller that *is* authorized to write (root or the daemon's UID) can pass `--control_url` to point
-the node at an arbitrary control plane on the next `up` (`src/bin/tnet.rs:51`, applied at
-`src/ipn.rs:188`). This is **by design** — it is how you target a self-hosted Headscale — and it is
-gated behind the same write authorization as `up`/`down` (§4.1). It is listed here only to be
-explicit: the control plane is **operator-trusted input**, so anyone you grant write to can move the
-node's root of trust. The only validation is that the scheme is `http`/`https`; a malformed URL fails
-loudly rather than silently falling back (`src/ipn.rs:189-198`).
-
-> **Note on `SECURITY.md` drift.** [`../SECURITY.md`](../SECURITY.md) still describes the LocalAPI as
-> authorizing "by filesystem permissions … richer `SO_PEERCRED`-based authorization is planned, not
-> yet implemented", and suggests protecting the state dir at `0600` yourself. Both are now partially
-> superseded by shipped code: peer-cred authz **is** implemented (§4.1), and the daemon enforces
-> `0700` on the state and socket dirs itself (§4.2). The unaudited-crypto, at-rest-encryption, and
-> Tailnet-Lock caveats in `SECURITY.md` remain accurate.
+A caller that *is* authorized to write (root or the daemon's UID) can pass `--control-url` to point
+the node at an arbitrary control plane on the next `up` (`src/bin/tnet.rs:55`, applied at
+`src/ipn/config.rs:118`). This is **by design** — it is how you target a self-hosted Headscale — and it is
+gated behind the same write authorization as `up`/`down` (§4.1); switching the control server on an
+already-running node additionally requires `--force-reauth` (`change_blocked`,
+`src/ipn/control_url.rs:64`). It is listed here only to be explicit: the control plane is
+**operator-trusted input**, so anyone you grant write to can move the node's root of trust. The only
+validation is that the scheme is `http`/`https`; a malformed URL fails loudly rather than silently
+falling back (`src/ipn/config.rs:110-117`).
 
 ---
 
@@ -349,13 +359,13 @@ the language; and the privileged-attacker and cold-boot leaks remain unaddressed
 | Cross-user LocalAPI write (up/down, repoint control) | (a) | **Yes** — peercred + `0700` dir, fail-closed | Misconfigured (non-`0700`) parent dir created *outside* the daemon's path before startup; daemon re-tightens what it can reach | `src/auth.rs`, `src/server.rs`, `src/lib.rs` |
 | Cross-user socket reach | (a) | **Yes** — `0700` dir gate | Reads (`status`) intentionally open to anyone who *does* reach the socket | `src/server.rs:132`, `src/lib.rs:60` |
 | LocalAPI DoS (buffer OOM / conn flood) | (a) | **Yes** — line cap + conn semaphore | Bounded resource use only; not an availability *guarantee* | `src/server.rs:31`, `src/server.rs:36` |
-| Accidental key leak (logs / `Debug` / serialize) | (e) | **Yes** — `SecretString`, no-`Debug`, expose-once | One forced un-zeroized `String` copy at the engine call | §5.5; `src/ipn.rs:153` |
+| Accidental key leak (logs / `Debug` / serialize) | (e) | **Yes** — `SecretString`, no-`Debug`, expose-once | One forced un-zeroized `String` copy at the CLI's LocalAPI wire boundary (engine path stays wrapped) | §5.5; `src/bin/tnet.rs:1250` |
 | Live key read by root / ptrace / `/proc/mem` | (b) | **No** | Full key disclosure to a privileged local attacker | Out of scope — OS-level threat |
 | Keys in swap / hibernation / coredump | (e) | **Best-effort** — `mlockall` + `PR_SET_DUMPABLE=0` + `RLIMIT_CORE=0` when `harden_process()` succeeds | Swap still exposed if `mlockall` denied (no `CAP_IPC_LOCK`); macOS coredump is rlimit-only; opt-out via `TAILNETD_NO_HARDEN=1`; cold-boot RAM remanence uncovered; root unaffected | §4.7, §5.2; `src/hardening.rs` |
 | Broken handshake / traffic disclosure | (c) | **No** — engine is unaudited | Confidentiality unproven until audited | Engine; `SECURITY.md` |
 | Rogue peer-key injection | (d) | **No** — Tailnet Lock inert | Compromised control plane can add trusted peers | Engine; §5.4, `SECURITY.md` |
-| Operator repoints control plane | (b)/operator | **N/A** — by design | A write-authed caller can move the root of trust (authz-gated) | §5.6; `src/ipn.rs:188` |
-| Auth-key in argv / shell history | (a)/(b) | **Partial** — `--authkey-file` / `$TS_AUTH_KEY` offered | `--authkey` flag still exposes the key in argv if used | `src/bin/tnet.rs:41-45` |
+| Operator repoints control plane | (b)/operator | **N/A** — by design | A write-authed caller can move the root of trust (authz-gated) | §5.6; `src/ipn/config.rs:118` |
+| Auth-key in argv / shell history | (a)/(b) | **Partial** — `--authkey-file` / `$TS_AUTH_KEY` offered | `--authkey` flag still exposes the key in argv if used | `src/bin/tnet.rs:37-42` |
 
 ---
 

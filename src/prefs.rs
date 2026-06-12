@@ -126,7 +126,7 @@ impl Prefs {
                 tracing::warn!(
                     error = %e,
                     path = %path.display(),
-                    "prefs file is malformed; falling back to default prefs (node starts unconfigured)"
+                    "prefs: file is malformed; falling back to default prefs (node starts unconfigured)"
                 );
                 Self::default()
             })),
@@ -162,14 +162,48 @@ impl Prefs {
         self.tun_mtu = d.tun_mtu;
     }
 
-    /// Atomically-enough persist prefs to `path`, creating parent directories as needed.
+    /// Atomically persist prefs to `path`, creating parent directories as needed.
+    ///
+    /// Crash-safe via write-to-temp-then-rename: the bytes land in a sibling temp file in the *same*
+    /// directory (so the final [`tokio::fs::rename`] is a same-filesystem POSIX rename, which is
+    /// atomic), then the temp file replaces `path` in one step. A crash mid-write therefore leaves
+    /// either the OLD complete `prefs.json` or the NEW complete one — never a truncated file that
+    /// [`Prefs::load`] would treat as malformed and discard (which would silently read the node back
+    /// as never-configured). The file mode is umask/dir-derived (this writer sets no explicit mode),
+    /// and the temp file inherits the same perms, so the renamed-into-place file is unchanged from the
+    /// previous behavior.
     pub async fn save(&self, path: &Path) -> std::io::Result<()> {
         if let Some(dir) = path.parent() {
             tokio::fs::create_dir_all(dir).await?;
         }
         let bytes = serde_json::to_vec_pretty(self).expect("prefs serialize");
-        tokio::fs::write(path, bytes).await
+        atomic_write(path, &bytes).await
     }
+}
+
+/// Write `bytes` to `path` atomically: stage them in a temp file in the *same* directory, then
+/// [`tokio::fs::rename`] it over `path` (atomic on POSIX within one filesystem). On any failure the
+/// temp file is removed best-effort so no stray `.tmp` is left behind. Same-dir staging is required —
+/// a cross-filesystem rename is neither atomic nor guaranteed to succeed.
+async fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    let mut tmp_name = file_name;
+    tmp_name.push(format!(".tmp.{}", std::process::id()));
+    let tmp = dir.join(tmp_name);
+
+    if let Err(e) = tokio::fs::write(&tmp, bytes).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e);
+    }
+    if let Err(e) = tokio::fs::rename(&tmp, path).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

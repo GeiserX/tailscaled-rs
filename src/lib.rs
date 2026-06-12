@@ -91,7 +91,7 @@ pub async fn ensure_state_dir_secure(dir: &std::path::Path) -> std::io::Result<(
             tracing::warn!(
                 path = %dir.display(),
                 found = format!("{mode:o}"),
-                "state dir not 0700; tightening (it holds unencrypted key material)"
+                "state-dir: not 0700; tightening (it holds unencrypted key material)"
             );
             let mut perms = meta.permissions();
             perms.set_mode(0o700);
