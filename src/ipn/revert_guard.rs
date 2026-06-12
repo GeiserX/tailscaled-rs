@@ -149,6 +149,12 @@ pub(super) fn check_accidental_reverts(
             value: prefs.accept_routes.to_string(),
         });
     }
+    if opts.accept_dns.is_none() && prefs.accept_dns != d.accept_dns {
+        reverts.push(RevertedPref {
+            key: "accept_dns".into(),
+            value: prefs.accept_dns.to_string(),
+        });
+    }
     if opts.shields_up.is_none() && prefs.shields_up != d.shields_up {
         reverts.push(RevertedPref {
             key: "shields_up".into(),
@@ -196,6 +202,7 @@ mod tests {
             control_url: _,
             hostname: _,
             accept_routes: _,
+            accept_dns: _,
             shields_up: _,
             exit_node: _,
             advertise_exit_node: _,
@@ -223,6 +230,8 @@ mod tests {
             }),
             ("hostname", |p| p.hostname = Some("h".into())),
             ("accept_routes", |p| p.accept_routes = true),
+            // accept_dns DEFAULTS to true, so its non-default value is false.
+            ("accept_dns", |p| p.accept_dns = false),
             ("shields_up", |p| p.shields_up = true),
             ("exit_node", |p| p.exit_node = Some("100.64.0.9".into())),
             ("advertise_exit_node", |p| p.advertise_exit_node = true),
@@ -274,6 +283,7 @@ mod tests {
                 "control_url" => assert_eq!(reset_prefs.control_url, d.control_url),
                 "hostname" => assert_eq!(reset_prefs.hostname, d.hostname),
                 "accept_routes" => assert_eq!(reset_prefs.accept_routes, d.accept_routes),
+                "accept_dns" => assert_eq!(reset_prefs.accept_dns, d.accept_dns),
                 "shields_up" => assert_eq!(reset_prefs.shields_up, d.shields_up),
                 "exit_node" => assert_eq!(reset_prefs.exit_node, d.exit_node),
                 "advertise_exit_node" => {

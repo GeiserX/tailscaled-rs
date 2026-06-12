@@ -120,6 +120,15 @@ enum Command {
         /// `--accept-routes`; omitting both leaves the persisted setting unchanged.
         #[arg(long)]
         no_accept_routes: bool,
+        /// Accept the tailnet's MagicDNS configuration (Go `tailscale up --accept-dns`; on by
+        /// default). Mutually exclusive with `--no-accept-dns`; omitting both leaves the persisted
+        /// setting unchanged.
+        #[arg(long, conflicts_with = "no_accept_dns")]
+        accept_dns: bool,
+        /// Ignore the tailnet's MagicDNS configuration (keep the system resolver). Mutually exclusive
+        /// with `--accept-dns`; omitting both leaves the persisted setting unchanged.
+        #[arg(long)]
+        no_accept_dns: bool,
         /// Block incoming connections from other nodes (Go `tailscale up --shields-up`). Mutually
         /// exclusive with `--no-shields-up`; omitting both leaves the persisted setting unchanged.
         #[arg(long, conflicts_with = "no_shields_up")]
@@ -185,6 +194,14 @@ enum Command {
         /// `--accept-routes`; omitting both leaves the persisted setting unchanged.
         #[arg(long)]
         no_accept_routes: bool,
+        /// Accept the tailnet's MagicDNS configuration (Go `tailscale set --accept-dns`). Mutually
+        /// exclusive with `--no-accept-dns`; omitting both leaves the persisted setting unchanged.
+        #[arg(long, conflicts_with = "no_accept_dns")]
+        accept_dns: bool,
+        /// Ignore the tailnet's MagicDNS configuration (keep the system resolver). Mutually exclusive
+        /// with `--accept-dns`; omitting both leaves the persisted setting unchanged.
+        #[arg(long)]
+        no_accept_dns: bool,
         /// Block incoming connections from other nodes. Mutually exclusive with `--no-shields-up`;
         /// omitting both leaves the persisted setting unchanged.
         #[arg(long, conflicts_with = "no_shields_up")]
@@ -681,6 +698,17 @@ fn resolve_accept_routes(accept: bool, no_accept: bool) -> Option<bool> {
     }
 }
 
+/// Map the `--accept-dns` / `--no-accept-dns` flag pair to a tri-state `Option<bool>`.
+/// Enable → `Some(true)`; disable → `Some(false)`; neither → `None` (leave the persisted pref
+/// unchanged). clap's `conflicts_with` guarantees the two are never both set.
+fn resolve_accept_dns(accept: bool, no_accept: bool) -> Option<bool> {
+    match (accept, no_accept) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        _ => None,
+    }
+}
+
 /// Map the `--shields-up` / `--no-shields-up` flag pair to a tri-state `Option<bool>`.
 /// Enable → `Some(true)`; disable → `Some(false)`; neither → `None` (leave the persisted pref
 /// unchanged). Mirrors the `--tun`/`--no-tun` mapping; clap's `conflicts_with` guarantees the two
@@ -919,6 +947,8 @@ async fn main() -> Result<()> {
             advertise_tags_clear,
             accept_routes,
             no_accept_routes,
+            accept_dns,
+            no_accept_dns,
             shields_up,
             no_shields_up,
             ssh,
@@ -948,6 +978,8 @@ async fn main() -> Result<()> {
                 advertise_tags_clear,
                 accept_routes,
                 no_accept_routes,
+                accept_dns,
+                no_accept_dns,
                 shields_up,
                 no_shields_up,
                 ssh,
@@ -963,6 +995,8 @@ async fn main() -> Result<()> {
             hostname,
             accept_routes,
             no_accept_routes,
+            accept_dns,
+            no_accept_dns,
             shields_up,
             no_shields_up,
             exit_node,
@@ -982,6 +1016,8 @@ async fn main() -> Result<()> {
                 hostname,
                 accept_routes,
                 no_accept_routes,
+                accept_dns,
+                no_accept_dns,
                 shields_up,
                 no_shields_up,
                 exit_node,
@@ -1202,6 +1238,8 @@ async fn run_up(
     advertise_tags_clear: bool,
     accept_routes: bool,
     no_accept_routes: bool,
+    accept_dns: bool,
+    no_accept_dns: bool,
     shields_up: bool,
     no_shields_up: bool,
     ssh: bool,
@@ -1275,6 +1313,8 @@ async fn run_up(
         // `--accept-routes`/`--no-accept-routes` tri-state (mirrors `--tun`); reuses the same
         // resolver as the `set` arm.
         accept_routes: resolve_accept_routes(accept_routes, no_accept_routes),
+        // `--accept-dns`/`--no-accept-dns` tri-state (default-on; mirrors the `set` arm).
+        accept_dns: resolve_accept_dns(accept_dns, no_accept_dns),
         // `--shields-up`/`--no-shields-up` tri-state (mirrors `--tun`); reuses the same
         // resolver as the `set` arm.
         shields_up: resolve_shields_up(shields_up, no_shields_up),
@@ -1365,6 +1405,8 @@ async fn run_set(
     hostname: Option<String>,
     accept_routes: bool,
     no_accept_routes: bool,
+    accept_dns: bool,
+    no_accept_dns: bool,
     shields_up: bool,
     no_shields_up: bool,
     exit_node: Option<String>,
@@ -1390,6 +1432,8 @@ async fn run_set(
         hostname,
         // `--accept-routes`/`--no-accept-routes` tri-state (mirrors `--tun`).
         accept_routes: resolve_accept_routes(accept_routes, no_accept_routes),
+        // `--accept-dns`/`--no-accept-dns` tri-state (default-on).
+        accept_dns: resolve_accept_dns(accept_dns, no_accept_dns),
         // `--shields-up`/`--no-shields-up` tri-state (mirrors `--tun`).
         shields_up: resolve_shields_up(shields_up, no_shields_up),
         // `--exit-node <sel>` sets, `--clear-exit-node` stops using one, neither leaves it
@@ -1975,12 +2019,13 @@ fn format_lock_status(r: &tailscaled_rs::localapi::LockReport, json: bool) -> St
 /// on/off, resolvers in preference order, split-DNS routes, search domains, fallback resolvers,
 /// certificate domains, additional DNS records, and exit-node-filtered suffixes — each empty section
 /// printing a parenthetical none-line, then a one-line honest note that the Go "Use Tailscale DNS"
-/// accept-dns line + the "System DNS configuration" section are not surfaced by this build (no
-/// CorpDNS pref / no engine OS-DNS accessor). `json` emits a REDUCED, fork-specific object — NOT
+/// line *here* + the "System DNS configuration" section are not surfaced by this build (no engine
+/// OS-DNS accessor). The accept-dns pref itself IS modelled — surfaced via `tnet get accept-dns` (it
+/// just isn't echoed in this `dns status` view). `json` emits a REDUCED, fork-specific object — NOT
 /// byte-compatible with Go's `jsonoutput.DNSStatusResult`: resolvers/fallback-resolvers are plain
 /// `addr:port` STRINGS (Go nests `DNSResolverInfo{Addr, BootstrapResolution}` objects), MagicDNS-on
 /// is a top-level `MagicDNS` bool (Go nests it as `CurrentTailnet.MagicDNSEnabled`, with a separate
-/// top-level `TailscaleDNS`=accept-dns this build doesn't model), `ExtraRecords` is a name→addr map
+/// top-level `TailscaleDNS`=accept-dns not surfaced in this `dns status` JSON), `ExtraRecords` is a name→addr map
 /// (Go: an array of `{Name,Type,Value}`), and there is no `SystemDNS`/`SystemDNSError`. Built via
 /// `serde_json` (escape-safe, 2-space pretty). Pure (returns the string incl. its trailing newline)
 /// → unit-testable.
@@ -2107,8 +2152,8 @@ fn format_dns_status(r: &tailscaled_rs::localapi::DnsStatusReport, json: bool) -
     }
 
     out.push_str(
-        "(note: the 'Use Tailscale DNS' accept-dns line and the 'System DNS configuration' section \
-         are not surfaced by this build)\n",
+        "(note: the accept-dns pref is shown by `tnet get accept-dns`; the 'Use Tailscale DNS' line \
+         here and the 'System DNS configuration' section are not surfaced by this build)\n",
     );
     out
 }
@@ -2234,10 +2279,10 @@ fn format_profiles(profiles: &[tailscaled_rs::localapi::ProfileEntry]) -> String
 /// [`get_value_display`]. One source so the table, the `--json` map, and single-setting lookup agree.
 ///
 /// This is a SUBSET of Go's `tailscale get` settings (Go derives its list from the full `set` flag
-/// set; many of those flags — `hostname`, `nickname`, `accept-dns`, `auto-update`, … — are not yet
-/// modelled by this fork's prefs/engine and so are absent here). One entry, `tun`, is a
-/// fork-specific extension (selecting the kernel-TUN vs userspace datapath) that Go's `get` has no
-/// counterpart for; it is intentionally surfaced because it is a real `tnet set` flag in this build.
+/// set; many of those flags — `hostname`, `nickname`, `auto-update`, … — are not yet modelled by
+/// this fork's prefs/engine and so are absent here). One entry, `tun`, is a fork-specific extension
+/// (selecting the kernel-TUN vs userspace datapath) that Go's `get` has no counterpart for; it is
+/// intentionally surfaced because it is a real `tnet set` flag in this build.
 fn get_settings(
     view: &tailscaled_rs::localapi::PrefsView,
 ) -> Vec<(&'static str, serde_json::Value)> {
@@ -2263,6 +2308,7 @@ fn get_settings(
             Value::String(view.advertise_tags.join(",")),
         ),
         ("accept-routes", Value::Bool(view.accept_routes)),
+        ("accept-dns", Value::Bool(view.accept_dns)),
         ("shields-up", Value::Bool(view.shields_up)),
         ("ssh", Value::Bool(view.ssh)),
         ("tun", Value::Bool(view.tun)),
@@ -4181,6 +4227,7 @@ mod tests {
         let req = Request::Set {
             hostname: Some("laptop".to_string()),
             accept_routes: resolve_accept_routes(true, false),
+            accept_dns: resolve_accept_dns(false, false),
             shields_up: resolve_shields_up(false, false),
             exit_node: resolve_exit_node(Some("100.64.0.9".to_string()), false),
             advertise_exit_node: resolve_advertise_exit_node(false, false),
@@ -4192,6 +4239,7 @@ mod tests {
             Request::Set {
                 hostname,
                 accept_routes,
+                accept_dns,
                 shields_up,
                 exit_node,
                 advertise_exit_node,
@@ -4201,6 +4249,7 @@ mod tests {
             } => {
                 assert_eq!(hostname, Some("laptop".to_string()));
                 assert_eq!(accept_routes, Some(true));
+                assert_eq!(accept_dns, None, "unset → unchanged, not flipped");
                 assert_eq!(shields_up, None, "unset → unchanged, not flipped");
                 assert_eq!(exit_node, Some(Some("100.64.0.9".to_string())));
                 assert_eq!(advertise_exit_node, None, "unset → unchanged, not flipped");
@@ -4229,6 +4278,7 @@ mod tests {
             advertise_routes: None,
             advertise_tags: None,
             accept_routes: resolve_accept_routes(true, false),
+            accept_dns: None,
             shields_up: None,
             ssh: None,
             reset: false,
@@ -4253,6 +4303,7 @@ mod tests {
             advertise_routes: None,
             advertise_tags: None,
             accept_routes: resolve_accept_routes(false, true),
+            accept_dns: None,
             shields_up: None,
             ssh: None,
             reset: false,
@@ -4281,6 +4332,7 @@ mod tests {
             advertise_routes: None,
             advertise_tags: None,
             accept_routes: resolve_accept_routes(false, false),
+            accept_dns: None,
             shields_up: None,
             ssh: None,
             reset: false,
@@ -4313,6 +4365,7 @@ mod tests {
             advertise_routes: None,
             advertise_tags: None,
             accept_routes: None,
+            accept_dns: None,
             shields_up: resolve_shields_up(true, false),
             ssh: None,
             reset: false,
@@ -4337,6 +4390,7 @@ mod tests {
             advertise_routes: None,
             advertise_tags: None,
             accept_routes: None,
+            accept_dns: None,
             shields_up: resolve_shields_up(false, true),
             ssh: None,
             reset: false,
@@ -4361,6 +4415,7 @@ mod tests {
             advertise_routes: None,
             advertise_tags: None,
             accept_routes: None,
+            accept_dns: None,
             shields_up: resolve_shields_up(false, false),
             ssh: None,
             reset: false,
@@ -4383,6 +4438,7 @@ mod tests {
         let req = Request::Set {
             hostname: None,
             accept_routes: resolve_accept_routes(false, true),
+            accept_dns: resolve_accept_dns(false, false),
             shields_up: resolve_shields_up(true, false),
             exit_node: resolve_exit_node(None, true),
             advertise_exit_node: resolve_advertise_exit_node(false, true),
@@ -4394,6 +4450,7 @@ mod tests {
             Request::Set {
                 hostname,
                 accept_routes,
+                accept_dns,
                 shields_up,
                 exit_node,
                 advertise_exit_node,
@@ -4403,6 +4460,10 @@ mod tests {
             } => {
                 assert_eq!(hostname, None);
                 assert_eq!(accept_routes, Some(false));
+                assert_eq!(
+                    accept_dns, None,
+                    "neither --accept-dns flag → None (unchanged)"
+                );
                 assert_eq!(shields_up, Some(true), "--shields-up → Some(true)");
                 assert_eq!(exit_node, Some(None), "--clear-exit-node → Some(None)");
                 assert_eq!(advertise_exit_node, Some(false));
@@ -4911,6 +4972,7 @@ mod tests {
             advertise_routes: vec!["10.0.0.0/8".into(), "192.168.1.0/24".into()],
             advertise_tags: vec![],
             accept_routes: true,
+            accept_dns: true,
             shields_up: true,
             ssh: true,
             ssh_running: true,
@@ -4932,9 +4994,10 @@ mod tests {
             "{table}"
         );
         assert!(table.contains("advertise-tags"), "{table}");
-        // 1 header + 8 settings (exit-node, advertise-exit-node, advertise-routes, advertise-tags,
-        // accept-routes, shields-up, ssh, tun) → 9 lines.
-        assert_eq!(table.lines().count(), 9, "{table}");
+        assert!(table.contains("accept-dns"), "{table}");
+        // 1 header + 9 settings (exit-node, advertise-exit-node, advertise-routes, advertise-tags,
+        // accept-routes, accept-dns, shields-up, ssh, tun) → 10 lines.
+        assert_eq!(table.lines().count(), 10, "{table}");
 
         // --json: flattened name→value map keyed by set-flag name, with GO-FAITHFUL TYPED values —
         // booleans are bare JSON `true`/`false` (NOT quoted strings), strings are strings. Parse it

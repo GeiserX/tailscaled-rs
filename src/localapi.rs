@@ -71,6 +71,10 @@ pub enum Request {
         /// keeps the wire backward-compatible with clients that omit it.
         #[serde(default)]
         accept_routes: Option<bool>,
+        /// Accept the tailnet's MagicDNS config (Go `tailscale up --accept-dns`, default-on). `None`
+        /// leaves the pref unchanged; `Some(b)` sets it. `#[serde(default)]` keeps the wire back-compat.
+        #[serde(default)]
+        accept_dns: Option<bool>,
         /// Shields-up: block inbound peer connections terminating on this node (Go `--shields-up`).
         /// `None` leaves the pref unchanged; `Some(b)` sets it. `#[serde(default)]` keeps the wire
         /// backward-compatible with clients that omit it.
@@ -112,6 +116,10 @@ pub enum Request {
         /// Accept (and route to) subnet routes advertised by peers.
         #[serde(default)]
         accept_routes: Option<bool>,
+        /// Accept the tailnet's MagicDNS config (Go `tailscale set --accept-dns`). `None` unchanged;
+        /// `Some(b)` sets it. Applied LIVE on a running device (`Device::set_accept_dns`).
+        #[serde(default)]
+        accept_dns: Option<bool>,
         /// Shields-up: block inbound peer connections terminating on this node (Go `--shields-up`).
         /// `None` unchanged; `Some(b)` sets it. Takes effect by reconfiguring a running device.
         #[serde(default)]
@@ -579,6 +587,13 @@ pub struct PrefsView {
     pub advertise_tags: Vec<String>,
     /// Whether this node accepts subnet routes advertised by peers.
     pub accept_routes: bool,
+    /// Whether this node accepts the tailnet's MagicDNS configuration (Go `--accept-dns` / `CorpDNS`).
+    /// Default-on in the persisted [`Prefs`]; here it is always populated by `prefs_view()` from the
+    /// live pref (PrefsView is a fresh, fully-populated reply from a lockstep-versioned daemon — never
+    /// a partial/upgraded payload), so the container `#[serde(default)]` (→ `false`) only applies to an
+    /// impossible missing-field case. No field-level `true` default, to avoid disagreeing with the
+    /// derived `Default`.
+    pub accept_dns: bool,
     /// Whether shields-up is on (block inbound peer connections terminating on this node).
     pub shields_up: bool,
     /// Whether the Tailscale SSH server is *enabled* by the persisted pref (`ssh_enabled`). This is
@@ -922,6 +937,7 @@ mod tests {
             advertise_routes: Some(vec!["192.168.1.0/24".to_string()]),
             advertise_tags: Some(vec!["tag:server".to_string()]),
             accept_routes: Some(true),
+            accept_dns: Some(false),
             shields_up: Some(true),
             ssh: Some(true),
             reset: true,
@@ -942,6 +958,7 @@ mod tests {
                 advertise_routes,
                 advertise_tags: _,
                 accept_routes,
+                accept_dns,
                 shields_up,
                 ssh,
                 reset,
@@ -959,6 +976,11 @@ mod tests {
                 assert_eq!(advertise_exit_node, Some(true));
                 assert_eq!(advertise_routes, Some(vec!["192.168.1.0/24".to_string()]));
                 assert_eq!(accept_routes, Some(true));
+                assert_eq!(
+                    accept_dns,
+                    Some(false),
+                    "accept_dns survives the wire round-trip"
+                );
                 assert_eq!(shields_up, Some(true));
             }
             other => panic!("expected Up, got {other:?}"),
@@ -1610,6 +1632,7 @@ mod tests {
             advertise_routes: None,
             advertise_tags: None,
             accept_routes: None,
+            accept_dns: None,
             shields_up: None,
             ssh: None,
             reset: false,
@@ -1630,6 +1653,7 @@ mod tests {
                 advertise_routes,
                 advertise_tags: _,
                 accept_routes,
+                accept_dns,
                 shields_up,
                 ssh,
                 reset,
@@ -1646,6 +1670,7 @@ mod tests {
                 assert!(advertise_exit_node.is_none());
                 assert!(advertise_routes.is_none());
                 assert!(accept_routes.is_none());
+                assert!(accept_dns.is_none());
                 assert!(shields_up.is_none());
                 assert!(ssh.is_none());
             }
@@ -1694,6 +1719,7 @@ mod tests {
             advertise_routes: Some(vec![]),
             advertise_tags: None,
             accept_routes: None,
+            accept_dns: None,
             shields_up: None,
             ssh: None,
             reset: false,
@@ -1747,6 +1773,7 @@ mod tests {
             advertise_routes: None,
             advertise_tags: None,
             accept_routes: None,
+            accept_dns: None,
             shields_up: None,
             ssh: None,
             reset: false,
@@ -1815,6 +1842,7 @@ mod tests {
             advertise_routes: None,
             advertise_tags: None,
             accept_routes: None,
+            accept_dns: None,
             shields_up: None,
             ssh: None,
             reset: false,
@@ -1833,6 +1861,7 @@ mod tests {
             advertise_routes: None,
             advertise_tags: None,
             accept_routes: None,
+            accept_dns: None,
             shields_up: None,
             ssh: None,
             reset: false,
@@ -1919,6 +1948,7 @@ mod tests {
         let clear_json = serde_json::to_string(&Request::Set {
             hostname: None,
             accept_routes: None,
+            accept_dns: None,
             shields_up: None,
             exit_node: Some(None),
             advertise_exit_node: None,
@@ -1930,6 +1960,7 @@ mod tests {
         let unchanged_json = serde_json::to_string(&Request::Set {
             hostname: None,
             accept_routes: None,
+            accept_dns: None,
             shields_up: None,
             exit_node: None,
             advertise_exit_node: None,

@@ -664,6 +664,8 @@ pub enum LiveSetOp {
     Hostname(String),
     /// `set_accept_routes` was issued with this value.
     AcceptRoutes(bool),
+    /// `set_accept_dns` was issued with this value.
+    AcceptDns(bool),
     /// `set_advertise_routes` was issued with these (already-parsed) routes.
     AdvertiseRoutes(Vec<ipnet::IpNet>),
     /// `set_advertise_exit_node` was issued with this value.
@@ -731,6 +733,9 @@ pub struct UpOptions {
     /// Accept-subnet-routes override (`None` leaves the pref unchanged; `Some(b)` sets it). Go's
     /// `tailscale up --accept-routes`; same tri-state as `set`'s `accept_routes`.
     pub accept_routes: Option<bool>,
+    /// Accept-MagicDNS override (`None` leaves the pref unchanged; `Some(b)` sets it). Go's
+    /// `tailscale up --accept-dns` (default-on); `Some(false)` ignores the pushed DNS config.
+    pub accept_dns: Option<bool>,
     /// Shields-up override (`None` leaves the pref unchanged; `Some(b)` sets it). Go's
     /// `tailscale up --shields-up`; block inbound peer connections terminating on this node.
     pub shields_up: Option<bool>,
@@ -774,6 +779,7 @@ impl UpOptions {
             || self.advertise_routes.is_some()
             || self.advertise_tags.is_some()
             || self.accept_routes.is_some()
+            || self.accept_dns.is_some()
             || self.shields_up.is_some()
             || self.ssh.is_some()
     }
@@ -800,6 +806,10 @@ pub struct SetOptions {
     /// [`tailscale::Device::set_accept_routes`] (the engine recomputes the route table + source
     /// filter in lock-step; no reconnect).
     pub accept_routes: Option<bool>,
+    /// Accept the tailnet's MagicDNS configuration (`None` unchanged). Applied LIVE via
+    /// [`tailscale::Device::set_accept_dns`] (the engine re-applies/withdraws the pushed DNS config;
+    /// no reconnect).
+    pub accept_dns: Option<bool>,
     /// Shields-up: block inbound peer connections terminating on this node (`None` unchanged). Has NO
     /// live engine setter (it maps to the immutable `Config.block_incoming`), so on a running node it
     /// takes the [`SetAction::Rebuild`] path — a brief reconnect.
@@ -829,6 +839,7 @@ impl SetOptions {
     pub fn is_empty(&self) -> bool {
         self.hostname.is_none()
             && self.accept_routes.is_none()
+            && self.accept_dns.is_none()
             && self.shields_up.is_none()
             && self.exit_node.is_none()
             && self.advertise_exit_node.is_none()
@@ -850,6 +861,8 @@ impl SetOptions {
     /// (and the reconnect is unavoidable the moment a rebuild-only pref is named). Pure inspection of
     /// which fields the REQUEST named (not post-apply state). Only meaningful when a device is up;
     /// the caller checks device-presence separately (a down node is always `PersistedOnly`).
+    ///
+    /// (`accept_dns` is a live field too — `Device::set_accept_dns` — so it is NOT listed here.)
     pub fn needs_rebuild(&self) -> bool {
         self.shields_up.is_some() || self.ssh.is_some() || self.advertise_tags.is_some()
     }
@@ -1379,6 +1392,7 @@ impl Backend {
         let named_exit_node = opts.exit_node.is_some();
         let named_hostname = opts.hostname.is_some();
         let named_accept_routes = opts.accept_routes.is_some();
+        let named_accept_dns = opts.accept_dns.is_some();
         let named_advertise_routes = opts.advertise_routes.is_some();
         let named_advertise_exit_node = opts.advertise_exit_node.is_some();
         // The rebuild-only fields (no live setter), captured for the reconcile-decision log below —
@@ -1422,6 +1436,9 @@ impl Backend {
         }
         if let Some(ar) = opts.accept_routes {
             self.prefs.accept_routes = ar;
+        }
+        if let Some(ad) = opts.accept_dns {
+            self.prefs.accept_dns = ad;
         }
         if let Some(su) = opts.shields_up {
             self.prefs.shields_up = su;
@@ -1518,6 +1535,12 @@ impl Backend {
                         .await
                         .map_err(|e| anyhow!("set accept-routes failed: {e:?}"))?;
                     ops.push(LiveSetOp::AcceptRoutes(self.prefs.accept_routes));
+                }
+                if named_accept_dns {
+                    dev.set_accept_dns(self.prefs.accept_dns)
+                        .await
+                        .map_err(|e| anyhow!("set accept-dns failed: {e:?}"))?;
+                    ops.push(LiveSetOp::AcceptDns(self.prefs.accept_dns));
                 }
                 if named_advertise_routes {
                     // Already pre-validated as `ipnet::IpNet` at the top of `begin_set` (before any
@@ -1705,6 +1728,11 @@ impl Backend {
         // sentinel as `set`'s accept_routes; baked into the engine Config in `build_config`.
         if let Some(ar) = opts.accept_routes {
             self.prefs.accept_routes = ar;
+        }
+        // Accept-MagicDNS override (Go `up --accept-dns`, default-on), same sentinel; baked into the
+        // engine Config in `build_config`.
+        if let Some(ad) = opts.accept_dns {
+            self.prefs.accept_dns = ad;
         }
         if let Some(su) = opts.shields_up {
             self.prefs.shields_up = su;
@@ -2403,6 +2431,7 @@ impl Backend {
             advertise_routes: self.prefs.advertise_routes.clone(),
             advertise_tags: self.prefs.advertise_tags.clone(),
             accept_routes: self.prefs.accept_routes,
+            accept_dns: self.prefs.accept_dns,
             shields_up: self.prefs.shields_up,
             ssh: self.prefs.ssh_enabled,
             // SSH *liveness*, distinct from the `ssh_enabled` pref above: the server task is spawned
