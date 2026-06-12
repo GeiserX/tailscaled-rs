@@ -2,9 +2,18 @@
 
 This lists the changes the downstream daemon (`tailscaled-rs`) needs from the `tailscale-rs`
 library to unblock end-to-end features. Each ask is self-contained, additive, and
-backward-compatible. The daemon pins engine rev `81446f88` (`v0.28.2`); individual asks
-note the rev they were verified against (older "verified vs `e126bba`/v0.6.9" notes below predate the
-current pin and are kept as historical context — the SHIPPED markers reflect what the pin provides).
+backward-compatible. The daemon pins engine rev `6035651b` (`v0.29.1`); individual asks
+note the rev they were verified against (older "verified vs `e126bba`/v0.6.9" / `81446f88`/v0.28.2
+notes below predate the current pin and are kept as historical context — the SHIPPED markers reflect
+what the pin provides).
+
+> **Pin bump 81446f88 (v0.28.2) → 6035651b (v0.29.1), 2026-06-12 (PR #125).** This bump SHIPPED +
+> CONSUMED three asks: **#14 `accept_dns`** (Config field + `set_accept_dns`; wired daemon-side in
+> PR #126 — supersedes the "did NOT land" note below), **#16 `cert_pair`** (PEM cert+key export;
+> consumed by `tnet cert` PR #127), and **#19** (the TUN peer-AllowedIPs host-route bug; consumed for
+> free — engine owns routing). Still OPEN: **#15 `query_dns`** (→ `tnet dns query`), **#17 TKA
+> mutation** (→ `tnet lock` write-ops), **#18** Windows host-net, plus #8/#9/#13 (minor). v0.29.2
+> (engine-internal MagicDNS qtype fix) is intentionally NOT pinned — taken on the next meaningful bump.
 
 > **Pin bump f42eb70e (v0.21.2) → 81446f88 (v0.28.2), 2026-06-12.** API-surface diff (both revs'
 > `src/lib.rs` + `ts_runtime` types compared) confirmed the engine surface is **purely additive across

@@ -75,23 +75,35 @@ stateDiagram-v2
 
 All seven Go `ipn.State` variants now exist as `ipn::State` for wire/API parity:
 `NoState`, `NeedsLogin`, `NeedsMachineAuth`, `InUseOtherUser`, `Starting`, `Running`, `Stopped`
-(`ipn::State::as_str` is the authoritative list). Two of them are **parity-only and not yet
-reachable** from a live status snapshot: because the MVP is pre-auth-key only with no interactive
-login, `NeedsMachineAuth` (node registered, awaiting admin approval) and `InUseOtherUser`
-(node key already bound to another user/profile) are never produced — those conditions currently
-surface as `NeedsLogin`/error instead. They are kept so the state name set never has to change
-when interactive login lands.
+(`ipn::State::as_str` is the authoritative list). `NeedsLogin` IS produced — interactive/browser
+login works (see below). Two variants are **parity-only and not yet reachable** because the engine
+emits no typed signal for them: `NeedsMachineAuth` (node registered, awaiting admin approval) and
+`InUseOtherUser` (node key already bound to another user/profile). A node awaiting admin approval
+currently presents as `Starting` (indistinguishable from one still converging); a multi-user daemon
+contention as an error. They are kept so the state name set never has to change once the engine
+surfaces those conditions (tracked as a bead). `InUseOtherUser` is largely moot for this fork's
+single-user model.
 
 ## Minimal Viable Daemon — in / out
 
-**In (the smallest useful closed loop):** pre-auth-key registration, obtaining a tailnet IP,
-DERP-relayed connectivity, the IPN state machine, persisted Prefs, the LocalAPI socket
-(`status`/`up`/`down`), and the thin CLI. Runs in **userspace-networking** mode.
+**In (the smallest useful closed loop):** pre-auth-key **AND keyless interactive/browser**
+registration (a keyless `up` reaches `NeedsLogin(url)` and auto-advances to `Running` once the user
+authorizes), obtaining a tailnet IP, DERP-relayed connectivity, the IPN state machine, persisted
+Prefs, the LocalAPI socket (`status`/`up`/`down`), and the thin CLI. Runs in **userspace-networking**
+mode by default.
 
-**Out (explicitly deferred):** TUN data path + OS routing + OS DNS programming, MagicDNS OS
-integration, exit nodes / subnet routers, interactive/browser login, Tailscale SSH / Serve /
-Funnel / Taildrop, Tailnet Lock enforcement, fine-grained operator authorization, and Windows
-service packaging.
+> Note: this list has grown well beyond the original MVP. Since first draft the daemon has also
+> shipped: the TUN data path + per-OS route/DNS programming (engine-owned `ts_host_net`, Linux+macOS),
+> exit-node use/advertise, subnet-route advertise, Tailscale SSH, Serve/Funnel, Taildrop, `cert`,
+> `accept-dns`, multi-profile switching, systemd/launchd install, and link-change rebind. See the
+> phase table + the bead backlog for the current frontier.
+
+**Still out / deferred:** a faithful `tnet login` *verb* (the capability exists via keyless `up`; the
+verb needs Go's empty-profile model — a posture decision), Tailnet Lock *write-ops* + enforcement
+(engine-gated), `dns query` (engine-gated), MagicDNS OS-resolver integration, the richer operator/GID
+authorization matrix, Windows service + host-net (engine-gated), and the declarative `--config` file.
+A handful of Go subcommands (`web`, `update`, `syspolicy`, `systray`, `configure synology`, exotic
+OSes) are **intentional non-goals** for a headless Rust daemon.
 
 ## Phased plan
 
