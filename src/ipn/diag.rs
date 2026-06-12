@@ -292,7 +292,10 @@ pub(super) async fn ping(dev: &tailscale::Device, ip: &str, timeout_ms: Option<u
 /// `symlink_metadata` does not traverse the final component), device, FIFO, socket, or directory.
 /// This is fail-closed defense-in-depth: it stops an infinite-stream device like `/dev/zero` from
 /// turning a "send a file" into an unbounded transfer, and stops a symlink from redirecting the
-/// root-held open at a file the operator did not name. Minimal by design — not a full sandbox.
+/// root-held open at a file the operator did not name. The subsequent open also uses `O_NOFOLLOW`,
+/// closing the stat→open TOCTOU window (a symlink swapped in after the stat fails the open with
+/// `ELOOP` rather than being followed) — the same hardening [`debug_capture`] applies. Minimal by
+/// design — not a full sandbox.
 ///
 /// Peer resolution mirrors [`whois`]/[`ping`]: a `peer` that parses
 /// as an [`IpAddr`](std::net::IpAddr) is looked up by tailnet IP, otherwise by MagicDNS name. The
@@ -348,8 +351,17 @@ pub(super) async fn file_cp(dev: &tailscale::Device, path: &str, peer: &str) -> 
         }
     }
     // The daemon opens the path (same-host/same-user; see the method doc). A read error here
-    // (missing/unreadable file) fails closed, naming the path.
-    let file = match tokio::fs::File::open(path).await {
+    // (missing/unreadable file) fails closed, naming the path. `O_NOFOLLOW` closes the stat→open
+    // TOCTOU window: the `symlink_metadata` check above already refused an existing symlink, but a
+    // symlink swapped in AFTER the stat (the daemon may run as root) would otherwise be followed and
+    // its target's contents sent — with O_NOFOLLOW the open fails (ELOOP) instead, so we never read
+    // through a planted link. Matches `debug_capture`'s open hardening.
+    let file = match tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .await
+    {
         Ok(f) => f,
         Err(e) => {
             return Response::Error {
@@ -425,8 +437,10 @@ pub(super) fn file_list(dev: &tailscale::Device) -> Response {
 /// device, FIFO, socket, or directory — **refuse** rather than write. This is fail-closed
 /// defense-in-depth: it stops a fetch from following a symlink planted at `dest` to overwrite a
 /// file the operator did not name, and from writing through a device/dir. A non-existent `dest`
-/// (the normal case) passes the check and is created by the copy. Minimal by design — not a full
-/// sandbox.
+/// (the normal case) passes the check and is created by the copy. The create also uses `O_NOFOLLOW`,
+/// closing the stat→create TOCTOU window (a symlink swapped in after the stat fails the open with
+/// `ELOOP` rather than being followed) — the same hardening [`debug_capture`] applies. Minimal by
+/// design — not a full sandbox.
 ///
 /// With `delete_after` set (the Go default), the received file is removed from the receive
 /// directory after a successful copy. A delete failure is logged as a warning but does **not**
@@ -468,10 +482,19 @@ pub(super) async fn file_get(
         }
     }
     // Copy off the async runtime: `std::io::copy` over `std::fs` handles is blocking, so do it on
-    // a blocking thread rather than stall an async worker. The `dest` string is moved in.
+    // a blocking thread rather than stall an async worker. The `dest` string is moved in. The create
+    // uses `O_NOFOLLOW` to close the stat→create TOCTOU window: the `symlink_metadata` check above
+    // already refused an existing symlink, but one swapped in AFTER the stat (the daemon may run as
+    // root) would otherwise be followed and the received file written through it to an arbitrary
+    // target — with O_NOFOLLOW the open fails (ELOOP) instead. Matches `debug_capture`'s open.
     let dest_owned = dest.to_string();
     let copy_result = tokio::task::spawn_blocking(move || {
-        let mut out = std::fs::File::create(&dest_owned)?;
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&dest_owned)?;
         std::io::copy(&mut src, &mut out)?;
         Ok::<(), std::io::Error>(())
     })
@@ -724,5 +747,63 @@ mod tests {
             ),
             Ok(_) => panic!("the dest must not exist for this test"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn o_nofollow_open_refuses_a_symlink() {
+        // The SECOND line of defense (the stat→open TOCTOU closure): even if a symlink is swapped in
+        // at the path AFTER the `symlink_metadata` check passes, the actual open uses `O_NOFOLLOW`, so
+        // it fails with `ELOOP` rather than following the link. `file_cp` (read) and `file_get`
+        // (write+create) both now open this way (matching `debug_capture`). Pin the exact mechanism:
+        // an `O_NOFOLLOW` open of a symlink fails, for BOTH the read and the write+create open shapes.
+        use std::os::unix::fs::OpenOptionsExt;
+        let base = std::env::temp_dir().join(format!("tailnetd-nofollow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let target = base.join("target.bin");
+        std::fs::write(&target, b"data").unwrap();
+        let link = base.join("link.bin");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        // Read open (the `file_cp` source shape): O_NOFOLLOW → refused.
+        let read_res = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&link);
+        assert!(
+            read_res.is_err(),
+            "O_NOFOLLOW read-open of a symlink must fail (ELOOP), never follow it"
+        );
+        assert_eq!(
+            read_res.err().unwrap().raw_os_error(),
+            Some(libc::ELOOP),
+            "the refusal must be ELOOP (the O_NOFOLLOW signal), not some other error"
+        );
+
+        // Write+create+truncate open (the `file_get` dest / `debug_capture` shape): also refused.
+        let write_res = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&link);
+        assert!(
+            write_res.is_err(),
+            "O_NOFOLLOW write-open of a symlink must fail (ELOOP), never write through it"
+        );
+        assert_eq!(
+            write_res.err().unwrap().raw_os_error(),
+            Some(libc::ELOOP),
+            "the refusal must be ELOOP"
+        );
+        // The target's contents were never read or clobbered through the link.
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"data",
+            "the symlink target must be untouched by the refused opens"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
