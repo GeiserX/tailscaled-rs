@@ -320,6 +320,19 @@ enum Command {
         /// Hide this node's own line/object (Go `--self=false`). Use `--no-self`.
         #[arg(long = "no-self")]
         no_self: bool,
+        /// Serve an HTML status page from an embedded web server instead of printing (Go `tailscale
+        /// status --web`). Runs until interrupted (Ctrl-C); each page load reflects the live status.
+        /// Mutually exclusive with `--json`/`--watch`.
+        #[arg(long, conflicts_with_all = ["json", "watch"])]
+        web: bool,
+        /// In `--web` mode, the address to listen on (Go `--listen`, default `127.0.0.1:8384`; use a
+        /// `:0` port for an automatic free port). Ignored without `--web`.
+        #[arg(long, value_name = "ADDR")]
+        listen: Option<String>,
+        /// In `--web` mode, do NOT open a browser at the served URL (Go's `--browser=false`; the
+        /// browser opens by default). Ignored without `--web`.
+        #[arg(long)]
+        no_browser: bool,
     },
     /// Block until the node is connected (state `Running` with a tailnet IP), then exit 0. Mirrors
     /// Go `tailscale wait` — handy in scripts as `tnet wait && start-my-service`.
@@ -1299,7 +1312,18 @@ async fn main() -> Result<()> {
             active,
             no_peers,
             no_self,
+            web,
+            listen,
+            no_browser,
         } => {
+            // `status --web` is a long-lived embedded HTTP server, not a one-shot — handle it here and
+            // return (like --watch). Default listen 127.0.0.1:8384; browser opens unless --no-browser.
+            if web {
+                let listen = listen.unwrap_or_else(|| "127.0.0.1:8384".to_string());
+                return run_status_web(&socket, &listen, !no_browser)
+                    .await
+                    .with_context(|| format!("serving status --web on {listen}"));
+            }
             if watch {
                 return watch_status(&socket)
                     .await
@@ -2852,6 +2876,224 @@ async fn round_trip(socket: &std::path::Path, request: &Request) -> Result<Respo
     let response = serde_json::from_str(response_line.trim())
         .with_context(|| format!("parsing daemon response: {response_line:?}"))?;
     Ok(response)
+}
+
+/// HTML-escape a string for safe inclusion in `status --web` page text. Control-server-/peer-supplied
+/// values (node/peer names, relay codes, the MagicDNS suffix) flow into the page, so they must never
+/// be able to inject markup/script — map the five HTML-significant characters to entities. Pure.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Render a [`StatusReport`](tailscaled_rs::localapi::StatusReport) as a self-contained HTML status
+/// page — the body `status --web` serves (the analogue of Go `ipnstate.Status.WriteHTML`, faithful in
+/// content rather than a byte-copy of Go's template). A header block (state, version, TUN, this node's
+/// name + IPs, MagicDNS suffix, active exit node) plus a peer table (name, IPs, online, exit-node,
+/// relay, last-seen). Every control-/peer-supplied string is [`html_escape`]d. Pure → unit-testable.
+fn render_status_html(s: &tailscaled_rs::localapi::StatusReport) -> String {
+    let mut h = String::new();
+    h.push_str("<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">");
+    h.push_str("<title>tailnetd status</title>");
+    h.push_str(
+        "<style>body{font-family:system-ui,sans-serif;margin:2rem;}\
+         table{border-collapse:collapse;margin-top:1rem;}\
+         th,td{border:1px solid #ccc;padding:4px 10px;text-align:left;}\
+         th{background:#f4f4f4;}.k{color:#555;}</style></head><body>",
+    );
+    h.push_str("<h1>tailnetd status</h1>");
+    h.push_str("<table>");
+    let row = |h: &mut String, k: &str, v: String| {
+        h.push_str(&format!("<tr><td class=\"k\">{k}</td><td>{v}</td></tr>"));
+    };
+    row(&mut h, "state", html_escape(&s.state));
+    if let Some(v) = &s.version {
+        row(&mut h, "version", html_escape(v));
+    }
+    row(&mut h, "TUN", s.prefs.tun.to_string());
+    if let Some(n) = &s.self_name {
+        row(&mut h, "self", html_escape(n));
+    }
+    let mut ips = Vec::new();
+    if let Some(v4) = &s.self_ipv4 {
+        ips.push(v4.clone());
+    }
+    if let Some(v6) = &s.self_ipv6 {
+        ips.push(v6.clone());
+    }
+    if !ips.is_empty() {
+        row(&mut h, "addresses", html_escape(&ips.join(", ")));
+    }
+    if let Some(suffix) = &s.magic_dns_suffix {
+        row(&mut h, "magic-dns-suffix", html_escape(suffix));
+    }
+    if let Some(exit) = &s.active_exit_node {
+        row(&mut h, "exit-node", html_escape(exit));
+    }
+    h.push_str("</table>");
+
+    h.push_str(&format!("<h2>peers ({})</h2>", s.peers.len()));
+    if s.peers.is_empty() {
+        h.push_str("<p>no peers</p>");
+    } else {
+        h.push_str(
+            "<table><tr><th>name</th><th>ipv4</th><th>ipv6</th><th>online</th>\
+             <th>exit-node</th><th>relay</th><th>last-seen</th></tr>",
+        );
+        for p in &s.peers {
+            let online = match p.online {
+                Some(true) => "yes",
+                Some(false) => "no",
+                None => "?",
+            };
+            h.push_str(&format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                html_escape(&p.name),
+                html_escape(&p.ipv4),
+                html_escape(p.ipv6.as_deref().unwrap_or("")),
+                online,
+                if p.is_exit_node { "yes" } else { "" },
+                html_escape(p.relay.as_deref().unwrap_or("")),
+                html_escape(p.last_seen.as_deref().unwrap_or("")),
+            ));
+        }
+        h.push_str("</table>");
+    }
+    h.push_str("</body></html>");
+    h
+}
+
+/// Parse the method + target from an HTTP request line (`GET / HTTP/1.1`) → `(method, path)`. Returns
+/// `None` for a malformed line (fewer than the two leading tokens). Pure → unit-testable; the
+/// `status --web` serve loop routes only the exact path `/`.
+fn parse_request_target(request_line: &str) -> Option<(&str, &str)> {
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next()?;
+    let path = parts.next()?;
+    Some((method, path))
+}
+
+/// `tnet status --web`: serve an HTML status page from an embedded HTTP server (Go `tailscale status
+/// --web`). Binds a TCP listener on `listen` (default `127.0.0.1:8384`), optionally opens a browser at
+/// the URL, then accepts connections until interrupted: each request re-fetches the live status
+/// ([`Request::Status`]) and, for `GET /`, replies `200 text/html` with [`render_status_html`]; any
+/// other path is a `404`. Reuses the existing daemon read — no new daemon/engine surface.
+async fn run_status_web(socket: &std::path::Path, listen: &str, browser: bool) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind(listen)
+        .await
+        .with_context(|| format!("binding the status web server to {listen}"))?;
+    let addr = listener
+        .local_addr()
+        .context("resolving the listen address")?;
+    // The status page has no authentication (matching Go's `tailscale status --web`). On the default
+    // 127.0.0.1 bind that's fine; if the operator widened it, warn that the tailnet topology (node
+    // name, IPs, peers) is now reachable by anyone who can hit this address.
+    if !addr.ip().is_loopback() {
+        eprintln!(
+            "warning: serving status on {addr}, which is reachable beyond localhost and has NO \
+             authentication — this node's name, tailnet IPs, and peer topology are exposed to \
+             anyone who can reach this address."
+        );
+    }
+    let url = format!("http://{addr}");
+    println!("Serving Tailscale status at {url} ... (Ctrl-C to stop)");
+    if browser {
+        open_browser_best_effort(&url);
+    }
+    loop {
+        let (conn, _peer) = match listener.accept().await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("status --web: accept failed: {e}");
+                continue;
+            }
+        };
+        // Handle each connection on its own task. Go's `http.Serve` is goroutine-per-connection, so a
+        // single slow or silent client can't head-of-line-block every other status request; the read
+        // deadline inside the handler is what actually bounds a stalled client.
+        let socket = socket.to_path_buf();
+        tokio::spawn(async move {
+            serve_status_connection(conn, &socket).await;
+        });
+    }
+}
+
+/// Serve one HTTP/1.1 connection for the `status --web` server: read the request line, route `GET /`
+/// to a fresh status fetch, write the response, and close. Best-effort throughout — any read/write
+/// error or timeout just drops the connection (this is a diagnostic server, not a hardened endpoint).
+///
+/// The request-line read is bounded in BOTH bytes (8 KiB cap) and time (a 5s deadline): TCP can split
+/// the line across segments so a single read isn't enough, but a client that dribbles or never sends
+/// must not park the task forever.
+async fn serve_status_connection(mut conn: tokio::net::TcpStream, socket: &std::path::Path) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+    let read_line = async {
+        loop {
+            let n = conn.read(&mut chunk).await?;
+            if n == 0 {
+                break; // EOF before a full line — treat as no request.
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            // Stop once we have the end of the request line, or cap buffering from a hostile client.
+            if buf.contains(&b'\n') || buf.len() >= 8192 {
+                break;
+            }
+        }
+        Ok::<(), std::io::Error>(())
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(5), read_line).await {
+        Ok(Ok(())) => {}
+        // Timed out, or a read error: drop the connection silently.
+        _ => return,
+    }
+    if buf.is_empty() {
+        return;
+    }
+    let request_line = String::from_utf8_lossy(&buf);
+    let first_line = request_line.lines().next().unwrap_or("");
+    let (status, body) = match parse_request_target(first_line) {
+        Some(("GET", "/")) => match round_trip(socket, &Request::Status).await {
+            Ok(Response::Status(s)) => ("200 OK", render_status_html(&s)),
+            Ok(_) | Err(_) => (
+                "500 Internal Server Error",
+                "<!DOCTYPE html><html><body>status unavailable</body></html>".to_string(),
+            ),
+        },
+        _ => (
+            "404 Not Found",
+            "<!DOCTYPE html><html><body>not found</body></html>".to_string(),
+        ),
+    };
+    let resp = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = conn.write_all(resp.as_bytes()).await;
+    let _ = conn.flush().await;
+}
+
+/// Best-effort open `url` in the OS browser (macOS `open`, Linux `xdg-open`). Never fatal — a failure
+/// (no browser, headless host) is logged and ignored; the served URL was already printed.
+fn open_browser_best_effort(url: &str) {
+    #[cfg(target_os = "macos")]
+    let prog = "open";
+    #[cfg(not(target_os = "macos"))]
+    let prog = "xdg-open";
+    if let Err(e) = std::process::Command::new(prog).arg(url).spawn() {
+        eprintln!("(could not open a browser via `{prog}`: {e} — open {url} manually)");
+    }
 }
 
 /// `tnet nc <host> <port>`: open a connection through the daemon and pipe stdin/stdout over it.
@@ -5127,6 +5369,69 @@ mod tests {
             serde_json::json!(false),
             "TUN is always present even when HaveNodeKey is omitted (Go bare bool)"
         );
+    }
+
+    #[test]
+    fn html_escape_neutralizes_markup() {
+        assert_eq!(
+            html_escape("a&b<c>d\"e'f"),
+            "a&amp;b&lt;c&gt;d&quot;e&#39;f"
+        );
+        assert_eq!(html_escape("plain"), "plain");
+    }
+
+    #[test]
+    fn render_status_html_includes_fields_and_escapes_peers() {
+        use tailscaled_rs::localapi::{PeerReport, StatusReport};
+        let report = StatusReport {
+            state: "Running".to_string(),
+            self_name: Some("node-a".to_string()),
+            self_ipv4: Some("100.64.0.1".to_string()),
+            magic_dns_suffix: Some("tail0123.ts.net".to_string()),
+            version: Some("0.37.0".to_string()),
+            peers: vec![PeerReport {
+                // A hostile, control-supplied peer name must render inert (no raw <script>).
+                name: "<script>alert(1)</script>".to_string(),
+                ipv4: "100.64.0.2".to_string(),
+                online: Some(true),
+                ..Default::default()
+            }],
+            have_node_key: true,
+            ..Default::default()
+        };
+        let html = render_status_html(&report);
+        assert!(html.starts_with("<!DOCTYPE html>"), "well-formed page");
+        assert!(html.contains("Running") && html.contains("0.37.0") && html.contains("node-a"));
+        assert!(html.contains("tail0123.ts.net") && html.contains("100.64.0.1"));
+        // The peer is listed, but its hostile name is escaped — no raw <script> tag.
+        assert!(html.contains("100.64.0.2"), "peer ip present");
+        assert!(
+            !html.contains("<script>"),
+            "a hostile peer name must be HTML-escaped, not rendered as markup: {html}"
+        );
+        assert!(html.contains("&lt;script&gt;"), "escaped form present");
+
+        // An empty / not-yet-running report still renders a valid page (no panic).
+        let empty = StatusReport {
+            state: "NeedsLogin".to_string(),
+            ..Default::default()
+        };
+        let empty_html = render_status_html(&empty);
+        assert!(empty_html.starts_with("<!DOCTYPE html>"));
+        assert!(empty_html.contains("NeedsLogin") && empty_html.contains("no peers"));
+    }
+
+    #[test]
+    fn parse_request_target_extracts_method_and_path() {
+        assert_eq!(parse_request_target("GET / HTTP/1.1"), Some(("GET", "/")));
+        assert_eq!(
+            parse_request_target("GET /foo HTTP/1.1"),
+            Some(("GET", "/foo"))
+        );
+        assert_eq!(parse_request_target("POST / HTTP/1.0"), Some(("POST", "/")));
+        // Malformed (no path token) → None; the serve loop treats that as 404.
+        assert_eq!(parse_request_target("GET"), None);
+        assert_eq!(parse_request_target(""), None);
     }
 
     #[test]
