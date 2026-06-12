@@ -422,9 +422,21 @@ pub struct WhoisReport {
     /// The owning user's login/email, if control retained it (always `None` in this fork).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
-    /// The node's control-granted capabilities (capability name → args).
+    /// The node's control-granted capabilities (capability name → args). This is the **node-level**
+    /// cap map (Go `Node.CapMap` — node attributes like `can-funnel`); just the names are kept (the
+    /// args are dropped for the summary). Distinct from [`cap_map`](WhoisReport::cap_map).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+    /// The **flow-scoped** peer-capability grants for the `this-node → queried-IP` flow — Go
+    /// `apitype.WhoIsResponse.CapMap` (`tailcfg.PeerCapMap`): the capabilities control's packet-filter
+    /// rules authorize for traffic from this node to the queried address, keyed by capability name
+    /// with raw (JSON-encoded) value strings the daemon never parses (kept here, unlike
+    /// [`capabilities`](WhoisReport::capabilities), since the grant *values* are the point). Empty
+    /// when no grant matches the flow. `#[serde(default)]` +
+    /// `skip_serializing_if` keep the wire backward-compatible (an older daemon/client omits the
+    /// field, which deserializes to an empty map).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub cap_map: std::collections::BTreeMap<String, Vec<String>>,
     /// The node's control-granted ACL tags (e.g. `tag:server`), if any. `#[serde(default)]` +
     /// `skip_serializing_if` keep the wire backward-compatible (an older daemon/client simply omits
     /// the field, which deserializes to an empty set).
@@ -1132,6 +1144,10 @@ mod tests {
             node_ipv4: Some("100.64.0.2".into()),
             user: None,
             capabilities: vec!["funnel".into()],
+            cap_map: std::collections::BTreeMap::from([(
+                "https://tailscale.com/cap/file-sharing".to_string(),
+                vec![r#"{"foo":1}"#.to_string()],
+            )]),
             tags: vec!["tag:server".into(), "tag:ci".into()],
             node_key_expiry: Some("2026-09-01 12:00:00 UTC".into()),
             online: Some(false),
@@ -1148,6 +1164,7 @@ mod tests {
                 assert_eq!(r.online, report.online, "online must round-trip");
                 assert_eq!(r.last_seen, report.last_seen, "last_seen must round-trip");
                 assert_eq!(r.capabilities, report.capabilities);
+                assert_eq!(r.cap_map, report.cap_map, "cap_map must round-trip");
                 assert_eq!(r.node_name, report.node_name);
             }
             other => panic!("expected Whois, got {other:?}"),
@@ -1166,6 +1183,7 @@ mod tests {
                 );
                 assert!(r.online.is_none(), "omitted online defaults to None");
                 assert!(r.last_seen.is_none(), "omitted last_seen defaults to None");
+                assert!(r.cap_map.is_empty(), "omitted cap_map defaults to empty");
             }
             other => panic!("expected Whois, got {other:?}"),
         }
@@ -1182,7 +1200,8 @@ mod tests {
             !empty_json.contains("\"tags\"")
                 && !empty_json.contains("\"node_key_expiry\"")
                 && !empty_json.contains("\"online\"")
-                && !empty_json.contains("\"last_seen\""),
+                && !empty_json.contains("\"last_seen\"")
+                && !empty_json.contains("\"cap_map\""),
             "empty optional fields must be omitted from the wire: {empty_json}"
         );
     }
