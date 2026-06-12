@@ -590,9 +590,17 @@ pub struct PrefsView {
 }
 
 /// The node's serve configuration (the TCP-forward subset of Go `ipn.ServeConfig`), carried by
-/// [`Request::SetServeConfig`] / [`Response::ServeConfig`]. The serde shape mirrors Go's wire JSON
-/// byte-for-byte (PascalCase, `omitempty`), e.g. `{"TCP":{"8443":{"TCPForward":"127.0.0.1:5000"}}}`.
-/// Persistence + the served/not-served logic live in `crate::ipn::serve`.
+/// [`Request::SetServeConfig`] / [`Response::ServeConfig`]. Persistence + the served/not-served logic
+/// live in `crate::ipn::serve`.
+///
+/// **Wire-shape fidelity is exact for the TCP-forward path only.** A plain TCP forward round-trips
+/// byte-for-byte with Go (PascalCase, `omitempty`), e.g. `{"TCP":{"8443":{"TCPForward":
+/// "127.0.0.1:5000"}}}`, as does the `AllowFunnel` map. It is NOT byte-compatible with Go for web
+/// (HTTP/HTTPS/text/redirect/path) handlers: Go stores those handler bodies in a top-level
+/// `Web map[HostPort]*WebServerConfig`, whereas this fork carries them as `Text`/`Redirect`/`Mounts`
+/// directly on the per-port handler and has no `Web`/`Services`/`Foreground` fields. So a *web* serve
+/// config written by an upstream `tailscaled` would not deserialize its targets here (and vice-versa);
+/// adding the Go `Web` map is tracked as a follow-up. (See `bd` `tsd-serve-web`.)
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServeConfig {
     /// Per-tailnet-port handler, keyed by the tailnet listen port AS A STRING. The key is a string

@@ -2096,34 +2096,37 @@ fn format_dns_status(r: &tailscaled_rs::localapi::DnsStatusReport, json: bool) -
 /// latency rounded to 0.1ms, e.g. `23.4ms`), with parenthetical none-lines when there is no preferred
 /// region / no measured latency. It then prints a one-line honest note that Go's
 /// UDP/IPv4/IPv6/`MappingVariesByDestIP`/PortMapping flags are not measured by this build, and that
-/// DERP regions are shown by id (the engine carries no region name). `json` emits a `{ "PreferredDERP":
-/// <id|null>, "RegionLatency": [{"RegionID":<id>,"LatencyMs":<f64>}, …] }` object via `serde_json`
-/// (escape-safe, 2-space pretty). Pure (returns the string incl. its trailing newline) → unit-testable.
+/// DERP regions are shown by id (the engine carries no region name).
+///
+/// `json` emits the two fields this build can populate **in Go's exact `net/netcheck.Report` wire
+/// shape**, so an upstream JSON consumer parses them: `PreferredDERP` is a plain integer (Go's
+/// `int`, `0` for unknown — never `null`), and `RegionLatency` is a **map keyed by stringified DERP
+/// region id with integer-nanosecond values** (Go's `map[int]time.Duration`, marshalled as ns;
+/// emitted via a `BTreeMap` so keys sort numerically). The many other Go `Report` fields
+/// (UDP/IPv4/IPv6/PortMapping/GlobalV4…) are genuinely not measured by this build and are simply
+/// absent — a reduction, not a renamed/reshaped field. (Go itself prints `# Warning: this JSON
+/// format is not yet considered a stable interface` to stderr for `--format=json`.) Pure (returns
+/// the string incl. its trailing newline) → unit-testable.
 fn format_netcheck(r: &tailscaled_rs::localapi::NetcheckReport, json: bool) -> String {
     if json {
         use serde_json::{Map, Value, json};
         let mut root = Map::new();
-        // A None preferred region serializes as JSON null (Go's zero value), not an omitted key.
-        root.insert(
-            "PreferredDERP".into(),
-            match r.preferred_derp {
-                Some(id) => json!(id),
-                None => Value::Null,
-            },
-        );
-        // Per-region latency: an ordered list of {RegionID, LatencyMs} objects (Go `RegionLatency`),
-        // in the engine's latency-ascending order.
-        let regions: Vec<Value> = r
-            .region_latencies
-            .iter()
-            .map(|rl| {
-                let mut m = Map::new();
-                m.insert("RegionID".into(), json!(rl.region_id));
-                m.insert("LatencyMs".into(), json!(rl.latency_ms));
-                Value::Object(m)
-            })
-            .collect();
-        root.insert("RegionLatency".into(), Value::Array(regions));
+        // Go's `PreferredDERP int // or 0 for unknown` — a plain number, 0 when unknown (never null).
+        root.insert("PreferredDERP".into(), json!(r.preferred_derp.unwrap_or(0)));
+        // Go's `RegionLatency map[int]time.Duration`: a JSON object keyed by the stringified region
+        // id, values being the duration as integer NANOSECONDS (how Go marshals `time.Duration`). A
+        // BTreeMap gives deterministic numeric-ascending key order. The engine carries latency as f64
+        // milliseconds, so ns = round(ms * 1e6).
+        let mut region_latency: std::collections::BTreeMap<u32, i64> =
+            std::collections::BTreeMap::new();
+        for rl in &r.region_latencies {
+            region_latency.insert(rl.region_id, (rl.latency_ms * 1_000_000.0).round() as i64);
+        }
+        let mut latency_obj = Map::new();
+        for (id, ns) in &region_latency {
+            latency_obj.insert(id.to_string(), json!(ns));
+        }
+        root.insert("RegionLatency".into(), Value::Object(latency_obj));
         return format!(
             "{}\n",
             serde_json::to_string_pretty(&root).unwrap_or_else(|_| "{}".to_string())
@@ -2202,6 +2205,12 @@ fn format_profiles(profiles: &[tailscaled_rs::localapi::ProfileEntry]) -> String
 /// JSON escaping is handled by serde (a future setting carrying a quote/backslash can't corrupt the
 /// output). The plain-text table/single-value path derives display strings from these via
 /// [`get_value_display`]. One source so the table, the `--json` map, and single-setting lookup agree.
+///
+/// This is a SUBSET of Go's `tailscale get` settings (Go derives its list from the full `set` flag
+/// set; many of those flags — `hostname`, `nickname`, `accept-dns`, `auto-update`, … — are not yet
+/// modelled by this fork's prefs/engine and so are absent here). One entry, `tun`, is a
+/// fork-specific extension (selecting the kernel-TUN vs userspace datapath) that Go's `get` has no
+/// counterpart for; it is intentionally surfaced because it is a real `tnet set` flag in this build.
 fn get_settings(
     view: &tailscaled_rs::localapi::PrefsView,
 ) -> Vec<(&'static str, serde_json::Value)> {
@@ -2286,9 +2295,15 @@ fn format_get(
             .collect();
         Ok(format!("{}\n", serde_json::to_string_pretty(&map)?))
     } else {
-        // NAME  VALUE table, column-aligned to the widest name.
-        let width = settings.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
-        let mut out = String::new();
+        // NAME  VALUE table (Go `getOutputTable` prints a literal `NAME\tVALUE` header first),
+        // column-aligned to the widest of the header and the setting names.
+        let width = settings
+            .iter()
+            .map(|(n, _)| n.len())
+            .chain(std::iter::once("NAME".len()))
+            .max()
+            .unwrap_or(0);
+        let mut out = format!("{:<width$}  VALUE\n", "NAME");
         for (name, value) in &settings {
             out.push_str(&format!("{name:<width$}  {}\n", get_value_display(value)));
         }
@@ -3787,8 +3802,12 @@ fn elliptically_truncate(s: &str, max: usize) -> String {
 /// caller. Pure → unit-testable.
 fn format_serve_status(cfg: &tailscaled_rs::localapi::ServeConfig, _json: bool) -> String {
     use tailscaled_rs::localapi::WebMount;
-    if cfg.tcp.is_empty() {
-        return "No serve config.\n".to_string();
+    // Go's `isServeConfigEmpty` treats a config as empty only when there is NO serve handler AND no
+    // funnel exposure — a funnel-only config (AllowFunnel set, TCP empty) is NOT empty. Mirror that
+    // over the two maps this wire model carries (tcp + allow_funnel). Message matches Go's exact
+    // `No serve config` (no trailing period).
+    if cfg.tcp.is_empty() && cfg.allow_funnel.is_empty() {
+        return "No serve config\n".to_string();
     }
     let mut out = String::new();
     for (port, h) in &cfg.tcp {
@@ -4847,8 +4866,13 @@ mod tests {
             tun: false,
         };
 
-        // Default table: one NAME VALUE line per setting, all settings present.
+        // Default table: a `NAME  VALUE` header line (Go `getOutputTable`) then one line per setting.
         let table = format_get(&view, None, false).unwrap();
+        // First line is the header.
+        assert!(
+            table.starts_with("NAME") && table.lines().next().unwrap().contains("VALUE"),
+            "the table must lead with a NAME/VALUE header, like Go: {table}"
+        );
         assert!(table.contains("accept-routes"), "{table}");
         assert!(table.contains("shields-up"), "{table}");
         assert!(table.contains("true"), "{table}");
@@ -4857,9 +4881,9 @@ mod tests {
             "{table}"
         );
         assert!(table.contains("advertise-tags"), "{table}");
-        // 8 settings → 8 lines (exit-node, advertise-exit-node, advertise-routes, advertise-tags,
-        // accept-routes, shields-up, ssh, tun).
-        assert_eq!(table.lines().count(), 8, "{table}");
+        // 1 header + 8 settings (exit-node, advertise-exit-node, advertise-routes, advertise-tags,
+        // accept-routes, shields-up, ssh, tun) → 9 lines.
+        assert_eq!(table.lines().count(), 9, "{table}");
 
         // --json: flattened name→value map keyed by set-flag name, with GO-FAITHFUL TYPED values —
         // booleans are bare JSON `true`/`false` (NOT quoted strings), strings are strings. Parse it
@@ -5051,13 +5075,19 @@ mod tests {
             h.contains("DERP-region latency only"),
             "the honest reduced-scope note must be present: {h}"
         );
-        // JSON form: Go-shaped keys, a bare numeric PreferredDERP, and the ordered RegionLatency list.
+        // JSON form: Go's `net/netcheck.Report` shape — a bare numeric PreferredDERP and a
+        // RegionLatency map keyed by stringified region id with integer-NANOSECOND values
+        // (`map[int]time.Duration` marshalled as ns). 23.42ms = 23_420_000ns; 41.7ms = 41_700_000ns.
         let j = format_netcheck(&report, true);
         let v: serde_json::Value = serde_json::from_str(&j).unwrap();
         assert_eq!(v["PreferredDERP"], serde_json::json!(1));
-        assert_eq!(v["RegionLatency"][0]["RegionID"], serde_json::json!(1));
-        assert_eq!(v["RegionLatency"][0]["LatencyMs"], serde_json::json!(23.42));
-        assert_eq!(v["RegionLatency"][1]["RegionID"], serde_json::json!(7));
+        assert_eq!(v["RegionLatency"]["1"], serde_json::json!(23_420_000_i64));
+        assert_eq!(v["RegionLatency"]["7"], serde_json::json!(41_700_000_i64));
+        // Numeric-ascending key order (BTreeMap): region 1's key precedes region 7's in the bytes.
+        assert!(
+            j.find("\"1\":").unwrap() < j.find("\"7\":").unwrap(),
+            "RegionLatency keys must be numeric-ascending: {j}"
+        );
     }
 
     #[test]
@@ -5074,10 +5104,11 @@ mod tests {
         );
         assert!(h.contains("(no DERP latency measured)"), "{h}");
         assert!(h.contains("DERP-region latency only"), "{h}");
-        // JSON: a default report carries a null PreferredDERP + an empty RegionLatency array.
+        // JSON: a default report carries PreferredDERP 0 (Go's "0 for unknown", NOT null) + an empty
+        // RegionLatency object (Go's `map[int]time.Duration`, empty → `{}`, not `[]`).
         let v: serde_json::Value = serde_json::from_str(&format_netcheck(&empty, true)).unwrap();
-        assert_eq!(v["PreferredDERP"], serde_json::Value::Null);
-        assert_eq!(v["RegionLatency"], serde_json::json!([]));
+        assert_eq!(v["PreferredDERP"], serde_json::json!(0));
+        assert_eq!(v["RegionLatency"], serde_json::json!({}));
     }
 
     #[test]
@@ -5156,8 +5187,23 @@ mod tests {
     #[test]
     fn format_serve_status_lists_and_flags() {
         use tailscaled_rs::localapi::{ServeConfig, TcpPortHandler};
-        // Empty → placeholder.
-        assert!(format_serve_status(&ServeConfig::default(), false).contains("No serve config"));
+        // Empty → placeholder, with Go's exact wording (no trailing period).
+        let empty = format_serve_status(&ServeConfig::default(), false);
+        assert_eq!(
+            empty, "No serve config\n",
+            "must match Go's exact empty message"
+        );
+
+        // A funnel-only config (AllowFunnel set, no TCP handler) is NOT empty in Go's
+        // `isServeConfigEmpty`, so it must NOT print the placeholder.
+        let mut funnel_only = ServeConfig::default();
+        funnel_only
+            .allow_funnel
+            .insert("node:443".to_string(), true);
+        assert!(
+            !format_serve_status(&funnel_only, false).contains("No serve config"),
+            "a funnel-only config is not empty (Go isServeConfigEmpty), must not show the placeholder"
+        );
 
         let mut cfg = ServeConfig::default();
         // Plain TCP forward (daemon's own accept loop) — served.
