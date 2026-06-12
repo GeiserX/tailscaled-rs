@@ -275,7 +275,9 @@ pub(super) async fn whois(dev: &tailscale::Device, ip: &str) -> Response {
 /// device-absent "node is not up" branch now lives at the caller. Still fail-closed on a bad `ip`
 /// (naming the value).
 ///
-/// `Ok(rtt)` → [`Response::Ping`] with the RTT in milliseconds (and the IP echoed for the CLI);
+/// `Ok(rtt)` → [`Response::Ping`] with the RTT in milliseconds (and the IP echoed for the CLI), plus
+/// the direct underlay `endpoint` when one exists (so the CLI can render `via <endpoint>` for a
+/// direct path vs `via DERP` for a relayed one, and `--until-direct` knows when to stop);
 /// `Err(e)` → a clear [`Response::Error`] (e.g. an unreachable peer, an IPv6 destination in this
 /// v4-only fork, or TUN mode where there is no application netstack to ping from).
 pub(super) async fn ping(dev: &tailscale::Device, ip: &str, timeout_ms: Option<u64>) -> Response {
@@ -289,10 +291,25 @@ pub(super) async fn ping(dev: &tailscale::Device, ip: &str, timeout_ms: Option<u
     };
     let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(5000));
     match dev.ping(dst, timeout).await {
-        Ok(rtt) => Response::Ping {
-            rtt_ms: rtt.as_secs_f64() * 1000.0,
-            ip: ip.to_string(),
-        },
+        Ok(rtt) => {
+            // Classify the path WITHOUT a second network round-trip. The ICMP ping above already
+            // traversed the overlay, which is what nudges magicsock to attempt a direct disco
+            // upgrade; `direct_path` then reports whether one is currently established as a cached
+            // snapshot of the last disco probe (up to one probe interval stale — not a fresh ping).
+            // `Some((endpoint, _rtt))` ⇒ direct (render `via endpoint`); `None`/`Err` ⇒ no direct
+            // path ⇒ the overlay is DERP-relayed (Go prints `via DERP`). A classification failure is
+            // non-fatal: the ping itself succeeded, so degrade to `None` (treated as relayed) rather
+            // than turn a good pong into an error.
+            let endpoint = match dev.direct_path(dst).await {
+                Ok(Some((addr, _rtt))) => Some(addr.to_string()),
+                Ok(None) | Err(_) => None,
+            };
+            Response::Ping {
+                rtt_ms: rtt.as_secs_f64() * 1000.0,
+                ip: ip.to_string(),
+                endpoint,
+            }
+        }
         Err(e) => Response::Error {
             message: format!("ping {ip} failed: {e:?}"),
         },

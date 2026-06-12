@@ -414,7 +414,11 @@ enum Command {
         #[arg(value_name = "AUDIENCE")]
         audience: String,
     },
-    /// Ping a tailnet peer over the overlay and report the round-trip time.
+    /// Ping a tailnet peer over the overlay and report the round-trip time (Go `tailscale ping`).
+    ///
+    /// By default this stops after 10 pings OR as soon as a **direct** (non-DERP) path is
+    /// established, whichever comes first — matching Go. Each result line reports the path the pong
+    /// took: `via <ip:port>` for a direct connection, `via DERP` when the overlay is still relayed.
     Ping {
         /// The tailnet IP of the peer to ping.
         #[arg(value_name = "IP")]
@@ -422,10 +426,21 @@ enum Command {
         /// Per-attempt timeout in milliseconds (omit for a sensible default).
         #[arg(long, value_name = "MS")]
         timeout: Option<u64>,
-        /// Number of pings to send (Go `-c`). Default 1. Prints one result line per attempt, then a
-        /// summary; a failed attempt is counted but does not abort the rest.
-        #[arg(short = 'c', long, value_name = "N", default_value_t = 1)]
+        /// Max number of pings to send (Go `-c`). Default 10; `0` means infinity (ping until a direct
+        /// path is established, or forever if `--no-until-direct`). Prints one result line per
+        /// attempt, then a summary; a failed attempt is counted but does not abort the rest.
+        #[arg(short = 'c', long, value_name = "N", default_value_t = 10)]
         count: u32,
+        /// Stop once a direct (non-DERP) path is established (Go `--until-direct`, **on by default**).
+        /// A new node usually starts out DERP-relayed and upgrades to a direct path within a few
+        /// pings; with this on, `ping` returns as soon as that happens. Mutually exclusive with
+        /// `--no-until-direct`.
+        #[arg(long, conflicts_with = "no_until_direct")]
+        until_direct: bool,
+        /// Keep pinging for the full count even after a direct path is established (disables the
+        /// default `--until-direct` early stop). Mutually exclusive with `--until-direct`.
+        #[arg(long)]
+        no_until_direct: bool,
     },
     /// Send and receive files over Taildrop (Go `tailscale file`).
     File {
@@ -748,6 +763,23 @@ fn resolve_ephemeral(ephemeral: bool, no_ephemeral: bool) -> Option<bool> {
         (true, _) => Some(true),
         (_, true) => Some(false),
         _ => None,
+    }
+}
+
+/// Resolve the `--until-direct` / `--no-until-direct` flag pair into a plain `bool`, **defaulting to
+/// `true`** to match Go's `tailscale ping` (where `--until-direct` is a bool flag that defaults
+/// true). Unlike the prefs toggles this is NOT tri-state: there is no "leave unchanged" — every ping
+/// invocation needs a concrete stop policy, and the Go default is "stop once direct". `--until-direct`
+/// → `true`; `--no-until-direct` → `false`; neither → `true` (the default). clap's `conflicts_with`
+/// guarantees the two are never both set. Pure → unit-testable.
+fn resolve_until_direct(until_direct: bool, no_until_direct: bool) -> bool {
+    match (until_direct, no_until_direct) {
+        // `--no-until-direct` explicitly turns the early-stop off (ping the full count).
+        (_, true) => false,
+        // `--until-direct` explicitly turns it on (redundant with the default, but a user may pass it).
+        (true, _) => true,
+        // Neither flag → Go's default: stop once a direct path is established.
+        (false, false) => true,
     }
 }
 
@@ -1178,7 +1210,22 @@ async fn main() -> Result<()> {
         // loop over `Request::Ping`. Handled inline (the loop + summary + exit-code contract); each
         // attempt prints a result line, a failure is counted but does not abort the rest, and the
         // command exits non-zero only if NOTHING was received.
-        Command::Ping { ip, timeout, count } => run_ping(&socket, ip, timeout, count).await,
+        Command::Ping {
+            ip,
+            timeout,
+            count,
+            until_direct,
+            no_until_direct,
+        } => {
+            run_ping(
+                &socket,
+                ip,
+                timeout,
+                count,
+                resolve_until_direct(until_direct, no_until_direct),
+            )
+            .await
+        }
         // Taildrop. The nested subcommand picks which wire `Request` to send: `cp` and `get` are
         // writes (the daemon reads/consumes a file) and reply `Ok`; `list` is read-only and replies
         // `Files`.
@@ -1832,19 +1879,31 @@ async fn run_ip(
     Ok(())
 }
 
-/// `ping` (Go `tailscale ping [-c N]`): the engine pings one-at-a-time, so `-c` is a CLI-side
-/// loop over `Request::Ping`. Inline (the loop + summary + exit-code contract); each attempt prints
-/// a result line, a failure is counted but does not abort the rest, and the command exits non-zero
-/// only if NOTHING was received.
+/// `ping` (Go `tailscale ping [-c N] [--until-direct]`): the engine pings one-at-a-time, so the
+/// count + the `--until-direct` early-stop are a CLI-side loop over `Request::Ping`. Inline (the
+/// loop + summary + exit-code contract); each attempt prints a result line reporting the path the
+/// pong took (`via <endpoint>` direct vs `via DERP` relayed), a failure is counted but does not
+/// abort the rest, and the exit verdict follows Go's [`ping_verdict`].
+///
+/// `count == 0` means infinity (Go `-c 0`): loop until a direct path is established (when
+/// `until_direct`) or forever. `until_direct` (Go's default-true) returns as soon as the overlay
+/// upgrades to a direct path — the ICMP echo each attempt sends is itself what nudges magicsock to
+/// attempt that upgrade.
 async fn run_ping(
     socket: &std::path::Path,
     ip: String,
     timeout: Option<u64>,
     count: u32,
+    until_direct: bool,
 ) -> Result<()> {
-    let n = count.max(1);
+    let infinite = count == 0;
     let mut received = 0u32;
-    for seq in 1..=n {
+    let mut went_direct = false;
+    let mut seq = 0u32;
+    loop {
+        seq += 1;
+        // The last attempt of a finite run (an infinite run only stops on a direct path or ^C).
+        let last = !infinite && seq >= count;
         match round_trip(
             socket,
             &Request::Ping {
@@ -1854,33 +1913,128 @@ async fn run_ping(
         )
         .await
         {
-            Ok(Response::Ping { rtt_ms, ip }) => {
+            Ok(Response::Ping {
+                rtt_ms,
+                ip,
+                endpoint,
+            }) => {
                 received += 1;
-                println!("pong from {ip} in {rtt_ms:.1} ms  (seq {seq}/{n})");
+                let direct = endpoint.is_some();
+                if direct {
+                    went_direct = true;
+                }
+                println!(
+                    "{}",
+                    format_ping_line(&ip, rtt_ms, endpoint.as_deref(), seq, count)
+                );
+                // Early stop: a direct (non-DERP) path is exactly what `--until-direct` waits for
+                // (Go returns success here without sending the rest of the count).
+                if until_direct && direct {
+                    break;
+                }
+                if last {
+                    break;
+                }
+                // Pace at ~1 ping/second like Go, so `-c N` is a steady stream rather than a burst.
+                // Go sleeps ONLY after a pong (a timeout already consumed its own wait), so the
+                // sleep lives in this arm, not after a miss.
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
             Ok(Response::Error { message }) => {
-                eprintln!("ping {seq}/{n} failed: {message}");
+                // A per-attempt failure (timeout, transient unreachability) is counted as a miss
+                // but does not abort the run — keep pinging like Go. No sleep after a miss: the
+                // per-attempt timeout already elapsed (matches Go's immediate retry on deadline).
+                eprintln!("{}", format_ping_miss(&message, seq, count));
+                if last {
+                    break;
+                }
             }
             Ok(other) => anyhow::bail!("unexpected response to ping: {other:?}"),
             Err(e) => {
                 return Err(e).with_context(|| format!("pinging at {}", socket.display()));
             }
         }
-        // Pace at ~1 ping/second like Go `tailscale ping`, so `-c N` is a steady stream
-        // rather than a burst. Skip the wait after the final attempt.
-        if seq < n {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    // Summary for any multi-attempt run (a single ping's one line is self-explanatory). `seq` is the
+    // number actually sent, which is honest when `--until-direct` stopped the run early.
+    if count != 1 {
+        println!("{}", format_ping_summary(seq, received));
+    }
+    // Exit verdict (Go's end-of-loop logic): non-zero if nothing replied, or if `--until-direct` was
+    // asked for but no direct path was ever established.
+    match ping_verdict(received, went_direct, until_direct) {
+        PingVerdict::Ok => Ok(()),
+        PingVerdict::NoReply => {
+            eprintln!("no reply");
+            std::process::exit(1);
+        }
+        PingVerdict::NoDirect => {
+            eprintln!("direct connection not established");
+            std::process::exit(1);
         }
     }
-    // Only print a summary for a multi-ping run (a single ping's one line is self-explanatory).
-    if n > 1 {
-        println!("{}", format_ping_summary(n, received));
-    }
-    // Exit non-zero only if nothing came back at all (Go: success if any reply).
+}
+
+/// The process-exit verdict for a `ping` run, decided from the run tally. A separate enum (rather
+/// than threading exit codes inline) so the Go end-of-loop logic is a pure, unit-testable function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PingVerdict {
+    /// At least one reply (and, if `--until-direct`, a direct path was reached) → exit 0.
+    Ok,
+    /// Nothing replied at all → Go's `"no reply"` error, exit non-zero.
+    NoReply,
+    /// `--until-direct` was requested but no direct path was ever established → Go's
+    /// `"direct connection not established"` error, exit non-zero.
+    NoDirect,
+}
+
+/// Decide the `ping` exit verdict (Go's end-of-loop logic), pure → unit-testable.
+///
+/// Go order: no reply at all → `"no reply"`; otherwise if `--until-direct` was set but the path
+/// never went direct → `"direct connection not established"`; otherwise success.
+fn ping_verdict(received: u32, went_direct: bool, until_direct: bool) -> PingVerdict {
     if received == 0 {
-        std::process::exit(1);
+        PingVerdict::NoReply
+    } else if until_direct && !went_direct {
+        PingVerdict::NoDirect
+    } else {
+        PingVerdict::Ok
     }
-    Ok(())
+}
+
+/// Render the `via …` path descriptor for a ping result line. `Some(endpoint)` ⇒ a direct path
+/// (Go prints `via <ip:port>`); `None` ⇒ the overlay is DERP-relayed (Go prints `via DERP`). Pure.
+fn ping_via(endpoint: Option<&str>) -> String {
+    match endpoint {
+        Some(ep) => format!("via {ep}"),
+        None => "via DERP".to_string(),
+    }
+}
+
+/// The `seq N` / `seq N/M` attempt label for a ping line. An infinite run (`count == 0`) has no
+/// denominator, so it shows just the attempt number; a finite run shows `N/M`. Pure.
+fn ping_seq_label(seq: u32, count: u32) -> String {
+    if count == 0 {
+        format!("{seq}")
+    } else {
+        format!("{seq}/{count}")
+    }
+}
+
+/// Format a successful-pong result line: the peer IP, the path (`via …`), the RTT, and the attempt
+/// label. Pure → unit-testable. (Go also prints the node name; our `Response::Ping` carries only the
+/// IP, so the IP stands in — the path + RTT, the operationally meaningful parts, match Go.)
+fn format_ping_line(ip: &str, rtt_ms: f64, endpoint: Option<&str>, seq: u32, count: u32) -> String {
+    format!(
+        "pong from {ip} {} in {rtt_ms:.1} ms  (seq {})",
+        ping_via(endpoint),
+        ping_seq_label(seq, count)
+    )
+}
+
+/// Format a missed-attempt line (a per-attempt failure that does not abort the run). Pure.
+fn format_ping_miss(message: &str, seq: u32, count: u32) -> String {
+    format!("ping {} failed: {message}", ping_seq_label(seq, count))
 }
 
 /// `metrics` (Go `tailscale metrics`): fetch the Prometheus text, then print or write it. Inline
@@ -5939,6 +6093,68 @@ mod tests {
         assert_eq!(
             format_ping_summary(2, 0),
             "--- 2 sent, 0 received, 100% loss ---"
+        );
+    }
+
+    #[test]
+    fn resolve_until_direct_defaults_true_like_go() {
+        // Go's `--until-direct` is a bool flag defaulting to true: neither flag → on.
+        assert!(
+            resolve_until_direct(false, false),
+            "default must be on (Go)"
+        );
+        // The bare flag → on (redundant with the default, but a user may pass it).
+        assert!(resolve_until_direct(true, false));
+        // `--no-until-direct` is the only way to turn it off.
+        assert!(!resolve_until_direct(false, true));
+    }
+
+    #[test]
+    fn ping_verdict_matches_go_end_of_loop() {
+        // No reply at all → "no reply" (regardless of until_direct).
+        assert_eq!(ping_verdict(0, false, true), PingVerdict::NoReply);
+        assert_eq!(ping_verdict(0, false, false), PingVerdict::NoReply);
+        // Replies but never went direct, and --until-direct was asked → "direct not established".
+        assert_eq!(ping_verdict(3, false, true), PingVerdict::NoDirect);
+        // Replies and went direct → ok, even with --until-direct.
+        assert_eq!(ping_verdict(2, true, true), PingVerdict::Ok);
+        // Replies, no direct, but --until-direct OFF → ok (we weren't waiting for direct).
+        assert_eq!(ping_verdict(5, false, false), PingVerdict::Ok);
+    }
+
+    #[test]
+    fn ping_via_distinguishes_direct_and_derp() {
+        // A direct endpoint → `via <ip:port>`; no endpoint → `via DERP` (relayed).
+        assert_eq!(ping_via(Some("100.64.0.2:41641")), "via 100.64.0.2:41641");
+        assert_eq!(ping_via(None), "via DERP");
+    }
+
+    #[test]
+    fn ping_seq_label_omits_denominator_when_infinite() {
+        // Finite run shows N/M; infinite (`-c 0`) shows just the attempt number.
+        assert_eq!(ping_seq_label(2, 10), "2/10");
+        assert_eq!(ping_seq_label(7, 0), "7");
+    }
+
+    #[test]
+    fn format_ping_line_reports_path_and_rtt() {
+        // Direct path.
+        assert_eq!(
+            format_ping_line("100.64.0.2", 12.34, Some("100.64.0.2:41641"), 1, 10),
+            "pong from 100.64.0.2 via 100.64.0.2:41641 in 12.3 ms  (seq 1/10)"
+        );
+        // DERP-relayed path, infinite count (no denominator).
+        assert_eq!(
+            format_ping_line("100.64.0.2", 50.0, None, 3, 0),
+            "pong from 100.64.0.2 via DERP in 50.0 ms  (seq 3)"
+        );
+    }
+
+    #[test]
+    fn format_ping_miss_labels_attempt() {
+        assert_eq!(
+            format_ping_miss("ping 100.64.0.2 failed: timeout", 2, 10),
+            "ping 2/10 failed: ping 100.64.0.2 failed: timeout"
         );
     }
 
