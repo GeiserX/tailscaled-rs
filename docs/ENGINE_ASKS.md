@@ -2,9 +2,21 @@
 
 This lists the changes the downstream daemon (`tailscaled-rs`) needs from the `tailscale-rs`
 library to unblock end-to-end features. Each ask is self-contained, additive, and
-backward-compatible. The daemon currently pins engine rev `f42eb70e` (≈`v0.21.2`); individual asks
+backward-compatible. The daemon pins engine rev `81446f88` (`v0.28.2`); individual asks
 note the rev they were verified against (older "verified vs `e126bba`/v0.6.9" notes below predate the
 current pin and are kept as historical context — the SHIPPED markers reflect what the pin provides).
+
+> **Pin bump f42eb70e (v0.21.2) → 81446f88 (v0.28.2), 2026-06-12.** API-surface diff (both revs'
+> `src/lib.rs` + `ts_runtime` types compared) confirmed the engine surface is **purely additive across
+> all 28 commits — zero breaking/changed/removed public items**, so the bump is build-safe. Newly
+> consumable as `tailscale::*` (no new dep): `Device::watch_ipn_bus(NotifyWatchOpt) -> IpnBusWatcher`
+> streaming `Notify { state, net_map, browse_to_url }` (unblocks interactive `tnet login` —
+> `browse_to_url` merges registration auth-URL + running-node PopBrowserURL); `set_hostname`,
+> `set_accept_routes`, `set_advertise_exit_node`, `accept_routes()` getter (runtime pref toggles);
+> `ping_disco` (true on-demand RTT); `StatusNode.relay` now populated (DERP region for the status
+> table); `WhoIs.cap_map` (flow-scoped cap-grants). **`accept_dns` (ask #14) did NOT land** — code
+> search = 0 hits, no `Config.accept_dns` field at v0.28.2; it remains an open, explicit ask, not a
+> passive wait.
 
 Ranked by leverage: #1 converts ~115 lines of already-written, CI-built, feature-gated daemon code
 into a working feature with a one-line change downstream.
