@@ -344,28 +344,31 @@ pub async fn drive_up(
 /// 1. **Node down** ([`SetAction::PersistedOnly`]) — there is no engine to reconcile; persisting the
 ///    prefs (already done in `begin_set`) is the whole job. The new prefs apply on the next `up`.
 ///    Returns immediately, lock already released.
-/// 2. **Exit-node-only, node up** ([`SetAction::LiveExitNode`]) — the one change the engine applies
-///    *live* (no reconnect) via [`tailscale::Device::set_exit_node`]. We re-acquire the lock just
-///    long enough to issue that single actor message and await it. `set_exit_node` takes `&self`
-///    (not `&mut`); the device is held behind an `Arc` (shared with the SSH task), so it *could* be
-///    cloned and hoisted off-lock — but we deliberately do NOT, because it is a quick mailbox
-///    round-trip (re-resolve the selector against the live peer set + recompute routes), not the
-///    multi-second registration handshake the begin/finish split exists to keep off-lock. Holding
-///    the brief lock for it keeps the code simple and the prefs-apply + live-set atomic under one
-///    lock. Only NEW flows use the new exit; in-flight connections are untouched (no teardown, no
-///    reconnect).
-/// 3. **Other prefs changed, node up** ([`SetAction::Rebuild`]) — `hostname` / `accept_routes` /
-///    `advertise_*` are baked into the engine's *immutable* construction [`tailscale::Config`], so
-///    the only way to apply them to a running node is to **rebuild the device** from the
-///    now-updated prefs. This reuses the exact [`begin_up`](Backend::begin_up) →
-///    [`build_device`] → [`finish_up`](Backend::finish_up) machinery as `drive_up` (same off-lock
-///    handshake, same generation-supersede guard, same off-lock orphan settle), so it inherits the
-///    same lock discipline verbatim. **CAVEAT — this is a brief reconnect:** rebuilding tears down
-///    the live engine and stands a fresh one up, so the overlay drops and re-registers (a short
-///    interruption + a new netmap convergence). `set` is honest about this: only the exit-node path
-///    is truly seamless. **No `authkey` is involved** (resume uses the persisted node key), and
-///    `want_running` is **never** changed — a `set` that rebuilds keeps a running node running and a
-///    (paradoxical) `set` on a down node still just persists; `set` is not `up`/`down`.
+/// 2. **All-live, node up** ([`SetAction::Live`]) — every changed pref has an in-place engine setter
+///    (`exit_node`, `hostname`, `accept_routes`, `advertise_routes`, `advertise_exit_node`), so the
+///    change applies *live* (no reconnect), matching Go's `set` = one `EditPrefs`. `begin_set` issues
+///    the relevant setters under the brief lock it already holds and returns the list of ops; this
+///    function has nothing further to do. Each setter takes `&self` (not `&mut`); the device is held
+///    behind an `Arc` (shared with the SSH task), so they *could* be cloned and hoisted off-lock —
+///    but we deliberately do NOT, because they are quick mailbox round-trips (a local state edit + a
+///    control re-push on the established map-poll), not the multi-second registration handshake the
+///    begin/finish split exists to keep off-lock. Holding the brief lock keeps the prefs-apply +
+///    live-set atomic under one lock. Only NEW flows use the new values; in-flight connections are
+///    untouched (no teardown, no reconnect).
+/// 3. **A rebuild-only pref changed, node up** ([`SetAction::Rebuild`]) — `shields_up` (the immutable
+///    `Config.block_incoming`), `ssh` (a device-lifecycle task), or `advertise_tags` (registration-time
+///    `Config.requested_tags`) have no live setter, so the only way to apply them to a running node
+///    is to **rebuild the device** from the now-updated prefs. This reuses the exact
+///    [`begin_up`](Backend::begin_up) → [`build_device`] → [`finish_up`](Backend::finish_up) machinery
+///    as `drive_up` (same off-lock handshake, same generation-supersede guard, same off-lock orphan
+///    settle), so it inherits the same lock discipline verbatim. **CAVEAT — this is a brief
+///    reconnect:** rebuilding tears down the live engine and stands a fresh one up, so the overlay
+///    drops and re-registers (a short interruption + a new netmap convergence). `set` is honest about
+///    this: only the live path is truly seamless, and a `set` that mixes live-applicable and
+///    rebuild-only prefs takes this rebuild path for the whole change (the rebuild re-applies the live
+///    ones from the persisted prefs too). **No `authkey` is involved** (resume uses the persisted node
+///    key), and `want_running` is **never** changed — a `set` that rebuilds keeps a running node
+///    running and a (paradoxical) `set` on a down node still just persists; `set` is not `up`/`down`.
 ///
 /// This mirrors `drive_up`'s phasing for the rebuild case. The lock is taken briefly for
 /// `begin_set` (apply + persist + decide); then, if rebuilding, briefly for `begin_up`; the lock is
@@ -378,9 +381,9 @@ pub async fn drive_set(
     opts: SetOptions,
 ) -> Result<()> {
     // Phase 1: brief lock — apply + persist the pref overrides and decide the reconcile path. For
-    // the live exit-node path we ALSO issue the live `set_exit_node` here, under the same brief lock:
-    // it is a quick actor message (not the off-lock-worthy registration handshake), so we keep it
-    // atomic with the prefs-apply rather than hoisting it off-lock via the device's `Arc`.
+    // the live path we ALSO issue the live engine setters here, under the same brief lock: each is a
+    // quick actor message (not the off-lock-worthy registration handshake), so we keep them atomic
+    // with the prefs-apply rather than hoisting them off-lock via the device's `Arc`.
     let action = {
         let mut be = backend.lock().await;
         be.begin_set(opts).await
@@ -389,9 +392,10 @@ pub async fn drive_set(
     match action {
         // Node down: persisting was the whole job; nothing live to reconcile.
         SetAction::PersistedOnly => Ok(()),
-        // Exit-node applied live, under the brief lock, inside `begin_set`. Done.
-        SetAction::LiveExitNode => Ok(()),
-        // Other prefs changed on a running node → rebuild from the updated prefs, reusing the
+        // Every changed pref was live-applicable and applied in place, under the brief lock, inside
+        // `begin_set` (`ops` records what was issued). No reconnect. Done.
+        SetAction::Live(_) => Ok(()),
+        // A rebuild-only pref changed on a running node → rebuild from the updated prefs, reusing the
         // begin_up/build_device/finish_up off-lock handshake exactly like `drive_up`. The brief
         // reconnect is documented on this function and `SetAction::Rebuild`.
         SetAction::Rebuild => {
@@ -430,21 +434,50 @@ pub async fn drive_set(
     }
 }
 
+/// A single live engine pref-setter that [`Backend::begin_set`] issued (under its brief lock) to
+/// apply a `set` change in place — the no-reconnect analogue of rebuilding the device. Each carries
+/// the resolved value that was pushed, so [`SetAction::Live`] is a self-describing, comparable record
+/// of what the live path did (handy for tests + tracing). Issuing happens in `begin_set`; this type
+/// is the receipt, not a deferred instruction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveSetOp {
+    /// `set_exit_node` was issued. Carries the resolved selector *as the pref string*
+    /// (`None` = cleared) rather than the engine's `ExitNodeSelector` — the string is what the daemon
+    /// persists and is trivially `Eq`, and the engine `FromStr` is infallible, so no fidelity is lost.
+    ExitNode(Option<String>),
+    /// `set_hostname` was issued with this hostname.
+    Hostname(String),
+    /// `set_accept_routes` was issued with this value.
+    AcceptRoutes(bool),
+    /// `set_advertise_routes` was issued with these (already-parsed) routes.
+    AdvertiseRoutes(Vec<ipnet::IpNet>),
+    /// `set_advertise_exit_node` was issued with this value.
+    AdvertiseExitNode(bool),
+}
+
 /// What [`Backend::begin_set`] decided a `set` must do to reconcile the live engine with the
 /// freshly-persisted prefs. The prefs are *already* applied + persisted by the time this is
-/// returned; this only describes the remaining engine-side work (and whether the live exit-node set
-/// was already issued under the lock).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// returned; this only describes the remaining engine-side work (and, for [`Live`](Self::Live),
+/// records which live setters were already issued under the lock).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SetAction {
     /// No device is up: persisting the prefs was the entire job; they take effect on the next `up`.
     PersistedOnly,
-    /// The only change was the exit node and a device is up — it was applied LIVE (via
-    /// [`tailscale::Device::set_exit_node`]) under the brief `begin_set` lock. No rebuild, no
-    /// reconnect; nothing further for the caller to do.
-    LiveExitNode,
-    /// Other prefs (hostname / accept_routes / advertise_*) changed on a running node: the immutable
-    /// engine `Config` must be rebuilt from the updated prefs. The caller ([`drive_set`]) runs the
-    /// off-lock `begin_up`/`build_device`/`finish_up` handshake. This is a brief reconnect.
+    /// Every changed pref is live-applicable and a device is up — the corresponding engine setters
+    /// were issued LIVE under the brief `begin_set` lock (`set_exit_node` / `set_hostname` /
+    /// `set_accept_routes` / `set_advertise_routes` / `set_advertise_exit_node`). No rebuild, no
+    /// reconnect; nothing further for the caller to do. The `Vec` records what was issued (in apply
+    /// order) — a `set --exit-node X` is the common single-op case, but a multi-pref all-live `set`
+    /// (e.g. `--hostname h --accept-routes`) issues several. Mirrors Go's `set` = one live
+    /// `EditPrefs` (no reconnect).
+    Live(Vec<LiveSetOp>),
+    /// At least one changed pref has NO live setter — `shields_up` (maps to the immutable
+    /// `Config.block_incoming`), `ssh` (a device-lifecycle task, not a `Config` knob), or
+    /// `advertise_tags` (registration-time `requested_tags`) — so the engine `Config` must be rebuilt
+    /// from the updated prefs. The caller ([`drive_set`]) runs the off-lock
+    /// `begin_up`/`build_device`/`finish_up` handshake. This is a brief reconnect. (When a `set` mixes
+    /// live-applicable and rebuild-only prefs, the whole `set` rebuilds — a rebuild re-applies every
+    /// pref from the persisted state anyway, so applying the live ones first would be wasted work.)
     Rebuild,
 }
 
@@ -535,30 +568,44 @@ impl UpOptions {
 /// [`UpOptions`]. Same "leave unchanged unless named" sentinel semantics, but a deliberately
 /// narrower field set: `set` never (re)authenticates (no `authkey`), never changes the control
 /// server or TUN transport (those are connection-defining and belong to `up`), and never flips
-/// `want_running`. It only adjusts policy prefs on an already-configured node. `exit_node` is the
-/// one field the engine can apply **live** (via [`tailscale::Device::set_exit_node`]); the rest take
-/// effect by reconfiguring a running device, or simply persist when the node is down.
+/// `want_running`. It only adjusts policy prefs on an already-configured node.
+///
+/// On a running node, most of these apply **live** (no reconnect, matching Go's `set` = one
+/// `EditPrefs`) via the engine's runtime setters: `exit_node`, `hostname`, `accept_routes`,
+/// `advertise_routes`, `advertise_exit_node`. Only `shields_up` (the immutable
+/// `Config.block_incoming`), `ssh` (a device-lifecycle task), and `advertise_tags` (registration-time
+/// `requested_tags`) have no live setter and take the device-rebuild path (a brief reconnect). See
+/// [`SetOptions::needs_rebuild`] and [`SetAction`].
 #[derive(Debug, Default, Clone)]
 pub struct SetOptions {
-    /// Requested hostname (applied on the next device (re)build; the engine has no live hostname set).
+    /// Requested hostname (`None` unchanged). Applied LIVE on a running node via
+    /// [`tailscale::Device::set_hostname`] (display metadata; no reconnect).
     pub hostname: Option<String>,
-    /// Accept subnet routes advertised by peers (`None` unchanged).
+    /// Accept subnet routes advertised by peers (`None` unchanged). Applied LIVE via
+    /// [`tailscale::Device::set_accept_routes`] (the engine recomputes the route table + source
+    /// filter in lock-step; no reconnect).
     pub accept_routes: Option<bool>,
-    /// Shields-up: block inbound peer connections terminating on this node (`None` unchanged). A
-    /// device-rebuild change (it alters the engine's packet-filter posture), like `accept_routes`.
+    /// Shields-up: block inbound peer connections terminating on this node (`None` unchanged). Has NO
+    /// live engine setter (it maps to the immutable `Config.block_incoming`), so on a running node it
+    /// takes the [`SetAction::Rebuild`] path — a brief reconnect.
     pub shields_up: Option<bool>,
     /// Exit-node selector. Double `Option`: `None` unchanged, `Some(None)` clear, `Some(Some(s))`
     /// set. Applied LIVE when a device is up (no reconnect).
     pub exit_node: Option<Option<String>>,
-    /// Advertise this node as an exit node (`None` unchanged).
+    /// Advertise this node as an exit node (`None` unchanged). Applied LIVE via
+    /// [`tailscale::Device::set_advertise_exit_node`] (composes with `advertise_routes` engine-side;
+    /// no reconnect).
     pub advertise_exit_node: Option<bool>,
-    /// Subnet routes this node advertises (`None` unchanged; `Some(vec)` replaces).
+    /// Subnet routes this node advertises (`None` unchanged; `Some(vec)` replaces). Applied LIVE via
+    /// [`tailscale::Device::set_advertise_routes`] (no reconnect).
     pub advertise_routes: Option<Vec<String>>,
-    /// ACL tags this node advertises (`None` unchanged; `Some(vec)` replaces; `tag:<name>` each).
+    /// ACL tags this node advertises (`None` unchanged; `Some(vec)` replaces; `tag:<name>` each). Has
+    /// NO live engine setter (tags are requested at registration via `Config.requested_tags`), so on
+    /// a running node it takes the [`SetAction::Rebuild`] path — a brief reconnect.
     pub advertise_tags: Option<Vec<String>>,
     /// Run the Tailscale SSH server (`None` unchanged; `Some(b)` sets it). Toggling SSH is a
     /// device-rebuild change (the SSH server task is tied to the device lifecycle), so it takes the
-    /// [`SetAction::Rebuild`] path on a running node — not the live exit-node fast path.
+    /// [`SetAction::Rebuild`] path on a running node — not the live fast path.
     pub ssh: Option<bool>,
 }
 
@@ -575,20 +622,21 @@ impl SetOptions {
             && self.ssh.is_none()
     }
 
-    /// Whether the ONLY change requested is the exit node — the case the engine can satisfy purely
-    /// live (via [`tailscale::Device::set_exit_node`]) with no device rebuild. Note `ssh` is
-    /// deliberately part of this guard: toggling the SSH server is a device-lifecycle change (the
-    /// server task is bound to the device), so a `set` that touches `ssh` is NOT exit-node-only and
-    /// must take the rebuild path even if it also names an exit node.
-    pub fn is_exit_node_only(&self) -> bool {
-        self.exit_node.is_some()
-            && self.hostname.is_none()
-            && self.accept_routes.is_none()
-            && self.shields_up.is_none()
-            && self.advertise_exit_node.is_none()
-            && self.advertise_routes.is_none()
-            && self.advertise_tags.is_none()
-            && self.ssh.is_none()
+    /// Whether applying this `set` on a **running** node requires a device REBUILD (a brief
+    /// reconnect) — true IFF it names any pref with no live engine setter: `shields_up` (the
+    /// immutable `Config.block_incoming`), `ssh` (a device-lifecycle task, not a `Config` knob), or
+    /// `advertise_tags` (registration-time `Config.requested_tags`). The other five fields — `exit_node`,
+    /// `hostname`, `accept_routes`, `advertise_routes`, `advertise_exit_node` — each have an in-place
+    /// engine setter (v0.28.2), so a `set` naming ONLY those applies live with no reconnect.
+    ///
+    /// The mixed-change rule: if a single `set` touches BOTH a live-applicable pref and a
+    /// rebuild-only one, the whole `set` rebuilds (this returns `true`). A rebuild re-applies every
+    /// pref from the persisted state anyway, so applying the live ones first would be wasted work
+    /// (and the reconnect is unavoidable the moment a rebuild-only pref is named). Pure inspection of
+    /// which fields the REQUEST named (not post-apply state). Only meaningful when a device is up;
+    /// the caller checks device-presence separately (a down node is always `PersistedOnly`).
+    pub fn needs_rebuild(&self) -> bool {
+        self.shields_up.is_some() || self.ssh.is_some() || self.advertise_tags.is_some()
     }
 }
 
@@ -973,7 +1021,7 @@ impl Backend {
     ///
     /// Runs the decision ([`begin_set`](Backend::begin_set)) and, for the rebuild sub-case, the full
     /// [`begin_up`](Backend::begin_up) → [`build_device`] → [`finish_up`](Backend::finish_up) inline.
-    /// The exit-node live set and the prefs persist are already done by `begin_set`.
+    /// The live setters and the prefs persist are already done by `begin_set`.
     ///
     /// For the **concurrent LocalAPI server**, use [`drive_set`] instead, which keeps the rebuild's
     /// slow `Device::new` handshake **off** the backend lock so a concurrent `status` is not
@@ -984,9 +1032,9 @@ impl Backend {
     /// (those are connection-defining and belong to `up`), and never flips `want_running`.
     pub async fn set(&mut self, opts: SetOptions) -> Result<()> {
         match self.begin_set(opts).await? {
-            // Node down, or exit-node applied live under begin_set — nothing further to do.
-            SetAction::PersistedOnly | SetAction::LiveExitNode => Ok(()),
-            // A non-exit-node pref changed on a running node: rebuild from the updated prefs to apply
+            // Node down, or every changed pref applied live under begin_set — nothing further to do.
+            SetAction::PersistedOnly | SetAction::Live(_) => Ok(()),
+            // A rebuild-only pref changed on a running node: rebuild from the updated prefs to apply
             // it (the engine Config is immutable). Brief reconnect; no authkey (resume from the
             // persisted node key); `want_running` unchanged. Inline three-phase like `up`.
             SetAction::Rebuild => {
@@ -1022,29 +1070,38 @@ impl Backend {
     /// parsed here. Unlike `begin_up`, `set` does **not** touch `want_running` / `logged_out` /
     /// control URL / TUN, and does **not** tear down or rebuild the device itself.
     ///
-    /// The reconcile decision (and the live exit-node set, when chosen) is the one place that needs
+    /// The reconcile decision (and the live setters, when chosen) is the one place that needs
     /// the live device, so it is done here under the (brief) backend lock the caller already holds:
     /// - **No device up** → [`SetAction::PersistedOnly`]: the persist above is the whole job; the new
     ///   prefs apply on the next `up`.
-    /// - **Device up AND `opts.is_exit_node_only()`** → apply the exit node **live** here via
-    ///   [`tailscale::Device::set_exit_node`] (parse `self.prefs.exit_node` into the engine's
-    ///   `ExitNodeSelector`, or `None` if cleared — the `FromStr` is infallible, see
-    ///   [`build_config`](Backend::build_config)), then return [`SetAction::LiveExitNode`]. No
-    ///   rebuild, no reconnect — the fast path that is the whole point of `set`. The actor message is
-    ///   awaited under the lock; the device's `Arc` could in principle be cloned to hoist it off-lock,
-    ///   but it is a quick mailbox round-trip, so we keep it atomic with the prefs-apply under the one
-    ///   brief lock instead.
-    /// - **Device up AND other prefs changed** → [`SetAction::Rebuild`]: the caller must rebuild the
-    ///   device from the updated prefs (the engine `Config` is immutable). A brief reconnect.
+    /// - **Device up AND every changed pref is live-applicable** (`!opts.needs_rebuild()`) → apply
+    ///   each named change **live** here via the engine's runtime setters (`set_exit_node` /
+    ///   `set_hostname` / `set_accept_routes` / `set_advertise_routes` / `set_advertise_exit_node`),
+    ///   then return [`SetAction::Live`] listing what was issued. No rebuild, no reconnect — the fast
+    ///   path that is the whole point of `set`, matching Go's `set` = one live `EditPrefs`. The actor
+    ///   messages are awaited under the lock; the device's `Arc` could in principle be cloned to hoist
+    ///   them off-lock, but they are quick mailbox round-trips (not the multi-second registration
+    ///   handshake), so we keep them atomic with the prefs-apply under the one brief lock.
+    /// - **Device up AND a rebuild-only pref changed** (`shields_up` / `ssh` / `advertise_tags`, which
+    ///   have no live setter) → [`SetAction::Rebuild`]: the caller must rebuild the device from the
+    ///   updated prefs (the engine `Config` is immutable). A brief reconnect. A `set` mixing live and
+    ///   rebuild-only prefs rebuilds wholesale (the rebuild re-applies the live ones too).
     ///
     /// Does **no** network I/O for the `Rebuild` case (the slow `Device::new` is the caller's
-    /// off-lock job); the only blocking step here is the quick live `set_exit_node` mailbox
-    /// round-trip on the exit-node path.
+    /// off-lock job); the only blocking steps here are the quick live setter mailbox round-trips on
+    /// the `Live` path.
     pub async fn begin_set(&mut self, opts: SetOptions) -> Result<SetAction> {
-        // Decide the path BEFORE mutating prefs — `is_exit_node_only()` inspects which fields the
+        // Decide the path BEFORE mutating prefs — `needs_rebuild()` inspects which fields the
         // request named, which the apply below would not change, but reading it first keeps the
-        // decision crisply about the *request* rather than post-apply state.
-        let exit_node_only = opts.is_exit_node_only();
+        // decision crisply about the *request* rather than post-apply state. Also snapshot which
+        // live-applicable fields were named, so after the apply+persist we know which engine setters
+        // to issue (the apply below moves the option values into prefs, so capture the booleans now).
+        let needs_rebuild = opts.needs_rebuild();
+        let named_exit_node = opts.exit_node.is_some();
+        let named_hostname = opts.hostname.is_some();
+        let named_accept_routes = opts.accept_routes.is_some();
+        let named_advertise_routes = opts.advertise_routes.is_some();
+        let named_advertise_exit_node = opts.advertise_exit_node.is_some();
 
         // PRE-VALIDATE the advertised CIDRs BEFORE mutating/persisting prefs. `build_config` is the
         // final authority (it re-parses the same way; see its `advertise_routes` block), but it only
@@ -1093,11 +1150,11 @@ impl Backend {
             self.prefs.advertise_tags = tags;
         }
         // Run-SSH-server override. Toggling SSH is a device-lifecycle change (the server task is
-        // bound to the device), so on a running node it must take the Rebuild path, NOT the live
-        // exit-node fast path — `SetOptions::is_exit_node_only` already returns false whenever `ssh`
-        // is named (see its doc), so the reconcile match below routes a device-up `ssh` change to
-        // `Rebuild`, which on rebuild re-runs `finish_up` and (re)spawns the SSH task from the
-        // now-updated `ssh_enabled`. The brief reconnect is documented on `drive_set`.
+        // bound to the device) with no live engine setter, so on a running node it must take the
+        // Rebuild path — `SetOptions::needs_rebuild` returns true whenever `ssh` is named (see its
+        // doc), so the reconcile match below routes a device-up `ssh` change to `Rebuild`, which on
+        // rebuild re-runs `finish_up` and (re)spawns the SSH task from the now-updated `ssh_enabled`.
+        // The brief reconnect is documented on `drive_set`.
         if let Some(ssh) = opts.ssh {
             self.prefs.ssh_enabled = ssh;
         }
@@ -1112,26 +1169,76 @@ impl Backend {
         match self.device.as_ref() {
             // No engine to reconcile — persisting above is the whole job; prefs apply on next `up`.
             None => Ok(SetAction::PersistedOnly),
-            // Fast path: only the exit node changed, and a device is up → apply it LIVE. Parse the
-            // (now-updated) pref into the engine selector; `None` (cleared) clears the exit node. The
-            // `ExitNodeSelector` `FromStr` is infallible (bare IP → `Ip`, else `Name`), so `.parse()`
-            // cannot fail — the `Err` is `core::convert::Infallible` (same total parse `build_config`
-            // relies on). The call is awaited under the (brief) lock the caller holds: the device's
-            // `Arc` could be cloned to hoist this off-lock, but it is a quick mailbox round-trip
-            // (re-resolve selector + recompute routes), not the multi-second registration handshake
-            // the off-lock split exists for, so we keep it atomic under the one lock. Only NEW flows
-            // use the new exit.
-            Some(dev) if exit_node_only => {
-                let sel: Option<tailscale::ExitNodeSelector> =
-                    self.prefs.exit_node.as_ref().map(|s| s.parse().unwrap());
-                dev.set_exit_node(sel)
-                    .await
-                    .map_err(|e| anyhow!("set exit node failed: {e:?}"))?;
-                Ok(SetAction::LiveExitNode)
+            // A rebuild-only pref (shields_up / ssh / advertise_tags — no live setter) changed on a
+            // running node: the engine Config is immutable, so the caller must rebuild the device
+            // from the updated prefs (a brief reconnect). A `set` that ALSO named live-applicable
+            // prefs still rebuilds wholesale — the rebuild re-applies them from the persisted prefs.
+            Some(_) if needs_rebuild => Ok(SetAction::Rebuild),
+            // Fast path: every changed pref is live-applicable and a device is up → apply each named
+            // change LIVE via the engine's runtime setters, no rebuild, no reconnect (Go's `set` =
+            // one live `EditPrefs`). Each call is awaited under the (brief) lock the caller holds: the
+            // device's `Arc` could be cloned to hoist these off-lock, but they are quick mailbox
+            // round-trips (local state edit + a control re-push on the established map-poll), not the
+            // multi-second registration handshake the off-lock split exists for, so we keep them
+            // atomic with the prefs-apply under the one lock. Only NEW flows use the new values. A
+            // setter error returns `Err` with the device fully INTACT (no teardown) — strictly safer
+            // than the rebuild path; the pref is already persisted, so it applies on the next
+            // successful reconcile (same persisted-but-not-yet-live semantics as Go).
+            Some(dev) => {
+                let mut ops = Vec::new();
+                // Order: exit_node, hostname, accept_routes, advertise_routes, advertise_exit_node.
+                // The advertise pair composes engine-side (each setter re-reads the other's stored
+                // contribution behind a shared lock), so the relative order of the two is immaterial.
+                if named_exit_node {
+                    // `ExitNodeSelector` `FromStr` is infallible (bare IP → `Ip`, else `Name`; the
+                    // `Err` is `Infallible`), the same total parse `build_config` relies on — so
+                    // `.unwrap()` cannot panic. `None` (cleared) clears the exit node.
+                    let sel: Option<tailscale::ExitNodeSelector> =
+                        self.prefs.exit_node.as_ref().map(|s| s.parse().unwrap());
+                    dev.set_exit_node(sel)
+                        .await
+                        .map_err(|e| anyhow!("set exit node failed: {e:?}"))?;
+                    ops.push(LiveSetOp::ExitNode(self.prefs.exit_node.clone()));
+                }
+                if named_hostname {
+                    let hostname = self.prefs.hostname.clone().unwrap_or_default();
+                    dev.set_hostname(hostname.clone())
+                        .await
+                        .map_err(|e| anyhow!("set hostname failed: {e:?}"))?;
+                    ops.push(LiveSetOp::Hostname(hostname));
+                }
+                if named_accept_routes {
+                    dev.set_accept_routes(self.prefs.accept_routes)
+                        .await
+                        .map_err(|e| anyhow!("set accept-routes failed: {e:?}"))?;
+                    ops.push(LiveSetOp::AcceptRoutes(self.prefs.accept_routes));
+                }
+                if named_advertise_routes {
+                    // Already pre-validated as `ipnet::IpNet` at the top of `begin_set` (before any
+                    // mutation/persist), the byte-identical parse `build_config` uses — so this parse
+                    // cannot fail here.
+                    let routes: Vec<ipnet::IpNet> = self
+                        .prefs
+                        .advertise_routes
+                        .iter()
+                        .map(|s| {
+                            s.parse()
+                                .expect("advertise routes pre-validated in begin_set")
+                        })
+                        .collect();
+                    dev.set_advertise_routes(routes.clone())
+                        .await
+                        .map_err(|e| anyhow!("set advertise-routes failed: {e:?}"))?;
+                    ops.push(LiveSetOp::AdvertiseRoutes(routes));
+                }
+                if named_advertise_exit_node {
+                    dev.set_advertise_exit_node(self.prefs.advertise_exit_node)
+                        .await
+                        .map_err(|e| anyhow!("set advertise-exit-node failed: {e:?}"))?;
+                    ops.push(LiveSetOp::AdvertiseExitNode(self.prefs.advertise_exit_node));
+                }
+                Ok(SetAction::Live(ops))
             }
-            // A non-exit-node pref changed on a running node: the engine Config is immutable, so the
-            // caller must rebuild the device from the updated prefs (a brief reconnect).
-            Some(_) => Ok(SetAction::Rebuild),
         }
     }
 
@@ -3563,76 +3670,136 @@ mod tests {
     }
 
     #[test]
-    fn set_options_is_exit_node_only_truth_table() {
-        // The fast-path discriminator: `is_exit_node_only` is true IFF exit_node is named AND no
-        // other field is — that is the ONLY shape the engine satisfies live (no rebuild). Both the
-        // SET and CLEAR exit_node forms qualify; pairing exit_node with anything else does not; and
-        // a request that names no exit_node is never "exit-node only".
+    fn set_options_needs_rebuild_truth_table() {
+        // The path discriminator on a RUNNING node: `needs_rebuild` is true IFF the request names a
+        // pref with NO live engine setter — `shields_up`, `ssh`, or `advertise_tags`. The five
+        // live-applicable fields (exit_node / hostname / accept_routes / advertise_routes /
+        // advertise_exit_node) each apply in place, so naming ONLY those is a no-reconnect live set.
+
+        // Each live-applicable pref ALONE → live (no rebuild). Both exit_node forms (SET + CLEAR).
         assert!(
-            SetOptions {
+            !SetOptions {
                 exit_node: Some(Some("100.64.0.9".into())),
                 ..SetOptions::default()
             }
-            .is_exit_node_only(),
-            "exit_node SET alone is exit-node-only (live path)"
+            .needs_rebuild(),
+            "exit_node SET alone is live"
         );
         assert!(
-            SetOptions {
+            !SetOptions {
                 exit_node: Some(None),
                 ..SetOptions::default()
             }
-            .is_exit_node_only(),
-            "exit_node CLEAR alone is exit-node-only (live path)"
-        );
-        assert!(
-            !SetOptions::default().is_exit_node_only(),
-            "an empty set names no exit_node → not exit-node-only"
+            .needs_rebuild(),
+            "exit_node CLEAR alone is live"
         );
         assert!(
             !SetOptions {
-                exit_node: Some(Some("x".into())),
                 hostname: Some("h".into()),
                 ..SetOptions::default()
             }
-            .is_exit_node_only(),
-            "exit_node + hostname needs a rebuild → NOT exit-node-only"
+            .needs_rebuild(),
+            "hostname alone is live (set_hostname)"
         );
         assert!(
             !SetOptions {
-                exit_node: Some(Some("x".into())),
                 accept_routes: Some(true),
                 ..SetOptions::default()
             }
-            .is_exit_node_only(),
-            "exit_node + accept_routes needs a rebuild → NOT exit-node-only"
+            .needs_rebuild(),
+            "accept_routes alone is live (set_accept_routes)"
         );
+        assert!(
+            !SetOptions {
+                advertise_routes: Some(vec!["10.0.0.0/24".into()]),
+                ..SetOptions::default()
+            }
+            .needs_rebuild(),
+            "advertise_routes alone is live (set_advertise_routes)"
+        );
+        assert!(
+            !SetOptions {
+                advertise_exit_node: Some(true),
+                ..SetOptions::default()
+            }
+            .needs_rebuild(),
+            "advertise_exit_node alone is live (set_advertise_exit_node)"
+        );
+
+        // An all-live MIX → still live (no rebuild): the whole point of the generalized path.
         assert!(
             !SetOptions {
                 hostname: Some("h".into()),
+                accept_routes: Some(true),
+                advertise_exit_node: Some(true),
                 ..SetOptions::default()
             }
-            .is_exit_node_only(),
-            "a non-exit-node change is not exit-node-only"
+            .needs_rebuild(),
+            "a mix of only live-applicable prefs stays live"
         );
-        // SSH is a device-lifecycle change, so it must take the REBUILD path, never the live
-        // exit-node fast path: an ssh-only set is not exit-node-only, and pairing ssh WITH an
-        // exit_node still is not (the ssh toggle forces a rebuild even alongside an exit-node change).
+
+        // Each rebuild-only pref ALONE → rebuild (no live setter exists).
         assert!(
-            !SetOptions {
+            SetOptions {
+                shields_up: Some(true),
+                ..SetOptions::default()
+            }
+            .needs_rebuild(),
+            "shields_up has no live setter (immutable block_incoming) → rebuild"
+        );
+        assert!(
+            SetOptions {
                 ssh: Some(true),
                 ..SetOptions::default()
             }
-            .is_exit_node_only(),
-            "an ssh-only toggle is a device-lifecycle change → NOT exit-node-only"
+            .needs_rebuild(),
+            "ssh is a device-lifecycle task → rebuild"
         );
         assert!(
-            !SetOptions {
+            SetOptions {
+                advertise_tags: Some(vec!["tag:server".into()]),
+                ..SetOptions::default()
+            }
+            .needs_rebuild(),
+            "advertise_tags is registration-time → rebuild"
+        );
+
+        // The mixed-change rule: a live-applicable pref paired with ANY rebuild-only pref → rebuild
+        // the whole set (the rebuild re-applies the live one anyway). One case per rebuild-forcer.
+        assert!(
+            SetOptions {
+                hostname: Some("h".into()),
+                shields_up: Some(true),
+                ..SetOptions::default()
+            }
+            .needs_rebuild(),
+            "hostname + shields_up → rebuild (shields_up forces it)"
+        );
+        assert!(
+            SetOptions {
                 exit_node: Some(Some("100.64.0.9".into())),
                 ssh: Some(true),
                 ..SetOptions::default()
             }
-            .is_exit_node_only(),
-            "exit_node + ssh must rebuild (ssh is bound to the device) → NOT exit-node-only"
+            .needs_rebuild(),
+            "exit_node + ssh → rebuild (ssh forces it)"
+        );
+        assert!(
+            SetOptions {
+                accept_routes: Some(true),
+                advertise_tags: Some(vec!["tag:ci".into()]),
+                ..SetOptions::default()
+            }
+            .needs_rebuild(),
+            "accept_routes + advertise_tags → rebuild (tags force it)"
+        );
+
+        // An empty set names no rebuild-only pref → needs_rebuild is false (the server rejects an
+        // empty set earlier via is_empty; needs_rebuild is only consulted for a non-empty, device-up
+        // set).
+        assert!(
+            !SetOptions::default().needs_rebuild(),
+            "an empty set needs no rebuild"
         );
     }
 
@@ -3698,6 +3865,44 @@ mod tests {
         assert!(be.prefs.advertise_exit_node);
         assert_eq!(be.prefs.advertise_routes, vec!["10.0.0.0/8".to_string()]);
         assert_eq!(be.prefs.hostname.as_deref(), Some("baseline-host"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn begin_set_device_less_persists_regardless_of_live_vs_rebuild() {
+        // With NO device up, the live-vs-rebuild classification is moot: `begin_set` always returns
+        // `PersistedOnly` and persists the named prefs (they apply on the next `up`). Verify this for
+        // a request that MIXES a live-applicable pref (hostname) and a rebuild-only one (shields_up) —
+        // a device-up version would take `Rebuild`, but device-less it just persists both. This pins
+        // that the new classification never leaks into the device-less path. Offline (no engine I/O).
+        let dir = std::env::temp_dir().join(format!("tailnetd-set-devless-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+
+        // Sanity: this request WOULD rebuild on a running node (shields_up has no live setter)...
+        let opts = SetOptions {
+            hostname: Some("mixed-host".to_string()),
+            shields_up: Some(true),
+            ..SetOptions::default()
+        };
+        assert!(
+            opts.needs_rebuild(),
+            "hostname + shields_up classifies as rebuild (precondition)"
+        );
+        // ...but device-less it just persists, returning PersistedOnly and applying BOTH prefs.
+        let action = be.begin_set(opts).await.expect("begin_set");
+        assert_eq!(
+            action,
+            SetAction::PersistedOnly,
+            "device-less set persists regardless of live/rebuild classification"
+        );
+        assert_eq!(be.prefs.hostname.as_deref(), Some("mixed-host"));
+        assert!(
+            be.prefs.shields_up,
+            "the rebuild-only pref was persisted too"
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
