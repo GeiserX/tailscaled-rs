@@ -20,8 +20,13 @@
 //!   downgrades to plaintext, and without an issuable cert (the engine's `acme` feature off, or a
 //!   control plane that 501s on `set-dns`) the engine returns a cert error and nothing binds.
 //!
-//! `TerminateTLS` (raw-TCP-after-TLS-termination) has no engine `ServeTarget` analogue at this pin,
-//! so it remains persisted-but-not-served.
+//! - **`TerminateTLS`** (raw-TCP-after-TLS-termination, Go `--tls-terminated-tcp`) ALSO rides the
+//!   engine-delegation lane: it maps to the same engine `Proxy` target as an `https` web entry (the
+//!   engine terminates TLS, then verbatim-splices the decrypted stream to the `tcp_forward` backend —
+//!   exactly Go's `TerminateTLS`), so it is fail-closed/acme-gated identically. Exception: a
+//!   `ProxyProtocol`-bearing terminate-tls entry stays persisted-but-not-served (the engine `Proxy`
+//!   target does not prepend the PROXY-protocol header, so serving it as a plain splice would silently
+//!   drop that semantic). See [`is_terminate_tls_serve`].
 
 use std::path::{Path, PathBuf};
 
@@ -119,10 +124,13 @@ fn handler_to_target(h: &TcpPortHandler) -> Result<tailscale::ServeTarget, &'sta
 /// [`handler_to_target`]: a `text` body → `Text`, a `redirect` → `Redirect`, path `mounts` → `Path`
 /// (or the bare target for a lone `/` mount), and an `https`/`http` proxy → `Proxy` (the existing
 /// behavior; `HTTP` and `HTTPS` both map to `Proxy` — the engine has no distinct plaintext-web variant
-/// at this pin, every web `ServeTarget` rides a TLS-terminating port). Plain `tcp_forward` entries (no
-/// web aspect) and `terminate_tls` entries are **excluded** — the former stays on the daemon's
-/// hand-rolled accept loop, the latter is not served. A web-shaped entry that produces no valid target
-/// (or an invalid mount/redirect) is skipped + logged rather than poisoning the whole state.
+/// at this pin, every web `ServeTarget` rides a TLS-terminating port). A **TLS-terminated raw-TCP
+/// forward** ([`is_terminate_tls_serve`], Go `--tls-terminated-tcp`) also rides this lane, mapping to
+/// `Proxy { to: tcp_forward }` — the engine terminates TLS and verbatim-splices to the backend (Go's
+/// `TerminateTLS`). Plain `tcp_forward` entries (no web/TLS aspect) are **excluded** — they stay on the
+/// daemon's hand-rolled accept loop — as are proxy-protocol terminate-tls entries (the engine `Proxy`
+/// can't write the PROXY header). A web-shaped entry that produces no valid target (or an invalid
+/// mount/redirect) is skipped + logged rather than poisoning the whole state.
 ///
 /// `name` is the node's MagicDNS name (e.g. `host.tailnet.ts.net`, no trailing dot) — the cert the
 /// engine's TLS-terminating ports share. It is set only when at least one web port is produced; an
@@ -133,14 +141,26 @@ fn handler_to_target(h: &TcpPortHandler) -> Result<tailscale::ServeTarget, &'sta
 pub fn build_web_serve_state(cfg: &ServeConfig, name: &str) -> tailscale::ServeState {
     let mut ports = std::collections::BTreeMap::new();
     for (port_str, h) in &cfg.tcp {
-        if !is_web_serve(h) {
+        // Both web entries and TLS-terminated raw-TCP forwards ride this engine-delegation lane: the
+        // engine terminates TLS with the node cert and (for a `Proxy` target) verbatim-splices to the
+        // backend, which is exactly Go's `TerminateTLS`. A terminate-tls handler maps straight to
+        // `Proxy { to: tcp_forward }` (no web precedence to resolve); web handlers go through
+        // `handler_to_target`. Everything else (plain TCP forward, proxy-protocol terminate-tls,
+        // backendless web) is excluded here and handled/logged by the LANE dispatch in `spawn_serve`.
+        let target = if is_terminate_tls_serve(h) {
+            Ok(tailscale::ServeTarget::Proxy {
+                to: h.tcp_forward.clone(),
+            })
+        } else if is_web_serve(h) {
+            handler_to_target(h)
+        } else {
             continue;
-        }
+        };
         let Ok(port) = port_str.parse::<u16>() else {
             // A non-numeric key can't be a tailnet port; skip (the persistence layer keeps it).
             continue;
         };
-        match handler_to_target(h) {
+        match target {
             Ok(target) => {
                 ports.insert(port, target);
             }
@@ -166,6 +186,22 @@ pub fn build_web_serve_state(cfg: &ServeConfig, name: &str) -> tailscale::ServeS
 /// for handlers where this is true; everything else is persisted-but-not-served.
 pub fn is_plain_tcp_forward(h: &TcpPortHandler) -> bool {
     !h.tcp_forward.is_empty() && !h.https && !h.http && h.terminate_tls.is_empty()
+}
+
+/// Whether a handler is a **TLS-terminated raw-TCP forward** this build can serve via the engine
+/// (Go `tailscale serve --tls-terminated-tcp`): a `terminate_tls` SNI/host set, a `tcp_forward`
+/// backend to splice the decrypted stream to, and NO PROXY-protocol prefix requested. The engine
+/// terminates TLS with the node cert and verbatim-splices to the backend — exactly Go's `TerminateTLS`
+/// semantics, and the SAME engine operation as an `https` web `Proxy` (a post-TLS L4 byte-splice), so
+/// it rides the engine-delegation lane ([`build_web_serve_state`]).
+///
+/// `proxy_protocol != 0` is **excluded**: Go pairs `TerminateTLS` with an optional PROXY-protocol v1/v2
+/// header prepended to the backend stream, which the engine's `Proxy` target does NOT write. Serving
+/// such an entry as a plain splice would silently drop that semantic, so it stays "recognized only"
+/// (a faithful refusal) until PROXY-protocol support exists. A `terminate_tls` entry with no
+/// `tcp_forward` backend is likewise not servable (nothing to splice to).
+pub fn is_terminate_tls_serve(h: &TcpPortHandler) -> bool {
+    !h.terminate_tls.is_empty() && !h.tcp_forward.is_empty() && h.proxy_protocol == 0
 }
 
 /// Set (or replace) the TCP forward for `port` → `forward_to` (Go `SetTCPForwarding`). `forward_to`
@@ -378,6 +414,52 @@ mod tests {
         // Name is set (trailing dot stripped) because a TLS-terminating port exists.
         assert_eq!(state.name, "host.example.ts.net");
         // The produced state is valid per the engine's fail-closed checks.
+        assert!(state.validate().is_ok());
+    }
+
+    #[test]
+    fn terminate_tls_predicate_and_mapping() {
+        // Servable: terminate_tls SNI + a backend + no proxy-protocol.
+        let servable = TcpPortHandler {
+            tcp_forward: "127.0.0.1:9".into(),
+            terminate_tls: "host.ts.net".into(),
+            ..Default::default()
+        };
+        assert!(is_terminate_tls_serve(&servable));
+        // Not servable: proxy-protocol requested (engine `Proxy` can't write the PROXY header).
+        let pp = TcpPortHandler {
+            proxy_protocol: 1,
+            ..servable.clone()
+        };
+        assert!(!is_terminate_tls_serve(&pp));
+        // Not servable: no backend to splice to.
+        let no_backend = TcpPortHandler {
+            tcp_forward: String::new(),
+            ..servable.clone()
+        };
+        assert!(!is_terminate_tls_serve(&no_backend));
+        // A servable terminate-tls is NOT a plain-tcp-forward (mutually exclusive lanes) and NOT
+        // a web serve (it has no http/https/text/redirect/mounts aspect).
+        assert!(!is_plain_tcp_forward(&servable));
+        assert!(!is_web_serve(&servable));
+
+        // build_web_serve_state maps the servable one to Proxy { backend } and excludes the pp one.
+        let mut cfg = ServeConfig::default();
+        cfg.tcp.insert("9000".into(), servable);
+        cfg.tcp.insert("9001".into(), pp);
+        let state = build_web_serve_state(&cfg, "host.ts.net");
+        assert_eq!(
+            state.ports.get(&9000),
+            Some(&tailscale::ServeTarget::Proxy {
+                to: "127.0.0.1:9".into()
+            }),
+            "servable terminate-tls maps to a Proxy target on the backend (engine terminates TLS + splices)"
+        );
+        assert!(
+            !state.ports.contains_key(&9001),
+            "proxy-protocol terminate-tls must NOT be armed (engine can't write the PROXY header)"
+        );
+        assert_eq!(state.name, "host.ts.net");
         assert!(state.validate().is_ok());
     }
 
