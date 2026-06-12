@@ -156,6 +156,13 @@ enum Command {
         /// a duration string (`30s`), so a duration suffix is not accepted here.
         #[arg(long, value_name = "SECONDS")]
         timeout: Option<u64>,
+        /// Pre-accept a named risk and skip its safety refusal (Go `--accept-risk`). Currently the one
+        /// enforced risk is `lose-ssh`: `--force-reauth` over a Tailscale SSH session can drop that
+        /// very session (it re-registers the node), so it is refused unless you pass
+        /// `--accept-risk=lose-ssh` (or `--accept-risk=all`). Unlike Go's interactive y/N prompt, this
+        /// daemon CLI refuses non-interactively — pass the flag to override.
+        #[arg(long, value_name = "RISK")]
+        accept_risk: Option<String>,
     },
     /// Tweak individual prefs on an already-configured node, without an up/down cycle (the analogue
     /// of Go's `tailscale set`). This never (re)authenticates and never changes whether the node is
@@ -234,6 +241,12 @@ enum Command {
         /// omitting both leaves the setting unchanged.
         #[arg(long)]
         no_ssh: bool,
+        /// Pre-accept a named risk (Go `--accept-risk`), e.g. `lose-ssh` or `all`. Accepted for parity
+        /// and forward-compatibility; the `set`-side enforcement (refusing an SSH toggle over a
+        /// Tailscale SSH session) is a tracked follow-up, so today this flag parses but is otherwise
+        /// inert on `set`.
+        #[arg(long, value_name = "RISK")]
+        accept_risk: Option<String>,
     },
     /// Disconnect the node without logging out.
     Down,
@@ -701,6 +714,66 @@ fn resolve_ssh(ssh: bool, no_ssh: bool) -> Option<bool> {
     }
 }
 
+/// Whether `ip` is a Tailscale-assigned address — the Rust analogue of Go `tsaddr.IsTailscaleIP`.
+/// CGNAT `100.64.0.0/10` **minus** the ChromeOS-VM subrange `100.115.92.0/23` (Go excludes it —
+/// `IsTailscaleIPv4 = CGNATRange.Contains && !ChromeOSVMRange.Contains`), plus the Tailscale ULA
+/// `fd7a:115c:a1e0::/48`. Used by the risk gate to decide whether an SSH session originates from the
+/// tailnet (a `--force-reauth` then risks dropping that very session). Pure → unit-testable.
+fn is_tailscale_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            // CGNAT 100.64.0.0/10: octet0 == 100 AND octet1's top two bits == 0b01 (64..=127).
+            let in_cgnat = o[0] == 100 && (o[1] & 0xc0) == 0x40;
+            // ChromeOS-VM 100.115.92.0/23: 100.115.{92,93}.x — excluded from the Tailscale set.
+            let in_chromeos_vm = o[0] == 100 && o[1] == 115 && (o[2] == 92 || o[2] == 93);
+            in_cgnat && !in_chromeos_vm
+        }
+        // Tailscale ULA fd7a:115c:a1e0::/48 — match the full /48 (all three leading segments).
+        std::net::IpAddr::V6(v6) => {
+            let s = v6.segments();
+            s[0] == 0xfd7a && s[1] == 0x115c && s[2] == 0xa1e0
+        }
+    }
+}
+
+/// Whether an `SSH_CLIENT` value denotes a session whose client is a Tailscale IP — the Rust analogue
+/// of Go's `isSSHOverTailscale()`. `SSH_CLIENT` is `<client-ip> <client-port> <server-port>`; take the
+/// first space-separated token, parse it, and test it with [`is_tailscale_ip`]. An empty or
+/// unparseable value (or a non-tailnet client) → false. Split out from [`is_ssh_over_tailscale`] so it
+/// is testable without mutating the process environment. Pure.
+fn ssh_client_is_tailscale(ssh_client: &str) -> bool {
+    let Some(ip_str) = ssh_client.split(' ').next() else {
+        return false;
+    };
+    ip_str
+        .parse::<std::net::IpAddr>()
+        .map(is_tailscale_ip)
+        .unwrap_or(false)
+}
+
+/// Whether this CLI is running over a Tailscale-SSH session (Go `isSSHOverTailscale`): reads
+/// `$SSH_CLIENT` and delegates to [`ssh_client_is_tailscale`]. Reads the process environment, so it is
+/// not pure — but the decision logic it wraps is. (Go additionally walks `/proc/<sid>/environ` under
+/// sudo; this fork reads only `$SSH_CLIENT`, a documented minor deviation — a sudo'd session that
+/// scrubbed `SSH_CLIENT` would not trip the risk gate, the same fail-*open* direction the operator
+/// can always close explicitly with `--accept-risk`.)
+fn is_ssh_over_tailscale() -> bool {
+    std::env::var("SSH_CLIENT")
+        .map(|c| ssh_client_is_tailscale(&c))
+        .unwrap_or(false)
+}
+
+/// Whether a named `risk` is in the operator's `--accept-risk` value — the Rust analogue of Go's
+/// `isRiskAccepted`: split on `,`, trim, and accept if any token equals the risk name or the catch-all
+/// `all`. Pure.
+fn risk_accepted(accepted: &str, risk: &str) -> bool {
+    accepted
+        .split(',')
+        .map(str::trim)
+        .any(|r| r == risk || r == "all")
+}
+
 /// Map the `--advertise-routes` / `--advertise-routes-clear` flags to the wire field's
 /// `Option<Vec<String>>`. Any routes passed → `Some(routes)` (replace the set); else
 /// `--advertise-routes-clear` → `Some(vec![])` (advertise none); else `None` (leave the persisted
@@ -763,7 +836,25 @@ async fn main() -> Result<()> {
             reset,
             force_reauth,
             timeout,
+            accept_risk,
         } => {
+            // Risk gate (Go `--accept-risk`/`riskLoseSSH`): `--force-reauth` re-registers the node,
+            // which can drop the very Tailscale-SSH session you're typing from. Refuse it over such a
+            // session unless the operator pre-accepted `lose-ssh` (or `all`). Detected entirely
+            // CLI-side from `$SSH_CLIENT` (like Go's `isSSHOverTailscale`), BEFORE anything reaches the
+            // daemon. Unlike Go's interactive y/N, this daemon CLI refuses non-interactively (it has no
+            // TTY-prompt path) — faithful to Go's own non-interactive branch + the same flag/values.
+            if force_reauth
+                && is_ssh_over_tailscale()
+                && !risk_accepted(accept_risk.as_deref().unwrap_or(""), "lose-ssh")
+            {
+                eprintln!(
+                    "refusing --force-reauth: you appear to be connected over a Tailscale SSH \
+                     session, and re-registering the node may drop it (you could lock yourself out)."
+                );
+                eprintln!("To override, re-run with --accept-risk=lose-ssh");
+                std::process::exit(1);
+            }
             // `--timeout` is a CLIENT-SIDE wait, not a pref and not a wire field: capture it so the
             // post-`up` success path waits for Running (Go `up --timeout`). `None` here means the post-up
             // path will not wait; `Some(secs)` arms the wait (0 = forever, per `wait_for_running`).
@@ -836,6 +927,10 @@ async fn main() -> Result<()> {
             advertise_tags_clear,
             ssh,
             no_ssh,
+            // Parsed for parity + forward-compat; the `set`-side ssh-toggle-over-SSH enforcement that
+            // will consume it is a tracked follow-up (needs a pre-flight GetPrefs for `haveSSH`), so
+            // it is inert here today.
+            accept_risk: _,
         } => Request::Set {
             hostname,
             // `--accept-routes`/`--no-accept-routes` tri-state (mirrors `--tun`).
@@ -3215,6 +3310,72 @@ mod tests {
     }
 
     #[test]
+    fn is_tailscale_ip_matches_go_tsaddr() {
+        use std::net::IpAddr;
+        let v = |s: &str| s.parse::<IpAddr>().unwrap();
+        // CGNAT 100.64.0.0/10 → Tailscale.
+        assert!(is_tailscale_ip(v("100.64.0.1")));
+        assert!(is_tailscale_ip(v("100.127.255.255")));
+        // ChromeOS-VM 100.115.92.0/23 is EXCLUDED (Go IsTailscaleIPv4 && !ChromeOSVMRange).
+        assert!(!is_tailscale_ip(v("100.115.92.1")));
+        assert!(!is_tailscale_ip(v("100.115.93.250")));
+        // ...but the rest of 100.115/16 (outside the /23) is still CGNAT/Tailscale.
+        assert!(is_tailscale_ip(v("100.115.94.1")));
+        // Tailscale ULA fd7a:115c:a1e0::/48 → Tailscale.
+        assert!(is_tailscale_ip(v("fd7a:115c:a1e0::1")));
+        // Outside CGNAT (octet1 top bits 0b10), a /32-not-/48 ULA, loopback, public → NOT Tailscale.
+        assert!(!is_tailscale_ip(v("100.128.0.1")));
+        assert!(!is_tailscale_ip(v("fd7a:115c:beef::1")));
+        assert!(!is_tailscale_ip(v("192.168.1.1")));
+        assert!(!is_tailscale_ip(v("::1")));
+        assert!(!is_tailscale_ip(v("8.8.8.8")));
+    }
+
+    #[test]
+    fn ssh_client_is_tailscale_parses_first_token() {
+        // SSH_CLIENT = "<client-ip> <client-port> <server-port>"; only the first token matters.
+        assert!(ssh_client_is_tailscale("100.64.0.7 12345 22"));
+        assert!(ssh_client_is_tailscale("fd7a:115c:a1e0::9 50000 22"));
+        assert!(!ssh_client_is_tailscale("8.8.8.8 1 22")); // public client → not over tailnet
+        assert!(!ssh_client_is_tailscale("100.115.92.5 1 22")); // ChromeOS-VM excluded
+        assert!(!ssh_client_is_tailscale("")); // not an SSH session
+        assert!(!ssh_client_is_tailscale("garbage")); // unparseable
+    }
+
+    #[test]
+    fn risk_accepted_matches_go_isriskaccepted() {
+        // Comma list; accept on exact name or the catch-all `all`; trimmed.
+        assert!(risk_accepted("lose-ssh", "lose-ssh"));
+        assert!(risk_accepted("all", "lose-ssh"));
+        assert!(risk_accepted("foo, lose-ssh", "lose-ssh")); // trimmed member of a list
+        assert!(risk_accepted("foo,all", "lose-ssh")); // `all` anywhere in the list
+        assert!(!risk_accepted("", "lose-ssh"));
+        assert!(!risk_accepted("other", "lose-ssh"));
+    }
+
+    #[test]
+    fn force_reauth_over_ssh_refusal_predicate() {
+        // The exact gate the Up handler applies: refuse iff force_reauth AND over-tailnet-SSH AND not
+        // accepted. Pin all the corners of that 3-way composition (the env read is factored out via
+        // `ssh_client_is_tailscale`, so this is fully deterministic).
+        let refuse = |force_reauth: bool, ssh_client: &str, accept: &str| {
+            force_reauth
+                && ssh_client_is_tailscale(ssh_client)
+                && !risk_accepted(accept, "lose-ssh")
+        };
+        // Refuse: force-reauth, over tailnet SSH, not accepted.
+        assert!(refuse(true, "100.64.0.7 1 22", ""));
+        // Allow: not a force-reauth.
+        assert!(!refuse(false, "100.64.0.7 1 22", ""));
+        // Allow: not over a tailnet SSH session (public client / no session).
+        assert!(!refuse(true, "8.8.8.8 1 22", ""));
+        assert!(!refuse(true, "", ""));
+        // Allow: the operator pre-accepted the risk (by name or `all`).
+        assert!(!refuse(true, "100.64.0.7 1 22", "lose-ssh"));
+        assert!(!refuse(true, "100.64.0.7 1 22", "all"));
+    }
+
+    #[test]
     fn command_set_maps_to_request_set_fields() {
         // A representative invocation: rename + set an exit node + accept routes, leaving the
         // advertise-* prefs untouched. Built from the same resolver helpers the `Command::Set` arm
@@ -4841,6 +5002,29 @@ mod tests {
             Cli::try_parse_from(["tnet", "id-token"]).is_err(),
             "audience is required"
         );
+    }
+
+    #[test]
+    fn accept_risk_flag_parses_on_up_and_set() {
+        // `--accept-risk <risk>` parses on both `up` and `set` (Go --accept-risk); omitted → None.
+        match Cli::try_parse_from(["tnet", "up", "--accept-risk", "lose-ssh"])
+            .expect("parses")
+            .command
+        {
+            Command::Up { accept_risk, .. } => assert_eq!(accept_risk.as_deref(), Some("lose-ssh")),
+            _ => panic!("expected Command::Up"),
+        }
+        match Cli::try_parse_from(["tnet", "up"]).expect("parses").command {
+            Command::Up { accept_risk, .. } => assert_eq!(accept_risk, None),
+            _ => panic!("expected Command::Up"),
+        }
+        match Cli::try_parse_from(["tnet", "set", "--accept-risk", "all"])
+            .expect("parses")
+            .command
+        {
+            Command::Set { accept_risk, .. } => assert_eq!(accept_risk.as_deref(), Some("all")),
+            _ => panic!("expected Command::Set"),
+        }
     }
 
     #[tokio::test]
