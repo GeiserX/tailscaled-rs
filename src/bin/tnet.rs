@@ -1946,10 +1946,16 @@ fn format_lock_status(r: &tailscaled_rs::localapi::LockReport, json: bool) -> St
             serde_json::to_string_pretty(&m).unwrap_or_else(|_| "{}".to_string())
         );
     }
+    // Status line + a blank line, matching Go `runTailnetLockStatus` (tailnet-lock.go: prints
+    // `Tailnet Lock is {ENABLED.|NOT enabled.}` then an unconditional `fmt.Println()`). The wording is
+    // byte-for-byte Go's — no "on this tailnet" suffix.
     if !r.enabled {
-        return "Tailnet Lock is NOT enabled on this tailnet.\n".to_string();
+        return "Tailnet Lock is NOT enabled.\n\n".to_string();
     }
-    let mut out = String::from("Tailnet Lock is ENABLED.\n");
+    let mut out = String::from("Tailnet Lock is ENABLED.\n\n");
+    // The rich Go sections (this-node key, trusted-keys table, filtered peers) are engine-gated — the
+    // engine's read-only `tka_status` carries only the authority head + a pending-disablement signal
+    // (ENGINE_ASKS #17). `authority head` is itself a fork-specific extra (Go has no such line).
     if !r.head.is_empty() {
         out.push_str(&format!("  authority head: {}\n", r.head));
     }
@@ -4940,9 +4946,14 @@ mod tests {
     #[test]
     fn format_lock_status_human_and_json() {
         use tailscaled_rs::localapi::LockReport;
-        // Not enabled.
+        // Not enabled: Go's exact wording (no "on this tailnet" suffix) + the trailing blank line Go
+        // prints unconditionally after the status line.
         let off = LockReport::default();
-        assert!(format_lock_status(&off, false).contains("NOT enabled"));
+        assert_eq!(
+            format_lock_status(&off, false),
+            "Tailnet Lock is NOT enabled.\n\n",
+            "must byte-match Go's `Tailnet Lock is NOT enabled.` + blank line"
+        );
         // Enabled with a head + pending disablement.
         let on = LockReport {
             enabled: true,
@@ -4950,7 +4961,8 @@ mod tests {
             disabled: true,
         };
         let h = format_lock_status(&on, false);
-        assert!(h.contains("ENABLED"), "{h}");
+        // Status line is byte-exact Go wording, followed by the blank line.
+        assert!(h.starts_with("Tailnet Lock is ENABLED.\n\n"), "{h}");
         assert!(h.contains("tka-aumhash-abc"), "{h}");
         assert!(h.contains("disablement is pending"), "{h}");
         // JSON shape (typed bools).

@@ -378,8 +378,11 @@ pub(super) async fn file_cp(dev: &tailscale::Device, path: &str, peer: &str) -> 
     }
 }
 
-/// List the Taildrop files waiting in this node's receive directory (the `tnet file list` / Go
-/// `tailscale file get` no-arg path).
+/// List the Taildrop files waiting in this node's receive directory (the `tnet file list` verb).
+///
+/// Fork-specific: Go v1.100.0 has no inbox-listing verb — bare `tailscale file get` errors, and
+/// `file get <dir>` drains the inbox into a directory. This build splits discovery (`list`) from a
+/// per-file `get <name> <dest>`; the directory-draining Go model is tracked as a follow-up.
 ///
 /// Read-only. Synchronous because the engine's
 /// [`taildrop_waiting_files`](tailscale::Device::taildrop_waiting_files) is a non-blocking store
@@ -408,8 +411,12 @@ pub(super) fn file_list(dev: &tailscale::Device) -> Response {
     }
 }
 
-/// Fetch a waiting Taildrop file by name, writing it to `dest` (the `tnet file get <name>` / Go
-/// `tailscale file get <name>` path).
+/// Fetch a waiting Taildrop file by name, writing it to `dest` (the `tnet file get <name>` verb).
+///
+/// Fork-specific shape: Go's `tailscale file get <target-directory>` drains the whole inbox into a
+/// directory with a `--conflict` policy (default: skip/refuse-overwrite). This per-name fetch instead
+/// overwrites `dest`; aligning with Go's directory model + conflict policy is tracked as a follow-up
+/// (`bd` `tsd-file-model`).
 ///
 /// Takes the engine handle as `dev` so the LocalAPI server can run it **off the backend lock**
 /// (clone the `Arc` via [`device_handle`](super::Backend::device_handle), drop the lock, call here) —

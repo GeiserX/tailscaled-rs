@@ -260,11 +260,20 @@ pub enum Request {
         /// Destination peer: a tailnet IP or MagicDNS name.
         peer: String,
     },
-    /// List Taildrop files waiting in this node's receive directory (Go `tailscale file get` with no
-    /// args). Read-only.
+    /// List Taildrop files waiting in this node's receive directory. Read-only.
+    ///
+    /// Fork-specific verb: Go v1.100.0 has no `file list` — its `tailscale file get <dir>` drains the
+    /// whole inbox into a directory, and bare `file get` errors. This build instead splits discovery
+    /// (`list`) from a per-file `get <name> <dest>` (see [`FileGet`](Request::FileGet)); the
+    /// directory-draining Go model is tracked as a follow-up.
     FileList,
-    /// Fetch a waiting Taildrop file by name, writing it to `dest` (Go `tailscale file get <name>`).
-    /// A WRITE (it consumes/deletes the inbound file after copying) — gated like `up`/`down`.
+    /// Fetch a waiting Taildrop file by name, writing it to `dest`. A WRITE (it consumes/deletes the
+    /// inbound file after copying) — gated like `up`/`down`.
+    ///
+    /// Fork-specific: Go's `tailscale file get <target-directory>` takes a DIRECTORY and drains the
+    /// entire inbox (with a `--conflict` policy defaulting to skip/refuse-overwrite). This build's
+    /// per-name fetch is not Go's command shape; the Go directory model + conflict policy is tracked
+    /// as a follow-up (see `bd` `tsd-file-model`).
     FileGet {
         /// The waiting file's base name (from [`FileList`](Request::FileList)).
         name: String,
