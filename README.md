@@ -72,6 +72,9 @@ export TS_RS_EXPERIMENT=this_is_unstable_software
 
 # Serve a live HTML status page (default http://127.0.0.1:8384; opens a browser):
 ./target/release/tnet status --web            # add --no-browser / --listen ADDR to customize
+
+# Adjust policy prefs on a running node — applied live, no reconnect:
+./target/release/tnet set --hostname my-node --accept-routes
 ```
 
 `tnet up --timeout <SECONDS>` (Go `tailscale up --timeout`) waits for the node to reach the Running
@@ -82,6 +85,12 @@ connectivity. Omit it to return as soon as the daemon accepts the up; `0` waits 
 fresh, surfacing a new login URL — handy to re-authenticate without changing any settings. It may
 briefly bring the connection down while it re-registers, so avoid running it over a remote SSH/RDP
 session you could lock yourself out of.
+
+`tnet set` (Go `tailscale set`) adjusts policy prefs on an already-running node. Changing
+`--exit-node`, `--hostname`, `--accept-routes`, `--advertise-routes`, or `--advertise-exit-node`
+applies **live** — in place, with no reconnect (matching Go's `set`). Only `--shields-up`, `--ssh`,
+and `--advertise-tags` briefly rebuild the connection (they have no in-place engine setter). `set`
+never re-authenticates and never changes whether the node is up or down.
 
 State (node keys + prefs) lives in `$XDG_STATE_HOME/tailnetd` (override with `TAILNETD_STATE_DIR`);
 the control socket is `<state-dir>/tailnetd.sock` (override with `TAILNETD_SOCKET`).
