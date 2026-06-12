@@ -2989,57 +2989,99 @@ fn parse_request_target(request_line: &str) -> Option<(&str, &str)> {
 /// ([`Request::Status`]) and, for `GET /`, replies `200 text/html` with [`render_status_html`]; any
 /// other path is a `404`. Reuses the existing daemon read — no new daemon/engine surface.
 async fn run_status_web(socket: &std::path::Path, listen: &str, browser: bool) -> Result<()> {
-    use tokio::io::AsyncReadExt;
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("binding the status web server to {listen}"))?;
     let addr = listener
         .local_addr()
         .context("resolving the listen address")?;
+    // The status page has no authentication (matching Go's `tailscale status --web`). On the default
+    // 127.0.0.1 bind that's fine; if the operator widened it, warn that the tailnet topology (node
+    // name, IPs, peers) is now reachable by anyone who can hit this address.
+    if !addr.ip().is_loopback() {
+        eprintln!(
+            "warning: serving status on {addr}, which is reachable beyond localhost and has NO \
+             authentication — this node's name, tailnet IPs, and peer topology are exposed to \
+             anyone who can reach this address."
+        );
+    }
     let url = format!("http://{addr}");
     println!("Serving Tailscale status at {url} ... (Ctrl-C to stop)");
     if browser {
         open_browser_best_effort(&url);
     }
     loop {
-        let (mut conn, _peer) = match listener.accept().await {
+        let (conn, _peer) = match listener.accept().await {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("status --web: accept failed: {e}");
                 continue;
             }
         };
-        // Read just enough to get the request line (a status GET has no body we care about). A small
-        // bounded read avoids unbounded buffering from a slow/hostile client on a localhost server.
-        let mut buf = [0u8; 2048];
-        let n = match conn.read(&mut buf).await {
-            Ok(0) => continue,
-            Ok(n) => n,
-            Err(_) => continue,
-        };
-        let request_line = String::from_utf8_lossy(&buf[..n]);
-        let first_line = request_line.lines().next().unwrap_or("");
-        let body_and_status = match parse_request_target(first_line) {
-            Some(("GET", "/")) => match round_trip(socket, &Request::Status).await {
-                Ok(Response::Status(s)) => ("200 OK", render_status_html(&s)),
-                Ok(_) | Err(_) => (
-                    "500 Internal Server Error",
-                    "<!DOCTYPE html><html><body>status unavailable</body></html>".to_string(),
-                ),
-            },
-            _ => (
-                "404 Not Found",
-                "<!DOCTYPE html><html><body>not found</body></html>".to_string(),
-            ),
-        };
-        let (status, body) = body_and_status;
-        let resp = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        let _ = conn.write_all(resp.as_bytes()).await;
-        let _ = conn.flush().await;
+        // Handle each connection on its own task. Go's `http.Serve` is goroutine-per-connection, so a
+        // single slow or silent client can't head-of-line-block every other status request; the read
+        // deadline inside the handler is what actually bounds a stalled client.
+        let socket = socket.to_path_buf();
+        tokio::spawn(async move {
+            serve_status_connection(conn, &socket).await;
+        });
     }
+}
+
+/// Serve one HTTP/1.1 connection for the `status --web` server: read the request line, route `GET /`
+/// to a fresh status fetch, write the response, and close. Best-effort throughout — any read/write
+/// error or timeout just drops the connection (this is a diagnostic server, not a hardened endpoint).
+///
+/// The request-line read is bounded in BOTH bytes (8 KiB cap) and time (a 5s deadline): TCP can split
+/// the line across segments so a single read isn't enough, but a client that dribbles or never sends
+/// must not park the task forever.
+async fn serve_status_connection(mut conn: tokio::net::TcpStream, socket: &std::path::Path) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+    let read_line = async {
+        loop {
+            let n = conn.read(&mut chunk).await?;
+            if n == 0 {
+                break; // EOF before a full line — treat as no request.
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            // Stop once we have the end of the request line, or cap buffering from a hostile client.
+            if buf.contains(&b'\n') || buf.len() >= 8192 {
+                break;
+            }
+        }
+        Ok::<(), std::io::Error>(())
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(5), read_line).await {
+        Ok(Ok(())) => {}
+        // Timed out, or a read error: drop the connection silently.
+        _ => return,
+    }
+    if buf.is_empty() {
+        return;
+    }
+    let request_line = String::from_utf8_lossy(&buf);
+    let first_line = request_line.lines().next().unwrap_or("");
+    let (status, body) = match parse_request_target(first_line) {
+        Some(("GET", "/")) => match round_trip(socket, &Request::Status).await {
+            Ok(Response::Status(s)) => ("200 OK", render_status_html(&s)),
+            Ok(_) | Err(_) => (
+                "500 Internal Server Error",
+                "<!DOCTYPE html><html><body>status unavailable</body></html>".to_string(),
+            ),
+        },
+        _ => (
+            "404 Not Found",
+            "<!DOCTYPE html><html><body>not found</body></html>".to_string(),
+        ),
+    };
+    let resp = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = conn.write_all(resp.as_bytes()).await;
+    let _ = conn.flush().await;
 }
 
 /// Best-effort open `url` in the OS browser (macOS `open`, Linux `xdg-open`). Never fatal — a failure
