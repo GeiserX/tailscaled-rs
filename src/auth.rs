@@ -142,7 +142,9 @@ pub(crate) fn requires_write(request: &crate::localapi::Request) -> bool {
         | Request::Netcheck
         | Request::BugReport { .. }
         | Request::GetServeConfig
-        | Request::FileList => false,
+        | Request::FileList
+        // `file cp --targets` only enumerates peers we could send to — a read, like `status`/`list`.
+        | Request::FileTargets => false,
         // Writes: lifecycle/prefs mutations plus the Taildrop transfers. `FileCp` initiates a send
         // and `FileGet` consumes/deletes an inbound file, so both mutate and gate like `up`/`down`.
         Request::Up { .. }

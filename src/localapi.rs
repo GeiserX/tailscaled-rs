@@ -345,6 +345,12 @@ pub enum Request {
         #[serde(default)]
         conflict: ConflictPolicy,
     },
+    /// List the tailnet peers this node can Taildrop a file *to* (Go `file cp --targets` /
+    /// `file-targets` LocalAPI). Read-only — it only enumerates eligible peers, gated like `status`.
+    /// The daemon projects the engine's `Device::file_targets()` (which already applies Go's
+    /// eligibility filter: a reachable peerAPI **and** same-owner-or-shared, gated on this node holding
+    /// the file-sharing capability) into [`Response::FileTargets`].
+    FileTargets,
     /// Capture the dataplane's plaintext packets to a pcap file for `seconds`, then stop (Go
     /// `tailscale debug capture`). A WRITE: it installs a dataplane capture hook and writes a file as
     /// the daemon's uid, so it's gated like `up`/`down`. The daemon owns a `BufWriter<File>` at `path`,
@@ -410,6 +416,13 @@ pub enum Response {
     FilesGot {
         /// One outcome per attempted file.
         results: Vec<FileGotReport>,
+    },
+    /// The peers this node can Taildrop to (reply to [`Request::FileTargets`]), sorted by the engine
+    /// (MagicDNS name). Empty when the node holds no file-sharing capability (fail-closed) or has no
+    /// eligible peers.
+    FileTargets {
+        /// One entry per eligible target peer.
+        targets: Vec<FileTargetReport>,
     },
     /// The daemon's own version (reply to [`Request::Version`]) — the analogue of Go's
     /// `ipnstate.Status.Version`, used by `tnet version --daemon`.
@@ -590,6 +603,21 @@ pub struct FileGotReport {
     /// The failure reason when this file could not be received (then it stays in the inbox).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// One Taildrop-able peer (reply element of [`Request::FileTargets`]), projected from the engine's
+/// `FileTarget`. Mirrors the columns Go's `file cp --targets` prints: the peer's tailnet IP, its
+/// MagicDNS/computed name, and its online status.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FileTargetReport {
+    /// The peer's primary tailnet IP (Go prints `Node.Addresses[0]`).
+    pub ip: String,
+    /// The peer's display/MagicDNS name (Go `Node.ComputedName`).
+    pub name: String,
+    /// Online status: `Some(true)` online, `Some(false)` offline, `None` unknown (Go distinguishes
+    /// the three; offline/unknown peers are still listed — an offline send simply times out).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub online: Option<bool>,
 }
 
 /// A snapshot of daemon + netmap state.
