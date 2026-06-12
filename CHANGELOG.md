@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.40.1](https://github.com/GeiserX/tailscaled-rs/compare/v0.40.0...v0.40.1) (2026-06-12)
+
+
+### Bug Fixes
+
+* **taildrop:** O_NOFOLLOW on file_cp/file_get opens + file engine asks [#16](https://github.com/GeiserX/tailscaled-rs/issues/16)/[#17](https://github.com/GeiserX/tailscaled-rs/issues/17) ([#112](https://github.com/GeiserX/tailscaled-rs/issues/112)) ([86e86c8](https://github.com/GeiserX/tailscaled-rs/commit/86e86c80525655686b8950cbe63df2c57dc485f5))
+
 ## [0.40.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.39.0...v0.40.0) (2026-06-12)
 
 
