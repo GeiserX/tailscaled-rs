@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.34.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.33.0...v0.34.0) (2026-06-12)
+
+
+### Features
+
+* **id-token:** tnet id-token &lt;audience&gt; — fetch an OIDC id-token for the node ([#95](https://github.com/GeiserX/tailscaled-rs/issues/95)) ([2103a6f](https://github.com/GeiserX/tailscaled-rs/commit/2103a6f0e0229a2ca25b7456819f1d6638ae1f53))
+
 ## [0.33.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.32.0...v0.33.0) (2026-06-11)
 
 
