@@ -479,3 +479,22 @@ a trusted key, disable/local-disable, revoke keys) — the analogues of Go's `lo
 calls — backed by the `ts_tka` crate's signing. Once they land, the daemon adds `tnet lock`
 init/sign/add/remove/disable/revoke (consumed via a pin bump). Tracked in the daemon as bead
 `tsd-1r6` (the enforcement epic). No rush — filed so the frontier is recorded.
+
+## 18. Windows host route/DNS programming in `ts_host_net` (for `--tun` parity on Windows)
+
+The engine's `ts_host_net` (the TUN-mode host route/DNS chokepoint, wired into
+`ts_runtime/tun_actor.rs`) ships `linux.rs` + `macos.rs` but **no `windows.rs`** (verified at pin
+`81446f88`). So a `--tun` node on Windows brings up the wintun interface but `host_net()` returns
+`Unsupported` — no OS routing table / DNS programming, i.e. no transparent connectivity. This is the
+engine-side analogue of Go's `wgengine/router/router_windows.go` + the Windows DNS manager.
+
+**Why it's an engine ask, not daemon work:** as with the macOS/Linux routers (daemon beads `tsd-jys`
+/ `tsd-5u2`, both closed as engine-absorbed), the daemon has **no routing seam** — the facade exposes
+no `host_net`, and routing lives inside `ts_runtime` gated on `TransportMode::Tun`. The daemon's only
+Windows-TUN role would be wintun-name selection + the privilege preflight (the analogue of the
+macOS `lowest_free_utun` + root check it already does). The routing/DNS itself must be engine-side.
+
+**Ask (LOW priority — Windows is daemon bead `tsd-1yw` P3, no consumer needs it yet):** add
+`ts_host_net/src/windows.rs` mirroring Go `router_windows.go` (route table via the Windows routing
+API / `netsh`, DNS via the NRPT or per-interface resolver). Filed so the gap is recorded; the daemon
+consumes it for free (it's automatic in the TUN datapath) once it lands. No rush. — daemon lane
