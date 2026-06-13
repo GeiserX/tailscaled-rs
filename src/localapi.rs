@@ -126,6 +126,26 @@ pub enum Request {
         /// fresh node). `#[serde(default)]` keeps the wire backward-compatible with clients that omit it.
         #[serde(default)]
         ephemeral: Option<bool>,
+        /// Workload-identity-federation (WIF) / OAuth registration credentials (Go `tailscale up
+        /// --client-id/--client-secret/--id-token/--audience`). Like [`authkey`](Request::Up::authkey)
+        /// these are **registration-time-only and NOT prefs** (Go marks them "prefless"): the engine
+        /// exchanges an OAuth client secret or an IdP-issued OIDC token for a real auth key during
+        /// registration (engine `identity-federation` feature), and nothing is persisted. They are
+        /// carried on the wire only when the operator passes them, exposed once from the CLI's
+        /// `SecretString`s. Precedence mirrors Go: an explicit `authkey` wins, else `client_secret`
+        /// (used as the OAuth secret), else the WIF `id_token`/`audience` exchange. All four default to
+        /// absent and `#[serde(default)]` keeps the wire backward-compatible. The daemon refuses them
+        /// with a clear error unless built with the `identity-federation` feature (never silently
+        /// ignored — honest-omission). `client_secret`/`id_token` are secrets; the CLI holds them in
+        /// `SecretString` and the daemon hands them straight to the engine without logging.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_secret: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id_token: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        audience: Option<String>,
     },
     /// Change individual prefs on the node **without** a full up/down cycle (the analogue of Go's
     /// `tailscale set`). Every field is the same "leave unchanged unless named" sentinel as
@@ -1143,6 +1163,10 @@ mod tests {
             reset: true,
             force_reauth: false,
             ephemeral: None,
+            client_id: Some("oauth-client-1".to_string()),
+            client_secret: Some("tskey-client-secret".to_string()),
+            id_token: None,
+            audience: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&json).unwrap();
@@ -1165,6 +1189,10 @@ mod tests {
                 reset,
                 force_reauth: _,
                 ephemeral: _,
+                client_id,
+                client_secret,
+                id_token,
+                audience,
             } => {
                 assert!(reset, "reset must survive the wire round-trip when set");
                 assert_eq!(authkey.as_deref(), Some("tskey-auth-xxx"));
@@ -1173,6 +1201,10 @@ mod tests {
                 assert_eq!(tun, Some(true));
                 assert_eq!(ssh, Some(true));
                 assert_eq!(tun_name.as_deref(), Some("tailscale0"));
+                // Workload-identity creds survive the wire round-trip (client_id/secret set here).
+                assert_eq!(client_id.as_deref(), Some("oauth-client-1"));
+                assert_eq!(client_secret.as_deref(), Some("tskey-client-secret"));
+                assert!(id_token.is_none() && audience.is_none());
                 assert_eq!(tun_mtu, Some(1280));
                 assert_eq!(exit_node, Some(Some("100.64.0.9".to_string())));
                 assert_eq!(advertise_exit_node, Some(true));
@@ -1872,6 +1904,10 @@ mod tests {
             reset: false,
             force_reauth: false,
             ephemeral: None,
+            client_id: None,
+            client_secret: None,
+            id_token: None,
+            audience: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&json).unwrap();
@@ -1894,6 +1930,10 @@ mod tests {
                 reset,
                 force_reauth: _,
                 ephemeral: _,
+                client_id,
+                client_secret,
+                id_token,
+                audience,
             } => {
                 assert!(!reset);
                 assert!(authkey.is_none());
@@ -1909,6 +1949,8 @@ mod tests {
                 assert!(accept_dns.is_none());
                 assert!(shields_up.is_none());
                 assert!(ssh.is_none());
+                assert!(client_id.is_none() && client_secret.is_none());
+                assert!(id_token.is_none() && audience.is_none());
             }
             other => panic!("expected Up, got {other:?}"),
         }
@@ -1961,6 +2003,10 @@ mod tests {
             reset: false,
             force_reauth: false,
             ephemeral: None,
+            client_id: None,
+            client_secret: None,
+            id_token: None,
+            audience: None,
         };
         let json = serde_json::to_string(&clear).unwrap();
         match serde_json::from_str::<Request>(&json).unwrap() {
@@ -2016,6 +2062,10 @@ mod tests {
             reset: false,
             force_reauth: true,
             ephemeral: None,
+            client_id: None,
+            client_secret: None,
+            id_token: None,
+            audience: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         match serde_json::from_str::<Request>(&json).unwrap() {
@@ -2086,6 +2136,10 @@ mod tests {
             reset: false,
             force_reauth: false,
             ephemeral: None,
+            client_id: None,
+            client_secret: None,
+            id_token: None,
+            audience: None,
         })
         .unwrap();
         let unchanged_json = serde_json::to_string(&Request::Up {
@@ -2106,6 +2160,10 @@ mod tests {
             reset: false,
             force_reauth: false,
             ephemeral: None,
+            client_id: None,
+            client_secret: None,
+            id_token: None,
+            audience: None,
         })
         .unwrap();
         assert!(

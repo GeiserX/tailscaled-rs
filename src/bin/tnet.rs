@@ -30,6 +30,14 @@ struct Cli {
 // NB: neither `Cli` nor `Command` derives `Debug`. That is deliberate — it keeps the parsed
 // `authkey` off any accidental `{:?}` / debug-log path. Keep it that way (the secret is held in a
 // `SecretString` once resolved; see `resolve_authkey`).
+//
+// `large_enum_variant` is allowed: `Up` carries the full `tailscale up` flag surface (~40 optional
+// fields) so it dwarfs small variants like `Status`. This is a clap-`Subcommand` enum constructed
+// exactly once per process at argv-parse time and immediately destructured, so the per-variant stack
+// size is irrelevant here — boxing the variant would only fight clap's derive for no real benefit
+// (same rationale as the `#[allow(clippy::too_many_arguments)]` on `run_up`, which mirrors this
+// surface).
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// Bring the node up and connect to the tailnet.
@@ -187,6 +195,31 @@ enum Command {
         /// daemon CLI refuses non-interactively — pass the flag to override.
         #[arg(long, value_name = "RISK")]
         accept_risk: Option<String>,
+        /// OAuth client ID for generating an auth key via workload-identity federation (Go
+        /// `tailscale up --client-id`). Used with `--client-secret`, or with `--id-token`/`--audience`
+        /// for the OIDC-exchange path. Registration-time only — NOT a stored pref. Requires a daemon
+        /// built with the `identity-federation` feature.
+        #[arg(long, value_name = "ID")]
+        client_id: Option<String>,
+        /// OAuth client secret for generating an auth key (Go `tailscale up --client-secret`). If the
+        /// value begins with `file:`, the rest is a path to a file containing the secret (avoids
+        /// argv/shell-history exposure — preferred for the bare value, which IS visible in `ps`).
+        /// Registration-time only — NOT a stored pref. Requires the `identity-federation` daemon
+        /// feature. Held in memory as a zeroizing secret and never logged.
+        #[arg(long, value_name = "SECRET|file:PATH")]
+        client_secret: Option<String>,
+        /// IdP-issued OIDC ID token to exchange with control for an auth key via workload-identity
+        /// federation (Go `tailscale up --id-token`). `file:PATH` reads it from a file. Used with
+        /// `--client-id`; mutually exclusive with `--audience`. Registration-time only — NOT a stored
+        /// pref. Requires the `identity-federation` daemon feature. Treated as a secret (bearer token).
+        #[arg(long, value_name = "TOKEN|file:PATH")]
+        id_token: Option<String>,
+        /// Audience for requesting an OIDC ID token from the ambient workload identity (GitHub
+        /// Actions / GCP / AWS), to exchange for an auth key (Go `tailscale up --audience`). Used with
+        /// `--client-id`; mutually exclusive with `--id-token`. Registration-time only — NOT a stored
+        /// pref. Requires the `identity-federation` daemon feature.
+        #[arg(long, value_name = "AUDIENCE")]
+        audience: Option<String>,
     },
     /// Tweak individual prefs on an already-configured node, without an up/down cycle (the analogue
     /// of Go's `tailscale set`). This never (re)authenticates and never changes whether the node is
@@ -1172,6 +1205,10 @@ async fn main() -> Result<()> {
             no_ephemeral,
             timeout,
             accept_risk,
+            client_id,
+            client_secret,
+            id_token,
+            audience,
         } => {
             run_up(
                 &socket,
@@ -1205,6 +1242,7 @@ async fn main() -> Result<()> {
                 no_ephemeral,
                 timeout,
                 accept_risk,
+                resolve_wif(client_id, client_secret, id_token, audience).await?,
             )
             .await
         }
@@ -1497,6 +1535,7 @@ async fn run_up(
     no_ephemeral: bool,
     timeout: Option<u64>,
     accept_risk: Option<String>,
+    wif: WifFlags,
 ) -> Result<()> {
     // Risk gate (Go `--accept-risk`/`riskLoseSSH`): `--force-reauth` re-registers the node,
     // which can drop the very Tailscale-SSH session you're typing from. Refuse it over such a
@@ -1577,6 +1616,17 @@ async fn run_up(
         force_reauth,
         // `--ephemeral`/`--no-ephemeral` tri-state (registration-time intent; default persistent).
         ephemeral: resolve_ephemeral(ephemeral, no_ephemeral),
+        // Workload-identity-federation creds (Go `--client-id/--client-secret/--id-token/--audience`):
+        // registration-time only, NOT prefs. Expose the two secrets only here, at wire-serialize time
+        // (the wire field is a plain `Option<String>`, like `authkey` above); `client_id`/`audience`
+        // are non-secret identifiers. All absent in the common (authkey/interactive) case.
+        client_id: wif.client_id,
+        client_secret: wif
+            .client_secret
+            .as_ref()
+            .map(|s| s.expose_secret().to_owned()),
+        id_token: wif.id_token.as_ref().map(|s| s.expose_secret().to_owned()),
+        audience: wif.audience,
     };
     let response = round_trip(socket, &request)
         .await
@@ -4028,6 +4078,61 @@ async fn resolve_authkey(
     }
 }
 
+/// Resolve a secret-bearing CLI value that may be either the literal secret or a `file:PATH`
+/// reference (Go's `--client-secret`/`--id-token` convention: a value beginning with `file:` is a
+/// path to a file containing the secret, so the secret never lands in argv / shell history). Returns
+/// the secret wrapped in a [`SecretString`] (zeroized on drop, never logged). A bare value is taken
+/// verbatim; a `file:` value is read from disk with leading/trailing whitespace trimmed (`str::trim`,
+/// matching Go's `strings.TrimSpace` on a `file:` secret — so `echo > secret` and a CRLF file both
+/// work without smuggling whitespace into the secret). `None` in → `None` out. Mirrors the
+/// `--authkey-file` handling in [`resolve_authkey`].
+async fn read_secret_arg(value: Option<String>) -> Result<Option<SecretString>> {
+    let Some(v) = value else { return Ok(None) };
+    if let Some(path) = v.strip_prefix("file:") {
+        let contents = tokio::fs::read_to_string(path)
+            .await
+            .with_context(|| format!("reading secret from {path}"))?;
+        return Ok(Some(SecretString::from(contents.trim().to_owned())));
+    }
+    Ok(Some(SecretString::from(v)))
+}
+
+/// The workload-identity-federation / OAuth registration flags (`tnet up
+/// --client-id/--client-secret/--id-token/--audience`), bundled so they thread through `run_up` as
+/// one parameter rather than four more positional args. `client_id`/`audience` are non-secret
+/// identifiers; `client_secret`/`id_token` are secrets (held in [`SecretString`]). All four are
+/// registration-time-only and never persisted as prefs — they ride the same one-shot channel as the
+/// auth key.
+struct WifFlags {
+    client_id: Option<String>,
+    client_secret: Option<SecretString>,
+    id_token: Option<SecretString>,
+    audience: Option<String>,
+}
+
+/// Resolve the raw `--client-secret`/`--id-token` CLI strings (each possibly `file:PATH`) into
+/// [`SecretString`]s and bundle the WIF flags. Also enforces Go's `--id-token` ⇔ `--audience` mutual
+/// exclusion (`up.go`: both feed the OIDC-token request, so passing both is ambiguous) before any
+/// daemon round-trip. The non-secret `client_id`/`audience` pass through unchanged.
+async fn resolve_wif(
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    id_token: Option<String>,
+    audience: Option<String>,
+) -> Result<WifFlags> {
+    if id_token.is_some() && audience.is_some() {
+        anyhow::bail!(
+            "--id-token and --audience are mutually exclusive (both request an OIDC token)"
+        );
+    }
+    Ok(WifFlags {
+        client_id,
+        client_secret: read_secret_arg(client_secret).await?,
+        id_token: read_secret_arg(id_token).await?,
+        audience,
+    })
+}
+
 /// Send one request, read one newline-delimited JSON response.
 async fn round_trip(socket: &std::path::Path, request: &Request) -> Result<Response> {
     let stream = UnixStream::connect(socket)
@@ -5223,6 +5328,10 @@ mod tests {
             reset: false,
             force_reauth: false,
             ephemeral: None,
+            client_id: None,
+            client_secret: None,
+            id_token: None,
+            audience: None,
         };
         match enabled {
             Request::Up { accept_routes, .. } => {
@@ -5249,6 +5358,10 @@ mod tests {
             reset: false,
             force_reauth: false,
             ephemeral: None,
+            client_id: None,
+            client_secret: None,
+            id_token: None,
+            audience: None,
         };
         match disabled {
             Request::Up { accept_routes, .. } => {
@@ -5279,6 +5392,10 @@ mod tests {
             reset: false,
             force_reauth: false,
             ephemeral: None,
+            client_id: None,
+            client_secret: None,
+            id_token: None,
+            audience: None,
         };
         match unchanged {
             Request::Up { accept_routes, .. } => assert_eq!(
@@ -5313,6 +5430,10 @@ mod tests {
             reset: false,
             force_reauth: false,
             ephemeral: None,
+            client_id: None,
+            client_secret: None,
+            id_token: None,
+            audience: None,
         };
         match enabled {
             Request::Up { shields_up, .. } => {
@@ -5339,6 +5460,10 @@ mod tests {
             reset: false,
             force_reauth: false,
             ephemeral: None,
+            client_id: None,
+            client_secret: None,
+            id_token: None,
+            audience: None,
         };
         match disabled {
             Request::Up { shields_up, .. } => {
@@ -5365,6 +5490,10 @@ mod tests {
             reset: false,
             force_reauth: false,
             ephemeral: None,
+            client_id: None,
+            client_secret: None,
+            id_token: None,
+            audience: None,
         };
         match unchanged {
             Request::Up { shields_up, .. } => assert_eq!(
@@ -5749,6 +5878,75 @@ mod tests {
         );
         assert!(!m.contains('\x1b'), "{m:?}");
         assert_eq!(m, "a\tb\nc\rd\u{FFFD}e");
+    }
+
+    #[tokio::test]
+    async fn read_secret_arg_handles_literal_file_and_none() {
+        use secrecy::ExposeSecret as _;
+        // A bare value is taken verbatim.
+        let lit = read_secret_arg(Some("tskey-client-literal".into()))
+            .await
+            .unwrap()
+            .expect("some");
+        assert_eq!(lit.expose_secret(), "tskey-client-literal");
+        // `None` in → `None` out.
+        assert!(read_secret_arg(None).await.unwrap().is_none());
+        // `file:PATH` reads the file and trims leading/trailing whitespace (`str::trim`, matching Go's
+        // `strings.TrimSpace`) — so a plain `echo >` newline AND a CRLF / leading-space file both work.
+        let dir = std::env::temp_dir().join(format!("tnet-wif-secret-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("secret");
+        tokio::fs::write(&path, b"tskey-from-file\n").await.unwrap();
+        let from_file = read_secret_arg(Some(format!("file:{}", path.display())))
+            .await
+            .unwrap()
+            .expect("some");
+        assert_eq!(
+            from_file.expose_secret(),
+            "tskey-from-file",
+            "file: value is read and the trailing newline trimmed"
+        );
+        // A CRLF file with surrounding whitespace is fully trimmed on both ends (not just one \n).
+        let crlf = dir.join("crlf");
+        tokio::fs::write(&crlf, b"  tskey-crlf\r\n").await.unwrap();
+        let from_crlf = read_secret_arg(Some(format!("file:{}", crlf.display())))
+            .await
+            .unwrap()
+            .expect("some");
+        assert_eq!(
+            from_crlf.expose_secret(),
+            "tskey-crlf",
+            "leading spaces and a trailing CRLF are both trimmed"
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn resolve_wif_rejects_id_token_with_audience() {
+        // Go's `up.go`: `--id-token` and `--audience` both drive the OIDC-token request, so passing
+        // both is ambiguous — reject it CLI-side before any daemon round-trip.
+        // NOTE: `WifFlags` holds `SecretString` and is deliberately NOT `Debug` (no accidental secret
+        // leak), so we cannot use `expect_err` (it would format the `Ok` value) — match the `Result`.
+        match resolve_wif(
+            Some("cid".into()),
+            None,
+            Some("eyJ.token".into()),
+            Some("sts.example".into()),
+        )
+        .await
+        {
+            Err(e) => assert!(
+                e.to_string().contains("mutually exclusive"),
+                "error should name the conflict: {e}"
+            ),
+            Ok(_) => panic!("id-token + audience must be rejected"),
+        }
+        // The non-conflicting combinations resolve fine and wrap the secret.
+        let ok = resolve_wif(Some("cid".into()), Some("sec".into()), None, None)
+            .await
+            .expect("client-id + client-secret is valid");
+        assert!(ok.client_secret.is_some() && ok.client_id.is_some());
     }
 
     #[test]

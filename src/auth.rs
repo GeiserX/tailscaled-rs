@@ -225,6 +225,10 @@ mod tests {
             reset: false,
             force_reauth: false,
             ephemeral: None,
+            client_id: None,
+            client_secret: None,
+            id_token: None,
+            audience: None,
         }
     }
 

@@ -648,7 +648,7 @@ async fn watch_redrives_on_lifecycle_bump_after_parking_on_down_node() {
     {
         let mut be = harness.backend.lock().await;
         let _pending = be
-            .begin_up(tailscaled_rs::ipn::UpOptions::default())
+            .begin_up(tailscaled_rs::ipn::UpOptions::default(), None)
             .await
             .expect("begin_up prepares config + bumps generation offline (no engine)");
         // (We intentionally drop `_pending` without a matching `finish_up`: this test isolates the
@@ -726,7 +726,7 @@ async fn lifecycle_subscriber_observes_generation_advance_on_up_path() {
     // Drive the reachable offline bump (the start-of-`up` edge).
     {
         let mut be = harness.backend.lock().await;
-        be.begin_up(tailscaled_rs::ipn::UpOptions::default())
+        be.begin_up(tailscaled_rs::ipn::UpOptions::default(), None)
             .await
             .expect("begin_up bumps the generation offline");
     }
