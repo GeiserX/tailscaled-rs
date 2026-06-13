@@ -130,6 +130,15 @@ sudo ./target/release/tnet uninstall
 > not set that opt-in for itself). Other OSes are not supported; `tnet install` there exits with a
 > clear error.
 
+> [!NOTE]
+> On Linux, `tnet install` picks the systemd unit that matches how the daemon was **built**. A
+> default (userspace-networking) build installs a fully-sandboxed unit (no capabilities, no
+> `/dev/net/tun`). A build with the `tun` feature (`--features tun`, kernel-TUN data path) installs a
+> unit relaxed *only* as much as a kernel `tun` interface needs — `CAP_NET_ADMIN`, `/dev/net/tun`, and
+> the matching syscall/address-family surface — while keeping the key-protection hardening intact. The
+> installed binary and its unit therefore always agree, so a TUN build is never silently broken by a
+> sandbox that hides its device, and a userspace build is never needlessly granted `CAP_NET_ADMIN`.
+
 `tnet uninstall` disables/unloads the service and removes the unit, but **deliberately leaves the
 state dir** (it holds your node's key material), so a later `tnet install` resumes the same node.
 To purge the node entirely, remove the state dir for your OS (above) by hand after uninstalling.
