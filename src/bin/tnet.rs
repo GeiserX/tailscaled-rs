@@ -453,6 +453,9 @@ enum Command {
         #[command(subcommand)]
         cmd: Option<MetricsCmd>,
     },
+    /// Print open-source license information (Go `tailscale licenses`). Local-only — contacts no
+    /// daemon. This fork's own license + where to find the dependency licenses.
+    Licenses,
     /// Tailnet Lock (TKA) commands. Currently `status` (read-only): whether lock is in use, the
     /// authority head, and any pending disablement. Mirrors Go `tailscale lock status`.
     Lock {
@@ -1333,6 +1336,11 @@ async fn main() -> Result<()> {
         // `metrics` (Go `tailscale metrics`): fetch the Prometheus text, then print or write it.
         // Inline because `write <path>` chooses a file sink over stdout.
         Command::Metrics { cmd } => run_metrics(&socket, cmd).await,
+        // `licenses` is purely local (Go contacts no daemon either) — print + return.
+        Command::Licenses => {
+            print!("{}", format_licenses());
+            Ok(())
+        }
         // `lock status` (Go `tailscale lock status`): fetch + render the TKA status.
         Command::Lock {
             cmd: LockCmd::Status { json },
@@ -1806,6 +1814,29 @@ async fn run_switch(
             std::process::exit(1);
         }
     }
+}
+
+/// Render the `tnet licenses` notice (Go `tailscale licenses`). Local-only, pure → unit-testable.
+///
+/// Faithful to Go's command shape (a short notice + a pointer to where the full license texts live)
+/// but with content true to THIS fork rather than Tailscale's URL: this is a Rust port under
+/// BSD-3-Clause, and its dependency-license texts are reproducible offline via `cargo` tooling
+/// (`cargo about`/`cargo license` over `Cargo.lock`), so we point there instead of a hosted page that
+/// would not describe this project's actual dependency set.
+fn format_licenses() -> String {
+    format!(
+        "\n\
+         {name} is a Rust reimplementation of the Tailscale daemon + CLI, licensed under \
+         {license}.\n\
+         It wouldn't be possible without thousands of open-source contributors. For this project's \
+         license and the licenses of its dependencies:\n\
+         \n    \
+         {repo}\n    \
+         (dependency licenses: `cargo install cargo-about && cargo about generate` over Cargo.lock)\n",
+        name = env!("CARGO_PKG_NAME"),
+        license = env!("CARGO_PKG_LICENSE"),
+        repo = env!("CARGO_PKG_REPOSITORY"),
+    )
 }
 
 /// `version` answers from the CLI's own crate version. WITHOUT `--daemon` it never contacts the
@@ -5836,6 +5867,24 @@ mod tests {
         assert_eq!(revert_pref_to_flag("ssh", "false"), "--no-ssh");
         // Unknown key (daemon newer than CLI): still actionable, not dropped.
         assert_eq!(revert_pref_to_flag("future_pref", "x"), "--future_pref=x");
+    }
+
+    #[test]
+    fn format_licenses_is_fork_true_and_local() {
+        let out = format_licenses();
+        // Names THIS fork + its license + repo (not Tailscale's hosted URL), and points at the
+        // offline cargo dependency-license path. Pure/local — no network or daemon involved.
+        assert!(out.contains("tailscaled-rs"), "{out}");
+        assert!(out.contains("BSD-3-Clause"), "{out}");
+        assert!(
+            out.contains("github.com/GeiserX/tailscaled-rs"),
+            "must point at this fork's repo, not tailscale.com: {out}"
+        );
+        assert!(
+            !out.contains("tailscale.com/licenses"),
+            "must NOT point at Tailscale's hosted licenses page (wrong dep set): {out}"
+        );
+        assert!(out.contains("cargo about"), "{out}");
     }
 
     #[test]
