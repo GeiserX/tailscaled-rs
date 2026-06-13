@@ -214,6 +214,18 @@ pub enum Request {
     /// Report Tailnet Lock (TKA) status (Go `tailscale lock status`, read-only subset). Replies with
     /// [`Response::Lock`]. Read-only — gated like [`Status`](Request::Status).
     LockStatus,
+    /// Co-sign a node key into Tailnet Lock (Go `tailscale lock sign`). Submits the signature to
+    /// control over the engine's TKA mutation RPC; replies with [`Response::Ok`]/[`Response::Error`].
+    /// A **write** — gated like `up`/`down` (root/same-uid): it mutates tailnet-wide trust. Requires
+    /// the node to be up. `node_key` is the `nodekey:<hex>` form (the daemon parses it to the engine's
+    /// `NodePublicKey`).
+    LockSign { node_key: String },
+    /// Disable Tailnet Lock for the tailnet by presenting the disablement secret (Go `tailscale lock
+    /// disable`). Submits to control; replies with [`Response::Ok`]/[`Response::Error`]. A **write**,
+    /// and a tailnet-wide irreversible one — gated like `up`/`down`. Requires the node to be up.
+    /// `secret_hex` is the hex-encoded disablement secret (the daemon decodes it to the raw bytes the
+    /// engine's `tka_disable` expects). The secret is operator-supplied; it is never logged.
+    LockDisable { secret_hex: String },
     /// Report the control-pushed MagicDNS configuration (Go `tailscale dns status`). Replies with
     /// [`Response::DnsStatus`]. Read-only — gated like [`Status`](Request::Status). Requires the node
     /// to be up (the config comes from the live engine's netmap).

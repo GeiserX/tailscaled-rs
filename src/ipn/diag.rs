@@ -67,6 +67,79 @@ pub(super) async fn lock_status(dev: &tailscale::Device) -> Response {
     }
 }
 
+/// Co-sign a node key into Tailnet Lock (the `tnet lock sign` / Go `tailscale lock sign` path).
+/// Parses the `nodekey:<hex>` string into the engine's [`NodePublicKey`](tailscale::keys::NodePublicKey)
+/// and calls [`Device::tka_sign`](tailscale::Device::tka_sign), which submits the signature to control
+/// over the TKA mutation RPC (this node must itself be trusted under the current authority). It does
+/// NOT mutate the local authority — that advances on the next verified netmap sync — so success means
+/// "submitted", which we report as a clear [`Response::Ok`]. A bad node-key string fails fast (before
+/// any RPC); an engine/control error (no lock, untrusted signer, transient) surfaces as
+/// [`Response::Error`].
+pub(super) async fn lock_sign(dev: &tailscale::Device, node_key: &str) -> Response {
+    let nk: tailscale::keys::NodePublicKey = match node_key.parse() {
+        Ok(k) => k,
+        Err(_) => {
+            return Response::Error {
+                message: format!(
+                    "invalid node key {node_key:?}: expected the `nodekey:<hex>` form (as shown by \
+                     `tnet status`/`whois`)"
+                ),
+            };
+        }
+    };
+    match dev.tka_sign(&nk).await {
+        Ok(()) => Response::Ok {
+            message: "node key signed into Tailnet Lock (applies on the next netmap sync)"
+                .to_string(),
+        },
+        Err(e) => Response::Error {
+            message: format!("tailnet lock sign failed: {e}"),
+        },
+    }
+}
+
+/// Disable Tailnet Lock for the tailnet (the `tnet lock disable` / Go `tailscale lock disable` path).
+/// Hex-decodes the operator-supplied disablement secret and calls
+/// [`Device::tka_disable`](tailscale::Device::tka_disable), which presents it to control against the
+/// current authority head. Submit-only (the disablement reflects locally on the next verified sync),
+/// reported as [`Response::Ok`]. A malformed-hex secret fails fast (before any RPC); a control
+/// rejection (invalid secret, no lock) surfaces as [`Response::Error`]. The secret is never logged —
+/// only a generic error is surfaced on failure.
+pub(super) async fn lock_disable(dev: &tailscale::Device, secret_hex: &str) -> Response {
+    let secret = match decode_hex(secret_hex) {
+        Some(bytes) => bytes,
+        None => {
+            return Response::Error {
+                message: "invalid disablement secret: expected a hex-encoded value".to_string(),
+            };
+        }
+    };
+    match dev.tka_disable(secret).await {
+        Ok(()) => Response::Ok {
+            message: "Tailnet Lock disabled for the tailnet (applies on the next netmap sync)"
+                .to_string(),
+        },
+        // Deliberately do NOT echo the secret (or the engine error's inner detail beyond its Display)
+        // — `tka_disable`'s error is already coarse and secret-free.
+        Err(e) => Response::Error {
+            message: format!("tailnet lock disable failed: {e}"),
+        },
+    }
+}
+
+/// Decode a lowercase/uppercase hex string into bytes; `None` on any non-hex char or an odd length.
+/// A tiny local helper so the crate takes no `hex` dependency for this one use (mirrors the
+/// `hex_encode` on the CLI side).
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
 /// Report the control-pushed MagicDNS configuration (the `tnet dns status` / Go `tailscale dns
 /// status` read-only path). Maps the engine's `Device::dns_config()` → `Option<DnsConfig>` to the
 /// wire [`DnsStatusReport`](crate::localapi::DnsStatusReport): resolver addresses are pre-rendered
@@ -1250,6 +1323,23 @@ mod tests {
     // and path-hardening decisions, which require a live `&Device` to reach inside the method
     // (integration territory — no offline `Device` constructor exists), are pinned here via their
     // underlying predicates.
+
+    #[test]
+    fn decode_hex_roundtrips_and_rejects_malformed() {
+        // The `lock disable` secret arrives hex-encoded; `decode_hex` must round-trip valid hex and
+        // reject malformed input (so a bad secret fails fast in the daemon before any control RPC).
+        assert_eq!(super::decode_hex("00ff10"), Some(vec![0x00, 0xff, 0x10]));
+        assert_eq!(
+            super::decode_hex("DEADbeef"),
+            Some(vec![0xde, 0xad, 0xbe, 0xef])
+        );
+        assert_eq!(super::decode_hex(""), Some(vec![]));
+        // Odd length → None (a hex byte is 2 chars).
+        assert_eq!(super::decode_hex("abc"), None);
+        // Non-hex chars → None.
+        assert_eq!(super::decode_hex("zz"), None);
+        assert_eq!(super::decode_hex("00gg"), None);
+    }
 
     #[test]
     fn diagnostic_bad_ip_parse_is_rejected() {

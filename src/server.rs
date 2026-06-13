@@ -566,6 +566,29 @@ async fn dispatch(
                 },
             }
         }
+        // `lock sign` (Go `tailscale lock sign`): co-sign a node key into the lock. A write (authz'd
+        // above), but a control RPC, not a backend-state mutation — off-lock device call like the
+        // diagnostics; needs the node up (the RPC goes over the live control connection).
+        Request::LockSign { node_key } => {
+            let dev = { backend.lock().await.device_handle() };
+            match dev {
+                Some(dev) => Backend::lock_sign(&dev, &node_key).await,
+                None => Response::Error {
+                    message: "node is not up".into(),
+                },
+            }
+        }
+        // `lock disable` (Go `tailscale lock disable`): present the disablement secret. Same shape as
+        // `lock sign` — a control-RPC write, off-lock, needs the node up.
+        Request::LockDisable { secret_hex } => {
+            let dev = { backend.lock().await.device_handle() };
+            match dev {
+                Some(dev) => Backend::lock_disable(&dev, &secret_hex).await,
+                None => Response::Error {
+                    message: "node is not up".into(),
+                },
+            }
+        }
         // `dns status` (Go `tailscale dns status`, read-only). Off-lock device call; needs the node
         // up (the MagicDNS config comes from the live engine's netmap).
         Request::DnsStatus => {

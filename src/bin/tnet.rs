@@ -707,6 +707,24 @@ enum LockCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Co-sign a node key into Tailnet Lock so that node may join the locked tailnet (Go `tailscale
+    /// lock sign <node-key>`). This node must itself be a trusted signing node under the current
+    /// authority. Submits the signature to control; the local trusted-key state advances on the next
+    /// verified netmap sync. Requires Tailnet Lock to be enabled (`tnet lock status`).
+    Sign {
+        /// The node key to sign, in the `nodekey:<hex>` form (as shown by `tnet status`/`whois`).
+        #[arg(value_name = "NODE-KEY")]
+        node_key: String,
+    },
+    /// Disable Tailnet Lock for the tailnet by presenting the disablement secret (Go `tailscale lock
+    /// disable <secret>`). The secret is the operator-held capability minted when the lock was
+    /// created; control verifies it against the authority's disablement set. IRREVERSIBLE for the
+    /// tailnet — turns the lock off everywhere, not just this node.
+    Disable {
+        /// The disablement secret, hex-encoded (the value recorded when the lock was initialized).
+        #[arg(value_name = "SECRET")]
+        secret: String,
+    },
 }
 
 /// `tnet dns` subcommands: `status` (the control-pushed config) and `query` (resolve a name through
@@ -1440,6 +1458,14 @@ async fn main() -> Result<()> {
         Command::Lock {
             cmd: LockCmd::Status { json },
         } => run_lock_status(&socket, json).await,
+        // `lock sign` (Go `tailscale lock sign`): co-sign a node key into the lock.
+        Command::Lock {
+            cmd: LockCmd::Sign { node_key },
+        } => run_lock_sign(&socket, &node_key).await,
+        // `lock disable` (Go `tailscale lock disable`): present the disablement secret.
+        Command::Lock {
+            cmd: LockCmd::Disable { secret },
+        } => run_lock_disable(&socket, &secret).await,
         // `dns status` (Go `tailscale dns status`): fetch + render the control-pushed MagicDNS config.
         Command::Dns {
             cmd: DnsCmd::Status { json },
@@ -2362,6 +2388,53 @@ async fn run_lock_status(socket: &std::path::Path, json: bool) -> Result<()> {
     };
     print!("{}", format_lock_status(&report, json));
     Ok(())
+}
+
+/// `lock sign <node-key>` (Go `tailscale lock sign`): submit a co-signature for the node key into
+/// Tailnet Lock. Prints the daemon's `ok` message (the signature applies on the next netmap sync) or
+/// surfaces the error and exits non-zero.
+async fn run_lock_sign(socket: &std::path::Path, node_key: &str) -> Result<()> {
+    let req = Request::LockSign {
+        node_key: node_key.to_string(),
+    };
+    match round_trip(socket, &req)
+        .await
+        .with_context(|| format!("talking to daemon at {}", socket.display()))?
+    {
+        Response::Ok { message } => {
+            println!("ok: {message}");
+            Ok(())
+        }
+        Response::Error { message } => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        other => anyhow::bail!("unexpected response to lock sign: {other:?}"),
+    }
+}
+
+/// `lock disable <secret>` (Go `tailscale lock disable`): present the hex-encoded disablement secret
+/// to turn Tailnet Lock off for the tailnet. Prints the daemon's `ok` message or surfaces the error
+/// and exits non-zero. The secret is passed straight through on the wire (a local Unix-socket
+/// request, like the auth key) and is never echoed back by the daemon.
+async fn run_lock_disable(socket: &std::path::Path, secret: &str) -> Result<()> {
+    let req = Request::LockDisable {
+        secret_hex: secret.to_string(),
+    };
+    match round_trip(socket, &req)
+        .await
+        .with_context(|| format!("talking to daemon at {}", socket.display()))?
+    {
+        Response::Ok { message } => {
+            println!("ok: {message}");
+            Ok(())
+        }
+        Response::Error { message } => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        other => anyhow::bail!("unexpected response to lock disable: {other:?}"),
+    }
 }
 
 /// `dns status` (Go `tailscale dns status`): fetch + render the control-pushed MagicDNS config.

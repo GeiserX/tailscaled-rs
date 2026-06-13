@@ -178,7 +178,13 @@ pub(crate) fn requires_write(request: &crate::localapi::Request) -> bool {
         // `Cert` provisions a TLS cert and returns its PRIVATE KEY — a sensitive credential, and an
         // ACME control round-trip (not a passive read). Go gates `serveCert` on write; a
         // socket-reachable non-owner must not be able to mint a cert/key. Gates like `up`/`IdToken`.
-        | Request::Cert { .. } => true,
+        | Request::Cert { .. }
+        // `LockSign`/`LockDisable` MUTATE tailnet-wide trust (co-sign a node into the lock / turn the
+        // lock off for the whole tailnet). Go gates the NetworkLock mutation LocalAPI on write; these
+        // are among the most sensitive writes there are, so a socket-reachable non-owner must never
+        // reach them. Gate like `up`/`down`.
+        | Request::LockSign { .. }
+        | Request::LockDisable { .. } => true,
     }
 }
 
