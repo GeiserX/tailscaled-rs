@@ -70,6 +70,11 @@ export TS_RS_EXPERIMENT=this_is_unstable_software
 #   --verbose <0|1|2>  log verbosity        (overrides TAILNETD_LOG; 0=info,1=debug,2=trace)
 #   --version          print version and exit;  --help  full usage
 # e.g.  ./target/release/tailnetd --statedir /var/lib/tailnetd --verbose 1
+#
+# NOTE: --statedir also moves the default socket to <dir>/tailnetd.sock. Since `tnet` has no
+# --statedir, point the client at it explicitly:  tnet --socket /var/lib/tailnetd/tailnetd.sock status
+# (or export TAILNETD_SOCKET). The packaged service uses the default /var/lib/tailnetd, so this only
+# matters when you relocate state on a manual/non-root run.
 
 # In another shell: join a tailnet with a pre-auth key, then check status
 ./target/release/tnet up --authkey tskey-auth-XXXX --hostname my-node

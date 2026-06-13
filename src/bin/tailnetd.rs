@@ -25,10 +25,14 @@ const REQUIRED_EXPERIMENT_VALUE: &str = "this_is_unstable_software";
 /// these flags are the Go-faithful CLI surface over the same knobs. **A flag, when given, OVERRIDES
 /// the corresponding env var** (Go resolves flags first); when omitted, the existing env/default
 /// resolution (`tailscaled_rs::state_dir` / `socket_path`) is unchanged, so existing env-driven
-/// deployments behave exactly as before. The engine-data-path knobs Go also exposes here (`--tun`,
-/// `--port`) are NOT daemon-startup flags in this fork — they are prefs set via `tnet up`
-/// (`--tun`/`--tun-name`/`--tun-mtu`), so they are deliberately not duplicated here; `--config`
-/// (declarative `ipn.ConfigVAlpha`) is a tracked follow-up.
+/// deployments behave exactly as before.
+///
+/// Two Go daemon flags Go also exposes are deliberately NOT daemon-startup flags in this fork, for
+/// different reasons: `--tun` (and its name/MTU) is a **pref**, set via `tnet up`
+/// (`--tun`/`--tun-name`/`--tun-mtu`); `--port` (the WireGuard listen port) is **engine-gated** —
+/// the `tailscale` engine binds an ephemeral port and exposes no configurable listen port, so there
+/// is nothing for a daemon flag to set (tracked if/when the engine adds the knob). `--config`
+/// (declarative `ipn.ConfigVAlpha`) is a tracked follow-up that hangs off this flag surface.
 #[derive(Parser, Debug)]
 #[command(
     name = "tailnetd",
@@ -38,7 +42,10 @@ const REQUIRED_EXPERIMENT_VALUE: &str = "this_is_unstable_software";
 struct Args {
     /// Directory for daemon state (node key, prefs). Overrides `TAILNETD_STATE_DIR`. When omitted,
     /// resolves as before: `TAILNETD_STATE_DIR`, else the system path when root, else an XDG/HOME
-    /// path. Go `tailscaled --statedir`.
+    /// path. Go `tailscaled --statedir`. NOTE: relocating the state dir also moves the default socket
+    /// to `<DIR>/tailnetd.sock` (unless `TAILNETD_SOCKET`/`--socket` is set), so the `tnet` client
+    /// must be pointed at it — `tnet --socket <DIR>/tailnetd.sock …` (or export `TAILNETD_SOCKET`) —
+    /// since `tnet` has no `--statedir` of its own.
     #[arg(long, value_name = "DIR")]
     statedir: Option<PathBuf>,
     /// Path of the LocalAPI control socket. Overrides `TAILNETD_SOCKET`. When omitted, resolves to
@@ -112,13 +119,9 @@ async fn main() -> Result<()> {
     // Resolve the state dir + socket: a flag wins; otherwise the existing env/default resolution.
     // The socket default is derived from the *resolved* state dir (matching `socket_path()`'s own
     // `<state_dir>/tailnetd.sock` fallback), so `--statedir` alone also relocates the socket.
-    let state_dir = args
-        .statedir
-        .clone()
-        .unwrap_or_else(tailscaled_rs::state_dir);
+    let state_dir = args.statedir.unwrap_or_else(tailscaled_rs::state_dir);
     let socket_path = args
         .socket
-        .clone()
         .unwrap_or_else(|| tailscaled_rs::socket_path_in(&state_dir));
     tracing::info!(state_dir = %state_dir.display(), "starting tailnetd");
 

@@ -179,4 +179,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(mode, 0o700, "freshly-created state dir must be 0700");
     }
+
+    #[test]
+    fn socket_path_in_joins_explicit_state_dir() {
+        // The new join branch (the main contract `--statedir` relies on): with `TAILNETD_SOCKET`
+        // UNSET, the socket is `<state_dir>/tailnetd.sock` for the explicit dir passed in — NOT the
+        // env/default state dir. Race-free: this branch never touches env. (The env-wins branch is
+        // deliberately not asserted here — reading/setting TAILNETD_SOCKET races under the parallel
+        // test harness; its precedence is covered by the `socket_path_in` body + the daemon's
+        // resolution order, and the env check structurally precedes this join.)
+        if std::env::var_os("TAILNETD_SOCKET").is_none() {
+            let dir = std::path::Path::new("/var/lib/tailnetd-explicit");
+            assert_eq!(socket_path_in(dir), dir.join("tailnetd.sock"));
+        }
+    }
 }
