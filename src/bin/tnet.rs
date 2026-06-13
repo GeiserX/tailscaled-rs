@@ -516,6 +516,38 @@ enum Command {
     /// Print open-source license information (Go `tailscale licenses`). Local-only — contacts no
     /// daemon. This fork's own license + where to find the dependency licenses.
     Licenses,
+    /// Check for (and optionally install) a newer release of this client (Go `tailscale update`).
+    /// Queries the project's GitHub Releases for the latest version and compares it to the running
+    /// version. By DEFAULT (or with `--check`/`--dry-run`) it only REPORTS current-vs-latest and does
+    /// nothing else — the same as Go's `--dry-run`. Pass `--yes` to actually download the matching
+    /// release tarball, verify its published SHA-256 sidecar, and replace this binary in place.
+    ///
+    /// SECURITY: the SHA-256 sidecar is an INTEGRITY check (detects a corrupted/truncated download),
+    /// NOT an authenticity check — this fork publishes no cryptographic signatures yet, so a
+    /// `--yes` self-install trusts GitHub Releases as the source of truth. `update` says so before
+    /// installing.
+    Update {
+        /// Only report whether a newer version is available (current vs latest); never install.
+        /// Equivalent to Go `tailscale update --dry-run`. This is also the default when neither
+        /// `--check` nor `--yes` is given.
+        #[arg(long)]
+        check: bool,
+        /// Alias for `--check` (Go's flag name): report only, do not install.
+        #[arg(long)]
+        dry_run: bool,
+        /// Actually download + verify + install the update (Go `--yes`: no interactive prompt). This
+        /// fork never prompts, so an install requires `--yes` explicitly.
+        #[arg(long)]
+        yes: bool,
+        /// Update/downgrade to an explicit version (e.g. `0.42.0` or `v0.42.0`) instead of the latest
+        /// (Go `--version`). Mutually exclusive with `--track`.
+        #[arg(long, value_name = "VERSION", conflicts_with = "track")]
+        version: Option<String>,
+        /// Which release track to consider: `stable` (default — only non-prerelease releases) or
+        /// `unstable` (include prereleases). Go `--track`.
+        #[arg(long, value_name = "TRACK")]
+        track: Option<String>,
+    },
     /// Tailnet Lock (TKA) commands. Currently `status` (read-only): whether lock is in use, the
     /// authority head, and any pending disablement. Mirrors Go `tailscale lock status`.
     Lock {
@@ -1496,6 +1528,15 @@ async fn main() -> Result<()> {
             print!("{}", format_licenses());
             Ok(())
         }
+        // `update` (Go `tailscale update`): version-check against GitHub Releases; report by default,
+        // self-install with `--yes`. Local-only (no daemon socket).
+        Command::Update {
+            check,
+            dry_run,
+            yes,
+            version,
+            track,
+        } => run_update(check || dry_run, yes, version, track).await,
         // `lock status` (Go `tailscale lock status`): fetch + render the TKA status.
         // `lock init` (Go `tailscale lock init`): initialize the lock with this node as sole trusted key.
         Command::Lock {
@@ -2136,6 +2177,394 @@ fn format_licenses() -> String {
         license = env!("CARGO_PKG_LICENSE"),
         repo = env!("CARGO_PKG_REPOSITORY"),
     )
+}
+
+/// The GitHub owner/repo this client updates from — derived from `CARGO_PKG_REPOSITORY`
+/// (`https://github.com/GeiserX/tailscaled-rs`). Used to build the Releases API URLs.
+const UPDATE_REPO_SLUG: &str = "GeiserX/tailscaled-rs";
+
+/// A semantic version `major.minor.patch`, parsed from a `vX.Y.Z` tag or a bare `X.Y.Z` string, for
+/// comparing the running version against a release tag. Pre-release/build suffixes are ignored (the
+/// fork tags plain `vX.Y.Z`). Pure → unit-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SemVer {
+    major: u64,
+    minor: u64,
+    patch: u64,
+}
+
+impl SemVer {
+    /// Parse `v1.2.3` / `1.2.3` (a leading `v` is optional; anything after the patch — `-rc1`, `+meta`
+    /// — is ignored). Returns `None` if the three core numbers aren't present.
+    fn parse(s: &str) -> Option<SemVer> {
+        let s = s.trim().strip_prefix('v').unwrap_or(s.trim());
+        // Drop any pre-release/build suffix so `1.2.3-rc1` still parses to (1,2,3).
+        let core = s.split(['-', '+']).next().unwrap_or(s);
+        let mut it = core.split('.');
+        let major = it.next()?.parse().ok()?;
+        let minor = it.next()?.parse().ok()?;
+        let patch = it.next()?.parse().ok()?;
+        if it.next().is_some() {
+            return None; // more than 3 dotted components → not a plain semver
+        }
+        Some(SemVer {
+            major,
+            minor,
+            patch,
+        })
+    }
+}
+
+impl std::fmt::Display for SemVer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+/// The host target triple this build's release assets are named with (`tailscaled-rs-vX.Y.Z-<triple>`,
+/// see the release workflow). The fork publishes Linux glibc assets only; `None` on a platform with no
+/// published asset (e.g. macOS) so the updater can report that honestly instead of 404-ing.
+fn host_release_triple() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => Some("x86_64-unknown-linux-gnu"),
+        ("linux", "aarch64") => Some("aarch64-unknown-linux-gnu"),
+        // Only Linux x86_64/aarch64 release assets are published today (see `.github/workflows/release.yml`).
+        _ => None,
+    }
+}
+
+/// One GitHub release, as much of the Releases-API JSON as `update` needs.
+#[derive(Debug, serde::Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    #[serde(default)]
+    prerelease: bool,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    html_url: String,
+    #[serde(default)]
+    assets: Vec<GithubAsset>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GithubAsset {
+    name: String,
+    #[serde(default)]
+    browser_download_url: String,
+}
+
+/// Blocking HTTP GET via `ureq` (rustls), returning the response body as bytes. Bounded by a size cap
+/// so a hostile/huge response can't exhaust memory. Sends the GitHub-required `User-Agent`. Run from
+/// `spawn_blocking` (ureq is blocking). `accept` sets the `Accept` header (the GitHub API wants
+/// `application/vnd.github+json`; an asset download wants the default).
+fn http_get_bytes(url: &str, accept: Option<&str>, max_bytes: u64) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    let ua = concat!(
+        "tailscaled-rs/",
+        env!("CARGO_PKG_VERSION"),
+        " (tnet update)"
+    );
+    let mut req = ureq::get(url).header("User-Agent", ua);
+    if let Some(a) = accept {
+        req = req.header("Accept", a);
+    }
+    let resp = req.call().with_context(|| format!("HTTP GET {url}"))?;
+    let mut reader = resp.into_body().into_reader().take(max_bytes);
+    let mut buf = Vec::new();
+    reader
+        .read_to_end(&mut buf)
+        .with_context(|| format!("reading response body from {url}"))?;
+    Ok(buf)
+}
+
+/// Resolve which release `update` should target, by querying the GitHub Releases API:
+///
+/// - explicit `version` (e.g. `0.42.0`) → fetch `releases/tags/v0.42.0`.
+/// - `track = unstable` → the newest release including prereleases (`releases?per_page=…`, pick max).
+/// - default / `track = stable` → `releases/latest` (GitHub's "latest non-prerelease, non-draft").
+///
+/// Returns the chosen `GithubRelease`. Blocking (ureq) — call from `spawn_blocking`.
+fn resolve_target_release(version: Option<&str>, unstable: bool) -> Result<GithubRelease> {
+    const API_MAX: u64 = 4 << 20; // 4 MiB cap on the JSON response
+    let json = "application/vnd.github+json";
+    if let Some(v) = version {
+        let tag = if v.starts_with('v') {
+            v.to_string()
+        } else {
+            format!("v{v}")
+        };
+        let url = format!("https://api.github.com/repos/{UPDATE_REPO_SLUG}/releases/tags/{tag}");
+        let body = http_get_bytes(&url, Some(json), API_MAX)
+            .with_context(|| format!("no release found for {tag}"))?;
+        return serde_json::from_slice(&body).context("parsing release JSON");
+    }
+    if unstable {
+        // Newest release of any kind (prereleases included). The API lists newest-first; pick the
+        // highest semver among non-draft releases so a prerelease can win.
+        let url = format!("https://api.github.com/repos/{UPDATE_REPO_SLUG}/releases?per_page=20");
+        let body = http_get_bytes(&url, Some(json), API_MAX)?;
+        let releases: Vec<GithubRelease> =
+            serde_json::from_slice(&body).context("parsing releases JSON")?;
+        releases
+            .into_iter()
+            .filter(|r| !r.draft)
+            .filter(|r| SemVer::parse(&r.tag_name).is_some())
+            .max_by_key(|r| SemVer::parse(&r.tag_name).unwrap())
+            .context("no releases found")
+    } else {
+        let url = format!("https://api.github.com/repos/{UPDATE_REPO_SLUG}/releases/latest");
+        let body = http_get_bytes(&url, Some(json), API_MAX)?;
+        serde_json::from_slice(&body).context("parsing latest-release JSON")
+    }
+}
+
+/// `update` (Go `tailscale update`): check GitHub Releases for a newer version and report it; with
+/// `--yes`, download + SHA-256-verify + replace this binary in place. `report_only` (from
+/// `--check`/`--dry-run`, or the default when `--yes` is absent) stops after reporting. All network
+/// I/O is `ureq` (blocking) on a `spawn_blocking` thread.
+async fn run_update(
+    report_only: bool,
+    yes: bool,
+    version: Option<String>,
+    track: Option<String>,
+) -> Result<()> {
+    let current = SemVer::parse(env!("CARGO_PKG_VERSION"))
+        .context("parsing this build's own version (CARGO_PKG_VERSION)")?;
+    // Track: stable (default, non-prerelease) vs unstable (include prereleases). An explicit
+    // `--version` overrides track selection (clap already forbids both).
+    let unstable = match track.as_deref() {
+        None | Some("stable") => false,
+        Some("unstable") => true,
+        Some(other) => anyhow::bail!("unknown --track {other:?}: expected `stable` or `unstable`"),
+    };
+
+    // If `--yes` was NOT given, this is report-only regardless of `--check` (we never install without
+    // an explicit `--yes`). Capture that up front so the messaging is honest.
+    let will_install = yes && !report_only;
+
+    // Resolve the target release off the async runtime (ureq is blocking).
+    let ver_owned = version.clone();
+    let release =
+        tokio::task::spawn_blocking(move || resolve_target_release(ver_owned.as_deref(), unstable))
+            .await
+            .context("update: version-check task panicked")??;
+
+    let latest = SemVer::parse(&release.tag_name).with_context(|| {
+        format!(
+            "release tag {:?} is not a semantic version",
+            release.tag_name
+        )
+    })?;
+
+    // Report current vs latest (Go's `--dry-run` line), always — both report-only and pre-install.
+    println!("current: {current}");
+    println!(
+        "latest:  {latest}  ({}{})",
+        release.tag_name,
+        if release.prerelease {
+            ", prerelease"
+        } else {
+            ""
+        }
+    );
+    if !release.html_url.is_empty() {
+        println!("release: {}", release.html_url);
+    }
+
+    if version.is_none() && latest <= current {
+        println!("you are already on the latest version.");
+        return Ok(());
+    }
+
+    // Report-only (default / --check / --dry-run, or no --yes): stop here, having reported.
+    if !will_install {
+        if latest > current {
+            println!();
+            if version.is_some() {
+                println!("to install {latest}, re-run with --yes.");
+            } else {
+                println!(
+                    "a newer version is available; re-run with --yes to download + install it."
+                );
+            }
+        } else if version.is_some() {
+            // Explicit older/equal --version with no --yes.
+            println!();
+            println!("re-run with --yes to switch to {latest}.");
+        }
+        return Ok(());
+    }
+
+    // --- install path (--yes) ---
+    let Some(triple) = host_release_triple() else {
+        anyhow::bail!(
+            "this build's platform ({}/{}) has no published release artifact (the project ships \
+             Linux x86_64/aarch64 tarballs only) — install/update via your package or build from \
+             source instead",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
+    };
+
+    // The asset names are `tailscaled-rs-<tag>-<triple>.tar.gz` + `.sha256` (see release.yml).
+    let tarball_name = format!("tailscaled-rs-{}-{triple}.tar.gz", release.tag_name);
+    let sha_name = format!("{tarball_name}.sha256");
+    let find = |name: &str| -> Option<String> {
+        release
+            .assets
+            .iter()
+            .find(|a| a.name == name && !a.browser_download_url.is_empty())
+            .map(|a| a.browser_download_url.clone())
+    };
+    let tarball_url = find(&tarball_name).with_context(|| {
+        format!(
+            "release {} has no asset named {tarball_name}",
+            release.tag_name
+        )
+    })?;
+    let sha_url = find(&sha_name).with_context(|| {
+        format!(
+            "release {} has no SHA-256 sidecar {sha_name}",
+            release.tag_name
+        )
+    })?;
+
+    // Honest security note BEFORE downloading: integrity, not authenticity.
+    eprintln!();
+    eprintln!(
+        "installing {latest} from {UPDATE_REPO_SLUG} release assets. NOTE: the download is verified \
+         against its published SHA-256 sidecar (integrity — detects a corrupted download), NOT a \
+         cryptographic signature (authenticity). This client publishes no signatures yet, so a \
+         `--yes` install trusts GitHub Releases as the source of truth."
+    );
+
+    // Download tarball + sidecar off the runtime.
+    const DL_MAX: u64 = 256 << 20; // 256 MiB cap (a tnet+tailnetd tarball is ~10 MiB)
+    let (tarball_url2, sha_url2) = (tarball_url.clone(), sha_url.clone());
+    let (tarball_bytes, sha_text) =
+        tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, Vec<u8>)> {
+            let tb = http_get_bytes(&tarball_url2, None, DL_MAX)?;
+            let sh = http_get_bytes(&sha_url2, None, 4096)?;
+            Ok((tb, sh))
+        })
+        .await
+        .context("update: download task panicked")??;
+
+    // Verify SHA-256 against the GNU `sha256sum` sidecar (`<hex>  <filename>`).
+    verify_sha256(&tarball_bytes, &sha_text, &tarball_name)?;
+    println!(
+        "verified SHA-256 of {tarball_name} ({} bytes).",
+        tarball_bytes.len()
+    );
+
+    // Extract `tnet` from the tarball and atomically replace the running executable.
+    let new_tnet = extract_tnet_from_tarball(&tarball_bytes)?;
+    let exe = std::env::current_exe().context("resolving the running executable to replace")?;
+    swap_binary_in_place(&exe, &new_tnet)
+        .with_context(|| format!("replacing {} with the new tnet", exe.display()))?;
+    println!("updated {} to {latest}.", exe.display());
+    println!(
+        "(note: only this `tnet` binary was replaced; update `tailnetd` and restart the daemon \
+         separately — the tarball at the release contains both.)"
+    );
+    Ok(())
+}
+
+/// Verify `data`'s SHA-256 against a GNU `sha256sum` sidecar line (`<64-hex>  <filename>`). The
+/// sidecar may name the file; we match the expected hex regardless of the filename column (the
+/// sidecar from the release names the tarball). Errors on a hex mismatch or a malformed sidecar. The
+/// hex compare is constant-time-ish via byte equality on the parsed digest. Pure → unit-testable.
+fn verify_sha256(data: &[u8], sidecar: &[u8], expected_name: &str) -> Result<()> {
+    use sha2::{Digest as _, Sha256};
+    let sidecar = std::str::from_utf8(sidecar).context("SHA-256 sidecar is not valid UTF-8")?;
+    // First whitespace-delimited token of the (first non-empty) line is the hex digest.
+    let line = sidecar
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .context("empty SHA-256 sidecar")?;
+    let want_hex = line
+        .split_whitespace()
+        .next()
+        .context("malformed SHA-256 sidecar (no digest)")?
+        .to_ascii_lowercase();
+    if want_hex.len() != 64 || !want_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        anyhow::bail!("malformed SHA-256 sidecar for {expected_name}: not a 64-char hex digest");
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let got = hasher.finalize();
+    let got_hex: String = got.iter().map(|b| format!("{b:02x}")).collect();
+    if got_hex != want_hex {
+        anyhow::bail!(
+            "SHA-256 mismatch for {expected_name}: download is corrupt or has been tampered with \
+             (expected {want_hex}, got {got_hex})"
+        );
+    }
+    Ok(())
+}
+
+/// Extract the `tnet` binary's bytes from a gzip'd tar release tarball (`tailscaled-rs-…tar.gz`,
+/// containing `tnet`, `tailnetd`, `LICENSE`, `README.md` at the root). Uses the `tar`/`flate2` the
+/// engine already pulls transitively — no new dep. Errors if `tnet` isn't found.
+fn extract_tnet_from_tarball(gz: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    let dec = flate2::read::GzDecoder::new(gz);
+    let mut archive = tar::Archive::new(dec);
+    for entry in archive.entries().context("reading tarball entries")? {
+        let mut entry = entry.context("reading a tarball entry")?;
+        let path = entry.path().context("tarball entry path")?;
+        // The binary is `tnet` at the archive root.
+        if path.file_name().and_then(|n| n.to_str()) == Some("tnet")
+            && path.components().count() == 1
+        {
+            let mut buf = Vec::new();
+            entry
+                .read_to_end(&mut buf)
+                .context("reading tnet from tarball")?;
+            if buf.is_empty() {
+                anyhow::bail!("tnet in the tarball is empty");
+            }
+            return Ok(buf);
+        }
+    }
+    anyhow::bail!("the release tarball does not contain a `tnet` binary")
+}
+
+/// Atomically replace the binary at `exe` with `new_bytes`: write to a same-directory temp file,
+/// `chmod 0755`, then `rename` over `exe`. Same-directory + rename is atomic on POSIX and works even
+/// though `exe` is the *running* binary (Linux/macOS keep the old inode mapped until exit; renaming
+/// over a busy executable is allowed, unlike writing into it which would `ETXTBSY`). The temp lives in
+/// `exe`'s directory so the rename stays on one filesystem.
+fn swap_binary_in_place(exe: &std::path::Path, new_bytes: &[u8]) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = exe
+        .parent()
+        .context("the running executable has no parent directory")?;
+    let tmp = dir.join(format!(".tnet.update.{}", std::process::id()));
+    // Clean up the temp on any error after this point.
+    let cleanup = |t: &std::path::Path| {
+        let _ = std::fs::remove_file(t);
+    };
+    if let Err(e) = std::fs::write(&tmp, new_bytes) {
+        cleanup(&tmp);
+        return Err(e).with_context(|| format!("writing the new binary to {}", tmp.display()));
+    }
+    if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)) {
+        cleanup(&tmp);
+        return Err(e).context("setting 0755 on the new binary");
+    }
+    if let Err(e) = std::fs::rename(&tmp, exe) {
+        cleanup(&tmp);
+        return Err(e).with_context(|| {
+            format!(
+                "renaming {} over {} (is the target on a different filesystem, or not writable?)",
+                tmp.display(),
+                exe.display()
+            )
+        });
+    }
+    Ok(())
 }
 
 /// `version` answers from the CLI's own crate version. WITHOUT `--daemon` it never contacts the
@@ -8438,6 +8867,67 @@ mod tests {
             format_version(env!("CARGO_PKG_VERSION"), None, 130, false),
             format!("{}\n", env!("CARGO_PKG_VERSION"))
         );
+    }
+
+    #[test]
+    fn semver_parse_and_order() {
+        // `v`-prefix optional; pre-release/build suffix ignored; ordering is numeric per-field.
+        assert_eq!(SemVer::parse("v0.43.0"), SemVer::parse("0.43.0"));
+        assert_eq!(SemVer::parse("0.43.0").unwrap().to_string(), "0.43.0");
+        assert_eq!(
+            SemVer::parse("v1.2.3-rc1"),
+            Some(SemVer {
+                major: 1,
+                minor: 2,
+                patch: 3
+            })
+        );
+        assert!(SemVer::parse("v0.42.0") < SemVer::parse("v0.43.0"));
+        assert!(SemVer::parse("v0.43.0") < SemVer::parse("v0.43.1"));
+        assert!(SemVer::parse("v1.0.0") > SemVer::parse("v0.99.99"));
+        // The crate's own version must parse (the updater reads it as the baseline).
+        assert!(SemVer::parse(env!("CARGO_PKG_VERSION")).is_some());
+        // Garbage / wrong arity → None.
+        assert_eq!(SemVer::parse("nope"), None);
+        assert_eq!(SemVer::parse("1.2"), None);
+        assert_eq!(SemVer::parse("1.2.3.4"), None);
+    }
+
+    #[test]
+    fn verify_sha256_matches_and_rejects() {
+        use sha2::{Digest as _, Sha256};
+        let data = b"the release tarball bytes";
+        let hex: String = Sha256::digest(data)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        // GNU sha256sum format: "<hex>  <filename>" (two spaces). A good sidecar verifies.
+        let good = format!("{hex}  tailscaled-rs-v0.43.0-x86_64-unknown-linux-gnu.tar.gz\n");
+        assert!(verify_sha256(data, good.as_bytes(), "tarball").is_ok());
+        // Filename column is ignored — only the digest matters.
+        assert!(verify_sha256(data, format!("{hex}  whatever\n").as_bytes(), "x").is_ok());
+        // A wrong digest is rejected (corruption / tamper).
+        let bad = format!("{}  f\n", "0".repeat(64));
+        assert!(verify_sha256(data, bad.as_bytes(), "tarball").is_err());
+        // Malformed sidecars are rejected, not silently accepted.
+        assert!(verify_sha256(data, b"", "x").is_err());
+        assert!(verify_sha256(data, b"not-hex  f\n", "x").is_err());
+        assert!(verify_sha256(data, b"abc  short\n", "x").is_err());
+    }
+
+    #[test]
+    fn host_release_triple_is_linux_or_none() {
+        // On a published-asset platform it's a Linux glibc triple; elsewhere (e.g. macOS) it's None
+        // so `update --yes` can report "no artifact for this platform" instead of 404-ing.
+        match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("linux", "x86_64") => {
+                assert_eq!(host_release_triple(), Some("x86_64-unknown-linux-gnu"))
+            }
+            ("linux", "aarch64") => {
+                assert_eq!(host_release_triple(), Some("aarch64-unknown-linux-gnu"))
+            }
+            _ => assert_eq!(host_release_triple(), None),
+        }
     }
 
     #[test]
