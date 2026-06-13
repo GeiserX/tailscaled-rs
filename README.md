@@ -64,6 +64,13 @@ export TS_RS_EXPERIMENT=this_is_unstable_software
 # Run the daemon (foreground)
 ./target/release/tailnetd
 
+# tailnetd accepts flags (Go `tailscaled`-style) that override the TAILNETD_* env vars:
+#   --statedir <dir>   state directory      (overrides TAILNETD_STATE_DIR)
+#   --socket <path>    LocalAPI socket path (overrides TAILNETD_SOCKET)
+#   --verbose <0|1|2>  log verbosity        (overrides TAILNETD_LOG; 0=info,1=debug,2=trace)
+#   --version          print version and exit;  --help  full usage
+# e.g.  ./target/release/tailnetd --statedir /var/lib/tailnetd --verbose 1
+
 # In another shell: join a tailnet with a pre-auth key, then check status
 ./target/release/tnet up --authkey tskey-auth-XXXX --hostname my-node
 ./target/release/tnet status

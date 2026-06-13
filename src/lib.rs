@@ -68,9 +68,20 @@ pub fn state_dir() -> PathBuf {
 ///
 /// Resolved from `TAILNETD_SOCKET`, else `<state_dir>/tailnetd.sock`.
 pub fn socket_path() -> PathBuf {
+    socket_path_in(&state_dir())
+}
+
+/// Path to the LocalAPI Unix domain socket, deriving the default from an **explicit** state dir.
+///
+/// Same resolution as [`socket_path`] — `TAILNETD_SOCKET` still wins — but the fallback joins
+/// `tailnetd.sock` onto the caller-supplied `state_dir` rather than the env/default one. This lets a
+/// caller that has already resolved the state dir (e.g. `tailnetd --statedir <dir>`) keep the socket
+/// alongside it without re-deriving the state dir. `socket_path()` is the `state_dir()`-derived shim
+/// over this, so existing callers are unchanged.
+pub fn socket_path_in(state_dir: &std::path::Path) -> PathBuf {
     std::env::var_os("TAILNETD_SOCKET")
         .map(PathBuf::from)
-        .unwrap_or_else(|| state_dir().join("tailnetd.sock"))
+        .unwrap_or_else(|| state_dir.join("tailnetd.sock"))
 }
 
 /// Create the state directory if absent and enforce `0700` permissions on it.
