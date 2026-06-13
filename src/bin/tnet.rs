@@ -3905,10 +3905,12 @@ const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 /// `tnet up --timeout` (both want the same "wait for Running, bounded, fail-fast-on-error" semantics).
 ///
 /// We poll `Request::Status` rather than stream the IPN bus: it reuses the existing one-shot
-/// round-trip, and the daemon's derived `state` is authoritative. Go additionally waits for the
-/// kernel TUN interface to actually carry the IP — but this daemon defaults to the userspace
-/// netstack (no OS interface to observe), which is exactly the case Go *also* short-circuits ("if
-/// `!st.TUN` return immediately"), so polling to `Running` + a tailnet IP is the faithful condition.
+/// round-trip, and the daemon's derived `state` is authoritative. Mirroring Go `wait`'s
+/// `checkForInterfaceIP`: in the userspace-netstack default (no OS interface to observe) `Running` +
+/// a tailnet IP is the done condition (Go also short-circuits here — "if `!st.TUN` return
+/// immediately"); on a `--tun` node we additionally confirm the kernel interface actually carries the
+/// tailnet IP before returning (via [`tun_interface_has_ip`]), so a script chaining off `tnet up
+/// --tun --timeout N` doesn't proceed before the address is usable.
 async fn wait_for_running(socket: &std::path::Path, timeout_secs: Option<u64>) -> Result<()> {
     // `None` or `0` → wait forever (Go's "0 means wait indefinitely").
     let deadline = match timeout_secs {
@@ -3928,6 +3930,15 @@ async fn wait_for_running(socket: &std::path::Path, timeout_secs: Option<u64>) -
         if let Ok(Response::Status(s)) = round_trip(socket, &Request::Status).await {
             match wait_decision(&s) {
                 WaitStep::Done => return Ok(()),
+                // TUN mode: the node is Running with a tailnet IP, but Go `wait` also requires the
+                // kernel interface to actually carry that IP before returning. Done once it does;
+                // otherwise keep polling (the OS may take a moment to apply the address after the
+                // engine reports Running).
+                WaitStep::AwaitInterfaceIp(ip) => {
+                    if tun_interface_has_ip(&ip) {
+                        return Ok(());
+                    }
+                }
                 WaitStep::Failed(reason) => {
                     anyhow::bail!("node registration failed: {}", sanitize_multiline(&reason))
                 }
@@ -3954,6 +3965,13 @@ async fn wait_for_running(socket: &std::path::Path, timeout_secs: Option<u64>) -
 enum WaitStep {
     /// The node reached `Running` with a tailnet IP — the wait succeeded.
     Done,
+    /// The node reached `Running` with a tailnet IP **and is in TUN mode**, so — mirroring Go
+    /// `wait`'s `checkForInterfaceIP` — the wait is not done until the kernel TUN interface actually
+    /// carries that IP. Carries the self tailnet IPv4 to look for on the OS interfaces. The impure
+    /// [`wait_for_running`] performs the interface check (kept out of this pure classifier); when the
+    /// IP is present it is `Done`, otherwise it keeps polling. (Netstack-mode nodes never reach this
+    /// arm — they short-circuit to [`Done`](WaitStep::Done), exactly as Go returns early when `!st.TUN`.)
+    AwaitInterfaceIp(String),
     /// A terminal registration failure, carrying control's **raw** reason (the caller sanitizes it
     /// at the print/bail site, like [`classify_auth`]). Fail fast; the engine will not retry, so
     /// waiting longer is futile.
@@ -3964,19 +3982,54 @@ enum WaitStep {
 }
 
 /// Decide what a single poll's [`StatusReport`] means for [`wait_for_running`]. **Pure** (no I/O), so
-/// the precedence is unit-testable: `Running` short-circuits to [`Done`](WaitStep::Done) FIRST (a
-/// Running node never carries a terminal error); otherwise a `Some(error)` is a terminal failure
+/// the precedence is unit-testable: a `Running` node with a tailnet IP short-circuits FIRST (a
+/// Running node never carries a terminal error) — to [`Done`](WaitStep::Done) in netstack mode, or to
+/// [`AwaitInterfaceIp`](WaitStep::AwaitInterfaceIp) in TUN mode (Go `wait` then confirms the kernel
+/// interface carries the IP). Otherwise a `Some(error)` is a terminal failure
 /// ([`Failed`](WaitStep::Failed), the raw reason — the caller sanitizes); otherwise — including a
 /// pending `auth_url` (interactive login is transient, not a failure) — we [`Keep`](WaitStep::Keep)
 /// waiting.
 fn wait_decision(s: &tailscaled_rs::localapi::StatusReport) -> WaitStep {
-    if s.state == "Running" && s.self_ipv4.is_some() {
-        return WaitStep::Done;
+    if s.state == "Running"
+        && let Some(ip) = s.self_ipv4.as_deref()
+    {
+        // TUN mode: not done until the OS interface carries the IP (Go's `checkForInterfaceIP`); the
+        // impure caller does the interface check. Netstack mode (the default, no kernel iface to
+        // observe): done immediately, exactly as Go returns early on `!st.TUN`.
+        return if s.prefs.tun {
+            WaitStep::AwaitInterfaceIp(ip.to_string())
+        } else {
+            WaitStep::Done
+        };
     }
     if let Some(reason) = s.error.as_deref() {
         return WaitStep::Failed(reason.to_string());
     }
     WaitStep::Keep
+}
+
+/// Whether the tailnet IP `want` is currently assigned to some non-loopback OS interface — the
+/// daemon-side analogue of Go `wait`'s `checkForInterfaceIP`, used to confirm a `--tun` node's kernel
+/// interface actually carries its tailnet address before [`wait_for_running`] returns. Enumerates the
+/// host interfaces via `if_addrs` (the same crate the link monitor uses). A failure to enumerate, or
+/// an unparseable `want`, reads as "not yet present" (keep waiting) rather than a spurious success —
+/// the wait then relies on the timeout, never returning before the IP is observed.
+fn tun_interface_has_ip(want: &str) -> bool {
+    let Ok(want) = want.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    match if_addrs::get_if_addrs() {
+        Ok(ifaces) => ifaces
+            .into_iter()
+            .map(|i| i.ip())
+            .any(|ip| !ip.is_loopback() && ip == want),
+        Err(e) => {
+            // Don't treat an enumeration error as "ready" — that would return before the iface holds
+            // the addr. Log once per poll and keep waiting (the next poll retries; the deadline bounds).
+            tracing::debug!(error = %e, "wait: failed to enumerate interfaces; treating IP as not-yet-present");
+            false
+        }
+    }
 }
 
 /// Maximum time to wait, after an interactive `up`, for the control auth URL to appear. Measured
@@ -7722,13 +7775,31 @@ mod tests {
     fn wait_decision_precedence_running_error_authurl_keep() {
         use tailscaled_rs::localapi::StatusReport;
 
-        // (a) Running + a tailnet IP → Done (the wait succeeded).
+        // (a) Running + a tailnet IP, NETSTACK mode (default, prefs.tun=false) → Done immediately
+        // (no kernel interface to observe — Go also returns early on `!st.TUN`).
         let running = StatusReport {
             state: "Running".to_string(),
             self_ipv4: Some("100.64.0.1".to_string()),
             ..Default::default()
         };
         assert_eq!(wait_decision(&running), WaitStep::Done);
+
+        // (a') Running + a tailnet IP, TUN mode → AwaitInterfaceIp (Go `wait` additionally confirms the
+        // kernel interface carries the IP; the impure caller does that check). Carries the IP to find.
+        let running_tun = StatusReport {
+            state: "Running".to_string(),
+            self_ipv4: Some("100.64.0.1".to_string()),
+            prefs: tailscaled_rs::localapi::PrefsView {
+                tun: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            wait_decision(&running_tun),
+            WaitStep::AwaitInterfaceIp("100.64.0.1".to_string()),
+            "a TUN-mode Running node must await the kernel interface IP (Go checkForInterfaceIP)"
+        );
 
         // Running short-circuits even if (impossibly) an error were also set — Running wins.
         let running_with_stale_error = StatusReport {
@@ -7802,6 +7873,27 @@ mod tests {
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tun_interface_has_ip_rejects_unparseable_loopback_and_absent() {
+        // An unparseable "IP" is never present (keep waiting, never a spurious success).
+        assert!(!tun_interface_has_ip("not-an-ip"));
+        assert!(!tun_interface_has_ip(""));
+        // A loopback address is explicitly excluded (it's on lo on every host, but it is NOT the
+        // tailnet interface carrying the overlay IP — counting it would let the wait return on a node
+        // whose TUN iface never came up).
+        assert!(
+            !tun_interface_has_ip("127.0.0.1"),
+            "loopback must not satisfy the kernel-interface-IP check"
+        );
+        // A CGNAT tailnet IP that is (essentially certainly) not assigned on this test host → absent.
+        // This asserts the negative path deterministically without depending on host interfaces; the
+        // positive path (the IP IS present) is covered by the gated TUN e2e, which has a real iface.
+        assert!(
+            !tun_interface_has_ip("100.127.255.254"),
+            "an unassigned tailnet IP must read as not-yet-present"
+        );
     }
 
     #[test]
