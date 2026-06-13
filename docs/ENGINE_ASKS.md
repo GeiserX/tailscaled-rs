@@ -687,3 +687,42 @@ into the status the daemon reads), matching Go's `ipnstate.PeerStatus.SSH_HostKe
 **Daemon impact once landed:** the daemon adds `tnet ssh` — `peerStatusFromArg` resolve → write
 `<state_dir>/ssh_known_hosts` from the new field → exec `ssh` with Go's exact `-o` options +
 `ProxyCommand`. Consumed via a pin bump. Tracked in daemon bead tsd-dy5. — daemon lane
+
+## 24. `Device::suggest_exit_node()` — best-available exit node (for `tnet exit-node suggest`)
+
+**Why:** Go's `tailscale exit-node suggest` calls `LocalClient.SuggestExitNode`, which asks the
+daemon to pick the best available exit-node peer (by DERP-region proximity / latency / priority) and
+prints its name with "run `tailscale set --exit-node=…`". The daemon has the peer list (`status()`)
+but **no suggestion logic + no engine method** that reproduces Go's selection algorithm
+(`ipnlocal.SuggestExitNode`, which weighs region latency + a deterministic tiebreak). Hand-rolling a
+*different* heuristic daemon-side would silently diverge from Go's choice (a fidelity gap), and the
+inputs Go uses (per-peer DERP region + measured latency + capability weighting) are not all surfaced
+on `NodeInfo`/`Status` today.
+
+**Ask:** add `Device::suggest_exit_node() -> Result<Option<ExitNodeSuggestion>, Error>` reproducing
+Go's `SuggestExitNode` selection (region-latency-weighted, deterministic tiebreak), returning the
+chosen peer's `StableNodeId` + name (Go's `apitype.ExitNodeSuggestionResponse`). Verbatim parity with
+Go's algorithm is the point — a different heuristic is worse than none.
+
+**Daemon impact once landed:** `tnet exit-node suggest` → `Response::ExitNodeSuggestion` → print the
+name + the `set --exit-node` hint (Go's exact wording), "no suggestion" when none. Read-only.
+Consumed via a pin bump. Tracked in daemon bead tsd-jz2. — daemon lane
+
+## 25. TKA key-set mutation + AUM log — `Device::tka_{add,remove,log}` (for `tnet lock add/remove/log`)
+
+**Why:** `tnet lock` already ships `init`/`status`/`sign`/`disable` over the engine's
+`tka_{init,status,sign,disable}`. Go additionally has `lock add <key…>` / `lock remove <key…>` (add or
+remove trusted signing keys from the tailnet-lock key authority) and `lock log` (print the AUM
+update-chain history). The engine exposes **no** `tka_add`/`tka_remove` (key-set mutation) and **no**
+AUM-log reader, so these three verbs can't be built faithfully — and a tailnet-lock key-set change is
+a high-stakes trust operation that must NOT be approximated.
+
+**Ask:** add (a) `Device::tka_add(keys)` / `Device::tka_remove(keys)` to mutate the lock's trusted-key
+set (Go `NetworkLockModify`), submitting a signed AUM through control like `tka_sign` does; and (b)
+`Device::tka_log(limit) -> Vec<TkaLogEntry>` returning the AUM chain (Go `NetworkLockLog` —
+`ipnstate.NetworkLockUpdate` entries: AUM hash, kind, signer). All gated behind the existing TKA
+plumbing.
+
+**Daemon impact once landed:** `tnet lock add/remove` (WRITES — gated root/owner-uid like the other
+lock mutations) + `tnet lock log` (read). Consumed via a pin bump. Tracked in daemon bead tsd-lq8. —
+daemon lane
