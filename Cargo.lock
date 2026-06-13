@@ -4867,6 +4867,7 @@ name = "tailscaled-rs"
 version = "0.40.1"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "geiserx_tailscale",
  "geiserx_ts_capabilityversion",

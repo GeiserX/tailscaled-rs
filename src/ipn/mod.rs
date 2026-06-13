@@ -2378,12 +2378,14 @@ impl Backend {
                                     .iter()
                                     .map(|r| r.to_string())
                                     .collect(),
-                                // LastSeen (Go PeerStatus.LastSeen); meaningful when offline. chrono's
-                                // `DateTime<Utc>` Display is ISO-8601/RFC3339-shaped (`2026-06-11
-                                // 05:19:14 UTC`) and needs only the always-available Display impl (the
-                                // `to_rfc3339` formatter needs an extra chrono feature not enabled on
-                                // the transitive dep), so use `to_string()`.
-                                last_seen: p.last_seen.map(|t| t.to_string()),
+                                // LastSeen (Go PeerStatus.LastSeen); meaningful when offline. Emit
+                                // strict RFC3339 (`2026-06-11T05:19:14+00:00`) via the chrono
+                                // `DateTime<Utc>`'s inherent `to_rfc3339` so a JSON consumer parses it
+                                // like Go's `ipnstate.PeerStatus.LastSeen`. (The Display impl —
+                                // `2026-06-11 05:19:14 UTC`, space-separated — is NOT RFC3339;
+                                // `to_rfc3339` is an inherent method on the type, no chrono feature
+                                // needed, so the earlier "needs a feature" note was wrong.)
+                                last_seen: p.last_seen.map(|t| t.to_rfc3339()),
                                 // Direct endpoint vs DERP relay (Go CurAddr/Relay; mutually exclusive).
                                 cur_addr: p.cur_addr.map(|a| a.to_string()),
                                 relay: p.relay,
