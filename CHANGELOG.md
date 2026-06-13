@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.44.1](https://github.com/GeiserX/tailscaled-rs/compare/v0.44.0...v0.44.1) (2026-06-13)
+
+
+### Bug Fixes
+
+* **update:** harden the self-replace path (decompression-bomb cap, O_EXCL temp, explicit oversize) ([#172](https://github.com/GeiserX/tailscaled-rs/issues/172)) ([6442a15](https://github.com/GeiserX/tailscaled-rs/commit/6442a15c94b0bde8a3dc8648735ee8c076874f59))
+
 ## [0.44.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.43.0...v0.44.0) (2026-06-13)
 
 
