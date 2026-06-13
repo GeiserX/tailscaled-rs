@@ -118,13 +118,22 @@ async fn headscale_join_netmap_down() {
     // Poll status until the netmap arrives and the node is Running with a self address. A real
     // register + first map poll against headscale typically settles within a few seconds; give it a
     // bounded window so a wedged join fails the test instead of hanging forever.
+    //
+    // IMPORTANT: wait for the self ADDRESS, not merely for `state == "Running"`. The daemon publishes
+    // `Running` the instant the netmap stream attaches, but the self-node address is filled on the
+    // *next* status poll (documented in `Backend::status`: "On timeout we report Running with no
+    // addresses yet — the next poll fills them"). Breaking on the first `Running` therefore races that
+    // fill window and can capture `self_ipv4 == None` even though the node is healthy. So we keep
+    // polling until the address is present (the true "netmap arrived" signal), recording `last_state`
+    // for the failure message either way.
     let mut last_state = String::new();
     let mut self_ipv4: Option<String> = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while tokio::time::Instant::now() < deadline {
         let report = backend.status().await;
         last_state = report.state.clone();
-        if report.state == "Running" {
+        // Settle condition: Running AND the self address has landed in the netmap projection.
+        if report.state == "Running" && report.self_ipv4.is_some() {
             self_ipv4 = report.self_ipv4.clone();
             break;
         }
@@ -199,24 +208,58 @@ async fn headscale_debug_capture_writes_pcap() {
         .await
         .unwrap_or_else(|e| panic!("up() against headscale {hs_url} failed: {e:?}"));
 
-    // Wait for Running so the dataplane is live.
+    // Wait for Running AND the self address (the datapath is only truly live once the netmap has
+    // arrived — `Running` is published a beat earlier; see the note in the join test). We need the
+    // self address both to know the datapath is live and to ping it (below).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let mut running = false;
+    let mut self_ipv4: Option<String> = None;
     while tokio::time::Instant::now() < deadline {
-        if backend.status().await.state == "Running" {
+        let report = backend.status().await;
+        if report.state == "Running" && report.self_ipv4.is_some() {
             running = true;
+            self_ipv4 = report.self_ipv4.clone();
             break;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    // Capture to a temp pcap for ~3s. The engine writes the 24-byte global header on start; any
-    // dataplane traffic in the window adds records. (A freshly-joined node exchanges DERP/DISCO +
-    // map-poll keepalives, so the capture is rarely empty even without injected traffic.)
+    // Capture to a temp pcap for ~4s. The engine writes the 24-byte global header on start; dataplane
+    // traffic in the window adds records. A freshly-joined, PEERLESS node (this headscale has no other
+    // nodes) generates little incidental dataplane traffic, so we DRIVE deterministic traffic: a
+    // `ping` puts real ICMP/disco packets onto the tapped dataplane (the capture taps the dataplane
+    // packet path, `tstun.Wrapper`-style — empirically a ping during capture grows the pcap past the
+    // header even when the ping gets no reply, because the OUTBOUND packets are recorded). MagicDNS
+    // queries do NOT suffice (they are answered above the dataplane tap), so ping is the right driver.
     let pcap = state_dir.join("capture.pcap");
     let outcome = if running {
         if let Some(dev) = backend.device_handle() {
-            tailscaled_rs::ipn::Backend::debug_capture(&dev, pcap.to_str().unwrap(), 3).await
+            // Spawn the capture, then ping during the window so the dataplane carries packets.
+            let dev_cap = std::sync::Arc::clone(&dev);
+            let pcap_path = pcap.to_str().unwrap().to_string();
+            let cap_handle = tokio::spawn(async move {
+                tailscaled_rs::ipn::Backend::debug_capture(&dev_cap, &pcap_path, 4).await
+            });
+            // Let the capture install its hook, then drive ICMP across the dataplane. Pinging the
+            // node's own tailnet IP (and a likely pool address) emits real packets regardless of any
+            // reply — that is what reaches the capture tap.
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let targets: Vec<String> = self_ipv4
+                .iter()
+                .cloned()
+                .chain(["100.64.0.1".to_string()])
+                .collect();
+            for _ in 0..3 {
+                for t in &targets {
+                    let _ = Backend::ping(&dev, t, Some(500)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            cap_handle
+                .await
+                .unwrap_or(tailscaled_rs::localapi::Response::Error {
+                    message: "capture task panicked".into(),
+                })
         } else {
             tailscaled_rs::localapi::Response::Error {
                 message: "no device handle".into(),

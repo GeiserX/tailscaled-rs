@@ -116,6 +116,17 @@ pub(super) async fn build_config(prefs: &Prefs, key_path: &Path) -> Result<tails
                 ));
             }
         }
+        // Allow the unauthenticated `/key` bootstrap to use plain http when (and only when) the
+        // control URL is itself `http://`. The engine defaults `allow_http_key_fetch` to `false`,
+        // which force-upgrades the `GET /key` fetch to `https` even for an `http://` control server —
+        // so a plain-http control plane (a self-hosted Headscale on `http://host:port` with no TLS,
+        // common on a LAN / NodePort) fails registration with a TLS error against the plaintext
+        // listener. Go's client honors the control URL's scheme for the key fetch, so this matches
+        // upstream. It is scoped to an operator-configured `http://` URL (an explicit, deliberate
+        // choice) and has NO effect on the normal `https://` path; an `https://` control URL leaves
+        // the fail-closed default in place. (Setting it for `https` would be a harmless no-op, but we
+        // gate on the scheme so the relaxation is visible and never silently applies to https.)
+        config.allow_http_key_fetch = url.scheme() == "http";
         config.control_server_url = url;
     }
     // TUN-mode data path. Default is the engine's userspace netstack (unprivileged); TUN hands
@@ -207,4 +218,57 @@ pub(super) async fn build_config(prefs: &Prefs, key_path: &Path) -> Result<tails
     // string maps straight to the engine's `Option<PathBuf>` (no parse can fail).
     config.taildrop_dir = prefs.taildrop_dir.as_ref().map(PathBuf::from);
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::prefs::Prefs;
+
+    /// A `build_config` over a throwaway key path with the given control_url override. The key file
+    /// is created on first read, so each call gets a unique temp path to stay parallel-safe.
+    async fn config_for_control_url(control_url: Option<&str>) -> tailscale::Config {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let key_path = std::env::temp_dir().join(format!(
+            "tailnetd-cfgtest-{}-{}.key",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let prefs = Prefs {
+            control_url: control_url.map(String::from),
+            ..Default::default()
+        };
+        let cfg = build_config(&prefs, &key_path)
+            .await
+            .expect("build_config should succeed for a valid control_url");
+        let _ = std::fs::remove_file(&key_path);
+        cfg
+    }
+
+    #[tokio::test]
+    async fn http_control_url_enables_plaintext_key_fetch() {
+        // The bug this guards: a plaintext `http://` control server (self-hosted Headscale, no TLS)
+        // could never register because the engine force-upgraded the unauthenticated `/key` bootstrap
+        // to https. An `http://` control_url must set `allow_http_key_fetch` so the key fetch honors
+        // the scheme (matching Go).
+        let cfg = config_for_control_url(Some("http://localhost:8080")).await;
+        assert!(
+            cfg.allow_http_key_fetch,
+            "an http:// control_url must allow the plain-http /key bootstrap"
+        );
+        assert_eq!(cfg.control_server_url.scheme(), "http");
+    }
+
+    #[tokio::test]
+    async fn https_control_url_keeps_failclosed_key_fetch() {
+        // An `https://` control URL must leave the fail-closed default in place (no relaxation): the
+        // key fetch stays over TLS, as it should for a real control plane.
+        let cfg = config_for_control_url(Some("https://hs.example.com")).await;
+        assert!(
+            !cfg.allow_http_key_fetch,
+            "an https:// control_url must NOT relax the /key bootstrap"
+        );
+        assert_eq!(cfg.control_server_url.scheme(), "https");
+    }
 }
