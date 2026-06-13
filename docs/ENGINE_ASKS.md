@@ -621,3 +621,28 @@ enable — so wiring them today would also be inert. **Sub-ask:** confirm whethe
 `identity-federation` on the engine dep is supported/compiles; if so the daemon can wire those four
 flags immediately (they need no new engine field, only the feature on). Tracked in daemon bead
 tsd-1m9, which is BLOCKED on this ask. — daemon lane
+
+## 22. A configurable WireGuard/disco listen port on `Config` (for `tailnetd --port` / `PORT`)
+
+**Why:** Go `tailscaled` takes `--port` (and `PORT=` via its systemd/openrc `EnvironmentFile`, default
+`41641`) — the UDP port magicsock binds for WireGuard + disco. Operators behind a firewall that only
+forwards/pinholes a fixed UDP port need to pin it; a node that binds an ephemeral port can't be
+reached for direct (non-DERP) connectivity through such a firewall. The daemon already shipped the
+rest of the `tailnetd` flag plane (`--statedir`/`--socket`/`--verbose`/`--version`/`--config`, PR
+#139/#140), but **`--port` cannot be wired faithfully**: verified at the current pin (`f3793636`,
+`v0.31.0`, `src/config.rs`) the engine `Config` has **no** WireGuard/disco listen-port field — only
+the inbound-forwarder `forward_tcp_ports`/`forward_udp_ports` (a different concept), and there is no
+`Device` listen-port setter (`src/lib.rs` has no `set_port`/`listen_port`). So a `tailnetd --port`
+today would be an inert flag — refused under the honest-omission rule (the `accept_dns` trap).
+
+**Ask:** add a configurable listen port for the magicsock UDP socket — either a
+`Config.wireguard_listen_port: Option<u16>` (`None` = ephemeral, as today; `Some(p)` binds `p`),
+matching Go `tailscaled`'s `--port` semantics (and Go's `0` = "pick any", which maps to `None`). If
+the engine prefers a runtime setter, a `Device::set_listen_port`/rebind is also fine, but the
+construction-time `Config` field is the closest match to Go (the port is fixed at daemon start).
+
+**Daemon impact once landed:** `tailnetd` adds `--port <PORT>` + the `PORT` env (Go's
+`EnvironmentFile` convention), threads it into `build_config` as the new field, and the packaged
+systemd unit can set `PORT=41641`. Low-to-medium priority — it matters specifically for
+fixed-firewall-pinhole deployments; an ephemeral port is fine for the common NAT-traversal case.
+Tracked in daemon bead tsd-k7s (the one remaining engine-gated item there). — daemon lane
