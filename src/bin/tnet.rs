@@ -645,9 +645,13 @@ enum ServeCmd {
     Reset,
 }
 
-/// `tnet metrics` subcommands. Bare `tnet metrics` prints to stdout; `write <path>` writes a file.
+/// `tnet metrics` subcommands. Bare `tnet metrics` prints to stdout; `print` is the explicit
+/// stdout form (Go `tailscale metrics print`); `write <path>` writes a file.
 #[derive(Subcommand)]
 enum MetricsCmd {
+    /// Print the metrics to stdout (Go `tailscale metrics print`) — the explicit form of bare
+    /// `tnet metrics`.
+    Print,
     /// Write the metrics to a file instead of stdout.
     Write {
         /// Destination path.
@@ -2224,7 +2228,8 @@ async fn run_metrics(socket: &std::path::Path, cmd: Option<MetricsCmd>) -> Resul
                 .with_context(|| format!("writing metrics to {}", path.display()))?;
             println!("wrote metrics to {}", path.display());
         }
-        None => print!("{text}"),
+        // `print` (explicit, Go `metrics print`) and bare `metrics` (no subcommand) both go to stdout.
+        Some(MetricsCmd::Print) | None => print!("{text}"),
     }
     Ok(())
 }
