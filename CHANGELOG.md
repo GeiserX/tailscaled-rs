@@ -25,6 +25,14 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.44.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.43.0...v0.44.0) (2026-06-13)
+
+
+### Features
+
+* **cli:** add `tnet update` (Go `tailscale update`) — version-check + verified self-install ([#169](https://github.com/GeiserX/tailscaled-rs/issues/169)) ([b7adb4d](https://github.com/GeiserX/tailscaled-rs/commit/b7adb4dd7a547961f2c9e868a704941ca7082e75))
+* **cli:** add `tnet web` (Go `tailscale web`) — read-only status web UI ([#171](https://github.com/GeiserX/tailscaled-rs/issues/171)) ([e6132ca](https://github.com/GeiserX/tailscaled-rs/commit/e6132cada71e6e8cb8dd5264e5333bc644ef471d))
+
 ## [0.43.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.42.0...v0.43.0) (2026-06-13)
 
 
