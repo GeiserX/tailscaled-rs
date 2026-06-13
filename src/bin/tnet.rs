@@ -2889,6 +2889,15 @@ fn get_settings(
 ) -> Vec<(&'static str, serde_json::Value)> {
     use serde_json::Value;
     vec![
+        // An unset hostname is JSON null (the OS hostname is used); the table renders it empty. Go's
+        // `get` lists hostname, and the daemon holds it as a pref — surface it.
+        (
+            "hostname",
+            view.hostname
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        ),
         // An unset exit-node is JSON null (Go uses the empty/zero value); the table renders it empty.
         (
             "exit-node",
@@ -5976,6 +5985,7 @@ mod tests {
     fn format_get_shapes() {
         use tailscaled_rs::localapi::PrefsView;
         let view = PrefsView {
+            hostname: Some("node-a".into()),
             exit_node: Some("100.64.0.9".into()),
             advertise_exit_node: false,
             advertise_routes: vec!["10.0.0.0/8".into(), "192.168.1.0/24".into()],
@@ -6004,9 +6014,13 @@ mod tests {
         );
         assert!(table.contains("advertise-tags"), "{table}");
         assert!(table.contains("accept-dns"), "{table}");
-        // 1 header + 9 settings (exit-node, advertise-exit-node, advertise-routes, advertise-tags,
-        // accept-routes, accept-dns, shields-up, ssh, tun) → 10 lines.
-        assert_eq!(table.lines().count(), 10, "{table}");
+        assert!(
+            table.contains("hostname") && table.contains("node-a"),
+            "hostname must be listed with its value: {table}"
+        );
+        // 1 header + 10 settings (hostname, exit-node, advertise-exit-node, advertise-routes,
+        // advertise-tags, accept-routes, accept-dns, shields-up, ssh, tun) → 11 lines.
+        assert_eq!(table.lines().count(), 11, "{table}");
 
         // --json: flattened name→value map keyed by set-flag name, with GO-FAITHFUL TYPED values —
         // booleans are bare JSON `true`/`false` (NOT quoted strings), strings are strings. Parse it

@@ -2453,6 +2453,7 @@ impl Backend {
     /// it is cheap and safe to call under the brief backend lock.
     pub fn prefs_view(&self) -> crate::localapi::PrefsView {
         crate::localapi::PrefsView {
+            hostname: self.prefs.hostname.clone(),
             exit_node: self.prefs.exit_node.clone(),
             advertise_exit_node: self.prefs.advertise_exit_node,
             advertise_routes: self.prefs.advertise_routes.clone(),
@@ -4522,6 +4523,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let mut be = backend_for(&dir);
+        be.prefs.hostname = Some("node-a".to_string());
         be.prefs.exit_node = Some("100.64.0.9".to_string());
         be.prefs.advertise_exit_node = true;
         be.prefs.advertise_routes = vec!["192.168.1.0/24".to_string(), "10.0.0.0/8".to_string()];
@@ -4530,6 +4532,11 @@ mod tests {
         be.prefs.tun_enabled = true;
 
         let view = be.status().await.prefs;
+        assert_eq!(
+            view.hostname.as_deref(),
+            Some("node-a"),
+            "hostname pref must project into PrefsView.hostname verbatim"
+        );
         assert_eq!(
             view.exit_node.as_deref(),
             Some("100.64.0.9"),
