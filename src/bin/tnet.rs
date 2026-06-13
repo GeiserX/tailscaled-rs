@@ -723,6 +723,19 @@ enum MetricsCmd {
 /// `tnet lock` subcommands.
 #[derive(Subcommand)]
 enum LockCmd {
+    /// Initialize Tailnet Lock for this tailnet with **this node** as the sole initial trusted key
+    /// (Go `tailscale lock init`, single-node case). The `disablement-secret` you supply is the
+    /// operator-held capability that can later turn the lock off (`tnet lock disable <secret>`) — keep
+    /// it safe; without it the lock cannot be disabled. Single-node only for now: if the tailnet has
+    /// other nodes that would need (re)signing under the new lock, control refuses and the engine
+    /// surfaces that (multi-node init is a deferred follow-up). Submit-only — the lock takes effect on
+    /// the next verified netmap sync.
+    Init {
+        /// The disablement secret to gate the lock with, hex-encoded. This is the value you later pass
+        /// to `tnet lock disable`. Choose a high-entropy secret and store it securely.
+        #[arg(value_name = "DISABLEMENT-SECRET")]
+        disablement_secret: String,
+    },
     /// Show Tailnet Lock status (read-only).
     Status {
         /// Output as JSON.
@@ -1484,6 +1497,10 @@ async fn main() -> Result<()> {
             Ok(())
         }
         // `lock status` (Go `tailscale lock status`): fetch + render the TKA status.
+        // `lock init` (Go `tailscale lock init`): initialize the lock with this node as sole trusted key.
+        Command::Lock {
+            cmd: LockCmd::Init { disablement_secret },
+        } => run_lock_init(&socket, &disablement_secret).await,
         Command::Lock {
             cmd: LockCmd::Status { json },
         } => run_lock_status(&socket, json).await,
@@ -2510,6 +2527,30 @@ async fn run_lock_status(socket: &std::path::Path, json: bool) -> Result<()> {
     };
     print!("{}", format_lock_status(&report, json));
     Ok(())
+}
+
+/// `lock init <disablement-secret>` (Go `tailscale lock init`): initialize Tailnet Lock with this
+/// node as the sole trusted key, gated by the hex-encoded disablement secret. Prints the daemon's
+/// `ok` message or surfaces the error and exits non-zero. The secret is passed straight through on the
+/// wire (a local Unix-socket request, like the auth key) and is never echoed back by the daemon.
+async fn run_lock_init(socket: &std::path::Path, secret: &str) -> Result<()> {
+    let req = Request::LockInit {
+        secret_hex: secret.to_string(),
+    };
+    match round_trip(socket, &req)
+        .await
+        .with_context(|| format!("talking to daemon at {}", socket.display()))?
+    {
+        Response::Ok { message } => {
+            println!("ok: {message}");
+            Ok(())
+        }
+        Response::Error { message } => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        other => anyhow::bail!("unexpected response to lock init: {other:?}"),
+    }
 }
 
 /// `lock sign <node-key>` (Go `tailscale lock sign`): submit a co-signature for the node key into
