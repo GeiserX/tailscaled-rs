@@ -65,6 +65,14 @@ pub(super) fn reload_effective_policy() -> PolicyReport {
 /// no env/file source either.) This is the single seam a future managed-platform source would
 /// extend — it returns the contributed settings, which the snapshot then carries through the
 /// LocalAPI to the CLI unchanged.
+///
+/// INVARIANT for any future store wired in here: reading/reloading it MUST be side-effect-free. The
+/// `syspolicy list`/`reload` LocalAPI is classified read-only (`auth::requires_write` → false,
+/// gated on `PermitRead`, matching Go's `policy/` handler). If a registered store's read ever
+/// performs an observable action (writes a cache as the daemon's uid, fetches over the network,
+/// spawns a helper), that classification becomes too weak — a non-owner read-only caller could drive
+/// the side effect. In that case, reclassify `Request::SyspolicyReload` (at least) as a write in
+/// `auth.rs` before wiring the store.
 fn registered_store_settings() -> Vec<PolicySetting> {
     Vec::new()
 }
