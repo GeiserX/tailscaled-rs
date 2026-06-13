@@ -570,6 +570,10 @@ enum DebugCmd {
         #[arg(long, default_value_t = 10)]
         seconds: u64,
     },
+    /// Dump the node's current preferences as JSON (Go `tailscale debug prefs`). A read-only view of
+    /// the persisted prefs — the same data `tnet get` renders, but as the raw pretty-printed object
+    /// for scripting/debugging rather than the human/flag view.
+    Prefs,
 }
 
 /// `tnet serve` subcommands. Mirrors the TCP-forward subset of Go `tailscale serve`.
@@ -1240,9 +1244,10 @@ async fn main() -> Result<()> {
         // `debug capture`: send DebugCapture (a long-lived write — the daemon taps the dataplane for
         // `seconds`, then replies with the byte count). Inline early-return like the other subcommand
         // groups.
-        Command::Debug {
-            cmd: DebugCmd::Capture { path, seconds },
-        } => run_debug_capture(&socket, path, seconds).await,
+        Command::Debug { cmd } => match cmd {
+            DebugCmd::Capture { path, seconds } => run_debug_capture(&socket, path, seconds).await,
+            DebugCmd::Prefs => run_debug_prefs(&socket).await,
+        },
         // `install` / `uninstall` (Go `tailscaled install-system-daemon` / `uninstall-system-daemon`):
         // purely LOCAL, privileged file + service-manager work — they never touch the LocalAPI socket.
         // Handled inline (early return), root-gated inside `run_install`/`run_uninstall`.
@@ -1776,6 +1781,30 @@ async fn run_debug_capture(
         Response::Error { message } => anyhow::bail!("debug capture failed: {message}"),
         other => anyhow::bail!("unexpected response to debug capture: {other:?}"),
     }
+}
+
+/// `debug prefs` (Go `tailscale debug prefs`): round-trip `GetPrefs` and print the prefs view as
+/// pretty JSON. The raw-object counterpart to `tnet get`'s human/flag rendering — same data
+/// (`Response::Prefs`), different shape, for scripting/debugging. Read-only.
+async fn run_debug_prefs(socket: &std::path::Path) -> Result<()> {
+    let view = match round_trip(socket, &Request::GetPrefs).await {
+        Ok(Response::Prefs(v)) => v,
+        Ok(Response::Error { message }) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        Ok(other) => anyhow::bail!("unexpected response to debug prefs: {other:?}"),
+        Err(e) => {
+            return Err(e).with_context(|| format!("getting prefs at {}", socket.display()));
+        }
+    };
+    // Pretty JSON of the prefs view (Go's `json.MarshalIndent(prefs, "", "\t")`). `PrefsView` is a
+    // plain serde struct, so this cannot fail in practice; fall back to `{}` rather than panic.
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&view).unwrap_or_else(|_| "{}".to_string())
+    );
+    Ok(())
 }
 
 /// `switch` (Go `tailscale switch`): `--list` renders a table; `remove <id>` deletes; a bare
