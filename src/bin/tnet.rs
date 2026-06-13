@@ -709,12 +709,29 @@ enum LockCmd {
     },
 }
 
-/// `tnet dns` subcommands. Currently just `status`; structured as a subcommand group to leave room
-/// for future DNS subcommands (e.g. `query`).
+/// `tnet dns` subcommands: `status` (the control-pushed config) and `query` (resolve a name through
+/// the node's own MagicDNS path).
 #[derive(Subcommand)]
 enum DnsCmd {
     /// Show the control-pushed MagicDNS configuration (read-only).
     Status {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resolve a name through the node's MagicDNS path (Go `tailscale dns query`), showing the RCODE,
+    /// which upstream resolver(s) were consulted, and the raw response. Answers tailnet/MagicDNS
+    /// names authoritatively and forwards the rest exactly as the node itself would — a faithful way
+    /// to see what this node resolves, distinct from the host's system resolver.
+    Query {
+        /// The DNS name to resolve (e.g. `host.tailnet.ts.net` or `example.com`).
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// The query type: a name (`A`, `AAAA`, `CNAME`, `PTR`, `TXT`, `MX`, `NS`, `SRV`, `SOA`,
+        /// `CAA`) or a numeric RFC 1035 TYPE. Defaults to `A`. (Go takes the same optional positional
+        /// type.)
+        #[arg(value_name = "TYPE", default_value = "A")]
+        qtype: String,
         /// Output as JSON.
         #[arg(long)]
         json: bool,
@@ -1427,6 +1444,9 @@ async fn main() -> Result<()> {
         Command::Dns {
             cmd: DnsCmd::Status { json },
         } => run_dns_status(&socket, json).await,
+        Command::Dns {
+            cmd: DnsCmd::Query { name, qtype, json },
+        } => run_dns_query(&socket, &name, &qtype, json).await,
         // `netcheck` (Go `tailscale netcheck`): fetch + render the net-report (DERP-region latency).
         Command::Netcheck { json } => run_netcheck(&socket, json).await,
         // `exit-node list` (Go `tailscale exit-node list`): reuse Status, filter to exit-node peers.
@@ -2361,6 +2381,96 @@ async fn run_dns_status(socket: &std::path::Path, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// `tnet dns query <name> [type]` (Go `tailscale dns query`): resolve a name through the node's own
+/// MagicDNS path and render the RCODE, the upstream resolver(s) consulted, and the response. The
+/// `qtype` string (a name like `AAAA` or a number) is parsed CLI-side into the numeric RFC 1035 TYPE
+/// the wire carries.
+async fn run_dns_query(
+    socket: &std::path::Path,
+    name: &str,
+    qtype: &str,
+    json: bool,
+) -> Result<()> {
+    let qtype_num =
+        parse_qtype(qtype).with_context(|| format!("unrecognized DNS query type {qtype:?}"))?;
+    let report = match round_trip(
+        socket,
+        &Request::DnsQuery {
+            name: name.to_string(),
+            qtype: qtype_num,
+        },
+    )
+    .await
+    {
+        Ok(Response::DnsQuery(r)) => r,
+        Ok(Response::Error { message }) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        Ok(other) => anyhow::bail!("unexpected response to dns query: {other:?}"),
+        Err(e) => {
+            return Err(e).with_context(|| format!("querying dns at {}", socket.display()));
+        }
+    };
+    print!("{}", format_dns_query(&report, json));
+    Ok(())
+}
+
+/// Parse a DNS query-type token into its numeric RFC 1035 TYPE: either a case-insensitive mnemonic
+/// (`A`, `AAAA`, `CNAME`, `PTR`, `TXT`, `MX`, `NS`, `SRV`, `SOA`, `CAA`, `ANY`) or a decimal number
+/// (so any TYPE the mnemonic table omits is still reachable, e.g. `tnet dns query x 257`). Returns
+/// `None` for an unrecognized mnemonic that also is not a number. Pure → unit-testable.
+fn parse_qtype(s: &str) -> Option<u16> {
+    match s.to_ascii_uppercase().as_str() {
+        "A" => Some(1),
+        "NS" => Some(2),
+        "CNAME" => Some(5),
+        "SOA" => Some(6),
+        "PTR" => Some(12),
+        "MX" => Some(15),
+        "TXT" => Some(16),
+        "AAAA" => Some(28),
+        "SRV" => Some(33),
+        "CAA" => Some(257),
+        "ANY" => Some(255),
+        // Not a known mnemonic — accept a bare decimal TYPE number so uncommon types stay reachable.
+        other => other.parse::<u16>().ok(),
+    }
+}
+
+/// Map a numeric DNS TYPE back to its mnemonic for display (inverse of the common cases in
+/// [`parse_qtype`]); an unknown number renders as `TYPE<n>` (the RFC 3597 convention). Pure.
+fn qtype_name(qtype: u16) -> String {
+    match qtype {
+        1 => "A".into(),
+        2 => "NS".into(),
+        5 => "CNAME".into(),
+        6 => "SOA".into(),
+        12 => "PTR".into(),
+        15 => "MX".into(),
+        16 => "TXT".into(),
+        28 => "AAAA".into(),
+        33 => "SRV".into(),
+        255 => "ANY".into(),
+        257 => "CAA".into(),
+        n => format!("TYPE{n}"),
+    }
+}
+
+/// Map a DNS RCODE (response-header low 4 bits) to its mnemonic for display; an unknown code renders
+/// as `RCODE<n>`. Pure.
+fn rcode_name(rcode: u8) -> String {
+    match rcode {
+        0 => "NoError".into(),
+        1 => "FormErr".into(),
+        2 => "ServFail".into(),
+        3 => "NXDomain".into(),
+        4 => "NotImp".into(),
+        5 => "Refused".into(),
+        n => format!("RCODE{n}"),
+    }
+}
+
 /// `netcheck` (Go `tailscale netcheck`): fetch + render the net-report (DERP-region latency).
 async fn run_netcheck(socket: &std::path::Path, json: bool) -> Result<()> {
     let report = match round_trip(socket, &Request::Netcheck).await {
@@ -2850,6 +2960,114 @@ fn format_dns_status(r: &tailscaled_rs::localapi::DnsStatusReport, json: bool) -
          here and the 'System DNS configuration' section are not surfaced by this build)\n",
     );
     out
+}
+
+/// Render `tnet dns query` from a [`DnsQueryReport`](tailscaled_rs::localapi::DnsQueryReport). Human
+/// form shows the queried name/type, the RCODE (mnemonic + number), the upstream resolver(s)
+/// consulted (or "answered locally" when none egressed), the decoded fixed DNS header (id, flags,
+/// section counts) and the raw response as hex; `json` emits a small serde object. The answer RECORDS
+/// are deliberately NOT decoded — the engine returns raw bytes and this fork has no answer-record
+/// decoder (the honest-omission boundary; surfaced as an explicit note rather than faked). Pure →
+/// unit-testable.
+fn format_dns_query(r: &tailscaled_rs::localapi::DnsQueryReport, json: bool) -> String {
+    // Decode the fixed 12-byte DNS header from the raw response hex (RFC 1035 §4.1.1): id (2),
+    // flags (2), then QD/AN/NS/AR counts (2 each). `None` if the response is shorter than a header.
+    let header = decode_dns_header(&r.response_hex);
+
+    if json {
+        use serde_json::{Map, json};
+        let mut root = Map::new();
+        root.insert("Name".into(), json!(r.name));
+        root.insert("QType".into(), json!(qtype_name(r.qtype)));
+        root.insert("QTypeNum".into(), json!(r.qtype));
+        root.insert("RCode".into(), json!(rcode_name(r.rcode)));
+        root.insert("RCodeNum".into(), json!(r.rcode));
+        root.insert("ResolversConsulted".into(), json!(r.resolvers_consulted));
+        if let Some(h) = &header {
+            root.insert(
+                "Header".into(),
+                json!({
+                    "ID": h.id, "QDCount": h.qd, "ANCount": h.an,
+                    "NSCount": h.ns, "ARCount": h.ar,
+                }),
+            );
+        }
+        root.insert("ResponseHex".into(), json!(r.response_hex));
+        return format!(
+            "{}\n",
+            serde_json::to_string_pretty(&root).unwrap_or_else(|_| "{}".to_string())
+        );
+    }
+
+    let mut out = String::new();
+    // The queried name/type and the answer's RCODE — the headline result.
+    out.push_str(&format!(
+        "query:    {} {}\n",
+        sanitize_for_terminal(&r.name),
+        qtype_name(r.qtype)
+    ));
+    out.push_str(&format!(
+        "rcode:    {} ({})\n",
+        rcode_name(r.rcode),
+        r.rcode
+    ));
+    // Which upstream resolver(s) answered — or that nothing egressed (a locally-answered tailnet
+    // name / NODATA / fail-closed NXDOMAIN). The resolver strings are engine-supplied addr:port — run
+    // them through the terminal sanitizer like the other diagnostics' control-influenced fields.
+    if r.resolvers_consulted.is_empty() {
+        out.push_str("resolvers: (answered locally — nothing egressed)\n");
+    } else {
+        out.push_str("resolvers:\n");
+        for res in &r.resolvers_consulted {
+            out.push_str(&format!("  - {}\n", sanitize_for_terminal(res)));
+        }
+    }
+    // The decoded fixed header: section counts tell the operator at a glance whether there were any
+    // answers, without us decoding the (undecodable, this build) records themselves.
+    match &header {
+        Some(h) => {
+            out.push_str(&format!(
+                "header:   id=0x{:04x} questions={} answers={} authority={} additional={}\n",
+                h.id, h.qd, h.an, h.ns, h.ar
+            ));
+        }
+        None => out.push_str("header:   (response too short to decode a DNS header)\n"),
+    }
+    out.push_str(&format!("response: {} (hex)\n", r.response_hex));
+    out.push_str(
+        "(note: this build returns the raw DNS response; individual answer records are not decoded \
+         — use the hex above, or `dig`, for the full record set)\n",
+    );
+    out
+}
+
+/// The fixed 12-byte DNS message header (RFC 1035 §4.1.1) decoded from a response, for display.
+struct DnsHeader {
+    id: u16,
+    qd: u16,
+    an: u16,
+    ns: u16,
+    ar: u16,
+}
+
+/// Decode the fixed DNS header from a lowercase-hex response datagram. Returns `None` if the hex is
+/// malformed or shorter than the 12-byte header. Pure → unit-testable. (We decode only the header —
+/// fixed offsets, no name-compression to follow — never the variable-length question/answer sections.)
+fn decode_dns_header(response_hex: &str) -> Option<DnsHeader> {
+    // 12 header bytes = 24 hex chars.
+    if response_hex.len() < 24 {
+        return None;
+    }
+    let byte = |i: usize| u8::from_str_radix(response_hex.get(i * 2..i * 2 + 2)?, 16).ok();
+    let be16 = |i: usize| Some(((byte(i)? as u16) << 8) | byte(i + 1)? as u16);
+    Some(DnsHeader {
+        id: be16(0)?,
+        // bytes 2..4 are the flags (incl. the RCODE we already carry separately) — skip for the count view.
+        qd: be16(4)?,
+        an: be16(6)?,
+        ns: be16(8)?,
+        ar: be16(10)?,
+    })
 }
 
 /// Render `tnet netcheck` from a [`NetcheckReport`](tailscaled_rs::localapi::NetcheckReport) (Go
@@ -6648,6 +6866,86 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&format_dns_status(&empty, true)).unwrap();
         assert_eq!(v["MagicDNS"], serde_json::json!(false));
         assert_eq!(v["Resolvers"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn parse_and_name_qtype_round_trip_plus_numeric_and_rcode() {
+        // Mnemonics (case-insensitive) → numbers, and back.
+        for (name, num) in [
+            ("A", 1u16),
+            ("aaaa", 28),
+            ("CNAME", 5),
+            ("ptr", 12),
+            ("TXT", 16),
+            ("caa", 257),
+        ] {
+            assert_eq!(parse_qtype(name), Some(num), "parse {name}");
+            assert_eq!(qtype_name(num), name.to_ascii_uppercase(), "name {num}");
+        }
+        // A bare decimal TYPE is accepted (so uncommon types stay reachable) and an unknown number
+        // renders RFC-3597-style.
+        assert_eq!(parse_qtype("65"), Some(65));
+        assert_eq!(qtype_name(65), "TYPE65");
+        // Garbage → None.
+        assert_eq!(parse_qtype("nope"), None);
+        assert_eq!(parse_qtype(""), None);
+        // RCODE mnemonics + unknown.
+        assert_eq!(rcode_name(0), "NoError");
+        assert_eq!(rcode_name(3), "NXDomain");
+        assert_eq!(rcode_name(5), "Refused");
+        assert_eq!(rcode_name(11), "RCODE11");
+    }
+
+    #[test]
+    fn decode_dns_header_reads_fixed_fields_and_rejects_short() {
+        // A hand-built 12-byte header: id=0x1234, flags=0x8180, QD=1, AN=2, NS=0, AR=1.
+        let hex = "12348180000100020000000100";
+        let h = decode_dns_header(hex).expect("12+ bytes decodes");
+        assert_eq!(h.id, 0x1234);
+        assert_eq!((h.qd, h.an, h.ns, h.ar), (1, 2, 0, 1));
+        // Too short (< 24 hex chars = < 12 bytes) → None (not a panic / garbage).
+        assert!(decode_dns_header("1234").is_none());
+        assert!(decode_dns_header("").is_none());
+    }
+
+    #[test]
+    fn format_dns_query_human_and_json() {
+        use tailscaled_rs::localapi::DnsQueryReport;
+        // A forwarded NoError answer: id=0x1234 flags=0x8180 QD=1 AN=1, one resolver consulted.
+        let r = DnsQueryReport {
+            name: "example.com".into(),
+            qtype: 1,
+            rcode: 0,
+            resolvers_consulted: vec!["8.8.8.8:53".into()],
+            response_hex: "12348180000100010000000000".into(),
+        };
+        let h = format_dns_query(&r, false);
+        assert!(h.contains("query:    example.com A"), "{h}");
+        assert!(h.contains("rcode:    NoError (0)"), "{h}");
+        assert!(h.contains("- 8.8.8.8:53"), "{h}");
+        assert!(h.contains("questions=1 answers=1"), "{h}");
+        assert!(h.contains("answer records are not decoded"), "{h}");
+
+        // A locally-answered query (no resolver egressed) → the explicit local note.
+        let local = DnsQueryReport {
+            name: "host.tailnet.ts.net".into(),
+            qtype: 1,
+            rcode: 0,
+            resolvers_consulted: vec![],
+            response_hex: "abcd8180000100010000000000".into(),
+        };
+        assert!(
+            format_dns_query(&local, false).contains("answered locally"),
+            "local query must say so"
+        );
+
+        // JSON shape: mnemonic + numeric for both qtype and rcode, plus the decoded header.
+        let v: serde_json::Value = serde_json::from_str(&format_dns_query(&r, true)).unwrap();
+        assert_eq!(v["Name"], serde_json::json!("example.com"));
+        assert_eq!(v["QType"], serde_json::json!("A"));
+        assert_eq!(v["RCode"], serde_json::json!("NoError"));
+        assert_eq!(v["Header"]["ANCount"], serde_json::json!(1));
+        assert_eq!(v["ResolversConsulted"], serde_json::json!(["8.8.8.8:53"]));
     }
 
     #[test]

@@ -577,6 +577,17 @@ async fn dispatch(
                 },
             }
         }
+        // `dns query <name> [type]` (Go `tailscale dns query`, read-only). Off-lock device call; needs
+        // the node up (the query runs through the live engine's MagicDNS forwarder).
+        Request::DnsQuery { name, qtype } => {
+            let dev = { backend.lock().await.device_handle() };
+            match dev {
+                Some(dev) => Backend::dns_query(&dev, &name, qtype).await,
+                None => Response::Error {
+                    message: "node is not up".into(),
+                },
+            }
+        }
         // `netcheck` (Go `tailscale netcheck`, read-only). Off-lock device call; needs the node up
         // (the net-report measurements come from the live engine).
         Request::Netcheck => {

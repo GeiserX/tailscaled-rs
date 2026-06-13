@@ -218,6 +218,16 @@ pub enum Request {
     /// [`Response::DnsStatus`]. Read-only — gated like [`Status`](Request::Status). Requires the node
     /// to be up (the config comes from the live engine's netmap).
     DnsStatus,
+    /// Resolve a name through the node's own MagicDNS path (Go `tailscale dns query`). Replies with
+    /// [`Response::DnsQuery`]. Read-only — gated like [`Status`](Request::Status). Requires the node
+    /// to be up (the query runs through the live engine's MagicDNS forwarder). `qtype` is the numeric
+    /// RFC 1035 TYPE (the CLI maps the name → number); the daemon passes it straight to the engine.
+    DnsQuery {
+        /// The DNS name to resolve.
+        name: String,
+        /// The numeric DNS query type (1=A, 28=AAAA, 12=PTR, …).
+        qtype: u16,
+    },
     /// Report this node's network-conditions report (Go `tailscale netcheck`). Replies with
     /// [`Response::Netcheck`]. Read-only — gated like [`Status`](Request::Status). Requires the node
     /// to be up (the measurements come from the live engine's net-report). NOTE: this fork's
@@ -479,6 +489,9 @@ pub enum Response {
     /// The control-pushed MagicDNS configuration (reply to [`Request::DnsStatus`]), rendered by
     /// `tnet dns status`.
     DnsStatus(DnsStatusReport),
+    /// The outcome of a MagicDNS-path resolution (reply to [`Request::DnsQuery`]), rendered by
+    /// `tnet dns query`.
+    DnsQuery(DnsQueryReport),
     /// The node's network-conditions report (reply to [`Request::Netcheck`]), rendered by
     /// `tnet netcheck`.
     Netcheck(NetcheckReport),
@@ -1033,6 +1046,38 @@ pub struct DnsStatusReport {
     /// `exit_node_filtered_set`), lowercased, no trailing dot.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub exit_node_filtered_set: Vec<String>,
+}
+
+/// The outcome of a MagicDNS-path resolution in a [`Response::DnsQuery`] reply (Go `tailscale dns
+/// query`). Projected from the engine's `tailscale::DnsQueryResult`. Like Go's `LocalClient.QueryDNS`,
+/// the engine returns the **raw DNS response datagram** (header + question + any answer records), NOT
+/// parsed records — this fork's wire codec has no answer-record decoder, so the CLI renders the RCODE,
+/// the resolvers consulted, and a decode of the fixed DNS header (id/flags/counts) plus the raw bytes
+/// as hex, and deliberately does NOT pretty-print individual A/AAAA/CNAME records (the honest-omission
+/// boundary; documented in the renderer). The query name + numeric qtype are echoed back for context.
+///
+/// Container-level `#[serde(default)]` so a wire document missing any field deserializes to the
+/// [`DnsQueryReport::default`] value rather than hard-erroring.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DnsQueryReport {
+    /// The queried name, echoed back.
+    pub name: String,
+    /// The numeric DNS query type that was asked (1=A, 28=AAAA, …), echoed back.
+    pub qtype: u16,
+    /// The RCODE from the response header's low 4 bits (engine `DnsQueryResult::rcode`): 0=NoError,
+    /// 2=SERVFAIL, 3=NXDOMAIN, 5=Refused, ….
+    pub rcode: u8,
+    /// The upstream resolver(s) consulted, each as an `addr:port` string (engine
+    /// `resolvers_consulted`). Empty for a locally-answered query (an authoritative tailnet name, a
+    /// NODATA, or a fail-closed NXDOMAIN — nothing egressed).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub resolvers_consulted: Vec<String>,
+    /// The raw DNS response datagram (engine `DnsQueryResult::response`), as lowercase hex. The CLI
+    /// decodes the fixed 12-byte header from this; the answer records are NOT decoded (see the struct
+    /// doc). Empty only if the engine returned no bytes.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub response_hex: String,
 }
 
 /// The node's network-conditions report in a [`Response::Netcheck`] reply (Go `tailscale netcheck`).

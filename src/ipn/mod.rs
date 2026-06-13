@@ -2659,6 +2659,18 @@ impl Backend {
         diag::dns_status(dev).await
     }
 
+    /// Resolve `name`/`qtype` through the node's MagicDNS path (the `tnet dns query` path). Thin `pub`
+    /// shim over [`diag::dns_query`], kept on `Backend` so the `server.rs` dispatch call site is
+    /// uniform with the other off-lock diagnostics. See [`diag::dns_query`] for the
+    /// `Device::query_dns` → [`DnsQueryReport`](crate::localapi::DnsQueryReport) mapping.
+    pub async fn dns_query(
+        dev: &tailscale::Device,
+        name: &str,
+        qtype: u16,
+    ) -> crate::localapi::Response {
+        diag::dns_query(dev, name, qtype).await
+    }
+
     /// Report the node's network-conditions report (the `tnet netcheck` path). Thin `pub` shim over
     /// [`diag::netcheck`], kept on `Backend` so the `server.rs` dispatch call site
     /// (`Backend::netcheck(&dev)`) is uniform with the other off-lock diagnostics. See
