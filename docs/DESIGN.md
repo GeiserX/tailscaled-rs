@@ -98,48 +98,52 @@ mode by default.
 > `accept-dns`, multi-profile switching, systemd/launchd install, and link-change rebind. See the
 > phase table + the bead backlog for the current frontier.
 
-**Still out / deferred (a gap we *would* close given the unblock):** a faithful `tnet login` *verb*
-(the capability exists via keyless `up`; the verb needs Go's empty-profile model — a posture
-decision, bead tsd-z1a), Tailnet Lock *write-ops* + enforcement (engine-gated, #17), `dns query`
-(engine-gated, #15), Taildrop `file get --wait`/`--loop` (engine-gated on an IPN-bus file-arrival
-signal, #20), a configurable WireGuard listen `--port` (engine-gated — the engine binds ephemeral),
-MagicDNS OS-resolver integration, the richer operator/GID authorization matrix, and Windows service +
-host-net (engine-gated). These are *deferred*, not non-goals — each is tracked and would ship when the
-engine/decision unblocks it.
+**Still out / deferred (a gap we *would* close given the unblock):** the `tnet login` *verb* (the
+interactive (re)auth capability already exists via keyless `up`; shipping the verb now — the
+full-fidelity "switch to a different account while logged in" case can layer an empty-profile model
+later, but the verb itself is the interactive-login path), Taildrop `file get --wait`/`--loop`
+(engine-gated on an IPN-bus file-arrival signal, #20), a configurable WireGuard listen `--port`
+(engine-gated — the engine binds ephemeral, ask #22), MagicDNS OS-resolver integration, the richer
+operator/GID authorization matrix, and Windows service + host-net (engine port). `dns query` (#15)
+and Tailnet Lock write-ops/enforcement (#17) are **done** (consumed in the v0.31.0 / v0.32.0 engine
+bumps). These are *deferred*, not non-goals — each is tracked and ships when the engine/port unblocks
+it.
 
-## Non-goals — intentional reductions (do NOT re-file these)
+## Remaining Go surface to match (deferred / blocked — none are "won't do")
 
-These Go `tailscaled`/`tailscale` features are **deliberately out of scope** for a headless Rust
-daemon. Each parity gap-analysis pass tends to re-discover them as "missing subcommands"; they are
-listed here so future passes can skip them rather than re-file beads (see bead tsd-vyp). A gap is a
-*non-goal* (not a deferral) when shipping it would mean building a desktop/host-management surface this
-daemon is not, or faking a capability the fork has no honest substrate for.
+**The goal is full `tailscaled` + `tailscale`-CLI parity** — a complete Rust copy of the daemon and
+its command surface. Nothing Go does is "out of scope by choice." The items below are the Go features
+we do **not yet** match; each is either *not-yet-built* (a real target — file a bead and ship it) or
+*blocked* on a substrate the fork doesn't have yet (an engine capability or an OS port). When a thing
+is blocked, that is a **deferral with a named unblock**, never a decision to skip it. (This list
+exists only so a parity pass records *why* each is still open and what unblocks it — not to wave any
+of it off.)
 
-- **`web`** — the local management **web UI** (an embedded HTTP admin server). Out of scope: this is a
-  headless daemon; configuration is the CLI + the declarative `--config` file. (Distinct from our
-  `status --web`, which is a one-shot read-only HTML status snapshot, not a management server.)
-- **`update` / self-update** — there is **no release/update server** for this fork, so there is
-  nothing to check against or download. Mirrors the `version --upstream` stance ("fetching latest
-  version not supported in this build"). Distribution is via the user's package manager / a manual
-  build, not an in-daemon updater.
-- **`syspolicy`** — the **MDM / device-management policy store** (Windows registry / Apple
-  managed-prefs / Group Policy). A managed-fleet feature with no headless-daemon analogue.
-- **`systray`** — the **GTK/desktop system-tray** GUI. A desktop-app surface, not a daemon's.
-- **`configure synology` / `configure sysext` / `configure jetkvm`** — host-specific glue for those
-  platforms. Out of scope. (The one possible exception is **`configure kubeconfig`** — a pure
-  file-generation step that *could* be daemon-fixable if a headless-k8s deploy ever needs it; if so,
-  promote it from this list to a bead. Not currently wanted.)
-- **Exotic OS targets** — Plan9 / AIX / Solaris / illumos. The fork targets Linux + macOS (+ a
-  Windows engine gap); these have no demand and no engine support.
+- **`web`** — Go's local management **web UI** (an HTTP admin server that *mutates* prefs). A real
+  target: it needs an embedded HTTP server that drives the same LocalAPI verbs the CLI does. Build it
+  when wanted (distinct from our existing read-only `status --web` snapshot). *Not-yet-built.*
+- **`update` / self-update** — Go checks a release server and self-installs. To match it we need a
+  release/update feed for this fork's artifacts (the GitHub releases the CI already publishes are a
+  candidate source) + an in-daemon updater. *Not-yet-built* (needs an update-feed decision, then
+  wire it — no longer "there is no server, so never").
+- **`syspolicy`** — the MDM / device-management policy store (Windows registry / Apple managed-prefs /
+  Group Policy). To match: read the platform policy store and apply it over prefs. *Blocked* on the
+  per-OS policy-store readers (and most useful once Windows lands).
+- **`systray`** — Go's desktop system-tray GUI. To match: a tray app driving the LocalAPI. A real
+  target when a desktop UX is wanted; *not-yet-built* (a separate UI surface, not daemon-internal).
+- **`configure` (synology / sysext / jetkvm / kubeconfig)** — host-specific setup glue. Each is a
+  concrete file/host-config generator we can match per platform; **`configure kubeconfig`** (pure
+  file generation) is the cleanest first one. *Not-yet-built* — file beads per sub-target.
+- **Exotic OS targets** — Plan9 / AIX / Solaris / illumos. *Blocked* on engine support for those
+  targets (the engine builds Linux + macOS today; Windows is the next port). Match them as the engine
+  grows targets.
 - **TPM / Secure-Enclave `--encrypt-state`** — at-rest state encryption backed by a hardware key
-  store. Out of scope; the state dir is protected by `0700` + the process-hardening posture instead.
-- **`status --web` as a server, `web`-style mutation, GUI flows generally** — anything that turns the
-  daemon into a user-facing app rather than a headless service.
+  store. A real target (Go has it); *not-yet-built* — needs a platform keystore integration. Today the
+  state dir is `0700` + the process-hardening posture; that is the interim, not the end state.
 
-> A separate, non-closeable item (a **gate**, not a non-goal): the **unaudited-crypto production
-> bar** (bead tsd-q8o) — this fork must not be claimed production-ready until an external crypto audit
-> of the engine, regardless of feature parity. It is a release gate, tracked, never "done" by feature
-> work.
+> The one **gate** (not a feature, can't be "matched away"): the **unaudited-crypto production bar**
+> (bead tsd-q8o) — this fork must not be *claimed production-ready* until an external crypto audit of
+> the engine, regardless of feature parity. A release gate, tracked, never closed by feature work.
 
 ## Phased plan
 

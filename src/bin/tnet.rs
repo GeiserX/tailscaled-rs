@@ -320,6 +320,28 @@ enum Command {
     /// which keeps the registration for a seamless reconnect, `logout` ends it. Mirrors Go
     /// `tailscale logout`.
     Logout,
+    /// Authenticate this node with the control plane (Go `tailscale login`). With no `--authkey`, this
+    /// is an **interactive login**: the node contacts control, reaches `NeedsLogin`, and the auth URL
+    /// is printed for you to open in a browser; the node finishes connecting once you authorize it.
+    /// With `--authkey`/`--authkey-file` (or `$TS_AUTH_KEY`) it registers non-interactively. Like Go's
+    /// `login`, this re-authenticates **without changing any prefs** — it is `up`'s auth half on its
+    /// own (use `tnet up <flags>` to also change settings). Brings the node up (sets want-running).
+    Login {
+        /// Pre-auth key for non-interactive login. Prefer `--authkey-file` or `$TS_AUTH_KEY` (a bare
+        /// `--authkey` is visible in `ps`/shell history). Precedence: `--authkey-file` > `--authkey` >
+        /// `$TS_AUTH_KEY`. With none of them, the login is interactive (an auth URL is printed).
+        #[arg(long, conflicts_with = "authkey_file")]
+        authkey: Option<String>,
+        /// Read the pre-auth key from a file (avoids argv/shell-history exposure). Takes precedence
+        /// over `--authkey`.
+        #[arg(long, value_name = "PATH")]
+        authkey_file: Option<PathBuf>,
+        /// Control server URL to log in against (Go `--login-server`), e.g. a self-hosted Headscale.
+        /// Changing the control server is itself a fresh registration, which is exactly what `login`
+        /// does, so unlike `up` this needs no `--force-reauth`.
+        #[arg(long, value_name = "URL")]
+        login_server: Option<String>,
+    },
     /// Switch between profiles (separate accounts/tailnets), or list/remove them. Mirrors Go
     /// `tailscale switch`. Each profile keeps its own prefs + node key; switching tears down the
     /// current connection and activates the target (run `tnet up` to connect it).
@@ -1361,6 +1383,13 @@ async fn main() -> Result<()> {
             .context("removing the tailnetd system service"),
         Command::Down => dispatch_simple(&socket, Request::Down).await,
         Command::Logout => dispatch_simple(&socket, Request::Logout).await,
+        // `login` (Go `tailscale login`): interactive (or authkey) (re)authentication that changes no
+        // prefs — `up`'s auth half on its own. Reuses the interactive-login machinery.
+        Command::Login {
+            authkey,
+            authkey_file,
+            login_server,
+        } => run_login(&socket, authkey, authkey_file, login_server).await,
         // `switch` (Go `tailscale switch`): --list renders a table; `remove <id>` deletes; a bare
         // `<target>` switches. Handled inline — `--list` renders the Profiles reply, and the three
         // modes map to different requests.
@@ -1738,6 +1767,99 @@ async fn run_up(
             std::process::exit(1);
         }
         other => anyhow::bail!("unexpected response to up: {other:?}"),
+    }
+}
+
+/// `login` (Go `tailscale login`): (re)authenticate this node **without changing any prefs** — the
+/// auth half of `up` on its own. Resolves the auth key through the usual precedence
+/// (`--authkey-file` > `--authkey` > `$TS_AUTH_KEY`); with none, it is an interactive login (the
+/// control auth URL is printed). Sends an `up` request that **mentions no pref** (so the
+/// accidental-revert guard never fires — a no-pref `up` is exempt) with `force_reauth: true` so the
+/// node re-authenticates even if it already holds a key (mirroring Go `login` →
+/// `StartLoginInteractive`). Reuses `poll_for_auth_url` to surface the URL, exactly like an
+/// interactive `up`.
+async fn run_login(
+    socket: &std::path::Path,
+    authkey: Option<String>,
+    authkey_file: Option<std::path::PathBuf>,
+    login_server: Option<String>,
+) -> Result<()> {
+    // Refuse a re-auth that could drop the very Tailscale-SSH session we're on (same gate as `up
+    // --force-reauth`): `login` re-registers the node. Without an explicit accept-risk flag on
+    // `login` (Go's `login` has no such flag — it always StartLoginInteractive), we mirror `up`'s
+    // safety by refusing over a detected Tailscale SSH session.
+    if is_ssh_over_tailscale() {
+        eprintln!(
+            "refusing `login`: you appear to be connected over a Tailscale SSH session, and \
+             re-authenticating may drop it (you could lock yourself out). Run it from a local \
+             console, or use `tnet up --force-reauth --accept-risk=lose-ssh` if you accept the risk."
+        );
+        std::process::exit(1);
+    }
+    // Resolve the secret (zeroized `SecretString`); `None` → interactive login.
+    let authkey = resolve_authkey(authkey, authkey_file).await?;
+    let interactive = authkey.is_none();
+    // An `up` that mentions NO pref (every override `None`) + force_reauth: just (re)authenticate.
+    // `force_reauth` is not a "mentioned pref", so the no-pref shape keeps the accidental-revert
+    // guard from firing — `login` must never refuse-to-revert; it changes nothing but auth state.
+    let request = Request::Up {
+        authkey: authkey.as_ref().map(|k| k.expose_secret().to_owned()),
+        control_url: login_server,
+        hostname: None,
+        tun: None,
+        tun_name: None,
+        tun_mtu: None,
+        exit_node: None,
+        advertise_exit_node: None,
+        advertise_routes: None,
+        advertise_tags: None,
+        accept_routes: None,
+        accept_dns: None,
+        shields_up: None,
+        ssh: None,
+        reset: false,
+        force_reauth: true,
+        ephemeral: None,
+        client_id: None,
+        client_secret: None,
+        id_token: None,
+        audience: None,
+    };
+    match round_trip(socket, &request)
+        .await
+        .with_context(|| format!("talking to daemon at {}", socket.display()))?
+    {
+        Response::Ok { message } => {
+            println!("ok: {message}");
+            // Interactive login → surface the control auth URL once the engine reaches NeedsLogin.
+            if interactive {
+                match poll_for_auth_url(socket).await {
+                    AuthOutcome::Url(url) => {
+                        println!();
+                        println!("To authenticate this node, visit:");
+                        println!("    {url}");
+                        println!();
+                        println!(
+                            "(the node will finish connecting automatically once authorized; \
+                             run `tnet status` to check)"
+                        );
+                    }
+                    AuthOutcome::Failed(reason) => {
+                        eprintln!();
+                        eprintln!("login failed: {}", sanitize_multiline(&reason));
+                        std::process::exit(1);
+                    }
+                    AuthOutcome::None => {}
+                }
+            }
+            Ok(())
+        }
+        Response::Error { message } => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        // `login` mentions no pref, so the revert guard never triggers; any other reply is unexpected.
+        other => anyhow::bail!("unexpected response to login: {other:?}"),
     }
 }
 
