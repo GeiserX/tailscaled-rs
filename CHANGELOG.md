@@ -25,6 +25,14 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.43.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.42.0...v0.43.0) (2026-06-13)
+
+
+### Features
+
+* **cli:** add `tnet login` + reframe DESIGN scope to full Go parity (no "non-goals") ([#165](https://github.com/GeiserX/tailscaled-rs/issues/165)) ([7914e8b](https://github.com/GeiserX/tailscaled-rs/commit/7914e8b899df46b6e044bd8ed38b5cc9fc6aea7a))
+* **cli:** bump engine v0.32.0 → v0.33.0 + add `tnet lock init` (complete the lock surface) ([#168](https://github.com/GeiserX/tailscaled-rs/issues/168)) ([bf0e58e](https://github.com/GeiserX/tailscaled-rs/commit/bf0e58ef356502bec5454fb32598c92734eb1b84))
+
 ## [0.42.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.41.0...v0.42.0) (2026-06-13)
 
 
