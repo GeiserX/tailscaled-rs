@@ -2,10 +2,23 @@
 
 This lists the changes the downstream daemon (`tailscaled-rs`) needs from the `tailscale-rs`
 library to unblock end-to-end features. Each ask is self-contained, additive, and
-backward-compatible. The daemon pins engine rev `6035651b` (`v0.29.1`); individual asks
+backward-compatible. The daemon pins engine rev `f3793636` (`v0.31.0`); individual asks
 note the rev they were verified against (older "verified vs `e126bba`/v0.6.9" / `81446f88`/v0.28.2
-notes below predate the current pin and are kept as historical context — the SHIPPED markers reflect
-what the pin provides).
+/ `6035651b`/v0.29.1 notes below predate the current pin and are kept as historical context — the
+SHIPPED markers reflect what the pin provides).
+
+> **Pin bump 6035651b (v0.29.1) → f3793636 (v0.31.0), 2026-06-13.** Clean bump — full gate green
+> (194 lib + 97 tnet + 9 integ; clippy ±`identity-federation`; fmt). The one breaking change
+> (`feat(ts_tunnel)!`: `Psk` drops `Copy` for zeroize-on-drop) does **not** touch the daemon's surface
+> (the daemon consumes `tailscale::Device`, not `ts_tunnel::Psk`), confirmed by a clean probe-compile.
+> **Unblocks `#15 query_dns`**: the engine now exposes `Device::query_dns` through the live MagicDNS
+> forwarder (#152) → `tnet dns query` is now daemon-fixable (was engine-gated). Also **confirms the
+> TUN peer-AllowedIPs host-route fix** landed (#127, the ask filed with the live `ip route` repro).
+> Pulls a large batch of crypto/robustness fixes for free: WG symmetric-key zeroize-on-drop (#164),
+> TKA `Aum::sign` + KAT (#163 — a step toward #17 enforcement, NOT enough yet), magicsock pong-source
+> + best-addr hysteresis (#160/#135), mid-session re-auth URL surfacing (#134), and ~15 panic→graceful
+> hardening fixes across netstack/derp/disco/control/netcheck/ffi. NEXT to consume: wire `tnet dns
+> query` over `Device::query_dns`.
 
 > **Pin bump 81446f88 (v0.28.2) → 6035651b (v0.29.1), 2026-06-12 (PR #125).** This bump SHIPPED +
 > CONSUMED three asks: **#14 `accept_dns`** (Config field + `set_accept_dns`; wired daemon-side in
