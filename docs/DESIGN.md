@@ -98,12 +98,48 @@ mode by default.
 > `accept-dns`, multi-profile switching, systemd/launchd install, and link-change rebind. See the
 > phase table + the bead backlog for the current frontier.
 
-**Still out / deferred:** a faithful `tnet login` *verb* (the capability exists via keyless `up`; the
-verb needs Go's empty-profile model — a posture decision), Tailnet Lock *write-ops* + enforcement
-(engine-gated), `dns query` (engine-gated), MagicDNS OS-resolver integration, the richer operator/GID
-authorization matrix, Windows service + host-net (engine-gated), and the declarative `--config` file.
-A handful of Go subcommands (`web`, `update`, `syspolicy`, `systray`, `configure synology`, exotic
-OSes) are **intentional non-goals** for a headless Rust daemon.
+**Still out / deferred (a gap we *would* close given the unblock):** a faithful `tnet login` *verb*
+(the capability exists via keyless `up`; the verb needs Go's empty-profile model — a posture
+decision, bead tsd-z1a), Tailnet Lock *write-ops* + enforcement (engine-gated, #17), `dns query`
+(engine-gated, #15), Taildrop `file get --wait`/`--loop` (engine-gated on an IPN-bus file-arrival
+signal, #20), a configurable WireGuard listen `--port` (engine-gated — the engine binds ephemeral),
+MagicDNS OS-resolver integration, the richer operator/GID authorization matrix, and Windows service +
+host-net (engine-gated). These are *deferred*, not non-goals — each is tracked and would ship when the
+engine/decision unblocks it.
+
+## Non-goals — intentional reductions (do NOT re-file these)
+
+These Go `tailscaled`/`tailscale` features are **deliberately out of scope** for a headless Rust
+daemon. Each parity gap-analysis pass tends to re-discover them as "missing subcommands"; they are
+listed here so future passes can skip them rather than re-file beads (see bead tsd-vyp). A gap is a
+*non-goal* (not a deferral) when shipping it would mean building a desktop/host-management surface this
+daemon is not, or faking a capability the fork has no honest substrate for.
+
+- **`web`** — the local management **web UI** (an embedded HTTP admin server). Out of scope: this is a
+  headless daemon; configuration is the CLI + the declarative `--config` file. (Distinct from our
+  `status --web`, which is a one-shot read-only HTML status snapshot, not a management server.)
+- **`update` / self-update** — there is **no release/update server** for this fork, so there is
+  nothing to check against or download. Mirrors the `version --upstream` stance ("fetching latest
+  version not supported in this build"). Distribution is via the user's package manager / a manual
+  build, not an in-daemon updater.
+- **`syspolicy`** — the **MDM / device-management policy store** (Windows registry / Apple
+  managed-prefs / Group Policy). A managed-fleet feature with no headless-daemon analogue.
+- **`systray`** — the **GTK/desktop system-tray** GUI. A desktop-app surface, not a daemon's.
+- **`configure synology` / `configure sysext` / `configure jetkvm`** — host-specific glue for those
+  platforms. Out of scope. (The one possible exception is **`configure kubeconfig`** — a pure
+  file-generation step that *could* be daemon-fixable if a headless-k8s deploy ever needs it; if so,
+  promote it from this list to a bead. Not currently wanted.)
+- **Exotic OS targets** — Plan9 / AIX / Solaris / illumos. The fork targets Linux + macOS (+ a
+  Windows engine gap); these have no demand and no engine support.
+- **TPM / Secure-Enclave `--encrypt-state`** — at-rest state encryption backed by a hardware key
+  store. Out of scope; the state dir is protected by `0700` + the process-hardening posture instead.
+- **`status --web` as a server, `web`-style mutation, GUI flows generally** — anything that turns the
+  daemon into a user-facing app rather than a headless service.
+
+> A separate, non-closeable item (a **gate**, not a non-goal): the **unaudited-crypto production
+> bar** (bead tsd-q8o) — this fork must not be claimed production-ready until an external crypto audit
+> of the engine, regardless of feature parity. It is a release gate, tracked, never "done" by feature
+> work.
 
 ## Phased plan
 
