@@ -474,6 +474,49 @@ pub(super) fn file_list(dev: &tailscale::Device) -> Response {
     }
 }
 
+/// List the tailnet peers this node can Taildrop a file *to* (the `tnet file cp --targets` / Go
+/// `tailscale file cp --targets` / `file-targets` LocalAPI path).
+///
+/// Read-only: a thin projection of the engine's [`Device::file_targets`](tailscale::Device::file_targets),
+/// which already applies Go's full eligibility filter — a peer qualifies when it advertises a
+/// reachable IPv4 peerAPI **and** is either owned by the same user OR carries the file-sharing-target
+/// capability, and the whole list is gated on this node holding the file-sharing capability (empty,
+/// not an error, when control has not granted it). The engine returns the peers sorted by MagicDNS
+/// name, so this preserves that order. Each [`FileTarget`] is mapped to the wire
+/// [`FileTargetReport`]: the peer's primary tailnet IPv4, its display name
+/// ([`fqdn_opt`](tailscale::Node::fqdn_opt) falling back to the bare hostname — the analogue of Go's
+/// `Node.ComputedName`), and its tri-state online status (preserved, never collapsed to `false`).
+///
+/// Takes the engine handle as `dev` so the LocalAPI server runs it off-lock like the other
+/// diagnostics; the device-absent "node is not up" branch lives at the caller.
+pub(super) async fn file_targets(dev: &tailscale::Device) -> Response {
+    match dev.file_targets().await {
+        Ok(targets) => {
+            let targets = targets
+                .into_iter()
+                .map(|t| {
+                    let node = t.node;
+                    crate::localapi::FileTargetReport {
+                        // Primary tailnet IPv4 (Go prints `Node.Addresses[0]`).
+                        ip: node.tailnet_address.ipv4.addr().to_string(),
+                        // Display name: MagicDNS FQDN when known, else the bare hostname (Go
+                        // `Node.ComputedName`). `false` = no trailing dot, matching the status view.
+                        name: node
+                            .fqdn_opt(false)
+                            .unwrap_or_else(|| node.hostname.clone()),
+                        // Tri-state online (Go distinguishes online/offline/unknown; do not collapse).
+                        online: node.online,
+                    }
+                })
+                .collect();
+            Response::FileTargets { targets }
+        }
+        Err(e) => Response::Error {
+            message: format!("listing file targets failed: {e:?}"),
+        },
+    }
+}
+
 /// Fetch a waiting Taildrop file by name, writing it to `dest` (the `tnet file get <name>` verb).
 ///
 /// Fork-specific shape: Go's `tailscale file get <target-directory>` drains the whole inbox into a

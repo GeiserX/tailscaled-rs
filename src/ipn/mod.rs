@@ -2649,6 +2649,13 @@ impl Backend {
         diag::file_list(dev)
     }
 
+    /// List the tailnet peers this node can Taildrop *to* (the `tnet file cp --targets` / Go
+    /// `tailscale file cp --targets` path). A thin `pub` shim over [`diag::file_targets`], kept on
+    /// `Backend` so the `server.rs` dispatch call site matches the other off-lock diagnostics.
+    pub async fn file_targets(dev: &tailscale::Device) -> crate::localapi::Response {
+        diag::file_targets(dev).await
+    }
+
     /// Fetch a waiting Taildrop file by name, writing it to `dest` (the `tnet file get <name>` / Go
     /// `tailscale file get <name>` path). A thin `pub` shim over [`diag::file_get`], kept on
     /// `Backend` so the `server.rs` dispatch call site (`Backend::file_get(&dev, ..)`) is unchanged.

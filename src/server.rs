@@ -925,6 +925,17 @@ async fn dispatch(
                 },
             }
         }
+        // `file cp --targets` enumerates eligible Taildrop peers. Read-only, off-lock like the other
+        // diagnostics (the engine's `file_targets` awaits the peer set).
+        Request::FileTargets => {
+            let dev = { backend.lock().await.device_handle() };
+            match dev {
+                Some(dev) => Backend::file_targets(&dev).await,
+                None => Response::Error {
+                    message: "node is not up".into(),
+                },
+            }
+        }
         Request::FileGet {
             name,
             dest,

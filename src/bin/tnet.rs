@@ -695,14 +695,30 @@ enum SwitchCmd {
 /// same parse path; keeping the choice uniform avoids reintroducing a debug-print surface).
 #[derive(Subcommand)]
 enum FileCmd {
-    /// Send a local file to a tailnet peer (by IP or MagicDNS name).
+    /// Send local files to a tailnet peer via Taildrop (Go `tailscale file cp <files...> <target>:`).
+    ///
+    /// The final argument is the destination peer and MUST end in a colon (`peer-b:`,
+    /// `100.64.0.9:`, or `[fd7a::1]:` for an IPv6 literal) — matching Go, which uses the trailing
+    /// colon to disambiguate a peer from a file path. One or more files may precede it. With
+    /// `--targets` (and no files/target), instead lists the peers you can send to.
+    ///
+    /// NOTE: unlike Go, this build does NOT support `-` (stdin) as a file — the daemon opens each
+    /// path itself (tnet + tailnetd are same-host/same-user), so there is no stdin to hand it; pass a
+    /// real file path. Streaming stdin over the LocalAPI is a tracked follow-up.
     Cp {
-        /// Local filesystem path of the file to send.
-        #[arg(value_name = "PATH")]
-        path: String,
-        /// Destination peer: a tailnet IP or MagicDNS name (e.g. `100.64.0.9` or `peer-b`).
-        #[arg(value_name = "PEER")]
-        peer: String,
+        /// The files to send, followed by the destination `<peer>:` (trailing colon required). Empty
+        /// only when `--targets` is given. `-` (stdin) is not supported by this build.
+        #[arg(value_name = "FILES... TARGET:")]
+        args: Vec<String>,
+        /// Destination filename override (Go `--name`): with a single explicit file, send it under
+        /// this name instead of its base name. Cannot be combined with multiple files. (Go also uses
+        /// `--name` to name stdin content, but this build does not support stdin.)
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// Instead of sending, list the tailnet peers you can Taildrop to (Go `file cp --targets` /
+        /// the `file-targets` LocalAPI): one line per peer — its tailnet IP, name, and online status.
+        #[arg(long)]
+        targets: bool,
     },
     /// List files waiting in the Taildrop inbox.
     List,
@@ -823,6 +839,49 @@ fn resolve_until_direct(until_direct: bool, no_until_direct: bool) -> bool {
         // Neither flag → Go's default: stop once a direct path is established.
         (false, false) => true,
     }
+}
+
+/// Parse and validate a `file cp` destination argument into the bare peer selector (IP or MagicDNS
+/// name), enforcing Go's `runCp` rules:
+///
+/// - The argument MUST end in a colon (`peer-b:`, `100.64.0.9:`) — Go uses the trailing colon to
+///   tell a destination apart from a file path; a missing colon is an error.
+/// - An IPv6 literal MUST be bracketed (`[fd7a::1]:`); a bare `fd7a::1:` is rejected with Go's
+///   "an IPv6 literal must be written as [..]" guidance. Brackets are only valid around an actual
+///   IPv6 literal (Go rejects `[peer-b]:` / `[1.2.3.4]:`).
+///
+/// Returns the inner selector with the colon (and any brackets) stripped. Pure → unit-testable
+/// without a daemon. Mirrors `cmd/tailscale/cli/file.go` `runCp`.
+fn parse_cp_target(arg: &str) -> Result<String> {
+    let target = arg.strip_suffix(':').ok_or_else(|| {
+        anyhow::anyhow!("final argument to 'file cp' must end in a colon (e.g. {arg}:)")
+    })?;
+
+    let had_brackets = target.starts_with('[') && target.ends_with(']');
+    let inner = if had_brackets {
+        &target[1..target.len() - 1]
+    } else {
+        target
+    };
+
+    // An empty peer (`:` or `[]:`) can't resolve — reject at the CLI with a clear message rather than
+    // sending `""` to the daemon for a less-precise "no peer matches" round-trip.
+    if inner.is_empty() {
+        anyhow::bail!("empty peer in 'file cp' target (expected e.g. `peer-b:`)");
+    }
+
+    // Bracket/IPv6 consistency, mirroring Go: a bare IPv6 literal must be bracketed, and brackets are
+    // only valid around an actual IPv6 literal.
+    match inner.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(ip)) if !had_brackets => {
+            anyhow::bail!("an IPv6 literal must be written as [{ip}]");
+        }
+        _ if had_brackets && !matches!(inner.parse(), Ok(std::net::IpAddr::V6(_))) => {
+            anyhow::bail!("unexpected brackets around target {target:?}");
+        }
+        _ => {}
+    }
+    Ok(inner.to_string())
 }
 
 /// Map the `--shields-up` / `--no-shields-up` flag pair to a tri-state `Option<bool>`.
@@ -2285,8 +2344,14 @@ async fn run_whois(socket: &std::path::Path, ip: String) -> Result<()> {
 /// file name in a `list` reply is engine/peer-supplied, so it is run through `sanitize_for_terminal`
 /// inside `format_files` before printing (a sender could craft a hostile name).
 async fn run_file(socket: &std::path::Path, cmd: FileCmd) -> Result<()> {
+    // `cp` has its own handler: it may `--targets`-list, or send 1..N files (a round-trip each), so
+    // it does not fit the single-request-then-match shape the other verbs share.
     let request = match cmd {
-        FileCmd::Cp { path, peer } => Request::FileCp { path, peer },
+        FileCmd::Cp {
+            args,
+            name,
+            targets,
+        } => return run_file_cp(socket, args, name, targets).await,
         FileCmd::List => Request::FileList,
         FileCmd::Get {
             target,
@@ -2332,6 +2397,113 @@ async fn run_file(socket: &std::path::Path, cmd: FileCmd) -> Result<()> {
         other => anyhow::bail!("unexpected response to file request: {other:?}"),
     }
     Ok(())
+}
+
+/// `tnet file cp` — the Go `tailscale file cp <files...> <target>:` path, plus `--targets`.
+///
+/// With `targets` (and no positional args), lists the Taildrop-able peers. Otherwise the LAST arg is
+/// the destination peer and MUST end in a colon (Go's disambiguator); the rest are files to send, one
+/// `FileCp` round-trip each. A lone `-` file reads stdin (with `--name`). `--name` overrides the
+/// destination filename and is rejected with multiple files (matching Go).
+async fn run_file_cp(
+    socket: &std::path::Path,
+    args: Vec<String>,
+    name: Option<String>,
+    targets: bool,
+) -> Result<()> {
+    // `--targets`: list peers, ignore (reject) any positional args — matches Go's `runCpTargets`.
+    if targets {
+        if !args.is_empty() {
+            anyhow::bail!("invalid arguments with --targets");
+        }
+        return run_file_targets(socket).await;
+    }
+
+    // Need at least one file + the `<target>:` (Go: "usage: tailscale file cp <files...> <target>:").
+    if args.len() < 2 {
+        anyhow::bail!("usage: tnet file cp <files...> <target>:");
+    }
+    let (files, raw_target) = args.split_at(args.len() - 1);
+    let peer = parse_cp_target(&raw_target[0])?;
+
+    // Multi-file guards (Go): --name is single-file only, and stdin can't mix with named files.
+    if files.len() > 1 {
+        if name.is_some() {
+            anyhow::bail!("can't use --name with multiple files");
+        }
+        if files.iter().any(|f| f == "-") {
+            anyhow::bail!("can't use '-' (stdin) together with other files");
+        }
+    }
+
+    // Send each file as its own transfer. A failure on one file is reported and makes the command
+    // exit non-zero, but does not abort the remaining sends (mirrors a best-effort batch).
+    let mut had_error = false;
+    for file in files {
+        let (path, send_name) = resolve_cp_file(file, name.as_deref())?;
+        let req = Request::FileCp {
+            path,
+            peer: peer.clone(),
+        };
+        match round_trip(socket, &req)
+            .await
+            .with_context(|| format!("talking to daemon at {}", socket.display()))?
+        {
+            Response::Ok { message } => println!("ok: {message}"),
+            Response::Error { message } => {
+                eprintln!("error: sending {send_name}: {message}");
+                had_error = true;
+            }
+            other => anyhow::bail!("unexpected response to file cp: {other:?}"),
+        }
+    }
+    if had_error {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// `tnet file cp --targets`: round-trip [`Request::FileTargets`] and render the peer list.
+async fn run_file_targets(socket: &std::path::Path) -> Result<()> {
+    match round_trip(socket, &Request::FileTargets)
+        .await
+        .with_context(|| format!("talking to daemon at {}", socket.display()))?
+    {
+        Response::FileTargets { targets } => {
+            print!("{}", format_file_targets(&targets));
+            Ok(())
+        }
+        Response::Error { message } => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        other => anyhow::bail!("unexpected response to file targets: {other:?}"),
+    }
+}
+
+/// Resolve one `cp` file argument to `(path_to_send, display_name)`. A `-` means stdin, which this
+/// daemon's same-host `FileCp` (the daemon opens the path itself) cannot stream, so `-` is rejected
+/// with an actionable message rather than silently mis-sent. Pure enough to reason about; the stdin
+/// limitation is a fork constraint documented at the call site.
+fn resolve_cp_file(file: &str, name: Option<&str>) -> Result<(String, String)> {
+    if file == "-" {
+        // The daemon opens the file by path (tnet + tailnetd are same-host/same-user); there is no
+        // path for stdin to hand it. Rather than fake it, reject clearly. (A future stdin path would
+        // need the CLI to stream bytes over the LocalAPI — tracked separately.)
+        anyhow::bail!(
+            "stdin ('-') is not supported by this build's `file cp`; pass a file path instead"
+        );
+    }
+    // Display name for error/progress lines: the override, else the file's base name.
+    let display = name
+        .map(str::to_string)
+        .unwrap_or_else(|| basename(file).to_string());
+    Ok((file.to_string(), display))
+}
+
+/// The base name of a path (the final `/`-separated component), for `cp` display. Pure.
+fn basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
 }
 
 /// Render `tnet lock status` from a [`LockReport`](tailscaled_rs::localapi::LockReport). Human form
@@ -3042,6 +3214,34 @@ fn format_files_got(results: &[tailscaled_rs::localapi::FileGotReport]) -> Strin
                 out.push_str(&format!("error: {name}: unknown outcome\n"));
             }
         }
+    }
+    out
+}
+
+/// Render the `tnet file cp --targets` peer list (a [`Response::FileTargets`]). One tab-separated line
+/// per peer — `<ip>\t<name>[\t<status>]` — mirroring Go's `runCpTargets` (which prints
+/// `addr \t ComputedName` plus an `offline`/`unknown-status` detail column). An empty list prints a
+/// clear placeholder. The peer name is control-supplied, so it is run through `sanitize_for_terminal`.
+/// Pure → unit-testable.
+fn format_file_targets(targets: &[tailscaled_rs::localapi::FileTargetReport]) -> String {
+    if targets.is_empty() {
+        return "(no Taildrop targets)\n".to_string();
+    }
+    let mut out = String::new();
+    for t in targets {
+        let name = sanitize_for_terminal(&t.name);
+        // Go prints a detail column only when the peer is not known-online: `offline` for an explicit
+        // offline, `unknown-status` when control reports no online state. A known-online peer gets no
+        // extra column.
+        let detail = match t.online {
+            Some(true) => String::new(),
+            Some(false) => "\toffline".to_string(),
+            None => "\tunknown-status".to_string(),
+        };
+        out.push_str(&format!(
+            "{}\t{name}{detail}\n",
+            sanitize_for_terminal(&t.ip)
+        ));
     }
     out
 }
@@ -5128,24 +5328,10 @@ mod tests {
 
     #[test]
     fn command_file_subcommands_map_to_requests() {
-        // The three `tnet file` subcommands each select the right wire `Request`. Built the same way
-        // `main`'s `Command::File` arm builds them, so the dispatch mapping is covered without
-        // spawning the CLI. `cp`/`get` are writes (reply `Ok`); `list` is read-only (reply `Files`).
-        let cp = match (FileCmd::Cp {
-            path: "/tmp/a.txt".to_string(),
-            peer: "peer-b".to_string(),
-        }) {
-            FileCmd::Cp { path, peer } => Request::FileCp { path, peer },
-            _ => unreachable!(),
-        };
-        match cp {
-            Request::FileCp { path, peer } => {
-                assert_eq!(path, "/tmp/a.txt");
-                assert_eq!(peer, "peer-b");
-            }
-            other => panic!("expected Request::FileCp, got {other:?}"),
-        }
-
+        // `list`/`get` select the right wire `Request` (built the same way `main`'s `Command::File`
+        // arm builds them). `cp` is no longer a simple request-map (it parses the colon target, may
+        // `--targets`-list, and sends 1..N files via `run_file_cp`), so its logic is covered by the
+        // `parse_cp_target` / `basename` / `format_file_targets` unit tests instead.
         let list = match FileCmd::List {
             FileCmd::List => Request::FileList,
             _ => unreachable!(),
@@ -5221,6 +5407,92 @@ mod tests {
             }
             other => panic!("expected Request::FileGetDir, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_cp_target_requires_colon_and_strips_it() {
+        // A bare name + colon → the name (Go's trailing-colon disambiguator).
+        assert_eq!(parse_cp_target("peer-b:").unwrap(), "peer-b");
+        assert_eq!(parse_cp_target("100.64.0.9:").unwrap(), "100.64.0.9");
+        // Missing colon → error (Go: "must end in colon").
+        assert!(
+            parse_cp_target("peer-b").is_err(),
+            "no colon must be rejected"
+        );
+        // Empty peer (`:` or `[]:`) → error (can't resolve an empty selector).
+        assert!(parse_cp_target(":").is_err(), "empty peer must be rejected");
+        assert!(
+            parse_cp_target("[]:").is_err(),
+            "empty bracketed peer must be rejected"
+        );
+    }
+
+    #[test]
+    fn parse_cp_target_ipv6_bracket_rules_match_go() {
+        // A bracketed IPv6 literal → the inner address (brackets + colon stripped).
+        assert_eq!(parse_cp_target("[fd7a::1]:").unwrap(), "fd7a::1");
+        // A bare (unbracketed) IPv6 literal → error, pointing at the bracketed form.
+        let err = parse_cp_target("fd7a::1:").unwrap_err().to_string();
+        assert!(err.contains("must be written as ["), "got: {err}");
+        // Brackets around a NON-IPv6 (a name or v4) → error (Go rejects unexpected brackets).
+        assert!(
+            parse_cp_target("[peer-b]:").is_err(),
+            "brackets around a non-IPv6 must be rejected"
+        );
+        assert!(
+            parse_cp_target("[1.2.3.4]:").is_err(),
+            "brackets around a v4 literal must be rejected"
+        );
+    }
+
+    #[test]
+    fn basename_takes_final_component() {
+        assert_eq!(basename("/tmp/a/b.txt"), "b.txt");
+        assert_eq!(basename("b.txt"), "b.txt");
+        assert_eq!(basename("/trailing/"), "");
+    }
+
+    #[test]
+    fn format_file_targets_renders_status_columns_like_go() {
+        use tailscaled_rs::localapi::FileTargetReport;
+        let targets = vec![
+            FileTargetReport {
+                ip: "100.64.0.2".to_string(),
+                name: "laptop".to_string(),
+                online: Some(true),
+            },
+            FileTargetReport {
+                ip: "100.64.0.3".to_string(),
+                name: "desktop".to_string(),
+                online: Some(false),
+            },
+            FileTargetReport {
+                ip: "100.64.0.4".to_string(),
+                name: "phone".to_string(),
+                online: None,
+            },
+        ];
+        let out = format_file_targets(&targets);
+        // Online peer: just ip \t name, no detail column.
+        assert!(out.contains("100.64.0.2\tlaptop\n"), "{out}");
+        // Offline / unknown peers get the detail column.
+        assert!(out.contains("100.64.0.3\tdesktop\toffline\n"), "{out}");
+        assert!(out.contains("100.64.0.4\tphone\tunknown-status\n"), "{out}");
+        // Empty → placeholder.
+        assert_eq!(format_file_targets(&[]), "(no Taildrop targets)\n");
+    }
+
+    #[test]
+    fn format_file_targets_sanitizes_peer_name() {
+        use tailscaled_rs::localapi::FileTargetReport;
+        // The peer name is control-supplied; terminal escapes must be stripped.
+        let targets = vec![FileTargetReport {
+            ip: "100.64.0.2".to_string(),
+            name: "evil\x1b[2J\x07".to_string(),
+            online: Some(true),
+        }];
+        let out = format_file_targets(&targets);
+        assert!(!out.contains('\x1b') && !out.contains('\x07'), "{out}");
     }
 
     #[test]
