@@ -4845,4 +4845,63 @@ mod tests {
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
+
+    #[tokio::test]
+    async fn apply_config_merges_persists_and_marks_configured() {
+        // `Backend::apply_config` is the seam that turns a `--config` document into the node's
+        // intent: it merges the config over the loaded prefs, PERSISTS the result (so the intent
+        // survives a `--config`-less restart), marks `ever_configured`, and returns the AuthKey
+        // out-of-band (never persisting it). The pure merge (`conffile::apply_to_prefs`) is unit-
+        // tested in `conffile`; this pins the Backend wrapper's persist + ever_configured + the
+        // auth-key-not-persisted contract end to end.
+        use secrecy::ExposeSecret;
+        let dir = std::env::temp_dir().join(format!("tailnetd-applycfg-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+        assert!(!be.ever_configured, "fresh backend is not yet configured");
+
+        // Parse a config that sets a few prefs + carries an auth key.
+        let cfg_path = dir.join("c.json");
+        tokio::fs::write(
+            &cfg_path,
+            br#"{"version":"alpha0","Hostname":"cfg-host","acceptDNS":false,"AuthKey":"tskey-secret"}"#,
+        )
+        .await
+        .unwrap();
+        let config = crate::conffile::load(&cfg_path).expect("load config");
+
+        let authkey = be.apply_config(&config).await.expect("apply_config");
+
+        // (1) The auth key is returned (for bring-up), as a SecretString.
+        assert_eq!(
+            authkey.as_ref().map(|k| k.expose_secret().to_string()),
+            Some("tskey-secret".to_string()),
+            "apply_config returns the config auth key"
+        );
+        // (2) The merge landed on the in-memory prefs (Hostname set; Enabled unset → up; acceptDNS off).
+        assert_eq!(be.prefs.hostname.as_deref(), Some("cfg-host"));
+        assert!(
+            be.prefs.want_running,
+            "unset Enabled defaults the node up (Go)"
+        );
+        assert!(!be.prefs.accept_dns, "acceptDNS:false applied");
+        // (3) ever_configured flipped (a --config boot is a deliberate configuration).
+        assert!(be.ever_configured, "apply_config marks the node configured");
+        // (4) The merged prefs were PERSISTED to disk — re-load and confirm.
+        let reloaded = Prefs::load(&be.prefs_path)
+            .await
+            .expect("reload persisted prefs");
+        assert_eq!(reloaded.hostname.as_deref(), Some("cfg-host"));
+        assert!(reloaded.want_running);
+        assert!(!reloaded.accept_dns);
+        // (5) The auth key MUST NOT be in the persisted file (it's a credential, not intent).
+        let raw = tokio::fs::read_to_string(&be.prefs_path).await.unwrap();
+        assert!(
+            !raw.contains("tskey-secret"),
+            "the auth key must never be persisted into prefs.json: {raw}"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
 }
