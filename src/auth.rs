@@ -324,6 +324,9 @@ mod tests {
         assert!(requires_write(&file_cp()));
         assert!(requires_write(&file_get()));
         assert!(!requires_write(&Request::FileList));
+        // `file cp --targets` only enumerates eligible peers — a read, like `list`/`status`.
+        assert!(!requires_write(&Request::FileTargets));
+        assert_eq!(authorize(&Request::FileTargets, Access::ReadOnly), Ok(()));
     }
 
     #[test]

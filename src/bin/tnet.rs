@@ -699,16 +699,20 @@ enum FileCmd {
     ///
     /// The final argument is the destination peer and MUST end in a colon (`peer-b:`,
     /// `100.64.0.9:`, or `[fd7a::1]:` for an IPv6 literal) — matching Go, which uses the trailing
-    /// colon to disambiguate a peer from a file path. One or more files may precede it; a single `-`
-    /// reads from stdin (then `--name` sets the destination filename). With `--targets` (and no
-    /// files/target), instead lists the peers you can send to.
+    /// colon to disambiguate a peer from a file path. One or more files may precede it. With
+    /// `--targets` (and no files/target), instead lists the peers you can send to.
+    ///
+    /// NOTE: unlike Go, this build does NOT support `-` (stdin) as a file — the daemon opens each
+    /// path itself (tnet + tailnetd are same-host/same-user), so there is no stdin to hand it; pass a
+    /// real file path. Streaming stdin over the LocalAPI is a tracked follow-up.
     Cp {
-        /// The files to send, followed by the destination `<peer>:` (trailing colon required). A lone
-        /// `-` in the file position reads stdin. Empty only when `--targets` is given.
+        /// The files to send, followed by the destination `<peer>:` (trailing colon required). Empty
+        /// only when `--targets` is given. `-` (stdin) is not supported by this build.
         #[arg(value_name = "FILES... TARGET:")]
         args: Vec<String>,
-        /// Destination filename override (Go `--name`). Required-ish for stdin (`-`); with an explicit
-        /// file it defaults to the file's base name. Cannot be combined with multiple files.
+        /// Destination filename override (Go `--name`): with a single explicit file, send it under
+        /// this name instead of its base name. Cannot be combined with multiple files. (Go also uses
+        /// `--name` to name stdin content, but this build does not support stdin.)
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
         /// Instead of sending, list the tailnet peers you can Taildrop to (Go `file cp --targets` /
@@ -847,7 +851,7 @@ fn resolve_until_direct(until_direct: bool, no_until_direct: bool) -> bool {
 ///   IPv6 literal (Go rejects `[peer-b]:` / `[1.2.3.4]:`).
 ///
 /// Returns the inner selector with the colon (and any brackets) stripped. Pure → unit-testable
-/// without a daemon. Mirrors `cmd/tailscale/cli/file.go` `runCp` lines 101-115.
+/// without a daemon. Mirrors `cmd/tailscale/cli/file.go` `runCp`.
 fn parse_cp_target(arg: &str) -> Result<String> {
     let target = arg.strip_suffix(':').ok_or_else(|| {
         anyhow::anyhow!("final argument to 'file cp' must end in a colon (e.g. {arg}:)")
@@ -859,6 +863,12 @@ fn parse_cp_target(arg: &str) -> Result<String> {
     } else {
         target
     };
+
+    // An empty peer (`:` or `[]:`) can't resolve — reject at the CLI with a clear message rather than
+    // sending `""` to the daemon for a less-precise "no peer matches" round-trip.
+    if inner.is_empty() {
+        anyhow::bail!("empty peer in 'file cp' target (expected e.g. `peer-b:`)");
+    }
 
     // Bracket/IPv6 consistency, mirroring Go: a bare IPv6 literal must be bracketed, and brackets are
     // only valid around an actual IPv6 literal.
@@ -5408,6 +5418,12 @@ mod tests {
         assert!(
             parse_cp_target("peer-b").is_err(),
             "no colon must be rejected"
+        );
+        // Empty peer (`:` or `[]:`) → error (can't resolve an empty selector).
+        assert!(parse_cp_target(":").is_err(), "empty peer must be rejected");
+        assert!(
+            parse_cp_target("[]:").is_err(),
+            "empty bracketed peer must be rejected"
         );
     }
 
