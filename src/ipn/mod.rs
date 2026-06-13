@@ -721,8 +721,19 @@ pub async fn drive_set(
             // Phase 2c: brief lock — install iff still current, returning any orphan to settle off-lock.
             let orphan = {
                 let mut be = backend.lock().await;
-                be.finish_up(pending, built)
-            }?;
+                let orphan = be.finish_up(pending, built)?;
+                // A `set`-driven rebuild re-registers the engine just like `up`, so on a successful
+                // install `finish_up` flips `has_logged_in` in memory — persist it here too (same
+                // contract as `drive_up`/`Backend::up`), or a rebuild-`set` after a prior transient
+                // persist failure would leave the flag true-in-memory but false-on-disk and lose the
+                // guard's fresh-node exemption across a restart. Non-fatal on failure (node is up).
+                if orphan.is_none()
+                    && let Err(e) = be.persist_prefs().await
+                {
+                    tracing::warn!(error = %e, "failed to persist has_logged_in after set-rebuild");
+                }
+                orphan
+            };
             // Lock released — settle the (rare) superseded device off-lock.
             shutdown_orphan(orphan).await;
             Ok(())
@@ -1442,6 +1453,14 @@ impl Backend {
                 let pending = self.begin_up(UpOptions::default(), None).await?;
                 let built = build_device(&pending, None).await;
                 let orphan = self.finish_up(pending, built)?;
+                // On a successful install `finish_up` flipped `has_logged_in` in memory; persist it
+                // (same contract as `drive_up`/`Backend::up`/`drive_set`) so a rebuild-`set` after a
+                // prior transient persist failure doesn't leave the flag true-in-memory/false-on-disk.
+                if orphan.is_none()
+                    && let Err(e) = self.persist_prefs().await
+                {
+                    tracing::warn!(error = %e, "failed to persist has_logged_in after set-rebuild");
+                }
                 shutdown_orphan(orphan).await;
                 Ok(())
             }
@@ -2366,9 +2385,16 @@ impl Backend {
 
         // 4. Now that the key is gone, flip intent to logged-out and persist. `logged_out` suppresses
         // auto-start (see `wants_running`); `ever_configured` keeps a post-logout restart reporting
-        // `NeedsLogin`/`Stopped` rather than `NoState`.
+        // `NeedsLogin`/`Stopped` rather than `NoState`. Clear `has_logged_in`: logout ends the
+        // registration (the node key is gone), so the node is no longer "logged in" — matching Go,
+        // which clears `Persist.UserProfile.LoginName` on logout. This keeps the revert-guard's
+        // fresh-node exemption faithful: a `set`-then-`up` after a logout is unguarded (the node must
+        // re-register first), exactly as it is on a never-logged-in node — the next successful `up`
+        // re-sets `has_logged_in` in `finish_up`. (`down`, by contrast, preserves it — `down` keeps
+        // the registration, like Go keeping LoginName across a non-logout disconnect.)
         self.prefs.want_running = false;
         self.prefs.logged_out = true;
+        self.prefs.has_logged_in = false;
         self.ever_configured = true;
         self.persist_prefs().await?;
         Ok(())
@@ -3100,6 +3126,7 @@ mod tests {
         // --- `down` keeps the key file ---
         let mut be = backend_for(&dir);
         be.prefs.want_running = true;
+        be.prefs.has_logged_in = true; // a registered node
         // Simulate a prior registration: a node key file on disk.
         tokio::fs::write(&be.key_path, b"{\"key_state\":{}}")
             .await
@@ -3108,13 +3135,18 @@ mod tests {
         assert!(!be.prefs.want_running, "down clears want_running");
         assert!(!be.prefs.logged_out, "down must NOT set logged_out");
         assert!(
+            be.prefs.has_logged_in,
+            "down must PRESERVE has_logged_in (down keeps the registration, like Go keeps LoginName)"
+        );
+        assert!(
             tokio::fs::try_exists(&be.key_path).await.unwrap(),
             "down must KEEP the node key file (resume path)"
         );
 
-        // --- `logout` wipes the key file + sets logged_out ---
+        // --- `logout` wipes the key file + sets logged_out + clears has_logged_in ---
         let mut be = backend_for(&dir);
         be.prefs.want_running = true;
+        be.prefs.has_logged_in = true; // a registered node
         // key file still present from the `down` case above.
         assert!(tokio::fs::try_exists(&be.key_path).await.unwrap());
         be.logout().await.expect("logout");
@@ -3122,6 +3154,11 @@ mod tests {
         assert!(
             be.prefs.logged_out,
             "logout MUST set logged_out (suppresses auto-start; forces fresh login)"
+        );
+        assert!(
+            !be.prefs.has_logged_in,
+            "logout MUST clear has_logged_in (ends the registration; matches Go clearing LoginName) \
+             — so a post-logout set-then-up is unguarded until the node re-registers"
         );
         assert!(
             !be.wants_running(),
