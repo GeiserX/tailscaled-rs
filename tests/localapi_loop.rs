@@ -455,6 +455,59 @@ async fn debug_capture_on_offline_node_is_node_not_up() {
     harness.shutdown_and_verify().await;
 }
 
+/// The Taildrop + config wire requests added this session (`file get <dir>`, `file cp [--name]`,
+/// `file cp --targets`) must each reach their server-dispatch arm and, on an OFFLINE node (no engine
+/// device), return a clean "node is not up" error rather than panicking, hanging, or mis-routing.
+/// These verbs all need a live `Device`, so the device-absent branch is the right offline outcome —
+/// this proves the dispatch arm EXISTS and is reachable over the real socket (the unit tests cover
+/// only serde + pure helpers, not end-to-end dispatch). Mirrors `debug_capture_on_offline_node_...`.
+#[tokio::test]
+async fn new_taildrop_wire_requests_dispatch_and_report_node_not_up_offline() {
+    let harness = Harness::start().await;
+
+    let dir = std::env::temp_dir().join(format!("tnet-getdir-test-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+
+    // Each is a real CLI-emitted request line; all should hit the device-absent branch on a fresh
+    // (never-up) node and reply `node is not up`. Build via the typed `Request` so the wire `cmd`
+    // tags are exactly what the CLI emits (no hand-typed JSON to drift).
+    let cases: Vec<(&str, Request)> = vec![
+        (
+            "file get <dir> (FileGetDir, write)",
+            Request::FileGetDir {
+                dir: dir.to_string_lossy().into_owned(),
+                conflict: tailscaled_rs::localapi::ConflictPolicy::Skip,
+            },
+        ),
+        (
+            "file cp with --name (FileCp{name}, write)",
+            Request::FileCp {
+                path: "/tmp/whatever.bin".to_string(),
+                peer: "100.64.0.2".to_string(),
+                name: Some("renamed.bin".to_string()),
+            },
+        ),
+        (
+            "file cp --targets (FileTargets, read)",
+            Request::FileTargets,
+        ),
+    ];
+
+    for (label, req) in cases {
+        let line = serde_json::to_string(&req).expect("serialize request");
+        match harness.round_trip(&line).await {
+            Response::Error { message } => assert!(
+                message.contains("not up"),
+                "{label}: offline node should report 'not up', got: {message}"
+            ),
+            other => panic!("{label}: expected Response::Error on an offline node, got {other:?}"),
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+    harness.shutdown_and_verify().await;
+}
+
 /// 4. wire-format guard: assert the exact on-the-wire bytes of the request/response discriminants
 ///    at the integration boundary. This mirrors the unit tests in `localapi.rs` but guards against
 ///    wire drift from the consumer's side (the bytes the daemon and CLI must agree on).
@@ -488,6 +541,30 @@ async fn wire_format_discriminants_are_stable() {
     assert!(matches!(parsed, Request::Status));
     let parsed: Request = serde_json::from_str(r#"{"cmd":"down"}"#).expect("parse down request");
     assert!(matches!(parsed, Request::Down));
+
+    // The Taildrop verbs added this session — pin their `cmd` tags so a rename can't silently break
+    // the CLI↔daemon contract. `file_targets` (read) is a unit variant; `file_get_dir` carries
+    // `dir`+`conflict`; `file_cp` now carries an optional `name` (serde-default → absent when None).
+    assert_eq!(
+        serde_json::to_string(&Request::FileTargets).expect("serialize FileTargets"),
+        r#"{"cmd":"file_targets"}"#,
+        "file_targets request wire format drifted"
+    );
+    assert_eq!(
+        serde_json::to_string(&Request::FileCp {
+            path: "/p".into(),
+            peer: "peer".into(),
+            name: None,
+        })
+        .expect("serialize FileCp"),
+        r#"{"cmd":"file_cp","path":"/p","peer":"peer","name":null}"#,
+        "file_cp request wire format drifted"
+    );
+    // A pre-`name` daemon's `file_cp` JSON (no `name` key) must still parse — `#[serde(default)]`
+    // back-compat, so a mixed-version CLI/daemon pair doesn't break on the new field.
+    let parsed: Request = serde_json::from_str(r#"{"cmd":"file_cp","path":"/p","peer":"x"}"#)
+        .expect("parse file_cp without name (back-compat)");
+    assert!(matches!(parsed, Request::FileCp { name: None, .. }));
 }
 
 /// 5. WATCH wake-edge regression (the lost-wakeup fix in `Backend::finish_up`).
