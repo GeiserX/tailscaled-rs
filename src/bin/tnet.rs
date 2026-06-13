@@ -605,6 +605,14 @@ enum Command {
         #[command(subcommand)]
         cmd: ExitNodeCmd,
     },
+    /// Diagnose the system policy / MDM configuration (Go `tailscale syspolicy`). `list` prints the
+    /// effective policy; `reload` forces a re-read first. On Linux/Unix no policy store is registered
+    /// (Tailscale reads MDM policy only on Windows), so both normally print "No policy settings" —
+    /// this is the faithful, accurate result, not a stub.
+    Syspolicy {
+        #[command(subcommand)]
+        cmd: SyspolicyCmd,
+    },
     /// Print a shareable diagnostic marker for bug reports (Go `tailscale bugreport`). NOTE: this
     /// fork uploads no logs — the marker is a LOCAL identifier (id + daemon version + state) to quote
     /// when reporting an issue, not a server-retrievable log id.
@@ -856,6 +864,26 @@ enum DnsCmd {
 enum ExitNodeCmd {
     /// List tailnet peers offering to be exit nodes.
     List,
+}
+
+/// `tnet syspolicy` subcommands (Go `tailscale syspolicy`). Both honor `--json`.
+#[derive(Subcommand)]
+enum SyspolicyCmd {
+    /// Print the effective system policy (Go `tailscale syspolicy list`). On Linux/Unix no policy
+    /// store is registered, so this normally prints "No policy settings".
+    List {
+        /// Output as JSON (the snapshot as `{"scope":..,"settings":[..]}`).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Force a re-read of the system policy, then print it (Go `tailscale syspolicy reload`).
+    /// Re-reads the external policy sources; mutates no node state. With no registered store the
+    /// result matches `list`.
+    Reload {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// The `tnet switch` subcommands. Mirrors Go's `tailscale switch remove`.
@@ -1610,6 +1638,13 @@ async fn main() -> Result<()> {
         Command::ExitNode {
             cmd: ExitNodeCmd::List,
         } => run_exit_node_list(&socket).await,
+        // `syspolicy list`/`reload` (Go `tailscale syspolicy`): fetch + render the effective policy.
+        Command::Syspolicy {
+            cmd: SyspolicyCmd::List { json },
+        } => run_syspolicy(&socket, Request::SyspolicyList, json).await,
+        Command::Syspolicy {
+            cmd: SyspolicyCmd::Reload { json },
+        } => run_syspolicy(&socket, Request::SyspolicyReload, json).await,
         Command::File { cmd } => run_file(&socket, cmd).await,
     }
 }
@@ -3237,6 +3272,26 @@ async fn run_netcheck(socket: &std::path::Path, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// `syspolicy list` / `reload` (Go `tailscale syspolicy`): round-trip the given request (which the
+/// caller picks — [`Request::SyspolicyList`] or [`Request::SyspolicyReload`]) and render the
+/// effective-policy snapshot. Both verbs reply with [`Response::Policy`] and render identically; the
+/// only difference is whether the daemon forced a re-read first.
+async fn run_syspolicy(socket: &std::path::Path, request: Request, json: bool) -> Result<()> {
+    let report = match round_trip(socket, &request).await {
+        Ok(Response::Policy(r)) => r,
+        Ok(Response::Error { message }) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        Ok(other) => anyhow::bail!("unexpected response to syspolicy: {other:?}"),
+        Err(e) => {
+            return Err(e).with_context(|| format!("querying syspolicy at {}", socket.display()));
+        }
+    };
+    print!("{}", format_policy(&report, json));
+    Ok(())
+}
+
 /// `cert <domain>` (Go `tailscale cert`): round-trip a [`Request::Cert`], then write the issued
 /// cert+key PEMs. File handling mirrors Go's `runCert`: when neither `--cert-file` nor `--key-file`
 /// is given, default to `DOMAIN.crt` + `DOMAIN.key` in the cwd (with `*.` → `wildcard_.` so a wildcard
@@ -3888,6 +3943,122 @@ fn format_netcheck(r: &tailscaled_rs::localapi::NetcheckReport, json: bool) -> S
          UDP/IPv4/IPv6/MappingVariesByDestIP/PortMapping flags are not measured, and DERP regions \
          are shown by id as the engine carries no region name)\n",
     );
+    out
+}
+
+/// Render `tnet syspolicy list` / `reload`. The TEXT form is byte-faithful to Go's
+/// `printPolicySettings` (which prints through `text/tabwriter`): the empty case is exactly
+/// `No policy settings\n` (the normal result on Linux/Unix, where no policy store is registered);
+/// the populated case is the four-column `Name / Origin / Value / Error` table with a dashed
+/// separator, rows sorted by key, an error rendered `{...}` in the Error column (mutually exclusive
+/// with Value), and a trailing blank line. Crucially, value rows END IN WHITESPACE — Go's tabwriter
+/// pads the Value column out to width and the empty trailing Error cell leaves that padding at line
+/// end — so we keep it (see the `render_row` note) to match Go's exact bytes.
+///
+/// The `--json` form is the ONE intentional deviation: it emits the daemon's own `PolicyReport`
+/// (`{scope, settings:[{key,origin,value,error}, …]}`), tab-indented like Go's
+/// `json.MarshalIndent(policy, "", "\t")`, NOT Go's internal `setting.Snapshot` shape
+/// (`{Summary, Settings:{key:{…}}}`, which marshals an empty snapshot as `{}`). This is the daemon's
+/// own stable IPC wire type rendered directly; the data (keys/origins/values) is the same, but a
+/// script scraping `--json` should expect the fork's shape, not upstream's.
+///
+/// Every key/origin/value/error string is run through [`sanitize_for_terminal`] before display: a
+/// managed-platform policy store is an external/semi-trusted source, so the same escape-neutralizing
+/// hardening (each control char → `U+FFFD`) applied to control-supplied DNS/whois strings applies
+/// here — and it runs BEFORE the column-width computation, so a smuggled escape can't desync the
+/// columns (the `--json` path is serde-escaped). Pure (returns the string incl. its trailing
+/// newline) → unit-testable.
+fn format_policy(r: &tailscaled_rs::localapi::PolicyReport, json: bool) -> String {
+    if json {
+        use serde_json::Value;
+        // Serialize the report itself (serde already escapes); tab-indent to match Go's MarshalIndent.
+        let v: Value = serde_json::to_value(r).unwrap_or(Value::Null);
+        return format!(
+            "{}\n",
+            to_string_pretty_tabs(&v).unwrap_or_else(|_| "{}".to_string())
+        );
+    }
+
+    if r.settings.is_empty() {
+        // Go's exact empty-case string (no table, no trailing blank line).
+        return "No policy settings\n".to_string();
+    }
+
+    // Sort by key for stable output, matching Go's `slices.Sorted(policy.Keys())`. Clone the refs so
+    // the daemon's wire order is irrelevant to the rendering.
+    let mut rows: Vec<&tailscaled_rs::localapi::PolicySetting> = r.settings.iter().collect();
+    rows.sort_by(|a, b| a.key.cmp(&b.key));
+
+    // Width the columns to their contents (Go uses a tabwriter with padding 2). Compute the sanitized
+    // cells once so width + render agree, and so no escape sequence can desync the columns.
+    let header = ["Name", "Origin", "Value", "Error"];
+    let dashes = ["----", "------", "-----", "-----"];
+    let cells: Vec<[String; 4]> = rows
+        .iter()
+        .map(|s| {
+            let key = sanitize_for_terminal(&s.key);
+            let origin = sanitize_for_terminal(&s.origin);
+            // Go renders EITHER the value OR the error, never both: an error blanks the Value column
+            // and fills the Error column wrapped in `{...}`.
+            match &s.error {
+                Some(err) => [
+                    key,
+                    origin,
+                    String::new(),
+                    format!("{{{}}}", sanitize_for_terminal(err)),
+                ],
+                None => [
+                    key,
+                    origin,
+                    sanitize_for_terminal(s.value.as_deref().unwrap_or("")),
+                    String::new(),
+                ],
+            }
+        })
+        .collect();
+
+    // Column widths = the widest cell (in CHARS, matching tabwriter's rune counting — use
+    // `chars().count()` uniformly for header and cells so a non-ASCII header would still be correct).
+    let mut widths = [0usize; 4];
+    for (c, h) in header.iter().enumerate() {
+        widths[c] = h.chars().count();
+    }
+    for row in &cells {
+        for (c, cell) in row.iter().enumerate() {
+            widths[c] = widths[c].max(cell.chars().count());
+        }
+    }
+
+    // Render: header, dashed separator, then the rows. This reproduces Go's `text/tabwriter`
+    // (minwidth 0, padding 2, no flags): the first three cells are tab-terminated, so each is
+    // left-aligned to its column width plus 2 padding spaces; the fourth segment (Error) is the
+    // line's *trailing text* (after the final tab), printed as-is and never padded. A value row's
+    // Error segment is empty, so Go leaves the padded Value column's spaces at end of line — i.e.
+    // value rows END IN WHITESPACE. We deliberately keep that (no trailing trim) so the output is
+    // byte-identical to `tailscale syspolicy list`. Trailing blank line below = Go's `fmt.Println()`.
+    let render_row = |row: &[String; 4], out: &mut String| {
+        for (c, cell) in row.iter().enumerate() {
+            if c + 1 == row.len() {
+                // The trailing Error segment: raw, never padded (matches tabwriter's last cell).
+                out.push_str(cell);
+            } else {
+                // A tab-terminated cell: pad to the column width + 2, as tabwriter does — including
+                // the Value column on a value row, which is what produces Go's trailing whitespace.
+                let pad = widths[c].saturating_sub(cell.chars().count()) + 2;
+                out.push_str(cell);
+                out.push_str(&" ".repeat(pad));
+            }
+        }
+        out.push('\n');
+    };
+
+    let mut out = String::new();
+    render_row(&header.map(String::from), &mut out);
+    render_row(&dashes.map(String::from), &mut out);
+    for row in &cells {
+        render_row(row, &mut out);
+    }
+    out.push('\n');
     out
 }
 
@@ -7810,6 +7981,192 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&format_netcheck(&empty, true)).unwrap();
         assert_eq!(v["PreferredDERP"], serde_json::json!(0));
         assert_eq!(v["RegionLatency"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn format_policy_empty_is_no_policy_settings() {
+        use tailscaled_rs::localapi::PolicyReport;
+        // The normal Linux/Unix result: no registered store → empty snapshot → Go's exact string.
+        let empty = PolicyReport {
+            scope: "Device".into(),
+            settings: vec![],
+        };
+        assert_eq!(format_policy(&empty, false), "No policy settings\n");
+        // JSON form still emits a valid object carrying the scope (settings omitted when empty).
+        let v: serde_json::Value = serde_json::from_str(&format_policy(&empty, true)).unwrap();
+        assert_eq!(v["scope"], serde_json::json!("Device"));
+        // Tab indent like Go's MarshalIndent.
+        assert!(
+            format_policy(&empty, true).contains("\n\t\"scope\""),
+            "policy JSON must use tab indent"
+        );
+    }
+
+    #[test]
+    fn format_policy_populated_table_and_error_row() {
+        use tailscaled_rs::localapi::{PolicyReport, PolicySetting};
+        // Two value rows + one error row; supplied OUT of key order to prove the sort.
+        let r = PolicyReport {
+            scope: "Device".into(),
+            settings: vec![
+                PolicySetting {
+                    key: "ExitNodeID".into(),
+                    origin: "Platform (Device)".into(),
+                    value: Some("n123".into()),
+                    error: None,
+                },
+                PolicySetting {
+                    key: "AuthKey".into(),
+                    origin: "Platform (Device)".into(),
+                    value: None,
+                    error: Some("decrypt failed".into()),
+                },
+                PolicySetting {
+                    key: "LoginURL".into(),
+                    origin: "Platform (Device)".into(),
+                    value: Some("https://controlplane.example".into()),
+                    error: None,
+                },
+            ],
+        };
+        let h = format_policy(&r, false);
+        // Header + dashed separator present.
+        assert!(h.contains("Name"), "{h}");
+        assert!(h.contains("Origin"), "{h}");
+        assert!(h.contains("Value"), "{h}");
+        assert!(h.contains("Error"), "{h}");
+        assert!(h.contains("----"), "{h}");
+        // Rows sorted by key: AuthKey < ExitNodeID < LoginURL.
+        let a = h.find("AuthKey").unwrap();
+        let e = h.find("ExitNodeID").unwrap();
+        let l = h.find("LoginURL").unwrap();
+        assert!(a < e && e < l, "rows must be sorted by key: {h}");
+        // The error row wraps the error in {...} and shows no value.
+        assert!(h.contains("{decrypt failed}"), "{h}");
+        // A value row shows its value.
+        assert!(h.contains("https://controlplane.example"), "{h}");
+        // Trailing blank line (Go's fmt.Println()).
+        assert!(
+            h.ends_with("\n\n"),
+            "policy table ends with a blank line: {h:?}"
+        );
+
+        // JSON: settings round-trip with all four logical fields.
+        let v: serde_json::Value = serde_json::from_str(&format_policy(&r, true)).unwrap();
+        assert_eq!(v["scope"], serde_json::json!("Device"));
+        assert_eq!(v["settings"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn format_policy_table_is_byte_faithful_to_go_tabwriter() {
+        use tailscaled_rs::localapi::{PolicyReport, PolicySetting};
+        // GOLDEN test: the populated table must be byte-for-byte what Go's `printPolicySettings`
+        // emits through `text/tabwriter` (minwidth 0, padding 2, padchar ' ', flags 0). The expected
+        // literal below was generated by reproducing tabwriter's algorithm for this exact input.
+        // KEY POINT (the one all three reviewers flagged): value rows END IN TRAILING WHITESPACE —
+        // Go's value-row format `"%s\t%s\t%v\t\n"` tab-terminates the Value cell, so tabwriter pads it
+        // to the column width and the empty trailing Error cell leaves that padding at end of line.
+        // We must NOT trim it, or we diverge from Go. Error rows (`"%s\t%s\t\t{%v}\n"`) end on the
+        // non-empty trailing Error text, so they are not padded. Widths here: Name=10 (ExitNodeID),
+        // Origin=17 (Platform (Device)), Value=28 (the URL).
+        let r = PolicyReport {
+            scope: "Device".into(),
+            settings: vec![
+                PolicySetting {
+                    key: "ExitNodeID".into(),
+                    origin: "Platform (Device)".into(),
+                    value: Some("n123".into()),
+                    error: None,
+                },
+                PolicySetting {
+                    key: "AuthKey".into(),
+                    origin: "Platform (Device)".into(),
+                    value: None,
+                    error: Some("decrypt failed".into()),
+                },
+                PolicySetting {
+                    key: "LoginURL".into(),
+                    origin: "Platform (Device)".into(),
+                    value: Some("https://controlplane.example".into()),
+                    error: None,
+                },
+            ],
+        };
+        // Build the expected bytes with an explicit tab-terminated-cell padder. Source-literal lines
+        // can't carry trailing whitespace (editors/`cargo fmt` strip it, and it's invisible), so the
+        // value rows' trailing padding is injected here — this is exactly what must NOT be trimmed.
+        // `pad` left-aligns a cell to `width` + 2 spaces, matching tabwriter (padding 2). The widths
+        // (Name=10, Origin=17, Value=28) are hand-derived from the inputs above.
+        let pad =
+            |s: &str, width: usize| format!("{s}{}", " ".repeat(width - s.chars().count() + 2));
+        let mut expected = String::new();
+        // Header + dashed separator (Value/Origin/Name are tab-terminated → padded; Error trailing).
+        expected.push_str(&pad("Name", 10));
+        expected.push_str(&pad("Origin", 17));
+        expected.push_str(&pad("Value", 28));
+        expected.push_str("Error\n");
+        expected.push_str(&pad("----", 10));
+        expected.push_str(&pad("------", 17));
+        expected.push_str(&pad("-----", 28));
+        expected.push_str("-----\n");
+        // AuthKey: error row — empty Value cell (still padded to width), error trailing, unpadded.
+        expected.push_str(&pad("AuthKey", 10));
+        expected.push_str(&pad("Platform (Device)", 17));
+        expected.push_str(&pad("", 28));
+        expected.push_str("{decrypt failed}\n");
+        // ExitNodeID + LoginURL: value rows — the Value cell is padded (so the line ENDS in spaces),
+        // and the empty trailing Error cell contributes nothing. This is Go's behavior we must match.
+        expected.push_str(&pad("ExitNodeID", 10));
+        expected.push_str(&pad("Platform (Device)", 17));
+        expected.push_str(&pad("n123", 28));
+        expected.push('\n');
+        expected.push_str(&pad("LoginURL", 10));
+        expected.push_str(&pad("Platform (Device)", 17));
+        expected.push_str(&pad("https://controlplane.example", 28));
+        expected.push('\n');
+        expected.push('\n'); // trailing blank line (Go's `fmt.Println()` after `w.Flush()`)
+
+        assert_eq!(
+            format_policy(&r, false),
+            expected,
+            "policy table must be byte-identical to Go's tabwriter output (incl. value-row trailing \
+             whitespace)"
+        );
+        // Independently pin the no-trim fix with concrete counts (so this can't silently pass if the
+        // padder and the renderer ever shared the same off-by-one): the `n123` value (4 chars) is
+        // padded to width 28 + 2 → 26 trailing spaces; the 28-char URL → exactly 2 trailing spaces.
+        assert!(
+            format_policy(&r, false).contains(&format!("n123{}\n", " ".repeat(26))),
+            "value row must keep Go's trailing padding (26 spaces after n123)"
+        );
+        assert!(
+            format_policy(&r, false).contains("https://controlplane.example  \n"),
+            "the widest value gets exactly 2 trailing spaces, like tabwriter"
+        );
+    }
+
+    #[test]
+    fn format_policy_sanitizes_terminal_escapes() {
+        use tailscaled_rs::localapi::{PolicyReport, PolicySetting};
+        // A malicious/managed store could smuggle an ANSI escape or a newline into a key/value; the
+        // renderer must NEUTRALIZE controls (each → U+FFFD) so it can't forge a row or hijack the
+        // terminal (defense in depth, matching the DNS/whois hardening).
+        let r = PolicyReport {
+            scope: "Device".into(),
+            settings: vec![PolicySetting {
+                key: "Evil\u{1b}[31m".into(),
+                origin: "Platform (Device)".into(),
+                value: Some("bad\nFakeKey  forged".into()),
+                error: None,
+            }],
+        };
+        let h = format_policy(&r, false);
+        assert!(!h.contains('\u{1b}'), "escape byte must be stripped: {h:?}");
+        // The embedded newline must not survive to forge a second row.
+        assert!(
+            !h.contains("bad\nFakeKey"),
+            "embedded newline must be neutralized: {h:?}"
+        );
     }
 
     #[test]

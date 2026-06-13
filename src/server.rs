@@ -633,6 +633,13 @@ async fn dispatch(
                 },
             }
         }
+        // `syspolicy list`/`reload` (Go `tailscale syspolicy`, read-only). NO lock + NO device:
+        // policy resolution reads OS/registered policy stores, independent of node lifecycle, so it
+        // works whether or not the node is up (and never touches the engine). On Linux/Unix no store
+        // is registered → an empty snapshot. The two verbs differ only in that `reload` forces a
+        // re-read (a no-op while there are zero sources).
+        Request::SyspolicyList => Backend::syspolicy_list(),
+        Request::SyspolicyReload => Backend::syspolicy_reload(),
         // `cert <domain>` (Go `tailscale cert`): issue a TLS cert+key via the tailnet ACME flow.
         // Off-lock device call (issuance is a control round-trip, potentially slow). Needs the node up
         // (issuance goes through the live engine's control connection); fail-closed without `acme`.

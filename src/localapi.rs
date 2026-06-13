@@ -252,6 +252,21 @@ pub enum Request {
     /// to be up (the measurements come from the live engine's net-report). NOTE: this fork's
     /// net-report measures ONLY DERP-region latency (see [`NetcheckReport`]).
     Netcheck,
+    /// Report the effective system policy / MDM configuration (Go `tailscale syspolicy list`).
+    /// Replies with [`Response::Policy`]. Read-only — Go gates BOTH `list` and `reload` on
+    /// `PermitRead` (the LocalAPI `policy/` handler checks only `PermitRead`), so this is classified
+    /// like [`Status`](Request::Status). Node-up-independent: policy resolution reads OS/registered
+    /// policy stores, not the netmap, so it works whether or not the node is up. On a Linux/Unix host
+    /// no policy store is registered, so the reply is an empty-but-valid snapshot (the CLI prints "No
+    /// policy settings") — matching Go's runtime behavior on those platforms.
+    SyspolicyList,
+    /// Force a re-read + re-merge of the effective system policy (Go `tailscale syspolicy reload`).
+    /// Replies with [`Response::Policy`]. Despite being a "reload", it mutates **no node state** — it
+    /// re-reads the external policy sources — so Go gates it on `PermitRead` (same handler as
+    /// `list`), and this is classified read-only like [`SyspolicyList`](Request::SyspolicyList). With
+    /// no registered policy store (Linux/Unix) the forced re-read re-merges zero sources and yields
+    /// the same empty snapshot as `list`.
+    SyspolicyReload,
     /// Provision (or fetch) a TLS certificate + key for `domain` via the tailnet's ACME flow (Go
     /// `tailscale cert <domain>`). Replies with [`Response::Cert`] carrying the leaf+chain and the
     /// private key as PEM. Requires the node to be up (issuance goes through the live engine's
@@ -514,6 +529,9 @@ pub enum Response {
     /// The node's network-conditions report (reply to [`Request::Netcheck`]), rendered by
     /// `tnet netcheck`.
     Netcheck(NetcheckReport),
+    /// The effective system policy snapshot (reply to [`Request::SyspolicyList`] /
+    /// [`Request::SyspolicyReload`]), rendered by `tnet syspolicy list` / `reload`.
+    Policy(PolicyReport),
     /// An issued TLS certificate (reply to [`Request::Cert`]), written out by `tnet cert`. Both fields
     /// are PEM text: `cert_pem` is the leaf + intermediate chain, `key_pem` is the private key. The
     /// key is sensitive — the CLI writes it `0600` and the daemon never logs it.
@@ -629,6 +647,50 @@ pub struct WhoisReport {
     /// last-seen is "now". Back-compatible (omitted when absent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen: Option<String>,
+}
+
+/// The effective system-policy snapshot, returned by [`Request::SyspolicyList`] /
+/// [`Request::SyspolicyReload`] and rendered by `tnet syspolicy list` / `reload`. The Rust analogue
+/// of Go's `util/syspolicy/setting.Snapshot`: a scope plus the merged set of policy settings.
+///
+/// On a Linux/Unix host no policy store is registered, so [`settings`](PolicyReport::settings) is
+/// empty and the CLI prints "No policy settings" — matching Go's runtime behavior (Go registers a
+/// store only on Windows). The struct still carries the full shape so a future managed-platform
+/// source (or the wire from a host that DID resolve settings) round-trips faithfully.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyReport {
+    /// The scope the snapshot was resolved for, as Go's `PolicyScope.String()` spells it — `"Device"`
+    /// on every non-Windows host (Go's `setting.DefaultScope()` is the device scope, which is what
+    /// the CLI always requests). Carried so the renderer/JSON can show which scope was queried.
+    pub scope: String,
+    /// The merged policy settings, sorted by key for stable rendering (Go sorts with
+    /// `slices.Sorted(policy.Keys())` before printing). Empty on a host with no registered policy
+    /// store. Each entry is one resolved policy key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub settings: Vec<PolicySetting>,
+}
+
+/// One resolved policy setting inside a [`PolicyReport`] — the Rust analogue of Go's
+/// `setting.RawItem` keyed by its policy name. Carries the value, the originating store, and any
+/// resolution error, mirroring the four CLI columns (Name / Origin / Value / Error).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicySetting {
+    /// The policy key (Go `pkey.Key` — e.g. `"LoginURL"`, `"ExitNodeID"`). The "Name" column.
+    pub key: String,
+    /// The originating policy store, as Go's `Origin.String()` renders it (e.g. `"Platform
+    /// (Device)"`), or empty when the setting has no recorded origin. The "Origin" column.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub origin: String,
+    /// The resolved value rendered as a string (Go prints the `any` value with `%v`). `None` when the
+    /// setting resolved to an error instead of a value (then [`error`](PolicySetting::error) is set).
+    /// The "Value" column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// The resolution error for this key, if any (Go prints it wrapped in `{...}` in the "Error"
+    /// column). Mutually exclusive with [`value`](PolicySetting::value) in Go's renderer. `None` when
+    /// the setting resolved cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// A single waiting Taildrop file, returned by [`Request::FileList`]. Mirrors the engine's
