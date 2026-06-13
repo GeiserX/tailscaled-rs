@@ -34,15 +34,19 @@ use super::UpOptions;
 /// any non-default pref the command did not mention — returning the list of such reverts (empty =
 /// the `up` is safe to proceed). The Rust analogue of Go's `checkForAccidentalSettingReverts`.
 ///
-/// `ever_configured` is the node's "has been brought up/down before" signal (the daemon derives it
-/// from the prefs-file's existence); it is the analogue of Go's `curPrefs.ControlURL == ""`
-/// fresh-install check.
+/// `has_logged_in` is the node's "has actually registered / reached Running before" signal (the
+/// daemon's `Prefs::has_logged_in`, the analogue of Go's `Persist.UserProfile.LoginName != ""`). It is
+/// deliberately NOT the daemon's `ever_configured` (prefs-file existence): Go's check is
+/// `curPrefs.ControlURL == ""` (never logged in), and Go's `set` never writes ControlURL, so a
+/// `set`-then-`up` on a fresh node stays unguarded there — keying on prefs-file existence (which a
+/// bare `set` creates) would wrongly arm the guard on that sequence. See bead tsd-i7c.
 ///
 /// ## Two exemptions (both mirror Go)
 ///
-/// 1. **Fresh node** (`!ever_configured`): a node that was never configured has no settings to
-///    accidentally lose, so the first `up` is never guarded (Go's `curPrefs.ControlURL == ""`
-///    early-return).
+/// 1. **Fresh node** (`!has_logged_in`): a node that has never logged in has no settings worth
+///    guarding, so the first real `up` is never guarded (Go's `curPrefs.ControlURL == ""`
+///    early-return). A `tnet set` before that first `up` does NOT arm the guard (it does not log the
+///    node in), matching Go's `set`-never-writes-ControlURL behavior.
 /// 2. **Bare `up`** (`!opts.mentions_any_pref()`): an `up` that names no prefs is "just connect,
 ///    change nothing" (Go's `simpleUp`). Our PATCH merge changes nothing in that case, so there is
 ///    nothing to revert — guarding it would wrongly flag *every* non-default pref. Skip it.
@@ -56,10 +60,10 @@ use super::UpOptions;
 pub(super) fn check_accidental_reverts(
     prefs: &Prefs,
     opts: &UpOptions,
-    ever_configured: bool,
+    has_logged_in: bool,
 ) -> Vec<RevertedPref> {
-    // Exemption 1: fresh node — nothing to lose.
-    if !ever_configured {
+    // Exemption 1: never-logged-in node — no settings worth guarding (Go's ControlURL=="" early-return).
+    if !has_logged_in {
         return Vec::new();
     }
     // Exemption 2: bare `up` (Go's simpleUp) — names no prefs, so changes nothing.
@@ -198,6 +202,7 @@ mod tests {
             logged_out: _,   // lifecycle — `up`/`logout` own it directly.
             ephemeral: _,    // registration-time property; no `up`/`set` flag controls it.
             taildrop_dir: _, // configured out-of-band (engine Config), not an `up` flag.
+            has_logged_in: _, // registration signal — the guard's own fresh-node INPUT, never a guarded setting (tsd-i7c).
             // --- UP-MANAGED (MUST be in reset + guard; asserted at runtime below) ---
             control_url: _,
             hostname: _,
@@ -335,7 +340,10 @@ mod tests {
 
     #[test]
     fn fresh_node_is_never_guarded() {
-        // ever_configured = false → first up is exempt even with mentioned flags + non-default prefs.
+        // has_logged_in = false → the first real `up` is exempt even with mentioned flags +
+        // non-default prefs (Go's `curPrefs.ControlURL == ""` early-return). This is the key tsd-i7c
+        // case: a node that has a prefs.json (e.g. from a prior `tnet set`) but has NEVER logged in is
+        // still treated as fresh, so a `set`-then-`up` sequence is not spuriously rejected.
         let prefs = configured_prefs();
         let opts = UpOptions {
             ssh: Some(true),

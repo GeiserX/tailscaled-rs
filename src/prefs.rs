@@ -102,6 +102,18 @@ pub struct Prefs {
     /// TUN interface MTU; `None` uses the transport default. Tailscale's overlay MTU is 1280.
     /// Ignored unless [`tun_enabled`](Prefs::tun_enabled) is `true`.
     pub tun_mtu: Option<u16>,
+    /// Whether this node has ever actually **logged in** (completed registration / reached `Running`).
+    /// The faithful analogue of Go's `Persist.UserProfile.LoginName != ""` — distinct from "has a
+    /// prefs file" (the daemon's `ever_configured`, derived from prefs.json existence + flipped by a
+    /// bare `set`/`logout`). Used **only** by the accidental-revert guard's fresh-node exemption (Go's
+    /// `curPrefs.ControlURL == ""` early-return): a node that has never logged in has no settings worth
+    /// guarding, so the first real `up` is unguarded even if a prior `tnet set` already wrote a
+    /// prefs.json. Set `true` when the node registers (see the bring-up path); never reset by `set`.
+    /// `#[serde(default)]` (container-level) migrates an old prefs.json with no key → `false`, so the
+    /// first `up` after a daemon upgrade is unguarded once (acceptable — it cannot lose a setting the
+    /// operator didn't just then decline to re-mention on an already-running node).
+    #[serde(default)]
+    pub has_logged_in: bool,
 }
 
 impl Default for Prefs {
@@ -124,6 +136,7 @@ impl Default for Prefs {
             tun_enabled: false,
             tun_name: None,
             tun_mtu: None,
+            has_logged_in: false,
         }
     }
 }
