@@ -1606,7 +1606,7 @@ async fn run_up(
                         // re-running with the same key loops forever. Surface the reason and exit
                         // non-zero (mirroring the `Response::Error` path below).
                         eprintln!();
-                        eprintln!("registration failed: {}", sanitize_for_terminal(&reason));
+                        eprintln!("registration failed: {}", sanitize_multiline(&reason));
                         eprintln!(
                             "(this is a permanent failure — re-run `tnet up --authkey <NEW_KEY>` \
                              with a fresh key; the same key will keep failing)"
@@ -2876,7 +2876,10 @@ fn format_netcheck(r: &tailscaled_rs::localapi::NetcheckReport, json: bool) -> S
 
 /// Render `tnet exit-node list`: one line per peer offering to be an exit node (IP, hostname, and
 /// online state when known), or a placeholder when none. Country/City columns (Go) are omitted —
-/// this fork has no control-supplied Location data. Pure → unit-testable.
+/// this fork has no control-supplied Location data. The hostname is control-supplied (netmap), so it
+/// is run through `sanitize_for_terminal` before display — both to strip terminal escapes and so an
+/// embedded `\n`/`\t` can't forge a fake exit-node row or shift the column (same hardening as
+/// `format_file_targets`/`format_whois`; see THREAT_MODEL §4.8). Pure → unit-testable.
 fn format_exit_node_list(peers: &[tailscaled_rs::localapi::PeerReport]) -> String {
     let exits: Vec<&tailscaled_rs::localapi::PeerReport> =
         peers.iter().filter(|p| p.is_exit_node).collect();
@@ -2890,7 +2893,12 @@ fn format_exit_node_list(peers: &[tailscaled_rs::localapi::PeerReport]) -> Strin
             Some(false) => "  (offline)",
             None => "",
         };
-        out.push_str(&format!("{:<16} {}{}\n", p.ipv4, p.name, online));
+        out.push_str(&format!(
+            "{:<16} {}{}\n",
+            p.ipv4,
+            sanitize_for_terminal(&p.name),
+            online
+        ));
     }
     out
 }
@@ -3178,21 +3186,50 @@ fn format_revert_guard(reverts: &[RevertedPref]) -> String {
     out
 }
 
-/// Sanitize a control-plane-supplied string before printing it to the terminal.
+/// Sanitize a control-plane-supplied string for printing as a **single-line / columnar cell** — the
+/// safe default for terminal output.
 ///
-/// The registration-failure `reason` (and, defensively, any other server-supplied text) originates
-/// from the control server, which the daemon treats as only semi-trusted. Printing it verbatim would
-/// let a malicious or compromised control server smuggle ANSI/terminal escape sequences (cursor
-/// moves, color, clear-screen, even hyperlink/OSC injection) into the operator's terminal. We strip
-/// every C0/C1 control character except plain whitespace (`\t`, `\n`, `\r`) so the reason renders as
-/// inert text. This is display hardening only — the wire value is unchanged.
+/// Server-supplied text (a peer's `ComputedName`, a DNS resolver/suffix, an AUMHash, a Taildrop file
+/// name, …) originates from the control server / a sending peer, which the daemon treats as only
+/// semi-trusted. Two distinct injection classes have to be defused:
+///
+/// 1. **Terminal-escape injection.** Printing the value verbatim would let a malicious or compromised
+///    server smuggle ANSI/terminal escape sequences (cursor moves, color, clear-screen, even
+///    hyperlink/OSC injection) into the operator's terminal.
+/// 2. **Delimiter / column / row injection.** Our human-readable renderers are *structured*:
+///    `file cp --targets` prints TAB-separated columns (`<ip>\t<name>\t<status>`), and `whois` /
+///    `file list` / `dns status` / `lock status` print one record per line. A control-supplied name
+///    containing a literal `\t` could forge an extra column (a fake IP or a fake `offline` status),
+///    and an embedded `\n` could forge an entirely fake row/line. Go's `tailscale` does no
+///    sanitization here at all and *is* vulnerable to this; this fork is deliberately stricter.
+///
+/// So this neutralizes **every** C0/C1 control character — including the structural whitespace
+/// `\t`/`\n`/`\r` — to a visible `U+FFFD` placeholder. The affected fields (IPs, DNS names, hostnames,
+/// hashes) never legitimately contain those bytes, so this is lossless for real data and display
+/// hardening only — the wire value is unchanged. For genuinely free-form, possibly multi-line text
+/// (the registration-failure `reason`) use [`sanitize_multiline`] instead, which preserves `\t`/`\n`.
 fn sanitize_for_terminal(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect()
+}
+
+/// Sanitize a control-supplied string that is rendered as **free-form, possibly multi-line** text
+/// (the registration-failure `reason`, printed as `registration failed: <reason>`).
+///
+/// Unlike [`sanitize_for_terminal`], this preserves plain whitespace (`\t`, `\n`, `\r`) so a
+/// multi-line reason still renders across lines — matching Go, which prints the reason raw. It is safe
+/// to keep the newlines here precisely because the reason is *not* structured output: it is not parsed
+/// into columns or rows, so an embedded `\n` can only wrap the message, not forge a fake table cell.
+/// Every other C0/C1 control (ESC, BEL, …) is still stripped to `U+FFFD`, so escape-sequence injection
+/// is defused exactly as in the single-line path. Use this ONLY for free-form message text; anything
+/// rendered into a delimited/columnar line MUST use [`sanitize_for_terminal`].
+fn sanitize_multiline(s: &str) -> String {
     s.chars()
         .map(|c| {
             if c == '\t' || c == '\n' || c == '\r' {
                 c
             } else if c.is_control() {
-                // C0 (incl. ESC 0x1B) and C1 controls → a visible placeholder, never the raw byte.
                 '\u{FFFD}'
             } else {
                 c
@@ -3403,7 +3440,10 @@ fn format_whois(w: &tailscaled_rs::localapi::WhoisReport, ip: &str) -> String {
         out.push_str(&format!("node:         {}\n", sanitize_for_terminal(name)));
     }
     if let Some(v4) = w.node_ipv4.as_deref() {
-        out.push_str(&format!("ipv4:         {v4}\n"));
+        // Control-supplied like the rest of the whois fields; sanitize uniformly (defense-in-depth —
+        // a parsed IP can't hold control bytes today, but the rule is "every off-box field", so there
+        // is no per-field judgement call about which ones are "safe enough" to print raw).
+        out.push_str(&format!("ipv4:         {}\n", sanitize_for_terminal(v4)));
     }
     if let Some(user) = w.user.as_deref() {
         // `user` originates from control too; sanitize it before printing.
@@ -3474,11 +3514,32 @@ fn format_whois(w: &tailscaled_rs::localapi::WhoisReport, ip: &str) -> String {
 
 /// Render a [`StatusReport`] to stdout (the shared one-shot + watch formatter).
 fn print_status(s: &tailscaled_rs::localapi::StatusReport) {
-    println!("state:        {}", s.state);
-    println!("want_running: {}", s.want_running);
-    println!(
+    print!("{}", format_status(s));
+}
+
+/// Render the human-readable `tnet status` text (a [`StatusReport`]). Pure (returns the whole block,
+/// trailing newline included) so it is unit-testable — in particular so the sanitization of the
+/// control-supplied `self`/`exit-node`/peer names is provable, not just printed. The caller `print!`s
+/// it. Every off-box (control/netmap-supplied) name below is run through `sanitize_for_terminal` —
+/// single-line cells, so an embedded `\t`/`\n` can neither forge a fake status line / peer row nor
+/// break a fixed-width column — except the free-form registration `reason`, which uses
+/// `sanitize_multiline` (multi-line message; see THREAT_MODEL §4.8).
+fn format_status(s: &tailscaled_rs::localapi::StatusReport) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    // `writeln!` into a String is infallible; the `let _ =` keeps clippy quiet without `.unwrap()`.
+    let _ = writeln!(out, "state:        {}", s.state);
+    let _ = writeln!(out, "want_running: {}", s.want_running);
+    // `self_name` is this node's control-supplied display name (netmap ComputedName); sanitize it so
+    // it can't smuggle terminal escapes or, via an embedded `\n`, forge extra status lines (e.g. a
+    // spoofed `registration failed:` / `peers:` line). Same hardening as the peer list; §4.8.
+    let _ = writeln!(
+        out,
         "self:         {} {}",
-        s.self_name.as_deref().unwrap_or("(unknown)"),
+        s.self_name
+            .as_deref()
+            .map(sanitize_for_terminal)
+            .unwrap_or_else(|| "(unknown)".to_string()),
         s.self_ipv4.as_deref().unwrap_or("-")
     );
     // Configured posture (the node's persisted prefs), so `tnet status` shows what `up`/`set` left
@@ -3486,19 +3547,19 @@ fn print_status(s: &tailscaled_rs::localapi::StatusReport) {
     // only when it carries non-default information, to keep a plain node's status uncluttered.
     let p = &s.prefs;
     if let Some(en) = p.exit_node.as_deref() {
-        println!("exit-node:    {en}");
+        let _ = writeln!(out, "exit-node:    {en}");
     }
     if p.advertise_exit_node {
-        println!("advertising:  exit-node");
+        let _ = writeln!(out, "advertising:  exit-node");
     }
     if !p.advertise_routes.is_empty() {
-        println!("adv-routes:   {}", p.advertise_routes.join(", "));
+        let _ = writeln!(out, "adv-routes:   {}", p.advertise_routes.join(", "));
     }
     if p.accept_routes {
-        println!("accept-routes: on");
+        let _ = writeln!(out, "accept-routes: on");
     }
     if p.shields_up {
-        println!("shields-up:   on");
+        let _ = writeln!(out, "shields-up:   on");
     }
     if p.ssh {
         // Distinguish the *enabled* pref from the server actually *running*. The task can die at
@@ -3508,28 +3569,29 @@ fn print_status(s: &tailscaled_rs::localapi::StatusReport) {
         // (`ssh_running: false`) and must not be reported as a broken SSH server.
         let node_should_serve = s.state == "Running" || s.state == "Starting";
         if node_should_serve && !p.ssh_running {
-            println!("ssh-server:   on (NOT RUNNING — check logs)");
+            let _ = writeln!(out, "ssh-server:   on (NOT RUNNING — check logs)");
         } else {
-            println!("ssh-server:   on");
+            let _ = writeln!(out, "ssh-server:   on");
         }
     }
     if p.tun {
-        println!("tun:          on");
+        let _ = writeln!(out, "tun:          on");
     }
     // Interactive login: when the node is waiting for a human to authorize it, the daemon surfaces
     // the control auth URL — make it prominent so the operator can click it.
     if let Some(url) = s.auth_url.as_deref() {
-        println!();
-        println!("To authenticate this node, visit:");
-        println!("    {url}");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "To authenticate this node, visit:");
+        let _ = writeln!(out, "    {url}");
     }
     // Terminal registration failure: distinct from `auth_url`, this means registration hard-failed
     // and the engine will not retry. Re-running with the same key loops forever, so spell out that
     // the operator must re-authenticate with a fresh key.
     if let Some(reason) = s.error.as_deref() {
-        println!();
-        println!("registration failed: {}", sanitize_for_terminal(reason));
-        println!(
+        let _ = writeln!(out);
+        let _ = writeln!(out, "registration failed: {}", sanitize_multiline(reason));
+        let _ = writeln!(
+            out,
             "(this is a permanent failure — re-run `tnet up --authkey <NEW_KEY>` with a fresh \
              key; the same key will keep failing)"
         );
@@ -3537,18 +3599,29 @@ fn print_status(s: &tailscaled_rs::localapi::StatusReport) {
     // The exit node currently engaged (Go `ExitNodeStatus`), distinct from the *configured* selector
     // above: this is what traffic actually egresses through right now (the engine's fail-closed answer).
     if let Some(active) = s.active_exit_node.as_deref() {
-        println!("exit-node:    {active} (active)");
+        // `active_exit_node` resolves to the exit peer's control-supplied display name (netmap), so
+        // sanitize before display — same single-line hardening as `self_name`/the peer list (§4.8).
+        let _ = writeln!(
+            out,
+            "exit-node:    {} (active)",
+            sanitize_for_terminal(active)
+        );
     }
-    println!("peers:        {}", s.peers.len());
+    let _ = writeln!(out, "peers:        {}", s.peers.len());
     for p in &s.peers {
-        println!(
+        // `p.name` is the peer's control-supplied hostname: sanitize before display so it cannot
+        // smuggle terminal escapes or, via an embedded `\t`/`\n`, forge a fake peer row or break the
+        // fixed-width column layout (same hardening as the other listings; §4.8).
+        let _ = writeln!(
+            out,
             "  - {:<28} {:<16}{}{}",
-            p.name,
+            sanitize_for_terminal(&p.name),
             p.ipv4,
             if p.is_exit_node { "  [exit]" } else { "" },
             peer_status_cell(p),
         );
     }
+    out
 }
 
 /// The Go-`printPS`-flavored status cell for a peer: direct-vs-relay + an offline/last-seen suffix.
@@ -3806,10 +3879,7 @@ async fn wait_for_running(socket: &std::path::Path, timeout_secs: Option<u64>) -
             match wait_decision(&s) {
                 WaitStep::Done => return Ok(()),
                 WaitStep::Failed(reason) => {
-                    anyhow::bail!(
-                        "node registration failed: {}",
-                        sanitize_for_terminal(&reason)
-                    )
+                    anyhow::bail!("node registration failed: {}", sanitize_multiline(&reason))
                 }
                 WaitStep::Keep => {}
             }
@@ -5633,6 +5703,55 @@ mod tests {
     }
 
     #[test]
+    fn format_file_targets_resists_column_and_row_injection() {
+        use tailscaled_rs::localapi::FileTargetReport;
+        // `file cp --targets` renders TAB-separated columns, one peer per line. A malicious control
+        // server could set a peer's ComputedName to embed a TAB (forging a fake `offline`/IP column)
+        // or a newline (forging an entire fake peer row). The name MUST NOT be able to introduce a
+        // structural delimiter — only the renderer itself emits `\t`/`\n`.
+        let targets = vec![FileTargetReport {
+            ip: "100.64.0.2".to_string(),
+            name: "real\toffline\n100.64.0.99\tfake-peer".to_string(),
+            online: Some(true),
+        }];
+        let out = format_file_targets(&targets);
+        // Exactly ONE row (one trailing newline, no interior newline forged by the name).
+        assert_eq!(out.matches('\n').count(), 1, "forged extra row: {out:?}");
+        // A single online peer → exactly ONE column separator (ip<TAB>name, no status column, and the
+        // name contributed no extra TAB).
+        assert_eq!(out.matches('\t').count(), 1, "forged extra column: {out:?}");
+        // The forged literals survive as inert visible text (neutralized to U+FFFD), so nothing is
+        // silently dropped — the operator still sees the suspicious name.
+        assert!(
+            out.contains('\u{FFFD}'),
+            "delimiters not neutralized: {out:?}"
+        );
+        assert!(out.contains("fake-peer"), "name text lost: {out:?}");
+    }
+
+    #[test]
+    fn sanitizers_split_on_structural_whitespace() {
+        // The single-line/columnar default neutralizes ALL control chars, INCLUDING `\t`/`\n`/`\r`,
+        // so it can never forge a column or row.
+        let s = sanitize_for_terminal("a\tb\nc\rd\x1be");
+        assert!(
+            !s.contains('\t') && !s.contains('\n') && !s.contains('\r') && !s.contains('\x1b'),
+            "{s:?}"
+        );
+        assert_eq!(s, "a\u{FFFD}b\u{FFFD}c\u{FFFD}d\u{FFFD}e");
+
+        // The free-form multiline variant keeps `\t`/`\n`/`\r` (so a multi-line reason stays legible)
+        // but still strips other C0/C1 escapes like ESC.
+        let m = sanitize_multiline("a\tb\nc\rd\x1be");
+        assert!(
+            m.contains('\t') && m.contains('\n') && m.contains('\r'),
+            "{m:?}"
+        );
+        assert!(!m.contains('\x1b'), "{m:?}");
+        assert_eq!(m, "a\tb\nc\rd\u{FFFD}e");
+    }
+
+    #[test]
     fn format_files_got_renders_success_and_failure_lines() {
         use tailscaled_rs::localapi::FileGotReport;
         // A drain with one success (written elsewhere under rename), one failure (left in inbox).
@@ -5914,11 +6033,12 @@ mod tests {
 
     #[test]
     fn sanitize_strips_terminal_escapes_keeps_plain_text() {
-        // A control-supplied failure reason is only semi-trusted; before we print it, ANSI/terminal
-        // escapes must be neutralized so a malicious control server can't drive the operator's
-        // terminal. Plain text + ordinary whitespace survive unchanged.
+        // The registration-failure reason is the one free-form, possibly multi-line field, so it is
+        // printed via `sanitize_multiline`: ANSI/terminal escapes must be neutralized so a malicious
+        // control server can't drive the operator's terminal, but plain text AND ordinary whitespace
+        // (so a multi-line message stays legible) survive unchanged.
         let evil = "auth rejected\x1b[2J\x1b[31mFAKE PROMPT\x07 token=\x00secret";
-        let clean = sanitize_for_terminal(evil);
+        let clean = sanitize_multiline(evil);
         assert!(
             !clean.contains('\x1b'),
             "ESC must be stripped, got {clean:?}"
@@ -5929,12 +6049,12 @@ mod tests {
         assert!(clean.contains("auth rejected"));
         assert!(clean.contains("token="));
 
-        // Ordinary text and whitespace pass through verbatim.
+        // Ordinary text and whitespace pass through verbatim in the multi-line reason path.
         let benign = "authentication rejected by control: key not found\n\tretry later";
         assert_eq!(
-            sanitize_for_terminal(benign),
+            sanitize_multiline(benign),
             benign,
-            "plain text + tab/newline must be unchanged"
+            "plain text + tab/newline must be unchanged in a free-form reason"
         );
     }
 
@@ -6404,6 +6524,66 @@ mod tests {
         assert!(
             !out.contains("plain-b"),
             "non-exit peer must not appear: {out}"
+        );
+    }
+
+    #[test]
+    fn format_exit_node_list_resists_row_injection() {
+        use tailscaled_rs::localapi::PeerReport;
+        // The hostname is control-supplied (netmap); a name with an embedded newline must not be able
+        // to forge a second exit-node row (header line + one row per real exit, nothing more).
+        let peers = vec![PeerReport {
+            name: "real\n100.64.0.99  fake-exit".into(),
+            ipv4: "100.64.0.9".into(),
+            is_exit_node: true,
+            online: Some(true),
+            ..Default::default()
+        }];
+        let out = format_exit_node_list(&peers);
+        // Header line + exactly one peer row = two newlines, no forged third line.
+        assert_eq!(out.matches('\n').count(), 2, "forged extra row: {out:?}");
+        assert!(out.contains('\u{FFFD}'), "newline not neutralized: {out:?}");
+    }
+
+    #[test]
+    fn format_status_sanitizes_control_supplied_names() {
+        use tailscaled_rs::localapi::{PeerReport, StatusReport};
+        // `self_name`, `active_exit_node`, and each peer `name` are control-supplied (netmap display
+        // names). A `\n` in any of them must not be able to forge a fake status line / peer row, and
+        // terminal escapes must be stripped — `format_status` runs each through `sanitize_for_terminal`.
+        let s = StatusReport {
+            state: "Running".into(),
+            want_running: true,
+            self_name: Some("me\x1b[2J\n injected: yes".into()),
+            self_ipv4: Some("100.64.0.1".into()),
+            active_exit_node: Some("exit\nfake-line: spoofed".into()),
+            peers: vec![PeerReport {
+                name: "peer\n  - 100.64.0.99  forged".into(),
+                ipv4: "100.64.0.2".into(),
+                is_exit_node: false,
+                online: Some(true),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let out = format_status(&s);
+        // No escape survives.
+        assert!(!out.contains('\x1b'), "ESC must be stripped: {out:?}");
+        // None of the injected newlines created a real line: every line must start with one of the
+        // known fixed labels or the `  - ` peer-row prefix. A forged `injected:`/`fake-line:`/`forged`
+        // line would NOT, so this catches row/line injection structurally.
+        for line in out.lines() {
+            let ok = line.is_empty()
+                || line.starts_with("  - ")
+                || ["state:", "want_running:", "self:", "exit-node:", "peers:"]
+                    .iter()
+                    .any(|lbl| line.starts_with(lbl));
+            assert!(ok, "forged/unexpected status line: {line:?}\nfull:\n{out}");
+        }
+        // The neutralized text is still visibly present (nothing silently dropped).
+        assert!(
+            out.contains('\u{FFFD}'),
+            "delimiters not neutralized: {out:?}"
         );
     }
 
@@ -7396,25 +7576,31 @@ mod tests {
 
         // (e) A hostile error string (control-influenced): `wait_decision` carries the RAW reason
         // (it's a pure classifier — the caller sanitizes at the bail site, like `classify_auth`).
-        // Assert the raw reason round-trips here, AND that the caller's `sanitize_for_terminal` step
-        // (what `wait_for_running` applies before bailing) strips the ESC/BEL — the full two-step
-        // contract, not just one half.
+        // Assert the raw reason round-trips here, AND that the caller's sanitize step — the registration
+        // `reason` is free-form text, so `wait_for_running` applies `sanitize_multiline` — strips the
+        // ESC/BEL while preserving the legible newline. The full two-step contract, not just one half.
         let hostile = StatusReport {
             state: "NeedsLogin".to_string(),
-            error: Some("evil\x1b[2J\x07reason".to_string()),
+            error: Some("evil\x1b[2J\x07reason\nsecond line".to_string()),
             ..Default::default()
         };
         match wait_decision(&hostile) {
             WaitStep::Failed(reason) => {
                 assert_eq!(
-                    reason, "evil\x1b[2J\x07reason",
+                    reason, "evil\x1b[2J\x07reason\nsecond line",
                     "wait_decision carries the RAW reason (caller sanitizes)"
                 );
-                // The caller's sanitize step (mirrors wait_for_running's bail site) neutralizes it.
-                let shown = sanitize_for_terminal(&reason);
+                // The caller's sanitize step (mirrors wait_for_running's bail site) neutralizes the
+                // escapes but, because a registration reason is free-form, keeps the newline so a
+                // multi-line server message still renders across lines (matching Go's raw print).
+                let shown = sanitize_multiline(&reason);
                 assert!(!shown.contains('\x1b'), "ESC stripped at the bail site");
                 assert!(!shown.contains('\x07'), "BEL stripped at the bail site");
-                assert!(shown.contains("evil") && shown.contains("reason"));
+                assert!(
+                    shown.contains('\n'),
+                    "multiline reason keeps its newline: {shown:?}"
+                );
+                assert!(shown.contains("evil") && shown.contains("second line"));
             }
             other => panic!("expected Failed, got {other:?}"),
         }

@@ -218,6 +218,42 @@ So the §3 row for **(e)** is now "best-effort mitigated when `harden_process()`
 than "not mitigated" — with the residual that a denied `mlockall`, a macOS host, an opt-out, or a
 cold-boot capture all leave a window open (see §5.2).
 
+### 4.8 Terminal-output sanitization of semi-trusted text — adversaries (d), (peer)
+
+Several `tnet` subcommands print text that originates **off-box** — from the control plane or a
+sending peer — and so is only semi-trusted (boundaries ② and ③): this node's own and its peers'
+computed names (`status`, `exit-node list`), the active exit node's name, Taildrop file names, the DNS
+resolvers / split-route suffixes / search domains / cert domains pushed in the netmap, the
+Tailnet-Lock authority hash, the registration-failure reason, and the `whois` node name / user / tags
+/ capability grants. Printed verbatim, that text could carry two kinds of payload:
+
+- **Terminal-escape injection.** Embedded ANSI/OSC control sequences (cursor moves, color,
+  clear-screen, even hyperlink/clipboard OSC) let a hostile server rewrite what the operator sees in
+  their terminal, or hide output.
+- **Delimiter / column / row injection.** The human-readable renderers are *structured*:
+  `tnet file cp --targets` prints TAB-separated columns (`<ip>\t<name>\t<status>`) and `status` /
+  `exit-node list` / `whois` / `file list` / `dns status` / `lock status` print one record per
+  fixed-width or single line. A name containing a literal `\t` could forge an extra column (a spoofed
+  IP or a fake `offline` status) or break the column alignment; an embedded newline could forge an
+  entire fake row — or, in `status`, a fake top-level line such as `registration failed:`.
+
+Two sanitizers in `src/bin/tnet.rs` defuse both, applied at every off-box print site:
+
+- **`sanitize_for_terminal`** — the safe default for **single-line / columnar cells**. It neutralizes
+  **every** C0/C1 control character, *including* the structural whitespace `\t`/`\n`/`\r`, to a
+  visible `U+FFFD`. The affected fields (IPs, DNS names, hostnames, hashes) never legitimately contain
+  those bytes, so this is lossless for real data and a control-supplied value can never introduce a
+  delimiter — only the renderer itself emits `\t`/`\n`.
+- **`sanitize_multiline`** — used **only** for the free-form registration `reason`, which is a
+  message (not parsed into columns/rows), so it preserves `\t`/`\n`/`\r` to keep a multi-line server
+  message legible while still stripping ESC/BEL and the other escapes.
+
+This is **display hardening only** — the wire value is unchanged, and it does not address the
+underlying trust gap (a compromised control plane is still §5.4/adversary (d)); it only stops that
+text from corrupting the operator's terminal or spoofing a structured listing. Note this is a place
+where the fork is **deliberately stricter than Go**: upstream `tailscale` prints `ComputedName` and
+the DNS fields raw and *is* susceptible to escape/column injection in these listings.
+
 ---
 
 ## 5. What is NOT mitigated (blunt)
@@ -366,6 +402,7 @@ the language; and the privileged-attacker and cold-boot leaks remain unaddressed
 | Rogue peer-key injection | (d) | **No** — Tailnet Lock inert | Compromised control plane can add trusted peers | Engine; §5.4, `SECURITY.md` |
 | Operator repoints control plane | (b)/operator | **N/A** — by design | A write-authed caller can move the root of trust (authz-gated) | §5.6; `src/ipn/config.rs:118` |
 | Auth-key in argv / shell history | (a)/(b) | **Partial** — `--authkey-file` / `$TS_AUTH_KEY` offered | `--authkey` flag still exposes the key in argv if used | `src/bin/tnet.rs:37-42` |
+| Terminal escape / column-row injection via off-box text | (d)/peer | **Yes** — all control/peer-supplied text sanitized at every print site (columnar cells strip `\t`/`\n`/`\r` too) | Display hardening only; the underlying control-plane trust gap is unchanged (§5.4); does not cover output piped through a *different* tool that re-interprets `U+FFFD` | §4.8; `src/bin/tnet.rs` `sanitize_for_terminal`/`sanitize_multiline` |
 
 ---
 
