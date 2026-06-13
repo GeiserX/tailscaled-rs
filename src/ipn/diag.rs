@@ -228,16 +228,18 @@ pub(super) async fn whois(dev: &tailscale::Device, ip: &str) -> Response {
             // projection carries name/ipv4/liveness but NOT these two, so without this the daemon
             // would discard them — yet Go surfaces them (tags in `whois` text; key-expiry is a
             // superset this fork also exposes). Read before the `user`/`capabilities` moves below.
-            // Expiry → its chrono `DateTime<Utc>` Display form (`YYYY-MM-DD HH:MM:SS UTC`, not
-            // RFC3339's `T…Z`), matching how `status` renders `last_seen`.
+            // Expiry → strict RFC3339 (`YYYY-MM-DDTHH:MM:SS+00:00`) via the chrono `DateTime<Utc>`'s
+            // inherent `to_rfc3339`, matching Go's `ipnstate`/`apitype` timestamps so a JSON consumer
+            // can parse `KeyExpiry`/`LastSeen` (a `.to_string()` Display form — `… UTC`, space-
+            // separated — is NOT RFC3339 and mis-parses).
             let tags = w.node.tags.clone();
-            let node_key_expiry = w.node.node_key_expiry.map(|t| t.to_string());
+            let node_key_expiry = w.node.node_key_expiry.map(|t| t.to_rfc3339());
             // Liveness comes off the StatusNode projection (already computed by `from_node`): the
             // same control-connected `online` signal + `last_seen` time that `status` renders per
             // peer. Capture into locals before `node.display_name` is moved below. `online` is a
-            // `Copy` bool; `last_seen` → chrono `DateTime<Utc>` Display (`YYYY-MM-DD HH:MM:SS UTC`).
+            // `Copy` bool; `last_seen` → strict RFC3339 (Go-compatible), as above.
             let online = node.online;
-            let last_seen = node.last_seen.map(|t| t.to_string());
+            let last_seen = node.last_seen.map(|t| t.to_rfc3339());
             Response::Whois(WhoisReport {
                 found: true,
                 node_name: Some(node.display_name),
@@ -1433,6 +1435,26 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn timestamps_emit_strict_rfc3339_not_display_form() {
+        // `whois`/`status` render peer `last_seen` / `node_key_expiry` via `DateTime::to_rfc3339`
+        // (Go-`ipnstate`-compatible), NOT chrono's `Display` (`2026-06-11 05:19:14 UTC`, which a
+        // JSON consumer mis-parses). Pin the exact shape for a known instant so a refactor back to
+        // `.to_string()` is caught. This is the format the three emission sites use (diag::whois ×2,
+        // ipn::status peer projection).
+        use chrono::{TimeZone, Utc};
+        let t = Utc.with_ymd_and_hms(2026, 6, 11, 5, 19, 14).unwrap();
+        let rfc = t.to_rfc3339();
+        assert_eq!(rfc, "2026-06-11T05:19:14+00:00", "must be strict RFC3339");
+        // Guard against the Display form ever sneaking back in.
+        assert!(rfc.contains('T') && !rfc.contains(" UTC"));
+        assert_ne!(
+            rfc,
+            t.to_string(),
+            "to_rfc3339 must differ from the Display form"
+        );
     }
 
     #[test]

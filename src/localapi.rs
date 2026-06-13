@@ -560,10 +560,10 @@ pub struct WhoisReport {
     /// the field, which deserializes to an empty set).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
-    /// When the node's key expires, in the engine's chrono `DateTime<Utc>` Display form
-    /// (`YYYY-MM-DD HH:MM:SS UTC` — note this is NOT RFC3339's `T…Z`), or `None` if the key has no
-    /// expiry. Surfaced so `whois`/`whoami` can show an upcoming/elapsed key expiry (Go carries it in
-    /// its `whois --json`). Back-compatible (omitted when absent).
+    /// When the node's key expires, in strict RFC3339 (`2026-09-01T12:00:00+00:00`, via
+    /// `DateTime::to_rfc3339` — Go-`ipnstate`-compatible), or `None` if the key has no expiry.
+    /// Surfaced so `whois`/`whoami` can show an upcoming/elapsed key expiry (Go carries it in its
+    /// `whois --json`). Back-compatible (omitted when absent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_key_expiry: Option<String>,
     /// The node's liveness: `Some(true)` = control-connected (online), `Some(false)` = offline,
@@ -571,10 +571,10 @@ pub struct WhoisReport {
     /// (omitted when unknown).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub online: Option<bool>,
-    /// When the node was last seen by control, in chrono `DateTime<Utc>` Display form
-    /// (`YYYY-MM-DD HH:MM:SS UTC`, NOT RFC3339), or `None` if never/unknown. Like `status`, this is
-    /// only *meaningful* (and only rendered) when the node is offline — an online node's last-seen is
-    /// "now". Back-compatible (omitted when absent).
+    /// When the node was last seen by control, in strict RFC3339 (`2026-06-11T05:19:14+00:00`, via
+    /// `DateTime::to_rfc3339` — Go-`ipnstate`-compatible), or `None` if never/unknown. Like `status`,
+    /// this is only *meaningful* (and only rendered) when the node is offline — an online node's
+    /// last-seen is "now". Back-compatible (omitted when absent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen: Option<String>,
 }
@@ -1089,9 +1089,9 @@ pub struct PeerReport {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_routes: Vec<String>,
     /// When control last saw this peer online, per Go `PeerStatus.LastSeen` — meaningful mainly while
-    /// the peer is offline. `None` when unknown / never seen. Format is the engine `chrono`
-    /// `DateTime<Utc>` Display form (RFC3339-*shaped* but space-separated with a ` UTC` suffix, e.g.
-    /// `2026-06-11 05:19:14 UTC`, not strict RFC3339 `…T…Z`).
+    /// the peer is offline. `None` when unknown / never seen. Strict RFC3339
+    /// (`2026-06-11T05:19:14+00:00`, via `DateTime::to_rfc3339`), matching Go's `ipnstate` timestamps
+    /// so a JSON consumer parses it directly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen: Option<String>,
     /// The peer's current direct UDP endpoint (`host:port`) when a direct path is confirmed (Go
@@ -1435,9 +1435,10 @@ mod tests {
                 vec![r#"{"foo":1}"#.to_string()],
             )]),
             tags: vec!["tag:server".into(), "tag:ci".into()],
-            node_key_expiry: Some("2026-09-01 12:00:00 UTC".into()),
+            // RFC3339 (what the daemon now emits via DateTime::to_rfc3339) — Go-ipnstate-compatible.
+            node_key_expiry: Some("2026-09-01T12:00:00+00:00".into()),
             online: Some(false),
-            last_seen: Some("2026-06-11 05:19:14 UTC".into()),
+            last_seen: Some("2026-06-11T05:19:14+00:00".into()),
         };
         let json = serde_json::to_string(&Response::Whois(report.clone())).unwrap();
         match serde_json::from_str::<Response>(&json).unwrap() {

@@ -63,6 +63,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+# chrono is already in the tree (the engine re-exports `DateTime<Utc>` on Node/StatusNode), but the
+# engine pulls it `default-features = false`, so the `to_rfc3339` formatter is absent. We depend on it
+# directly with the minimal `alloc` feature purely to light up `DateTime::to_rfc3339` (Cargo unifies
+# the feature across the graph), so `status`/`whois` timestamps emit strict RFC3339 (`…T…+00:00`),
+# Go-`ipnstate`-compatible, instead of chrono's space-separated `… UTC` Display form.
+chrono = { version = "0.4", default-features = false, features = ["alloc"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Secret strings: zeroize-on-drop, no Debug/serialize by default (auth keys / tokens in the daemon).
