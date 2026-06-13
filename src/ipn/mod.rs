@@ -2676,6 +2676,21 @@ impl Backend {
         diag::lock_status(dev).await
     }
 
+    /// Co-sign a node key into Tailnet Lock (the `tnet lock sign` path). Thin `pub` shim over
+    /// [`diag::lock_sign`] (parses the `nodekey:<hex>` and calls `Device::tka_sign`).
+    pub async fn lock_sign(dev: &tailscale::Device, node_key: &str) -> crate::localapi::Response {
+        diag::lock_sign(dev, node_key).await
+    }
+
+    /// Disable Tailnet Lock (the `tnet lock disable` path). Thin `pub` shim over
+    /// [`diag::lock_disable`] (hex-decodes the secret and calls `Device::tka_disable`).
+    pub async fn lock_disable(
+        dev: &tailscale::Device,
+        secret_hex: &str,
+    ) -> crate::localapi::Response {
+        diag::lock_disable(dev, secret_hex).await
+    }
+
     /// Report the control-pushed MagicDNS configuration (the `tnet dns status` path). Thin `pub`
     /// shim over [`diag::dns_status`], kept on `Backend` so the `server.rs` dispatch call site
     /// (`Backend::dns_status(&dev)`) is uniform with the other off-lock diagnostics. See
