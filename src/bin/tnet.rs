@@ -2315,11 +2315,17 @@ fn http_get_bytes(url: &str, accept: Option<&str>, max_bytes: u64) -> Result<Vec
         req = req.header("Accept", a);
     }
     let resp = req.call().with_context(|| format!("HTTP GET {url}"))?;
-    let mut reader = resp.into_body().into_reader().take(max_bytes);
+    // Read up to `max_bytes + 1` so an over-cap body is an explicit ERROR, not a silent truncation
+    // (`Read::take` alone would quietly cut the body, which a downstream consumer could mistake for a
+    // complete response). The cap still bounds memory against a hostile/huge response.
+    let mut reader = resp.into_body().into_reader().take(max_bytes + 1);
     let mut buf = Vec::new();
     reader
         .read_to_end(&mut buf)
         .with_context(|| format!("reading response body from {url}"))?;
+    if buf.len() as u64 > max_bytes {
+        anyhow::bail!("response from {url} exceeds the {max_bytes}-byte cap");
+    }
     Ok(buf)
 }
 
@@ -2519,7 +2525,8 @@ async fn run_update(
 /// Verify `data`'s SHA-256 against a GNU `sha256sum` sidecar line (`<64-hex>  <filename>`). The
 /// sidecar may name the file; we match the expected hex regardless of the filename column (the
 /// sidecar from the release names the tarball). Errors on a hex mismatch or a malformed sidecar. The
-/// hex compare is constant-time-ish via byte equality on the parsed digest. Pure → unit-testable.
+/// digest compared here is a public hash of a public release artifact (not a secret), so a plain
+/// string compare is fine — no constant-time requirement. Pure → unit-testable.
 fn verify_sha256(data: &[u8], sidecar: &[u8], expected_name: &str) -> Result<()> {
     use sha2::{Digest as _, Sha256};
     let sidecar = std::str::from_utf8(sidecar).context("SHA-256 sidecar is not valid UTF-8")?;
@@ -2563,10 +2570,23 @@ fn extract_tnet_from_tarball(gz: &[u8]) -> Result<Vec<u8>> {
         if path.file_name().and_then(|n| n.to_str()) == Some("tnet")
             && path.components().count() == 1
         {
+            // Cap the DECOMPRESSED read: the 256 MiB download cap bounds the *compressed* tarball, but
+            // gzip can expand ~1000:1, so an unbounded `read_to_end` on a hostile archive could exhaust
+            // memory. A real `tnet` binary is ~10-30 MiB; 128 MiB is a generous ceiling. Read one byte
+            // past it so an over-size entry is an explicit error (decompression-bomb guard), not OOM.
+            const MAX_TNET_BYTES: u64 = 128 << 20;
             let mut buf = Vec::new();
-            entry
+            let n = entry
+                .by_ref()
+                .take(MAX_TNET_BYTES + 1)
                 .read_to_end(&mut buf)
                 .context("reading tnet from tarball")?;
+            if n as u64 > MAX_TNET_BYTES {
+                anyhow::bail!(
+                    "the `tnet` entry in the tarball exceeds {MAX_TNET_BYTES} bytes — refusing \
+                     (possible decompression bomb)"
+                );
+            }
             if buf.is_empty() {
                 anyhow::bail!("tnet in the tarball is empty");
             }
@@ -2582,23 +2602,42 @@ fn extract_tnet_from_tarball(gz: &[u8]) -> Result<Vec<u8>> {
 /// over a busy executable is allowed, unlike writing into it which would `ETXTBSY`). The temp lives in
 /// `exe`'s directory so the rename stays on one filesystem.
 fn swap_binary_in_place(exe: &std::path::Path, new_bytes: &[u8]) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
     let dir = exe
         .parent()
         .context("the running executable has no parent directory")?;
-    let tmp = dir.join(format!(".tnet.update.{}", std::process::id()));
-    // Clean up the temp on any error after this point.
+    // Temp name: pid + a nanosecond timestamp for uniqueness. The REAL race defense is `create_new`
+    // (`O_EXCL`) below — it refuses to open a pre-existing file OR symlink, so a local attacker can't
+    // pre-plant the temp path to redirect the write or feed us their bytes. (No `rand` dep here — it's
+    // gated behind the `ssh` feature; `O_EXCL` is the security control, the suffix is just uniqueness.)
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!(".tnet.update.{}.{nanos:x}", std::process::id()));
     let cleanup = |t: &std::path::Path| {
         let _ = std::fs::remove_file(t);
     };
-    if let Err(e) = std::fs::write(&tmp, new_bytes) {
+    // Create exclusively (O_EXCL) with mode 0755 directly — fails if the path already exists (defeats a
+    // pre-planted file/symlink) and avoids a separate chmod window.
+    let create = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o755)
+        .open(&tmp);
+    let mut f = match create {
+        Ok(f) => f,
+        Err(e) => {
+            return Err(e).with_context(|| format!("creating the update temp {}", tmp.display()));
+        }
+    };
+    if let Err(e) = f.write_all(new_bytes).and_then(|()| f.sync_all()) {
+        drop(f);
         cleanup(&tmp);
         return Err(e).with_context(|| format!("writing the new binary to {}", tmp.display()));
     }
-    if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)) {
-        cleanup(&tmp);
-        return Err(e).context("setting 0755 on the new binary");
-    }
+    drop(f);
     if let Err(e) = std::fs::rename(&tmp, exe) {
         cleanup(&tmp);
         return Err(e).with_context(|| {
