@@ -566,3 +566,45 @@ Option<Vec<WaitingFile>>` field to the existing `watch_ipn_bus` `Notify` (the Go
 it lands, the daemon adds `--wait` (await the first non-empty signal, then drain once) and `--loop`
 (drain on every signal) to `tnet file get`, consumed via a pin bump. No rush — recorded so the gap is
 not forgotten; the drain itself is already faithful without it. — daemon lane
+
+## 21. Engine `Config` fields for the ~12 missing Go `up`/`set` pref flags
+
+**Why:** Go's `tailscale up`/`set` (v1.100.0 `up.go:99-148`, `set.go:76-122`) expose ~15 pref flags;
+this fork's `up`/`set` faithfully cover the ten that map to existing engine `Config` fields
+(`hostname`, `accept-routes`, `accept-dns`, `shields-up`, `exit-node`, `advertise-exit-node`,
+`advertise-routes`, `advertise-tags`, `ssh`, `tun`). The remainder are **not daemon-fixable today**
+because the pinned engine `Config` (rev `6035651`, `src/config.rs`) has **no field** to carry them, and
+the honest-omission rule forbids shipping a flag that parses but silently does nothing (the historical
+`accept_dns` inert-flag trap). Confirmed by reading the authoritative `Config` struct: its fields end
+at `audience`, with nothing for any of the flags below.
+
+**Ask — add the engine `Config` fields (Go pref name → suggested field), so the daemon can wire each
+faithfully (a wire `Up`/`Set` field + pref mapping + the revert-guard/`--reset` lockstep + a
+`get_settings` row):**
+
+- `--operator <user>` → `operator_user: Option<String>` (also the substrate for the operator-GID
+  LocalAPI authz matrix the daemon's THREAT_MODEL notes as a later phase).
+- `--exit-node-allow-lan-access <bool>` → `exit_node_allow_lan_access: bool` (Go
+  `Prefs.ExitNodeAllowLANAccess`; only meaningful with an exit node selected).
+- `--nickname <name>` → `nickname: Option<String>` (Go `Prefs.ProfileName`-adjacent / node nickname).
+- `--report-posture <bool>` → `posture_checking: bool` (Go `Prefs.PostureChecking`).
+- `--auto-update <bool>` / `--update-check <bool>` → `auto_update: { apply: Option<bool>, check:
+  Option<bool> }` (Go `Prefs.AutoUpdate`). *(Caveat: the daemon also lists self-update as a NON-GOAL —
+  see DESIGN §"Non-goals". If the engine carries the pref purely as state to report to control, the
+  daemon can wire the flag as a pref without implementing an updater; flagging the tension.)*
+- `--advertise-connector <bool>` → an app-connector pref/field (Go `Prefs.AppConnector`). Distinct from
+  the existing `advertise_services` (that is service-advertise, not the app-connector role).
+- `--webclient <bool>` → `run_web_client: bool` (Go `Prefs.RunWebClient`). *(Also a daemon NON-GOAL as
+  a UI; same caveat as auto-update — pref-state only, no embedded server.)*
+- Linux subnet-router knobs: `--snat-subnet-routes`, `--stateful-filtering`, `--netfilter-mode`,
+  `--unattended` → the engine's router/netfilter layer (Go `Prefs.NoSNAT` / `NoStatefulFiltering` /
+  `NetfilterMode` / `Unattended`). These ride on the Linux OS-router (daemon bead tsd-m8s) and are
+  lower priority.
+
+**Workload-identity flags** (`--client-id`/`--client-secret`/`--id-token`/`--audience`) are a SEPARATE
+case: the engine `Config` **already has** `client_id`/`client_secret`/`id_token`/`audience`, but they
+are behind the engine's **`identity-federation` cargo feature**, which this fork's engine dep does NOT
+enable — so wiring them today would also be inert. **Sub-ask:** confirm whether enabling
+`identity-federation` on the engine dep is supported/compiles; if so the daemon can wire those four
+flags immediately (they need no new engine field, only the feature on). Tracked in daemon bead
+tsd-1m9, which is BLOCKED on this ask. — daemon lane
