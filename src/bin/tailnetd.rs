@@ -66,8 +66,25 @@ struct Args {
     config: Option<PathBuf>,
 }
 
+/// Restore the default `SIGPIPE` disposition (terminate) before any output. The Rust runtime sets
+/// `SIG_IGN`, which turns a write to a closed pipe into `EPIPE` → a `print!` panic; resetting to
+/// `SIG_DFL` makes a broken output pipe (e.g. `tailnetd --version | head`) terminate cleanly instead,
+/// the Unix-idiomatic behavior (same as the `tnet` CLI; see its `reset_sigpipe`). Output-only — does
+/// not affect the LocalAPI socket I/O.
+fn reset_sigpipe() {
+    // SAFETY: `signal(SIGPIPE, SIG_DFL)` is async-signal-safe, no preconditions; called once at the
+    // very start of `main` before any threads/output. The `unsafe` is only the `libc::signal` FFI.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Restore default SIGPIPE before any output (a broken `--version`/`--help` pipe should terminate
+    // cleanly, not panic the print). Must run before clap, which prints help/version.
+    reset_sigpipe();
     // Parse flags FIRST: clap handles `--help`/`--version` (print + exit 0) and rejects unknown
     // flags before we touch the experiment gate or any state, matching how Go `tailscaled` parses its
     // flag set up front. The parsed values then override the env-derived defaults below.

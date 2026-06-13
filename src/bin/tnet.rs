@@ -1113,8 +1113,30 @@ fn resolve_advertise_routes(routes: Vec<String>, clear: bool) -> Option<Vec<Stri
     }
 }
 
+/// Restore the default `SIGPIPE` disposition (terminate) before doing any output.
+///
+/// The Rust runtime installs `SIG_IGN` for `SIGPIPE` before `main`, which turns a write to a closed
+/// pipe into an `EPIPE` error — and `print!`/`println!` then **panic** ("failed printing to stdout",
+/// exit 101). For a Unix CLI that is wrong: piping a large output into `head`, or any reader that
+/// exits early, should make the writer terminate *silently* on the broken pipe, exactly as Go's
+/// `tailscale` (and every well-behaved CLI) does. Resetting to `SIG_DFL` here restores that: a broken
+/// pipe kills the process with `SIGPIPE` (exit 141) instead of an ugly Rust panic. Output-only — no
+/// effect on the daemon's socket I/O (the daemon binary does the same for symmetry).
+fn reset_sigpipe() {
+    // SAFETY: `signal` with `SIG_DFL` for `SIGPIPE` is async-signal-safe and has no preconditions; we
+    // call it once at the very start of `main`, before any threads/output. This is the standard CLI
+    // fix (ripgrep/fd do the same); the `unsafe` is only because `libc::signal` is an FFI call.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // FIRST: restore default SIGPIPE so a broken output pipe (`tnet status | head`) terminates
+    // cleanly instead of panicking the print. Must run before any stdout write.
+    reset_sigpipe();
     let cli = Cli::parse();
     let socket = cli.socket.unwrap_or_else(tailscaled_rs::socket_path);
 
@@ -7436,5 +7458,28 @@ mod tests {
         // It is framed as an error (non-zero exit at the call site) and explains the revert.
         assert!(out.starts_with("error:"));
         assert!(out.contains("revert"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reset_sigpipe_sets_default_disposition() {
+        // The fix for the broken-pipe panic: `reset_sigpipe()` must actually restore SIGPIPE to
+        // SIG_DFL (Rust's runtime installs SIG_IGN, which is what makes `print!` to a closed pipe
+        // panic). Prove it by reading the handler back via sigaction after calling the helper — so a
+        // refactor that drops or breaks the reset is caught. (Pure libc introspection; no piping.)
+        super::reset_sigpipe();
+        // SAFETY: sigaction with a null `act` only READS the current handler into `oldact`; no
+        // preconditions, no mutation. `MaybeUninit` is fully written by the call on success.
+        let mut oldact = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+        let rc = unsafe { libc::sigaction(libc::SIGPIPE, std::ptr::null(), oldact.as_mut_ptr()) };
+        assert_eq!(rc, 0, "sigaction read must succeed");
+        let handler = unsafe { oldact.assume_init() }.sa_sigaction;
+        assert_eq!(
+            handler,
+            libc::SIG_DFL,
+            "reset_sigpipe must leave SIGPIPE at SIG_DFL (so a broken pipe terminates cleanly, \
+             not a print panic); got {handler:?} (SIG_IGN={:?})",
+            libc::SIG_IGN
+        );
     }
 }
