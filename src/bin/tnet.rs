@@ -328,8 +328,13 @@ enum Command {
         #[arg(value_name = "SETTING")]
         setting: Option<String>,
         /// Output as JSON (a flattened `{ "setting-name": value }` map, matching Go `get --json`).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "set_flags")]
         json: bool,
+        /// Output every setting as a single re-appliable `tnet set …` flag-argument line (Go
+        /// `get --set-flags`), e.g. `--accept-routes=true --hostname=node-a …`. Mutually exclusive
+        /// with `--json`; a single-`SETTING` query is ignored for this mode (it emits all flags).
+        #[arg(long)]
+        set_flags: bool,
     },
     /// Show daemon and netmap status.
     Status {
@@ -1278,7 +1283,11 @@ async fn main() -> Result<()> {
         // `get` (Go `tailscale get`): round-trip GetPrefs, then render. Handled inline (early return)
         // because its `setting`/`json` args shape the output and are not part of the wire request —
         // keeping the projection→render in one place, like `version`.
-        Command::Get { setting, json } => run_get(&socket, setting, json).await,
+        Command::Get {
+            setting,
+            json,
+            set_flags,
+        } => run_get(&socket, setting, json, set_flags).await,
         // `wait` (Go `tailscale wait`): poll until the node is Running with a tailnet IP, honoring an
         // optional timeout. Handled inline (it loops + has its own exit-code contract), not a
         // one-shot request.
@@ -1913,10 +1922,15 @@ async fn run_version(
     Ok(())
 }
 
-/// `get` (Go `tailscale get`): round-trip GetPrefs, then render. Inline because its `setting`/`json`
-/// args shape the output and are not part of the wire request — keeping the projection→render in one
-/// place, like `version`.
-async fn run_get(socket: &std::path::Path, setting: Option<String>, json: bool) -> Result<()> {
+/// `get` (Go `tailscale get`): round-trip GetPrefs, then render. Inline because its
+/// `setting`/`json`/`set_flags` args shape the output and are not part of the wire request — keeping
+/// the projection→render in one place, like `version`.
+async fn run_get(
+    socket: &std::path::Path,
+    setting: Option<String>,
+    json: bool,
+    set_flags: bool,
+) -> Result<()> {
     let view = match round_trip(socket, &Request::GetPrefs).await {
         Ok(Response::Prefs(v)) => v,
         Ok(Response::Error { message }) => {
@@ -1928,6 +1942,13 @@ async fn run_get(socket: &std::path::Path, setting: Option<String>, json: bool) 
             return Err(e).with_context(|| format!("getting prefs at {}", socket.display()));
         }
     };
+    // `--set-flags` (Go `get --set-flags`): emit every setting as one re-appliable `set` arg line,
+    // regardless of a single-SETTING arg (Go's set-flags mode always emits all). clap's
+    // `conflicts_with` guarantees `json` is false here.
+    if set_flags {
+        println!("{}", format_get_set_flags(&view));
+        return Ok(());
+    }
     match format_get(&view, setting.as_deref(), json) {
         Ok(out) => print!("{out}"),
         Err(e) => {
@@ -2935,6 +2956,20 @@ fn get_value_display(v: &serde_json::Value) -> String {
         serde_json::Value::Null => String::new(),
         other => other.to_string(),
     }
+}
+
+/// Render every setting as a single re-appliable `tnet set …` flag-argument line (Go
+/// `get --set-flags` / `getOutputSetFlags`): `--<name>=<value>` per setting, space-joined. Each
+/// value uses the explicit `=value` form (Go's `fmtFlagValueArg`) — `--accept-routes=true`,
+/// `--hostname=node-a`, `--exit-node=` for an unset/empty value — so the line is unambiguous and
+/// re-pasteable into `tnet set`. Pure → unit-testable. (The names are the canonical set-flag names
+/// the `get` table already uses, from [`get_settings`].)
+fn format_get_set_flags(view: &tailscaled_rs::localapi::PrefsView) -> String {
+    get_settings(view)
+        .into_iter()
+        .map(|(name, value)| format!("--{name}={}", get_value_display(&value)))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Render `tnet get` output from a [`PrefsView`] (Go `tailscale get`). `setting` selects a single
@@ -5979,6 +6014,42 @@ mod tests {
         assert_eq!(minor_of("1.2.3"), Some(2));
         assert_eq!(minor_of("0.31.0-dev"), Some(31));
         assert_eq!(minor_of("garbage"), None);
+    }
+
+    #[test]
+    fn format_get_set_flags_emits_reappliable_line() {
+        use tailscaled_rs::localapi::PrefsView;
+        let view = PrefsView {
+            hostname: Some("node-a".into()),
+            exit_node: None,
+            advertise_exit_node: false,
+            advertise_routes: vec!["10.0.0.0/8".into()],
+            advertise_tags: vec![],
+            accept_routes: true,
+            accept_dns: false,
+            shields_up: true,
+            ssh: false,
+            ssh_running: false,
+            tun: false,
+        };
+        let line = format_get_set_flags(&view);
+        // Every setting is `--name=value`, space-joined (Go getOutputSetFlags / fmtFlagValueArg).
+        assert!(line.contains("--hostname=node-a"), "{line}");
+        assert!(line.contains("--accept-routes=true"), "{line}");
+        assert!(line.contains("--accept-dns=false"), "{line}");
+        assert!(line.contains("--shields-up=true"), "{line}");
+        assert!(line.contains("--advertise-routes=10.0.0.0/8"), "{line}");
+        // Unset/empty values render as a bare `--name=` (Go's explicit empty form), not omitted.
+        assert!(
+            line.contains("--exit-node= "),
+            "unset exit-node → empty: {line}"
+        );
+        assert!(
+            line.contains("--advertise-tags= "),
+            "empty tags → empty: {line}"
+        );
+        // It's a single space-joined line (no newlines), re-pasteable into `tnet set`.
+        assert!(!line.contains('\n'), "must be one line: {line}");
     }
 
     #[test]
