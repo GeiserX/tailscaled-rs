@@ -68,9 +68,20 @@ pub fn state_dir() -> PathBuf {
 ///
 /// Resolved from `TAILNETD_SOCKET`, else `<state_dir>/tailnetd.sock`.
 pub fn socket_path() -> PathBuf {
+    socket_path_in(&state_dir())
+}
+
+/// Path to the LocalAPI Unix domain socket, deriving the default from an **explicit** state dir.
+///
+/// Same resolution as [`socket_path`] — `TAILNETD_SOCKET` still wins — but the fallback joins
+/// `tailnetd.sock` onto the caller-supplied `state_dir` rather than the env/default one. This lets a
+/// caller that has already resolved the state dir (e.g. `tailnetd --statedir <dir>`) keep the socket
+/// alongside it without re-deriving the state dir. `socket_path()` is the `state_dir()`-derived shim
+/// over this, so existing callers are unchanged.
+pub fn socket_path_in(state_dir: &std::path::Path) -> PathBuf {
     std::env::var_os("TAILNETD_SOCKET")
         .map(PathBuf::from)
-        .unwrap_or_else(|| state_dir().join("tailnetd.sock"))
+        .unwrap_or_else(|| state_dir.join("tailnetd.sock"))
 }
 
 /// Create the state directory if absent and enforce `0700` permissions on it.
@@ -167,5 +178,19 @@ mod tests {
             & 0o777;
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(mode, 0o700, "freshly-created state dir must be 0700");
+    }
+
+    #[test]
+    fn socket_path_in_joins_explicit_state_dir() {
+        // The new join branch (the main contract `--statedir` relies on): with `TAILNETD_SOCKET`
+        // UNSET, the socket is `<state_dir>/tailnetd.sock` for the explicit dir passed in — NOT the
+        // env/default state dir. Race-free: this branch never touches env. (The env-wins branch is
+        // deliberately not asserted here — reading/setting TAILNETD_SOCKET races under the parallel
+        // test harness; its precedence is covered by the `socket_path_in` body + the daemon's
+        // resolution order, and the env check structurally precedes this join.)
+        if std::env::var_os("TAILNETD_SOCKET").is_none() {
+            let dir = std::path::Path::new("/var/lib/tailnetd-explicit");
+            assert_eq!(socket_path_in(dir), dir.join("tailnetd.sock"));
+        }
     }
 }

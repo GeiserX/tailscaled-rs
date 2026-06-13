@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
+use clap::Parser;
 use tailscaled_rs::ipn::{self, Backend};
 use tailscaled_rs::prefs::Prefs;
 use tokio::sync::Mutex;
@@ -18,9 +19,53 @@ const EXPERIMENT_VAR: &str = "TS_RS_EXPERIMENT";
 /// The exact value the engine requires; anything else (or unset) is a refusal.
 const REQUIRED_EXPERIMENT_VALUE: &str = "this_is_unstable_software";
 
+/// `tailnetd` command-line flags (the analogue of Go `tailscaled`'s flag set).
+///
+/// The daemon was historically env-only (`TAILNETD_STATE_DIR` / `TAILNETD_SOCKET` / `TAILNETD_LOG`);
+/// these flags are the Go-faithful CLI surface over the same knobs. **A flag, when given, OVERRIDES
+/// the corresponding env var** (Go resolves flags first); when omitted, the existing env/default
+/// resolution (`tailscaled_rs::state_dir` / `socket_path`) is unchanged, so existing env-driven
+/// deployments behave exactly as before.
+///
+/// Two Go daemon flags Go also exposes are deliberately NOT daemon-startup flags in this fork, for
+/// different reasons: `--tun` (and its name/MTU) is a **pref**, set via `tnet up`
+/// (`--tun`/`--tun-name`/`--tun-mtu`); `--port` (the WireGuard listen port) is **engine-gated** —
+/// the `tailscale` engine binds an ephemeral port and exposes no configurable listen port, so there
+/// is nothing for a daemon flag to set (tracked if/when the engine adds the knob). `--config`
+/// (declarative `ipn.ConfigVAlpha`) is a tracked follow-up that hangs off this flag surface.
+#[derive(Parser, Debug)]
+#[command(
+    name = "tailnetd",
+    about = "The tailscaled-rs daemon (experimental WireGuard mesh node)",
+    version
+)]
+struct Args {
+    /// Directory for daemon state (node key, prefs). Overrides `TAILNETD_STATE_DIR`. When omitted,
+    /// resolves as before: `TAILNETD_STATE_DIR`, else the system path when root, else an XDG/HOME
+    /// path. Go `tailscaled --statedir`. NOTE: relocating the state dir also moves the default socket
+    /// to `<DIR>/tailnetd.sock` (unless `TAILNETD_SOCKET`/`--socket` is set), so the `tnet` client
+    /// must be pointed at it — `tnet --socket <DIR>/tailnetd.sock …` (or export `TAILNETD_SOCKET`) —
+    /// since `tnet` has no `--statedir` of its own.
+    #[arg(long, value_name = "DIR")]
+    statedir: Option<PathBuf>,
+    /// Path of the LocalAPI control socket. Overrides `TAILNETD_SOCKET`. When omitted, resolves to
+    /// `TAILNETD_SOCKET` else `<statedir>/tailnetd.sock`. Go `tailscaled --socket`.
+    #[arg(long, value_name = "PATH")]
+    socket: Option<PathBuf>,
+    /// Log verbosity: `0` (default, info), `1` (debug), `2+` (trace). Overrides the `TAILNETD_LOG`
+    /// env filter when given. Go `tailscaled --verbose`.
+    #[arg(long, short = 'v', value_name = "LEVEL")]
+    verbose: Option<u8>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Gate FIRST, before any logging is set up: the engine refuses to run unless
+    // Parse flags FIRST: clap handles `--help`/`--version` (print + exit 0) and rejects unknown
+    // flags before we touch the experiment gate or any state, matching how Go `tailscaled` parses its
+    // flag set up front. The parsed values then override the env-derived defaults below.
+    let args = Args::parse();
+
+    // Gate, before any logging is set up: the engine refuses to run unless
     // `TS_RS_EXPERIMENT=this_is_unstable_software` is set, so mirror that gate here and surface it
     // early with an actionable message instead of a deep engine error. We deliberately do NOT set
     // the var ourselves — auto-defeating the experimental gate would hide that this is unaudited
@@ -38,10 +83,16 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
+    // Log filter: `--verbose <n>` (when given) wins and maps to a level (Go's numeric verbosity);
+    // otherwise fall back to the `TAILNETD_LOG` env filter, else `info`. `--verbose` overriding the
+    // env mirrors the flags-first resolution Go uses.
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_env("TAILNETD_LOG").unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+        .with_env_filter(match args.verbose {
+            Some(level) => EnvFilter::new(verbose_to_level(level)),
+            None => {
+                EnvFilter::try_from_env("TAILNETD_LOG").unwrap_or_else(|_| EnvFilter::new("info"))
+            }
+        })
         .init();
 
     // Best-effort OS-level hardening (no-coredump / no-ptrace / no-swap) for the secrets the engine
@@ -65,8 +116,13 @@ async fn main() -> Result<()> {
         }
     };
 
-    let state_dir = tailscaled_rs::state_dir();
-    let socket_path = tailscaled_rs::socket_path();
+    // Resolve the state dir + socket: a flag wins; otherwise the existing env/default resolution.
+    // The socket default is derived from the *resolved* state dir (matching `socket_path()`'s own
+    // `<state_dir>/tailnetd.sock` fallback), so `--statedir` alone also relocates the socket.
+    let state_dir = args.statedir.unwrap_or_else(tailscaled_rs::state_dir);
+    let socket_path = args
+        .socket
+        .unwrap_or_else(|| tailscaled_rs::socket_path_in(&state_dir));
     tracing::info!(state_dir = %state_dir.display(), "starting tailnetd");
 
     // The state dir holds unencrypted key material; lock it to 0700 before any key file is written.
@@ -423,6 +479,18 @@ fn experiment_gate_ok(value: Option<&str>) -> bool {
     value == Some(REQUIRED_EXPERIMENT_VALUE)
 }
 
+/// Map a numeric `--verbose` level to a `tracing` env-filter directive (Go's numeric verbosity →
+/// our level-based filter). `0` = `info` (the default), `1` = `debug`, `2` or higher = `trace` (the
+/// most verbose level `tracing` has — Go's higher integers just mean "even more", which saturates
+/// here). Pure → unit-testable.
+fn verbose_to_level(level: u8) -> &'static str {
+    match level {
+        0 => "info",
+        1 => "debug",
+        _ => "trace",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,5 +550,50 @@ mod tests {
         let (key, resuming) = resume_decision(false, None);
         assert!(!resuming);
         assert!(key.is_none());
+    }
+
+    #[test]
+    fn verbose_to_level_maps_go_verbosity() {
+        // 0 = info (default), 1 = debug, 2+ saturates at trace (the most verbose tracing level).
+        assert_eq!(verbose_to_level(0), "info");
+        assert_eq!(verbose_to_level(1), "debug");
+        assert_eq!(verbose_to_level(2), "trace");
+        assert_eq!(verbose_to_level(9), "trace");
+    }
+
+    #[test]
+    fn args_parse_flags_and_defaults() {
+        use clap::Parser;
+        // All flags omitted → every override is None (env/default resolution stands).
+        let a = Args::parse_from(["tailnetd"]);
+        assert!(a.statedir.is_none() && a.socket.is_none() && a.verbose.is_none());
+        // Flags parse to their override values.
+        let a = Args::parse_from([
+            "tailnetd",
+            "--statedir",
+            "/var/lib/x",
+            "--socket",
+            "/run/x.sock",
+            "--verbose",
+            "2",
+        ]);
+        assert_eq!(
+            a.statedir.as_deref(),
+            Some(std::path::Path::new("/var/lib/x"))
+        );
+        assert_eq!(
+            a.socket.as_deref(),
+            Some(std::path::Path::new("/run/x.sock"))
+        );
+        assert_eq!(a.verbose, Some(2));
+        // `-v` short form works too.
+        assert_eq!(Args::parse_from(["tailnetd", "-v", "1"]).verbose, Some(1));
+    }
+
+    #[test]
+    fn args_rejects_unknown_flag() {
+        use clap::Parser;
+        // An unknown flag is a parse error (clap), not silently ignored — matches Go's flag set.
+        assert!(Args::try_parse_from(["tailnetd", "--nope"]).is_err());
     }
 }
