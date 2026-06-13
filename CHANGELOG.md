@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.42.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.41.0...v0.42.0) (2026-06-13)
+
+
+### Features
+
+* **cli:** add `tnet lock sign` / `tnet lock disable` (Tailnet Lock write-ops) ([#163](https://github.com/GeiserX/tailscaled-rs/issues/163)) ([fd9040a](https://github.com/GeiserX/tailscaled-rs/commit/fd9040a0c83400ebce80b196b05c74198413d6db))
+
 ## [0.41.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.40.1...v0.41.0) (2026-06-13)
 
 
