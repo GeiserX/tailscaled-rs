@@ -516,6 +516,34 @@ enum Command {
     /// Print open-source license information (Go `tailscale licenses`). Local-only — contacts no
     /// daemon. This fork's own license + where to find the dependency licenses.
     Licenses,
+    /// Serve a local web UI showing this node's status (Go `tailscale web`). Runs an HTTP server
+    /// until interrupted (Ctrl-C); each page load reflects the live status. Bound to localhost by
+    /// default (`--listen localhost:8088`, matching Go), so it is not reachable from the network.
+    ///
+    /// READ-ONLY: this serves the status view only. Go's `web` can switch to a *management* mode that
+    /// edits prefs (a React SPA served over the tailnet behind an owner/session/control-approval auth
+    /// stack); this fork does not yet ship that mutating UI (tracked separately) — to change settings,
+    /// use `tnet up`/`tnet set`. (`tnet status --web` serves the same page; `web` is the Go-named
+    /// command with Go's flags.)
+    Web {
+        /// Listen address (Go `web --listen`; default `localhost:8088`). Use `:0` for an OS-assigned
+        /// port. Binding beyond localhost exposes this node's status (name, tailnet IPs, peers) with
+        /// NO authentication — a warning is printed if you do.
+        #[arg(long, value_name = "ADDR")]
+        listen: Option<String>,
+        /// Run the UI in read-only mode (Go `web --readonly`). This build's web UI is ALWAYS read-only
+        /// (no mutating manage mode yet), so this flag is accepted for Go compatibility and is a no-op.
+        #[arg(long)]
+        readonly: bool,
+        /// URL path prefix the UI is served under (Go `web --prefix`), for use behind a reverse proxy
+        /// (e.g. `/tailscale`). Default: served at `/`.
+        #[arg(long, value_name = "PREFIX")]
+        prefix: Option<String>,
+        /// Do not open a browser window after starting (the server still runs). Without this, a
+        /// browser is opened to the served URL (best-effort).
+        #[arg(long)]
+        no_browser: bool,
+    },
     /// Check for (and optionally install) a newer release of this client (Go `tailscale update`).
     /// Queries the project's GitHub Releases for the latest version and compares it to the running
     /// version. By DEFAULT (or with `--check`/`--dry-run`) it only REPORTS current-vs-latest and does
@@ -1537,6 +1565,22 @@ async fn main() -> Result<()> {
             version,
             track,
         } => run_update(check || dry_run, yes, version, track).await,
+        // `web` (Go `tailscale web`): serve the read-only status UI. Reuses the same embedded HTTP
+        // server as `status --web`, but with Go's command name + flags (default localhost:8088). The
+        // `--readonly` flag is a no-op (this build's web UI is always read-only). `--prefix` serves
+        // the page under a URL path prefix (for reverse proxies).
+        Command::Web {
+            listen,
+            readonly: _,
+            prefix,
+            no_browser,
+        } => {
+            let listen = listen.unwrap_or_else(|| "localhost:8088".to_string());
+            let prefix = prefix.unwrap_or_default();
+            run_status_web(&socket, &listen, !no_browser, &prefix)
+                .await
+                .with_context(|| format!("serving web UI on {listen}"))
+        }
         // `lock status` (Go `tailscale lock status`): fetch + render the TKA status.
         // `lock init` (Go `tailscale lock init`): initialize the lock with this node as sole trusted key.
         Command::Lock {
@@ -2023,7 +2067,8 @@ async fn run_status(
     // return (like --watch). Default listen 127.0.0.1:8384; browser opens unless --no-browser.
     if web {
         let listen = listen.unwrap_or_else(|| "127.0.0.1:8384".to_string());
-        return run_status_web(socket, &listen, !no_browser)
+        // `status --web` serves at `/` (no path prefix).
+        return run_status_web(socket, &listen, !no_browser, "/")
             .await
             .with_context(|| format!("serving status --web on {listen}"));
     }
@@ -5209,6 +5254,18 @@ fn parse_request_target(request_line: &str) -> Option<(&str, &str)> {
 /// This is a local diagnostic server (default `127.0.0.1`), so 64 is far above normal single-user use.
 const MAX_WEB_CONNECTIONS: usize = 64;
 
+/// Normalize a `--prefix` value into the single URL path the web server serves at: `/` (empty/`"/"`)
+/// or `/<prefix>` with exactly one leading slash and no trailing slash — so `--prefix /tailscale`,
+/// `tailscale`, and `/tailscale/` all serve `/tailscale`. Pure → unit-testable.
+fn normalize_served_path(path_prefix: &str) -> String {
+    let trimmed = path_prefix.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
 /// `tnet status --web`: serve an HTML status page from an embedded HTTP server (Go `tailscale status
 /// --web`). Binds a TCP listener on `listen` (default `127.0.0.1:8384`), optionally opens a browser at
 /// the URL, then accepts connections until interrupted: each request re-fetches the live status
@@ -5218,7 +5275,13 @@ const MAX_WEB_CONNECTIONS: usize = 64;
 /// Each connection is handled on its own detached task, bounded by a [`Semaphore`](tokio::sync::Semaphore)
 /// cap ([`MAX_WEB_CONNECTIONS`]) so a flood can't leak handler tasks/fds without bound (the count
 /// bound; the per-handler 5s read-deadline is the slow-client bound).
-async fn run_status_web(socket: &std::path::Path, listen: &str, browser: bool) -> Result<()> {
+async fn run_status_web(
+    socket: &std::path::Path,
+    listen: &str,
+    browser: bool,
+    path_prefix: &str,
+) -> Result<()> {
+    let served_path = normalize_served_path(path_prefix);
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("binding the status web server to {listen}"))?;
@@ -5235,7 +5298,12 @@ async fn run_status_web(socket: &std::path::Path, listen: &str, browser: bool) -
              anyone who can reach this address."
         );
     }
-    let url = format!("http://{addr}");
+    // The browseable URL includes the path prefix (so `--prefix /foo` opens `http://addr/foo`).
+    let url = if served_path == "/" {
+        format!("http://{addr}")
+    } else {
+        format!("http://{addr}{served_path}")
+    };
     println!("Serving Tailscale status at {url} ... (Ctrl-C to stop)");
     if browser {
         open_browser_best_effort(&url);
@@ -5262,9 +5330,10 @@ async fn run_status_web(socket: &std::path::Path, listen: &str, browser: bool) -
         // single slow or silent client can't head-of-line-block every other status request; the read
         // deadline inside the handler is what actually bounds a stalled client.
         let socket = socket.to_path_buf();
+        let served_path = served_path.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            serve_status_connection(conn, &socket).await;
+            serve_status_connection(conn, &socket, &served_path).await;
         });
     }
 }
@@ -5276,7 +5345,11 @@ async fn run_status_web(socket: &std::path::Path, listen: &str, browser: bool) -
 /// The request-line read is bounded in BOTH bytes (8 KiB cap) and time (a 5s deadline): TCP can split
 /// the line across segments so a single read isn't enough, but a client that dribbles or never sends
 /// must not park the task forever.
-async fn serve_status_connection(mut conn: tokio::net::TcpStream, socket: &std::path::Path) {
+async fn serve_status_connection(
+    mut conn: tokio::net::TcpStream,
+    socket: &std::path::Path,
+    served_path: &str,
+) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
@@ -5305,7 +5378,9 @@ async fn serve_status_connection(mut conn: tokio::net::TcpStream, socket: &std::
     let request_line = String::from_utf8_lossy(&buf);
     let first_line = request_line.lines().next().unwrap_or("");
     let (status, body) = match parse_request_target(first_line) {
-        Some(("GET", "/")) => match round_trip(socket, &Request::Status).await {
+        // The status page is served at the configured path (default `/`, or `/<prefix>` when
+        // `--prefix` is given). Any other path → 404.
+        Some(("GET", p)) if p == served_path => match round_trip(socket, &Request::Status).await {
             Ok(Response::Status(s)) => ("200 OK", render_status_html(&s)),
             // Both the wrong-variant and the error case collapse to a 500; on a real error, log the
             // cause first so the failure isn't swallowed (the page itself stays generic).
@@ -8587,6 +8662,19 @@ mod tests {
         // Malformed (no path token) → None; the serve loop treats that as 404.
         assert_eq!(parse_request_target("GET"), None);
         assert_eq!(parse_request_target(""), None);
+    }
+
+    #[test]
+    fn normalize_served_path_handles_prefix_forms() {
+        // Empty / "/" → root.
+        assert_eq!(normalize_served_path(""), "/");
+        assert_eq!(normalize_served_path("/"), "/");
+        assert_eq!(normalize_served_path("   "), "/");
+        // A prefix is normalized to exactly one leading slash, no trailing slash, regardless of input.
+        assert_eq!(normalize_served_path("tailscale"), "/tailscale");
+        assert_eq!(normalize_served_path("/tailscale"), "/tailscale");
+        assert_eq!(normalize_served_path("/tailscale/"), "/tailscale");
+        assert_eq!(normalize_served_path("  /web/ui/  "), "/web/ui");
     }
 
     #[test]
