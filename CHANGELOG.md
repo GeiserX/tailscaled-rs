@@ -25,6 +25,49 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.41.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.40.1...v0.41.0) (2026-06-13)
+
+
+### Features
+
+* **cli:** add `tnet cert` (Go tailscale cert), consuming engine [#16](https://github.com/GeiserX/tailscaled-rs/issues/16) ([#127](https://github.com/GeiserX/tailscaled-rs/issues/127)) ([2dbb124](https://github.com/GeiserX/tailscaled-rs/commit/2dbb124637e2cc7785a22180d7fce982f2bd305d))
+* **cli:** add `tnet debug prefs` (Go `tailscale debug prefs`) ([#143](https://github.com/GeiserX/tailscaled-rs/issues/143)) ([367d0c5](https://github.com/GeiserX/tailscaled-rs/commit/367d0c5dd29e9388050a0cef11afba887f83eb10))
+* **cli:** add `tnet dns query` (Go `tailscale dns query`) ([#158](https://github.com/GeiserX/tailscaled-rs/issues/158)) ([4735a8a](https://github.com/GeiserX/tailscaled-rs/commit/4735a8af2240f83214474ea4a8dc5225d32a0286))
+* **cli:** add `tnet licenses` (Go `tailscale licenses`) ([#142](https://github.com/GeiserX/tailscaled-rs/issues/142)) ([87f2dfb](https://github.com/GeiserX/tailscaled-rs/commit/87f2dfb8b51b6949ae02ce37d4ab19bd9ac27222))
+* **cli:** add `tnet metrics print` subcommand (Go `tailscale metrics print`) ([#144](https://github.com/GeiserX/tailscaled-rs/issues/144)) ([3be6310](https://github.com/GeiserX/tailscaled-rs/commit/3be6310b3e523a1dd0931760e84c718a3ee28d86))
+* **cli:** add workload-identity-federation up flags (--client-id/--client-secret/--id-token/--audience) ([#154](https://github.com/GeiserX/tailscaled-rs/issues/154)) ([3df6101](https://github.com/GeiserX/tailscaled-rs/commit/3df61016e4879d6000e8468f3baf46962feca2b9))
+* **cli:** tnet wait/up --timeout confirms the kernel TUN interface carries the IP ([#155](https://github.com/GeiserX/tailscaled-rs/issues/155)) ([388df12](https://github.com/GeiserX/tailscaled-rs/commit/388df1264b6e255a21e69f1bd8df584298bac500))
+* **cli:** wire accept-dns (Go --accept-dns / CorpDNS), consuming engine [#14](https://github.com/GeiserX/tailscaled-rs/issues/14) ([#126](https://github.com/GeiserX/tailscaled-rs/issues/126)) ([06640b8](https://github.com/GeiserX/tailscaled-rs/commit/06640b8b71a1f6b72692046290c8e8a68c23ccbd))
+* **file:** Go cp colon-target syntax + variadic files + --targets (closes tsd-x4i) ([#137](https://github.com/GeiserX/tailscaled-rs/issues/137)) ([1807be3](https://github.com/GeiserX/tailscaled-rs/commit/1807be3b7390b6cfaafd28d104101800a6871ecb))
+* **file:** Go-faithful `file get <dir>` inbox drain + --conflict (fixes silent-overwrite data loss) ([#136](https://github.com/GeiserX/tailscaled-rs/issues/136)) ([77c037e](https://github.com/GeiserX/tailscaled-rs/commit/77c037ecf404a96c6e8b9da50aa25588fc61f1c4))
+* **get:** add `get --set-flags` (Go `tailscale get --set-flags`) ([#149](https://github.com/GeiserX/tailscaled-rs/issues/149)) ([6cbaa58](https://github.com/GeiserX/tailscaled-rs/commit/6cbaa5804ed79c4335c00954e79ecc7a96b11565))
+* **get:** surface hostname in `tnet get` (Go parity) + fix flaky conffile test temp path ([#148](https://github.com/GeiserX/tailscaled-rs/issues/148)) ([1180b43](https://github.com/GeiserX/tailscaled-rs/commit/1180b43c296d5558bfa962c5590d0f0223df64d9))
+* **install:** TUN-relaxed systemd unit for tun-feature builds (tsd-9qm) ([#138](https://github.com/GeiserX/tailscaled-rs/issues/138)) ([eb8e522](https://github.com/GeiserX/tailscaled-rs/commit/eb8e5229700d496af6fe7b15468ce99b65b168af))
+* **ping:** --until-direct + Go-faithful -c default + direct/DERP path reporting ([#135](https://github.com/GeiserX/tailscaled-rs/issues/135)) ([9c83b56](https://github.com/GeiserX/tailscaled-rs/commit/9c83b56db138c4c2f276d6c9d8e57264c0e8fa12))
+* **serve:** model Go's top-level ServeConfig.Web map (tsd-6p4 stage A) ([#129](https://github.com/GeiserX/tailscaled-rs/issues/129)) ([30d7522](https://github.com/GeiserX/tailscaled-rs/commit/30d7522fe5de6623cef2184641a4970c8621cd4d))
+* **serve:** serve + render the Go ServeConfig.Web map (tsd-6p4 stage B, read side) ([#130](https://github.com/GeiserX/tailscaled-rs/issues/130)) ([0f1c7ca](https://github.com/GeiserX/tailscaled-rs/commit/0f1c7ca468fa00cb04a1b9a607e53bb3b737a942))
+* **serve:** serve TLS-terminated raw-TCP forwards (Go --tls-terminated-tcp) ([#128](https://github.com/GeiserX/tailscaled-rs/issues/128)) ([6787ad8](https://github.com/GeiserX/tailscaled-rs/commit/6787ad8dc3d891cd5c33faa1ed657b515f15df0f))
+* **serve:** tnet serve authors the Go Web map (tsd-6p4 stage B2, write side) ([#131](https://github.com/GeiserX/tailscaled-rs/issues/131)) ([33ad18a](https://github.com/GeiserX/tailscaled-rs/commit/33ad18ae70ecd329875ade61b7a842eb1a757570))
+* **tailnetd:** --config declarative config file (Go ipn.ConfigVAlpha, closes tsd-bin) ([#140](https://github.com/GeiserX/tailscaled-rs/issues/140)) ([8e72b0c](https://github.com/GeiserX/tailscaled-rs/commit/8e72b0cd897a5f66b9f87647adef27a864e3e9aa))
+* **tailnetd:** Go-style CLI flags (--statedir/--socket/--verbose/--version) ([#139](https://github.com/GeiserX/tailscaled-rs/issues/139)) ([f7c5d3c](https://github.com/GeiserX/tailscaled-rs/commit/f7c5d3cce28cdea362f11ea5826c3a3d2e4ea0d4))
+
+
+### Bug Fixes
+
+* **cli:** align netcheck/serve/get diagnostic output with Go v1.100.0 ([#122](https://github.com/GeiserX/tailscaled-rs/issues/122)) ([f0788e3](https://github.com/GeiserX/tailscaled-rs/commit/f0788e39deae438aeaa36d83389426e247ca4f5c))
+* **cli:** byte-match Go's lock-status wording + correct file-command doc miscites ([#123](https://github.com/GeiserX/tailscaled-rs/issues/123)) ([1a65ea5](https://github.com/GeiserX/tailscaled-rs/commit/1a65ea5ce4c016e6551b594d475ab395e3822d56))
+* **cli:** neutralize column/row injection from control-supplied names in terminal output ([#152](https://github.com/GeiserX/tailscaled-rs/issues/152)) ([51b5d30](https://github.com/GeiserX/tailscaled-rs/commit/51b5d30e605c70344df3d7e30dc1d5e1c44862dc))
+* **cli:** reset SIGPIPE to default so broken output pipes exit cleanly (not a panic) ([#151](https://github.com/GeiserX/tailscaled-rs/issues/151)) ([2fb9130](https://github.com/GeiserX/tailscaled-rs/commit/2fb9130f74a76fe71771c448c111b9e25c6553ee))
+* **cli:** sanitize control-supplied diagnostic output + correct netcheck JSON claims ([#124](https://github.com/GeiserX/tailscaled-rs/issues/124)) ([19a4273](https://github.com/GeiserX/tailscaled-rs/commit/19a4273c848fcd5195c5f975d285a44ea4e7a39c))
+* **exit-node:** reject `auto:` selector instead of silently breaking exit routing ([#119](https://github.com/GeiserX/tailscaled-rs/issues/119)) ([27cd239](https://github.com/GeiserX/tailscaled-rs/commit/27cd23931547947d01717821e869c8b9d32e6dc6))
+* **file:** wire `cp --name` to the actual transfer (was silently a no-op) ([#141](https://github.com/GeiserX/tailscaled-rs/issues/141)) ([2b178ba](https://github.com/GeiserX/tailscaled-rs/commit/2b178baf7419d00d19870bfd348742caadc19ad2))
+* **ipn:** gate Stopped on a persisted node key (Go hasNodeKeyLocked) + honest dns-status --json doc ([#121](https://github.com/GeiserX/tailscaled-rs/issues/121)) ([8556063](https://github.com/GeiserX/tailscaled-rs/commit/85560635e1021538e6c80f4cc63dc63748a1e9e4))
+* **ipn:** persist has_logged_in on set-rebuild + clear it on logout (review follow-ups) ([#161](https://github.com/GeiserX/tailscaled-rs/issues/161)) ([c29128d](https://github.com/GeiserX/tailscaled-rs/commit/c29128d8338b771a233e497069d3edad1d25d582))
+* **ipn:** revert-guard fresh-node exemption keys on has-logged-in, not prefs-file existence ([#156](https://github.com/GeiserX/tailscaled-rs/issues/156)) ([14dbde7](https://github.com/GeiserX/tailscaled-rs/commit/14dbde7ee12015b47a6b99c7b79a78b49cb69296))
+* **release:** ship a full-featured daemon (tun,ssh,acme) — released binaries were feature-less ([#133](https://github.com/GeiserX/tailscaled-rs/issues/133)) ([b09fa10](https://github.com/GeiserX/tailscaled-rs/commit/b09fa1028a5889bc808771a6538b19321019cf8f))
+* **status:** emit RFC3339 timestamps (Go-ipnstate-compatible), not chrono Display ([#147](https://github.com/GeiserX/tailscaled-rs/issues/147)) ([6476b1b](https://github.com/GeiserX/tailscaled-rs/commit/6476b1ba28b07ced17d3c017cd63d20b6bc3e017))
+* **up:** default to a persistent node + add --ephemeral/--no-ephemeral (Go parity, tsd-4qt) ([#134](https://github.com/GeiserX/tailscaled-rs/issues/134)) ([d46bbee](https://github.com/GeiserX/tailscaled-rs/commit/d46bbee68b86bc85fda1a8e11dec67e68b76c42f))
+
 ## [0.40.1](https://github.com/GeiserX/tailscaled-rs/compare/v0.40.0...v0.40.1) (2026-06-12)
 
 
