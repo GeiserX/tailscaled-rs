@@ -2815,7 +2815,7 @@ impl Backend {
     pub async fn apply_config(
         &mut self,
         config: &crate::conffile::Config,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<secrecy::SecretString>> {
         let authkey = config.apply_to_prefs(&mut self.prefs)?;
         self.ever_configured = true;
         self.persist_prefs().await?;

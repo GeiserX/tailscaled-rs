@@ -177,9 +177,9 @@ async fn main() -> Result<()> {
         "tailnetd posture"
     );
 
-    // Auto-start if the persisted intent was "up". A `--config` auth key (if supplied) is threaded
-    // in as the registration credential, taking precedence over `TS_AUTH_KEY`.
-    let config_authkey = config_authkey.map(secrecy::SecretString::from);
+    // Auto-start if the persisted intent was "up". A `--config` auth key (if supplied, already a
+    // `SecretString`) is threaded in as the registration credential, taking precedence over
+    // `TS_AUTH_KEY`.
     auto_start(&mut backend, config_authkey).await;
 
     let backend = Arc::new(Mutex::new(backend));

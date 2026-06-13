@@ -18,12 +18,17 @@
 //! is a registration credential, not a persisted pref).
 
 use anyhow::{Context, Result, anyhow, bail};
+use secrecy::SecretString;
 use serde::Deserialize;
 
 use crate::prefs::Prefs;
 
 /// A parsed `--config` document: the raw [`ConfigVAlpha`] plus the version string it declared.
-#[derive(Debug, Clone)]
+///
+/// Deliberately does NOT derive `Debug` (nor does [`ConfigVAlpha`]): the config carries an `AuthKey`,
+/// and withholding `Debug` keeps the whole document off any accidental `{:?}` / debug-log path — the
+/// same secret-hygiene discipline `tnet`'s `Cli`/`Command` use (see `src/bin/tnet.rs`).
+#[derive(Clone)]
 pub struct Config {
     /// The declared `version` (only `"alpha0"` is accepted today).
     pub version: String,
@@ -43,7 +48,7 @@ pub struct Config {
 /// (a newer Go config with a field this build predates) is preferred over a hard parse error, and the
 /// honest-omission warnings below already surface anything set-but-unmapped. The `version` gate in
 /// [`load`] is the real compatibility guard.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 #[serde(default, rename_all = "PascalCase")]
 pub struct ConfigVAlpha {
     /// Schema version; `"alpha0"` today. Gated in [`load`] before this struct is decoded.
@@ -54,7 +59,11 @@ pub struct ConfigVAlpha {
     #[serde(rename = "ServerURL")]
     pub server_url: Option<String>,
     /// Auth key for registration when `NeedsLogin` (or `file:<path>` to read it from a file). Not a
-    /// persisted pref — returned separately by [`Config::apply_to_prefs`].
+    /// persisted pref — [`Config::apply_to_prefs`] returns it as a [`SecretString`] and it is never
+    /// written into `prefs`. Kept as `String` here only because it must deserialize from the JSON
+    /// (`secrecy 0.10`'s `SecretString` needs an opt-in serde feature); the leak risk that a `String`
+    /// field would otherwise pose via `{:?}` is closed by **withholding `Debug`** on this struct
+    /// (see the type's derive list — the deliberate omission matches `tnet`'s `Cli`).
     pub auth_key: Option<String>,
     /// Requested hostname; `None` → the OS hostname.
     pub hostname: Option<String>,
@@ -84,7 +93,11 @@ pub struct ConfigVAlpha {
     // config parses; `apply_to_prefs` warns when any is set to a non-default. ----
     /// Go `OperatorUser` — local user allowed to operate the daemon without root. No daemon authz tier yet.
     pub operator_user: Option<String>,
-    /// Go `DisableSNAT`. Engine routing concern, not a daemon pref.
+    /// Go `DisableSNAT`. Engine routing concern, not a daemon pref. Explicit rename: `rename_all =
+    /// "PascalCase"` would mangle this to `DisableSnat`, but Go's field is `DisableSNAT` (all-caps
+    /// acronym) — without the rename a real Go config's `DisableSNAT` would be silently ignored and the
+    /// honest-omission `warn_unmapped` would never fire for it.
+    #[serde(rename = "DisableSNAT")]
     pub disable_snat: Option<bool>,
     /// Go `NetfilterMode` ("on"/"off"/"nodivert"). Engine routing concern.
     pub netfilter_mode: Option<String>,
@@ -153,12 +166,18 @@ impl Config {
     /// `AuthKey` resolution: a bare value is returned as-is; a `file:<path>` value is read from that
     /// file (trimmed) — Go's convention for keeping the secret out of the (often world-readable)
     /// config file itself.
-    pub fn apply_to_prefs(&self, prefs: &mut Prefs) -> Result<Option<String>> {
+    pub fn apply_to_prefs(&self, prefs: &mut Prefs) -> Result<Option<SecretString>> {
         let c = &self.parsed;
 
-        if let Some(enabled) = c.enabled {
-            prefs.want_running = enabled;
-        }
+        // `Enabled` is special: Go ALWAYS masks `WantRunning` in from a config (`mp.WantRunning =
+        // !c.Enabled.EqualBool(false)`; `mp.WantRunningSet = mp.WantRunning || c.Enabled != ""`), so an
+        // UNSET `Enabled` means the node should come UP (`!EqualBool(false)` → true). This is the
+        // headless contract — deploy a `--config` and the node runs unless you write `"Enabled": false`.
+        // So, unlike the other (apply-only-when-set) fields below, we default it to `true` rather than
+        // leaving the pref untouched. (The other fields match Go's conditional masking — Go only sets
+        // e.g. `RouteAllSet`/`CorpDNSSet`/`HostnameSet` when the field is explicitly present, so an
+        // unset field there correctly leaves the existing pref.)
+        prefs.want_running = c.enabled.unwrap_or(true);
         if let Some(url) = &c.server_url {
             prefs.control_url = Some(url.clone());
         }
@@ -189,7 +208,8 @@ impl Config {
 
         warn_unmapped(c);
 
-        // Resolve the auth key (bare value or `file:<path>`). Returned, never persisted.
+        // Resolve the auth key (bare value or `file:<path>`). Returned as a `SecretString`, never
+        // persisted. An empty key is treated as absent (matching the CLI's guard).
         match &c.auth_key {
             None => Ok(None),
             Some(k) if k.is_empty() => Ok(None),
@@ -199,8 +219,9 @@ impl Config {
 }
 
 /// Resolve a config `AuthKey` value: a `file:<path>` form reads + trims the key from that file (Go's
-/// convention, keeping the secret out of the config), anything else is the literal key.
-fn resolve_auth_key(value: &str) -> Result<String> {
+/// convention, keeping the secret out of the config), anything else is the literal key. Returns a
+/// [`SecretString`] so the resolved key does not outlive this call as a plain `String`.
+fn resolve_auth_key(value: &str) -> Result<SecretString> {
     match value.strip_prefix("file:") {
         Some(path) => {
             let contents = std::fs::read_to_string(path)
@@ -209,9 +230,10 @@ fn resolve_auth_key(value: &str) -> Result<String> {
             if key.is_empty() {
                 return Err(anyhow!("auth key file {path} is empty"));
             }
-            Ok(key.to_string())
+            Ok(SecretString::from(key.to_string()))
         }
-        None => Ok(value.to_string()),
+        // Not a `file:` form → the literal config value is the key.
+        None => Ok(SecretString::from(value.to_string())),
     }
 }
 
@@ -253,7 +275,11 @@ fn warn_unmapped(c: &ConfigVAlpha) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secrecy::ExposeSecret;
 
+    /// Load a config from an inline JSON string via a temp file. `Config` deliberately has no `Debug`
+    /// (secret hygiene), so we cannot use `.expect()`/`.unwrap()` (they need `Debug` on the Err/Ok);
+    /// match the `Result` by hand instead.
     fn cfg(json: &str) -> Config {
         let dir = std::env::temp_dir().join(format!("tailnetd-conf-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -265,21 +291,35 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::write(&path, json).unwrap();
-        let c = load(&path).expect("load config");
+        let loaded = load(&path);
         let _ = std::fs::remove_file(&path);
-        c
+        match loaded {
+            Ok(c) => c,
+            Err(e) => panic!("load config failed: {e}"),
+        }
+    }
+
+    /// The auth key a config yields, as a plain `String` for assertions (the production type is a
+    /// `SecretString`). Test-only — exposing the secret in a test is fine.
+    fn key_str(k: Option<SecretString>) -> Option<String> {
+        k.map(|s| s.expose_secret().to_string())
     }
 
     #[test]
     fn minimal_config_parses() {
         let c = cfg(r#"{"version":"alpha0"}"#);
         assert_eq!(c.version, "alpha0");
-        // All fields default — applying touches nothing + returns no auth key.
         let mut p = Prefs::default();
         let before = p.clone();
         let key = c.apply_to_prefs(&mut p).unwrap();
         assert!(key.is_none());
-        assert_eq!(p.want_running, before.want_running);
+        // `Enabled` is special (Go-faithful): unset → the node should come UP, so a minimal config
+        // sets want_running=true even though `Prefs::default()` is false.
+        assert!(
+            p.want_running,
+            "unset Enabled defaults the node to up (Go !EqualBool(false))"
+        );
+        // Every other unset field is left untouched (here accept_dns keeps its default).
         assert_eq!(p.accept_dns, before.accept_dns);
     }
 
@@ -289,12 +329,17 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tailnetd-conf-bad-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("nover.json");
+        // `Config` has no `Debug`, so `unwrap_err()` won't compile — assert via the Err arm directly.
+        let err_str = |path: &std::path::Path| match load(path) {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e.to_string(),
+        };
         std::fs::write(&path, r#"{"Hostname":"x"}"#).unwrap();
-        let err = load(&path).unwrap_err().to_string();
+        let err = err_str(&path);
         assert!(err.contains("no \"version\""), "{err}");
         // Unknown version.
         std::fs::write(&path, r#"{"version":"beta9"}"#).unwrap();
-        let err = load(&path).unwrap_err().to_string();
+        let err = err_str(&path);
         assert!(
             err.contains("unsupported") && err.contains("beta9"),
             "{err}"
@@ -334,21 +379,22 @@ mod tests {
 
     #[test]
     fn unset_fields_leave_prefs_untouched() {
-        // A config that sets only Hostname must not reset want_running / accept_dns / etc.
+        // A config that sets only Hostname must not reset the conditionally-masked fields
+        // (accept_routes / accept_dns / exit_node / …) — only `Enabled` is unconditionally applied
+        // (see minimal_config_parses), so test the conditional ones here.
         let c = cfg(r#"{"version":"alpha0","Hostname":"only-host"}"#);
         let mut p = Prefs {
-            want_running: true,
             accept_routes: true,
             ..Prefs::default()
         };
         c.apply_to_prefs(&mut p).unwrap();
         assert_eq!(p.hostname.as_deref(), Some("only-host"));
         assert!(
-            p.want_running,
-            "unset Enabled must not clobber want_running"
+            p.accept_routes,
+            "unset acceptRoutes must not clobber an existing pref"
         );
-        assert!(p.accept_routes, "unset acceptRoutes must not clobber");
         assert!(p.accept_dns, "unset acceptDNS keeps the default (true)");
+        assert!(!p.shields_up, "unset ShieldsUp keeps the default (false)");
     }
 
     #[test]
@@ -356,7 +402,7 @@ mod tests {
         let c = cfg(r#"{"version":"alpha0","AuthKey":"tskey-abc123"}"#);
         let mut p = Prefs::default();
         let key = c.apply_to_prefs(&mut p).unwrap();
-        assert_eq!(key.as_deref(), Some("tskey-abc123"));
+        assert_eq!(key_str(key).as_deref(), Some("tskey-abc123"));
         // The key is a credential — it must NOT have been written into any pref field.
         assert!(p.control_url.is_none());
     }
@@ -374,7 +420,7 @@ mod tests {
         let mut p = Prefs::default();
         let key = c.apply_to_prefs(&mut p).unwrap();
         assert_eq!(
-            key.as_deref(),
+            key_str(key).as_deref(),
             Some("tskey-from-file"),
             "file: key must be read + trimmed"
         );
