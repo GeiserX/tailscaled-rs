@@ -608,8 +608,19 @@ pub async fn drive_up(
     // Phase 3: brief lock — install iff still current, returning any orphan to shut down off-lock.
     let orphan = {
         let mut be = backend.lock().await;
-        be.finish_up(pending, built)
-    }?;
+        let orphan = be.finish_up(pending, built)?;
+        // On a successful install (no orphan → this attempt was current, not superseded), `finish_up`
+        // flipped `has_logged_in` in memory; persist it so the accidental-revert guard's fresh-node
+        // exemption survives a daemon restart. A superseded attempt (orphan present) did NOT install
+        // or flip, so there is nothing to persist. Persist failure is non-fatal: the node is up: a
+        // lost flag just means the next `up` is unguarded once (the benign migration-default outcome).
+        if orphan.is_none()
+            && let Err(e) = be.persist_prefs().await
+        {
+            tracing::warn!(error = %e, "failed to persist has_logged_in after bring-up (node is up; next up may be unguarded once)");
+        }
+        orphan
+    };
 
     // Lock released — settle the (rare) superseded device off-lock so a supersede never blocks the
     // lock for up to SHUTDOWN_TIMEOUT.
@@ -1383,6 +1394,14 @@ impl Backend {
         // off-lock requirement is trivially satisfied — but in practice nothing supersedes a
         // synchronous `up`, so this is virtually always a no-op.
         let orphan = self.finish_up(pending, built)?;
+        // On a successful install, `finish_up` flipped `has_logged_in` in memory; persist it (same as
+        // the `drive_up` path). Non-fatal on failure — the node is up. (Auto-start resuming an
+        // already-logged-in node just re-writes the same flag.)
+        if orphan.is_none()
+            && let Err(e) = self.persist_prefs().await
+        {
+            tracing::warn!(error = %e, "failed to persist has_logged_in after bring-up");
+        }
         shutdown_orphan(orphan).await;
         Ok(())
     }
@@ -1667,7 +1686,13 @@ impl Backend {
     /// [`revert_guard::check_accidental_reverts`] for the two exemptions (fresh node / bare `up`) and
     /// the per-pref logic.
     pub fn up_revert_guard(&self, opts: &UpOptions) -> Vec<crate::localapi::RevertedPref> {
-        revert_guard::check_accidental_reverts(&self.prefs, opts, self.ever_configured)
+        // The fresh-node exemption keys on `has_logged_in` (the node actually registered), NOT
+        // `ever_configured` (prefs-file existence). Go's `checkForAccidentalSettingReverts`
+        // early-returns on `curPrefs.ControlURL == ""` — a never-logged-in node — and Go's `set` never
+        // writes ControlURL, so a `set`-then-`up` on a fresh node is unguarded there. Keying on
+        // `ever_configured` here (flipped true by a bare `tnet set`) would wrongly arm the guard on
+        // that exact sequence; `has_logged_in` is the faithful signal. (tsd-i7c)
+        revert_guard::check_accidental_reverts(&self.prefs, opts, self.prefs.has_logged_in)
     }
 
     /// Whether this `up` must be refused for changing the control server on a **Running** node
@@ -1946,6 +1971,15 @@ impl Backend {
         // Known lifecycle transition (the IPN state is derived fresh per `status()`, never stored, so
         // transitions are otherwise unlogged): the engine is up and the device is installed. The node
         // converges to Running once the netmap arrives.
+        // Mark the node as having logged in: `build_device`'s `Device::new` completed the control
+        // registration handshake, so this node has now actually registered (the analogue of Go setting
+        // `Persist.UserProfile.LoginName`). The accidental-revert guard's fresh-node exemption keys on
+        // this (NOT on prefs-file existence), so a `tnet set` before the first `up` no longer arms the
+        // guard. Flip the in-memory flag here, on the non-superseded success path only; the async
+        // caller (`drive_up` / `Backend::up`) persists it right after this returns `Ok`. A crash in the
+        // gap simply leaves `has_logged_in=false`, so the next `up` is unguarded once — the same benign
+        // outcome as the on-upgrade migration default.
+        self.prefs.has_logged_in = true;
         tracing::info!(
             generation = self.generation,
             "engine started, device installed"
@@ -3304,6 +3338,47 @@ mod tests {
             .mentions_any_pref(),
             "force_reauth must NOT be a mentioned pref (a bare `up --force-reauth` stays a bare up)"
         );
+    }
+
+    #[tokio::test]
+    async fn revert_guard_exempts_never_logged_in_node_then_guards_after_login() {
+        // tsd-i7c: the accidental-revert guard's fresh-node exemption must key on `has_logged_in`
+        // (the node actually registered), NOT prefs-file existence / `ever_configured` (which a bare
+        // `tnet set` flips true). So a `set`-then-`up` on a node that never logged in must NOT trip the
+        // guard — matching Go (whose `set` never writes ControlURL, so `checkForAccidentalSettingReverts`
+        // still early-returns on the subsequent `up`).
+        let dir = std::env::temp_dir().join(format!("tailnetd-i7c-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let mut be = backend_for(&dir);
+        // Simulate `tnet set --accept-routes` on a never-logged-in node: a non-default pref is set and
+        // a prefs.json exists (ever_configured true), but the node has NOT registered.
+        be.prefs.accept_routes = true;
+        be.ever_configured = true;
+        be.prefs.has_logged_in = false;
+
+        // A later `tnet up --ssh` mentions ssh but not accept_routes. Under the OLD (ever_configured)
+        // keying this WRONGLY tripped the guard; under has_logged_in it is correctly exempt.
+        let up_ssh = UpOptions {
+            ssh: Some(true),
+            ..UpOptions::default()
+        };
+        assert!(
+            be.up_revert_guard(&up_ssh).is_empty(),
+            "set-then-up on a never-logged-in node must NOT trip the revert guard (tsd-i7c)"
+        );
+
+        // Once the node HAS logged in, the guard arms normally: the same `up --ssh` would now silently
+        // revert the non-default accept_routes, so it is flagged.
+        be.prefs.has_logged_in = true;
+        let reverts = be.up_revert_guard(&up_ssh);
+        assert!(
+            reverts.iter().any(|r| r.key == "accept_routes"),
+            "after login, an unmentioned non-default accept_routes must be guarded: {reverts:?}"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
