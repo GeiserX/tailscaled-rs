@@ -283,12 +283,16 @@ mod tests {
     fn cfg(json: &str) -> Config {
         let dir = std::env::temp_dir().join(format!("tailnetd-conf-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        // Filename must be UNIQUE PER CALL: cargo runs these `#[test]`s as parallel threads in one
+        // process, and `SystemTime::now().as_nanos()` is NOT collision-free at that resolution on
+        // macOS — two concurrent `cfg()` calls could land on the same path, so one test's `write`/
+        // `load` races another's `remove_file` (intermittent failure under the full parallel suite).
+        // An atomic counter makes the name truly unique (mirrors `tests/localapi_loop.rs`'s `UNIQUE`).
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CFG_SEQ: AtomicU64 = AtomicU64::new(0);
         let path = dir.join(format!(
             "c-{}.json",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            CFG_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::write(&path, json).unwrap();
         let loaded = load(&path);

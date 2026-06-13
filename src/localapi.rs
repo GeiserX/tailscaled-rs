@@ -710,6 +710,10 @@ pub struct StatusReport {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PrefsView {
+    /// The requested hostname (Go `--hostname` / `Prefs.Hostname`), or `None` to use the OS hostname.
+    /// Surfaced so `tnet get` can show it (Go's `get` lists hostname). Back-compat: omitted when None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
     /// The configured exit-node selector (IP or MagicDNS name), or `None` if no exit node is set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_node: Option<String>,
