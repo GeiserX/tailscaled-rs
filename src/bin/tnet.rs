@@ -2403,8 +2403,10 @@ async fn run_file(socket: &std::path::Path, cmd: FileCmd) -> Result<()> {
 ///
 /// With `targets` (and no positional args), lists the Taildrop-able peers. Otherwise the LAST arg is
 /// the destination peer and MUST end in a colon (Go's disambiguator); the rest are files to send, one
-/// `FileCp` round-trip each. A lone `-` file reads stdin (with `--name`). `--name` overrides the
-/// destination filename and is rejected with multiple files (matching Go).
+/// `FileCp` round-trip each, with the `--name` override (when given) carried to the daemon so the
+/// file is sent under that name. `--name` is rejected with multiple files (matching Go). NOTE: stdin
+/// (`-`) is NOT supported by this build — the daemon opens each path itself (same-host); a `-` is
+/// rejected by `resolve_cp_file`.
 async fn run_file_cp(
     socket: &std::path::Path,
     args: Vec<String>,
@@ -2444,6 +2446,10 @@ async fn run_file_cp(
         let req = Request::FileCp {
             path,
             peer: peer.clone(),
+            // Thread `--name` onto the wire so the daemon actually sends the file under that name
+            // (Go `--name`); `None` lets the daemon derive the basename. The multi-file guard above
+            // already rejects `--name` with >1 file, so this only ever overrides a single send.
+            name: name.clone(),
         };
         match round_trip(socket, &req)
             .await

@@ -2638,8 +2638,9 @@ impl Backend {
         dev: &tailscale::Device,
         path: &str,
         peer: &str,
+        name: Option<&str>,
     ) -> crate::localapi::Response {
-        diag::file_cp(dev, path, peer).await
+        diag::file_cp(dev, path, peer, name).await
     }
 
     /// List the Taildrop files waiting in this node's receive directory (the `tnet file list` / Go

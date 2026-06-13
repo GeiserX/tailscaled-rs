@@ -907,10 +907,10 @@ async fn dispatch(
         // concurrent `down` may land mid-flight; `stop_device`'s `Arc::into_inner` then observes this
         // extra clone and takes the documented benign "drop the last clone" path. That is the correct
         // trade — a `down` no longer blocks for a multi-minute transfer — not a regression.
-        Request::FileCp { path, peer } => {
+        Request::FileCp { path, peer, name } => {
             let dev = { backend.lock().await.device_handle() };
             match dev {
-                Some(dev) => Backend::file_cp(&dev, &path, &peer).await,
+                Some(dev) => Backend::file_cp(&dev, &path, &peer, name.as_deref()).await,
                 None => Response::Error {
                     message: "node is not up".into(),
                 },

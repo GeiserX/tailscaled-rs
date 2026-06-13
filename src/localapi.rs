@@ -303,6 +303,10 @@ pub enum Request {
         path: String,
         /// Destination peer: a tailnet IP or MagicDNS name.
         peer: String,
+        /// Optional override for the name the file is sent AS (Go `--name`); `None` → the daemon uses
+        /// the path's basename. Validated to a single safe component on the daemon side.
+        #[serde(default)]
+        name: Option<String>,
     },
     /// List Taildrop files waiting in this node's receive directory. Read-only.
     ///
