@@ -2,10 +2,21 @@
 
 This lists the changes the downstream daemon (`tailscaled-rs`) needs from the `tailscale-rs`
 library to unblock end-to-end features. Each ask is self-contained, additive, and
-backward-compatible. The daemon pins engine rev `f3793636` (`v0.31.0`); individual asks
+backward-compatible. The daemon pins engine rev `575104b1` (`v0.32.0`); individual asks
 note the rev they were verified against (older "verified vs `e126bba`/v0.6.9" / `81446f88`/v0.28.2
-/ `6035651b`/v0.29.1 notes below predate the current pin and are kept as historical context — the
-SHIPPED markers reflect what the pin provides).
+/ `6035651b`/v0.29.1 / `f3793636`/v0.31.0 notes below predate the current pin and are kept as
+historical context — the SHIPPED markers reflect what the pin provides).
+
+> **Pin bump f3793636 (v0.31.0) → 575104b1 (v0.32.0), 2026-06-13.** Clean bump — full gate green;
+> probe-compile clean (no breaking surface). **Unblocks `#17` Tailnet Lock enforcement / write-ops**:
+> the engine now exposes the `Device`-level TKA drivers — `Device::tka_sign(&NodePublicKey)` (#169,
+> co-sign a node key into the lock = Go `NetworkLockSign`) and `Device::tka_disable(Vec<u8>)` (#170,
+> present the disablement secret = Go `NetworkLockDisable`), over the new control TKA mutation RPC
+> (#168). Previously only `Aum::sign` (a primitive) + read-only `tka_status` existed (v0.31.0), so
+> `tnet lock` was read-only; now `tnet lock sign`/`tnet lock disable` are daemon-fixable (the
+> consuming PR follows this bump). Also newly available: `Device::http_connector` (#165, HTTP over
+> the tailnet — a possible future slice). NOTE `Device::tka_init` (#175, `tnet lock init`) landed on
+> engine main AFTER the v0.32.0 tag → it rides the next bump (v0.33.0).
 
 > **Pin bump 6035651b (v0.29.1) → f3793636 (v0.31.0), 2026-06-13.** Clean bump — full gate green
 > (194 lib + 97 tnet + 9 integ; clippy ±`identity-federation`; fmt). The one breaking change
