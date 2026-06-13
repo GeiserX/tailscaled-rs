@@ -364,7 +364,12 @@ pub(super) async fn ping(dev: &tailscale::Device, ip: &str, timeout_ms: Option<u
 /// as an [`IpAddr`](std::net::IpAddr) is looked up by tailnet IP, otherwise by MagicDNS name. The
 /// engine derives the destination solely from the resolved peer's own node record, so a raw
 /// address can never be targeted directly.
-pub(super) async fn file_cp(dev: &tailscale::Device, path: &str, peer: &str) -> Response {
+pub(super) async fn file_cp(
+    dev: &tailscale::Device,
+    path: &str,
+    peer: &str,
+    name_override: Option<&str>,
+) -> Response {
     // Resolve the peer: a bare IP goes by tailnet-IP lookup, anything else by MagicDNS name —
     // the same IP-vs-name split the other peer-addressed commands use.
     let resolved = match peer.parse::<std::net::IpAddr>() {
@@ -384,17 +389,31 @@ pub(super) async fn file_cp(dev: &tailscale::Device, path: &str, peer: &str) -> 
             };
         }
     };
-    // Derive the send name from the path's final component (basename), like Go's `file cp`. A
-    // path with no basename (e.g. `/`) has nothing meaningful to name the transfer — reject it.
-    let Some(name) = std::path::Path::new(path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(str::to_string)
-    else {
-        return Response::Error {
-            message: format!("cannot derive a file name from path {path:?}"),
-        };
+    // The send name: Go's `--name` override when given, else the path's final component (basename),
+    // like Go's `file cp`. A `--name` is itself validated to a single safe component below; a path
+    // with no basename (e.g. `/`) and no override has nothing meaningful to name the transfer —
+    // reject it.
+    let name = match name_override {
+        Some(n) => n.to_string(),
+        None => {
+            let Some(base) = std::path::Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_string)
+            else {
+                return Response::Error {
+                    message: format!("cannot derive a file name from path {path:?}"),
+                };
+            };
+            base
+        }
     };
+    // The send name must be a single safe component regardless of source (see [`cp_send_name_ok`]).
+    if !cp_send_name_ok(&name) {
+        return Response::Error {
+            message: format!("invalid send name {name:?}: must be a bare file name"),
+        };
+    }
     // Path hardening (see method doc): the daemon opens `path` as root, so first stat it (via
     // `taildrop_source_ok`, which `symlink_metadata`s WITHOUT following a final-component symlink)
     // and refuse anything that is not a regular file — a symlink, device (e.g. `/dev/zero`, an
@@ -439,6 +458,20 @@ pub(super) async fn file_cp(dev: &tailscale::Device, path: &str, peer: &str) -> 
             message: format!("taildrop send failed: {e:?}"),
         },
     }
+}
+
+/// Whether a Taildrop SEND name (`--name` override or a derived basename) is a safe single file-name
+/// component. A name carrying a path separator / `.` / `..` / NUL would let the sender dictate a
+/// traversal-shaped name the receiver might mishandle — a name is a file name, not a path. The
+/// receiver's own engine re-validates, but [`file_cp`] refuses it here too (defense-in-depth,
+/// fail-closed). Pure → unit-testable.
+fn cp_send_name_ok(name: &str) -> bool {
+    !(name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0'))
 }
 
 /// List the Taildrop files waiting in this node's receive directory (the `tnet file list` verb).
@@ -1400,6 +1433,23 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cp_send_name_ok_accepts_bare_names_rejects_pathlike() {
+        use super::cp_send_name_ok;
+        // Bare file names (override or derived basename) are fine.
+        assert!(cp_send_name_ok("report.pdf"));
+        assert!(cp_send_name_ok(".bashrc"));
+        assert!(cp_send_name_ok("a b (1).txt"));
+        // Path-shaped / traversal / NUL names are refused (a name is not a path).
+        assert!(!cp_send_name_ok(""));
+        assert!(!cp_send_name_ok("."));
+        assert!(!cp_send_name_ok(".."));
+        assert!(!cp_send_name_ok("a/b.txt"));
+        assert!(!cp_send_name_ok("../escape"));
+        assert!(!cp_send_name_ok("a\\b"));
+        assert!(!cp_send_name_ok("a\0b"));
     }
 
     #[test]

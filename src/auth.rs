@@ -246,6 +246,7 @@ mod tests {
         Request::FileCp {
             path: "/tmp/send.bin".into(),
             peer: "100.64.0.2".into(),
+            name: None,
         }
     }
 
