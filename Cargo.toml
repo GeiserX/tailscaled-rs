@@ -123,6 +123,11 @@ ssh = ["tailscale/ssh", "dep:rand"]
 # (never a plaintext downgrade); plain TCP-forward serve is unaffected. Build with
 # `cargo build --features acme` to issue real certs against a Funnel/HTTPS-enabled SaaS tailnet.
 acme = ["tailscale/acme"]
+# Workload-identity federation (Phase 4, tsd-1m9): enables the engine's `identity-federation` feature
+# so the registration path can exchange an OAuth client secret or an IdP-issued OIDC token for a
+# Tailscale auth key (Go `tailscale up --client-id/--client-secret/--id-token/--audience`). SaaS-only,
+# off by default. Build with `cargo build --features identity-federation`.
+identity-federation = ["tailscale/identity-federation"]
 
 [profile.release]
 strip = true

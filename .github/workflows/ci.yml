@@ -51,11 +51,22 @@ jobs:
       - name: Clippy (acme feature)
         run: cargo clippy --all-targets --features acme -- -D warnings
 
+      # The `identity-federation` feature is off by default (it pulls the engine's OAuth/OIDC
+      # auth-key exchange for `tnet up --client-id/--client-secret/--id-token/--audience`). Lint + test
+      # it explicitly so the cfg(feature = "identity-federation")-gated WIF code can't silently rot —
+      # the default-config steps only compile the non-feature branch (where the daemon refuses the
+      # flags). Security-sensitive (credential handling), so the gating job must cover it directly.
+      - name: Clippy (identity-federation feature)
+        run: cargo clippy --all-targets --features identity-federation -- -D warnings
+
       - name: Test
         run: cargo test --all-targets
 
       - name: Test (ssh feature)
         run: cargo test --all-targets --features ssh
+
+      - name: Test (identity-federation feature)
+        run: cargo test --all-targets --features identity-federation
 
       - name: Build release
         run: cargo build --release --bins

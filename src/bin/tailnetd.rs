@@ -457,7 +457,9 @@ async fn auto_start_arc(backend: &Arc<Mutex<Backend>>) {
     let (authkey, resuming) = resume_decision(has_key, env_authkey);
     log_resume_decision(resuming, authkey.is_some(), ephemeral);
 
-    if let Err(e) = ipn::drive_up(backend, authkey, ipn::UpOptions::default()).await {
+    // The SIGHUP reload resume carries no workload-identity creds (it resumes from the persisted key
+    // or the env auth key) → `None`.
+    if let Err(e) = ipn::drive_up(backend, authkey, None, ipn::UpOptions::default()).await {
         tracing::warn!(error = %format!("{e:#}"), "SIGHUP auto-start retry failed; awaiting `tnet up`");
     }
 }

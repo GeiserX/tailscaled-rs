@@ -783,11 +783,33 @@ async fn dispatch(
             reset,
             force_reauth,
             ephemeral,
+            client_id,
+            client_secret,
+            id_token,
+            audience,
         } => {
             // Confine the plaintext authkey to the smallest scope: wrap it into a `SecretString`
             // right at the boundary and hand the engine path the secret. (The wire type stays
             // `String` because `SecretString` does not serialize.)
             let authkey = authkey.map(secrecy::SecretString::from);
+            // Workload-identity-federation creds (Go `--client-id/--client-secret/--id-token/
+            // --audience`): registration-time only, NOT prefs. Wrap the two secrets into
+            // `SecretString` at the boundary, same as the authkey; the non-secret identifiers
+            // (`client_id`/`audience`) pass through. `WifCreds::from_wire` returns `None` when no WIF
+            // field was sent (the common authkey/interactive case), so the feature gate and the
+            // engine-config plumbing are skipped entirely. When present AND the daemon was NOT built
+            // with `identity-federation`, refuse loudly here rather than silently dropping the creds
+            // (honest-omission — the engine would ignore them, so an operator must not think they
+            // took effect).
+            let wif = ipn::WifCreds::from_wire(client_id, client_secret, id_token, audience);
+            if wif.is_some() && !ipn::identity_federation_built() {
+                return Response::Error {
+                    message: "workload-identity flags (--client-id/--client-secret/--id-token/\
+                              --audience) require a daemon built with the `identity-federation` \
+                              feature; this build does not have it"
+                        .to_string(),
+                };
+            }
             // The routing fields (exit node + advertised exit/routes) flow straight through to
             // prefs via `UpOptions`; their semantics are documented on the field types.
             let opts = ipn::UpOptions {
@@ -833,7 +855,7 @@ async fn dispatch(
                     message: "can't change --login-server without --force-reauth".to_string(),
                 };
             }
-            match ipn::drive_up(backend, authkey, opts).await {
+            match ipn::drive_up(backend, authkey, wif, opts).await {
                 Ok(()) => {
                     tracing::info!("node up requested");
                     Response::Ok {

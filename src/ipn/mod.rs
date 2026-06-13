@@ -455,6 +455,73 @@ pub struct PendingUp {
     generation: u64,
 }
 
+/// Workload-identity-federation / OAuth registration credentials (Go `tailscale up
+/// --client-id/--client-secret/--id-token/--audience`), carried from the LocalAPI boundary to the
+/// engine handshake. Like the auth key, these are **registration-time-only and never persisted** —
+/// they are not part of [`Prefs`] and do not flow through [`config::build_config`]; instead they are
+/// set onto the engine [`tailscale::Config`] in [`build_device`] just before the handshake, so the
+/// secret window is confined to the construction call (the engine exchanges them for a real auth key
+/// when built with the `identity-federation` feature). The two secrets are held in
+/// [`secrecy::SecretString`] (zeroized on drop, never logged); `client_id`/`audience` are non-secret
+/// identifiers.
+pub struct WifCreds {
+    client_id: Option<String>,
+    client_secret: Option<secrecy::SecretString>,
+    id_token: Option<secrecy::SecretString>,
+    audience: Option<String>,
+}
+
+impl WifCreds {
+    /// Build from the four optional wire strings, wrapping the two secret-bearing ones into
+    /// [`secrecy::SecretString`]. Returns `None` when every field is absent (the common
+    /// authkey/interactive `up`), so callers skip the feature gate and the config plumbing entirely.
+    pub fn from_wire(
+        client_id: Option<String>,
+        client_secret: Option<String>,
+        id_token: Option<String>,
+        audience: Option<String>,
+    ) -> Option<Self> {
+        if client_id.is_none()
+            && client_secret.is_none()
+            && id_token.is_none()
+            && audience.is_none()
+        {
+            return None;
+        }
+        Some(Self {
+            client_id,
+            client_secret: client_secret.map(secrecy::SecretString::from),
+            id_token: id_token.map(secrecy::SecretString::from),
+            audience,
+        })
+    }
+
+    /// Apply these creds onto the engine [`tailscale::Config`] right before the registration
+    /// handshake. This is the daemon→engine trust boundary: the two secrets are exposed once here (the
+    /// other, earlier crossing is the CLI's wire-serialize step — the wire type is a plain `String`
+    /// because `SecretString` does not serialize, exactly as for the auth key). They are written into
+    /// the `Config`'s WIF fields that the engine's `resolve_auth_key` reads under the
+    /// `identity-federation` feature, then dropped with `self`; they never enter prefs or the key file.
+    fn apply_to_config(&self, config: &mut tailscale::Config) {
+        use secrecy::ExposeSecret as _;
+        config.client_id = self.client_id.clone();
+        config.client_secret = self
+            .client_secret
+            .as_ref()
+            .map(|s| s.expose_secret().to_owned());
+        config.id_token = self.id_token.as_ref().map(|s| s.expose_secret().to_owned());
+        config.audience = self.audience.clone();
+    }
+}
+
+/// Whether this daemon binary was compiled with the engine's `identity-federation` feature (the
+/// workload-identity / OAuth auth-key exchange). When `false`, the engine treats the WIF `Config`
+/// fields as inert, so the LocalAPI layer refuses WIF flags up front rather than letting them
+/// silently do nothing.
+pub fn identity_federation_built() -> bool {
+    cfg!(feature = "identity-federation")
+}
+
 /// Perform the slow engine handshake for a [`PendingUp`], **without** holding the backend lock.
 /// This is the multi-second, network-bound step (control-plane registration); keeping it off-lock is
 /// the whole point of the `begin_up`/`finish_up` split — a concurrent `status` (or any other LocalAPI
@@ -524,12 +591,14 @@ pub async fn shutdown_orphan(orphan: Option<std::sync::Arc<tailscale::Device>>) 
 pub async fn drive_up(
     backend: &std::sync::Arc<tokio::sync::Mutex<Backend>>,
     authkey: Option<secrecy::SecretString>,
+    wif: Option<WifCreds>,
     opts: UpOptions,
 ) -> Result<()> {
-    // Phase 1: brief lock — prep + persist prefs, build Config, bump generation.
+    // Phase 1: brief lock — prep + persist prefs, build Config (folding in any transient WIF creds),
+    // bump generation.
     let pending = {
         let mut be = backend.lock().await;
-        be.begin_up(opts).await
+        be.begin_up(opts, wif.as_ref()).await
     }?;
 
     // Phase 2: NO lock held — the slow, network-bound control-plane handshake. Concurrent
@@ -633,7 +702,8 @@ pub async fn drive_set(
             // does not silently flip `want_running` on a down node (that path is PersistedOnly).
             let pending = {
                 let mut be = backend.lock().await;
-                be.begin_up(UpOptions::default()).await
+                // A `set`-driven rebuild never (re)authenticates, so it carries no WIF creds (`None`).
+                be.begin_up(UpOptions::default(), None).await
             }?;
             // Phase 2b: NO lock held — the slow, network-bound re-registration handshake.
             let built = build_device(&pending, None).await;
@@ -1304,7 +1374,10 @@ impl Backend {
         authkey: Option<secrecy::SecretString>,
         opts: UpOptions,
     ) -> Result<()> {
-        let pending = self.begin_up(opts).await?;
+        // The single-owner `up` (daemon auto-start / resume at boot) carries no workload-identity
+        // creds — it resumes from the persisted node key or a config auth key. WIF registration is
+        // driven only through the LocalAPI `up` path (`drive_up`).
+        let pending = self.begin_up(opts, None).await?;
         let built = build_device(&pending, authkey).await;
         // Single-owner path: settle the (rare) orphan inline. No external lock is held here, so the
         // off-lock requirement is trivially satisfied — but in practice nothing supersedes a
@@ -1346,7 +1419,8 @@ impl Backend {
                 // device untouched. (The pref is already persisted by `begin_set`; it applies on the
                 // next successful `up`/`set` — but the running node stays up now.)
                 self.build_config().await?;
-                let pending = self.begin_up(UpOptions::default()).await?;
+                // A `set`-driven rebuild never (re)authenticates → no WIF creds.
+                let pending = self.begin_up(UpOptions::default(), None).await?;
                 let built = build_device(&pending, None).await;
                 let orphan = self.finish_up(pending, built)?;
                 shutdown_orphan(orphan).await;
@@ -1634,7 +1708,7 @@ impl Backend {
     /// shutdown (bounded by [`SHUTDOWN_TIMEOUT`]), so on a *reconfigure* (a device was already live)
     /// this phase is not strictly instantaneous under the lock — only the fresh-up case is. The
     /// common, head-of-line-sensitive case (no prior device) returns immediately.
-    pub async fn begin_up(&mut self, opts: UpOptions) -> Result<PendingUp> {
+    pub async fn begin_up(&mut self, opts: UpOptions, wif: Option<&WifCreds>) -> Result<PendingUp> {
         // PRE-VALIDATE the advertised CIDRs FIRST — before tearing down the device, mutating, or
         // persisting prefs. Same persist-before-validate gap as `begin_set`: `build_config` (below,
         // the final authority) only rejects a malformed CIDR AFTER `stop_device` + `persist_prefs`
@@ -1760,7 +1834,17 @@ impl Backend {
         self.ever_configured = true;
         self.persist_prefs().await?;
 
-        let config = self.build_config().await?;
+        let mut config = self.build_config().await?;
+        // Workload-identity-federation creds (Go `--client-id/--client-secret/--id-token/--audience`)
+        // are NOT prefs — they are not persisted and never flow through `build_config` (which reads
+        // only prefs + the key file). Apply the transient creds onto the freshly-built `Config` here,
+        // so the engine's registration handshake (`resolve_auth_key`, under the `identity-federation`
+        // feature) can exchange the OAuth secret / OIDC token for a real auth key. `None` (the common
+        // authkey/interactive up) leaves the config untouched. The two secrets are exposed once here,
+        // inside `apply_to_config`, then dropped with `wif` — they never enter prefs or the key file.
+        if let Some(wif) = wif {
+            wif.apply_to_config(&mut config);
+        }
         // `build_config`'s key load (`load_key_file`) create-on-missing-WROTE the key file, so a node
         // key is now persisted — update the cache. This holds for a plain up AND a force-reauth up:
         // force-reauth wiped the old key above (→ cache false) and this rebuild just minted a fresh
@@ -3101,7 +3185,7 @@ mod tests {
         // --- a PLAIN `begin_up` reaches build_config, which chokes on the bogus key (no wipe) ---
         let mut be = backend_for(&dir);
         tokio::fs::write(&be.key_path, bogus_key).await.unwrap();
-        match be.begin_up(UpOptions::default()).await {
+        match be.begin_up(UpOptions::default(), None).await {
             Ok(_) => panic!("a plain up must reach build_config and fail to parse the bogus key"),
             Err(e) => {
                 let msg = format!("{e:#}");
@@ -3122,10 +3206,13 @@ mod tests {
         // bogus key still present from the plain-up case above.
         assert!(tokio::fs::try_exists(&be.key_path).await.unwrap());
         match be
-            .begin_up(UpOptions {
-                force_reauth: true,
-                ..UpOptions::default()
-            })
+            .begin_up(
+                UpOptions {
+                    force_reauth: true,
+                    ..UpOptions::default()
+                },
+                None,
+            )
             .await
         {
             Ok(_) => {}
@@ -3177,10 +3264,13 @@ mod tests {
             .unwrap();
 
         let result = be
-            .begin_up(UpOptions {
-                force_reauth: true,
-                ..UpOptions::default()
-            })
+            .begin_up(
+                UpOptions {
+                    force_reauth: true,
+                    ..UpOptions::default()
+                },
+                None,
+            )
             .await;
         // PendingUp is not Debug, so check by hand rather than `.is_err()`/`expect_err`.
         if result.is_ok() {
@@ -3557,7 +3647,10 @@ mod tests {
 
         let gen0 = be.generation;
         // Phase 1 of an `up`: prep config + bump generation (no engine call).
-        let pending = be.begin_up(UpOptions::default()).await.expect("begin_up");
+        let pending = be
+            .begin_up(UpOptions::default(), None)
+            .await
+            .expect("begin_up");
         assert_eq!(
             pending.generation,
             gen0 + 1,
@@ -3606,7 +3699,10 @@ mod tests {
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let mut be = backend_for(&dir);
 
-        let pending = be.begin_up(UpOptions::default()).await.expect("begin_up");
+        let pending = be
+            .begin_up(UpOptions::default(), None)
+            .await
+            .expect("begin_up");
         // No superseding call → pending.generation == be.generation. A build error must surface.
         let result = be.finish_up(pending, Err(anyhow!("simulated engine start failure")));
         assert!(
@@ -3693,6 +3789,60 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn wif_creds_from_wire_is_none_when_all_absent() {
+        // The common case (plain authkey / interactive `up`): no WIF flag → `None`, so the daemon
+        // skips the feature gate and the config plumbing entirely.
+        assert!(
+            WifCreds::from_wire(None, None, None, None).is_none(),
+            "all-absent WIF must collapse to None"
+        );
+        // Any single field present → `Some` (so e.g. a lone `--audience` still triggers the gate).
+        assert!(WifCreds::from_wire(None, None, None, Some("aud".into())).is_some());
+        assert!(WifCreds::from_wire(Some("cid".into()), None, None, None).is_some());
+    }
+
+    #[tokio::test]
+    async fn wif_creds_apply_to_config_sets_engine_fields() {
+        // The WIF creds are NOT prefs: `build_config` (prefs-only) must leave the engine Config's WIF
+        // fields empty, and `apply_to_config` is what writes them — the exact fields the engine's
+        // `resolve_auth_key` reads under the `identity-federation` feature. Proves the secrets reach
+        // the Config (exposed once) rather than being silently dropped.
+        let dir = std::env::temp_dir().join(format!("tailnetd-wif-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let be = backend_for(&dir);
+        let mut cfg = be.build_config().await.expect("build_config");
+        // Prefs-only build leaves WIF fields empty (they are not prefs).
+        assert!(cfg.client_id.is_none() && cfg.client_secret.is_none());
+        assert!(cfg.id_token.is_none() && cfg.audience.is_none());
+
+        let wif = WifCreds::from_wire(
+            Some("oauth-client".into()),
+            Some("tskey-client-secret".into()),
+            None,
+            Some("sts.example".into()),
+        )
+        .expect("some WIF");
+        wif.apply_to_config(&mut cfg);
+        assert_eq!(cfg.client_id.as_deref(), Some("oauth-client"));
+        assert_eq!(cfg.client_secret.as_deref(), Some("tskey-client-secret"));
+        assert_eq!(cfg.audience.as_deref(), Some("sts.example"));
+        assert!(cfg.id_token.is_none(), "unset id_token stays None");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn identity_federation_built_matches_cfg() {
+        // The runtime gate must track the compile-time feature exactly (the LocalAPI layer relies on
+        // it to refuse WIF flags on a build that would ignore them).
+        assert_eq!(
+            identity_federation_built(),
+            cfg!(feature = "identity-federation")
+        );
     }
 
     #[tokio::test]
@@ -3838,10 +3988,13 @@ mod tests {
         // `begin_up` returns `Result<PendingUp>` and `PendingUp` is not `Debug`, so `expect_err`
         // (which would format the `Ok` value) won't compile — match by hand.
         let err = match be
-            .begin_up(UpOptions {
-                exit_node: Some(Some("auto:any".to_string())),
-                ..UpOptions::default()
-            })
+            .begin_up(
+                UpOptions {
+                    exit_node: Some(Some("auto:any".to_string())),
+                    ..UpOptions::default()
+                },
+                None,
+            )
             .await
         {
             Ok(_) => panic!("up --exit-node auto:any must fail (no auto-selection in this build)"),
@@ -3908,10 +4061,13 @@ mod tests {
         // (which would format the `Ok` value) won't compile — match by hand like
         // `build_config_rejects_malformed_advertise_route`.
         let err = match be
-            .begin_up(UpOptions {
-                advertise_routes: Some(vec!["10.0.0.0/8".to_string(), "nope/33".to_string()]),
-                ..UpOptions::default()
-            })
+            .begin_up(
+                UpOptions {
+                    advertise_routes: Some(vec!["10.0.0.0/8".to_string(), "nope/33".to_string()]),
+                    ..UpOptions::default()
+                },
+                None,
+            )
             .await
         {
             Ok(_) => panic!("a malformed advertise route must make begin_up fail"),
@@ -3949,12 +4105,15 @@ mod tests {
 
         // SET via overrides.
         let _ = be
-            .begin_up(UpOptions {
-                exit_node: Some(Some("exit-1".to_string())),
-                advertise_exit_node: Some(true),
-                advertise_routes: Some(vec!["10.0.0.0/8".to_string()]),
-                ..UpOptions::default()
-            })
+            .begin_up(
+                UpOptions {
+                    exit_node: Some(Some("exit-1".to_string())),
+                    advertise_exit_node: Some(true),
+                    advertise_routes: Some(vec!["10.0.0.0/8".to_string()]),
+                    ..UpOptions::default()
+                },
+                None,
+            )
             .await
             .expect("begin_up set");
         assert_eq!(be.prefs.exit_node.as_deref(), Some("exit-1"));
@@ -3963,7 +4122,7 @@ mod tests {
 
         // A plain follow-up `up` (all None) must leave the prefs UNCHANGED.
         let _ = be
-            .begin_up(UpOptions::default())
+            .begin_up(UpOptions::default(), None)
             .await
             .expect("begin_up unchanged");
         assert_eq!(
@@ -3979,12 +4138,15 @@ mod tests {
 
         // CLEAR exit_node via `Some(None)`, clear the advertised set via `Some(vec![])`.
         let _ = be
-            .begin_up(UpOptions {
-                exit_node: Some(None),
-                advertise_exit_node: Some(false),
-                advertise_routes: Some(vec![]),
-                ..UpOptions::default()
-            })
+            .begin_up(
+                UpOptions {
+                    exit_node: Some(None),
+                    advertise_exit_node: Some(false),
+                    advertise_routes: Some(vec![]),
+                    ..UpOptions::default()
+                },
+                None,
+            )
             .await
             .expect("begin_up clear");
         assert!(
@@ -4010,14 +4172,17 @@ mod tests {
 
         // Seed a richly-configured node.
         let _ = be
-            .begin_up(UpOptions {
-                hostname: Some("node-a".to_string()),
-                exit_node: Some(Some("exit-1".to_string())),
-                advertise_exit_node: Some(true),
-                advertise_routes: Some(vec!["10.0.0.0/8".to_string()]),
-                accept_routes: Some(true),
-                ..UpOptions::default()
-            })
+            .begin_up(
+                UpOptions {
+                    hostname: Some("node-a".to_string()),
+                    exit_node: Some(Some("exit-1".to_string())),
+                    advertise_exit_node: Some(true),
+                    advertise_routes: Some(vec!["10.0.0.0/8".to_string()]),
+                    accept_routes: Some(true),
+                    ..UpOptions::default()
+                },
+                None,
+            )
             .await
             .expect("begin_up seed");
         assert_eq!(be.prefs.advertise_routes, vec!["10.0.0.0/8".to_string()]);
@@ -4028,11 +4193,14 @@ mod tests {
         // default no-`ssh` build, which is a separate, already-tested behavior; this test is about the
         // reset mechanics, not the SSH preflight.)
         let _ = be
-            .begin_up(UpOptions {
-                accept_routes: Some(true),
-                reset: true,
-                ..UpOptions::default()
-            })
+            .begin_up(
+                UpOptions {
+                    accept_routes: Some(true),
+                    reset: true,
+                    ..UpOptions::default()
+                },
+                None,
+            )
             .await
             .expect("begin_up reset");
 
@@ -4080,20 +4248,26 @@ mod tests {
         let mut be = backend_for(&dir);
 
         let _ = be
-            .begin_up(UpOptions {
-                advertise_routes: Some(vec!["10.0.0.0/8".to_string()]),
-                accept_routes: Some(true),
-                ..UpOptions::default()
-            })
+            .begin_up(
+                UpOptions {
+                    advertise_routes: Some(vec!["10.0.0.0/8".to_string()]),
+                    accept_routes: Some(true),
+                    ..UpOptions::default()
+                },
+                None,
+            )
             .await
             .expect("begin_up seed");
 
         let _ = be
-            .begin_up(UpOptions {
-                advertise_routes: Some(vec!["192.168.0.0/16".to_string()]),
-                reset: true,
-                ..UpOptions::default()
-            })
+            .begin_up(
+                UpOptions {
+                    advertise_routes: Some(vec!["192.168.0.0/16".to_string()]),
+                    reset: true,
+                    ..UpOptions::default()
+                },
+                None,
+            )
             .await
             .expect("begin_up reset+mention");
 
@@ -4127,10 +4301,13 @@ mod tests {
 
         // ENABLE via the override.
         let _ = be
-            .begin_up(UpOptions {
-                accept_routes: Some(true),
-                ..UpOptions::default()
-            })
+            .begin_up(
+                UpOptions {
+                    accept_routes: Some(true),
+                    ..UpOptions::default()
+                },
+                None,
+            )
             .await
             .expect("begin_up accept_routes enable");
         assert!(
@@ -4140,7 +4317,7 @@ mod tests {
 
         // A plain follow-up `up` (None) must leave it enabled (unchanged).
         let _ = be
-            .begin_up(UpOptions::default())
+            .begin_up(UpOptions::default(), None)
             .await
             .expect("begin_up unchanged");
         assert!(
@@ -4150,10 +4327,13 @@ mod tests {
 
         // DISABLE via the override.
         let _ = be
-            .begin_up(UpOptions {
-                accept_routes: Some(false),
-                ..UpOptions::default()
-            })
+            .begin_up(
+                UpOptions {
+                    accept_routes: Some(false),
+                    ..UpOptions::default()
+                },
+                None,
+            )
             .await
             .expect("begin_up accept_routes disable");
         assert!(
@@ -4615,7 +4795,7 @@ mod tests {
 
         // A plain `up` (ssh: None) must leave ssh_enabled at its default (false).
         let _ = be
-            .begin_up(UpOptions::default())
+            .begin_up(UpOptions::default(), None)
             .await
             .expect("begin_up unchanged");
         assert!(
@@ -4627,10 +4807,13 @@ mod tests {
         // `Some(false)` override DISABLES it — without needing the feature/root an ENABLE would.
         be.prefs.ssh_enabled = true;
         let _ = be
-            .begin_up(UpOptions {
-                ssh: Some(false),
-                ..UpOptions::default()
-            })
+            .begin_up(
+                UpOptions {
+                    ssh: Some(false),
+                    ..UpOptions::default()
+                },
+                None,
+            )
             .await
             .expect("begin_up disable ssh");
         assert!(
@@ -4640,7 +4823,7 @@ mod tests {
 
         // And a follow-up `None` override must preserve the now-disabled state.
         let _ = be
-            .begin_up(UpOptions::default())
+            .begin_up(UpOptions::default(), None)
             .await
             .expect("begin_up unchanged after disable");
         assert!(
