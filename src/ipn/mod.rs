@@ -2801,6 +2801,26 @@ impl Backend {
             .await
             .with_context(|| format!("saving prefs to {}", self.prefs_path.display()))
     }
+
+    /// Apply a declarative `--config` document over the loaded prefs and persist the result, returning
+    /// the registration auth key the config supplied (if any) for the caller to feed into bring-up.
+    ///
+    /// The merge is layered (a field unset in the config leaves the corresponding pref untouched —
+    /// see [`crate::conffile::Config::apply_to_prefs`]), so the config refines the persisted prefs
+    /// rather than wholesale-replacing them. Persisting here means the merged intent survives a
+    /// restart even if the daemon is later launched without `--config` (matching Go, where a config
+    /// applied at boot becomes the node's prefs). Marks `ever_configured` so the node is treated as
+    /// explicitly configured (a `--config` boot is a deliberate configuration, like `up`). The auth
+    /// key is returned, never persisted into prefs — it is a credential, not intent.
+    pub async fn apply_config(
+        &mut self,
+        config: &crate::conffile::Config,
+    ) -> Result<Option<secrecy::SecretString>> {
+        let authkey = config.apply_to_prefs(&mut self.prefs)?;
+        self.ever_configured = true;
+        self.persist_prefs().await?;
+        Ok(authkey)
+    }
 }
 
 #[cfg(test)]

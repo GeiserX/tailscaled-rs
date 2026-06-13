@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use tailscaled_rs::ipn::{self, Backend};
 use tailscaled_rs::prefs::Prefs;
@@ -56,6 +56,14 @@ struct Args {
     /// env filter when given. Go `tailscaled --verbose`.
     #[arg(long, short = 'v', value_name = "LEVEL")]
     verbose: Option<u8>,
+    /// Declarative config file (Go `tailscaled --config`, the `ipn.ConfigVAlpha` JSON). Loaded at
+    /// startup and merged over the persisted prefs — the headless/automated path for setting prefs
+    /// without an interactive `tnet up`. An `AuthKey` (or `file:<path>`) in the config registers the
+    /// node. Fails fast on a malformed/unsupported-version file. (SIGHUP re-read is a follow-up: it
+    /// shares the same blocker as the existing prefs reload — adopting changed config fields into a
+    /// *running* engine needs an `ipn` `reload_prefs` primitive this crate does not yet own.)
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -136,6 +144,22 @@ async fn main() -> Result<()> {
 
     let mut backend = Backend::load(&state_dir).await?;
 
+    // `--config <file>`: load the declarative config and merge it over the just-loaded prefs (Go
+    // `tailscaled --config`). The merge is layered + persisted by `apply_config`, so the config
+    // refines the stored prefs and the merged intent survives a later restart. A malformed or
+    // unsupported-version file fails the daemon HARD (a misconfigured headless deploy must not start
+    // half-configured) — propagate the error rather than logging + continuing. The config's auth key
+    // (if any) is threaded into auto-start as a registration credential (never persisted into prefs).
+    let config_authkey = match &args.config {
+        Some(path) => {
+            let config = tailscaled_rs::conffile::load(path)
+                .with_context(|| format!("loading --config {}", path.display()))?;
+            tracing::info!(path = %path.display(), version = %config.version, "applying --config");
+            backend.apply_config(&config).await?
+        }
+        None => None,
+    };
+
     // Describe the daemon's effective posture once at boot so an operator tailing the log knows which
     // control plane it talks to, which data path it uses, and the exact build — without having to run
     // `tnet status`/`version`. (`control_url = None` → the engine default, Tailscale SaaS; `transport`
@@ -153,8 +177,10 @@ async fn main() -> Result<()> {
         "tailnetd posture"
     );
 
-    // Auto-start if the persisted intent was "up".
-    auto_start(&mut backend).await;
+    // Auto-start if the persisted intent was "up". A `--config` auth key (if supplied, already a
+    // `SecretString`) is threaded in as the registration credential, taking precedence over
+    // `TS_AUTH_KEY`.
+    auto_start(&mut backend, config_authkey).await;
 
     let backend = Arc::new(Mutex::new(backend));
 
@@ -362,7 +388,7 @@ async fn reconcile_on_reload(backend: &Arc<Mutex<Backend>>, prefs_path: &std::pa
 ///   rotation).
 /// - no persisted key AND no `TS_AUTH_KEY` → nothing to resume from and no key to auth with; still
 ///   attempt `up(None, ..)` so the engine yields the authoritative needs-login state, not a guess.
-async fn auto_start(backend: &mut Backend) {
+async fn auto_start(backend: &mut Backend, config_authkey: Option<secrecy::SecretString>) {
     if !backend.wants_running() {
         return;
     }
@@ -371,9 +397,11 @@ async fn auto_start(backend: &mut Backend) {
     // from an out-of-band intent flip.
     backend.mark_boot_attempted_up();
 
-    let env_authkey = env_authkey();
+    // Registration credential precedence: a `--config` auth key (the explicit declarative source for
+    // a config-driven boot) wins over `TS_AUTH_KEY`; either is a fresh-auth key that beats resume.
+    let explicit_authkey = config_authkey.or_else(env_authkey);
     let has_key = backend.has_persisted_node_key().await;
-    let (authkey, resuming) = resume_decision(has_key, env_authkey);
+    let (authkey, resuming) = resume_decision(has_key, explicit_authkey);
     log_resume_decision(resuming, authkey.is_some(), backend.prefs_ephemeral());
 
     // Auto-start uses persisted prefs as-is (no overrides) — TUN/hostname/control-url all come from

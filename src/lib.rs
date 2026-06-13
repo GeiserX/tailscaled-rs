@@ -21,6 +21,7 @@
 //! Two binaries consume it: `tailnetd` (the daemon) and `tnet` (the thin CLI client).
 
 pub mod auth;
+pub mod conffile;
 pub mod hardening;
 pub mod ipn;
 pub mod localapi;
