@@ -566,6 +566,17 @@ async fn dispatch(
                 },
             }
         }
+        // `lock init` (Go `tailscale lock init`): initialize the lock with this node as sole trusted
+        // key. A write (authz'd above) — a control init RPC, off-lock, needs the node up.
+        Request::LockInit { secret_hex } => {
+            let dev = { backend.lock().await.device_handle() };
+            match dev {
+                Some(dev) => Backend::lock_init(&dev, &secret_hex).await,
+                None => Response::Error {
+                    message: "node is not up".into(),
+                },
+            }
+        }
         // `lock sign` (Go `tailscale lock sign`): co-sign a node key into the lock. A write (authz'd
         // above), but a control RPC, not a backend-state mutation — off-lock device call like the
         // diagnostics; needs the node up (the RPC goes over the live control connection).

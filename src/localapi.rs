@@ -214,6 +214,13 @@ pub enum Request {
     /// Report Tailnet Lock (TKA) status (Go `tailscale lock status`, read-only subset). Replies with
     /// [`Response::Lock`]. Read-only — gated like [`Status`](Request::Status).
     LockStatus,
+    /// Initialize Tailnet Lock with this node as the sole initial trusted key (Go `tailscale lock
+    /// init`, single-node case). Submits the signed genesis to control; replies with
+    /// [`Response::Ok`]/[`Response::Error`]. A **write** — gated like `up`/`down` (root/same-uid): it
+    /// establishes tailnet-wide trust. Requires the node to be up. `secret_hex` is the hex-encoded
+    /// disablement secret the lock is gated with (the daemon decodes it to the bytes `tka_init` takes);
+    /// operator-supplied, never logged.
+    LockInit { secret_hex: String },
     /// Co-sign a node key into Tailnet Lock (Go `tailscale lock sign`). Submits the signature to
     /// control over the engine's TKA mutation RPC; replies with [`Response::Ok`]/[`Response::Error`].
     /// A **write** — gated like `up`/`down` (root/same-uid): it mutates tailnet-wide trust. Requires

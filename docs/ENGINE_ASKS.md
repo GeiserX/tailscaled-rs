@@ -2,10 +2,19 @@
 
 This lists the changes the downstream daemon (`tailscaled-rs`) needs from the `tailscale-rs`
 library to unblock end-to-end features. Each ask is self-contained, additive, and
-backward-compatible. The daemon pins engine rev `575104b1` (`v0.32.0`); individual asks
+backward-compatible. The daemon pins engine rev `f8192568` (`v0.33.0`); individual asks
 note the rev they were verified against (older "verified vs `e126bba`/v0.6.9" / `81446f88`/v0.28.2
-/ `6035651b`/v0.29.1 / `f3793636`/v0.31.0 notes below predate the current pin and are kept as
-historical context — the SHIPPED markers reflect what the pin provides).
+/ `6035651b`/v0.29.1 / `f3793636`/v0.31.0 / `575104b1`/v0.32.0 notes below predate the current pin and
+are kept as historical context — the SHIPPED markers reflect what the pin provides).
+
+> **Pin bump 575104b1 (v0.32.0) → f8192568 (v0.33.0), 2026-06-13.** Clean bump — full gate green;
+> probe-compile clean (no breaking surface). **Completes the Tailnet Lock surface**: the engine now
+> exposes `Device::tka_init(disablement_secret)` (#175, "epic complete") — initialize the lock with
+> this node as the sole initial trusted key (Go `tailscale lock init`, single-node case). Consumed as
+> `tnet lock init <disablement-secret>` (the consuming change rides this bump). So `tnet lock` now has
+> the full verb set: `status` (read), `init`, `sign`, `disable`. NOTE the engine's `tka_init` is
+> **single-node only** — a multi-node tailnet (other nodes needing re-signing under the new lock) gets
+> `Unsupported`; multi-node init is a deferred engine follow-up (file an ask if/when wanted).
 
 > **Pin bump f3793636 (v0.31.0) → 575104b1 (v0.32.0), 2026-06-13.** Clean bump — full gate green;
 > probe-compile clean (no breaking surface). **Unblocks `#17` Tailnet Lock enforcement / write-ops**:

@@ -2676,6 +2676,12 @@ impl Backend {
         diag::lock_status(dev).await
     }
 
+    /// Initialize Tailnet Lock (the `tnet lock init` path). Thin `pub` shim over [`diag::lock_init`]
+    /// (hex-decodes the disablement secret and calls `Device::tka_init`).
+    pub async fn lock_init(dev: &tailscale::Device, secret_hex: &str) -> crate::localapi::Response {
+        diag::lock_init(dev, secret_hex).await
+    }
+
     /// Co-sign a node key into Tailnet Lock (the `tnet lock sign` path). Thin `pub` shim over
     /// [`diag::lock_sign`] (parses the `nodekey:<hex>` and calls `Device::tka_sign`).
     pub async fn lock_sign(dev: &tailscale::Device, node_key: &str) -> crate::localapi::Response {

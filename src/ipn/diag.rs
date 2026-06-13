@@ -67,6 +67,36 @@ pub(super) async fn lock_status(dev: &tailscale::Device) -> Response {
     }
 }
 
+/// Initialize Tailnet Lock with this node as the sole initial trusted key (the `tnet lock init` / Go
+/// `tailscale lock init` single-node path). Hex-decodes the operator-supplied disablement secret and
+/// calls [`Device::tka_init`](tailscale::Device::tka_init), which builds + signs the genesis
+/// checkpoint (trusting only this node, gated by the secret's Argon2i disablement value) and drives
+/// control's two-phase init RPC. Submit-only (the lock reflects locally on the next verified sync),
+/// reported as [`Response::Ok`]. A malformed-hex secret fails fast (before any RPC). The engine
+/// returns `Unsupported` if the tailnet has other nodes needing (re)signing (multi-node init is a
+/// deferred engine follow-up) or a lock already exists — surfaced as a clear [`Response::Error`]. The
+/// secret is never logged.
+pub(super) async fn lock_init(dev: &tailscale::Device, secret_hex: &str) -> Response {
+    let secret = match decode_hex(secret_hex) {
+        Some(bytes) => bytes,
+        None => {
+            return Response::Error {
+                message: "invalid disablement secret: expected a hex-encoded value".to_string(),
+            };
+        }
+    };
+    match dev.tka_init(secret).await {
+        Ok(()) => Response::Ok {
+            message: "Tailnet Lock initialized with this node as the sole trusted key (applies on \
+                      the next netmap sync; keep the disablement secret safe)"
+                .to_string(),
+        },
+        Err(e) => Response::Error {
+            message: format!("tailnet lock init failed: {e}"),
+        },
+    }
+}
+
 /// Co-sign a node key into Tailnet Lock (the `tnet lock sign` / Go `tailscale lock sign` path).
 /// Parses the `nodekey:<hex>` string into the engine's [`NodePublicKey`](tailscale::keys::NodePublicKey)
 /// and calls [`Device::tka_sign`](tailscale::Device::tka_sign), which submits the signature to control
