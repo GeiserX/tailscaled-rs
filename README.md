@@ -134,8 +134,10 @@ sudo ./target/release/tnet uninstall
 > On Linux, `tnet install` picks the systemd unit that matches how the daemon was **built**. A
 > default (userspace-networking) build installs a fully-sandboxed unit (no capabilities, no
 > `/dev/net/tun`). A build with the `tun` feature (`--features tun`, kernel-TUN data path) installs a
-> unit relaxed *only* as much as a kernel `tun` interface needs — `CAP_NET_ADMIN`, `/dev/net/tun`, and
-> the matching syscall/address-family surface — while keeping the key-protection hardening intact. The
+> unit relaxed *only* as much as a kernel `tun` interface needs — `CAP_NET_ADMIN` (to create/configure
+> the interface and program routes), `/dev/net/tun` (allowlisted read-write, device cgroup otherwise
+> closed), and the syscall surface for the `ip`/`resolvectl` helpers it execs — while keeping every
+> key-protection directive intact. The
 > installed binary and its unit therefore always agree, so a TUN build is never silently broken by a
 > sandbox that hides its device, and a userspace build is never needlessly granted `CAP_NET_ADMIN`.
 

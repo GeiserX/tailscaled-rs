@@ -328,15 +328,17 @@ mod tests {
         // pins the feature-aware selection so a refactor can't silently ship a TUN binary under the
         // userspace sandbox (which would fail closed at /dev/net/tun) or grant CAP_NET_ADMIN to a
         // userspace build that has no need for it.
-        // Use unambiguous, ACTIVE-directive signals that appear in only one unit and are NOT present
-        // as commented text in the other: the userspace unit's Phase-3 NOTE *mentions*
-        // `CAP_NET_ADMIN` in a comment, so a bare `contains("CapabilityBoundingSet=CAP_NET_ADMIN")`
-        // would false-match it. `DeviceAllow=/dev/net/tun rw` and `PrivateDevices=false` appear ONLY
-        // as live directives in the TUN unit (the userspace unit has `PrivateDevices=true` and no
-        // DeviceAllow at all), so they cleanly distinguish the two.
+        // Distinguish the units by ACTIVE directives only. A plain `contains(..)` would false-match
+        // the userspace unit's Phase-3 NOTE, which *documents* the TUN directives (`DeviceAllow=...`,
+        // `PrivateDevices=false`, `CAP_NET_ADMIN`) as commented examples — so a substring search hits
+        // them in BOTH units. We therefore match line-anchored directives: trim each line and require
+        // it to EQUAL the directive (a leading `#` makes the trimmed line `"# ..."`, never equal), so
+        // commented examples can't satisfy the check.
         let p = plan().expect("linux plan");
-        let grants_tun = p.unit_content.contains("DeviceAllow=/dev/net/tun rw")
-            && p.unit_content.contains("PrivateDevices=false");
+        let has_directive =
+            |unit: &str, directive: &str| unit.lines().any(|l| l.trim_start() == directive);
+        let grants_tun = has_directive(p.unit_content, "DeviceAllow=/dev/net/tun rw")
+            && has_directive(p.unit_content, "PrivateDevices=false");
         if cfg!(feature = "tun") {
             assert!(
                 grants_tun,
@@ -344,7 +346,7 @@ mod tests {
             );
         } else {
             assert!(
-                !grants_tun && p.unit_content.contains("PrivateDevices=true"),
+                !grants_tun && has_directive(p.unit_content, "PrivateDevices=true"),
                 "userspace build must keep the locked-down unit (PrivateDevices=true, no /dev/net/tun)"
             );
         }

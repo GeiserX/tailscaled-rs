@@ -67,30 +67,43 @@ CapabilityBoundingSet=CAP_NET_ADMIN
 AmbientCapabilities=CAP_NET_ADMIN
 # Device access: the userspace unit sets PrivateDevices=true, which hides /dev/net/tun entirely.
 # TUN mode needs the device visible, so PrivateDevices is OFF here and /dev/net/tun is allowlisted
-# read-write (DeviceAllow is a strict allowlist — only this node is reachable, not all of /dev).
+# read-write. DeviceAllow switches the device cgroup to deny-by-default, so even with /dev visible
+# only the named node (plus systemd's standard null/zero/random/tty) is reachable — /dev/mem,
+# block devices, etc. stay denied. `rw` (not `rwm`) omits mknod, so no new device nodes can be made.
+# DevicePolicy=closed states that deny-by-default explicitly (implied by DeviceAllow, but pinned here
+# so a future edit that drops the last DeviceAllow can't silently re-open DevicePolicy=auto).
 PrivateDevices=false
+DevicePolicy=closed
 DeviceAllow=/dev/net/tun rw
-# ProtectSystem: the userspace unit uses `strict` (whole FS read-only). TUN mode needs the daemon to
-# reach /dev/net/tun and program routes, so relax to `full` (/usr + /boot + /etc read-only, the rest
-# writable) rather than the more aggressive `strict`. The state dir carve-out is still explicit.
-ProtectSystem=full
+# ProtectSystem: KEEP `strict` (whole FS read-only) — same as the userspace unit. TUN mode adds no
+# filesystem writes: the tun device is governed by DeviceAllow above (not ProtectSystem), and route
+# (`ip route …`) + DNS (`resolvectl …`) programming are kernel/IPC operations that write nothing to
+# disk (the engine deliberately never edits /etc/resolv.conf). `strict` keeps /usr+/etc readable so
+# the `ip`/`resolvectl` binaries still execute; only the state dir is writable, carved out below.
+ProtectSystem=strict
 ReadWritePaths=/var/lib/tailnetd
-# Address families: add AF_PACKET on top of the userspace set for the kernel data path; keep
-# AF_NETLINK (route/interface programming) + AF_UNIX (LocalAPI) + AF_INET/AF_INET6 (UDP + DERP).
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
-# Syscall surface: still start from the generic service set, but do NOT subtract @privileged — some
-# of the interface-configuration ioctls TUN needs live in that group. We still subtract @resources
-# (resource-limit tuning is not needed) to keep the surface as small as TUN allows.
+# Address families: IDENTICAL to the userspace set. The kernel TUN data path opens no AF_PACKET
+# socket — it is L3 (the tun device delivers IP packets; WireGuard is L3), interface config uses
+# AF_INET/AF_INET6 SOCK_DGRAM ioctls + TUNSETIFF, and interface enumeration uses AF_NETLINK. Keep
+# AF_NETLINK (route/interface) + AF_UNIX (LocalAPI) + AF_INET/AF_INET6 (UDP + DERP); add nothing.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# Syscall surface: start from the generic service set and subtract @resources. We do NOT subtract
+# @privileged (the userspace unit does) — NOT because the TUN ioctls need it (TUNSETIFF/SIOCSIF* are
+# plain ioctl(2), already in @system-service, authorized by CAP_NET_ADMIN, not a @privileged syscall)
+# but to stay robust against the root `ip`/`resolvectl` SUBPROCESSES this daemon execs, which (via
+# iproute2) may touch capability/namespace-adjacent syscalls. Revisit subtracting @privileged if the
+# ip/resolvectl surface is confirmed to run clean under ~@privileged.
 SystemCallFilter=@system-service
 SystemCallFilter=~@resources
 SystemCallErrorNumber=EPERM
 # /proc: still hide other processes and restrict to pid entries (TUN does not need a wider /proc).
 ProtectProc=invisible
 ProcSubset=pid
-# NOTE on RestrictNamespaces: intentionally NOT set here. The userspace unit sets
-# RestrictNamespaces=true; a future netns-based TUN deployment may need it relaxed, but the default
-# single-namespace TUN data path does not create namespaces, so leaving it unset is the conservative
-# choice that neither blocks the common case nor over-grants. Revisit if a netns mode is added.
+# Namespaces: KEEP the userspace unit's protection — the current single-namespace TUN data path
+# creates no namespaces (no unshare/setns/CLONE_NEW anywhere in the daemon or engine TUN path), so
+# blocking them costs nothing and denies a classic escalation primitive. A future netns-based TUN
+# mode would relax this (e.g. `RestrictNamespaces=net`) IN THE PR THAT ADDS IT, not pre-emptively.
+RestrictNamespaces=true
 
 [Install]
 WantedBy=multi-user.target
