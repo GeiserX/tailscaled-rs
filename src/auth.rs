@@ -139,6 +139,7 @@ pub(crate) fn requires_write(request: &crate::localapi::Request) -> bool {
         | Request::ProfileList
         | Request::LockStatus
         | Request::DnsStatus
+        | Request::DnsQuery { .. }
         | Request::Netcheck
         | Request::BugReport { .. }
         | Request::GetServeConfig

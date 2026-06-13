@@ -121,6 +121,48 @@ pub(super) async fn dns_status(dev: &tailscale::Device) -> Response {
     }
 }
 
+/// Resolve `name`/`qtype` through the node's MagicDNS path (the `tnet dns query` / Go `tailscale dns
+/// query` path). Calls the engine's [`Device::query_dns`](tailscale::Device::query_dns), which answers
+/// tailnet/MagicDNS names authoritatively and forwards the rest exactly as the node itself would,
+/// returning the raw DNS response datagram + RCODE + the upstream resolvers consulted.
+///
+/// Projects the engine's `DnsQueryResult` into the wire [`DnsQueryReport`](crate::localapi::DnsQueryReport):
+/// the resolver `SocketAddr`s are pre-rendered to `addr:port` strings (the wire DTO stays plain
+/// strings), and the raw response bytes are hex-encoded (the wire stays JSON-clean; the CLI decodes
+/// the fixed DNS header from the hex and renders the rest raw — this fork has no answer-record decoder,
+/// the honest-omission boundary documented on `DnsQueryReport`). The queried `name`/`qtype` are echoed
+/// back for the renderer. An engine error (e.g. the node is down / no live forwarder) surfaces as a
+/// clear [`Response::Error`]. Read-only — resolving a name changes nothing.
+pub(super) async fn dns_query(dev: &tailscale::Device, name: &str, qtype: u16) -> Response {
+    match dev.query_dns(name, qtype).await {
+        Ok(result) => Response::DnsQuery(crate::localapi::DnsQueryReport {
+            name: name.to_string(),
+            qtype,
+            rcode: result.rcode,
+            resolvers_consulted: result
+                .resolvers_consulted
+                .iter()
+                .map(|a| a.to_string())
+                .collect(),
+            response_hex: hex_encode(&result.response),
+        }),
+        Err(e) => Response::Error {
+            message: format!("dns query failed: {e:?}"),
+        },
+    }
+}
+
+/// Lowercase-hex-encode a byte slice (for carrying the raw DNS response datagram on the JSON wire).
+/// A tiny local helper so the crate takes no `hex` dependency for this one use.
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 /// Provision (or fetch) a TLS cert+key for `domain` via the tailnet ACME flow (the `tnet cert` / Go
 /// `tailscale cert <domain>` path). Calls the engine's `Device::cert_pair`, which issues against the
 /// tailnet CA through the live control connection and returns `(cert_pem, key_pem)`.
