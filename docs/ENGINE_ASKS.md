@@ -657,3 +657,24 @@ construction-time `Config` field is the closest match to Go (the port is fixed a
 systemd unit can set `PORT=41641`. Low-to-medium priority — it matters specifically for
 fixed-firewall-pinhole deployments; an ephemeral port is fine for the common NAT-traversal case.
 Tracked in daemon bead tsd-k7s (the one remaining engine-gated item there). — daemon lane
+
+## 23. Per-peer SSH host keys in `StatusNode` (for `tnet ssh`)
+
+**Why:** Go's `tailscale ssh [user@]<host>` resolves the peer via the daemon status, writes a
+`known_hosts` file from each peer's **SSH host keys** (`genKnownHosts` reads `ps.SSH_HostKeys`), and
+execs the system `ssh` with `StrictHostKeyChecking=yes` + that `UserKnownHostsFile` — so `ssh`
+verifies the peer's host key **pinned from the netmap** (no TOFU prompt, no MITM window). The daemon
+has everything else needed (`peerStatusFromArg` resolution over the peer name/IP, the `-o` flag set,
+the `ProxyCommand` via `tnet nc`, the exec) — but the engine's `StatusNode`
+(`ts_runtime/src/status.rs`) carries **no SSH-host-keys field**, so we cannot build a faithful
+`known_hosts`. Shipping a degraded version (skip the file / `StrictHostKeyChecking=accept-new`) would
+be a *less secure* facsimile of Go's pinned-key posture — refused under the honest-omission rule.
+
+**Ask:** surface each peer's SSH host keys in the status. Add `ssh_host_keys: Vec<String>` to
+`StatusNode` (the netmap already carries the peers' `Hostinfo.SSH_HostKeys` — this just projects them
+into the status the daemon reads), matching Go's `ipnstate.PeerStatus.SSH_HostKeys` (a slice of
+`known_hosts`-format public-key lines).
+
+**Daemon impact once landed:** the daemon adds `tnet ssh` — `peerStatusFromArg` resolve → write
+`<state_dir>/ssh_known_hosts` from the new field → exec `ssh` with Go's exact `-o` options +
+`ProxyCommand`. Consumed via a pin bump. Tracked in daemon bead tsd-dy5. — daemon lane
