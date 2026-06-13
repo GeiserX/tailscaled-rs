@@ -54,10 +54,23 @@ pub(crate) struct InstallPlan {
 pub(crate) fn plan() -> Result<InstallPlan> {
     #[cfg(target_os = "linux")]
     {
+        // Pick the systemd unit that matches how this daemon was BUILT. A `tun`-feature build creates
+        // a kernel TUN interface and would fail closed under the userspace unit's sandbox (which hides
+        // /dev/net/tun, strips CAP_NET_ADMIN, and blocks the interface-config syscalls); a userspace
+        // build needs none of those grants and is better off fully locked down. The unit is chosen at
+        // compile time (`cfg!`) — the installed daemon binary and its unit always agree, so an
+        // operator never gets a TUN binary under a sandbox that silently breaks it (or a userspace
+        // binary needlessly granted CAP_NET_ADMIN). Both units are embedded so neither path needs the
+        // packaging tree at install time.
+        let unit_content: &str = if cfg!(feature = "tun") {
+            include_str!("../../packaging/systemd/tailnetd-tun.service")
+        } else {
+            include_str!("../../packaging/systemd/tailnetd.service")
+        };
         Ok(InstallPlan {
             bin_dest: PathBuf::from("/usr/local/bin/tailnetd"),
             unit_path: PathBuf::from("/etc/systemd/system/tailnetd.service"),
-            unit_content: include_str!("../../packaging/systemd/tailnetd.service"),
+            unit_content,
             enable_argv: vec![
                 vec!["systemctl".to_string(), "daemon-reload".to_string()],
                 vec![
@@ -290,18 +303,53 @@ mod tests {
     #[test]
     fn linux_unit_content_is_the_embedded_systemd_unit() {
         let p = plan().expect("linux plan");
-        // The include resolved (file built) and is the systemd unit: non-empty + the canonical
-        // ExecStart sentinel (byte-for-byte the committed packaging/systemd/tailnetd.service).
+        // The include resolved (file built) and is a systemd unit: non-empty + the canonical
+        // ExecStart sentinel, present in BOTH the userspace and TUN units.
         assert!(!p.unit_content.is_empty());
         assert!(
             p.unit_content.contains("ExecStart=/usr/local/bin/tailnetd"),
             "embedded unit missing the canonical ExecStart sentinel"
         );
-        // The include is the same literal the test references — a true round-trip against the file.
-        assert_eq!(
-            p.unit_content,
+        // The selected unit must match how the daemon was built (cfg!(feature = "tun")) — a true
+        // round-trip against the file `plan()` embeds for this build.
+        let expected = if cfg!(feature = "tun") {
+            include_str!("../../packaging/systemd/tailnetd-tun.service")
+        } else {
             include_str!("../../packaging/systemd/tailnetd.service")
-        );
+        };
+        assert_eq!(p.unit_content, expected);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_tun_unit_is_selected_and_relaxed_under_tun_feature() {
+        // The TUN-feature build must select the TUN-relaxed unit (the grants the kernel TUN data path
+        // needs), and the userspace build must NOT carry those grants (stays fully sandboxed). This
+        // pins the feature-aware selection so a refactor can't silently ship a TUN binary under the
+        // userspace sandbox (which would fail closed at /dev/net/tun) or grant CAP_NET_ADMIN to a
+        // userspace build that has no need for it.
+        // Distinguish the units by ACTIVE directives only. A plain `contains(..)` would false-match
+        // the userspace unit's Phase-3 NOTE, which *documents* the TUN directives (`DeviceAllow=...`,
+        // `PrivateDevices=false`, `CAP_NET_ADMIN`) as commented examples — so a substring search hits
+        // them in BOTH units. We therefore match line-anchored directives: trim each line and require
+        // it to EQUAL the directive (a leading `#` makes the trimmed line `"# ..."`, never equal), so
+        // commented examples can't satisfy the check.
+        let p = plan().expect("linux plan");
+        let has_directive =
+            |unit: &str, directive: &str| unit.lines().any(|l| l.trim_start() == directive);
+        let grants_tun = has_directive(p.unit_content, "DeviceAllow=/dev/net/tun rw")
+            && has_directive(p.unit_content, "PrivateDevices=false");
+        if cfg!(feature = "tun") {
+            assert!(
+                grants_tun,
+                "TUN-feature build must select the TUN-relaxed unit (DeviceAllow=/dev/net/tun + PrivateDevices=false)"
+            );
+        } else {
+            assert!(
+                !grants_tun && has_directive(p.unit_content, "PrivateDevices=true"),
+                "userspace build must keep the locked-down unit (PrivateDevices=true, no /dev/net/tun)"
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]

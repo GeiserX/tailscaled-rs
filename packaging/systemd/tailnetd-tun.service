@@ -1,0 +1,109 @@
+# tailnetd-tun.service — systemd unit for the tailscaled-rs daemon in KERNEL-TUN mode (Linux).
+#
+# This is the TUN-mode sibling of `tailnetd.service`. It is shipped + installed only when the daemon
+# was built with the `tun` cargo feature (`tnet install` selects this unit via cfg!(feature = "tun")).
+# A TUN-mode daemon creates and configures a real kernel `tun` interface for the data path, so it
+# needs privileges the userspace-networking unit deliberately strips — the relaxations below are
+# exactly those called out in the userspace unit's Phase-3 NOTE.
+#
+# Everything NOT related to TUN stays as hardened as the userspace unit: tailnetd still holds
+# unencrypted WireGuard/node key material in its state dir, so the key-protection directives
+# (NoNewPrivileges, 0700 StateDirectory, UMask=0077, MemoryDenyWriteExecute, …) are unchanged. We
+# grant exactly the additional surface the kernel TUN data path needs and nothing more.
+#
+# WARNING: experimental, unaudited software — not for production. See the repository README.
+# Install / uninstall instructions: ../README.md
+
+[Unit]
+Description=tailscaled-rs daemon (tailnetd, kernel-TUN mode) — experimental WireGuard mesh node
+Documentation=https://github.com/GeiserX/tailscaled-rs
+# Wait for routable network before starting (the node dials a control server + DERP).
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tailnetd
+Restart=on-failure
+RestartSec=5
+
+# --- Experiment opt-in (REQUIRED) ---------------------------------------------------------
+# The underlying engine refuses to start unless this is set to exactly this value. We set it
+# here, explicitly and visibly, because enabling this unit IS the operator opting in to running
+# unaudited, experimental software on purpose. tailnetd deliberately does NOT set it for itself.
+Environment=TS_RS_EXPERIMENT=this_is_unstable_software
+
+# --- State directory ----------------------------------------------------------------------
+# systemd creates /var/lib/tailnetd with 0700 ownership root:root (StateDirectory). The daemon
+# additionally enforces 0700 on this dir itself at startup (it holds unencrypted key material),
+# so the two layers agree. TAILNETD_STATE_DIR points the daemon at this exact path.
+StateDirectory=tailnetd
+StateDirectoryMode=0700
+Environment=TAILNETD_STATE_DIR=/var/lib/tailnetd
+
+# --- Hardening (this daemon holds private keys) -------------------------------------------
+# Same key-protection posture as the userspace unit. The TUN-specific relaxations are grouped
+# separately below so the diff against tailnetd.service is exactly "what TUN needs".
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=true
+LockPersonality=true
+SystemCallArchitectures=native
+UMask=0077
+
+# --- TUN-mode grants (the ONLY differences from the userspace unit) -----------------------
+# Creating + configuring a kernel `tun` interface needs CAP_NET_ADMIN, access to the /dev/net/tun
+# device node, and the interface-configuration syscalls/address-families the userspace unit strips.
+#
+# Capability: grant CAP_NET_ADMIN both in the bounding set (the ceiling) AND as an ambient
+# capability (so the non-root-dropping process actually holds it at exec). Nothing else is granted.
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+# Device access: the userspace unit sets PrivateDevices=true, which hides /dev/net/tun entirely.
+# TUN mode needs the device visible, so PrivateDevices is OFF here and /dev/net/tun is allowlisted
+# read-write. DeviceAllow switches the device cgroup to deny-by-default, so even with /dev visible
+# only the named node (plus systemd's standard null/zero/random/tty) is reachable — /dev/mem,
+# block devices, etc. stay denied. `rw` (not `rwm`) omits mknod, so no new device nodes can be made.
+# DevicePolicy=closed states that deny-by-default explicitly (implied by DeviceAllow, but pinned here
+# so a future edit that drops the last DeviceAllow can't silently re-open DevicePolicy=auto).
+PrivateDevices=false
+DevicePolicy=closed
+DeviceAllow=/dev/net/tun rw
+# ProtectSystem: KEEP `strict` (whole FS read-only) — same as the userspace unit. TUN mode adds no
+# filesystem writes: the tun device is governed by DeviceAllow above (not ProtectSystem), and route
+# (`ip route …`) + DNS (`resolvectl …`) programming are kernel/IPC operations that write nothing to
+# disk (the engine deliberately never edits /etc/resolv.conf). `strict` keeps /usr+/etc readable so
+# the `ip`/`resolvectl` binaries still execute; only the state dir is writable, carved out below.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/tailnetd
+# Address families: IDENTICAL to the userspace set. The kernel TUN data path opens no AF_PACKET
+# socket — it is L3 (the tun device delivers IP packets; WireGuard is L3), interface config uses
+# AF_INET/AF_INET6 SOCK_DGRAM ioctls + TUNSETIFF, and interface enumeration uses AF_NETLINK. Keep
+# AF_NETLINK (route/interface) + AF_UNIX (LocalAPI) + AF_INET/AF_INET6 (UDP + DERP); add nothing.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# Syscall surface: start from the generic service set and subtract @resources. We do NOT subtract
+# @privileged (the userspace unit does) — NOT because the TUN ioctls need it (TUNSETIFF/SIOCSIF* are
+# plain ioctl(2), already in @system-service, authorized by CAP_NET_ADMIN, not a @privileged syscall)
+# but to stay robust against the root `ip`/`resolvectl` SUBPROCESSES this daemon execs, which (via
+# iproute2) may touch capability/namespace-adjacent syscalls. Revisit subtracting @privileged if the
+# ip/resolvectl surface is confirmed to run clean under ~@privileged.
+SystemCallFilter=@system-service
+SystemCallFilter=~@resources
+SystemCallErrorNumber=EPERM
+# /proc: still hide other processes and restrict to pid entries (TUN does not need a wider /proc).
+ProtectProc=invisible
+ProcSubset=pid
+# Namespaces: KEEP the userspace unit's protection — the current single-namespace TUN data path
+# creates no namespaces (no unshare/setns/CLONE_NEW anywhere in the daemon or engine TUN path), so
+# blocking them costs nothing and denies a classic escalation primitive. A future netns-based TUN
+# mode would relax this (e.g. `RestrictNamespaces=net`) IN THE PR THAT ADDS IT, not pre-emptively.
+RestrictNamespaces=true
+
+[Install]
+WantedBy=multi-user.target
