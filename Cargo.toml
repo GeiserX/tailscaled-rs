@@ -87,6 +87,25 @@ ipnet = "2.12"
 # exit node"). Without it, `#[serde(default)]` collapses both to None and the clear command becomes a
 # silent no-op. Already in the tree transitively via the engine (3.x).
 serde_with = "3"
+# `tnet update`: a minimal rustls-backed HTTP client for the GitHub Releases version-check + asset
+# download. ureq 3 defaults to rustls (the `ring` provider + webpki-roots — the SAME crypto family the
+# engine already pulls, so NO OpenSSL is introduced), follows the api.github.com → CDN cross-host 30x
+# redirect (dropping the auth header on the different host), and is blocking — called from
+# `tokio::task::spawn_blocking`. `default-features = false` drops the gzip default (a tarball download
+# needs no client-side gunzip). Smallest capable footprint for one GET + one download.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+# `tnet update`: verify the downloaded release tarball against its published `.sha256` sidecar
+# (GNU `sha256sum` format). INTEGRITY only (detects corruption/truncation), NOT authenticity — the
+# fork has no signing infrastructure; `update` says so plainly. `sha2` already resolves transitively
+# via the engine, but we depend on it directly so a future engine change can't drop it out from under
+# the updater.
+sha2 = "0.10"
+# `tnet update`: unpack the downloaded release tarball (`tailscaled-rs-…tar.gz` → extract `tnet`).
+# `flate2` with its pure-Rust `miniz_oxide` backend (no zlib C dep) gunzips; `tar` reads the archive.
+# Both are small, widely-vetted, pure-Rust. `flate2` already resolves transitively via the engine; we
+# pin it directly (with the rust backend) so the updater can name it and it can't be dropped.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+tar = "0.4"
 # RNG for generating the Tailscale SSH server's host key (`russh::keys::PrivateKey::random`). Must
 # be `rand 0.10` — russh 0.61's `ssh-key` bounds `random` on `rand_core 0.10`'s `CryptoRng`, which
 # `rand 0.9`'s `ThreadRng` does NOT implement (verified: build fails with a CryptoRng trait-bound
