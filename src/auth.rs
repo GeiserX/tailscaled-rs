@@ -141,6 +141,12 @@ pub(crate) fn requires_write(request: &crate::localapi::Request) -> bool {
         | Request::DnsStatus
         | Request::DnsQuery { .. }
         | Request::Netcheck
+        // `syspolicy list`/`reload` (Go `tailscale syspolicy`) only read the effective MDM/system
+        // policy. Go gates BOTH on `PermitRead` — its LocalAPI `policy/` handler checks only
+        // `PermitRead`, even for the POST/reload, because "reload" re-reads the external policy
+        // sources and mutates NO node state. So both are reads, like `status`/`dns status`.
+        | Request::SyspolicyList
+        | Request::SyspolicyReload
         | Request::BugReport { .. }
         | Request::GetServeConfig
         | Request::FileList

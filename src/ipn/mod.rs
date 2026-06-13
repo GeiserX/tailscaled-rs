@@ -82,6 +82,7 @@ mod profile;
 mod revert_guard;
 pub mod serve;
 mod state;
+mod syspolicy;
 
 // The reported [`State`] enum lives in [`state`] (with the pure state-derivation helpers) but is
 // part of `ipn`'s public surface — `crate::ipn::State` is referenced by `localapi` — so re-export
@@ -2704,6 +2705,26 @@ impl Backend {
     /// mapping.
     pub async fn dns_status(dev: &tailscale::Device) -> crate::localapi::Response {
         diag::dns_status(dev).await
+    }
+
+    /// Report the effective system policy (the `tnet syspolicy list` path; Go
+    /// `GetEffectivePolicy(DefaultScope())`). A **static** associated fn (not `&self`): policy
+    /// resolution reads no backend/engine/netmap state — like Go's `rsop.PolicyFor`, it merges the
+    /// registered policy stores, which is independent of node lifecycle — so it needs neither the
+    /// backend lock nor the node to be up. Thin shim over [`syspolicy::effective_policy`]; kept on
+    /// `Backend` so the `server.rs` dispatch reads uniformly with the other diagnostics. On this
+    /// platform (no registered policy store) the snapshot is always empty — faithful to Go on Linux.
+    pub fn syspolicy_list() -> crate::localapi::Response {
+        crate::localapi::Response::Policy(syspolicy::effective_policy())
+    }
+
+    /// Force a re-read of the effective system policy (the `tnet syspolicy reload` path; Go
+    /// `ReloadEffectivePolicy(DefaultScope())`). Static like [`syspolicy_list`](Self::syspolicy_list)
+    /// (no backend state, no lock, node-up-independent). Thin shim over
+    /// [`syspolicy::reload_effective_policy`]; observationally identical to `syspolicy_list` while no
+    /// policy store is registered (the forced re-read re-merges zero sources). Never errors.
+    pub fn syspolicy_reload() -> crate::localapi::Response {
+        crate::localapi::Response::Policy(syspolicy::reload_effective_policy())
     }
 
     /// Resolve `name`/`qtype` through the node's MagicDNS path (the `tnet dns query` path). Thin `pub`
