@@ -5928,10 +5928,19 @@ async fn run_serve(socket: &std::path::Path, cmd: ServeCmd) -> Result<()> {
                     ..Default::default()
                 },
             );
+            // Repurposing a port from `https`/`http` to a plain TCP forward must also drop any stale
+            // `Web[host:port]` entry a prior `serve https <port>` left behind — Go keeps `TCP[port]`
+            // and `Web[hostport]` mutually consistent (clearing the paired Web entry), and a lingering
+            // orphan would leave a phantom proxy in the persisted config that a Go tool (or a future
+            // Web-consulting path) could act on. Match by `:port` suffix across any host (the same
+            // rule `port_is_web_serve`/`web_proxy_backend` use; one node = one MagicDNS name).
+            let suffix = format!(":{port}");
+            cfg.web.retain(|k, _| !k.ends_with(&suffix));
             send_ok_or_die(socket, Request::SetServeConfig { config: cfg }).await?;
             println!("serving tailnet :{port} -> {fwd}");
             Ok(())
         }
+
         ServeCmd::Https {
             port,
             target,
@@ -6041,14 +6050,14 @@ async fn run_funnel(socket: &std::path::Path, port: u16, on_off: &str) -> Result
     tailscaled_rs::ipn::serve::set_funnel(&mut cfg, host, port, on);
 
     // Warn when funnel is on for a port the daemon can't actually expose. The funnel lane proxies a
-    // raw TLS-terminated stream to the port's `tcp_forward` backend, so it needs a web entry WITH a
-    // proxy backend — match that exact arming condition (a `text`/`redirect`/`mounts`-only serve has
-    // no backend to splice to, so it would silently never arm). Stricter than Go's "any serve config"
-    // check because our funnel lane only splices a proxy backend.
-    let has_proxy_backend = cfg
-        .tcp
-        .get(&port.to_string())
-        .is_some_and(|h| tailscaled_rs::ipn::serve::is_web_serve(h) && !h.tcp_forward.is_empty());
+    // raw TLS-terminated stream to the port's proxy backend, so it needs a web entry WITH a proxy
+    // backend — match that EXACT arming condition by reusing `web_proxy_backend` (the same resolver
+    // `arm_funnel_lane` uses). It consults both the legacy `tcp_forward` AND the Go `Web` map root
+    // proxy, so the warning no longer cries wolf on every CLI-created serve (which writes the `Web`
+    // map with an empty `tcp_forward`). A `text`/`redirect`/`mounts`-only serve has no backend to
+    // splice, so it correctly still warns. Stricter than Go's "any serve config" check because our
+    // funnel lane only splices a proxy backend.
+    let has_proxy_backend = tailscaled_rs::ipn::serve::web_proxy_backend(&cfg, port).is_some();
     send_ok_or_die(socket, Request::SetServeConfig { config: cfg }).await?;
     if on {
         println!("funnel enabled for {host}:{port}");

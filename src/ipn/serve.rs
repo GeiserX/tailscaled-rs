@@ -64,6 +64,48 @@ pub fn port_is_web_serve(cfg: &ServeConfig, port_str: &str, h: &TcpPortHandler) 
     false
 }
 
+/// Resolve the single proxy backend to splice for a **funnel** (or any raw-TCP-after-TLS) on `port`,
+/// judged against the WHOLE [`ServeConfig`]. Funnel terminates TLS and splices L4 to one backend, so
+/// it needs exactly one `host:port`.
+///
+/// This MUST consult both shapes a serve can take, in the same precedence the web lane
+/// ([`build_web_serve_state`]) uses, because the two have drifted apart over the serve work:
+/// - **Legacy** (pre-Web-map): the backend lived on the per-port handler as
+///   [`TcpPortHandler::tcp_forward`] alongside the `HTTPS`/`HTTP` flag.
+/// - **Go `Web` map** (current — what `build_web_serve` writes): the per-port handler is a bare
+///   `{HTTPS:true}` flag with an EMPTY `tcp_forward`, and the real backend is the `proxy` of the
+///   **root (`/`) handler** of the matching `Web[host:port]` entry.
+///
+/// Reading only `tcp_forward` (the old code path) therefore finds NOTHING for any serve created by
+/// the current CLI, so funnel silently never arms. Prefer the legacy field when present (an older
+/// on-disk config), else fall back to the `Web` map root proxy. Returns `None` when the port has no
+/// proxy backend (e.g. a `text:`/`redirect`-only web entry, which has nothing to L4-splice — funnel
+/// over such an entry is refused by the caller). The `Web` key is matched by `:port` suffix across
+/// any host (the lane dispatch doesn't resolve the node FQDN, and a port is unique per config), the
+/// same rule [`port_is_web_serve`] uses.
+pub fn web_proxy_backend(cfg: &ServeConfig, port: u16) -> Option<String> {
+    let port_str = port.to_string();
+    // 1. Legacy: a non-empty `tcp_forward` on the per-port handler (with the web flag set).
+    if let Some(h) = cfg.tcp.get(&port_str)
+        && is_web_serve(h)
+        && !h.tcp_forward.is_empty()
+    {
+        return Some(h.tcp_forward.clone());
+    }
+    // 2. Go `Web` map: the root (`/`) handler's proxy of the matching `Web[*:port]` entry.
+    let suffix = format!(":{port_str}");
+    let wsc = cfg
+        .web
+        .iter()
+        .find(|(k, _)| k.ends_with(&suffix))
+        .map(|(_, v)| v)?;
+    let root = wsc.handlers.get("/")?;
+    if root.proxy.is_empty() {
+        return None; // a text:/redirect: root has no L4 backend to splice.
+    }
+    Some(root.proxy.clone())
+}
+
 /// Translate one [`WebMount`] into the engine's nested [`ServeTarget`](tailscale::ServeTarget).
 /// Errors (as a static reason) on the same conditions the engine's `validate_target` rejects, so an
 /// invalid mount is caught daemon-side before the engine call rather than failing the whole arm.
@@ -86,14 +128,22 @@ fn mount_to_target(m: &WebMount) -> Result<tailscale::ServeTarget, &'static str>
     }
 }
 
-/// Fail-closed redirect validation, matching the engine's `validate_target`: non-empty `to`, no CR/LF
-/// (response-splitting guard), status in `300..=399`.
+/// Fail-closed redirect validation, matching (and slightly exceeding) the engine's `validate_target`:
+/// non-empty `to`, status in `300..=399`, and NO control characters in `to`.
+///
+/// The `to` is written verbatim into the response `Location:` header, so any control char is a
+/// response-header-injection vector. CR/LF are the load-bearing response-splitting characters
+/// (they terminate a header line), but we reject ALL control characters (`char::is_control()` — NUL,
+/// other C0/C1, NEL `U+0085`, etc.), not just CR/LF: a stricter "no controls in a header value" rule
+/// is cheap and strictly safer, and matches the `is_control`-based sanitization used elsewhere in
+/// this codebase. (Found by an adversarial serve/funnel review: the prior CR/LF-only check was
+/// sufficient against splitting but left NUL/other controls passing into the header value.)
 fn validate_redirect(to: &str, status: u16) -> Result<(), &'static str> {
     if to.trim().is_empty() {
         return Err("serve redirect target must not be empty");
     }
-    if to.contains(['\r', '\n']) {
-        return Err("serve redirect target must not contain CR/LF");
+    if to.chars().any(|c| c.is_control()) {
+        return Err("serve redirect target must not contain control characters");
     }
     if !(300..=399).contains(&status) {
         return Err("serve redirect status must be in 300..=399");
@@ -720,6 +770,47 @@ mod tests {
         let orphan: ServeConfig =
             serde_json::from_str(r#"{"TCP":{"8443":{"HTTPS":true}}}"#).unwrap();
         assert!(!port_is_web_serve(&orphan, "8443", &orphan.tcp["8443"]));
+    }
+
+    #[test]
+    fn web_proxy_backend_finds_go_web_map_and_legacy_shapes() {
+        // REGRESSION GUARD: this is the funnel-never-arms bug. A serve created by the current CLI
+        // (`build_web_serve`) writes the Go `Web` map with an EMPTY `tcp_forward`; the old funnel
+        // resolver read only `tcp_forward` + `is_web_serve(h)` and so found NOTHING, leaving funnel
+        // silently un-armed. `web_proxy_backend` must resolve the root (`/`) handler's proxy here.
+        let go_shape: ServeConfig = serde_json::from_str(
+            r#"{"TCP":{"443":{"HTTPS":true}},"Web":{"host.ts.net:443":{"Handlers":{"/":{"Proxy":"127.0.0.1:3000"}}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            web_proxy_backend(&go_shape, 443).as_deref(),
+            Some("127.0.0.1:3000"),
+            "funnel backend must come from the Web map root proxy (the shape build_web_serve writes)"
+        );
+
+        // Legacy on-disk shape: the backend on the per-port handler's `tcp_forward`.
+        let legacy: ServeConfig =
+            serde_json::from_str(r#"{"TCP":{"443":{"HTTPS":true,"TCPForward":"127.0.0.1:9000"}}}"#)
+                .unwrap();
+        assert_eq!(
+            web_proxy_backend(&legacy, 443).as_deref(),
+            Some("127.0.0.1:9000"),
+            "legacy tcp_forward backend must still resolve (back-compat)"
+        );
+
+        // A `text:`-only Web entry has no L4 backend to splice → None (funnel over it is refused).
+        let text_only: ServeConfig = serde_json::from_str(
+            r#"{"TCP":{"443":{"HTTPS":true}},"Web":{"host.ts.net:443":{"Handlers":{"/":{"Text":"hi"}}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            web_proxy_backend(&text_only, 443),
+            None,
+            "a text-only serve has no proxy backend to funnel-splice"
+        );
+
+        // No serve on the port at all → None.
+        assert_eq!(web_proxy_backend(&ServeConfig::default(), 443), None);
     }
 
     #[test]
