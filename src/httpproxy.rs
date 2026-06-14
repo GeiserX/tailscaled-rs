@@ -289,15 +289,28 @@ async fn read_line_capped(
     Ok(n)
 }
 
+/// Max length of the `Tailscale-Connect-Error` header value. A diagnostic fits easily; the cap stops
+/// a future verbose engine error (or one that interpolates the caller-supplied target host) from
+/// bloating the header line.
+const MAX_ERROR_HEADER_LEN: usize = 256;
+
+/// Sanitize an error string into a single header-safe value: collapse every control char (CR/LF/NUL/…)
+/// to a space so it can never inject a header line, cap the length, and trim surrounding whitespace.
+/// Pure so it is unit-testable without a socket. The input is engine-sourced today, but is treated as
+/// untrusted (defense-in-depth) since a future engine error could interpolate the caller's host.
+fn sanitize_header_value(err: &str) -> String {
+    err.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(MAX_ERROR_HEADER_LEN)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 /// Write Go's CONNECT-failure response: `HTTP/1.1 500 Internal Server Error` with the
 /// `Tailscale-Connect-Error: <err>` header (sanitized to a single header-safe line).
 async fn write_connect_error(client: &mut TcpStream, err: &str) -> Result<()> {
-    // A header value must not carry CR/LF; collapse any control char so the error can't inject a
-    // header (defense-in-depth — the err is engine-sourced, but never trust it into a header).
-    let safe: String = err
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
+    let safe = sanitize_header_value(err);
     let resp = format!(
         "HTTP/1.1 500 Internal Server Error\r\nTailscale-Connect-Error: {safe}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
     );
@@ -390,5 +403,41 @@ mod tests {
             "127.0.0.1:8080"
         );
         assert!(normalize_listen_addr("nope").is_err());
+    }
+
+    #[test]
+    fn sanitize_header_value_strips_crlf_to_prevent_injection() {
+        // CR/LF (and any control char) must collapse to spaces so the value can't inject a header
+        // line or split the response — the load-bearing safety property.
+        let injected = "boom\r\nX-Evil: 1\r\n\r\n<body>";
+        let safe = sanitize_header_value(injected);
+        assert!(!safe.contains('\r'), "no CR may survive: {safe:?}");
+        assert!(!safe.contains('\n'), "no LF may survive: {safe:?}");
+        assert!(!safe.contains('\0'));
+        // The header line that would be emitted stays single-line.
+        assert_eq!(safe.lines().count(), 1, "must remain one line: {safe:?}");
+    }
+
+    #[test]
+    fn sanitize_header_value_caps_length() {
+        // A pathologically long error (e.g. a future engine error interpolating a huge host) is
+        // bounded so it can't bloat the header line.
+        let long = "x".repeat(10_000);
+        let safe = sanitize_header_value(&long);
+        assert!(
+            safe.chars().count() <= MAX_ERROR_HEADER_LEN,
+            "must be capped at {MAX_ERROR_HEADER_LEN}, got {}",
+            safe.chars().count()
+        );
+    }
+
+    #[test]
+    fn sanitize_header_value_trims_and_passes_clean_text() {
+        // Surrounding whitespace is trimmed; ordinary diagnostic text passes through unchanged.
+        assert_eq!(sanitize_header_value("  node is not up  "), "node is not up");
+        assert_eq!(
+            sanitize_header_value("no route to peer \"db\""),
+            "no route to peer \"db\""
+        );
     }
 }
