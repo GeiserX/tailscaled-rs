@@ -4723,6 +4723,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn set_options_live_vs_rebuild_classification_no_silent_drift() {
+        // Structural drift tripwire — the `SetOptions` analogue of the `Prefs`/`UpOptions` lockstep
+        // tests in `revert_guard`. EXHAUSTIVELY destructure `SetOptions` with NO `..`, so adding a
+        // field is a COMPILE error until it is consciously classified LIVE (an in-place engine setter
+        // is called in `begin_set`, so a `set` naming only it applies with no reconnect) or REBUILD
+        // (no live setter → `needs_rebuild()` must return true so the device is rebuilt). Without this,
+        // a new field defaults to the Live path and SILENTLY persists-without-effect on a running node
+        // until the next restart — the exact exit_node/has_logged_in/funnel bug-class this repo has
+        // been burned by. The runtime half below proves each field's classification actually holds.
+        let SetOptions {
+            // --- LIVE (has a Device::set_* called in begin_set; needs_rebuild=false alone) ---
+            hostname: _,
+            accept_routes: _,
+            accept_dns: _,
+            exit_node: _,
+            advertise_exit_node: _,
+            advertise_routes: _,
+            // --- REBUILD (no live setter → MUST be in needs_rebuild()) ---
+            shields_up: _,
+            advertise_tags: _,
+            ssh: _,
+        } = SetOptions::default();
+
+        // Runtime half: a `set` naming ONLY a LIVE field must NOT need a rebuild; naming ONLY a
+        // REBUILD field MUST. (Drives the same `needs_rebuild` the dispatch consults.) If a field is
+        // misclassified above, the matching assertion below fails.
+        type Case = (&'static str, bool, fn(&mut SetOptions)); // (name, expect_rebuild, set-only-it)
+        let cases: Vec<Case> = vec![
+            ("hostname", false, |o| o.hostname = Some("h".into())),
+            ("accept_routes", false, |o| o.accept_routes = Some(true)),
+            ("accept_dns", false, |o| o.accept_dns = Some(false)),
+            ("exit_node", false, |o| {
+                o.exit_node = Some(Some("100.64.0.9".into()))
+            }),
+            ("advertise_exit_node", false, |o| {
+                o.advertise_exit_node = Some(true)
+            }),
+            ("advertise_routes", false, |o| {
+                o.advertise_routes = Some(vec!["10.0.0.0/8".into()])
+            }),
+            ("shields_up", true, |o| o.shields_up = Some(true)),
+            ("advertise_tags", true, |o| {
+                o.advertise_tags = Some(vec!["tag:server".into()])
+            }),
+            ("ssh", true, |o| o.ssh = Some(true)),
+        ];
+        for (name, expect_rebuild, set_only) in &cases {
+            let mut opts = SetOptions::default();
+            set_only(&mut opts);
+            assert!(
+                !opts.is_empty(),
+                "{name}: a named set must not be is_empty()"
+            );
+            assert_eq!(
+                opts.needs_rebuild(),
+                *expect_rebuild,
+                "{name}: live-vs-rebuild misclassified — a LIVE pref must apply in place (no rebuild) \
+                 and a REBUILD pref (no engine live setter) must force a rebuild; update \
+                 `needs_rebuild()` + `begin_set` for this field"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn begin_set_applies_named_prefs_and_leaves_rest_unchanged() {
         // With NO device up, `begin_set` returns `PersistedOnly` (the persist is the whole job) and
