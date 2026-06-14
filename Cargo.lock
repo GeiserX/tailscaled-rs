@@ -1615,8 +1615,8 @@ dependencies = [
 
 [[package]]
 name = "geiserx_tailscale"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "bytes",
  "geiserx_ts_control",
@@ -1643,8 +1643,8 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_array256"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "geiserx_ts_bitset",
  "heapless",
@@ -1654,8 +1654,8 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_bart"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "cfg-if",
  "geiserx_ts_array256",
@@ -1667,8 +1667,8 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_bart_packetfilter"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "geiserx_ts_array256",
  "geiserx_ts_bart",
@@ -1681,8 +1681,8 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_bitset"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "cfg-if",
  "static_assertions",
@@ -1690,16 +1690,16 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_capabilityversion"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "geiserx_ts_control"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "base64",
  "bytes",
@@ -1740,8 +1740,8 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_control_noise"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "base64",
  "bytes",
@@ -1764,8 +1764,8 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_control_serde"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "base64",
  "chrono",
@@ -1783,8 +1783,8 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_dataplane"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "etherparse",
  "geiserx_ts_bart",
@@ -1801,8 +1801,8 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_derp"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "bytes",
  "crypto_box",
@@ -1827,8 +1827,8 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_disco_protocol"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "aead 0.5.2",
  "crypto_box",
@@ -1841,13 +1841,13 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_dns_wire"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 
 [[package]]
 name = "geiserx_ts_dynbitset"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "geiserx_ts_bitset",
  "smallvec",
@@ -1855,8 +1855,8 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_forwarder"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "bytes",
  "geiserx_ts_netstack_smoltcp",
@@ -1868,16 +1868,16 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_hexdump"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "heapless",
 ]
 
 [[package]]
 name = "geiserx_ts_host_net"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "ipnet",
  "thiserror 2.0.18",
@@ -1886,8 +1886,8 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_http_util"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "bytes",
  "futures",
@@ -1906,8 +1906,8 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_keys"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "crypto_box",
  "ed25519-dalek 2.2.0",
@@ -1921,8 +1921,8 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_magicsock"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "geiserx_ts_disco_protocol",
  "geiserx_ts_keys",
@@ -1939,13 +1939,13 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_metrics"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 
 [[package]]
 name = "geiserx_ts_netcheck"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "bytes",
  "dashmap",
@@ -1961,8 +1961,8 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_netstack_smoltcp"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "bytes",
  "futures-util",
@@ -1974,8 +1974,8 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_netstack_smoltcp_core"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "bytes",
  "flume",
@@ -1987,8 +1987,8 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_netstack_smoltcp_socket"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "bytes",
  "geiserx_ts_netstack_smoltcp_core",
@@ -1998,8 +1998,8 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_nodecapability"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "cfg-if",
  "serde",
@@ -2008,8 +2008,8 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_overlay_router"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "geiserx_ts_bart",
  "geiserx_ts_packet",
@@ -2020,8 +2020,8 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_packet"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "bytes",
  "crypto_box",
@@ -2030,8 +2030,8 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_packetfilter"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "hashbrown 0.17.1",
  "ipnet",
@@ -2041,8 +2041,8 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_packetfilter_serde"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "geiserx_ts_nodecapability",
  "geiserx_ts_peercapability",
@@ -2054,8 +2054,8 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_packetfilter_state"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "geiserx_ts_packetfilter",
  "geiserx_ts_packetfilter_serde",
@@ -2064,8 +2064,8 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_peercapability"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "serde",
  "url",
@@ -2073,8 +2073,8 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_runtime"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "base64",
  "chrono",
@@ -2114,13 +2114,13 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_time"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 
 [[package]]
 name = "geiserx_ts_tka"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "argon2 0.5.3",
  "blake2 0.10.6",
@@ -2131,8 +2131,8 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_tls_util"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "ring",
  "rustls-pemfile",
@@ -2146,16 +2146,16 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_transport"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "geiserx_ts_packet",
 ]
 
 [[package]]
 name = "geiserx_ts_transport_tun"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "bytes",
  "geiserx_ts_hexdump",
@@ -2169,8 +2169,8 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_tunnel"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "aead 0.5.2",
  "blake2 0.10.6",
@@ -2189,8 +2189,8 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_underlay_router"
-version = "0.34.2"
-source = "git+https://github.com/GeiserX/tailscale-rs?rev=1694d20811fee4afdc268d4e13288cbfdc811ed7#1694d20811fee4afdc268d4e13288cbfdc811ed7"
+version = "0.35.3"
+source = "git+https://github.com/GeiserX/tailscale-rs?rev=fd4b9342967907bf9b578ad73fb9de6dc17b13d5#fd4b9342967907bf9b578ad73fb9de6dc17b13d5"
 dependencies = [
  "geiserx_ts_packet",
  "geiserx_ts_transport",
