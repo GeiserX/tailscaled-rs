@@ -72,6 +72,13 @@ struct Args {
     /// traffic through the tailnet without root or a TUN device. Off unless given.
     #[arg(long, value_name = "[HOST:]PORT")]
     socks5_server: Option<String>,
+    /// Run an outbound HTTP proxy on `[host:]port` that dials **over the tailnet** (Go `tailscaled
+    /// --outbound-http-proxy-listen`). The HTTP-proxy sibling of `--socks5-server` for clients that
+    /// speak the HTTP-proxy protocol (`https_proxy=...`, `curl -x`). Supports the `CONNECT` method
+    /// (HTTPS tunneling — the common case); a bare port binds `127.0.0.1`. Unauthenticated, so the
+    /// bind address is the security boundary. Off unless given.
+    #[arg(long, value_name = "[HOST:]PORT")]
+    outbound_http_proxy_listen: Option<String>,
 }
 
 /// Restore the default `SIGPIPE` disposition (terminate) before any output. The Rust runtime sets
@@ -164,12 +171,20 @@ async fn main() -> Result<()> {
         return Err(e.into());
     }
 
-    // Validate `--socks5-server` NOW (fail-fast, before any state work) so a bad listen address is a
-    // clear startup error rather than a deep bind failure later. `None` when the flag is absent.
+    // Validate `--socks5-server` / `--outbound-http-proxy-listen` NOW (fail-fast, before any state
+    // work) so a bad listen address is a clear startup error rather than a deep bind failure later.
+    // `None` when the flag is absent.
     let socks5_listen = match &args.socks5_server {
         Some(addr) => Some(
             tailscaled_rs::socks5::normalize_listen_addr(addr)
                 .context("invalid --socks5-server address")?,
+        ),
+        None => None,
+    };
+    let http_proxy_listen = match &args.outbound_http_proxy_listen {
+        Some(addr) => Some(
+            tailscaled_rs::httpproxy::normalize_listen_addr(addr)
+                .context("invalid --outbound-http-proxy-listen address")?,
         ),
         None => None,
     };
@@ -236,11 +251,16 @@ async fn main() -> Result<()> {
         // which, like Go, ends the daemon (a requested proxy that can't bind is a startup failure).
         let socks5_backend = Arc::clone(&backend);
         let socks5_addr = socks5_listen.clone();
+        let http_proxy_backend = Arc::clone(&backend);
+        let http_proxy_addr = http_proxy_listen.clone();
         tokio::select! {
             r = tailscaled_rs::server::serve(&socket_path, server_backend, shutdown_signal()) => r,
             // The SOCKS5 proxy arm: a bind/serve error ends the daemon (matches Go). When no
             // `--socks5-server` was given, `run_optional_socks5` is `pending()` and never wins.
             r = run_optional_socks5(socks5_addr, socks5_backend) => r,
+            // The HTTP-proxy arm: same model — bind/serve error ends the daemon; `pending()` when the
+            // `--outbound-http-proxy-listen` flag is absent.
+            r = run_optional_http_proxy(http_proxy_addr, http_proxy_backend) => r,
             // `sighup_reload_loop` never returns; this arm only wins if it somehow does (it logs and
             // exits the loop only if installing the SIGHUP handler fails), in which case we keep
             // serving — losing reload is not a reason to tear the daemon down.
@@ -271,6 +291,18 @@ async fn run_optional_socks5(
     match listen {
         Some(addr) => tailscaled_rs::socks5::serve(&addr, backend, shutdown_signal()).await,
         // No proxy requested: never resolve, so this `select!` arm stays dormant for the daemon's life.
+        None => std::future::pending().await,
+    }
+}
+
+/// Run the outbound HTTP proxy if `--outbound-http-proxy-listen` was given, else an inert future.
+/// Same uniform-`select!`-arm pattern as [`run_optional_socks5`].
+async fn run_optional_http_proxy(
+    listen: Option<String>,
+    backend: Arc<Mutex<tailscaled_rs::ipn::Backend>>,
+) -> anyhow::Result<()> {
+    match listen {
+        Some(addr) => tailscaled_rs::httpproxy::serve(&addr, backend, shutdown_signal()).await,
         None => std::future::pending().await,
     }
 }
