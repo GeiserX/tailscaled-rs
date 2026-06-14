@@ -702,6 +702,17 @@ enum DebugCmd {
     /// the persisted prefs — the same data `tnet get` renders, but as the raw pretty-printed object
     /// for scripting/debugging rather than the human/flag view.
     Prefs,
+    /// Print this CLI process's Tailscale-relevant environment (Go `tailscale debug env`): the `TS_*`
+    /// / `TAILNETD_*` env vars that influence the daemon + client (control URL, socket, state dir,
+    /// log filter, the experiment gate) plus the build version. Purely local — reads the process
+    /// environment, no daemon round-trip (matching Go, whose `debug env` dumps `os.Environ`-derived
+    /// Tailscale settings). Values are printed verbatim; nothing is mutated.
+    Env,
+    /// Dump the node's client metrics in Prometheus text format (Go `tailscale debug metrics`). The
+    /// same data as `tnet metrics`, exposed under `debug` for parity with Go's `debug metrics`
+    /// alias. Requires the node to be up. Write-gated like `tnet metrics` (the metrics may carry
+    /// operational detail — Go gates `serveMetrics` on PermitWrite).
+    Metrics,
 }
 
 /// `tnet serve` subcommands. Mirrors the TCP-forward subset of Go `tailscale serve`.
@@ -1474,6 +1485,13 @@ async fn main() -> Result<()> {
         Command::Debug { cmd } => match cmd {
             DebugCmd::Capture { path, seconds } => run_debug_capture(&socket, path, seconds).await,
             DebugCmd::Prefs => run_debug_prefs(&socket).await,
+            // `debug env` is purely local (reads this process's environment) — no socket round-trip.
+            DebugCmd::Env => {
+                run_debug_env();
+                Ok(())
+            }
+            // `debug metrics` is the same data as `tnet metrics` (reuse the handler) — a Go alias.
+            DebugCmd::Metrics => run_metrics(&socket, Some(MetricsCmd::Print)).await,
         },
         // `install` / `uninstall` (Go `tailscaled install-system-daemon` / `uninstall-system-daemon`):
         // purely LOCAL, privileged file + service-manager work — they never touch the LocalAPI socket.
@@ -2196,6 +2214,36 @@ async fn run_debug_prefs(socket: &std::path::Path) -> Result<()> {
         serde_json::to_string_pretty(&view).unwrap_or_else(|_| "{}".to_string())
     );
     Ok(())
+}
+
+/// `debug env` (Go `tailscale debug env`): print this CLI process's Tailscale-relevant environment +
+/// build version. Purely local — no daemon round-trip (Go's `debug env` likewise dumps the process
+/// environment). We print the daemon/client `TS_*` / `TAILNETD_*` knobs (each as `NAME=value` when
+/// set, or `NAME (unset)` when absent) so an operator can see exactly which env is in effect; nothing
+/// is mutated. Values are printed verbatim — these are the operator's own env, not off-box data.
+fn run_debug_env() {
+    // The Tailscale/daemon-relevant env vars, in a stable order. This is the set that actually
+    // influences `tnet`/`tailnetd` resolution (control URL, socket, state dir, log filter, the
+    // experiment gate, the auth-key fallback) — the faithful analogue of Go dumping its `TS_*` knobs.
+    const VARS: &[&str] = &[
+        "TS_RS_EXPERIMENT",
+        "TS_CONTROL_URL",
+        "TS_AUTH_KEY",
+        "TAILNETD_SOCKET",
+        "TAILNETD_STATE_DIR",
+        "TAILNETD_LOG",
+        "TAILNETD_NO_HARDEN",
+    ];
+    println!("tnet {} (client build)", env!("CARGO_PKG_VERSION"));
+    for name in VARS {
+        match std::env::var(name) {
+            // Never print a secret's value: TS_AUTH_KEY is a credential — show only set/unset, like a
+            // careful `debug env` would (Go redacts auth keys in its diagnostics too).
+            Ok(_) if *name == "TS_AUTH_KEY" => println!("{name}=<set, redacted>"),
+            Ok(v) => println!("{name}={v}"),
+            Err(_) => println!("{name} (unset)"),
+        }
+    }
 }
 
 /// `switch` (Go `tailscale switch`): `--list` renders a table; `remove <id>` deletes; a bare
