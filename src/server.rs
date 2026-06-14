@@ -35,6 +35,26 @@ const MAX_LINE_BYTES: usize = 64 * 1024;
 /// tasks/fds. The CLI opens one short-lived connection per command, so 128 is far above normal use.
 const MAX_CONNECTIONS: usize = 128;
 
+/// Separate, smaller cap on concurrent **long-lived** connections (`Watch` streams + `Nc` splices),
+/// which hold their slot for the client's whole (possibly hours-long) lifetime — unlike a one-shot
+/// `status`/`up`/`down` that returns immediately. Without a separate budget, a local user could open
+/// [`MAX_CONNECTIONS`] read-gated `Watch` streams and starve the general pool, locking out every
+/// short-lived control command (even `down`/`logout`) — a read-surface starving the write surface.
+/// This sub-cap is drawn from a DISTINCT semaphore, so long-lived streams can never exhaust the pool
+/// the one-shot control commands use. 32 is far above any real `--watch`/`nc` fan-out.
+const MAX_STREAM_CONNECTIONS: usize = 32;
+
+/// Deadline for a single `write_response` to a client. A `Watch` client that stops reading fills the
+/// socket send buffer and would otherwise park the writing task forever, pinning a stream permit (the
+/// write-side slowloris). A healthy local CLI drains promptly, so a few seconds is ample; on timeout
+/// the stream treats the client as gone and releases its permit.
+const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Deadline for the `nc` overlay connect (`connect_by_name`), mirroring the proxies' `HANDSHAKE_TIMEOUT`
+/// so an `nc` to a black-holed tailnet address can't park a stream permit for the netstack's full
+/// dead-connection window. The splice that follows is intentionally unbounded (a tunnel is long-lived).
+const NC_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// How long to let in-flight connection handlers finish after a shutdown signal before they are
 /// aborted. Bounds shutdown latency so a wedged handler can't keep the daemon from exiting.
 const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -69,6 +89,10 @@ pub async fn serve(
     let policy = AuthPolicy::from_current_process();
     // Cap concurrent connections; the permit is held for a connection's whole lifetime.
     let conn_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    // A SEPARATE, smaller budget for long-lived streams (`Watch`/`Nc`) so they cannot exhaust the
+    // general pool above and starve short-lived control commands. Acquired inside `handle_conn` only
+    // when a connection turns into a stream.
+    let stream_limit = Arc::new(Semaphore::new(MAX_STREAM_CONNECTIONS));
     // Track in-flight handlers so shutdown can drain them instead of dropping them mid-flight.
     let mut conns: JoinSet<()> = JoinSet::new();
 
@@ -91,9 +115,12 @@ pub async fn serve(
                             tracing::warn!("LocalAPI: connection cap reached; dropping connection");
                             continue;
                         };
+                        let stream_limit = Arc::clone(&stream_limit);
                         conns.spawn(async move {
                             let _permit = permit;
-                            if let Err(e) = handle_conn(stream, access, peer_uid, backend).await {
+                            if let Err(e) =
+                                handle_conn(stream, access, peer_uid, backend, stream_limit).await
+                            {
                                 tracing::warn!(error = %e, "LocalAPI: connection error");
                             }
                         });
@@ -160,6 +187,7 @@ async fn handle_conn(
     access: Access,
     peer_uid: Option<u32>,
     backend: Arc<Mutex<Backend>>,
+    stream_limit: Arc<Semaphore>,
 ) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -199,6 +227,23 @@ async fn handle_conn(
                     // status lines until the client disconnects (or shutdown). It is read-only, so
                     // it is gated exactly like `Status` — anyone who may read may watch.
                     Ok(Request::Watch) => {
+                        // A long-lived stream: take a permit from the SEPARATE stream budget so a
+                        // flood of `Watch` connections can't starve the short-lived control pool. If
+                        // the stream budget is exhausted, refuse cleanly (the client can retry) rather
+                        // than holding the connection — a `Watch` is best-effort observability.
+                        let Ok(_stream_permit) = Arc::clone(&stream_limit).try_acquire_owned()
+                        else {
+                            tracing::warn!("LocalAPI: stream cap reached; refusing watch");
+                            write_response(
+                                &mut write_half,
+                                &Response::Error {
+                                    message: "too many concurrent watch/nc streams; try again"
+                                        .into(),
+                                },
+                            )
+                            .await?;
+                            break;
+                        };
                         stream_watch(&mut write_half, &backend).await?;
                         break;
                     }
@@ -228,6 +273,22 @@ async fn handle_conn(
                             .await?;
                             continue;
                         }
+                        // A long-lived splice: take a permit from the SEPARATE stream budget (after
+                        // the auth check, so a denied nc never consumes one). If exhausted, refuse —
+                        // the connection was never hijacked, so keep the request loop alive.
+                        let Ok(_stream_permit) = Arc::clone(&stream_limit).try_acquire_owned()
+                        else {
+                            tracing::warn!("LocalAPI: stream cap reached; refusing nc");
+                            write_response(
+                                &mut write_half,
+                                &Response::Error {
+                                    message: "too many concurrent watch/nc streams; try again"
+                                        .into(),
+                                },
+                            )
+                            .await?;
+                            continue;
+                        };
                         // `stream_nc` returns Ok(true) if it hijacked the connection (spliced to EOF),
                         // Ok(false) if it only wrote an error line (connect failed) and the loop
                         // should continue serving this peer.
@@ -383,15 +444,31 @@ async fn stream_nc(
         .await?;
         return Ok(false);
     };
-    // Resolve + connect over the overlay (host may be a MagicDNS name or an IP). `connect_by_name`
-    // handles both (it resolves a name, and an IP literal resolves to itself).
-    let tcp = match dev.connect_by_name(host, port).await {
-        Ok(s) => s,
-        Err(e) => {
+    // Resolve + connect over the overlay. `connect_by_name` resolves the host against the netmap (a
+    // MagicDNS name → the peer's tailnet IP); it resolves by NAME and only ever reaches tailnet nodes
+    // (no host-network egress). Bounded by NC_CONNECT_TIMEOUT so an nc to a black-holed tailnet
+    // address can't park this task (holding a stream permit) for the netstack's full dead-connection
+    // window — mirroring the proxies' HANDSHAKE_TIMEOUT.
+    let tcp = match tokio::time::timeout(NC_CONNECT_TIMEOUT, dev.connect_by_name(host, port)).await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
             write_response(
                 write_half,
                 &Response::Error {
                     message: format!("nc: connect to {host}:{port} failed: {e}"),
+                },
+            )
+            .await?;
+            return Ok(false);
+        }
+        Err(_) => {
+            write_response(
+                write_half,
+                &Response::Error {
+                    message: format!(
+                        "nc: connect to {host}:{port} timed out after {NC_CONNECT_TIMEOUT:?}"
+                    ),
                 },
             )
             .await?;
@@ -434,8 +511,18 @@ async fn write_response(
 ) -> Result<()> {
     let mut bytes = serde_json::to_vec(response).expect("response serialize");
     bytes.push(b'\n');
-    write_half.write_all(&bytes).await?;
-    write_half.flush().await?;
+    // Bound the write+flush: a client that stopped reading fills the socket send buffer and would
+    // otherwise park this task forever (pinning a connection/stream permit — the write-side slowloris).
+    // On timeout, surface it as a connection error so the caller drops the connection + releases the
+    // permit. A healthy local CLI drains well within WRITE_TIMEOUT.
+    tokio::time::timeout(WRITE_TIMEOUT, async {
+        write_half.write_all(&bytes).await?;
+        write_half.flush().await
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!("LocalAPI write timed out after {WRITE_TIMEOUT:?} (slow/stalled client)")
+    })??;
     Ok(())
 }
 
