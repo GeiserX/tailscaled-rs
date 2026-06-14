@@ -241,13 +241,11 @@ async fn arm_funnel_lane(
     };
     for port in funnel_ports {
         // Funnel exposes a serve: the port must have a web proxy backend to splice to. (Mirrors Go's
-        // "funnel=on but no serve config" warning.)
-        let backend = cfg
-            .tcp
-            .get(&port.to_string())
-            .filter(|h| serve::is_web_serve(h))
-            .map(|h| h.tcp_forward.clone())
-            .filter(|b| !b.is_empty());
+        // "funnel=on but no serve config" warning.) Resolve via `web_proxy_backend`, which consults
+        // BOTH the legacy `tcp_forward` AND the Go `Web` map root proxy — the handler-only
+        // `is_web_serve(h)` + `h.tcp_forward` path finds nothing for a serve created by the current
+        // CLI (which writes the `Web` map with an empty `tcp_forward`), so funnel would never arm.
+        let backend = serve::web_proxy_backend(cfg, port);
         let Some(backend) = backend else {
             tracing::warn!(
                 port,
