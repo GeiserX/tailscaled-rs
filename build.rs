@@ -34,8 +34,11 @@ fn git_commit() -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
+    // `--untracked-files=no`: "dirty" should mean uncommitted changes to *tracked* sources, not the
+    // mere presence of an untracked scratch file (which would spuriously stamp `-dirty` on an
+    // otherwise-clean build of the committed tree).
     let dirty = Command::new("git")
-        .args(["status", "--porcelain"])
+        .args(["status", "--porcelain", "--untracked-files=no"])
         .output()
         .ok()
         .filter(|o| o.status.success())

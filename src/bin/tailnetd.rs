@@ -347,10 +347,19 @@ async fn main() -> Result<()> {
 ///
 /// In userspace/netstack mode the only system state the daemon owns is the LocalAPI socket, so this
 /// is the whole teardown. The node key and `prefs.json` are NEVER touched (that is `logout`/state
-/// reset — a separate operation; Go's `--cleanup` likewise never deletes identity). If a daemon is
-/// currently listening on the socket, refuse (exit 1) rather than yanking the socket from under a
-/// live process; a stale socket (path exists but nothing accepts) is removed; an absent socket is a
-/// no-op success.
+/// reset — a separate operation; Go's `--cleanup` likewise never deletes identity). This is enforced
+/// structurally: the function is handed only `socket_path` and never the key/prefs paths, so it
+/// *cannot* reach them. If a daemon is currently listening on the socket, refuse (exit 1) rather than
+/// yanking the socket from under a live process; a stale socket (path exists but nothing accepts) is
+/// removed; an absent socket is a no-op success.
+///
+/// There is a benign probe→unlink TOCTOU: a daemon that races startup in the window between the
+/// liveness probe and the `remove_file` could have its just-bound socket removed. This is acceptable
+/// — `--cleanup`'s contract is "the daemon is stopped," racing it against a starting daemon is
+/// operator error, and the blast radius is only the socket inode (the running daemon keeps its open
+/// fd and existing connections; only *new* LocalAPI clients fail to connect until the socket is
+/// re-created by a restart/SIGHUP). No key/pref/data loss is possible. Go is stricter-than-us nowhere
+/// here: it does not probe at all and operates unconditionally, so this probe is a safety addition.
 async fn run_cleanup(socket_path: &Path) -> i32 {
     if !socket_path.exists() {
         println!(
@@ -381,6 +390,10 @@ async fn run_cleanup(socket_path: &Path) -> i32 {
         return 1;
     }
 
+    // NB: this is the deliberately conservative sibling of `server::serve`'s socket removal, which
+    // unlinks any pre-existing socket UNCONDITIONALLY (it is about to `bind`, so a leftover is
+    // stale-to-it by definition). `--cleanup` must NOT yank a *different* live daemon's socket, hence
+    // the liveness probe above gates this unlink. The asymmetry is intentional — do not "harmonize".
     match tokio::fs::remove_file(socket_path).await {
         Ok(()) => {
             println!("cleanup: removed stale socket {}", socket_path.display());
