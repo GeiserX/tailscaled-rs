@@ -25,6 +25,20 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.46.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.45.0...v0.46.0) (2026-06-14)
+
+
+### Features
+
+* **switch:** resolve `tnet switch <target>` by profile name, not just id ([#184](https://github.com/GeiserX/tailscaled-rs/issues/184)) ([e9fb0cd](https://github.com/GeiserX/tailscaled-rs/commit/e9fb0cd7ada42edf5b58ad2fa6338c3b2131bc1d))
+
+
+### Bug Fixes
+
+* **funnel:** resolve the splice backend from the Web map, not just tcp_forward ([#181](https://github.com/GeiserX/tailscaled-rs/issues/181)) ([b5881d7](https://github.com/GeiserX/tailscaled-rs/commit/b5881d78ee02bda32470ce1dbe522389f44d334b))
+* **revert-guard:** correct ephemeral exemption docs + enforce UpOptions↔guard lockstep ([#185](https://github.com/GeiserX/tailscaled-rs/issues/185)) ([c82e43a](https://github.com/GeiserX/tailscaled-rs/commit/c82e43a41f73854b280135c471886010cb7bbce0))
+* **taildrop:** set the quarantine attribute BEFORE copying received bytes ([#183](https://github.com/GeiserX/tailscaled-rs/issues/183)) ([53f84a3](https://github.com/GeiserX/tailscaled-rs/commit/53f84a3c33fc8df547250096779ff3652d56002c))
+
 ## [0.45.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.44.1...v0.45.0) (2026-06-13)
 
 
