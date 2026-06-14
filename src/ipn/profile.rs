@@ -57,6 +57,40 @@ pub(super) fn is_valid_profile_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// Resolve a user-supplied `tnet switch <target>` to a canonical profile **id**, matching by id OR by
+/// display name (Go's `tailscale switch` accepts either). Precedence, mirroring Go (id wins over name
+/// so an exact-id target is never shadowed by a coincidental name):
+/// 1. `target` is a valid id that names a known profile (the reserved [`DEFAULT_PROFILE_ID`], or a key
+///    present in `profiles.json`) → that id.
+/// 2. exactly ONE profile's [`ProfileMeta::name`] equals `target` → that profile's id.
+/// 3. otherwise `None` — the caller reports an error. A name matching MULTIPLE ids is ambiguous and
+///    also yields `None` (the caller must be told to use the id), never an arbitrary pick.
+///
+/// Pure over the parsed `profiles.json` (no I/O) so it is unit-testable; the caller loads the file.
+/// Note a *syntactically* valid id that is NOT yet a known profile is intentionally left to the
+/// caller (switching to a brand-new id is how a new profile is created), so this returns `None` for
+/// it and the caller falls back to its own id-validation path — see the `switch_profile` call site.
+pub(super) fn resolve_target_to_id(target: &str, meta: &ProfilesFile) -> Option<String> {
+    // 1. Exact id match against a KNOWN profile (default is always known).
+    if is_valid_profile_id(target)
+        && (target == DEFAULT_PROFILE_ID || meta.profiles.contains_key(target))
+    {
+        return Some(target.to_string());
+    }
+    // 2. Unique display-name match. Collect all ids whose name equals `target`; resolve only if
+    //    exactly one (an ambiguous name must not silently pick one).
+    let mut by_name = meta
+        .profiles
+        .iter()
+        .filter(|(_, m)| m.name == target)
+        .map(|(id, _)| id.clone());
+    let first = by_name.next()?;
+    if by_name.next().is_some() {
+        return None; // ambiguous: >1 profile shares this name → caller errors, user must use the id.
+    }
+    Some(first)
+}
+
 /// The `(prefs.json, node.key.json)` paths for profile `id` under `state_dir`. The default profile
 /// maps to the legacy top-level paths (so existing installs are untouched); every other profile maps
 /// under `profiles/<id>/`. `id` MUST already be validated by [`is_valid_profile_id`] — this joins it
@@ -234,5 +268,65 @@ mod tests {
         let back = load_profiles_file(&dir).await;
         assert_eq!(back.profiles.get("work").unwrap().name, "Work tailnet");
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn resolve_target_matches_id_name_and_handles_ambiguity() {
+        let mut meta = ProfilesFile::default();
+        meta.profiles.insert(
+            "work".into(),
+            ProfileMeta {
+                name: "Work tailnet".into(),
+            },
+        );
+        meta.profiles.insert(
+            "home".into(),
+            ProfileMeta {
+                name: "Home".into(),
+            },
+        );
+
+        // Exact id match (known profile) → that id.
+        assert_eq!(resolve_target_to_id("work", &meta).as_deref(), Some("work"));
+        // The reserved default is always a known id.
+        assert_eq!(
+            resolve_target_to_id(DEFAULT_PROFILE_ID, &meta).as_deref(),
+            Some(DEFAULT_PROFILE_ID)
+        );
+        // Display-name match (the name has a space → not a valid id, so this proves the name path).
+        assert_eq!(
+            resolve_target_to_id("Work tailnet", &meta).as_deref(),
+            Some("work")
+        );
+        // A syntactically-valid id that is NOT yet known → None (caller treats it as a new-profile id).
+        assert_eq!(resolve_target_to_id("brand-new", &meta), None);
+        // Neither a known id/name nor (here) relevant → None.
+        assert_eq!(resolve_target_to_id("nope", &meta), None);
+
+        // Ambiguous name (two ids share it) → None: never silently pick one.
+        let mut amb = ProfilesFile::default();
+        amb.profiles
+            .insert("a".into(), ProfileMeta { name: "dup".into() });
+        amb.profiles
+            .insert("b".into(), ProfileMeta { name: "dup".into() });
+        assert_eq!(resolve_target_to_id("dup", &amb), None);
+
+        // id precedence over name: a target that is BOTH a known id AND some other profile's name
+        // resolves to the id. (Set up "home" id whose name coincides with a target that is also an id.)
+        let mut prec = ProfilesFile::default();
+        prec.profiles.insert(
+            "work".into(),
+            ProfileMeta {
+                name: "home".into(), // "work"'s display name is literally "home"
+            },
+        );
+        prec.profiles.insert(
+            "home".into(),
+            ProfileMeta {
+                name: "Home tailnet".into(),
+            },
+        );
+        // "home" is a known id → resolves to id "home", NOT to "work" (whose name is "home").
+        assert_eq!(resolve_target_to_id("home", &prec).as_deref(), Some("home"));
     }
 }
