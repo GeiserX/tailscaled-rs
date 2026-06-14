@@ -3373,9 +3373,18 @@ async fn run_cert(
     };
 
     // Go's default-filename rule: only when BOTH flags are unset. `*.` → `wildcard_.` keeps a wildcard
-    // domain a legal path.
+    // domain a legal path. GUARD (L1): the domain is interpolated into the default filename, so refuse
+    // a domain that would steer the path elsewhere (`/` or `..`). In practice the daemon only issues
+    // for the tailnet's own cert domains (an arbitrary domain fails at ACME time), but the filename
+    // derivation must not trust the domain shape regardless.
     let (cert_path, key_path) = match (cert_file, key_file) {
         (None, None) => {
+            if domain.contains('/') || domain.contains("..") {
+                anyhow::bail!(
+                    "refusing to derive a cert filename from domain {domain:?} (contains '/' or '..'); \
+                     pass explicit --cert-file/--key-file paths"
+                );
+            }
             let base = domain.replacen("*.", "wildcard_.", 1);
             (Some(format!("{base}.crt")), Some(format!("{base}.key")))
         }
@@ -3386,7 +3395,7 @@ async fn run_cert(
     // two flags was given) skips that output, matching Go (each is written only when its path is set).
     fn emit(path: Option<&str>, pem: &str, mode: u32, label: &str) -> Result<()> {
         use std::io::Write as _;
-        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        use std::os::unix::fs::OpenOptionsExt as _;
         match path {
             None => Ok(()),
             Some("-") => {
@@ -3396,23 +3405,51 @@ async fn run_cert(
                 Ok(())
             }
             Some(p) => {
-                // truncate+create with the exact mode (0644 cert / 0600 key). O_NOFOLLOW refuses to
-                // follow a pre-planted symlink at the destination (the daemon — and this CLI — may run
-                // as root), so the PEM can't be written through a link to an arbitrary target.
-                let mut f = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(mode)
-                    .custom_flags(libc::O_NOFOLLOW)
-                    .open(p)
-                    .with_context(|| format!("opening {label} file {p}"))?;
-                f.write_all(pem.as_bytes())
-                    .with_context(|| format!("writing {label} file {p}"))?;
-                // create() does not re-chmod an EXISTING file to `mode`; enforce it explicitly so a
-                // pre-existing key file can't stay world-readable.
-                f.set_permissions(std::fs::Permissions::from_mode(mode))
-                    .with_context(|| format!("setting {label} file mode on {p}"))?;
+                // ATOMIC write (Go `atomicfile` semantics): write to a fresh sibling temp file, fsync,
+                // then `rename` over the target. This removes the partial-key window a truncate-in-place
+                // would leave (a crash / disk-full / O_NOFOLLOW failure mid-write must not zero out a
+                // pre-existing good key), and `rename` replaces a symlinked target WITHOUT following it.
+                // The temp is created `O_EXCL | O_NOFOLLOW` with the exact mode (0644 cert / 0600 key),
+                // so the key is mode-0600 from creation (no world-readable window) and a pre-planted
+                // temp/symlink is refused. NOTE: O_NOFOLLOW guards only the FINAL path component — the
+                // parent directory must be caller-controlled (an attacker-symlinked intermediate dir is
+                // still traversed; same residual as Go).
+                let path = std::path::Path::new(p);
+                let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+                let dir = dir.unwrap_or_else(|| std::path::Path::new("."));
+                let file_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .with_context(|| format!("{label} path {p} has no file name"))?;
+                let tmp = dir.join(format!(".{file_name}.tmp{}", std::process::id()));
+
+                // Clean up a stale temp from a prior interrupted run (best-effort) so create_new can
+                // succeed; it is our own pid-suffixed name, so this only ever removes our leftover.
+                let _ = std::fs::remove_file(&tmp);
+                let write_tmp = || -> Result<()> {
+                    let mut f = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true) // O_EXCL: refuse a pre-existing temp (no symlink/clobber)
+                        .mode(mode)
+                        .custom_flags(libc::O_NOFOLLOW)
+                        .open(&tmp)
+                        .with_context(|| format!("creating {label} temp file {}", tmp.display()))?;
+                    f.write_all(pem.as_bytes())
+                        .with_context(|| format!("writing {label} temp file {}", tmp.display()))?;
+                    f.sync_all()
+                        .with_context(|| format!("fsync {label} temp file {}", tmp.display()))?;
+                    Ok(())
+                };
+                if let Err(e) = write_tmp() {
+                    let _ = std::fs::remove_file(&tmp); // don't leak the partial temp on failure
+                    return Err(e);
+                }
+                if let Err(e) = std::fs::rename(&tmp, path)
+                    .with_context(|| format!("renaming {label} into place at {p}"))
+                {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e);
+                }
                 // (The "-" case is handled by the earlier arm, so `p` here is always a real path.)
                 println!("Wrote {label} to {p}");
                 Ok(())
