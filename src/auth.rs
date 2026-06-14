@@ -181,6 +181,10 @@ pub(crate) fn requires_write(request: &crate::localapi::Request) -> bool {
         // `DebugCapture` installs a dataplane capture hook and writes a pcap as the daemon's uid —
         // it taps all plaintext traffic, so it gates like `up`/`down`, never a read.
         | Request::DebugCapture { .. }
+        // `DebugRebind` re-creates the engine's UDP sockets — a live-datapath MUTATION (Go gates the
+        // magicsock debug pokes on write). A socket-reachable non-owner must not be able to disrupt
+        // connectivity, so it gates like `down`.
+        | Request::DebugRebind
         // `Cert` provisions a TLS cert and returns its PRIVATE KEY — a sensitive credential, and an
         // ACME control round-trip (not a passive read). Go gates `serveCert` on write; a
         // socket-reachable non-owner must not be able to mint a cert/key. Gates like `up`/`IdToken`.
@@ -311,6 +315,10 @@ mod tests {
                 seconds: Some(5)
             }),
             "debug capture installs a dataplane tap + writes a file — a write"
+        );
+        assert!(
+            requires_write(&Request::DebugRebind),
+            "debug rebind re-creates the engine's UDP sockets — a live-datapath mutation, gated like down"
         );
         assert!(
             requires_write(&Request::IdToken {

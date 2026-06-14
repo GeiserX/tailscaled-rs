@@ -720,6 +720,18 @@ async fn dispatch(
                 },
             }
         }
+        // `debug rebind` (Go `tailscale debug rebind`, WRITE — re-creates the engine's UDP sockets).
+        // Off-lock device call; needs the node up (there is no datapath to rebind otherwise). The
+        // write-gate is enforced above by `auth::authorize`.
+        Request::DebugRebind => {
+            let dev = { backend.lock().await.device_handle() };
+            match dev {
+                Some(dev) => Backend::rebind(&dev).await,
+                None => Response::Error {
+                    message: "node is not up".into(),
+                },
+            }
+        }
         // `syspolicy list`/`reload` (Go `tailscale syspolicy`, read-only). NO lock + NO device:
         // policy resolution reads OS/registered policy stores, independent of node lifecycle, so it
         // works whether or not the node is up (and never touches the engine). On Linux/Unix no store
