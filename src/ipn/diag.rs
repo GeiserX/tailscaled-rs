@@ -992,25 +992,37 @@ async fn receive_one(
     // Resolve the on-disk target under the conflict policy and open it. `skip` refuses an existing
     // target (leaving the inbox file); `overwrite` removes-then-exclusive-creates (symlink-safe);
     // `rename` finds the next free `name (N).ext`. Runs on a blocking thread with the copy.
+    //
+    // QUARANTINE BEFORE BYTES (matches Go's `receiveFile`, which calls `quarantine.SetOnFile` on the
+    // open handle BEFORE `io.Copy`): we set the quarantine attribute on the freshly-created, still-
+    // EMPTY target before copying any bytes, so the file never exists on disk with content but
+    // without the "untrusted/downloaded" marker — closing the window where a crash mid-copy would
+    // leave un-quarantined bytes. The quarantine is best-effort (a failure is non-fatal — the marker
+    // is defense-in-depth, not a correctness gate), so we capture whether it succeeded and warn after
+    // the copy rather than aborting the receive.
     let dir_owned = dir.to_string();
     let name_owned = name.to_string();
-    let copy_result = tokio::task::spawn_blocking(move || -> std::io::Result<(String, u64)> {
-        let (mut out, written_path) = open_target_under_policy(&dir_owned, &name_owned, conflict)?;
-        let n = std::io::copy(&mut src, &mut out)?;
-        Ok((written_path, n))
-    })
-    .await;
+    let copy_result =
+        tokio::task::spawn_blocking(move || -> std::io::Result<(String, u64, Option<String>)> {
+            let (mut out, written_path) =
+                open_target_under_policy(&dir_owned, &name_owned, conflict)?;
+            // Mark untrusted on the empty file, before any bytes land.
+            let quarantine_err = set_quarantine(&written_path).err().map(|e| e.to_string());
+            let n = std::io::copy(&mut src, &mut out)?;
+            Ok((written_path, n, quarantine_err))
+        })
+        .await;
 
-    let (written_path, copied) = match copy_result {
-        Ok(Ok(pair)) => pair,
+    let (written_path, copied, quarantine_err) = match copy_result {
+        Ok(Ok(triple)) => triple,
         Ok(Err(e)) => return ReceiveOutcome::Failed(humanize_write_err(dir, name, conflict, &e)),
         Err(e) => return ReceiveOutcome::Failed(format!("receive task failed: {e}")),
     };
 
-    // Apply the quarantine attribute (defense-in-depth: mark the received file untrusted, matching
-    // Go's `quarantine.SetOnFile`). A failure here is non-fatal — the bytes are already written —
-    // so warn and still count the file as received.
-    if let Err(e) = set_quarantine(&written_path) {
+    // The quarantine attribute (defense-in-depth: mark the received file untrusted, matching Go's
+    // `quarantine.SetOnFile`) is applied inside the blocking copy above, BEFORE the bytes. A failure
+    // is non-fatal — the bytes are already written — so warn and still count the file as received.
+    if let Some(e) = quarantine_err {
         tracing::warn!(
             file = name,
             path = %written_path,
