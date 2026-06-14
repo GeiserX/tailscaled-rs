@@ -733,3 +733,22 @@ plumbing.
 **Daemon impact once landed:** `tnet lock add/remove` (WRITES — gated root/owner-uid like the other
 lock mutations) + `tnet lock log` (read). Consumed via a pin bump. Tracked in daemon bead tsd-lq8. —
 daemon lane
+
+---
+
+## 26. `Device::re_stun()` — force a STUN re-probe (for `tnet debug restun`)
+
+**Why:** `tnet debug rebind` already ships over the engine's `Device::rebind()` (re-creates the UDP
+sockets). Go's magicsock debug surface pairs `rebind` with **`restun`** — a lighter knob that forces a
+fresh STUN/endpoint re-probe *without* tearing down the sockets (`tailscale debug restun` →
+`magicsock.Conn.ReSTUN`). The engine exposes `rebind()` but **no** `re_stun()`, so `debug restun`
+can't be built faithfully. It's a strictly weaker/safer operation than `rebind` (no socket churn), so
+an operator diagnosing endpoint/NAT issues reaches for it first.
+
+**Ask:** add `Device::re_stun(&self) -> Result<(), Error>` that triggers an immediate STUN re-probe /
+endpoint re-derivation on the running magicsock conn (Go `Conn.ReSTUN("debug")`), without rebinding
+sockets. No netmap/control round-trip — purely the local endpoint-discovery refresh.
+
+**Daemon impact once landed:** `tnet debug restun` (WRITE — gated root/owner-uid like `debug rebind`),
+a thin sibling of the existing `debug rebind` handler. Consumed via a pin bump. Tracked in daemon bead
+tsd-rst. — daemon lane

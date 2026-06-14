@@ -2768,6 +2768,13 @@ impl Backend {
         diag::netcheck(dev).await
     }
 
+    /// Force the engine to rebind its UDP sockets (the `tnet debug rebind` path). Thin `pub` shim over
+    /// [`diag::rebind`], kept on `Backend` so the `server.rs` dispatch call site is uniform with the
+    /// other off-lock device operations. A **write** (mutates live datapath state).
+    pub async fn rebind(dev: &tailscale::Device) -> crate::localapi::Response {
+        diag::rebind(dev).await
+    }
+
     /// Provision a TLS cert+key for `domain` via the tailnet ACME flow (the `tnet cert` path). Thin
     /// `pub` shim over [`diag::cert_pair`], kept on `Backend` so the `server.rs` dispatch call site is
     /// uniform with the other off-lock device operations. Fail-closed: a non-`acme` build, or any ACME

@@ -334,6 +334,24 @@ pub(super) async fn netcheck(dev: &tailscale::Device) -> Response {
     }
 }
 
+/// Force the engine to rebind its UDP sockets (the `tnet debug rebind` / Go `tailscale debug rebind`
+/// path). A connectivity-recovery knob: it tears down and re-creates magicsock's underlying UDP
+/// sockets, which can clear a wedged NAT binding or recover after a network-interface change without
+/// a full node restart. A **write** (it mutates live datapath state) — the server gates it like
+/// `down`/`logout`. Maps the engine's `Device::rebind()` to a [`Response::Ok`]; an engine error
+/// surfaces as a clear [`Response::Error`]. Go pairs this with `restun`; this fork exposes only
+/// `rebind` for now (the engine has no re-STUN entrypoint yet — tracked in the engine asks).
+pub(super) async fn rebind(dev: &tailscale::Device) -> Response {
+    match dev.rebind().await {
+        Ok(()) => Response::Ok {
+            message: "rebind: re-created the engine's UDP sockets".to_string(),
+        },
+        Err(e) => Response::Error {
+            message: format!("rebind failed: {e:?}"),
+        },
+    }
+}
+
 /// Resolve a tailnet IP to the peer that owns it (the `tnet whois` / Go `tailscale whois` path).
 ///
 /// Read-only: a netmap lookup that mutates nothing. Takes the engine handle as `dev` so the

@@ -730,6 +730,11 @@ enum DebugCmd {
         #[arg(value_name = "IPv4-CIDR")]
         cidr: Option<String>,
     },
+    /// Force the daemon's engine to rebind its UDP sockets (Go `tailscale debug rebind`). A
+    /// connectivity-recovery knob: re-creates magicsock's underlying sockets to clear a wedged NAT
+    /// binding or recover after a network change, without restarting the node. Requires the node to
+    /// be up. Write-gated (root/same-uid) — it mutates live datapath state.
+    Rebind,
 }
 
 /// `tnet serve` subcommands. Mirrors the TCP-forward subset of Go `tailscale serve`.
@@ -1514,6 +1519,8 @@ async fn main() -> Result<()> {
                 site_or_route,
                 cidr,
             } => run_debug_via(&site_or_route, cidr.as_deref()),
+            // `debug rebind` is a write-gated daemon round-trip (re-creates the engine's UDP sockets).
+            DebugCmd::Rebind => run_debug_rebind(&socket).await,
         },
         // `install` / `uninstall` (Go `tailscaled install-system-daemon` / `uninstall-system-daemon`):
         // purely LOCAL, privileged file + service-manager work — they never touch the LocalAPI socket.
@@ -2236,6 +2243,24 @@ async fn run_debug_prefs(socket: &std::path::Path) -> Result<()> {
         serde_json::to_string_pretty(&view).unwrap_or_else(|_| "{}".to_string())
     );
     Ok(())
+}
+
+/// `debug rebind` (Go `tailscale debug rebind`): ask the daemon to re-create the engine's UDP
+/// sockets. A write (gated root/same-uid by the daemon); needs the node up. Prints the daemon's
+/// confirmation, or surfaces a clear error (node down / not authorized / engine failure).
+async fn run_debug_rebind(socket: &std::path::Path) -> Result<()> {
+    match round_trip(socket, &Request::DebugRebind).await {
+        Ok(Response::Ok { message }) => {
+            println!("{message}");
+            Ok(())
+        }
+        Ok(Response::Error { message }) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        Ok(other) => anyhow::bail!("unexpected response to debug rebind: {other:?}"),
+        Err(e) => Err(e).with_context(|| format!("requesting rebind at {}", socket.display())),
+    }
 }
 
 /// `debug env` (Go `tailscale debug env`): print this CLI process's Tailscale-relevant environment +

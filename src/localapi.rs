@@ -432,6 +432,12 @@ pub enum Request {
         #[serde(default)]
         seconds: Option<u64>,
     },
+    /// Force the engine to rebind its UDP sockets (Go `tailscale debug rebind`), rendered by
+    /// `tnet debug rebind`. A connectivity-recovery knob — tears down and re-creates magicsock's
+    /// underlying sockets to clear a wedged NAT binding or recover after a link change, without a
+    /// node restart. A **write** (mutates live datapath state): gated like `down`/`logout`. Needs the
+    /// node up. Replies with [`Response::Ok`]/[`Response::Error`].
+    DebugRebind,
 }
 
 /// The daemon's reply to a [`Request`].
