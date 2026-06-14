@@ -172,9 +172,11 @@ impl Prefs {
     /// and every other up-managed pref back at its default.
     ///
     /// Deliberately NOT reset: `want_running` / `logged_out` (lifecycle — `up` sets `want_running`
-    /// itself just after), `ephemeral` (a registration-time property with no `up` flag), and
-    /// `taildrop_dir` (not an `up`-managed pref). The set reset here is exactly the set the
-    /// accidental-revert guard (`crate::ipn::revert_guard`) checks — they must stay in lockstep.
+    /// itself just after), `ephemeral` (settable via `up --ephemeral` but a REGISTRATION-TIME intent
+    /// the engine only honors on a fresh register — a no-op on a registered node — and with our PATCH
+    /// merge it is never reverted, so resetting it on a live node is meaningless), and `taildrop_dir`
+    /// (not an `up`-managed pref). The set reset here is exactly the set the accidental-revert guard
+    /// (`crate::ipn::revert_guard`) checks — they must stay in lockstep.
     pub fn reset_up_managed_to_default(&mut self) {
         let d = Self::default();
         self.control_url = d.control_url;
