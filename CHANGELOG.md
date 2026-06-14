@@ -25,6 +25,18 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.45.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.44.1...v0.45.0) (2026-06-13)
+
+
+### Features
+
+* **cli:** add tnet syspolicy list / reload ([#175](https://github.com/GeiserX/tailscaled-rs/issues/175)) ([b390892](https://github.com/GeiserX/tailscaled-rs/commit/b390892e45d0eb44abb24b233a3f183b4ca28c76))
+
+
+### Bug Fixes
+
+* **control:** allow plaintext /key bootstrap for http:// control servers ([#178](https://github.com/GeiserX/tailscaled-rs/issues/178)) ([4fe80c8](https://github.com/GeiserX/tailscaled-rs/commit/4fe80c8c40b88f95b2e86d34daf2a2605f479046))
+
 ## [0.44.1](https://github.com/GeiserX/tailscaled-rs/compare/v0.44.0...v0.44.1) (2026-06-13)
 
 
