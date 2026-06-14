@@ -4,8 +4,9 @@
 //! the LocalAPI socket until SIGINT/SIGTERM, shutting the engine down cleanly on exit. A SIGHUP is
 //! handled separately — as a *reload*, not a shutdown (see [`sighup_reload_loop`]).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -18,6 +19,20 @@ use tracing_subscriber::EnvFilter;
 const EXPERIMENT_VAR: &str = "TS_RS_EXPERIMENT";
 /// The exact value the engine requires; anything else (or unset) is a refusal.
 const REQUIRED_EXPERIMENT_VALUE: &str = "this_is_unstable_software";
+
+/// Multi-line `--version` block, mirroring the *shape* of Go `tailscaled`'s `version.String()`: the
+/// semver on line 1, then two-space-indented detail lines. Go prints `tailscale commit: <sha>` and
+/// `go version: <...>`; the faithful analogues here are `commit:` (our git SHA, `-dirty`-suffixed
+/// when the tree was dirty at build time) and `rustc version:` (the toolchain that built us). Both
+/// values are stamped at compile time by `build.rs`, each falling back to `unknown` when git/rustc
+/// were unavailable. clap prints this for `--version`; `-V` still prints the bare semver.
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\n  commit: ",
+    env!("TAILNETD_GIT_COMMIT"),
+    "\n  rustc version: ",
+    env!("TAILNETD_RUSTC_VERSION"),
+);
 
 /// `tailnetd` command-line flags (the analogue of Go `tailscaled`'s flag set).
 ///
@@ -37,7 +52,8 @@ const REQUIRED_EXPERIMENT_VALUE: &str = "this_is_unstable_software";
 #[command(
     name = "tailnetd",
     about = "The tailscaled-rs daemon (experimental WireGuard mesh node)",
-    version
+    version,
+    long_version = LONG_VERSION
 )]
 struct Args {
     /// Directory for daemon state (node key, prefs). Overrides `TAILNETD_STATE_DIR`. When omitted,
@@ -79,6 +95,24 @@ struct Args {
     /// bind address is the security boundary. Off unless given.
     #[arg(long, value_name = "[HOST:]PORT")]
     outbound_http_proxy_listen: Option<String>,
+    /// Clean up any OS-level network state left by a previous run, then exit (Go `tailscaled
+    /// --cleanup`). Go uses this to undo DNS config, firewall/netfilter rules, and routes after a
+    /// crash or reboot. This fork runs in userspace/netstack mode by default and programs **no** OS
+    /// DNS/firewall/route/TUN state, so — exactly like Go's `userspace-networking` path, which skips
+    /// the teardown entirely — there is almost nothing to undo. The one piece of system state the
+    /// daemon owns is the LocalAPI socket, so cleanup removes a *stale* socket (one with no live
+    /// daemon listening) and exits 0. It NEVER deletes the node key or prefs — that is `logout`/state
+    /// reset, a different operation Go's `--cleanup` likewise never performs. Refuses (exit 1) if a
+    /// daemon is currently listening on the socket, rather than yanking it from under a live process.
+    #[arg(long)]
+    cleanup: bool,
+    /// Accept `--no-logs-no-support` for `tailscaled` CLI compatibility (Go disables log uploads and
+    /// forgoes technical support). This fork never uploads logs or telemetry anywhere, so the flag is
+    /// an honest no-op: it only prints a one-line notice at startup. There is no posture/status field
+    /// to set — Go surfaces it only as a printed warning + an internal logpolicy switch, neither of
+    /// which has anything to gate here.
+    #[arg(long)]
+    no_logs_no_support: bool,
 }
 
 /// Restore the default `SIGPIPE` disposition (terminate) before any output. The Rust runtime sets
@@ -104,6 +138,24 @@ async fn main() -> Result<()> {
     // flags before we touch the experiment gate or any state, matching how Go `tailscaled` parses its
     // flag set up front. The parsed values then override the env-derived defaults below.
     let args = Args::parse();
+
+    // `--cleanup` (Go `tailscaled --cleanup`): reclaim OS-level network state from a previous run,
+    // then exit — WITHOUT running the engine, so it deliberately runs BEFORE the experiment gate
+    // below (Go likewise drops cleanup's normal prerequisites, e.g. the macOS root check). In
+    // userspace/netstack mode this fork programs no OS DNS/firewall/route/TUN state, so the only
+    // system state to reclaim is the LocalAPI socket (Go skips its DNS/router teardown entirely on
+    // the `userspace-networking` path for the same reason). It never touches the node key or prefs.
+    if args.cleanup {
+        let state_dir = args
+            .statedir
+            .clone()
+            .unwrap_or_else(tailscaled_rs::state_dir);
+        let socket_path = args
+            .socket
+            .clone()
+            .unwrap_or_else(|| tailscaled_rs::socket_path_in(&state_dir));
+        std::process::exit(run_cleanup(&socket_path).await);
+    }
 
     // Gate, before any logging is set up: the engine refuses to run unless
     // `TS_RS_EXPERIMENT=this_is_unstable_software` is set, so mirror that gate here and surface it
@@ -134,6 +186,16 @@ async fn main() -> Result<()> {
             }
         })
         .init();
+
+    // `--no-logs-no-support` (Go `tailscaled --no-logs-no-support`): Go flips an envknob that swaps
+    // the logtail uploader for a no-op transport and prints a warning. This fork never uploads logs
+    // or telemetry anywhere, so the flag is an honest no-op — emit the one-line notice (now that
+    // logging is initialized) and carry on. There is nothing to disable and no posture field to set.
+    if args.no_logs_no_support {
+        tracing::info!(
+            "--no-logs-no-support: tailnetd never uploads logs or telemetry; this flag is a no-op"
+        );
+    }
 
     // Best-effort OS-level hardening (no-coredump / no-ptrace / no-swap) for the secrets the engine
     // will hold in memory. Done here — after the experiment gate and logging init (so its outcome is
@@ -276,6 +338,83 @@ async fn main() -> Result<()> {
 
     backend.lock().await.shutdown().await;
     Ok(())
+}
+
+/// `--cleanup` body: reclaim the OS-level state a previous run may have left, then return the
+/// process exit code (`main` calls `std::process::exit` with it). Prints to stderr/stdout directly
+/// rather than via `tracing` — `--cleanup` runs before logging is initialized (it precedes the
+/// experiment gate), and an operator runs it as a one-shot command expecting plain output.
+///
+/// In userspace/netstack mode the only system state the daemon owns is the LocalAPI socket, so this
+/// is the whole teardown. The node key and `prefs.json` are NEVER touched (that is `logout`/state
+/// reset — a separate operation; Go's `--cleanup` likewise never deletes identity). This is enforced
+/// structurally: the function is handed only `socket_path` and never the key/prefs paths, so it
+/// *cannot* reach them. If a daemon is currently listening on the socket, refuse (exit 1) rather than
+/// yanking the socket from under a live process; a stale socket (path exists but nothing accepts) is
+/// removed; an absent socket is a no-op success.
+///
+/// There is a benign probe→unlink TOCTOU: a daemon that races startup in the window between the
+/// liveness probe and the `remove_file` could have its just-bound socket removed. This is acceptable
+/// — `--cleanup`'s contract is "the daemon is stopped," racing it against a starting daemon is
+/// operator error, and the blast radius is only the socket inode (the running daemon keeps its open
+/// fd and existing connections; only *new* LocalAPI clients fail to connect until the socket is
+/// re-created by a restart/SIGHUP). No key/pref/data loss is possible. Go is stricter-than-us nowhere
+/// here: it does not probe at all and operates unconditionally, so this probe is a safety addition.
+async fn run_cleanup(socket_path: &Path) -> i32 {
+    if !socket_path.exists() {
+        println!(
+            "cleanup: nothing to do (no socket at {})",
+            socket_path.display()
+        );
+        return 0;
+    }
+
+    // Probe liveness: a successful connect means a daemon is accepting on the socket. Bound by a
+    // short timeout so a wedged peer that accepts-but-never-responds (the connect still completes at
+    // the OS level) doesn't matter — we only need the connect itself. A connect error (ECONNREFUSED
+    // / ENOENT) means the socket file is stale (no listener), so it is safe to remove.
+    let live = matches!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::net::UnixStream::connect(socket_path),
+        )
+        .await,
+        Ok(Ok(_))
+    );
+    if live {
+        eprintln!(
+            "cleanup: a tailnetd appears to be running on {} — refusing to remove a live socket; \
+             stop the daemon first",
+            socket_path.display()
+        );
+        return 1;
+    }
+
+    // NB: this is the deliberately conservative sibling of `server::serve`'s socket removal, which
+    // unlinks any pre-existing socket UNCONDITIONALLY (it is about to `bind`, so a leftover is
+    // stale-to-it by definition). `--cleanup` must NOT yank a *different* live daemon's socket, hence
+    // the liveness probe above gates this unlink. The asymmetry is intentional — do not "harmonize".
+    match tokio::fs::remove_file(socket_path).await {
+        Ok(()) => {
+            println!("cleanup: removed stale socket {}", socket_path.display());
+            0
+        }
+        // A race where the socket vanished between the probe and the unlink is still success.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!(
+                "cleanup: nothing to do (no socket at {})",
+                socket_path.display()
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!(
+                "cleanup: failed to remove stale socket {}: {e}",
+                socket_path.display()
+            );
+            1
+        }
+    }
 }
 
 /// Run the SOCKS5 proxy if `--socks5-server` was given, else an inert future that never resolves.
@@ -712,6 +851,11 @@ mod tests {
         assert_eq!(a.verbose, Some(2));
         // `-v` short form works too.
         assert_eq!(Args::parse_from(["tailnetd", "-v", "1"]).verbose, Some(1));
+        // The lifecycle bool flags default off and parse on when given.
+        let a = Args::parse_from(["tailnetd"]);
+        assert!(!a.cleanup && !a.no_logs_no_support);
+        let a = Args::parse_from(["tailnetd", "--cleanup", "--no-logs-no-support"]);
+        assert!(a.cleanup && a.no_logs_no_support);
     }
 
     #[test]
@@ -719,5 +863,116 @@ mod tests {
         use clap::Parser;
         // An unknown flag is a parse error (clap), not silently ignored — matches Go's flag set.
         assert!(Args::try_parse_from(["tailnetd", "--nope"]).is_err());
+    }
+
+    #[test]
+    fn long_version_has_go_shape() {
+        // `--version` block: semver on line 1, then two-space-indented detail lines (the shape of
+        // Go's `version.String()`). The build-stamped values may be `unknown` in some build
+        // environments, so assert structure, not the literal SHA.
+        let mut lines = LONG_VERSION.lines();
+        assert_eq!(
+            lines.next(),
+            Some(env!("CARGO_PKG_VERSION")),
+            "line 1 is the bare semver"
+        );
+        let commit = lines.next().unwrap();
+        assert!(
+            commit.starts_with("  commit: "),
+            "line 2 is the two-space-indented commit line, got {commit:?}"
+        );
+        let rustc = lines.next().unwrap();
+        assert!(
+            rustc.starts_with("  rustc version: "),
+            "line 3 is the two-space-indented rustc line, got {rustc:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_stale_socket() {
+        // A socket file with no listener (the post-crash case) is stale → removed, exit 0.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-cleanup-stale-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let sock = dir.join("tailnetd.sock");
+        // A plain file at the socket path stands in for a stale socket: connect() fails (not a
+        // socket / nothing accepting), so cleanup treats it as stale and unlinks it.
+        tokio::fs::write(&sock, b"stale").await.unwrap();
+
+        let rc = run_cleanup(&sock).await;
+        assert_eq!(rc, 0, "stale socket cleanup must succeed");
+        assert!(
+            !tokio::fs::try_exists(&sock).await.unwrap(),
+            "the stale socket must have been removed"
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_absent_socket_is_noop_success() {
+        // No socket at all → nothing to do, exit 0 (not an error).
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-cleanup-absent-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        let sock = dir.join("tailnetd.sock");
+        assert_eq!(run_cleanup(&sock).await, 0);
+    }
+
+    #[tokio::test]
+    async fn cleanup_refuses_live_socket() {
+        // A socket with a live listener (a running daemon) must NOT be removed — exit 1, file intact.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-cleanup-live-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let sock = dir.join("tailnetd.sock");
+        // Bind a real listener so connect() succeeds → cleanup sees it as live and refuses.
+        let _listener = tokio::net::UnixListener::bind(&sock).unwrap();
+
+        let rc = run_cleanup(&sock).await;
+        assert_eq!(rc, 1, "cleanup must refuse a live socket");
+        assert!(
+            tokio::fs::try_exists(&sock).await.unwrap(),
+            "a live socket must NOT be removed"
+        );
+        drop(_listener);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_never_touches_key_or_prefs() {
+        // The load-bearing safety invariant: `--cleanup` reclaims OS state (the socket) but NEVER the
+        // node identity. Stand up a state dir with a key file + prefs.json alongside a stale socket,
+        // run cleanup, and assert the socket is gone but the key and prefs survive untouched.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-cleanup-keep-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let sock = dir.join("tailnetd.sock");
+        let key = dir.join("tailnetd.key");
+        let prefs = dir.join("prefs.json");
+        tokio::fs::write(&sock, b"stale").await.unwrap();
+        tokio::fs::write(&key, b"node-key-material").await.unwrap();
+        tokio::fs::write(&prefs, b"{\"WantRunning\":true}")
+            .await
+            .unwrap();
+
+        assert_eq!(run_cleanup(&sock).await, 0);
+        assert!(
+            !tokio::fs::try_exists(&sock).await.unwrap(),
+            "the stale socket must be removed"
+        );
+        assert_eq!(
+            tokio::fs::read(&key).await.unwrap(),
+            b"node-key-material",
+            "cleanup must NEVER delete or alter the node key"
+        );
+        assert_eq!(
+            tokio::fs::read(&prefs).await.unwrap(),
+            b"{\"WantRunning\":true}",
+            "cleanup must NEVER delete or alter prefs"
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }
