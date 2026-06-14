@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.47.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.46.0...v0.47.0) (2026-06-14)
+
+
+### Features
+
+* **daemon:** SOCKS5 proxy that dials over the tailnet (--socks5-server) ([#189](https://github.com/GeiserX/tailscaled-rs/issues/189)) ([3fa605b](https://github.com/GeiserX/tailscaled-rs/commit/3fa605baf9c463f99d279083e4b2f6aad6ecda21))
+
 ## [0.46.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.45.0...v0.46.0) (2026-06-14)
 
 
