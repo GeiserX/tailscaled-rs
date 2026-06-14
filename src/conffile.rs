@@ -14,8 +14,12 @@
 //! **warn** (never silently drop) when an unmapped field is set to a non-default value, so a headless
 //! operator sees exactly what is and isn't applied. The mapped set today: `Enabled` → `want_running`,
 //! `ServerURL` → `control_url`, `Hostname`, `AcceptDNS`, `AcceptRoutes`, `ExitNode`, `AdvertiseRoutes`,
-//! `AdvertiseTags`, `ShieldsUp`, `RunSSHServer` → `ssh_enabled`. `AuthKey` is returned separately (it
-//! is a registration credential, not a persisted pref).
+//! `ShieldsUp`, `RunSSHServer` → `ssh_enabled`. `AuthKey` is returned separately (it is a registration
+//! credential, not a persisted pref).
+//!
+//! NOTE: Go's `ConfigVAlpha` has **no** tags field — ACL tags are carried by the auth key at
+//! registration, never by the config file (verified against `ipn/conf.go` @ v1.100.0). So there is no
+//! `AdvertiseTags` config mapping (tags are still settable via `tnet up --advertise-tags`).
 
 use anyhow::{Context, Result, anyhow, bail};
 use secrecy::SecretString;
@@ -81,8 +85,6 @@ pub struct ConfigVAlpha {
     pub allow_lan_while_using_exit_node: Option<bool>,
     /// Subnet routes (CIDRs) to advertise.
     pub advertise_routes: Vec<String>,
-    /// ACL tags to request at registration (`tag:<name>`).
-    pub advertise_tags: Vec<String>,
     /// Shields-up: block inbound connections from peers.
     pub shields_up: Option<bool>,
     /// Run the Tailscale SSH server (Go `RunSSHServer`). Requires the `ssh` build + root at runtime.
@@ -113,6 +115,22 @@ pub struct ConfigVAlpha {
     /// refused) must see that it is not honored. Parsing it explicitly (vs relying on the unknown-key
     /// catch-all) keeps that honest-omission contract intact.
     pub locked: Option<bool>,
+    /// Go `AdvertiseServices` — Tailscale Services this node advertises. No service-advertisement pref
+    /// in this fork; parsed + warned so a real Go config that sets it is not silently dropped. Wire key
+    /// is the Go field name (`AdvertiseServices`, un-tagged `omitempty` → PascalCase here).
+    pub advertise_services: Vec<String>,
+    /// Go `AppConnector` — app-connector config (a JSON object). Not implemented in this fork; parsed as
+    /// an opaque value + warned. Kept opaque (`serde_json::Value`) because we never inspect it.
+    pub app_connector: Option<serde_json::Value>,
+    /// Go `AutoUpdate` — self-update policy (a JSON object). This fork does not self-update; parsed +
+    /// warned.
+    pub auto_update: Option<serde_json::Value>,
+    /// Go `ServeConfigTemp` — an embedded serve config. Set via `tnet serve` in this fork, not the
+    /// declarative config; parsed as opaque + warned.
+    pub serve_config_temp: Option<serde_json::Value>,
+    /// Go `StaticEndpoints` — operator-pinned WireGuard endpoints. Engine-gated (no `Config` knob);
+    /// parsed + warned.
+    pub static_endpoints: Vec<String>,
 }
 
 /// Load and parse a `--config` file (Go `conffile.Load`).
@@ -239,9 +257,6 @@ impl Config {
         if !c.advertise_routes.is_empty() {
             prefs.advertise_routes = c.advertise_routes.clone();
         }
-        if !c.advertise_tags.is_empty() {
-            prefs.advertise_tags = c.advertise_tags.clone();
-        }
         if let Some(v) = c.shields_up {
             prefs.shields_up = v;
         }
@@ -311,6 +326,21 @@ fn warn_unmapped(c: &ConfigVAlpha) {
     // a true value is worth surfacing.
     if c.locked == Some(true) {
         unmapped.push("Locked");
+    }
+    if !c.advertise_services.is_empty() {
+        unmapped.push("AdvertiseServices");
+    }
+    if c.app_connector.is_some() {
+        unmapped.push("AppConnector");
+    }
+    if c.auto_update.is_some() {
+        unmapped.push("AutoUpdate");
+    }
+    if c.serve_config_temp.is_some() {
+        unmapped.push("ServeConfigTemp");
+    }
+    if !c.static_endpoints.is_empty() {
+        unmapped.push("StaticEndpoints");
     }
     if !unmapped.is_empty() {
         tracing::warn!(
@@ -473,7 +503,6 @@ mod tests {
                 "acceptRoutes":true,
                 "exitNode":"100.64.0.9",
                 "AdvertiseRoutes":["10.0.0.0/24"],
-                "AdvertiseTags":["tag:server"],
                 "ShieldsUp":true,
                 "RunSSHServer":true
             }"#);
@@ -487,9 +516,38 @@ mod tests {
         assert!(p.accept_routes);
         assert_eq!(p.exit_node.as_deref(), Some("100.64.0.9"));
         assert_eq!(p.advertise_routes, vec!["10.0.0.0/24".to_string()]);
-        assert_eq!(p.advertise_tags, vec!["tag:server".to_string()]);
         assert!(p.shields_up);
         assert!(p.ssh_enabled);
+    }
+
+    #[test]
+    fn go_config_fields_without_a_pref_parse_and_are_not_applied() {
+        // Go's ConfigVAlpha (v1.100.0) carries fields this fork has no pref for — including
+        // AdvertiseServices, AppConnector, AutoUpdate, ServeConfigTemp, StaticEndpoints. A real Go
+        // config that sets them MUST parse (no error) and MUST NOT mutate prefs — they are surfaced via
+        // warn_unmapped (honest omission), never silently applied. Critically, Go has NO tags field in
+        // the config (tags ride the auth key), so there is no AdvertiseTags mapping to leave a pref set.
+        let c = cfg(r#"{
+                "version":"alpha0",
+                "Hostname":"only-host",
+                "AdvertiseServices":["svc:web"],
+                "AppConnector":{"advertise":true},
+                "AutoUpdate":{"apply":true},
+                "StaticEndpoints":["1.2.3.4:41641"]
+            }"#);
+        let mut p = Prefs::default();
+        let key = c.apply_to_prefs(&mut p).unwrap();
+        assert!(key.is_none());
+        // Only the mapped field applied; the engine-gated/non-goal Go fields left prefs at default.
+        assert_eq!(p.hostname.as_deref(), Some("only-host"));
+        assert!(
+            p.advertise_routes.is_empty(),
+            "no AdvertiseRoutes in the config → pref untouched"
+        );
+        assert!(
+            p.advertise_tags.is_empty(),
+            "the config has no tags field at all (Go carries tags on the auth key) → pref untouched"
+        );
     }
 
     #[test]
