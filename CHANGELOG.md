@@ -25,6 +25,15 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.47.1](https://github.com/GeiserX/tailscaled-rs/compare/v0.47.0...v0.47.1) (2026-06-14)
+
+
+### Bug Fixes
+
+* **cert:** write the private key atomically (temp+fsync+rename), guard the filename ([#195](https://github.com/GeiserX/tailscaled-rs/issues/195)) ([fa0a045](https://github.com/GeiserX/tailscaled-rs/commit/fa0a045c5cb5d0d57c7c4e274225c8861812fdb6))
+* **conffile:** validate --config fields before persisting; warn on Locked ([#198](https://github.com/GeiserX/tailscaled-rs/issues/198)) ([08a72da](https://github.com/GeiserX/tailscaled-rs/commit/08a72daedd62fbb6db2491467911e8054591128d))
+* **localapi:** separate cap + timeouts for long-lived Watch/Nc streams (DoS) ([#197](https://github.com/GeiserX/tailscaled-rs/issues/197)) ([cad049c](https://github.com/GeiserX/tailscaled-rs/commit/cad049c2157f1233976838629ecdf41464c3929e))
+
 ## [0.47.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.46.0...v0.47.0) (2026-06-14)
 
 
