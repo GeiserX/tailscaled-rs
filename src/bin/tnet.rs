@@ -713,6 +713,23 @@ enum DebugCmd {
     /// alias. Requires the node to be up. Write-gated like `tnet metrics` (the metrics may carry
     /// operational detail — Go gates `serveMetrics` on PermitWrite).
     Metrics,
+    /// Convert between a 4via6 IPv6 route and its `(site-id, IPv4-CIDR)` components (Go `tailscale
+    /// debug via`). 4via6 lets several subnet routers advertise the *same* private IPv4 CIDR without
+    /// collision by mapping each into a distinct IPv6 `via` route under `fd7a:115c:a1e0:b1a::/64`,
+    /// keyed by a site id. Purely local bit-math — no daemon round-trip (matches Go).
+    ///
+    /// Two forms, exactly like Go:
+    /// - `debug via <site-id> <ipv4-cidr>` → prints the encoded IPv6 `via` route, e.g.
+    ///   `debug via 7 10.1.2.0/24` → `fd7a:115c:a1e0:b1a:0:7:a01:200/120`.
+    /// - `debug via <ipv6-via-route>` → decodes it back to the site id and the IPv4 CIDR.
+    Via {
+        /// Either a decimal site id (then `cidr` is required) or, alone, an IPv6 `via` route to decode.
+        #[arg(value_name = "SITE-ID|IPv6-ROUTE")]
+        site_or_route: String,
+        /// The IPv4 CIDR to encode (only with the two-argument site-id form).
+        #[arg(value_name = "IPv4-CIDR")]
+        cidr: Option<String>,
+    },
 }
 
 /// `tnet serve` subcommands. Mirrors the TCP-forward subset of Go `tailscale serve`.
@@ -1492,6 +1509,11 @@ async fn main() -> Result<()> {
             }
             // `debug metrics` is the same data as `tnet metrics` (reuse the handler) — a Go alias.
             DebugCmd::Metrics => run_metrics(&socket, Some(MetricsCmd::Print)).await,
+            // `debug via` is pure local bit-math (4via6 encode/decode) — no socket round-trip.
+            DebugCmd::Via {
+                site_or_route,
+                cidr,
+            } => run_debug_via(&site_or_route, cidr.as_deref()),
         },
         // `install` / `uninstall` (Go `tailscaled install-system-daemon` / `uninstall-system-daemon`):
         // purely LOCAL, privileged file + service-manager work — they never touch the LocalAPI socket.
@@ -2242,6 +2264,83 @@ fn run_debug_env() {
             Ok(_) if *name == "TS_AUTH_KEY" => println!("{name}=<set, redacted>"),
             Ok(v) => println!("{name}={v}"),
             Err(_) => println!("{name} (unset)"),
+        }
+    }
+}
+
+/// The Tailscale 4via6 `via` range, `fd7a:115c:a1e0:b1a::/64` (Go `tsaddr.TailscaleViaRange`; "b1a"
+/// ≈ "via"). A 4via6 route encodes an IPv4 CIDR + a 32-bit site id into a /64-prefixed IPv6 route so
+/// that multiple subnet routers can advertise the *same* private IPv4 space without colliding.
+const VIA_RANGE_PREFIX: [u8; 8] = [0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 0x0b, 0x1a];
+
+/// Encode `(site_id, v4)` into a 4via6 IPv6 `via` route (Go `tsaddr.MapVia`). Layout (16 bytes):
+/// `[0..8] = via prefix`, `[8..12] = site id big-endian`, `[12..16] = the IPv4 address`. The result
+/// prefix length is the v4 prefix bits + 96 (64 for the via prefix + 32 for the site id). Errors if
+/// `v4` is not an IPv4 prefix.
+fn map_via(site_id: u32, v4: &ipnet::Ipv4Net) -> Result<ipnet::Ipv6Net> {
+    let mut bytes = [0u8; 16];
+    bytes[0..8].copy_from_slice(&VIA_RANGE_PREFIX);
+    bytes[8..12].copy_from_slice(&site_id.to_be_bytes());
+    bytes[12..16].copy_from_slice(&v4.addr().octets());
+    let addr = std::net::Ipv6Addr::from(bytes);
+    // v4.prefix_len() is 0..=32; +96 stays within the u8 IPv6 prefix range (max 128).
+    let prefix = v4.prefix_len() + 96;
+    ipnet::Ipv6Net::new(addr, prefix).context("constructing the 4via6 route")
+}
+
+/// Decode a 4via6 IPv6 `via` route back to `(site_id, IPv4-CIDR)` (the inverse of [`map_via`], Go
+/// `tsaddr.UnmapVia` + the CLI's site-id extraction). Errors if `via` is not inside the via range or
+/// is too short to carry a site id + IPv4 (Go requires `Bits() >= 96`).
+fn unmap_via(via: &ipnet::Ipv6Net) -> Result<(u32, ipnet::Ipv4Net)> {
+    let octets = via.addr().octets();
+    if octets[0..8] != VIA_RANGE_PREFIX {
+        anyhow::bail!(
+            "{via} is not a 4via6 route (not within the fd7a:115c:a1e0:b1a::/64 via range)"
+        );
+    }
+    if via.prefix_len() < 96 {
+        anyhow::bail!(
+            "{via} is too short to be a 4via6 route (need at least a /96 to carry the site id + IPv4)"
+        );
+    }
+    let site_id = u32::from_be_bytes([octets[8], octets[9], octets[10], octets[11]]);
+    let v4_addr = std::net::Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]);
+    // The IPv4 prefix bits are the IPv6 route's bits minus the 96 the via prefix + site id occupy.
+    let v4 = ipnet::Ipv4Net::new(v4_addr, via.prefix_len() - 96)
+        .context("reconstructing the IPv4 CIDR")?;
+    Ok((site_id, v4))
+}
+
+/// `debug via` (Go `tailscale debug via`): 4via6 encode/decode. With one argument, decode an IPv6
+/// `via` route into its site id + IPv4 CIDR; with two, encode `(site-id, IPv4-CIDR)` into the route.
+/// Purely local bit-math — no daemon round-trip (matches Go).
+fn run_debug_via(site_or_route: &str, cidr: Option<&str>) -> Result<()> {
+    match cidr {
+        // Two-arg form: `debug via <site-id> <ipv4-cidr>` → encode.
+        Some(cidr) => {
+            let site_id: u32 = site_or_route.parse().with_context(|| {
+                format!("site id must be a non-negative integer, got {site_or_route:?}")
+            })?;
+            // Go rejects a site id above 0xffff (the encoding reserves 32 bits but the CLI caps it at
+            // 16 to match the documented site-id space). Mirror that bound.
+            if site_id > 0xffff {
+                anyhow::bail!("site id {site_id} is out of range (must be 0..=65535)");
+            }
+            let v4: ipnet::Ipv4Net = cidr
+                .parse()
+                .with_context(|| format!("invalid IPv4 CIDR {cidr:?}"))?;
+            let route = map_via(site_id, &v4)?;
+            println!("{route}");
+            Ok(())
+        }
+        // One-arg form: `debug via <ipv6-route>` → decode.
+        None => {
+            let via: ipnet::Ipv6Net = site_or_route.parse().with_context(|| {
+                format!("expected an IPv6 4via6 route to decode, got {site_or_route:?}")
+            })?;
+            let (site_id, v4) = unmap_via(&via)?;
+            println!("site {site_id} ({site_id:#x}), {v4}");
+            Ok(())
         }
     }
 }
@@ -6321,6 +6420,68 @@ fn format_serve_status(cfg: &tailscaled_rs::localapi::ServeConfig, _json: bool) 
 mod tests {
     use super::*;
     use tailscaled_rs::localapi::{StatusReport, WhoisReport};
+
+    #[test]
+    fn map_via_encodes_like_go() {
+        // Go `tailscale debug via 7 10.1.2.0/24` → fd7a:115c:a1e0:b1a:0:7:a01:200/120.
+        // (0x0a01_0200 = 10.1.2.0; site id 7 at bytes 8..12; /24 + 96 = /120.)
+        let v4: ipnet::Ipv4Net = "10.1.2.0/24".parse().unwrap();
+        let route = map_via(7, &v4).unwrap();
+        assert_eq!(route.to_string(), "fd7a:115c:a1e0:b1a:0:7:a01:200/120");
+    }
+
+    #[test]
+    fn unmap_via_decodes_back() {
+        let via: ipnet::Ipv6Net = "fd7a:115c:a1e0:b1a:0:7:a01:200/120".parse().unwrap();
+        let (site_id, v4) = unmap_via(&via).unwrap();
+        assert_eq!(site_id, 7);
+        assert_eq!(v4.to_string(), "10.1.2.0/24");
+    }
+
+    #[test]
+    fn via_round_trips_for_several_sites_and_cidrs() {
+        // Encoding then decoding must recover the exact (site_id, CIDR) for a spread of inputs.
+        for (site, cidr) in [
+            (0u32, "192.168.0.0/16"),
+            (1, "10.0.0.0/8"),
+            (255, "172.16.5.0/24"),
+            (0xffff, "10.1.2.3/32"),
+            (42, "0.0.0.0/0"),
+        ] {
+            let v4: ipnet::Ipv4Net = cidr.parse().unwrap();
+            let route = map_via(site, &v4).unwrap();
+            let (got_site, got_v4) = unmap_via(&route).unwrap();
+            assert_eq!(got_site, site, "site id must round-trip for {cidr}");
+            assert_eq!(got_v4, v4, "CIDR must round-trip for site {site}");
+        }
+    }
+
+    #[test]
+    fn unmap_via_rejects_non_via_range() {
+        // An IPv6 route outside fd7a:115c:a1e0:b1a::/64 is not a 4via6 route.
+        let not_via: ipnet::Ipv6Net = "2001:db8::/120".parse().unwrap();
+        assert!(unmap_via(&not_via).is_err());
+    }
+
+    #[test]
+    fn unmap_via_rejects_too_short_prefix() {
+        // Inside the via range but shorter than /96 → cannot carry a site id + IPv4.
+        let too_short: ipnet::Ipv6Net = "fd7a:115c:a1e0:b1a::/64".parse().unwrap();
+        assert!(unmap_via(&too_short).is_err());
+    }
+
+    #[test]
+    fn run_debug_via_encode_and_decode_paths() {
+        // The two CLI forms (these print; we assert they don't error and the math is wired).
+        assert!(run_debug_via("7", Some("10.1.2.0/24")).is_ok());
+        assert!(run_debug_via("fd7a:115c:a1e0:b1a:0:7:a01:200/120", None).is_ok());
+        // A site id above 0xffff is rejected (Go bounds it).
+        assert!(run_debug_via("70000", Some("10.0.0.0/8")).is_err());
+        // A bare non-IPv6 single arg (looks like neither a valid route nor a 2-arg form) errors.
+        assert!(run_debug_via("not-an-addr", None).is_err());
+        // A negative/garbage site id with a cidr errors on the parse.
+        assert!(run_debug_via("-1", Some("10.0.0.0/8")).is_err());
+    }
 
     /// Build a minimal `StatusReport` in the given state with no auth_url/error, no peers.
     fn report(state: &str) -> StatusReport {
