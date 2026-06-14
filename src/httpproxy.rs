@@ -434,7 +434,10 @@ mod tests {
     #[test]
     fn sanitize_header_value_trims_and_passes_clean_text() {
         // Surrounding whitespace is trimmed; ordinary diagnostic text passes through unchanged.
-        assert_eq!(sanitize_header_value("  node is not up  "), "node is not up");
+        assert_eq!(
+            sanitize_header_value("  node is not up  "),
+            "node is not up"
+        );
         assert_eq!(
             sanitize_header_value("no route to peer \"db\""),
             "no route to peer \"db\""
