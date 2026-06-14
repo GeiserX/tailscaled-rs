@@ -200,7 +200,15 @@ mod tests {
             // --- EXEMPT (not up-managed; never guarded, never reset by --reset) ---
             want_running: _, // lifecycle — `up`/`down` own it directly, not a revertable setting.
             logged_out: _,   // lifecycle — `up`/`logout` own it directly.
-            ephemeral: _,    // registration-time property; no `up`/`set` flag controls it.
+            // EXEMPT despite being `up`-settable (`up --ephemeral`): it is a REGISTRATION-TIME
+            // intent the engine only honors on a fresh register (a no-op on an already-registered
+            // node), and our `up` is a PATCH merge (an unmentioned `ephemeral` is left untouched, never
+            // defaulted) — so it can never be silently reverted, and a guard arm would only emit a
+            // SPURIOUS "about to revert ephemeral" warning. Mentioning `--ephemeral` still makes `up`
+            // non-bare (see `UpOptions::mentions_any_pref`), so the guard correctly checks the OTHER
+            // prefs — exactly as Go's REPLACE-semantics `up` would. Not in `--reset` either (resetting
+            // a registration-time property on a live node is meaningless).
+            ephemeral: _,
             taildrop_dir: _, // configured out-of-band (engine Config), not an `up` flag.
             has_logged_in: _, // registration signal — the guard's own fresh-node INPUT, never a guarded setting (tsd-i7c).
             // --- UP-MANAGED (MUST be in reset + guard; asserted at runtime below) ---
@@ -307,6 +315,96 @@ mod tests {
                 other => panic!("unclassified up-managed key in test table: {other}"),
             }
         }
+    }
+
+    #[test]
+    fn up_options_fields_classified_against_guard_no_silent_drift() {
+        // The Prefs-side lockstep above closes the "new persisted field skips the guard" hole. This
+        // closes the OTHER direction the `ephemeral` case slipped through: a new `UpOptions` flag must
+        // also force a conscious guard decision. Exhaustively destructure `UpOptions` — NO `..` — so
+        // adding a flag breaks this test until it is classified GUARD-RELEVANT (must be both a
+        // `check_accidental_reverts` arm AND in `mentions_any_pref`) or DIRECTIVE/REGISTRATION (a
+        // bare-up-preserving action that is neither). The classification is documented per-field; the
+        // assertions below verify the two non-obvious cases (`ephemeral`, `force_reauth`) actually
+        // behave as classified, so the comment can't drift from reality.
+        let crate::ipn::UpOptions {
+            // --- GUARD-RELEVANT: a pref flag → has a guard arm AND is in mentions_any_pref ---
+            hostname: _,
+            control_url: _,
+            tun: _,
+            tun_name: _,
+            tun_mtu: _,
+            exit_node: _,
+            advertise_exit_node: _,
+            advertise_routes: _,
+            advertise_tags: _,
+            accept_routes: _,
+            accept_dns: _,
+            shields_up: _,
+            ssh: _,
+            // --- DIRECTIVE: not a pref; bypasses or is exempt from the guard, NOT in mentions_any_pref ---
+            reset: _,        // its own guard-BYPASS path (caller skips the guard when set).
+            force_reauth: _, // re-key lifecycle action; excluded from mentions_any_pref + the guard.
+            // --- REGISTRATION-TIME: up-settable but never reverts (PATCH merge + honored only on a
+            //     fresh register), so it IS in mentions_any_pref (mentioning it makes up non-bare, Go-
+            //     faithfully checking the OTHER prefs) but is NOT a guard arm and NOT in --reset. ---
+            ephemeral: _,
+        } = crate::ipn::UpOptions::default();
+
+        // Verify the two non-obvious classifications actually hold (so the table can't lie):
+        // `force_reauth` is a directive → must NOT make a bare up look non-bare.
+        assert!(
+            !crate::ipn::UpOptions {
+                force_reauth: true,
+                ..Default::default()
+            }
+            .mentions_any_pref(),
+            "force_reauth must be excluded from mentions_any_pref (it's a directive, not a pref)"
+        );
+        // `reset` likewise.
+        assert!(
+            !crate::ipn::UpOptions {
+                reset: true,
+                ..Default::default()
+            }
+            .mentions_any_pref(),
+            "reset must be excluded from mentions_any_pref"
+        );
+        // `ephemeral` IS in mentions_any_pref (mentioning it makes up non-bare → guard checks others),
+        // but it is NOT a guard arm: setting only `ephemeral` non-default reports NO revert for it.
+        assert!(
+            crate::ipn::UpOptions {
+                ephemeral: Some(true),
+                ..Default::default()
+            }
+            .mentions_any_pref(),
+            "ephemeral must be in mentions_any_pref (Go checks the other prefs when it is named)"
+        );
+        let mut eph_prefs = Prefs {
+            want_running: true,
+            ephemeral: true, // the only non-default pref
+            ..Prefs::default()
+        };
+        // Mention an unrelated pref (hostname) to defeat the bare-up exemption; ephemeral must NOT
+        // appear as a revert (it has no guard arm by design — it never reverts under PATCH merge).
+        let reverts = check_accidental_reverts(
+            &eph_prefs,
+            &crate::ipn::UpOptions {
+                hostname: Some("h".into()),
+                ..Default::default()
+            },
+            true,
+        );
+        assert!(
+            !reverts.iter().any(|r| r.key == "ephemeral"),
+            "ephemeral must never be reported as a revert (registration-time, PATCH-merge-safe)"
+        );
+        // And --reset must leave ephemeral untouched (not in the reset set).
+        eph_prefs.reset_up_managed_to_default();
+        assert!(
+            eph_prefs.ephemeral,
+            "--reset must NOT clear ephemeral (it's not an up-managed policy pref)"
+        );
     }
 
     #[test]
