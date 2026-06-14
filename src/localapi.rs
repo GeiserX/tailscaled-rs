@@ -1550,6 +1550,77 @@ mod tests {
     }
 
     #[test]
+    fn syspolicy_request_response_round_trip() {
+        // The `syspolicy_list`/`syspolicy_reload` discriminants + the Policy(PolicyReport) reply must
+        // survive the wire (CLI ⇄ daemon agree only on this JSON). Pin both request verbs.
+        assert_eq!(
+            serde_json::to_string(&Request::SyspolicyList).unwrap(),
+            r#"{"cmd":"syspolicy_list"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::SyspolicyReload).unwrap(),
+            r#"{"cmd":"syspolicy_reload"}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<Request>(r#"{"cmd":"syspolicy_list"}"#).unwrap(),
+            Request::SyspolicyList
+        ));
+        assert!(matches!(
+            serde_json::from_str::<Request>(r#"{"cmd":"syspolicy_reload"}"#).unwrap(),
+            Request::SyspolicyReload
+        ));
+
+        // A populated snapshot round-trips with all four logical fields of each setting intact.
+        let report = PolicyReport {
+            scope: "Device".into(),
+            settings: vec![
+                PolicySetting {
+                    key: "ExitNodeID".into(),
+                    origin: "Platform (Device)".into(),
+                    value: Some("n123".into()),
+                    error: None,
+                },
+                PolicySetting {
+                    key: "AuthKey".into(),
+                    origin: "Platform (Device)".into(),
+                    value: None,
+                    error: Some("decrypt failed".into()),
+                },
+            ],
+        };
+        let resp = Response::Policy(report.clone());
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains(r#""kind":"policy""#), "discriminant: {json}");
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::Policy(r) => assert_eq!(r, report),
+            other => panic!("expected Policy, got {other:?}"),
+        }
+
+        // The empty snapshot (the normal Linux/Unix result) round-trips, and its empty `settings`
+        // collection is omitted from the wire (skip_serializing_if) while `scope` is present.
+        let empty = Response::Policy(PolicyReport {
+            scope: "Device".into(),
+            settings: vec![],
+        });
+        let empty_json = serde_json::to_string(&empty).unwrap();
+        assert!(
+            !empty_json.contains("settings"),
+            "empty settings must be omitted from the wire: {empty_json}"
+        );
+        assert!(
+            empty_json.contains(r#""scope":"Device""#),
+            "scope kept: {empty_json}"
+        );
+        match serde_json::from_str::<Response>(&empty_json).unwrap() {
+            Response::Policy(r) => {
+                assert_eq!(r.scope, "Device");
+                assert!(r.settings.is_empty());
+            }
+            other => panic!("expected Policy, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn cert_request_response_round_trip() {
         // The `cert` request (carrying the domain) and the `Cert { cert_pem, key_pem }` reply must
         // survive the wire intact — the CLI writes the PEMs the daemon issued, so neither may be
