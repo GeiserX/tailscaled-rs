@@ -793,12 +793,20 @@ pub struct StatusReport {
     /// This node's tailnet IPv6, once a netmap has been received (Go `Status.TailscaleIPs[1]`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub self_ipv6: Option<String>,
-    /// The stable id (resolved to the peer's display name where possible) of the exit node traffic is
-    /// **currently** egressing through, if any (Go `Status.ExitNodeStatus.ID`). `None` when no exit
+    /// The exit node traffic is **currently** egressing through, resolved to the peer's display name
+    /// where possible (friendlier than a raw id) for the human `tnet status` line. `None` when no exit
     /// node is engaged. Distinct from the *configured* `prefs.exit_node` selector: this is what is
     /// actually live (the route updater's fail-closed answer).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_exit_node: Option<String>,
+    /// The raw **StableNodeID** of the currently-active exit node — the value Go's `status --json`
+    /// puts in `ExitNodeStatus.ID` (a `tailcfg.StableNodeID`, e.g. `"nABC123"`, which keys the `Peer`
+    /// map), NOT a display name. Carried separately from [`active_exit_node`](StatusReport::active_exit_node)
+    /// (the resolved name, for the human line) so the `--json` shape stays Go-tooling-compatible: a
+    /// script doing `jq -r .ExitNodeStatus.ID` can match it against `Peer` keys. `None` when no exit
+    /// node is engaged. `#[serde(default)]` + skip keeps the wire backward-compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_exit_node_id: Option<String>,
     /// The tailnet's MagicDNS suffix (e.g. `tail0123.ts.net`), Go `Status.MagicDNSSuffix`. `None`
     /// before the first netmap.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1900,6 +1908,7 @@ mod tests {
             prefs: Default::default(),
             self_ipv6: None,
             active_exit_node: None,
+            active_exit_node_id: None,
             magic_dns_suffix: None,
             peers: vec![PeerReport {
                 name: "peer-b".to_string(),
@@ -1947,6 +1956,7 @@ mod tests {
             prefs: Default::default(),
             self_ipv6: None,
             active_exit_node: None,
+            active_exit_node_id: None,
             magic_dns_suffix: None,
             peers: vec![],
             version: None,
@@ -1984,6 +1994,7 @@ mod tests {
             prefs: Default::default(),
             self_ipv6: None,
             active_exit_node: None,
+            active_exit_node_id: None,
             magic_dns_suffix: None,
             peers: vec![],
             version: None,
@@ -2015,6 +2026,7 @@ mod tests {
             prefs: Default::default(),
             self_ipv6: None,
             active_exit_node: None,
+            active_exit_node_id: None,
             magic_dns_suffix: None,
             peers: vec![],
             version: None,
@@ -2043,6 +2055,7 @@ mod tests {
             prefs: Default::default(),
             self_ipv6: None,
             active_exit_node: None,
+            active_exit_node_id: None,
             magic_dns_suffix: None,
             peers: vec![],
             version: None,
@@ -2069,6 +2082,7 @@ mod tests {
             prefs: Default::default(),
             self_ipv6: None,
             active_exit_node: None,
+            active_exit_node_id: None,
             magic_dns_suffix: None,
             peers: vec![],
             version: None,
