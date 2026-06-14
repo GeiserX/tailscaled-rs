@@ -4900,7 +4900,7 @@ dependencies = [
 
 [[package]]
 name = "tailscaled-rs"
-version = "0.45.0"
+version = "0.46.0"
 dependencies = [
  "anyhow",
  "chrono",
