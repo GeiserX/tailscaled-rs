@@ -21,10 +21,14 @@
 //!   `localhost:1055`, not SOCKS auth). If `USERNAME/PASSWORD` is offered we still select no-auth;
 //!   if no-auth is not offered we reply "no acceptable methods" and close.
 //! - **Address types:** IPv4 (`0x01`), DOMAINNAME (`0x03`), IPv6 (`0x04`) — all three are rendered to
-//!   a host string and dialed via [`Device::connect_by_name`], which resolves a name to a tailnet
-//!   node and treats an IP literal as itself. This means the proxy reaches **tailnet** destinations
-//!   (the point of the feature); a non-tailnet host fails to resolve and is answered with a SOCKS
-//!   `HostUnreachable` reply, never a host-network dial (no split-tunnel leak).
+//!   a host string and dialed via [`Device::connect_by_name`], which resolves the string against the
+//!   netmap (a MagicDNS name → the peer's tailnet IP). NOTE: `connect_by_name` resolves by NAME and
+//!   does **not** parse a bare IP literal, so a `CONNECT 100.64.0.5:22` to a bare tailnet IP currently
+//!   fails `HostUnreachable` (a known gap vs Go, tracked in `tsd-httpfwd`'s sibling — use the peer's
+//!   MagicDNS name). Either way the proxy only ever reaches **tailnet** destinations; a non-tailnet
+//!   host (or an unresolvable name/IP) is answered with a SOCKS `HostUnreachable` reply and is
+//!   **never** dialed on the host network (no split-tunnel leak — the engine's dialer has no
+//!   host-socket egress path at all).
 //!
 //! Bound only when the operator passes `--socks5-server <addr>`; off by default (Go is the same).
 
@@ -66,6 +70,12 @@ mod atyp {
 /// Cap on a CONNECT to a busy server's connections — defense-in-depth against a local client opening
 /// unbounded overlay dials. Generous; the proxy is a local convenience, not a high-fanout service.
 const MAX_CONNECTIONS: usize = 256;
+/// Deadline for the SOCKS5 negotiation + CONNECT request + the overlay dial (everything BEFORE the
+/// splice). Without it a client that connects and sends nothing parks a handler task forever, holding
+/// a [`MAX_CONNECTIONS`] permit — 256 such idle connections wedge the proxy (a slowloris). The splice
+/// itself is deliberately NOT bounded (a proxied tunnel is legitimately long-lived). Matches the
+/// engine's own loopback SOCKS5 `HANDSHAKE_TIMEOUT`.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Run the SOCKS5 proxy on `listen_addr` until `shutdown` resolves. Binds a TCP listener and serves
 /// each accepted connection concurrently, dialing the engine over the overlay. Returns an error only
@@ -123,32 +133,44 @@ pub async fn serve(
 /// Handle one SOCKS5 client connection: method negotiation → CONNECT request → dial over the overlay
 /// → reply → bidirectional splice. Every failure path sends the correct SOCKS reply before closing.
 async fn handle_connection(mut client: TcpStream, backend: &Arc<Mutex<Backend>>) -> Result<()> {
-    negotiate_method(&mut client).await?;
-    let (host, port) = read_connect_request(&mut client).await?;
+    // Bound the negotiation + CONNECT request + overlay dial with a deadline so a client that never
+    // sends (or a hung dial) cannot park this task forever holding a connection permit (slowloris).
+    // The splice AFTER this returns is intentionally left unbounded — a real tunnel is long-lived.
+    // On timeout we just drop the connection (the client is misbehaving; no reply is owed).
+    let overlay = match tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+        negotiate_method(&mut client).await?;
+        let (host, port) = read_connect_request(&mut client).await?;
 
-    // Dial over the overlay using the engine's dialer (the same primitive `tnet nc` uses). An
-    // off-lock device handle, like the other diagnostics; if the node is down there is nothing to
-    // dial through, so reply GENERAL_FAILURE (the SOCKS analogue of "the proxy can't serve you").
-    let dev = { backend.lock().await.device_handle() };
-    let Some(dev) = dev else {
-        send_reply(&mut client, reply::GENERAL_FAILURE).await?;
-        bail!("SOCKS5 CONNECT {host}:{port} refused: node is not up");
+        // Dial over the overlay using the engine's dialer (the same primitive `tnet nc` uses). An
+        // off-lock device handle, like the other diagnostics; if the node is down there is nothing to
+        // dial through, so reply GENERAL_FAILURE (the SOCKS analogue of "the proxy can't serve you").
+        let dev = { backend.lock().await.device_handle() };
+        let Some(dev) = dev else {
+            send_reply(&mut client, reply::GENERAL_FAILURE).await?;
+            bail!("SOCKS5 CONNECT {host}:{port} refused: node is not up");
+        };
+        match dev.connect_by_name(&host, port).await {
+            Ok(overlay) => {
+                send_reply(&mut client, reply::SUCCEEDED).await?;
+                Ok::<_, anyhow::Error>(overlay)
+            }
+            Err(e) => {
+                // A name that doesn't resolve to a tailnet node, or a peer that won't accept: HOST
+                // UNREACHABLE. We never fall back to a host-network dial (that would be a split-tunnel
+                // leak — the whole point is to reach the TAILNET).
+                send_reply(&mut client, reply::HOST_UNREACHABLE).await?;
+                bail!("SOCKS5 CONNECT {host}:{port} failed: {e}");
+            }
+        }
+    })
+    .await
+    {
+        Ok(res) => res?,
+        Err(_) => bail!("SOCKS5 handshake/dial timed out after {HANDSHAKE_TIMEOUT:?}"),
     };
 
-    match dev.connect_by_name(&host, port).await {
-        Ok(overlay) => {
-            send_reply(&mut client, reply::SUCCEEDED).await?;
-            splice(client, overlay).await;
-            Ok(())
-        }
-        Err(e) => {
-            // A name that doesn't resolve to a tailnet node, or a peer that won't accept: HOST
-            // UNREACHABLE. We never fall back to a host-network dial (that would be a split-tunnel
-            // leak — the whole point is to reach the TAILNET).
-            send_reply(&mut client, reply::HOST_UNREACHABLE).await?;
-            bail!("SOCKS5 CONNECT {host}:{port} failed: {e}");
-        }
-    }
+    splice(client, overlay).await;
+    Ok(())
 }
 
 /// SOCKS5 method negotiation (RFC 1928 §3): read `VER NMETHODS METHODS...`, select no-auth. Replies

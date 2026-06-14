@@ -8,7 +8,10 @@
 //! netstack (no-TUN) daemon, but for clients that speak the HTTP-proxy protocol (`https_proxy=...`,
 //! `curl -x`, system "HTTP proxy" settings) rather than SOCKS5. Both reuse the engine's overlay
 //! dialer ([`Device::connect_by_name`]) — the exact primitive `tnet nc` uses — so a `CONNECT` to a
-//! tailnet `host:port` resolves a MagicDNS name (or IP literal) to a peer and splices the streams.
+//! tailnet `host:port` resolves the host against the netmap (a MagicDNS name → the peer's tailnet IP)
+//! and splices the streams. (Like SOCKS5, `connect_by_name` resolves by NAME, not a bare IP literal,
+//! and only ever reaches tailnet destinations — an unresolvable/non-tailnet host fails the dial and
+//! is **never** dialed on the host network: no split-tunnel leak.)
 //!
 //! ## Scope (faithful to Go's `httpProxyHandler`, with one honest reduction)
 //!
@@ -46,6 +49,11 @@ const MAX_CONNECTIONS: usize = 256;
 /// Max bytes for the request line + headers before we give up (a client that never sends a complete
 /// request head must not grow the buffer without bound).
 const MAX_HEAD_BYTES: usize = 64 * 1024;
+/// Deadline for reading the request head + the overlay dial (everything BEFORE the CONNECT splice).
+/// Without it a client that connects and sends nothing parks a handler task forever, holding a
+/// [`MAX_CONNECTIONS`] permit (slowloris). The splice itself is left unbounded (a tunnel is
+/// long-lived). Mirrors [`crate::socks5`]'s `HANDSHAKE_TIMEOUT` and the engine loopback proxy.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Run the outbound HTTP proxy on `listen_addr` until `shutdown` resolves. Errors only on the initial
 /// bind (a per-connection error is logged, never fatal) — matching Go, where a failed
@@ -99,13 +107,45 @@ pub async fn serve(
 /// Handle one HTTP-proxy client: read the request line, dispatch CONNECT (tunnel) vs everything else
 /// (the not-yet-implemented forward path → honest 501).
 async fn handle_connection(client: TcpStream, backend: &Arc<Mutex<Backend>>) -> Result<()> {
+    // Bound the request-head read + the overlay dial with a deadline so a client that never sends
+    // (or a hung dial) cannot park this task forever holding a connection permit (slowloris). The
+    // CONNECT splice runs AFTER this returns and is intentionally unbounded (a tunnel is long-lived).
+    let outcome =
+        match tokio::time::timeout(HANDSHAKE_TIMEOUT, handle_request_head(client, backend)).await {
+            Ok(res) => res?,
+            Err(_) => bail!("http-proxy: request head/dial timed out after {HANDSHAKE_TIMEOUT:?}"),
+        };
+    // CONNECT that dialed OK → splice (outside the timeout). Everything else already replied + closed.
+    if let HeadOutcome::Tunnel { client, overlay } = outcome {
+        splice(client, overlay).await;
+    }
+    Ok(())
+}
+
+/// What [`handle_request_head`] resolved to: either a CONNECT tunnel ready to splice, or `Done`
+/// (every error/501/400/500 path already wrote its reply and closed, so the caller does nothing).
+enum HeadOutcome {
+    Tunnel {
+        client: TcpStream,
+        overlay: tailscale::netstack::TcpStream,
+    },
+    Done,
+}
+
+/// Read the request line, dispatch CONNECT (parse + drain headers + dial + 200 reply) vs everything
+/// else (the not-yet-implemented forward path → honest 501). Returns a [`HeadOutcome`] so the caller
+/// can run the (unbounded) splice OUTSIDE this function's [`HANDSHAKE_TIMEOUT`].
+async fn handle_request_head(
+    client: TcpStream,
+    backend: &Arc<Mutex<Backend>>,
+) -> Result<HeadOutcome> {
     let mut reader = BufReader::new(client);
 
     // Read the request line: `METHOD TARGET HTTP/1.x`.
     let mut request_line = String::new();
     let n = read_line_capped(&mut reader, &mut request_line, MAX_HEAD_BYTES).await?;
     if n == 0 {
-        return Ok(()); // client closed before sending anything
+        return Ok(HeadOutcome::Done); // client closed before sending anything
     }
     let request_line = request_line.trim_end();
     let mut parts = request_line.split_whitespace();
@@ -130,19 +170,21 @@ async fn handle_connection(client: TcpStream, backend: &Arc<Mutex<Backend>>) -> 
         let mut client = reader.into_inner();
         client.write_all(resp.as_bytes()).await?;
         client.flush().await?;
+        // Replied + closing; no splice. (Logged at debug via the bail in the caller's spawn.)
         bail!(
             "http-proxy: non-CONNECT method {method:?} not implemented (forward path is tsd-httpfwd)"
         );
     }
 }
 
-/// The CONNECT tunnel: parse `host:port` from the target, drain the remaining request headers, dial
-/// over the overlay, reply `HTTP/1.1 200 OK` (Go's exact line), then bidirectionally splice.
+/// The CONNECT path: parse `host:port`, drain the remaining request headers, dial over the overlay,
+/// reply `HTTP/1.1 200 OK` (Go's exact line). On success returns [`HeadOutcome::Tunnel`] so the caller
+/// splices OUTSIDE the handshake timeout; every error path writes its reply and returns `Done`/errs.
 async fn handle_connect(
     mut reader: BufReader<TcpStream>,
     backend: &Arc<Mutex<Backend>>,
     target: &str,
-) -> Result<()> {
+) -> Result<HeadOutcome> {
     let Some((host, port)) = parse_authority(target) else {
         let mut client = reader.into_inner();
         write_simple_status(
@@ -173,8 +215,8 @@ async fn handle_connect(
             // Go writes exactly "HTTP/1.1 200 OK\r\n\r\n" (NOT "200 Connection established").
             client.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await?;
             client.flush().await?;
-            splice(client, overlay).await;
-            Ok(())
+            // Hand the spliceable pair back so the (unbounded) tunnel runs outside HANDSHAKE_TIMEOUT.
+            Ok(HeadOutcome::Tunnel { client, overlay })
         }
         Err(e) => {
             // Go: HTTP 500 + a `Tailscale-Connect-Error` header (never a host-network fallback).
