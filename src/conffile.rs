@@ -107,6 +107,12 @@ pub struct ConfigVAlpha {
     pub posture_checking: Option<bool>,
     /// Go `RunWebClient`. The web client is a documented non-goal of this fork.
     pub run_web_client: Option<bool>,
+    /// Go `Locked`: whether the config is locked from out-of-band `tnet set` mutations. NOT enforced
+    /// by this fork (`tnet set` remains free to mutate prefs), so it is surfaced via `warn_unmapped`
+    /// rather than silently dropped — an operator who set `"Locked": true` (expecting `set` to be
+    /// refused) must see that it is not honored. Parsing it explicitly (vs relying on the unknown-key
+    /// catch-all) keeps that honest-omission contract intact.
+    pub locked: Option<bool>,
 }
 
 /// Load and parse a `--config` file (Go `conffile.Load`).
@@ -168,6 +174,43 @@ impl Config {
     /// config file itself.
     pub fn apply_to_prefs(&self, prefs: &mut Prefs) -> Result<Option<SecretString>> {
         let c = &self.parsed;
+
+        // VALIDATE every field-level value BEFORE mutating `prefs` (all-or-nothing). The daemon's
+        // contract is "fail fast — never start half-configured"; a config that PARSES but carries a
+        // bad CIDR / control-url scheme / exit-node would otherwise be persisted and only caught
+        // (non-fatally) deep in the auto-start `build_config`, leaving an unbringable value on disk.
+        // Catching it here makes `--config` reject the file hard (like a bad version) and keeps the
+        // merge atomic — we bail before touching `prefs`. Re-uses the same parsers `build_config` uses
+        // so the two layers agree.
+        if let Some(url) = &c.server_url {
+            let parsed = url::Url::parse(url)
+                .with_context(|| format!("config: invalid ServerURL {url:?}"))?;
+            match parsed.scheme() {
+                "http" | "https" => {}
+                other => bail!("config: ServerURL {url:?} scheme {other:?} is not http or https"),
+            }
+        }
+        for s in &c.advertise_routes {
+            s.parse::<ipnet::IpNet>()
+                .with_context(|| format!("config: invalid advertise route {s:?}"))?;
+        }
+        if let Some(exit) = &c.exit_node {
+            // The engine's `ExitNodeSelector::FromStr` is infallible (a non-IP string → a Name that
+            // simply matches no peer), so a typo'd exit node would SILENTLY route nowhere. Reject the
+            // obvious-garbage forms here: empty/whitespace, and the `auto:` family (which the up/set
+            // path's `validate_exit_node_selector` also rejects — auto-exit-node selection is not
+            // wired). A bare IP or a plausible MagicDNS name is accepted (resolved against the netmap
+            // at bring-up, like Go).
+            let e = exit.trim();
+            if e.is_empty() {
+                bail!("config: exitNode must not be empty (omit the field to use no exit node)");
+            }
+            if e.starts_with("auto:") {
+                bail!(
+                    "config: exitNode {exit:?} uses the auto: form, which this build does not support"
+                );
+            }
+        }
 
         // `Enabled` is special: Go ALWAYS masks `WantRunning` in from a config (`mp.WantRunning =
         // !c.Enabled.EqualBool(false)`; `mp.WantRunningSet = mp.WantRunning || c.Enabled != ""`), so an
@@ -263,6 +306,12 @@ fn warn_unmapped(c: &ConfigVAlpha) {
     if c.run_web_client.is_some() {
         unmapped.push("RunWebClient");
     }
+    // `Locked: true` is an operator intent (refuse out-of-band `tnet set`) this fork does not enforce;
+    // warn so it is never silently ignored. `Locked: false`/absent is the default (no lock), so only
+    // a true value is worth surfacing.
+    if c.locked == Some(true) {
+        unmapped.push("Locked");
+    }
     if !unmapped.is_empty() {
         tracing::warn!(
             fields = ?unmapped,
@@ -325,6 +374,68 @@ mod tests {
         );
         // Every other unset field is left untouched (here accept_dns keeps its default).
         assert_eq!(p.accept_dns, before.accept_dns);
+    }
+
+    #[test]
+    fn apply_validates_fields_before_mutating_and_fails_hard() {
+        // A config that PARSES but carries a field-level invalid must fail `apply_to_prefs` HARD
+        // (the daemon's fail-fast / never-start-half-configured contract) AND leave prefs untouched
+        // (all-or-nothing — the validation runs before any mutation). `apply_to_prefs` returns a
+        // `Result` whose Ok carries a `SecretString` (no Debug), so match by hand.
+        let err = |json: &str| {
+            let c = cfg(json);
+            let mut p = Prefs::default();
+            let before = p.clone();
+            match c.apply_to_prefs(&mut p) {
+                Ok(_) => panic!("expected apply_to_prefs to reject {json}"),
+                Err(e) => {
+                    // All-or-nothing: a rejected config must not have mutated prefs.
+                    assert_eq!(
+                        p.want_running, before.want_running,
+                        "prefs must be untouched on a rejected config"
+                    );
+                    assert_eq!(p.control_url, before.control_url);
+                    assert_eq!(p.advertise_routes, before.advertise_routes);
+                    e.to_string()
+                }
+            }
+        };
+        // Bad control-url scheme.
+        let e = err(r#"{"version":"alpha0","ServerURL":"ftp://nope"}"#);
+        assert!(e.contains("ServerURL") && e.contains("scheme"), "{e}");
+        // Malformed ServerURL.
+        let e = err(r#"{"version":"alpha0","ServerURL":"not a url"}"#);
+        assert!(e.to_lowercase().contains("serverurl"), "{e}");
+        // Bad advertise route CIDR.
+        let e = err(r#"{"version":"alpha0","AdvertiseRoutes":["10.0.0.0/8","garbage"]}"#);
+        assert!(
+            e.contains("advertise route") && e.contains("garbage"),
+            "{e}"
+        );
+        // Empty exit node.
+        let e = err(r#"{"version":"alpha0","exitNode":"  "}"#);
+        assert!(e.contains("exitNode") && e.contains("empty"), "{e}");
+        // auto: exit node (not supported by this build).
+        let e = err(r#"{"version":"alpha0","exitNode":"auto:any"}"#);
+        assert!(e.contains("auto:"), "{e}");
+    }
+
+    #[test]
+    fn apply_accepts_valid_fields() {
+        // The valid forms of the above must apply cleanly (proves the guards aren't over-eager).
+        let c = cfg(r#"{"version":"alpha0","ServerURL":"https://hs.example.com",
+                "AdvertiseRoutes":["10.0.0.0/8","192.168.1.0/24"],"exitNode":"100.64.0.9"}"#);
+        let mut p = Prefs::default();
+        let key = c.apply_to_prefs(&mut p).unwrap();
+        assert!(key.is_none());
+        assert_eq!(p.control_url.as_deref(), Some("https://hs.example.com"));
+        assert_eq!(p.advertise_routes, vec!["10.0.0.0/8", "192.168.1.0/24"]);
+        assert_eq!(p.exit_node.as_deref(), Some("100.64.0.9"));
+        // A plausible MagicDNS name (non-IP, non-auto) is accepted too.
+        let c2 = cfg(r#"{"version":"alpha0","exitNode":"exit-node.tailnet.ts.net"}"#);
+        let mut p2 = Prefs::default();
+        assert!(c2.apply_to_prefs(&mut p2).is_ok());
+        assert_eq!(p2.exit_node.as_deref(), Some("exit-node.tailnet.ts.net"));
     }
 
     #[test]
