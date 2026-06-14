@@ -2,10 +2,14 @@
 
 This lists the changes the downstream daemon (`tailscaled-rs`) needs from the `tailscale-rs`
 library to unblock end-to-end features. Each ask is self-contained, additive, and
-backward-compatible. The daemon pins engine rev `f8192568` (`v0.33.0`); individual asks
+backward-compatible. The daemon pins engine rev `faf46b34` (`v0.35.8`); individual asks
 note the rev they were verified against (older "verified vs `e126bba`/v0.6.9" / `81446f88`/v0.28.2
-/ `6035651b`/v0.29.1 / `f3793636`/v0.31.0 / `575104b1`/v0.32.0 notes below predate the current pin and
-are kept as historical context — the SHIPPED markers reflect what the pin provides).
+/ `6035651b`/v0.29.1 / `f3793636`/v0.31.0 / `575104b1`/v0.32.0 / `f8192568`/v0.33.0 / `1694d208`/v0.34.2
+notes below predate the current pin and are kept as historical context — the SHIPPED markers reflect
+what the pin provides). Bumps since v0.33.0: → v0.34.2 (tka chokepoint, cap parity, taildrop
+length-verify) → v0.35.3 (control-runner unbounded mailbox, tka rotation-drop, tunnel/derp fixes) →
+v0.35.8 (netcheck hysteresis, dataplane ACL, magicsock STUN, derp wire keys, taildrop symlink-refuse) —
+all transparent (facade-internal, no daemon wiring), each clippy+test-verified.
 
 > **Pin bump 575104b1 (v0.32.0) → f8192568 (v0.33.0), 2026-06-13.** Clean bump — full gate green;
 > probe-compile clean (no breaking surface). **Completes the Tailnet Lock surface**: the engine now
@@ -359,15 +363,18 @@ ask #6 / the daemon's leak-safety invariant; this is specifically the ADVERTISE 
 
 ## 9. Document the live-set surface (engine bead `tsr-89s`)
 
-The daemon's `tnet set` (shipped v0.5.0) applies `exit_node` **live** via `Device::set_exit_node`
-(no reconnect) and **rebuilds** the device for every other pref (hostname / accept_routes /
-advertise_* / ssh), because the engine `Config` is immutable per-construction.
-
-**Ask (doc-only if the setters already exist):** publish the COMPLETE list of prefs the engine can
-change **live** on a running `Device` (no rebuild) vs those that require reconstruction. Today the
-daemon only knows `set_exit_node` is live; if `set_serve_config` / `listen_funnel` / others are also
-live, the daemon's `set` can widen its seamless fast-path instead of triggering a brief reconnect.
-No new engine code needed if the live setters already exist — just the contract.
+> ✅ **RESOLVED (current pin v0.35.8).** The engine now exposes — and the daemon's `tnet set` calls —
+> **six** in-place live setters (no reconnect): `Device::set_exit_node`, `set_hostname`,
+> `set_accept_routes`, `set_accept_dns`, `set_advertise_routes`, `set_advertise_exit_node`. The
+> remaining `set`-able prefs are rebuild-only because the engine has no live setter for them:
+> `shields_up` (immutable `Config.block_incoming`), `advertise_tags` (registration-time
+> `Config.requested_tags`), `ssh` (device-lifecycle task). The daemon's `SetOptions::needs_rebuild()`
+> encodes exactly this split and is now structurally drift-guarded by
+> `set_options_live_vs_rebuild_classification_no_silent_drift` (an exhaustive `SetOptions` destructure
+> forces every new field into a conscious Live/Rebuild decision at compile time). So the original ask
+> — "publish the complete live-vs-rebuild contract" — is satisfied; the contract lives in
+> `SetOptions::needs_rebuild`'s doc + that test. (Historical: at v0.5.0 only `set_exit_node` was live
+> and every other pref rebuilt; the v0.28.2 engine added the other five live setters.)
 
 ## 10. `block_incoming` / shields-up Config field (engine bead — to file)
 
