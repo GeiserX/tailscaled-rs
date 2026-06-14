@@ -1184,11 +1184,23 @@ impl Backend {
     /// `target` is validated as a profile id ([`profile::is_valid_profile_id`]) so it is always a safe
     /// single path component. Switching to the already-current profile is a no-op success.
     pub async fn switch_profile(&mut self, target: &str) -> Result<()> {
-        if !profile::is_valid_profile_id(target) {
-            return Err(anyhow!(
-                "invalid profile id {target:?} (use letters, digits, '-' or '_')"
-            ));
-        }
+        // Resolve `target` (a profile id OR a display name — Go's `switch` accepts either) to a
+        // canonical id BEFORE any teardown, so a no-match is rejected with the device untouched. An
+        // existing profile is matched by id or unique name; a syntactically-valid id that is NOT yet
+        // known falls through to the id path below (switching to a fresh id creates that profile).
+        let meta = profile::load_profiles_file(&self.state_dir).await;
+        let resolved = profile::resolve_target_to_id(target, &meta);
+        let target: &str = match &resolved {
+            Some(id) => id,
+            // No id/name match. If it is a syntactically valid id, treat it as a NEW profile id
+            // (create-on-switch); otherwise it is neither a known name nor a usable id — reject.
+            None if profile::is_valid_profile_id(target) => target,
+            None => {
+                return Err(anyhow!(
+                    "no profile matches {target:?} by id or name (ids: letters, digits, '-' or '_')"
+                ));
+            }
+        };
         if target == self.current_profile {
             return Ok(()); // already on it
         }
