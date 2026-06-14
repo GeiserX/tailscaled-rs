@@ -27,6 +27,7 @@ pub mod ipn;
 pub mod localapi;
 pub mod prefs;
 pub mod server;
+pub mod socks5;
 
 use std::path::PathBuf;
 

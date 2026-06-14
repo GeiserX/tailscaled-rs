@@ -64,6 +64,14 @@ struct Args {
     /// *running* engine needs an `ipn` `reload_prefs` primitive this crate does not yet own.)
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
+    /// Run a SOCKS5 proxy on `[host:]port` that dials **over the tailnet** (Go `tailscaled
+    /// --socks5-server`). A bare port (`1055`) binds `127.0.0.1:<port>`; pass an explicit address to
+    /// bind elsewhere (the proxy is UNAUTHENTICATED — the bind address is the security boundary, so it
+    /// defaults to loopback). CONNECT requests resolve a MagicDNS name or IP to a tailnet node and
+    /// splice over the overlay (the engine's dialer), so a netstack/no-TUN daemon can route an app's
+    /// traffic through the tailnet without root or a TUN device. Off unless given.
+    #[arg(long, value_name = "[HOST:]PORT")]
+    socks5_server: Option<String>,
 }
 
 /// Restore the default `SIGPIPE` disposition (terminate) before any output. The Rust runtime sets
@@ -156,6 +164,16 @@ async fn main() -> Result<()> {
         return Err(e.into());
     }
 
+    // Validate `--socks5-server` NOW (fail-fast, before any state work) so a bad listen address is a
+    // clear startup error rather than a deep bind failure later. `None` when the flag is absent.
+    let socks5_listen = match &args.socks5_server {
+        Some(addr) => Some(
+            tailscaled_rs::socks5::normalize_listen_addr(addr)
+                .context("invalid --socks5-server address")?,
+        ),
+        None => None,
+    };
+
     // The prefs path the backend persists to / loads from; SIGHUP re-reads it to re-evaluate intent.
     let prefs_path = state_dir.join("prefs.json");
 
@@ -211,8 +229,18 @@ async fn main() -> Result<()> {
         let server_backend = Arc::clone(&backend);
         let sighup_backend = Arc::clone(&backend);
         let sighup_prefs_path = prefs_path.clone();
+        // Optional SOCKS5 proxy (Go `--socks5-server`): a process-level listener that dials over the
+        // tailnet, sharing the same backend handle. Bound only when the flag is given; otherwise the
+        // arm is an inert `pending()` future that never fires, so the `select!` shape is uniform. The
+        // listen address was validated above (fail-fast), so this only fails on a real bind error —
+        // which, like Go, ends the daemon (a requested proxy that can't bind is a startup failure).
+        let socks5_backend = Arc::clone(&backend);
+        let socks5_addr = socks5_listen.clone();
         tokio::select! {
             r = tailscaled_rs::server::serve(&socket_path, server_backend, shutdown_signal()) => r,
+            // The SOCKS5 proxy arm: a bind/serve error ends the daemon (matches Go). When no
+            // `--socks5-server` was given, `run_optional_socks5` is `pending()` and never wins.
+            r = run_optional_socks5(socks5_addr, socks5_backend) => r,
             // `sighup_reload_loop` never returns; this arm only wins if it somehow does (it logs and
             // exits the loop only if installing the SIGHUP handler fails), in which case we keep
             // serving — losing reload is not a reason to tear the daemon down.
@@ -228,6 +256,23 @@ async fn main() -> Result<()> {
 
     backend.lock().await.shutdown().await;
     Ok(())
+}
+
+/// Run the SOCKS5 proxy if `--socks5-server` was given, else an inert future that never resolves.
+///
+/// Returning a uniform `Result` future lets `main`'s `select!` treat the proxy as a peer of `serve`:
+/// when configured, a bind/serve error ends the daemon (Go does the same — a requested proxy that
+/// can't bind is a startup failure); when not configured, this is `pending()` and the arm never wins.
+/// The proxy shares the backend handle and shuts down with the daemon (its own `shutdown_signal`).
+async fn run_optional_socks5(
+    listen: Option<String>,
+    backend: Arc<Mutex<tailscaled_rs::ipn::Backend>>,
+) -> anyhow::Result<()> {
+    match listen {
+        Some(addr) => tailscaled_rs::socks5::serve(&addr, backend, shutdown_signal()).await,
+        // No proxy requested: never resolve, so this `select!` arm stays dormant for the daemon's life.
+        None => std::future::pending().await,
+    }
 }
 
 /// Resolve when the process receives SIGINT or SIGTERM. **Deliberately not SIGHUP** — SIGHUP is a
