@@ -2486,6 +2486,7 @@ impl Backend {
             self_name: Option<String>,
             self_ipv6: Option<String>,
             active_exit_node: Option<String>,
+            active_exit_node_id: Option<String>,
             magic_dns_suffix: Option<String>,
             peers: Vec<PeerReport>,
         }
@@ -2497,6 +2498,7 @@ impl Backend {
             self_name,
             self_ipv6,
             active_exit_node,
+            active_exit_node_id,
             magic_dns_suffix,
             peers,
         } = match (state, self.device.as_ref()) {
@@ -2511,8 +2513,12 @@ impl Backend {
                             ),
                             None => (None, None, None),
                         };
-                        // Resolve the active-exit-node stable id → the peer's display name where we
-                        // can (friendlier than a raw id), falling back to the id (Go shows the id).
+                        // The raw StableNodeID of the active exit node — Go's `status --json`
+                        // `ExitNodeStatus.ID` (a StableNodeID that keys the `Peer` map), carried as-is.
+                        let active_exit_node_id =
+                            s.active_exit_node.as_ref().map(|id| id.0.clone());
+                        // Resolve the same id → the peer's display name where we can (friendlier than a
+                        // raw id, for the human `tnet status` line), falling back to the id.
                         let active_exit_node = s.active_exit_node.as_ref().map(|id| {
                             s.peers
                                 .iter()
@@ -2561,6 +2567,7 @@ impl Backend {
                             self_name,
                             self_ipv6,
                             active_exit_node,
+                            active_exit_node_id,
                             magic_dns_suffix,
                             peers,
                         }
@@ -2597,6 +2604,7 @@ impl Backend {
             prefs: self.prefs_view(),
             self_ipv6,
             active_exit_node,
+            active_exit_node_id,
             magic_dns_suffix,
             peers,
             // The daemon's own version (Go `Status.Version`) — the same crate version the `version`

@@ -2154,16 +2154,19 @@ async fn run_status(
             .await
             .with_context(|| format!("serving status --web on {listen}"));
     }
-    if watch {
-        return watch_status(socket)
-            .await
-            .with_context(|| format!("watching status at {}", socket.display()));
-    }
     let status_filter = StatusFilter {
         active_only: active,
         hide_peers: no_peers,
         hide_self: no_self,
     };
+    if watch {
+        // `--watch` honors `--json` and the `--active`/`--no-peers`/`--no-self` filters per frame,
+        // matching Go (`tailscale status --watch --json` streams JSON; the filters apply to each
+        // pushed snapshot). The filter is moved in (it is not used again on this path).
+        return watch_status(socket, json, status_filter)
+            .await
+            .with_context(|| format!("watching status at {}", socket.display()));
+    }
     let response = round_trip(socket, &Request::Status)
         .await
         .with_context(|| format!("talking to daemon at {}", socket.display()))?;
@@ -3015,8 +3018,10 @@ async fn run_ip(
             .iter()
             .find(|p| p.name == peer || p.ipv4 == peer)
         {
-            // Peers currently expose only an IPv4 in our PeerReport, so -6 yields nothing.
-            Some(p) => format_ip_filtered(Some(&p.ipv4), None, sel),
+            // Project both families so `ip -6 <peer>` / a bare `ip <peer>` show the peer's IPv6
+            // (Go prints `peer.TailscaleIPs` filtered by family). `PeerReport.ipv6` is populated by
+            // the daemon's status projection when the peer has one.
+            Some(p) => format_ip_filtered(Some(&p.ipv4), p.ipv6.as_deref(), sel),
             None => {
                 eprintln!("no peer matching {peer:?} in the current netmap");
                 std::process::exit(1);
@@ -5179,10 +5184,23 @@ fn format_status_json(s: &tailscaled_rs::localapi::StatusReport) -> Result<Strin
     if let Some(suffix) = &s.magic_dns_suffix {
         root.insert("MagicDNSSuffix".into(), json!(suffix));
     }
-    // ExitNodeStatus: Go nests the active exit node under an object keyed by its ID. We carry the
-    // resolved name/id, so emit the same shape (just the ID field) when one is engaged.
-    if let Some(active) = &s.active_exit_node {
-        root.insert("ExitNodeStatus".into(), json!({ "ID": active }));
+    // ExitNodeStatus: Go's `ExitNodeStatus.ID` is a `tailcfg.StableNodeID` (it keys the `Peer` map),
+    // NOT a display name — so emit the raw stable id there for Go-tooling compatibility (a script
+    // doing `jq -r .ExitNodeStatus.ID` matches it against a `Peer` key). The friendlier resolved name
+    // is for the human status line; we also surface it as a non-Go `Name` field for convenience. Fall
+    // back to the resolved name only if an older daemon sent no id.
+    if s.active_exit_node_id.is_some() || s.active_exit_node.is_some() {
+        let id = s
+            .active_exit_node_id
+            .as_deref()
+            .or(s.active_exit_node.as_deref())
+            .unwrap_or("");
+        let mut ens = serde_json::Map::new();
+        ens.insert("ID".into(), json!(id));
+        if let Some(name) = &s.active_exit_node {
+            ens.insert("Name".into(), json!(name));
+        }
+        root.insert("ExitNodeStatus".into(), Value::Object(ens));
     }
     root.insert("Peer".into(), Value::Object(peers));
 
@@ -5193,7 +5211,7 @@ fn format_status_json(s: &tailscaled_rs::localapi::StatusReport) -> Result<Strin
 /// initial snapshot, then one per state transition) until the connection ends or the user
 /// interrupts (Ctrl-C). The daemon closes the stream when the device is torn down. A `---` rule
 /// separates successive snapshots so transitions are visually distinct.
-async fn watch_status(socket: &std::path::Path) -> Result<()> {
+async fn watch_status(socket: &std::path::Path, json: bool, filter: StatusFilter) -> Result<()> {
     let stream = UnixStream::connect(socket)
         .await
         .context("connect (is tailnetd running?)")?;
@@ -5222,11 +5240,26 @@ async fn watch_status(socket: &std::path::Path) -> Result<()> {
             .with_context(|| format!("parsing daemon stream line: {trimmed:?}"))?
         {
             Response::Status(s) => {
-                if !first {
-                    println!("---");
+                // Honor the same client-side filters as the one-shot path (per pushed frame).
+                let s = filter.apply(s);
+                if json {
+                    // Stream one JSON object per snapshot (no `---` separator — a JSON consumer
+                    // reads object-by-object). On a (practically impossible) serialize error, surface
+                    // it and stop rather than emit a half object into the stream.
+                    match format_status_json(&s) {
+                        Ok(out) => print!("{out}"),
+                        Err(e) => {
+                            eprintln!("error: serializing status: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    if !first {
+                        println!("---");
+                    }
+                    print_status(&s);
                 }
                 first = false;
-                print_status(&s);
             }
             Response::Error { message } => {
                 eprintln!("error: {message}");
@@ -9084,6 +9117,7 @@ mod tests {
             prefs: PrefsView::default(),
             self_ipv6: None,
             active_exit_node: None,
+            active_exit_node_id: None,
             magic_dns_suffix: None,
             peers: vec![
                 PeerReport {
@@ -9170,6 +9204,7 @@ mod tests {
             prefs: PrefsView::default(),
             self_ipv6: Some("fd7a:115c:a1e0::1".to_string()),
             active_exit_node: Some("peer-b".to_string()),
+            active_exit_node_id: Some("nABC123".to_string()),
             magic_dns_suffix: Some("tail0123.ts.net".to_string()),
             peers: vec![
                 PeerReport {
@@ -9190,7 +9225,9 @@ mod tests {
                     stable_id: String::new(), // missing id → keyed by name (fallback)
                     online: Some(false),
                     relay: Some("nyc".to_string()),
-                    last_seen: Some("2026-06-11 05:19:14 UTC".to_string()),
+                    // RFC3339, the form the daemon actually emits (`to_rfc3339()`), NOT the chrono
+                    // Display form (`2026-06-11 05:19:14 UTC`) which is not RFC3339.
+                    last_seen: Some("2026-06-11T05:19:14+00:00".to_string()),
                     ..Default::default()
                 },
             ],
@@ -9210,7 +9247,15 @@ mod tests {
             serde_json::json!(["100.70.22.12", "fd7a:115c:a1e0::1"])
         );
         assert_eq!(v["MagicDNSSuffix"], serde_json::json!("tail0123.ts.net"));
-        assert_eq!(v["ExitNodeStatus"]["ID"], serde_json::json!("peer-b"));
+        // ExitNodeStatus.ID is the StableNodeID (Go's `tailcfg.StableNodeID` that keys the Peer map),
+        // NOT the display name — so it matches the `Peer` key `nABC123` (asserted below). The resolved
+        // name rides the non-Go `Name` field.
+        assert_eq!(v["ExitNodeStatus"]["ID"], serde_json::json!("nABC123"));
+        assert_eq!(v["ExitNodeStatus"]["Name"], serde_json::json!("peer-b"));
+        assert!(
+            v["Peer"].get("nABC123").is_some(),
+            "ExitNodeStatus.ID must be a key in the Peer map (Go-tooling compatibility)"
+        );
         // Version (Go `Status.Version`) + TUN (Go `Status.TUN`) now surfaced; HaveNodeKey true once
         // past the pre-login states (this report is Running). All Go-cased field names.
         assert_eq!(v["Version"], serde_json::json!("0.36.0"));
@@ -9249,7 +9294,7 @@ mod tests {
         assert_eq!(v["Peer"]["peer-c"]["Relay"], serde_json::json!("nyc"));
         assert_eq!(
             v["Peer"]["peer-c"]["LastSeen"],
-            serde_json::json!("2026-06-11 05:19:14 UTC")
+            serde_json::json!("2026-06-11T05:19:14+00:00")
         );
     }
 
