@@ -1798,26 +1798,36 @@ impl Backend {
         // REPLACE *contract* by refusing to silently drop an unmentioned non-default pref. `--reset`
         // is exactly the operator opting out of that guard. Lifecycle/registration prefs
         // (`want_running`/`logged_out`/`ephemeral`) are deliberately preserved by the reset helper.
-        if opts.reset {
-            self.prefs.reset_up_managed_to_default();
-        }
-
         // `--force-reauth` (Go `tailscale up --force-reauth`): discard the persisted node key BEFORE
         // we persist prefs or build the engine, so the rebuilt device cannot resume the old
         // registration and must register FRESH (an interactive up then reaches `NeedsLogin` and the
         // CLI surfaces the new auth URL — `build_config`'s key load re-initializes a fresh key, so
         // the on-disk *content* changes; the file is not left absent). Done after `stop_device` (the
         // device that held the old key is gone) and before `persist_prefs`/`build_config` (so a wipe
-        // failure aborts the up before anything is persisted — a combined `--reset` has by now mutated
-        // in-memory prefs, but nothing has been written to disk and the live device is already down).
+        // failure aborts the up before anything is persisted — the live device is already down).
         // Unlike `logout`, this keeps the node's up-intent — `want_running`/`logged_out` are set to up
         // below; force-reauth only re-keys, it does not log out. A wipe failure is FATAL here for the
         // same fail-closed reason as in `logout`: proceeding would bring the node back up on the very
         // key we meant to rotate.
+        //
+        // ORDER MATTERS: the fallible `discard_node_key` runs BEFORE the in-memory `--reset` mutation
+        // below, so a wipe failure aborts (`?`) with `self.prefs` STILL UNTOUCHED — never leaving the
+        // live backend's in-memory prefs reset-to-default while nothing was persisted (which a
+        // same-process retry / a later `set` would then wrongly read or persist). With this ordering,
+        // an aborted `up --reset --force-reauth` is fully no-op on prefs, matching the on-disk state.
         if opts.force_reauth {
             self.discard_node_key()
                 .await
                 .context("up --force-reauth: bring-up aborted before anything was persisted")?;
+        }
+
+        // `--reset`: reset every up-managed pref this command does not mention back to its default
+        // before applying the named overrides — the operator opting out of the accidental-revert
+        // guard (Go `tailscale up --reset`). Lifecycle/registration prefs
+        // (`want_running`/`logged_out`/`ephemeral`) are deliberately preserved by the reset helper.
+        // Placed AFTER the force-reauth wipe (above) so a wipe failure can't leave prefs half-reset.
+        if opts.reset {
+            self.prefs.reset_up_managed_to_default();
         }
 
         if let Some(h) = opts.hostname {
@@ -3420,6 +3430,61 @@ mod tests {
         assert!(
             !tokio::fs::try_exists(dir.join("prefs.json")).await.unwrap(),
             "a wipe-failed force-reauth must not have persisted prefs.json"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn begin_up_reset_force_reauth_wipe_failure_leaves_in_memory_prefs_untouched() {
+        // The fallible `discard_node_key` runs BEFORE the in-memory `--reset` mutation, so a combined
+        // `up --reset --force-reauth` whose key wipe fails must abort with `self.prefs` STILL the
+        // pre-command values — never half-reset in memory while nothing was persisted (which a
+        // same-process retry, a `status` read, or a later bare `set` would then wrongly observe or
+        // persist). Same un-removable-key trick as the plain wipe-failure test.
+        let dir = std::env::temp_dir().join(format!(
+            "tailnetd-reset-reauth-wipefail-{}",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+        tokio::fs::create_dir_all(&be.key_path).await.unwrap();
+        tokio::fs::write(be.key_path.join("blocker"), b"x")
+            .await
+            .unwrap();
+
+        // A non-default up-managed pref that `reset_up_managed_to_default` would clear to None.
+        be.prefs.hostname = Some("preset-host".to_string());
+
+        let result = be
+            .begin_up(
+                UpOptions {
+                    reset: true,
+                    force_reauth: true,
+                    ..UpOptions::default()
+                },
+                None,
+            )
+            .await;
+        if result.is_ok() {
+            panic!("a `--reset --force-reauth` whose key wipe fails must make begin_up fail");
+        }
+        // The load-bearing invariant: the reset never ran (the wipe aborted first), so the in-memory
+        // pref is untouched — matching the on-disk state (nothing persisted).
+        assert_eq!(
+            be.prefs.hostname.as_deref(),
+            Some("preset-host"),
+            "a wipe-failed `--reset --force-reauth` must NOT have reset in-memory prefs (the fallible \
+             wipe precedes the reset mutation, so an abort leaves prefs fully untouched)"
+        );
+        assert!(
+            !be.prefs.want_running,
+            "a wipe-failed `--reset --force-reauth` must NOT have flipped want_running"
+        );
+        assert!(
+            !tokio::fs::try_exists(dir.join("prefs.json")).await.unwrap(),
+            "a wipe-failed `--reset --force-reauth` must not have persisted prefs.json"
         );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
