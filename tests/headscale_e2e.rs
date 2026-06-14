@@ -534,3 +534,109 @@ async fn headscale_set_live_vs_rebuild_dispatch() {
          reconnect"
     );
 }
+
+/// Live read-only-diagnostics test: bring a node up against headscale, then exercise the read-only
+/// diagnostic surface against the REAL running node + netmap — `dns status`, `netcheck`, `syspolicy
+/// list`, and `status` (the data behind `tnet ip`). This is the live counterpart to the unit tests:
+/// it proves each diagnostic returns a well-shaped, non-error response when driven against a real
+/// engine (not just that the wire types round-trip). Same `#[ignore]` + env gate as the join test.
+#[tokio::test]
+#[ignore = "requires a running headscale (test-support/headscale) + TAILNETD_HS_URL/TAILNETD_HS_AUTHKEY; see docs/TESTING.md"]
+async fn headscale_readonly_diagnostics_on_running_node() {
+    let (hs_url, hs_authkey) = match (
+        std::env::var("TAILNETD_HS_URL"),
+        std::env::var("TAILNETD_HS_AUTHKEY"),
+    ) {
+        (Ok(u), Ok(k)) if !u.is_empty() && !k.is_empty() => (u, k),
+        _ => {
+            eprintln!(
+                "SKIP headscale_readonly_diagnostics_on_running_node: set TAILNETD_HS_URL and \
+                 TAILNETD_HS_AUTHKEY to run it (see docs/TESTING.md)"
+            );
+            return;
+        }
+    };
+    if std::env::var("TS_RS_EXPERIMENT").as_deref() != Ok("this_is_unstable_software") {
+        eprintln!("SKIP headscale_readonly_diagnostics_on_running_node: export TS_RS_EXPERIMENT");
+        return;
+    }
+
+    let state_dir = unique_state_dir();
+    let _ = tokio::fs::remove_dir_all(&state_dir).await;
+    tokio::fs::create_dir_all(&state_dir)
+        .await
+        .expect("state dir");
+    let mut backend = Backend::load(&state_dir).await.expect("Backend::load");
+
+    let authkey = secrecy::SecretString::from(hs_authkey);
+    backend
+        .up(
+            Some(authkey),
+            tailscaled_rs::ipn::UpOptions {
+                hostname: Some("tailscaled-rs-hs-diag".to_string()),
+                control_url: Some(hs_url.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("up() against headscale {hs_url} failed: {e:?}"));
+
+    // Wait for Running + the self address (the netmap-arrived signal — see the join test note).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut self_ipv4: Option<String> = None;
+    while tokio::time::Instant::now() < deadline {
+        let report = backend.status().await;
+        if report.state == "Running" && report.self_ipv4.is_some() {
+            self_ipv4 = report.self_ipv4.clone();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // Drive each read-only diagnostic against the live node. Capture outcomes, then ALWAYS tear down
+    // before asserting (so a failure can't leak a registered node or temp dir).
+    use tailscaled_rs::localapi::Response;
+    let dns = match backend.device_handle() {
+        Some(dev) => Some(Backend::dns_status(&dev).await),
+        None => None,
+    };
+    let netcheck = match backend.device_handle() {
+        Some(dev) => Some(Backend::netcheck(&dev).await),
+        None => None,
+    };
+    // syspolicy is node-up-independent (static, no device) — exercise it on the running node anyway.
+    let policy = Backend::syspolicy_list();
+    // `tnet ip` reads the same self address we already polled.
+    let ip = self_ipv4.clone();
+
+    backend.down().await.expect("down()");
+    backend.shutdown().await;
+    let _ = tokio::fs::remove_dir_all(&state_dir).await;
+
+    // `dns status`: a Running node must answer with a DnsStatus report (not an Error / not down).
+    assert!(
+        matches!(dns, Some(Response::DnsStatus(_))),
+        "dns status on a Running node should return a DnsStatus report, got {dns:?}"
+    );
+    // `netcheck`: a Running node must answer with a Netcheck report (DERP-region latency view).
+    assert!(
+        matches!(netcheck, Some(Response::Netcheck(_))),
+        "netcheck on a Running node should return a Netcheck report, got {netcheck:?}"
+    );
+    // `syspolicy list`: always a Policy report; on this (Linux) host it is empty (no store).
+    match policy {
+        Response::Policy(ref p) => assert!(
+            p.settings.is_empty(),
+            "no policy store is registered on this platform; settings must be empty, got {:?}",
+            p.settings
+        ),
+        other => panic!("syspolicy list should return a Policy report, got {other:?}"),
+    }
+    // `ip`: a Running node must have a self tailnet IPv4 from the pool.
+    let ip =
+        ip.expect("a Running node must report a self tailnet IPv4 (the data behind `tnet ip`)");
+    assert!(
+        ip.parse::<std::net::Ipv4Addr>().is_ok(),
+        "self address {ip:?} should be a valid IPv4 from the tailnet pool"
+    );
+}
