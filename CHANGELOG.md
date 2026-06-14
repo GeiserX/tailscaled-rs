@@ -25,6 +25,20 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.47.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.46.0...v0.47.0) (2026-06-14)
+
+
+### Features
+
+* **daemon:** outbound HTTP proxy over the tailnet (--outbound-http-proxy-listen) ([#191](https://github.com/GeiserX/tailscaled-rs/issues/191)) ([848c1ca](https://github.com/GeiserX/tailscaled-rs/commit/848c1ca6f51f083dd2064710f9925f805fbaf496))
+* **daemon:** SOCKS5 proxy that dials over the tailnet (--socks5-server) ([#189](https://github.com/GeiserX/tailscaled-rs/issues/189)) ([3fa605b](https://github.com/GeiserX/tailscaled-rs/commit/3fa605baf9c463f99d279083e4b2f6aad6ecda21))
+* **debug:** add `tnet debug env` and `tnet debug metrics` (Go parity) ([#192](https://github.com/GeiserX/tailscaled-rs/issues/192)) ([e341b99](https://github.com/GeiserX/tailscaled-rs/commit/e341b99924379cb626fdbca87a23ec834ec3651f))
+
+
+### Bug Fixes
+
+* **proxy:** bound the SOCKS5/HTTP handshake + dial with a timeout (slowloris) ([#193](https://github.com/GeiserX/tailscaled-rs/issues/193)) ([c64402e](https://github.com/GeiserX/tailscaled-rs/commit/c64402eb7c4b831beb3169f6bf062a2251140e32))
+
 ## [0.46.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.45.0...v0.46.0) (2026-06-14)
 
 
