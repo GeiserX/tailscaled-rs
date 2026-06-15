@@ -551,6 +551,10 @@ pub(crate) fn peer_report_from_status_node(p: tailscale::StatusNode) -> PeerRepo
         // Direct endpoint vs DERP relay (Go CurAddr/Relay; mutually exclusive).
         cur_addr: p.cur_addr.map(|a| a.to_string()),
         relay: p.relay,
+        // The peer's advertised SSH host keys (known_hosts format) → Go PeerStatus.SSH_HostKeys.
+        // Carried so `tnet ssh` can pin the host key; empty when control advertised none (the engine
+        // never fabricates them).
+        ssh_host_keys: p.ssh_host_keys,
     }
 }
 
