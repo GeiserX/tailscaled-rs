@@ -457,12 +457,21 @@ enum Command {
         /// against the current netmap (the peer set `status` reports).
         #[arg(value_name = "PEER")]
         peer: Option<String>,
+        /// Assert that one of the node's IPs matches this address (Go `tailscale ip --assert`).
+        /// Prints nothing and exits 0 on a match; exits 1 if the node does not hold it. For scripts
+        /// that want to verify the expected tailnet IP. Mutually exclusive with a peer argument.
+        #[arg(long, value_name = "IP", conflicts_with = "peer")]
+        assert: Option<String>,
     },
     /// Show which tailnet node owns an IP address.
     Whois {
         /// The tailnet IP to resolve to its owning node.
         #[arg(value_name = "IP")]
         ip: String,
+        /// Emit the result as JSON (Go `tailscale whois --json`) — the raw `WhoisReport` object, for
+        /// scripting, instead of the human table.
+        #[arg(long)]
+        json: bool,
     },
     /// Fetch an OIDC id-token for this node, scoped to an audience (Go `tailscale id-token <aud>`).
     /// Control mints a signed JWT identifying this machine; prints the raw token. Requires the node
@@ -1595,8 +1604,9 @@ async fn main() -> Result<()> {
             v6,
             first,
             peer,
-        } => run_ip(&socket, v4, v6, first, peer).await,
-        Command::Whois { ip } => run_whois(&socket, ip).await,
+            assert,
+        } => run_ip(&socket, v4, v6, first, peer, assert).await,
+        Command::Whois { ip, json } => run_whois(&socket, ip, json).await,
         Command::IdToken { audience } => {
             dispatch_simple(&socket, Request::IdToken { audience }).await
         }
@@ -3001,8 +3011,38 @@ async fn run_ip(
     v6: bool,
     first: bool,
     peer: Option<String>,
+    assert: Option<String>,
 ) -> Result<()> {
     let sel = IpSelect { v4, v6, first };
+    // `--assert <ip>`: verify one of this node's own IPs matches; exit 0 on a match, 1 otherwise.
+    // Prints nothing on success (Go's behavior) — it is a script predicate, not a display. Compares
+    // by parsed `IpAddr` so `100.64.0.1` and `100.064.000.001`-style spellings normalize.
+    if let Some(want) = assert {
+        let want_ip: std::net::IpAddr = want
+            .parse()
+            .with_context(|| format!("--assert: {want:?} is not a valid IP address"))?;
+        let (ipv4, ipv6) = match round_trip(socket, &Request::Ip).await {
+            Ok(Response::Ip { ipv4, ipv6 }) => (ipv4, ipv6),
+            Ok(Response::Error { message }) => {
+                eprintln!("error: {message}");
+                std::process::exit(1);
+            }
+            Ok(other) => anyhow::bail!("unexpected response to ip request: {other:?}"),
+            Err(e) => {
+                return Err(e).with_context(|| format!("querying ip at {}", socket.display()));
+            }
+        };
+        let matches = [ipv4.as_deref(), ipv6.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter_map(|s| s.parse::<std::net::IpAddr>().ok())
+            .any(|ip| ip == want_ip);
+        if matches {
+            return Ok(());
+        }
+        eprintln!("assertion failed: this node does not hold {want_ip}");
+        std::process::exit(1);
+    }
     let out = if let Some(peer) = peer {
         // Peer address: resolve the named peer against the status peer set (by MagicDNS name
         // or tailnet IP). We fetch Status (not whois, which is IP-only) so a NAME also works.
@@ -3608,13 +3648,22 @@ async fn run_exit_node_list(socket: &std::path::Path) -> Result<()> {
 /// owner. The node name is control-supplied text, so it is run through `sanitize_for_terminal` inside
 /// the formatter before printing. The queried `ip` is owned here (it is the not-found line's
 /// subject), so the render needs no read-back from the request.
-async fn run_whois(socket: &std::path::Path, ip: String) -> Result<()> {
+async fn run_whois(socket: &std::path::Path, ip: String, json: bool) -> Result<()> {
     let response = round_trip(socket, &Request::Whois { ip: ip.clone() })
         .await
         .with_context(|| format!("talking to daemon at {}", socket.display()))?;
     match response {
         Response::Whois(w) => {
-            print!("{}", format_whois(&w, &ip));
+            if json {
+                // Go `whois --json`: the raw report object (escape-safe via serde). A WhoisReport is a
+                // plain serde struct, so this cannot fail in practice; fall back to `{}` over a panic.
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&w).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                print!("{}", format_whois(&w, &ip));
+            }
             Ok(())
         }
         Response::Error { message } => {
@@ -9498,6 +9547,37 @@ mod tests {
             Cli::try_parse_from(["tnet", "id-token"]).is_err(),
             "audience is required"
         );
+    }
+
+    #[test]
+    fn ip_assert_and_whois_json_flags_parse() {
+        // `tnet ip --assert <ip>` parses into Command::Ip { assert: Some(..) }; and --assert conflicts
+        // with a peer positional (Go: --assert is self-only).
+        match Cli::try_parse_from(["tnet", "ip", "--assert", "100.64.0.1"])
+            .expect("parses")
+            .command
+        {
+            Command::Ip { assert, peer, .. } => {
+                assert_eq!(assert.as_deref(), Some("100.64.0.1"));
+                assert!(peer.is_none());
+            }
+            _ => panic!("expected Command::Ip"),
+        }
+        assert!(
+            Cli::try_parse_from(["tnet", "ip", "--assert", "100.64.0.1", "peer-b"]).is_err(),
+            "--assert must conflict with a peer argument"
+        );
+        // `tnet whois <ip> --json` parses into Command::Whois { json: true }.
+        match Cli::try_parse_from(["tnet", "whois", "100.64.0.9", "--json"])
+            .expect("parses")
+            .command
+        {
+            Command::Whois { ip, json } => {
+                assert_eq!(ip, "100.64.0.9");
+                assert!(json);
+            }
+            _ => panic!("expected Command::Whois"),
+        }
     }
 
     #[test]
