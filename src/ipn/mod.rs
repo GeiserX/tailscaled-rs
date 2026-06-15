@@ -740,6 +740,121 @@ pub async fn drive_set(
     }
 }
 
+/// Drive a `reload-config` against a shared [`Backend`]: re-read the `--config` file and adopt the
+/// changed fields into the running node, **without** holding the backend lock across the multi-second
+/// `Device::new` handshake — the concurrency-safe `reload-config` for the LocalAPI server (Go
+/// `tailscaled`'s `reload-config` route → `LocalBackend.ReloadConfig`).
+///
+/// It is the reload analogue of [`drive_set`]'s [`SetAction::Rebuild`] path, sharing the SAME
+/// three-phase lock discipline verbatim:
+///
+/// 1. **Brief lock** — [`reload_config`](Backend::reload_config) re-reads + re-parses the config file,
+///    merges it over the prefs, persists, and decides the [`ReloadAction`]. A malformed / unsupported
+///    file fails HERE with the running node untouched (the fail-fast contract; nothing is left
+///    half-applied).
+/// 2. **[`ReloadAction::PersistedOnly`]** (node down) — there is no engine to reconcile; persisting the
+///    merged prefs was the whole job (they apply on the next `up`/auto-start). Returns immediately.
+/// 3. **[`ReloadAction::BringDown`]** (node up, reloaded `Enabled:false`) — Go's config reload always
+///    re-applies `WantRunning`, so a reloaded `Enabled:false` means "stop". `apply_config` already
+///    persisted `want_running=false`; this calls [`down`](Backend::down) to tear the engine down to
+///    match (a teardown, no off-lock build).
+/// 4. **[`ReloadAction::Rebuild`]** (node up, reloaded config keeps it up) — the engine `Config` is
+///    immutable, so the only way to adopt the changed prefs on a running node is to **rebuild the
+///    device** from the now-updated prefs. This reuses the exact [`begin_up`](Backend::begin_up) →
+///    [`build_device`] → [`finish_up`](Backend::finish_up) machinery as `drive_up`/`drive_set`'s
+///    rebuild — same off-lock handshake, same generation-supersede guard, same off-lock orphan settle.
+///    **CAVEAT — this is a brief reconnect** (the overlay drops and re-registers from the persisted node
+///    key, then re-converges), identical to a rebuild-only `set`. **No `authkey` is involved** (a reload
+///    is not a re-auth; the rebuild resumes from the persisted node key — see
+///    [`reload_config`](Backend::reload_config)).
+///
+/// **`want_running` IS lifecycle-bearing on a reload** (unlike a `set`): Go's `ConfigVAlpha.ToPrefs`
+/// re-applies `WantRunning` on every reload (`WantRunningSet` is effectively always set), so a reloaded
+/// `Enabled:false` stops a running node ([`ReloadAction::BringDown`]) and an `Enabled`-less/`true`
+/// reload keeps/sets up-intent. A reload on a DOWN node does not originate a connection mid-reload
+/// (it persists up-intent that the next auto-start/`up` acts on) — so a reload never *surprise-starts*
+/// a stopped node from the reload call itself, but it can *stop* a running one.
+///
+/// Mirrors `drive_set`'s rebuild phasing precisely: brief lock for `reload_config` (apply + persist +
+/// decide); on a rebuild, a brief lock to PREFLIGHT the rebuilt config (so a bad value never drops a
+/// healthy tunnel); a brief lock for `begin_up`; the lock is **dropped** for the slow `build_device`;
+/// taken briefly again for `finish_up`; then dropped to settle any superseded orphan off-lock. A
+/// concurrent `status`/`down`/`up` is never blocked behind the handshake, and a `down`/`up` that lands
+/// mid-rebuild correctly supersedes it (the rebuilt device is discarded).
+pub async fn drive_reload_config(
+    backend: &std::sync::Arc<tokio::sync::Mutex<Backend>>,
+) -> Result<()> {
+    // Phase 1: brief lock — re-read the config, merge + persist, and decide the reconcile action.
+    let action = {
+        let mut be = backend.lock().await;
+        be.reload_config().await
+    }?;
+
+    match action {
+        // Node down: persisting the merged prefs was the whole job; they apply on the next `up`.
+        ReloadAction::PersistedOnly => return Ok(()),
+        // Node up, reloaded `Enabled:false` → tear the engine down to match the already-persisted
+        // `want_running=false` (Go applies a reloaded `Enabled:false`). `down` does `stop_device` +
+        // bump_generation (so an in-flight bring-up is superseded) + re-persists `want_running=false`
+        // (idempotent — `apply_config` already set it). No off-lock build needed for a teardown.
+        ReloadAction::BringDown => {
+            let mut be = backend.lock().await;
+            return be.down().await;
+        }
+        // Node up, reloaded config keeps it up → fall through to the rebuild handshake below.
+        ReloadAction::Rebuild => {}
+    }
+
+    // Node up → rebuild from the now-updated prefs, reusing the begin_up/build_device/finish_up
+    // off-lock handshake exactly like `drive_set`'s `SetAction::Rebuild`. The brief reconnect is
+    // documented on this function.
+    //
+    // Phase 2-pre: PREFLIGHT the rebuilt config before tearing the live device down. `begin_up` →
+    // `stop_device` drops the running engine, but the SSH root/feature checks (and control-URL/route
+    // parse) live in `build_config`, which `begin_up` only reaches AFTER teardown. If that check fails
+    // (e.g. a reloaded config enables SSH on a daemon without the `ssh` feature or without root), a
+    // naive rebuild would leave a healthy node OFFLINE — a reload that fails must never drop the
+    // tunnel. So validate FIRST under a brief lock; on error, return it with the live device untouched.
+    // (The prefs are already persisted by `reload_config`; they apply on the next successful `up`/`set`
+    // — but the running node stays up now.)
+    {
+        let be = backend.lock().await;
+        be.build_config().await?;
+    }
+    // Phase 2a: brief lock — begin a bring-up from the (already-updated) prefs. No authkey: a reload
+    // resumes from the persisted node key; it never (re)authenticates. NB: `begin_up` sets
+    // `want_running = true`, which on this arm is a no-op — we only reach `Rebuild` when the node was
+    // already up AND the reloaded config kept it up (`want_running` already true). The down node
+    // (`PersistedOnly`) and the stop-me-now (`BringDown`) cases were handled above, so `begin_up` here
+    // cannot resurrect a node the reloaded config asked to stop.
+    let pending = {
+        let mut be = backend.lock().await;
+        // A reload-driven rebuild never (re)authenticates, so it carries no WIF creds (`None`).
+        be.begin_up(UpOptions::default(), None).await
+    }?;
+    // Phase 2b: NO lock held — the slow, network-bound re-registration handshake.
+    let built = build_device(&pending, None).await;
+    // Phase 2c: brief lock — install iff still current, returning any orphan to settle off-lock.
+    let orphan = {
+        let mut be = backend.lock().await;
+        let orphan = be.finish_up(pending, built)?;
+        // A reload-driven rebuild re-registers the engine just like `up`, so on a successful install
+        // `finish_up` flips `has_logged_in` in memory — persist it here too (same contract as
+        // `drive_up`/`drive_set`'s rebuild), or a reload after a prior transient persist failure would
+        // leave the flag true-in-memory but false-on-disk and lose the guard's fresh-node exemption
+        // across a restart. Non-fatal on failure (node is up).
+        if orphan.is_none()
+            && let Err(e) = be.persist_prefs().await
+        {
+            tracing::warn!(error = %e, "failed to persist has_logged_in after reload-config rebuild");
+        }
+        orphan
+    };
+    // Lock released — settle the (rare) superseded device off-lock.
+    shutdown_orphan(orphan).await;
+    Ok(())
+}
+
 /// A single live engine pref-setter that [`Backend::begin_set`] issued (under its brief lock) to
 /// apply a `set` change in place — the no-reconnect analogue of rebuilding the device. Each carries
 /// the resolved value that was pushed, so [`SetAction::Live`] is a self-describing, comparable record
@@ -978,6 +1093,16 @@ pub struct Backend {
     current_profile: String,
     prefs_path: PathBuf,
     key_path: PathBuf,
+    /// The `--config` file path the daemon was started with, or `None` when it was launched without
+    /// `--config`. Held so the `reload-config` LocalAPI verb (Go `tailscaled`'s `reload-config` route
+    /// → `LocalBackend.ReloadConfig`) can **re-read** the same declarative config file and re-adopt its
+    /// fields into the running backend. Set once from `tailnetd`'s `main()` via
+    /// [`set_config_path`](Backend::set_config_path) right after [`load`](Backend::load) when `--config`
+    /// is given; `reload_config` errors clearly when it is `None` (there is nothing to re-read). This is
+    /// process-local boot configuration — like Go, it is NOT persisted (a `--config`-less restart has no
+    /// config to reload), and it is deliberately profile-independent: a `switch` does not change which
+    /// `--config` file the daemon was launched with.
+    config_path: Option<PathBuf>,
     /// The running engine, if up. `None` when stopped/needs-login.
     ///
     /// Held behind an [`Arc`](std::sync::Arc) (not a bare `Device`) so the engine handle can be
@@ -1123,6 +1248,9 @@ impl Backend {
             current_profile,
             prefs_path,
             key_path,
+            // No `--config` by default; `tailnetd`'s `main()` calls `set_config_path` right after this
+            // when `--config <file>` was given, so `reload_config` can later re-read that exact file.
+            config_path: None,
             device: None,
             ssh_task: None,
             serve_tasks: Vec::new(),
@@ -1138,6 +1266,16 @@ impl Backend {
         };
         backend.has_node_key = backend.has_persisted_node_key().await;
         Ok(backend)
+    }
+
+    /// Record the `--config` file path the daemon was started with, so the `reload-config` LocalAPI
+    /// verb can later re-read it (see [`config_path`](Backend::config_path) and
+    /// [`reload_config`](Backend::reload_config)). Called once from `tailnetd`'s `main()` right after
+    /// [`load`](Backend::load) when `--config <file>` was given — separate from `load` so the common
+    /// (config-less) startup path stays untouched and the rare config path is one explicit call. Idempotent
+    /// (last write wins), though the daemon only ever calls it once at boot.
+    pub fn set_config_path(&mut self, path: PathBuf) {
+        self.config_path = Some(path);
     }
 
     /// List the known profiles (the analogue of Go `tailscale switch --list`). Returns one entry per
@@ -3149,6 +3287,102 @@ impl Backend {
         self.persist_prefs().await?;
         Ok(authkey)
     }
+
+    /// Re-read the `--config` file the daemon was started with and re-adopt its fields into the running
+    /// backend — the Rust analogue of Go `tailscaled`'s `reload-config` LocalAPI route
+    /// (`ipn/localapi.go` `serveReloadConfig` → `LocalBackend.ReloadConfig` → `setConfigLocked`,
+    /// v1.100.0). Used when an operator edits the declarative config and wants the changes adopted
+    /// without restarting the daemon.
+    ///
+    /// Returns `Ok(true)` when a device is currently up (so the caller — [`drive_reload_config`] — must
+    /// rebuild the running engine from the now-updated prefs to actually adopt the change) and
+    /// `Ok(false)` when the node is down (persisting the merged prefs was the whole job; they apply on
+    /// the next `up`). This mirrors the `begin_set` → [`SetAction`] split: a brief lock applies +
+    /// persists + decides, and the off-lock rebuild (if any) is the caller's job so the multi-second
+    /// `Device::new` never runs under the backend lock.
+    ///
+    /// ## Faithful behavior
+    ///
+    /// - **No `--config` in use** → a clear error. Go's `ReloadConfig` likewise errors when there is no
+    ///   config file to reload; reloading is meaningless without one.
+    /// - **Malformed / unsupported-version file** → fails HARD (the error is propagated, NOTHING is
+    ///   mutated or persisted). This is the same fail-fast contract as boot ([`conffile::load`] +
+    ///   `apply_to_prefs`, which validates every field BEFORE touching `prefs`), so a bad reload can
+    ///   never half-corrupt the running node — it is rejected with the live prefs and device intact.
+    /// - **The merge is layered** (a field unset in the config leaves the corresponding pref untouched),
+    ///   identical to the boot-time `--config` apply — so reload refines the prefs, never wholesale-
+    ///   resets them.
+    ///
+    /// ## The auth key from a reloaded config
+    ///
+    /// A reloaded config's `AuthKey` is deliberately **dropped** here (logged, never used): a
+    /// `reload-config` is a re-configuration, not a re-authentication. If the node is up, the rebuild
+    /// resumes from the persisted node key (no re-register); if it is down, the merged prefs apply on
+    /// the next `up`, which already resolves auth from the config/`TS_AUTH_KEY` at that point. Adopting a
+    /// changed authkey on a live node would force a surprise re-registration — strictly more than a
+    /// "reload my settings" verb should do, so we do not. (This is the one deliberate narrowing vs. Go's
+    /// boot path, where the key is consumed at first bring-up; flagged in the type docs.)
+    pub async fn reload_config(&mut self) -> Result<ReloadAction> {
+        let path = match &self.config_path {
+            Some(p) => p.clone(),
+            None => {
+                return Err(anyhow!(
+                    "no --config file in use; reload-config requires the daemon to have been started \
+                     with --config"
+                ));
+            }
+        };
+        // Re-read + re-parse + version-gate the file, with context on failure (a malformed or
+        // unsupported-version file is rejected here, before any mutation — the same fail-hard contract
+        // as boot). `apply_config` then validates every field BEFORE mutating prefs (all-or-nothing),
+        // so a bad reload leaves the running node's prefs untouched.
+        let config = crate::conffile::load(&path)
+            .with_context(|| format!("reloading --config {}", path.display()))?;
+        tracing::info!(path = %path.display(), version = %config.version, "reloading --config");
+        // Merge + persist (and capture, only to drop) the config's auth key — a reload is not a
+        // re-auth (see the doc comment). `apply_config` already persists the merged prefs.
+        let authkey = self.apply_config(&config).await?;
+        if authkey.is_some() {
+            tracing::info!(
+                "reload-config: the reloaded config carried an AuthKey; ignoring it (a reload is not a \
+                 re-registration — a running node resumes from its persisted node key)"
+            );
+        }
+        // Decide the reconcile path from the now-updated prefs + the live device. Go's
+        // `ConfigVAlpha.ToPrefs` ALWAYS re-applies `WantRunning` on a reload (`WantRunningSet` is
+        // effectively always true: `mp.WantRunning = !Enabled.EqualBool(false)`,
+        // `mp.WantRunningSet = WantRunning || Enabled != ""`), so a reload is lifecycle-bearing — the
+        // reloaded `Enabled` decides up/down, NOT just "rebuild if it was up":
+        //   * device up + want_running now true  → REBUILD (adopt the new prefs into a fresh engine).
+        //   * device up + want_running now false (reloaded `Enabled:false`) → BRING DOWN (Go applies
+        //     it; the operator asked the node to stop). `apply_config` already persisted
+        //     `want_running=false`, so the caller only tears the engine down to match.
+        //   * device down → persisting above was the whole job (a `want_running=true` reload on a
+        //     down node sets intent up; it comes up on the next auto-start/`up`, NOT mid-reload —
+        //     matching how a down node treats a re-applied up-intent, and avoiding a reload silently
+        //     originating a connection).
+        Ok(match (self.device.is_some(), self.prefs.want_running) {
+            (true, true) => ReloadAction::Rebuild,
+            (true, false) => ReloadAction::BringDown,
+            (false, _) => ReloadAction::PersistedOnly,
+        })
+    }
+}
+
+/// What [`Backend::reload_config`] decided a `reload-config` must do to reconcile the live engine with
+/// the freshly-merged-and-persisted config prefs. The prefs are ALREADY applied + persisted by the
+/// time this is returned (including `want_running`, which Go's config reload always re-applies); this
+/// only tells [`drive_reload_config`] how to bring the live engine into line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReloadAction {
+    /// Node down → nothing live to reconcile; the persisted prefs apply on the next `up`/auto-start.
+    PersistedOnly,
+    /// Node up and the reloaded config keeps it up → rebuild the engine from the new prefs (the
+    /// engine `Config` is immutable), via the off-lock begin_up/build_device/finish_up handshake.
+    Rebuild,
+    /// Node up but the reloaded config set `Enabled:false` (`want_running=false`) → tear the engine
+    /// down to match the already-persisted intent (Go applies a reloaded `Enabled:false`).
+    BringDown,
 }
 
 #[cfg(test)]
@@ -3176,6 +3410,9 @@ mod tests {
             current_profile: profile::DEFAULT_PROFILE_ID.to_string(),
             prefs_path: dir.join("prefs.json"),
             key_path: dir.join("node.key.json"),
+            // No `--config` by default; the reload-config tests set this explicitly when exercising
+            // the re-read path (`set_config_path`).
+            config_path: None,
             device: None,
             ssh_task: None,
             serve_tasks: Vec::new(),
@@ -5551,6 +5788,204 @@ mod tests {
         assert!(
             !raw.contains("tskey-secret"),
             "the auth key must never be persisted into prefs.json: {raw}"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn reload_config_without_config_path_errors_clearly() {
+        // `reload_config` re-reads the `--config` file the daemon was started with. A daemon launched
+        // WITHOUT `--config` has nothing to reload (`config_path` is None) — it must fail with a clear,
+        // actionable error (matching Go's ReloadConfig, which errors when there is no config file),
+        // never silently no-op or panic.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-reloadcfg-none-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+        assert!(
+            be.config_path.is_none(),
+            "a backend with no --config has config_path None"
+        );
+
+        let err = be
+            .reload_config()
+            .await
+            .expect_err("reload_config must error when no --config is in use");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no --config") && msg.contains("reload-config"),
+            "the error must explain that reload-config needs --config: {msg}"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn reload_config_rereads_and_applies_the_config_file() {
+        // The happy path on a down node (device: None): `reload_config` re-reads the recorded `--config`
+        // file, merges its fields over the prefs, persists, and reports `Ok(false)` (no device up → no
+        // rebuild needed; the merged prefs apply on the next `up`). This pins the re-read + merge +
+        // persist + decision wiring end to end; the live-rebuild leg needs a real tailnet (the gated
+        // e2e). It also proves an EDITED file is re-read (reload picks up the change), the whole point
+        // of the verb vs. a one-shot boot apply.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-reloadcfg-apply-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+
+        // Record a config path (as `tailnetd`'s main() would after `--config`), then write a config to
+        // it and reload.
+        let cfg_path = dir.join("daemon-config.json");
+        be.set_config_path(cfg_path.clone());
+        tokio::fs::write(
+            &cfg_path,
+            br#"{"version":"alpha0","Hostname":"reloaded-host","ShieldsUp":true}"#,
+        )
+        .await
+        .unwrap();
+
+        let action = be.reload_config().await.expect("reload_config succeeds");
+        assert_eq!(
+            action,
+            ReloadAction::PersistedOnly,
+            "a down node (device: None) needs no live reconcile — the merged prefs apply on the next up"
+        );
+        // The config's fields landed on the in-memory prefs.
+        assert_eq!(be.prefs.hostname.as_deref(), Some("reloaded-host"));
+        assert!(be.prefs.shields_up, "ShieldsUp:true was adopted");
+        // ever_configured flipped (reload goes through apply_config).
+        assert!(be.ever_configured, "reload marks the node configured");
+        // And the merged prefs were PERSISTED — re-load from disk and confirm.
+        let persisted = Prefs::load(&be.prefs_path)
+            .await
+            .expect("reload persisted prefs from disk");
+        assert_eq!(persisted.hostname.as_deref(), Some("reloaded-host"));
+        assert!(persisted.shields_up);
+
+        // Now EDIT the file and reload again — the change must be picked up (the verb re-reads the file
+        // every time, it is not cached from boot).
+        tokio::fs::write(
+            &cfg_path,
+            br#"{"version":"alpha0","Hostname":"edited-host","ShieldsUp":false}"#,
+        )
+        .await
+        .unwrap();
+        be.reload_config().await.expect("second reload succeeds");
+        assert_eq!(
+            be.prefs.hostname.as_deref(),
+            Some("edited-host"),
+            "an edited config is re-read on reload"
+        );
+        assert!(
+            !be.prefs.shields_up,
+            "the edited ShieldsUp:false was adopted"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn reload_config_applies_enabled_false_as_stop_intent() {
+        // Go's config reload ALWAYS re-applies WantRunning (ToPrefs: WantRunningSet effectively always
+        // set), so a reloaded `Enabled:false` is a STOP intent — unlike a `set`, a reload IS lifecycle
+        // -bearing. On a down node (device: None) this can't reach the live BringDown teardown (that
+        // needs a real engine — the gated e2e), but it MUST: (a) persist want_running=false, and (b)
+        // map to PersistedOnly (down node → no live reconcile), NOT silently keep up-intent.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-reloadcfg-stop-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+        // Pretend the node was up-intent before the reload (a real up would also have a device).
+        be.prefs.want_running = true;
+        let cfg_path = dir.join("daemon-config.json");
+        be.set_config_path(cfg_path.clone());
+
+        // A config that keeps the node enabled → want_running stays true; down node → PersistedOnly.
+        tokio::fs::write(
+            &cfg_path,
+            br#"{"version":"alpha0","Hostname":"up-host","Enabled":true}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            be.reload_config().await.unwrap(),
+            ReloadAction::PersistedOnly,
+            "down node → PersistedOnly regardless of Enabled"
+        );
+        assert!(
+            be.prefs.want_running,
+            "Enabled:true keeps want_running true"
+        );
+
+        // Now reload a config with Enabled:false → want_running must flip to false (Go applies it).
+        tokio::fs::write(
+            &cfg_path,
+            br#"{"version":"alpha0","Hostname":"up-host","Enabled":false}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            be.reload_config().await.unwrap(),
+            ReloadAction::PersistedOnly,
+            "still a down node → PersistedOnly (the live BringDown path needs a real device)"
+        );
+        assert!(
+            !be.prefs.want_running,
+            "a reloaded Enabled:false MUST set want_running=false (Go re-applies WantRunning on reload)"
+        );
+        let persisted = Prefs::load(&be.prefs_path).await.unwrap();
+        assert!(
+            !persisted.want_running,
+            "the stop intent must be persisted, not just in-memory"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn reload_config_rejects_a_malformed_file_without_corrupting_prefs() {
+        // Fail-fast contract: a now-malformed / unsupported-version `--config` file must be rejected by
+        // `reload_config` HARD, leaving the running node's prefs UNTOUCHED (a bad reload must never
+        // half-corrupt a live node). `conffile::load` + `apply_to_prefs` validate before mutating; this
+        // pins that the Backend wrapper preserves that all-or-nothing behavior.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-reloadcfg-bad-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+        be.prefs.hostname = Some("original-host".to_string());
+
+        let cfg_path = dir.join("daemon-config.json");
+        be.set_config_path(cfg_path.clone());
+        // Unsupported version → `conffile::load` rejects it.
+        tokio::fs::write(
+            &cfg_path,
+            br#"{"version":"beta9","Hostname":"should-not-apply"}"#,
+        )
+        .await
+        .unwrap();
+
+        let err = be
+            .reload_config()
+            .await
+            .expect_err("a malformed/unsupported config must be rejected");
+        // `reload_config` wraps `conffile::load`'s error with `.with_context`, so the version detail
+        // lives in the SOURCE of the chain — assert on the FULL chain (`{:#}`), not the top-level
+        // `to_string()` (which is only the "reloading --config <path>" context line).
+        let chain = format!("{err:#}");
+        assert!(
+            chain.to_lowercase().contains("unsupported") || chain.contains("beta9"),
+            "the error names the version problem: {chain}"
+        );
+        // Prefs untouched — the rejected reload mutated nothing in memory.
+        assert_eq!(
+            be.prefs.hostname.as_deref(),
+            Some("original-host"),
+            "a rejected reload must leave the running prefs untouched"
         );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;

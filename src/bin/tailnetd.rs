@@ -267,7 +267,13 @@ async fn main() -> Result<()> {
             let config = tailscaled_rs::conffile::load(path)
                 .with_context(|| format!("loading --config {}", path.display()))?;
             tracing::info!(path = %path.display(), version = %config.version, "applying --config");
-            backend.apply_config(&config).await?
+            let authkey = backend.apply_config(&config).await?;
+            // Record the config path on the backend so the `reload-config` LocalAPI verb (Go
+            // `tailscaled`'s `reload-config`) can re-read this exact file and re-adopt its fields into
+            // the running node. Done only on the `--config` path — a config-less daemon has nothing to
+            // reload (and `reload_config` errors clearly in that case).
+            backend.set_config_path(path.clone());
+            authkey
         }
         None => None,
     };

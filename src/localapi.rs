@@ -475,6 +475,19 @@ pub enum Request {
     /// node restart. A **write** (mutates live datapath state): gated like `down`/`logout`. Needs the
     /// node up. Replies with [`Response::Ok`]/[`Response::Error`].
     DebugRebind,
+    /// Re-read the daemon's `--config` file and adopt the changed fields into the running node (Go
+    /// `tailscaled`'s `reload-config` LocalAPI route → `LocalBackend.ReloadConfig` → `setConfigLocked`,
+    /// v1.100.0). Rendered by `tnet reload-config`. The daemon re-loads the same declarative config it
+    /// was started with, merges it over the prefs (layered — an unset config field leaves its pref
+    /// untouched), persists the result, and — if the node is up — rebuilds the running engine from the
+    /// updated prefs to actually adopt the change (a brief reconnect, like a rebuild-only `set`); if the
+    /// node is down, the merged prefs apply on the next `up`. A **write** — gated like `up`/`down`: Go
+    /// gates `serveReloadConfig` on `PermitWrite`, and it reconfigures the running node. Fails with a
+    /// clear error when the daemon was started WITHOUT `--config` (there is nothing to reload) or when
+    /// the config file is now malformed (rejected with the running node untouched — the fail-fast
+    /// contract). Replies with [`Response::Ok`]/[`Response::Error`]. NOTE: a reloaded config's `AuthKey`
+    /// is deliberately ignored (a reload is not a re-registration — see the daemon's `reload_config`).
+    ReloadConfig,
 }
 
 /// The daemon's reply to a [`Request`].
@@ -1412,6 +1425,20 @@ mod tests {
             serde_json::to_string(&Request::Down).unwrap(),
             r#"{"cmd":"down"}"#
         );
+    }
+
+    #[test]
+    fn request_reload_config_wire_format() {
+        // `reload_config` (Go `tailscaled`'s `reload-config`): a unit variant. Pin its discriminant so
+        // the CLI and daemon — separate processes agreeing only on this JSON — stay in lockstep.
+        assert_eq!(
+            serde_json::to_string(&Request::ReloadConfig).unwrap(),
+            r#"{"cmd":"reload_config"}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<Request>(r#"{"cmd":"reload_config"}"#).unwrap(),
+            Request::ReloadConfig
+        ));
     }
 
     #[test]

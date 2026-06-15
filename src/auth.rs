@@ -188,6 +188,11 @@ pub(crate) fn requires_write(request: &crate::localapi::Request) -> bool {
         // magicsock debug pokes on write). A socket-reachable non-owner must not be able to disrupt
         // connectivity, so it gates like `down`.
         | Request::DebugRebind
+        // `ReloadConfig` re-reads the `--config` file and RECONFIGURES the running node (it merges +
+        // persists the prefs and, on a live node, rebuilds the engine — a brief reconnect). Go gates
+        // `serveReloadConfig` on `PermitWrite`; a socket-reachable non-owner must not be able to
+        // re-configure the node, so it gates like `up`/`down`.
+        | Request::ReloadConfig
         // `Cert` provisions a TLS cert and returns its PRIVATE KEY — a sensitive credential, and an
         // ACME control round-trip (not a passive read). Go gates `serveCert` on write; a
         // socket-reachable non-owner must not be able to mint a cert/key. Gates like `up`/`IdToken`.
@@ -326,6 +331,11 @@ mod tests {
         assert!(
             requires_write(&Request::DebugRebind),
             "debug rebind re-creates the engine's UDP sockets — a live-datapath mutation, gated like down"
+        );
+        assert!(
+            requires_write(&Request::ReloadConfig),
+            "reload-config re-reads --config + reconfigures the running node (Go gates serveReloadConfig \
+             on PermitWrite) — a write, so a non-root/non-owner local user can't reconfigure the node"
         );
         assert!(
             requires_write(&Request::IdToken {
