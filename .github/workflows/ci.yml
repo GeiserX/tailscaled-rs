@@ -70,12 +70,12 @@ jobs:
 
       # Reclaim disk before the release builds. The debug-profile test artifacts above accumulate a
       # separate compiled set per feature config (default / ssh / identity-federation), each pulling a
-      # full engine rebuild — on the disk-constrained self-hosted runner (shared with the engine lane)
-      # this peak has intermittently hit `No space left on device` during the last feature test (a
-      # transient that clears on re-run, but costs a re-run). The release builds below use a distinct
-      # `target/release` profile and need none of the `target/debug` artifacts, so dropping the dev
-      # profile here bounds peak usage with no loss of coverage. `rust-cache` (above) saves its cache
-      # from an earlier point in the job, so this does not defeat cross-run caching.
+      # full engine rebuild — on the GitHub-hosted `ubuntu-latest` runner (~14 GB free) this peak has
+      # intermittently hit `No space left on device` during the last feature test (a transient that
+      # clears on re-run, but costs a re-run). The release builds below use a distinct `target/release`
+      # profile and need none of the `target/debug` artifacts, so dropping the dev profile here bounds
+      # peak usage with no loss of coverage. `rust-cache` (above) saves its cache from an earlier point
+      # in the job, so this does not defeat cross-run caching.
       - name: Reclaim disk (drop debug artifacts before release builds)
         run: cargo clean --profile dev
 

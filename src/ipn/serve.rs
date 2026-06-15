@@ -433,6 +433,56 @@ pub fn funnel_host_ports(cfg: &ServeConfig) -> Vec<(String, u16)> {
         .collect()
 }
 
+/// The funnel-enabled ports whose web-proxy backend resolves to a **non-loopback** target, paired
+/// with that backend `host:port`. Funnel publishes a port to the PUBLIC internet, so a non-loopback
+/// backend means inbound internet traffic is spliced to something other than this host's loopback
+/// (another LAN host, a metadata endpoint, a public IP) — worth a heads-up. A loopback backend
+/// (`127.0.0.1` / `::1` / `localhost`) is the normal, expected case and is omitted.
+///
+/// "Non-loopback" is decided by parsing the backend host: a literal loopback IP, or the name
+/// `localhost`, is loopback; a parseable non-loopback IP is flagged; an unparseable name (a DNS name
+/// other than `localhost`) is conservatively treated as non-loopback (it could resolve anywhere).
+pub fn funnel_nonloopback_backends(cfg: &ServeConfig) -> Vec<(u16, String)> {
+    let mut out = Vec::new();
+    for port in funnel_ports(cfg) {
+        if let Some(backend) = web_proxy_backend(cfg, port)
+            && backend_is_nonloopback(&backend)
+        {
+            out.push((port, backend));
+        }
+    }
+    out
+}
+
+/// Whether a serve/funnel backend target (`host:port`, or a bare host) points at a NON-loopback host.
+/// Loopback = a loopback IP literal or the name `localhost`; everything else (a routable IP, or any
+/// other DNS name, which could resolve anywhere) is non-loopback. Bracketed IPv6 (`[::1]:443`) is
+/// handled.
+fn backend_is_nonloopback(backend: &str) -> bool {
+    // A bare IP literal (incl. an unbracketed IPv6 like `::1`, which has multiple colons and no
+    // port) parses directly — try that first so the host:port split below never mis-slices it.
+    if let Ok(ip) = backend.parse::<std::net::IpAddr>() {
+        return !ip.is_loopback();
+    }
+    // Otherwise isolate the host from a `host:port` / `[v6]:port` form.
+    let host = if let Some(rest) = backend.strip_prefix('[') {
+        // `[v6]` or `[v6]:port` → the part inside the brackets.
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        // `host:port` → host is before the last `:`; a bare host (no `:`) is itself.
+        backend.rsplit_once(':').map(|(h, _)| h).unwrap_or(backend)
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return false;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => !ip.is_loopback(),
+        // A non-IP host that isn't `localhost` (a DNS name) could resolve anywhere → treat as
+        // non-loopback (conservative — the warning is advisory, false-positives are acceptable).
+        Err(_) => true,
+    }
+}
+
 /// Path of the serve-config file for `state_dir` + profile id (next to prefs/key). The default
 /// profile uses a top-level `serve-config.json`; named profiles nest under `profiles/<id>/`.
 pub fn config_path(state_dir: &Path, profile_id: &str) -> PathBuf {
@@ -1028,6 +1078,26 @@ mod tests {
         set_funnel(&mut cfg, "host.example.ts.net", 8443, false);
         assert!(cfg.allow_funnel.is_empty());
         assert!(funnel_ports(&cfg).is_empty());
+    }
+
+    #[test]
+    fn backend_loopback_classification() {
+        // Loopback (no warning): loopback IPs + the name `localhost`, with/without port + brackets.
+        assert!(!backend_is_nonloopback("127.0.0.1:8080"));
+        assert!(!backend_is_nonloopback("127.0.0.1"));
+        assert!(!backend_is_nonloopback("localhost:3000"));
+        assert!(!backend_is_nonloopback("LOCALHOST"));
+        assert!(!backend_is_nonloopback("[::1]:443"));
+        assert!(!backend_is_nonloopback("::1"));
+        // Non-loopback (warn): routable IPs, the metadata endpoint, a LAN host, a DNS name.
+        assert!(backend_is_nonloopback("169.254.169.254:80"));
+        assert!(backend_is_nonloopback("10.0.0.5:8080"));
+        assert!(backend_is_nonloopback("192.168.1.10"));
+        assert!(backend_is_nonloopback("[2001:db8::1]:443"));
+        assert!(
+            backend_is_nonloopback("internal.example.com:443"),
+            "a non-localhost DNS name could resolve anywhere → treated as non-loopback"
+        );
     }
 
     #[test]
