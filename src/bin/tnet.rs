@@ -6731,6 +6731,20 @@ async fn run_ssh(
     if user.is_empty() {
         anyhow::bail!("ssh: empty user in target {target:?} (use `host` for the current user)");
     }
+    // SECURITY: the username becomes the left half of the `user@host` argv element handed to `ssh`. A
+    // username that LEADS WITH `-` would make `user@host` parse as an ssh option (getopt flag
+    // injection — e.g. `-oProxyCommand=…@host` overrides the tunnel), and whitespace/`@` would split
+    // or malform the destination. The user half can come from an UNTRUSTED env var (`$USER`/`$LOGNAME`
+    // via `current_login_user`, unlike Go which reads the OS passwd entry), so guard it regardless of
+    // source. Reject rather than sanitize — a `-`-leading or whitespace username is operator/env error,
+    // and silently rewriting it would surprise. (The host half cannot lead with `-` because `user@` is
+    // always prefixed; it is resolved against the netmap below, not taken raw.)
+    if user.starts_with('-') || user.contains([' ', '\t', '\n', '\r', '@']) {
+        anyhow::bail!(
+            "ssh: refusing unsafe username {user:?} (leads with '-' or contains whitespace/@) — pass \
+             an explicit `user@host` with a valid username"
+        );
+    }
 
     // 2. Resolve the peer against the netmap. Fetch Status (not whois — that is IP-only) so a NAME
     //    also resolves, mirroring `ip <peer>` / Go's `peerStatusFromArg`.
@@ -6790,8 +6804,12 @@ async fn run_ssh(
         std::env::current_exe().context("resolving the running `tnet` executable path")?;
     let self_exe = self_exe.to_string_lossy();
     let proxy_command = match explicit_socket {
+        // Bind the socket value to the flag with `=` (Go's `--socket=%q` form) so it is a SINGLE shell
+        // token after ssh splits the ProxyCommand — the value can never be seen as a separate
+        // argument, even before the inner `tnet` re-parses it. (The value is also `shell_quote`d, so
+        // this is belt-and-suspenders.)
         Some(s) => format!(
-            "ProxyCommand {} --socket {} nc %h %p",
+            "ProxyCommand {} --socket={} nc %h %p",
             shell_quote(&self_exe),
             shell_quote(&s.to_string_lossy())
         ),
@@ -6905,14 +6923,27 @@ fn ssh_conf_dir() -> Result<std::path::PathBuf> {
 /// injection-class guard the structured CLI output uses). Pure → unit-testable.
 fn render_known_hosts(peer: &tailscaled_rs::localapi::PeerReport) -> String {
     // Host identifiers: the display name (when non-empty) + every tailnet IP we know.
+    //
+    // SECURITY: the host field is control-supplied (peer.name derives from the wire Node.name, which
+    // this fork — unlike Go talking to Tailscale's sanitizing coordination server — accepts verbatim
+    // from arbitrary/self-hosted control). A name containing a newline could forge an extra
+    // known_hosts line (e.g. a `*` wildcard pinning an attacker key), and a space/tab would split the
+    // line into a bogus host token; a leading `#` would turn the line into a comment. So the host
+    // identifier is guarded EXACTLY like the key below — a known_hosts host token must contain no
+    // whitespace/CR/LF and not lead with `#`. The IPs are typed (`IpAddr` → always numeric) and so are
+    // inherently safe, but we run them through the same `is_safe_known_hosts_host` gate uniformly. A
+    // peer whose name is unsafe simply contributes no name-keyed line (its IP lines still work).
+    fn is_safe_known_hosts_host(h: &str) -> bool {
+        !h.is_empty() && !h.starts_with('#') && !h.contains([' ', '\t', '\n', '\r'])
+    }
     let mut hosts: Vec<&str> = Vec::new();
-    if !peer.name.is_empty() {
+    if is_safe_known_hosts_host(&peer.name) {
         hosts.push(peer.name.as_str());
     }
-    if !peer.ipv4.is_empty() {
+    if is_safe_known_hosts_host(&peer.ipv4) {
         hosts.push(peer.ipv4.as_str());
     }
-    if let Some(v6) = peer.ipv6.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(v6) = peer.ipv6.as_deref().filter(|s| is_safe_known_hosts_host(s)) {
         hosts.push(v6);
     }
     let mut out = String::new();
@@ -7620,6 +7651,50 @@ mod tests {
         assert!(!out.contains("bad"));
         assert!(out.contains("h ssh-ed25519 good"));
         assert!(out.contains("100.64.0.5 ssh-ed25519 good"));
+    }
+
+    #[test]
+    fn render_known_hosts_skips_crlf_injected_host_name() {
+        use tailscaled_rs::localapi::PeerReport;
+        // SECURITY (M1): a control-supplied peer.name with an embedded newline must NOT forge an extra
+        // known_hosts line (e.g. a `*` wildcard pinning an attacker key). The unsafe NAME contributes
+        // no line; the peer's IP (safe, numeric) still gets its line, so a real connection by IP works.
+        let peer = PeerReport {
+            name: "victim.ts.net\n* ssh-ed25519 ATTACKERKEY".into(),
+            ipv4: "100.64.0.9".into(),
+            ssh_host_keys: vec!["ssh-ed25519 realkey".into()],
+            ..Default::default()
+        };
+        let out = render_known_hosts(&peer);
+        // The forged `*` wildcard line must NOT appear, and no ATTACKERKEY anywhere.
+        assert!(
+            !out.contains('*'),
+            "must not forge a wildcard host line: {out:?}"
+        );
+        assert!(!out.contains("ATTACKERKEY"));
+        // Only the safe IP host keyed to the real key survives → exactly one line.
+        assert_eq!(out, "100.64.0.9 ssh-ed25519 realkey\n", "got: {out:?}");
+    }
+
+    #[test]
+    fn render_known_hosts_skips_host_with_space_or_leading_hash() {
+        use tailscaled_rs::localapi::PeerReport;
+        // A name with a space would split into a bogus host token; a leading `#` would comment the
+        // line out. Both are rejected as host identifiers (the IP still works).
+        let spaced = PeerReport {
+            name: "a b".into(),
+            ipv4: "100.64.0.3".into(),
+            ssh_host_keys: vec!["ssh-ed25519 k".into()],
+            ..Default::default()
+        };
+        assert_eq!(render_known_hosts(&spaced), "100.64.0.3 ssh-ed25519 k\n");
+        let hashed = PeerReport {
+            name: "#cmt".into(),
+            ipv4: "100.64.0.4".into(),
+            ssh_host_keys: vec!["ssh-ed25519 k".into()],
+            ..Default::default()
+        };
+        assert_eq!(render_known_hosts(&hashed), "100.64.0.4 ssh-ed25519 k\n");
     }
 
     #[test]
