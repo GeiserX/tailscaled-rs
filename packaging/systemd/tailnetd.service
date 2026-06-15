@@ -20,8 +20,27 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+# Type=simple, NOT Go's Type=notify. Go's tailscaled emits sd_notify(READY=1) once it is up, so its
+# unit is Type=notify; tailnetd does not send sd_notify yet, and Type=notify would make systemd block
+# the start until a readiness ping that never arrives, then SIGKILL at TimeoutStartSec. So we stay
+# Type=simple (ready == process exec'd) until the daemon learns sd_notify. See the sd_notify bead.
 Type=simple
+
+# Operator tunables, optional. Go ships EnvironmentFile=/etc/default/tailscaled; we use the same seam
+# so an admin can set env knobs (e.g. TAILNETD_LOG, or extra engine env) WITHOUT editing this vendor
+# unit (which an upgrade overwrites). The leading `-` makes it optional: a system without the file
+# starts fine. It is read BEFORE the hardcoded Environment= lines below, so those win — the file
+# CANNOT relocate the state dir (StateDirectory= + ReadWritePaths= are fixed to /var/lib/tailnetd) or
+# disable the experiment gate; it only adds/overrides knobs that do not fight the sandbox.
+EnvironmentFile=-/etc/default/tailnetd
+
 ExecStart=/usr/local/bin/tailnetd
+# Revert OS-level state when the service stops OR crashes (Go: ExecStopPost=tailscaled --cleanup).
+# `--cleanup` removes the daemon's own stale LocalAPI socket and is structurally incapable of touching
+# the node key or prefs.json (it is handed only the socket path), so a crash/stop never destroys
+# identity — it just clears the transient socket so the next start binds cleanly. Runs with this
+# unit's environment, so it inherits TAILNETD_STATE_DIR and resolves the same <statedir>/tailnetd.sock.
+ExecStopPost=/usr/local/bin/tailnetd --cleanup
 Restart=on-failure
 RestartSec=5
 
