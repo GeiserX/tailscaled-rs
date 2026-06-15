@@ -4755,8 +4755,29 @@ fn format_revert_guard(reverts: &[RevertedPref]) -> String {
 /// (the registration-failure `reason`) use [`sanitize_multiline`] instead, which preserves `\t`/`\n`.
 fn sanitize_for_terminal(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .map(|c| if is_display_unsafe(c) { '\u{FFFD}' } else { c })
         .collect()
+}
+
+/// Whether a character is unsafe to print verbatim into a structured/columnar terminal line.
+///
+/// Covers, beyond the C0/C1 controls `char::is_control()` already catches (ESC/CSI/BEL, NEL, LF/CR/TAB):
+/// - **U+2028 LINE SEPARATOR / U+2029 PARAGRAPH SEPARATOR** — some terminals treat these as line
+///   breaks, so a control-supplied name carrying one could forge a fake row even though they are *not*
+///   `is_control()`.
+/// - **Unicode bidi overrides/isolates** — U+202A–U+202E (LRE/RLE/PDF/LRO/RLO) and U+2066–U+2069
+///   (LRI/RLI/FSI/PDI). These reorder *displayed* text, so a hostile name could visually masquerade as
+///   another (the "Trojan Source" class) or shuffle a rendered column. Neither range is `is_control()`.
+///
+/// Mapping any of these to `U+FFFD` is lossless for the real data these fields carry (IPs, DNS names,
+/// hostnames, hashes never legitimately contain them) and closes the display-spoofing gap.
+fn is_display_unsafe(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{2028}' | '\u{2029}'            // line / paragraph separators
+            | '\u{202A}'..='\u{202E}'          // bidi embeddings + overrides (LRE..RLO)
+            | '\u{2066}'..='\u{2069}'          // bidi isolates (LRI..PDI)
+        )
 }
 
 /// Sanitize a control-supplied string that is rendered as **free-form, possibly multi-line** text
@@ -4773,8 +4794,12 @@ fn sanitize_multiline(s: &str) -> String {
     s.chars()
         .map(|c| {
             if c == '\t' || c == '\n' || c == '\r' {
+                // Preserve the plain ASCII whitespace that legitimately formats a free-form message.
                 c
-            } else if c.is_control() {
+            } else if is_display_unsafe(c) {
+                // Everything else unsafe — C0/C1 escapes AND U+2028/U+2029 + bidi overrides — is
+                // neutralized. (2028/2029 are NOT the `\n`/`\r` we preserve above: a Unicode line
+                // separator in a "free-form" message is still a spoofing vector, so it is stripped.)
                 '\u{FFFD}'
             } else {
                 c
@@ -7930,6 +7955,47 @@ mod tests {
             sanitize_multiline(benign),
             benign,
             "plain text + tab/newline must be unchanged in a free-form reason"
+        );
+    }
+
+    #[test]
+    fn sanitize_neutralizes_unicode_line_separators_and_bidi_overrides() {
+        // Beyond C0/C1 controls: U+2028/U+2029 (some terminals break a line on these → a forged row)
+        // and the bidi overrides/isolates U+202A–202E / U+2066–2069 (reorder displayed text — the
+        // "Trojan Source" class) are NOT `char::is_control()`, so they used to pass through. Both
+        // sanitizers must now map them to U+FFFD.
+        for evil in [
+            "node-a\u{2028}fake-row",       // line separator
+            "node-a\u{2029}fake-row",       // paragraph separator
+            "good\u{202E}evil\u{202C}name", // RLO + PDF (bidi override)
+            "iso\u{2066}late\u{2069}",      // LRI + PDI (bidi isolate)
+        ] {
+            let clean = sanitize_for_terminal(evil);
+            for bad in [
+                '\u{2028}', '\u{2029}', '\u{202A}', '\u{202E}', '\u{2066}', '\u{2069}',
+            ] {
+                assert!(
+                    !clean.contains(bad),
+                    "sanitize_for_terminal must strip {bad:?} (from {evil:?}), got {clean:?}"
+                );
+            }
+            // The multiline path must strip them too (a Unicode line/para separator is NOT the plain
+            // \n/\r it preserves — it is still a spoofing vector).
+            let clean_ml = sanitize_multiline(evil);
+            assert!(
+                !clean_ml.contains('\u{2028}')
+                    && !clean_ml.contains('\u{2029}')
+                    && !clean_ml.contains('\u{202E}')
+                    && !clean_ml.contains('\u{2066}'),
+                "sanitize_multiline must strip the Unicode separators + bidi from {evil:?}, got {clean_ml:?}"
+            );
+            // The ASCII letters survive.
+            assert!(clean.contains("node") || clean.contains("good") || clean.contains("iso"));
+        }
+        // A plain ASCII name is untouched (no false positives).
+        assert_eq!(
+            sanitize_for_terminal("node-a.example.ts.net"),
+            "node-a.example.ts.net"
         );
     }
 
