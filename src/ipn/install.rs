@@ -352,6 +352,49 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_unit_wires_cleanup_and_envfile_like_go() {
+        // Go's tailscaled.service wires `ExecStopPost=tailscaled --cleanup` (revert OS state on
+        // stop/crash) and `EnvironmentFile=` (operator env seam). BOTH embedded units must carry the
+        // faithful equivalents, regardless of cfg!(feature = "tun"). Pin them so a future unit edit
+        // can't silently drop the crash-cleanup hook or the env seam. Line-anchored match (== on the
+        // trimmed line) so the explanatory comments above each directive can't false-satisfy it.
+        let p = plan().expect("linux plan");
+        let has_directive =
+            |unit: &str, directive: &str| unit.lines().any(|l| l.trim_start() == directive);
+        assert!(
+            has_directive(
+                p.unit_content,
+                "ExecStopPost=/usr/local/bin/tailnetd --cleanup"
+            ),
+            "unit missing the crash/stop cleanup hook (Go: ExecStopPost=tailscaled --cleanup)"
+        );
+        // The cleanup hook MUST invoke the same binary as ExecStart (so it resolves the same socket
+        // under this unit's TAILNETD_STATE_DIR) and MUST pass --cleanup (not a bare re-exec, which
+        // would start a second daemon at stop time).
+        assert!(
+            has_directive(p.unit_content, "ExecStart=/usr/local/bin/tailnetd"),
+            "unit missing the canonical ExecStart"
+        );
+        // EnvironmentFile uses the optional `-` prefix: a host without /etc/default/tailnetd must
+        // still start (a non-optional EnvironmentFile would fail the unit when the file is absent).
+        assert!(
+            has_directive(p.unit_content, "EnvironmentFile=-/etc/default/tailnetd"),
+            "unit missing the optional operator EnvironmentFile seam (must use the `-` optional prefix)"
+        );
+        // The env seam must NOT be able to fight the sandbox: the state dir is pinned by hardcoded
+        // Environment=/StateDirectory= lines, which systemd applies AFTER EnvironmentFile, so they
+        // win. Assert the pin is still present (regression guard on the ordering invariant).
+        assert!(
+            has_directive(
+                p.unit_content,
+                "Environment=TAILNETD_STATE_DIR=/var/lib/tailnetd"
+            ),
+            "unit missing the hardcoded state-dir pin (must follow EnvironmentFile so the file can't relocate state)"
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_plan_paths_and_argv() {
