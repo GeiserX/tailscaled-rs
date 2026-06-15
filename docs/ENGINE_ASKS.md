@@ -2,15 +2,26 @@
 
 This lists the changes the downstream daemon (`tailscaled-rs`) needs from the `tailscale-rs`
 library to unblock end-to-end features. Each ask is self-contained, additive, and
-backward-compatible. The daemon pins engine rev `3e81d862` (`v0.39.0`); individual asks
+backward-compatible. The daemon pins engine rev `35e5db22` (`v0.41.0`); individual asks
 note the rev they were verified against (older "verified vs `e126bba`/v0.6.9" / `81446f88`/v0.28.2
 / `6035651b`/v0.29.1 / `f3793636`/v0.31.0 / `575104b1`/v0.32.0 / `f8192568`/v0.33.0 / `1694d208`/v0.34.2
 / `faf46b34`/v0.35.8 notes below predate the current pin and are kept as historical context — the SHIPPED
 markers reflect what the pin provides). Bumps since v0.33.0: → v0.34.2 (tka chokepoint, cap parity, taildrop
 length-verify) → v0.35.3 (control-runner unbounded mailbox, tka rotation-drop, tunnel/derp fixes) →
 v0.35.8 (netcheck hysteresis, dataplane ACL, magicsock STUN, derp wire keys, taildrop symlink-refuse) →
-v0.39.0 → v0.40.0 (current pin) — all transparent except the `DeviceState` growth noted in the v0.40.0
-header below, each clippy+test-verified.
+v0.39.0 → v0.40.0 → v0.41.0 (current pin) — all transparent except the `DeviceState` growth noted in the
+v0.40.0 header below, each clippy+test-verified.
+
+> **Pin bump fe86ca00 (v0.40.0) → 35e5db22 (v0.41.0), 2026-06-16.** Probe-compiled first (against the
+> pre-tag HEAD `73f56b1e`): CLEAN — no breaking change, purely additive. **SHIPS + CONSUMES ask #24**:
+> the engine now exposes `Device::suggest_exit_node() -> Result<Option<ExitNodeSuggestion>, Error>`
+> (#267, mirroring Go `LocalClient.SuggestExitNode`), where `ExitNodeSuggestion { id: StableNodeId,
+> name: String }`, `Ok(None)` = no eligible candidate (an honest empty result, NOT an error), and `Err`
+> = no usable netcheck report yet (no measured preferred DERP region for the latency ranking). Consumed
+> as `tnet exit-node suggest` (the consuming change rides this bump): a new read-only `SuggestExitNode`
+> LocalAPI verb → off-lock `Device::suggest_exit_node` → prints the suggested node + a `tnet set
+> --exit-node=<id>` hint (or a clear "no suggestion available" notice). Also pulls the `ts_netmon` crate
+> publish fix (#264) for free (workspace-release plumbing, no daemon surface).
 
 > **Pin bump 3e81d862 (v0.39.0) → fe86ca00 (v0.40.0), 2026-06-15.** Probe-compiled first; the ONE
 > breaking change was caught + handled there: the engine's `#[non_exhaustive]` `DeviceState` grew two

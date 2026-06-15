@@ -1031,6 +1031,10 @@ enum DnsCmd {
 enum ExitNodeCmd {
     /// List tailnet peers offering to be exit nodes.
     List,
+    /// Suggest the best available exit node (Go `tailscale exit-node suggest`). The daemon picks a
+    /// candidate by DERP-region proximity / latency and prints its name plus the `tnet set
+    /// --exit-node=<id>` command to engage it. Prints a clear notice when no candidate is available.
+    Suggest,
 }
 
 /// `tnet syspolicy` subcommands (Go `tailscale syspolicy`). Both honor `--json`.
@@ -1888,6 +1892,10 @@ async fn main() -> Result<()> {
         Command::ExitNode {
             cmd: ExitNodeCmd::List,
         } => run_exit_node_list(&socket).await,
+        // `exit-node suggest` (Go `tailscale exit-node suggest`): ask the daemon for the best candidate.
+        Command::ExitNode {
+            cmd: ExitNodeCmd::Suggest,
+        } => run_exit_node_suggest(&socket).await,
         // `syspolicy list`/`reload` (Go `tailscale syspolicy`): fetch + render the effective policy.
         Command::Syspolicy {
             cmd: SyspolicyCmd::List { json },
@@ -4251,6 +4259,38 @@ async fn run_exit_node_list(socket: &std::path::Path) -> Result<()> {
     };
     print!("{}", format_exit_node_list(&status.peers));
     Ok(())
+}
+
+/// `exit-node suggest` (Go `tailscale exit-node suggest`): ask the daemon for the best available exit
+/// node and print it with the `tnet set --exit-node=<id>` command to engage it. A `None` suggestion
+/// (no eligible candidate) prints a clear notice and exits 0 (not an error — there was simply nothing
+/// to suggest, matching Go's empty response). The suggested name is control-supplied text, so it is
+/// run through `sanitize_for_terminal` before printing.
+async fn run_exit_node_suggest(socket: &std::path::Path) -> Result<()> {
+    let response = round_trip(socket, &Request::SuggestExitNode)
+        .await
+        .with_context(|| format!("talking to daemon at {}", socket.display()))?;
+    match response {
+        Response::ExitNodeSuggestion {
+            suggestion: Some(s),
+        } => {
+            // Name is control-supplied — sanitize before printing. The id is a stable node id
+            // (`[A-Za-z0-9]`-ish), echoed verbatim as the selector for `set --exit-node`.
+            println!("Suggested exit node: {}", sanitize_for_terminal(&s.name));
+            println!("To use it, run: tnet set --exit-node={}", s.id);
+            Ok(())
+        }
+        Response::ExitNodeSuggestion { suggestion: None } => {
+            // No eligible candidate — an honest empty result, not an error. Exit 0.
+            println!("No exit node suggestion available (no eligible exit-node peer right now).");
+            Ok(())
+        }
+        Response::Error { message } => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        other => anyhow::bail!("unexpected response to exit-node suggest: {other:?}"),
+    }
 }
 
 /// `whois` (Go `tailscale whois <ip>`): round-trip Whois for the given tailnet IP, then render the

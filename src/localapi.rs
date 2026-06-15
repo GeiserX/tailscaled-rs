@@ -295,6 +295,12 @@ pub enum Request {
     /// to be up (the measurements come from the live engine's net-report). NOTE: this fork's
     /// net-report measures ONLY DERP-region latency (see [`NetcheckReport`]).
     Netcheck,
+    /// Ask the daemon to suggest the best available exit node (Go `tailscale exit-node suggest` →
+    /// `LocalClient.SuggestExitNode`). Replies with [`Response::ExitNodeSuggestion`] carrying the
+    /// suggested node (or `None` when there is no eligible candidate — NOT an error, mirroring Go's
+    /// empty response). Read-only — it computes a suggestion from the netmap + latency, mutating
+    /// nothing (gated like [`Status`](Request::Status)). Requires the node to be up.
+    SuggestExitNode,
     /// Report the effective system policy / MDM configuration (Go `tailscale syspolicy list`).
     /// Replies with [`Response::Policy`]. Read-only — Go gates BOTH `list` and `reload` on
     /// `PermitRead` (the LocalAPI `policy/` handler checks only `PermitRead`), so this is classified
@@ -641,6 +647,16 @@ pub enum Response {
     /// The node's network-conditions report (reply to [`Request::Netcheck`]), rendered by
     /// `tnet netcheck`.
     Netcheck(NetcheckReport),
+    /// The suggested exit node (reply to [`Request::SuggestExitNode`]), rendered by `tnet exit-node
+    /// suggest`. `suggestion` is `None` when the engine found no eligible candidate — an honest empty
+    /// result, not an error (mirroring Go's empty `SuggestExitNode` response). A **struct** variant
+    /// (not a newtype over `Option`): the `Response` enum is internally tagged (`tag = "kind"`), which
+    /// cannot merge its tag into a bare `Option`/`null` content, so the optional payload is carried as
+    /// a named field instead.
+    ExitNodeSuggestion {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        suggestion: Option<ExitNodeSuggestionView>,
+    },
     /// The effective system policy snapshot (reply to [`Request::SyspolicyList`] /
     /// [`Request::SyspolicyReload`]), rendered by `tnet syspolicy list` / `reload`.
     Policy(PolicyReport),
@@ -1325,6 +1341,20 @@ pub struct RegionLatencyView {
     /// The measured round-trip latency to the region's closest DERP node, in milliseconds (engine
     /// `RegionLatency::latency`, a `Duration`, rendered via `as_secs_f64() * 1000.0`).
     pub latency_ms: f64,
+}
+
+/// The suggested exit node in a [`Response::ExitNodeSuggestion`] reply (Go `tailscale exit-node
+/// suggest`). Mirrors the engine's `tailscale::ExitNodeSuggestion` as this crate's own wire type:
+/// the suggested node's stable id (pass to `tnet set --exit-node=<id>` to engage it) + its display
+/// name (for surfacing to the operator).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExitNodeSuggestionView {
+    /// The suggested exit node's stable node id (engine `ExitNodeSuggestion::id`, Go
+    /// `apitype.ExitNodeSuggestionResponse.ID`). This is the `--exit-node=<id>` selector to engage it.
+    pub id: String,
+    /// The suggested exit node's display name (engine `ExitNodeSuggestion::name`, Go
+    /// `apitype.ExitNodeSuggestionResponse.Name`), for the human-facing suggestion line.
+    pub name: String,
 }
 
 /// One profile in a [`Response::Profiles`] reply (Go `tailscale switch --list`).
@@ -2139,6 +2169,43 @@ mod tests {
         match serde_json::from_str::<Response>(&empty_json).unwrap() {
             Response::Netcheck(r) => assert_eq!(r, NetcheckReport::default()),
             other => panic!("expected Netcheck, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn suggest_exit_node_request_response_round_trip() {
+        // `suggest-exit-node` discriminant + the ExitNodeSuggestion(Option<..>) reply must survive the
+        // wire. The Some(..) case carries the id+name; the None case (no eligible candidate) is an
+        // honest empty result, NOT an error, and must round-trip as `null`.
+        assert_eq!(
+            serde_json::to_string(&Request::SuggestExitNode).unwrap(),
+            r#"{"cmd":"suggest_exit_node"}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<Request>(r#"{"cmd":"suggest_exit_node"}"#).unwrap(),
+            Request::SuggestExitNode
+        ));
+        // Some(suggestion) round-trips with both fields.
+        let sugg = ExitNodeSuggestionView {
+            id: "nABC123".to_string(),
+            name: "exit-fra-1".to_string(),
+        };
+        let resp = Response::ExitNodeSuggestion {
+            suggestion: Some(sugg.clone()),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::ExitNodeSuggestion {
+                suggestion: Some(s),
+            } => assert_eq!(s, sugg),
+            other => panic!("expected ExitNodeSuggestion(Some), got {other:?}"),
+        }
+        // None (no candidate) round-trips as a distinct, non-error empty result.
+        let none = Response::ExitNodeSuggestion { suggestion: None };
+        let none_json = serde_json::to_string(&none).unwrap();
+        match serde_json::from_str::<Response>(&none_json).unwrap() {
+            Response::ExitNodeSuggestion { suggestion: None } => {}
+            other => panic!("expected ExitNodeSuggestion(None), got {other:?}"),
         }
     }
 
