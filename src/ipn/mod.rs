@@ -521,6 +521,52 @@ pub fn identity_federation_built() -> bool {
     cfg!(feature = "identity-federation")
 }
 
+/// Project one engine [`StatusNode`](tailscale::StatusNode) into the LocalAPI [`PeerReport`] wire
+/// shape — the SINGLE source of truth for that mapping, shared by [`Backend::status`]'s netmap
+/// projection and the `watch`-notify stream's `net_map` projection (see
+/// [`crate::server`]'s `stream_notify`). Factored out so a one-shot `status` and the streamed
+/// notification feed can never describe the same peer differently: both render identical
+/// `name`/`ipv4`/`ipv6`/`stable_id`/`online`/`allowed_routes`/`last_seen`/`cur_addr`/`relay` fields
+/// from the same engine node.
+pub(crate) fn peer_report_from_status_node(p: tailscale::StatusNode) -> PeerReport {
+    PeerReport {
+        name: p.display_name,
+        ipv4: p.ipv4.to_string(),
+        is_exit_node: p.is_exit_node,
+        // The engine's StableNodeId → the Go `status --json` Peer-map key (see PeerReport::stable_id
+        // for the keying-deviation note). `p` is owned, so move the inner String rather than clone.
+        stable_id: p.stable_id.0,
+        // Engine-reported liveness (Option<bool>) → Go `PeerStatus.Online`.
+        online: p.online,
+        // IPv6 → Go PeerStatus.TailscaleIPs[1] (rendered as a string).
+        ipv6: Some(p.ipv6.to_string()),
+        // AllowedIPs → Go PeerStatus.AllowedIPs (CIDR strings).
+        allowed_routes: p.allowed_routes.iter().map(|r| r.to_string()).collect(),
+        // LastSeen (Go PeerStatus.LastSeen); meaningful when offline. Emit strict RFC3339
+        // (`2026-06-11T05:19:14+00:00`) via the chrono `DateTime<Utc>`'s inherent `to_rfc3339` so a
+        // JSON consumer parses it like Go's `ipnstate.PeerStatus.LastSeen`. (The Display impl —
+        // `2026-06-11 05:19:14 UTC`, space-separated — is NOT RFC3339; `to_rfc3339` is an inherent
+        // method on the type, no chrono feature needed.)
+        last_seen: p.last_seen.map(|t| t.to_rfc3339()),
+        // Direct endpoint vs DERP relay (Go CurAddr/Relay; mutually exclusive).
+        cur_addr: p.cur_addr.map(|a| a.to_string()),
+        relay: p.relay,
+    }
+}
+
+/// Map an engine [`DeviceState`](tailscale::DeviceState) into the `(state, error)` pair a
+/// [`NotifyView`](crate::localapi::NotifyView) carries for the `watch`-notify stream, reusing the
+/// SAME [`state_from_device`] mapping [`Backend::status`] uses so the streamed `state`/`error` can
+/// never drift from the one-shot `status` view. Only the state-name string and the terminal-failure
+/// `error` are returned: the interactive-login URL is carried independently by the engine's
+/// [`Notify::browse_to_url`](tailscale::Notify::browse_to_url) (derived there from `NeedsLogin`), so
+/// `stream_notify` sources `browse_to_url` from that field, not from this helper's dropped auth-URL
+/// component. Exposed at `pub(crate)` because `state_from_device` itself is module-private to `ipn`.
+pub(crate) fn notify_state_from_device(ds: tailscale::DeviceState) -> (String, Option<String>) {
+    let (state, _auth_url, error) = state_from_device(ds);
+    (state.as_str().to_string(), error)
+}
+
 /// Perform the slow engine handshake for a [`PendingUp`], **without** holding the backend lock.
 /// This is the multi-second, network-bound step (control-plane registration); keeping it off-lock is
 /// the whole point of the `begin_up`/`finish_up` split — a concurrent `status` (or any other LocalAPI
@@ -2668,37 +2714,7 @@ impl Backend {
                         let peers = s
                             .peers
                             .into_iter()
-                            .map(|p| PeerReport {
-                                name: p.display_name,
-                                ipv4: p.ipv4.to_string(),
-                                is_exit_node: p.is_exit_node,
-                                // The engine's StableNodeId → the Go `status --json` Peer-map key
-                                // (see PeerReport::stable_id for the keying-deviation note). `p`
-                                // is owned (into_iter) and the active-exit `find` above already
-                                // finished borrowing it, so move the inner String rather than clone.
-                                stable_id: p.stable_id.0,
-                                // Engine-reported liveness (Option<bool>) → Go `PeerStatus.Online`.
-                                online: p.online,
-                                // IPv6 → Go PeerStatus.TailscaleIPs[1] (rendered as a string).
-                                ipv6: Some(p.ipv6.to_string()),
-                                // AllowedIPs → Go PeerStatus.AllowedIPs (CIDR strings).
-                                allowed_routes: p
-                                    .allowed_routes
-                                    .iter()
-                                    .map(|r| r.to_string())
-                                    .collect(),
-                                // LastSeen (Go PeerStatus.LastSeen); meaningful when offline. Emit
-                                // strict RFC3339 (`2026-06-11T05:19:14+00:00`) via the chrono
-                                // `DateTime<Utc>`'s inherent `to_rfc3339` so a JSON consumer parses it
-                                // like Go's `ipnstate.PeerStatus.LastSeen`. (The Display impl —
-                                // `2026-06-11 05:19:14 UTC`, space-separated — is NOT RFC3339;
-                                // `to_rfc3339` is an inherent method on the type, no chrono feature
-                                // needed, so the earlier "needs a feature" note was wrong.)
-                                last_seen: p.last_seen.map(|t| t.to_rfc3339()),
-                                // Direct endpoint vs DERP relay (Go CurAddr/Relay; mutually exclusive).
-                                cur_addr: p.cur_addr.map(|a| a.to_string()),
-                                relay: p.relay,
-                            })
+                            .map(peer_report_from_status_node)
                             .collect();
                         NetmapProjection {
                             self_ipv4,

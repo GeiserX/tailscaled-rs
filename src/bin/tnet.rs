@@ -800,6 +800,14 @@ enum DebugCmd {
         #[arg(long)]
         ssh: Option<bool>,
     },
+    /// Stream the daemon's IPN notification bus as JSON, one object per line (Go `tailscale debug
+    /// watch-ipn-bus`). Subscribes to the **masked** `watch` path with both initial snapshots
+    /// requested, so the first line is the current state + peer set and each subsequent line carries
+    /// only what changed (state transitions, the full peer set on a netmap change, interactive-login /
+    /// consent URLs). Read-only and long-lived — it runs until interrupted (Ctrl-C) or the daemon
+    /// closes the stream (node torn down / shutdown). Distinct from `tnet status --watch`, which stays
+    /// on the bare status-stream path.
+    WatchIpn,
 }
 
 /// `tnet serve` subcommands. Mirrors the TCP-forward subset of Go `tailscale serve`.
@@ -1616,6 +1624,9 @@ async fn main() -> Result<()> {
                 )
                 .await
             }
+            // `debug watch-ipn` streams the IPN-bus notify path (masked watch) — a long-lived
+            // read-only stream printing one JSON `Notify` per line.
+            DebugCmd::WatchIpn => run_debug_watch_ipn(&socket).await,
         },
         // `install` / `uninstall` (Go `tailscaled install-system-daemon` / `uninstall-system-daemon`):
         // purely LOCAL, privileged file + service-manager work — they never touch the LocalAPI socket.
@@ -5689,7 +5700,8 @@ fn format_status_json(s: &tailscaled_rs::localapi::StatusReport) -> Result<Strin
     Ok(format!("{}\n", serde_json::to_string_pretty(&root)?))
 }
 
-/// Stream status: send `Request::Watch` and print each [`StatusReport`] the daemon pushes (an
+/// Stream status: send a bare `Request::Watch` (no mask fields → the daemon keeps streaming
+/// `Response::Status`, the back-compatible path) and print each [`StatusReport`] the daemon pushes (an
 /// initial snapshot, then one per state transition) until the connection ends or the user
 /// interrupts (Ctrl-C). The daemon closes the stream when the device is torn down. A `---` rule
 /// separates successive snapshots so transitions are visually distinct.
@@ -5699,7 +5711,12 @@ async fn watch_status(socket: &std::path::Path, json: bool, filter: StatusFilter
         .context("connect (is tailnetd running?)")?;
     let (read_half, mut write_half) = stream.into_split();
 
-    let mut line = serde_json::to_vec(&Request::Watch)?;
+    // The BARE watch (no mask fields) — `status --watch` stays on the legacy status-stream path,
+    // serializing to exactly `{"cmd":"watch"}`. The masked notify path is `tnet debug watch-ipn`.
+    let mut line = serde_json::to_vec(&Request::Watch {
+        initial_state: false,
+        initial_netmap: false,
+    })?;
     line.push(b'\n');
     write_half.write_all(&line).await?;
     write_half.flush().await?;
@@ -5751,6 +5768,64 @@ async fn watch_status(socket: &std::path::Path, json: bool, filter: StatusFilter
             // diagnostic Ip/Whois/Ping replies) is unexpected on this connection but harmless — note
             // it and keep streaming.
             other => eprintln!("warning: unexpected reply on status stream: {other:?}"),
+        }
+    }
+    Ok(())
+}
+
+/// `debug watch-ipn` (Go `tailscale debug watch-ipn-bus`): stream the daemon's IPN notification bus,
+/// printing one JSON [`NotifyView`](tailscaled_rs::localapi::NotifyView) per line. Sends the **masked**
+/// `watch` request (`initial_state` + `initial_netmap` both set) so the first frame is the current
+/// state + peer set and each later frame carries only what changed. Reuses `watch_status`'s
+/// streaming-read shape — connect, write the one request line, then read [`Response`] lines until the
+/// daemon closes the stream — but on the Notify path: `Notify` frames print as JSON, an `Error` frame
+/// exits non-zero, and any other reply (impossible on this connection) is noted and skipped.
+async fn run_debug_watch_ipn(socket: &std::path::Path) -> Result<()> {
+    let stream = UnixStream::connect(socket)
+        .await
+        .context("connect (is tailnetd running?)")?;
+    let (read_half, mut write_half) = stream.into_split();
+
+    // The MASKED watch: both initial snapshots requested → the daemon streams `Response::Notify`
+    // frames (not `Response::Status`), front-loading the current state + peer set.
+    let mut line = serde_json::to_vec(&Request::Watch {
+        initial_state: true,
+        initial_netmap: true,
+    })?;
+    line.push(b'\n');
+    write_half.write_all(&line).await?;
+    write_half.flush().await?;
+
+    let mut reader = BufReader::new(read_half);
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        let n = reader.read_line(&mut buf).await?;
+        if n == 0 {
+            // Daemon closed the stream (device torn down / shutdown).
+            break;
+        }
+        let trimmed = buf.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Response>(trimmed)
+            .with_context(|| format!("parsing daemon notify stream line: {trimmed:?}"))?
+        {
+            Response::Notify(_) => {
+                // One JSON object per notification (a JSON consumer reads object-by-object). We parsed
+                // it (above) only to validate the frame is a `Notify` and to route `Error`/unexpected
+                // frames; echo the daemon's exact bytes rather than decode→re-encode (which would
+                // re-order/normalize the JSON and add a dead serialize-error branch).
+                println!("{trimmed}");
+            }
+            Response::Error { message } => {
+                eprintln!("error: {message}");
+                std::process::exit(1);
+            }
+            // The notify stream only carries Notify frames; any other reply is unexpected on this
+            // connection but harmless — note it and keep streaming.
+            other => eprintln!("warning: unexpected reply on notify stream: {other:?}"),
         }
     }
     Ok(())

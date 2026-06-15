@@ -35,11 +35,45 @@ pub enum ConflictPolicy {
 pub enum Request {
     /// Report current state and netmap.
     Status,
-    /// Stream status: the daemon replies with an initial [`StatusReport`] line and then one more
-    /// every time the connection state transitions, until the client disconnects. This is a
-    /// long-lived connection (the analogue of `tailscale status --watch`), not a one-shot. Read-only
-    /// — gated identically to [`Status`](Request::Status).
-    Watch,
+    /// Stream node updates over a long-lived connection (the analogue of `tailscale status --watch`
+    /// and `tailscale debug watch-ipn-bus`), not a one-shot. Read-only — gated identically to
+    /// [`Status`](Request::Status).
+    ///
+    /// ## Two wire-compatible shapes on one verb (the back-compat contract)
+    ///
+    /// `watch` is **dual-path**, switched purely by whether any mask field below is set:
+    ///
+    /// - **Bare** (`{"cmd":"watch"}`, every mask field `false`/omitted) → the daemon streams
+    ///   [`Response::Status`] frames: an initial [`StatusReport`] then one more on every
+    ///   connection-state transition. This is the *unchanged* legacy path `tnet status --watch`
+    ///   speaks. The [`skip_serializing_if`](serde) attributes on the mask fields drop them when
+    ///   `false`, so a freshly-constructed bare watch still serializes to *exactly* `{"cmd":"watch"}`
+    ///   — byte-for-byte what older clients/daemons send and expect (pinned by the
+    ///   `request_watch_wire_format` test).
+    /// - **Masked** (any field `true`) → the daemon instead streams [`Response::Notify`] frames built
+    ///   on the engine's IPN bus ([`Device::watch_ipn_bus`](tailscale::Device::watch_ipn_bus)) — the
+    ///   faithful analogue of Go's `WatchNotifications` with a `NotifyWatchOpt` mask. Each [`NotifyView`]
+    ///   carries only the fields that changed (Go's nil-means-unchanged semantics).
+    ///
+    /// Keeping both on one `cmd` (rather than minting a second verb) mirrors Go, where the single
+    /// `WatchIPNBus` LocalAPI route takes the mask as a parameter; the mask *is* the path selector.
+    Watch {
+        /// Front-load the current connection state (and, in `NeedsLogin`, the auth URL as
+        /// [`NotifyView::browse_to_url`]) as the first [`Response::Notify`] frame. The faithful
+        /// analogue of Go's `ipn.NotifyInitialState` (`1 << 1`), threaded through to the engine's
+        /// [`NotifyWatchOpt::INITIAL_STATE`](tailscale::NotifyWatchOpt::INITIAL_STATE). `#[serde(default)]`
+        /// makes it `false` when omitted (so a bare watch still parses); `skip_serializing_if` drops it
+        /// from the wire when `false`, preserving the exact `{"cmd":"watch"}` legacy encoding.
+        #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+        initial_state: bool,
+        /// Front-load the current peer set as the first [`Response::Notify`] frame's
+        /// [`NotifyView::net_map`]. The faithful analogue of Go's `ipn.NotifyInitialNetMap` (`1 << 3`),
+        /// threaded through to the engine's [`NotifyWatchOpt::INITIAL_NETMAP`](tailscale::NotifyWatchOpt::INITIAL_NETMAP).
+        /// Same `#[serde(default)]` + `skip_serializing_if` back-compat discipline as
+        /// [`initial_state`](Request::Watch::initial_state).
+        #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+        initial_netmap: bool,
+    },
     /// Bring the node up (`WantRunning = true`), optionally (re)setting login/config fields.
     Up {
         /// Pre-auth key for non-interactive registration.
@@ -496,6 +530,11 @@ pub enum Request {
 pub enum Response {
     /// A status snapshot.
     Status(StatusReport),
+    /// A single IPN-bus notification frame — the streamed reply to a **masked** [`Request::Watch`]
+    /// (one with `initial_state`/`initial_netmap` set), the faithful analogue of Go's
+    /// `WatchNotifications` feed. Only ever sent on the masked watch path; the bare watch path streams
+    /// [`Status`](Response::Status) instead.
+    Notify(NotifyView),
     /// This node's own tailnet addresses (reply to [`Request::Ip`]).
     Ip {
         /// Tailnet IPv4, if assigned.
@@ -1282,8 +1321,71 @@ pub struct ProfileEntry {
     pub current: bool,
 }
 
+/// One IPN-bus notification, the body of a [`Response::Notify`] frame — the LocalAPI wire shape of
+/// the engine's [`tailscale::Notify`] and the faithful analogue of Go's `ipn.Notify` as streamed by
+/// `WatchNotifications`.
+///
+/// ## Nil-means-unchanged
+///
+/// Every field is `Option` and **set only when that thing changed in this event**; a `None` field
+/// means "unchanged since the last frame", exactly like Go's `*ipn.Notify` whose fields are nil
+/// pointers unless updated. A consumer keeps its own running view and applies each frame's non-`None`
+/// fields over it. The daemon never emits an all-`None` frame (the engine's bus skips empty
+/// notifications), so at least one field is always populated.
+///
+/// ## What Phase 1 carries — and what it deliberately does not
+///
+/// The engine's [`Notify`](tailscale::Notify) (v0.39.0) has exactly three fields — `state`,
+/// `net_map`, `browse_to_url` — so this view fills exactly those (with `state`'s terminal-failure
+/// reason split out into [`error`](NotifyView::error), mirroring how [`StatusReport`] already
+/// separates `state` from `error`). It has **no `prefs` field**: a prefs-change broadcast is a later
+/// phase, not this one.
+///
+/// The richer Go `Notify` fields (`Health`, `PeerChangedPatch`, `Engine`, `FilesWaiting`,
+/// `SuggestedExitNode`, …) are intentionally **absent**: the fork's engine does not surface them on
+/// its bus (there is no incremental peer-patch feed, no engine-status or health stream here), so
+/// faithfully reflecting "what the engine actually knows" means omitting them rather than fabricating
+/// empty values. In particular [`net_map`](NotifyView::net_map) is always the **full** peer set, never
+/// a delta — the engine has no `PeerChangedPatch` analogue.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct NotifyView {
+    /// The new connection state, if it changed this frame: one of the seven `ipn.State` names
+    /// (`NoState` / `NeedsLogin` / `NeedsMachineAuth` / `InUseOtherUser` / `Starting` / `Running` /
+    /// `Stopped`) — the SAME string [`StatusReport::state`] uses, derived from the engine's
+    /// `DeviceState` via the shared `state_from_device` mapping so the two surfaces can never drift.
+    /// `None` when this frame did not carry a state change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// A terminal registration-failure reason accompanying [`state`](NotifyView::state), if any —
+    /// the analogue of Go's `ipnstate.Status.ErrMessage`. Populated (alongside a `NeedsLogin` state)
+    /// only for a **permanent** failure (bad/expired/unknown key); `None` otherwise. Comes from the
+    /// same `state_from_device` mapping `StatusReport` uses, so a hard failure (`error` set, no
+    /// `browse_to_url`) reads distinctly from an interactive-login prompt (`browse_to_url` set, no
+    /// `error`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// An interactive-login / consent URL the operator should open (Go `Notify.BrowseToURL`), if this
+    /// frame carried one. Two sources feed it in the engine: the registration-time auth URL derived
+    /// from `NeedsLogin` (set alongside `state`), and a mid-session `MapResponse.PopBrowserURL`
+    /// (re-auth on an already-running node, streamed standalone). `None` when this frame carried no
+    /// URL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browse_to_url: Option<String>,
+    /// The **full** current peer set, if the netmap changed this frame (Go `Notify.NetMap`). Each
+    /// entry reuses the same [`PeerReport`] projection [`StatusReport::peers`] uses, from the identical
+    /// `StatusNode` → `PeerReport` mapping (see [`crate::ipn`]'s status projection), so the watch feed
+    /// and a one-shot `status` describe peers identically. NOT a delta — always the entire set (the
+    /// engine has no incremental peer-patch feed). `None` when this frame carried no netmap change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub net_map: Option<Vec<PeerReport>>,
+}
+
 /// A single peer entry in a [`StatusReport`].
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// Derives `PartialEq` so it can nest inside [`NotifyView`]'s `Option<Vec<PeerReport>>` (which is
+/// `PartialEq` for frame-equality in tests); all fields are `PartialEq` scalars/strings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct PeerReport {
     /// Display name (FQDN if known, else bare hostname).
     pub name: String,
@@ -1443,15 +1545,49 @@ mod tests {
 
     #[test]
     fn request_watch_wire_format() {
-        // `watch` is the streaming-status command; assert its discriminant so daemon + CLI agree.
+        // `watch` is the streaming command; assert its discriminant so daemon + CLI agree. The mask
+        // fields gained in Phase 1 (`initial_state`/`initial_netmap`) are `skip_serializing_if`-false,
+        // so a BARE watch must still serialize to EXACTLY `{"cmd":"watch"}` (byte-for-byte the legacy
+        // encoding `tnet status --watch` speaks) and a legacy `{"cmd":"watch"}` line must still parse —
+        // the dual-path back-compat contract.
         assert_eq!(
-            serde_json::to_string(&Request::Watch).unwrap(),
+            serde_json::to_string(&Request::Watch {
+                initial_state: false,
+                initial_netmap: false,
+            })
+            .unwrap(),
             r#"{"cmd":"watch"}"#
         );
         assert!(matches!(
             serde_json::from_str::<Request>(r#"{"cmd":"watch"}"#).unwrap(),
-            Request::Watch
+            Request::Watch {
+                initial_state: false,
+                initial_netmap: false,
+            }
         ));
+        // A masked watch round-trips its bits (the Notify-path selector): each `true` field appears on
+        // the wire, and the masked request decodes back to the same flags.
+        assert_eq!(
+            serde_json::to_string(&Request::Watch {
+                initial_state: true,
+                initial_netmap: true,
+            })
+            .unwrap(),
+            r#"{"cmd":"watch","initial_state":true,"initial_netmap":true}"#
+        );
+        match serde_json::from_str::<Request>(
+            r#"{"cmd":"watch","initial_state":true,"initial_netmap":true}"#,
+        )
+        .unwrap()
+        {
+            Request::Watch {
+                initial_state,
+                initial_netmap,
+            } => {
+                assert!(initial_state && initial_netmap);
+            }
+            other => panic!("expected masked Watch, got {other:?}"),
+        }
     }
 
     #[test]

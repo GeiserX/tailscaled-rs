@@ -130,7 +130,10 @@ pub(crate) fn requires_write(request: &crate::localapi::Request) -> bool {
         // classified exactly like `status`/`watch` (ping sends overlay traffic but changes nothing).
         // `FileList` only enumerates the receive directory — a read, like `status`.
         Request::Status
-        | Request::Watch
+        // Both watch paths (bare status-stream and masked notify-stream) are reads — the mask fields
+        // only select which feed streams, never whether it mutates — so match the struct variant
+        // ignoring them.
+        | Request::Watch { .. }
         | Request::Ip
         | Request::Whois { .. }
         | Request::Ping { .. }
@@ -378,8 +381,19 @@ mod tests {
         // `ip`/`whois`/`ping`/`version` mutate no state — they must classify as reads, like
         // `status`/`watch`.
         assert!(
-            !requires_write(&Request::Watch),
-            "watch only streams status snapshots — a read, gated exactly like status"
+            !requires_write(&Request::Watch {
+                initial_state: false,
+                initial_netmap: false,
+            }),
+            "bare watch only streams status snapshots — a read, gated exactly like status"
+        );
+        // A masked watch (the Notify path) is equally a read — the mask never makes it mutate.
+        assert!(
+            !requires_write(&Request::Watch {
+                initial_state: true,
+                initial_netmap: true,
+            }),
+            "masked watch only streams notifications — still a read"
         );
         assert!(!requires_write(&Request::Ip));
         assert!(!requires_write(&Request::Whois {
