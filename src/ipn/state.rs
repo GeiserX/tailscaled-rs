@@ -23,10 +23,11 @@ pub enum State {
     /// future refinement could surface a dedicated "bringing up" signal as `Starting`.
     NeedsLogin,
     /// Registered to control, but the machine is not yet authorized by a tailnet admin (Go's
-    /// `ipn.NeedsMachineAuth`). See the `// LIMITATION:` note on [`Backend::derive_state`](super::Backend):
-    /// the engine does not surface this from a status snapshot, and no current code path produces it; it
-    /// would require [`Backend::up`](super::Backend::up) to branch on a typed registration error. Kept for `ipn.State`
-    /// parity.
+    /// `ipn.NeedsMachineAuth`). **Produced** by [`state_from_device`] when the engine reports
+    /// `DeviceState::NeedsMachineAuth` (engine ≥ v0.40.0) — a node awaiting admin approval on an
+    /// approval-gated tailnet, with no interactive auth URL (an admin must approve it out of band).
+    /// NOT produced by [`derive_state_from`], which sees only netmap-presence and cannot distinguish
+    /// this from `Starting` — see the `// LIMITATION:` note on [`Backend::derive_state`](super::Backend).
     NeedsMachineAuth,
     /// The node key is already in use by a different user/profile (Go's `ipn.InUseOtherUser`).
     /// Unreachable in this single-user, auth-key-only daemon; kept only for `ipn.State` parity.
@@ -441,6 +442,37 @@ mod tests {
         assert!(
             err.is_none(),
             "key expiry is a re-auth prompt, not a terminal failure → no error reason"
+        );
+    }
+
+    #[test]
+    fn device_needs_machine_auth_is_needs_machine_auth_no_url_no_error() {
+        // Awaiting admin approval on an approval-gated tailnet: control offered NO interactive URL
+        // (an admin must approve out of band). Go local.go nextStateLocked → ipn.NeedsMachineAuth,
+        // set with no auth URL and no ErrMessage (enterStateLocked treats it like Starting). So we
+        // surface State::NeedsMachineAuth with neither an auth_url nor an error — it is transient.
+        let (st, url, err) = state_from_device(tailscale::DeviceState::NeedsMachineAuth);
+        assert_eq!(st, State::NeedsMachineAuth);
+        assert!(url.is_none(), "no interactive URL exists for machine-auth");
+        assert!(
+            err.is_none(),
+            "awaiting admin approval is transient, not a failure"
+        );
+    }
+
+    #[test]
+    fn device_reauthenticating_is_starting_no_url_no_error() {
+        // Non-interactive auto re-auth in flight (stored authkey, auto-reauth on, TKA not enforcing):
+        // the engine is rotating the key + re-registering and will flip back to Running itself. Go's
+        // equivalent (AuthCantContinue()==false, netMap nil) stays in the Starting/converging path,
+        // never NeedsLogin — so map it to Starting with no url/error (prompting the operator would be
+        // wrong; a genuinely stuck re-auth surfaces separately as Expired → NeedsLogin).
+        let (st, url, err) = state_from_device(tailscale::DeviceState::Reauthenticating);
+        assert_eq!(st, State::Starting);
+        assert!(url.is_none());
+        assert!(
+            err.is_none(),
+            "an in-flight auto re-auth is convergence, not a failure"
         );
     }
 
