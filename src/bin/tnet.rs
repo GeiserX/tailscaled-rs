@@ -6237,6 +6237,34 @@ fn render_status_html(s: &tailscaled_rs::localapi::StatusReport) -> String {
     }
     h.push_str("</table>");
 
+    // Login affordance (Go `tailscale web` LoginServerMode): when the node needs interactive login,
+    // surface the auth URL as a clickable link — the ONE action LoginServerMode exposes. This is
+    // display-only (a link, NOT a mutating POST): the page does not change any pref, so it stays the
+    // faithful read+login face and adds no unauthenticated-mutation surface (the full mutating manage
+    // UI is Go's over-Tailscale ManageServerMode, engine-gated here — see ENGINE_ASKS). A terminal
+    // registration failure is shown distinctly (it is NOT a pending login; re-running won't help).
+    if let Some(url) = &s.auth_url {
+        // `rel="noopener noreferrer"` so the opened auth page can't reach back into this origin.
+        h.push_str(&format!(
+            "<div style=\"margin-top:1rem;padding:12px;border:1px solid #d49b00;background:#fff8e1;\">\
+             <strong>This node needs to be authenticated.</strong><br>\
+             <a href=\"{href}\" target=\"_blank\" rel=\"noopener noreferrer\">Log in to authenticate this node</a>\
+             <br><span class=\"k\">The node finishes connecting automatically once authorized; reload to check.</span>\
+             </div>",
+            // `auth_url` is control-supplied — escape it as an HTML attribute so it can't break out of
+            // the href and inject markup/script.
+            href = html_escape(url),
+        ));
+    } else if let Some(err) = &s.error {
+        h.push_str(&format!(
+            "<div style=\"margin-top:1rem;padding:12px;border:1px solid #c0392b;background:#fdecea;\">\
+             <strong>Registration failed:</strong> {}<br>\
+             <span class=\"k\">This is a permanent failure — re-authenticate with a fresh key \
+             (`tnet up --authkey &lt;NEW_KEY&gt;`); the same key will keep failing.</span></div>",
+            html_escape(err),
+        ));
+    }
+
     h.push_str(&format!("<h2>peers ({})</h2>", s.peers.len()));
     if s.peers.is_empty() {
         h.push_str("<p>no peers</p>");
@@ -10020,6 +10048,51 @@ mod tests {
         let empty_html = render_status_html(&empty);
         assert!(empty_html.starts_with("<!DOCTYPE html>"));
         assert!(empty_html.contains("NeedsLogin") && empty_html.contains("no peers"));
+    }
+
+    #[test]
+    fn render_status_html_login_affordance() {
+        use tailscaled_rs::localapi::StatusReport;
+        // NeedsLogin + an auth_url → the page surfaces a clickable login LINK (the one action Go's
+        // LoginServerMode exposes), display-only (no form/POST — no mutating surface). A
+        // control-supplied auth_url is escaped into the href attribute (can't inject markup).
+        let needs_login = StatusReport {
+            state: "NeedsLogin".to_string(),
+            auth_url: Some("https://login.example.com/a/\"><script>x".to_string()),
+            ..Default::default()
+        };
+        let html = render_status_html(&needs_login);
+        assert!(
+            html.contains("needs to be authenticated") && html.contains("Log in to authenticate"),
+            "the login affordance must render when auth_url is set"
+        );
+        assert!(
+            html.contains("href=\"https://login.example.com/a/&quot;&gt;&lt;script&gt;x\""),
+            "the control-supplied auth_url must be HTML-attribute-escaped (no markup break-out): {html}"
+        );
+        assert!(
+            !html.contains("<script>x"),
+            "a hostile auth_url must not inject raw markup: {html}"
+        );
+        // No mutating form anywhere — this is the read+login face, not a control surface.
+        assert!(
+            !html.to_lowercase().contains("<form"),
+            "the loopback web UI must expose NO mutating form (mutation is the over-Tailscale manage \
+             UI, engine-gated): {html}"
+        );
+
+        // A terminal registration failure renders distinctly (NOT a pending-login link), escaped.
+        let failed = StatusReport {
+            state: "NeedsLogin".to_string(),
+            error: Some("bad key <x>".to_string()),
+            ..Default::default()
+        };
+        let fhtml = render_status_html(&failed);
+        assert!(fhtml.contains("Registration failed") && fhtml.contains("bad key &lt;x&gt;"));
+        assert!(
+            !fhtml.contains("Log in to authenticate"),
+            "a terminal failure must not offer a login link (re-running won't help)"
+        );
     }
 
     #[test]
