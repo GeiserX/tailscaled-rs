@@ -4282,6 +4282,22 @@ async fn run_file(socket: &std::path::Path, cmd: FileCmd) -> Result<()> {
             conflict,
             delete_after,
         } => match dest {
+            // A literal `-` dest means "stream to stdout" in the CLI convention (Go's `file get` uses
+            // it; `tnet cert -` does too). The single-file fetch is a daemon-writes-the-path operation
+            // (the daemon, not the CLI, has the Taildrop store), so `-` cannot mean the CLI's stdout
+            // without a new stream-back-to-client protocol — and silently sending `dest="-"` to the
+            // daemon would write a file literally NAMED `-` in the daemon's cwd (a footgun: the user
+            // expects stdout, gets a stray file on the daemon host). So reject `-` clearly with the
+            // working alternative, rather than do the surprising thing. (Faithful: we never pretend to
+            // support a mode we don't; stdout streaming is tracked as a larger follow-up if wanted.)
+            Some(dest) if dest == "-" => {
+                eprintln!(
+                    "file get: streaming to stdout (`-`) is not supported — the daemon writes the \
+                     file directly, so give a real destination path (`tnet file get <name> \
+                     ./out`), or drain the whole inbox to a directory (`tnet file get <dir>`)"
+                );
+                std::process::exit(1);
+            }
             // Two positionals (`get <name> <dest>`) → the single-file fetch (fork convenience).
             Some(dest) => Request::FileGet {
                 name: target,
