@@ -224,9 +224,18 @@ async fn handle_conn(
                 }
                 match serde_json::from_str::<Request>(text) {
                     // `Watch` is terminal for this connection: it takes over the socket and streams
-                    // status lines until the client disconnects (or shutdown). It is read-only, so
-                    // it is gated exactly like `Status` — anyone who may read may watch.
-                    Ok(Request::Watch) => {
+                    // until the client disconnects (or shutdown). It is read-only, so it is gated
+                    // exactly like `Status` — anyone who may read may watch.
+                    //
+                    // DUAL-PATH dispatch (the mask is the selector): a BARE watch (no mask fields)
+                    // streams `Response::Status` via the UNCHANGED `stream_watch` (byte-for-byte
+                    // back-compat for `tnet status --watch`); a MASKED watch (any field set) streams
+                    // `Response::Notify` via `stream_notify`, built on the engine's IPN bus. Both take
+                    // a stream permit first, so the permit accounting is identical on either path.
+                    Ok(Request::Watch {
+                        initial_state,
+                        initial_netmap,
+                    }) => {
                         // A long-lived stream: take a permit from the SEPARATE stream budget so a
                         // flood of `Watch` connections can't starve the short-lived control pool. If
                         // the stream budget is exhausted, refuse cleanly (the client can retry) rather
@@ -244,7 +253,14 @@ async fn handle_conn(
                             .await?;
                             break;
                         };
-                        stream_watch(&mut write_half, &backend).await?;
+                        if !initial_state && !initial_netmap {
+                            // Bare watch → the legacy status-stream path, untouched.
+                            stream_watch(&mut write_half, &backend).await?;
+                        } else {
+                            // Masked watch → the IPN-bus notify-stream path.
+                            stream_notify(&mut write_half, &backend, initial_state, initial_netmap)
+                                .await?;
+                        }
                         break;
                     }
                     // `nc` is terminal for this connection like `Watch`, but it is a WRITE (it opens
@@ -412,6 +428,186 @@ async fn stream_watch(
             },
         }
     }
+}
+
+/// Stream IPN-bus notifications over a connection — the **masked** `watch` path (the analogue of Go
+/// `tailscale debug watch-ipn-bus` / `WatchNotifications`). Emits [`Response::Notify`] frames built on
+/// the engine's [`Device::watch_ipn_bus`](tailscale::Device::watch_ipn_bus), surviving device
+/// replacement (`down`+`up`), until the client disconnects or the daemon shuts down. The bare-watch
+/// counterpart [`stream_watch`] (which streams [`Response::Status`]) is untouched.
+///
+/// ## Same device-epoch shape as `stream_watch`
+///
+/// The engine's IPN bus, like its `DeviceState` receiver, is **per-device**: each `up` builds a fresh
+/// [`Device`](tailscale::Device) with a fresh bus, and a watch may begin before the first `up` (no
+/// device yet). So this mirrors [`stream_watch`]'s two-level structure: subscribe to the backend
+/// **lifecycle** ([`Backend::watch_lifecycle`], bumped on every `up`/`down`) first, then per "device
+/// epoch" derive the current device, attach a fresh bus watcher, and stream it until a lifecycle
+/// change supersedes the epoch (re-derive at the top) or the device's bus closes.
+///
+/// ## What replaces `stream_watch`'s "snapshot FIRST" rule
+///
+/// `stream_watch` must emit a `status()` snapshot before awaiting `changed()` because a freshly-cloned
+/// `watch` receiver's first `changed()` may not deliver the current value. The IPN bus has no such
+/// hazard: the `mask` ([`NotifyWatchOpt::INITIAL_STATE`](tailscale::NotifyWatchOpt::INITIAL_STATE) /
+/// [`INITIAL_NETMAP`](tailscale::NotifyWatchOpt::INITIAL_NETMAP)) front-loads the current state/peer
+/// set as the watcher's first [`Notify`](tailscale::Notify) on subscribe (Go's `NotifyInitialState` /
+/// `NotifyInitialNetMap`). So each new epoch re-subscribes WITH the mask and the engine re-delivers a
+/// fresh initial snapshot for the replacement device — no manual snapshot needed here.
+///
+/// ## Lock discipline (the load-bearing rule)
+///
+/// The backend guard is held only for the brief `watch_lifecycle()` subscribe and the brief
+/// `device_handle()` clone — **never** across `dev.watch_ipn_bus(mask).await` (which is async and
+/// constructs the per-watcher channel) nor across `watcher.next()`/`life.changed()`. We clone the
+/// device `Arc` out under the lock, drop the lock, then subscribe + stream off-lock — exactly the
+/// "clone the work out, drop the lock" discipline [`stream_nc`] and the other slow engine calls use —
+/// so a notify watcher never head-of-line blocks a concurrent `up`/`down`/`status`.
+async fn stream_notify(
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    backend: &Arc<Mutex<Backend>>,
+    initial_state: bool,
+    initial_netmap: bool,
+) -> Result<()> {
+    use tailscale::NotifyWatchOpt;
+
+    // Translate the request's mask bools into the engine's `NotifyWatchOpt` once (the same mask is
+    // re-applied to every epoch's fresh subscription so a replacement device front-loads its snapshot
+    // too). `empty()` carries no initial snapshot; each requested bit adds its front-load.
+    let mut mask = NotifyWatchOpt::empty();
+    if initial_state {
+        mask = mask | NotifyWatchOpt::INITIAL_STATE;
+    }
+    if initial_netmap {
+        mask = mask | NotifyWatchOpt::INITIAL_NETMAP;
+    }
+
+    // Subscribe to lifecycle BEFORE deriving the first device so an up/down landing between the device
+    // clone and the subscribe is never lost (`subscribe()` starts synced to the current generation) —
+    // the same ordering `stream_watch` relies on.
+    let mut life = {
+        let be = backend.lock().await;
+        be.watch_lifecycle()
+    };
+
+    // Outer loop: one "device epoch" per iteration. Re-entered whenever the device is replaced
+    // (down+up) or torn down (down) — re-deriving the current device + a fresh bus watcher each time.
+    loop {
+        // BRIEF LOCK: clone the live device handle out, then DROP the lock before any await. The
+        // `watch_ipn_bus` subscribe (async) and the subsequent streaming MUST run off-lock.
+        let dev = { backend.lock().await.device_handle() };
+
+        let Some(dev) = dev else {
+            // No device this epoch: nothing to stream. Wait only for the next lifecycle change, then
+            // re-derive at the top (an `up` may now have installed a device). Mirrors `stream_watch`'s
+            // None arm.
+            if life.changed().await.is_err() {
+                return Ok(()); // lifecycle sender dropped (daemon gone)
+            }
+            continue;
+        };
+
+        // Attach a fresh IPN-bus watcher OFF-LOCK. The mask front-loads this device's current
+        // state/peer set as the first `Notify` (so a replacement device re-snapshots). On failure the
+        // device is already gone/closing — fall through to wait on the next lifecycle change.
+        let mut watcher = match dev.watch_ipn_bus(mask).await {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::debug!(error = %e, "watch_ipn_bus failed; awaiting lifecycle change");
+                if life.changed().await.is_err() {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
+        // Release the device Arc before parking on the selects below: holding it would keep the old
+        // engine alive across a concurrent `down` (the documented `Arc::into_inner` clone-count
+        // concern in `device_handle`). The watcher reads cloned `watch` receivers internally, so it
+        // does not need our `Arc` to keep streaming.
+        drop(dev);
+
+        // Inner loop: stream this epoch's notifications, but also break out on a lifecycle change so a
+        // replacement device is re-derived by the outer loop.
+        loop {
+            tokio::select! {
+                next = watcher.next() => {
+                    match next {
+                        // The device's bus closed (runtime shut down or every source sender dropped).
+                        // Re-derive at the top: either a new device exists, or we fall into the None
+                        // arm and wait.
+                        None => break,
+                        Some(notify) => {
+                            let Some(view) = project_notify(notify) else {
+                                // An all-empty Notify never occurs (the engine's bus skips empties),
+                                // but if one ever arrived there is nothing to send — skip it rather
+                                // than emit a meaningless frame.
+                                continue;
+                            };
+                            if write_response(write_half, &Response::Notify(view))
+                                .await
+                                .is_err()
+                            {
+                                return Ok(()); // client hung up
+                            }
+                        }
+                    }
+                }
+                res = life.changed() => {
+                    if res.is_err() {
+                        return Ok(()); // lifecycle sender dropped (daemon gone)
+                    }
+                    // A down+up replaced the device — supersede this epoch; the outer loop re-derives
+                    // the new device, re-subscribes with the mask, and re-snapshots it.
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Project one engine [`Notify`](tailscale::Notify) into the LocalAPI [`NotifyView`] wire shape,
+/// returning `None` for the (engine-impossible) all-empty notification so the caller can skip it.
+///
+/// The three engine fields map straight across: `state` is run through
+/// [`ipn::notify_state_from_device`] to reuse `status()`'s exact state-name + terminal-`error`
+/// mapping; `net_map` reuses [`ipn::peer_report_from_status_node`] (the identical `StatusNode` →
+/// [`PeerReport`](crate::localapi::PeerReport) projection `status()` uses) so the watch feed and a
+/// one-shot `status` describe peers identically; `browse_to_url` is rendered with `to_string()`. The
+/// engine carries the interactive-login URL in its own `browse_to_url` field (derived from
+/// `NeedsLogin`), so the auth-URL component of the state mapping is intentionally dropped here — the
+/// URL is sourced from `browse_to_url`, never duplicated out of `state`.
+fn project_notify(notify: tailscale::Notify) -> Option<crate::localapi::NotifyView> {
+    let (state, error) = match notify.state {
+        Some(ds) => {
+            let (state, error) = ipn::notify_state_from_device(ds);
+            (Some(state), error)
+        }
+        None => (None, None),
+    };
+    let net_map = notify.net_map.map(|nodes| {
+        nodes
+            .into_iter()
+            .map(ipn::peer_report_from_status_node)
+            .collect()
+    });
+    let browse_to_url = notify.browse_to_url.map(|u| u.to_string());
+
+    let view = crate::localapi::NotifyView {
+        state,
+        error,
+        browse_to_url,
+        net_map,
+    };
+    // The engine never emits an all-`None` Notify, but guard the projection anyway: a frame with no
+    // populated field carries nothing for a consumer to apply.
+    if view.state.is_none()
+        && view.error.is_none()
+        && view.browse_to_url.is_none()
+        && view.net_map.is_none()
+    {
+        return None;
+    }
+    Some(view)
 }
 
 /// Connect to `host:port` over the tailnet and, on success, splice the LocalAPI connection to the
@@ -602,10 +798,11 @@ async fn dispatch(
             let be = backend.lock().await;
             Response::Status(be.status().await)
         }
-        // `Watch` is intercepted in `handle_conn` (it takes over the connection to stream) and never
-        // reaches `dispatch`; this arm exists only for match exhaustiveness. Treat a stray `Watch`
-        // here as a single status snapshot rather than erroring.
-        Request::Watch => {
+        // `Watch` (either path — bare status-stream or masked notify-stream) is intercepted in
+        // `handle_conn` (it takes over the connection to stream) and never reaches `dispatch`; this
+        // arm exists only for match exhaustiveness. Treat a stray `Watch` here as a single status
+        // snapshot rather than erroring, regardless of its mask.
+        Request::Watch { .. } => {
             let be = backend.lock().await;
             Response::Status(be.status().await)
         }
