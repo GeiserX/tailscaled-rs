@@ -518,6 +518,14 @@ pub enum Request {
     /// node restart. A **write** (mutates live datapath state): gated like `down`/`logout`. Needs the
     /// node up. Replies with [`Response::Ok`]/[`Response::Error`].
     DebugRebind,
+    /// Force an immediate STUN re-probe / endpoint re-derivation WITHOUT rebinding the socket (Go
+    /// `tailscale debug restun` → magicsock `Conn.ReSTUN`), rendered by `tnet debug restun`. Strictly
+    /// lighter than [`DebugRebind`](Self::DebugRebind): it keeps the existing UDP socket + its NAT
+    /// mapping and only re-runs the STUN sweep now (re-learning this node's reflexive/public address)
+    /// instead of waiting out the periodic prober — the knob to reach for when the public endpoint may
+    /// have changed but the socket is still fine. A **write** (mutates live datapath state): gated like
+    /// `down`/`logout`. Needs the node up. Replies with [`Response::Ok`]/[`Response::Error`].
+    DebugReStun,
     /// Re-read the daemon's `--config` file and adopt the changed fields into the running node (Go
     /// `tailscaled`'s `reload-config` LocalAPI route → `LocalBackend.ReloadConfig` → `setConfigLocked`,
     /// v1.100.0). Rendered by `tnet reload-config`. The daemon re-loads the same declarative config it

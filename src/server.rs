@@ -991,6 +991,17 @@ async fn dispatch(
                 },
             }
         }
+        // `debug restun`: force a STUN re-probe without rebinding the socket. Same off-lock,
+        // node-must-be-up shape as `DebugRebind`; the write-gate is enforced above by `auth::authorize`.
+        Request::DebugReStun => {
+            let dev = { backend.lock().await.device_handle() };
+            match dev {
+                Some(dev) => Backend::re_stun(&dev).await,
+                None => Response::Error {
+                    message: "node is not up".into(),
+                },
+            }
+        }
         // `reload-config` (Go `tailscaled`'s `reload-config` → `LocalBackend.ReloadConfig`): re-read the
         // `--config` file and adopt the changed fields into the running node. Like `Set`, this can drive
         // an off-lock device rebuild (when the node is up), so it goes through the `ipn::drive_reload_config`
