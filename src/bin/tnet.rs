@@ -1348,18 +1348,70 @@ fn ssh_client_is_tailscale(ssh_client: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether this CLI is running over a Tailscale-SSH session (Go `isSSHOverTailscale`): reads
-/// `$SSH_CLIENT` and delegates to [`ssh_client_is_tailscale`]. Reads the process environment, so it is
-/// not pure — but the decision logic it wraps is. (Go additionally walks `/proc/<sid>/environ` under
-/// sudo; this fork reads only `$SSH_CLIENT`. Concretely: `sudo` strips `SSH_CLIENT` from the
-/// environment, so `sudo tnet up --force-reauth` over a Tailscale SSH session will NOT be refused
-/// here even though Go's would. That is the fail-*open* direction — the gate is advisory, not a
-/// security boundary (the operator can always bypass it with `--accept-risk` anyway), so a missed
-/// refusal costs only a warning, and the lock-out it guards against is recoverable out-of-band.)
+/// Whether this CLI is running over a Tailscale-SSH session (Go `isSSHOverTailscale`): resolves the
+/// `SSH_CLIENT` value via [`ssh_client_env_value`] and delegates the IP test to
+/// [`ssh_client_is_tailscale`]. Reads the process environment (+ `/proc` under sudo on Linux), so it
+/// is not pure — but the decision logic it wraps is.
 fn is_ssh_over_tailscale() -> bool {
-    std::env::var("SSH_CLIENT")
+    ssh_client_env_value()
         .map(|c| ssh_client_is_tailscale(&c))
         .unwrap_or(false)
+}
+
+/// Resolve the `SSH_CLIENT` value, the Rust analogue of Go's `getSSHClientEnvVar`. Normally this is
+/// just `std::env::var("SSH_CLIENT")`, but `sudo` STRIPS `SSH_CLIENT` from the environment — so a
+/// `sudo tnet up --force-reauth` / `sudo tnet ssh` over a Tailscale-SSH session would otherwise lose
+/// the very signal the lock-out guard depends on. To match Go, on **Linux when `SUDO_USER` is set**
+/// (the sudo case, and the only case where the var was stripped) we fall back to reading the login
+/// session leader's environment from `/proc/<sid>/environ` and parsing it for `SSH_CLIENT=` — the
+/// session leader is the original login shell, which still has the var. `getsid(getpid())` gives that
+/// pid; the environ file is NUL-separated. Best-effort + fail-OPEN throughout (a missing/unreadable
+/// `/proc`, a no-`SSH_CLIENT` environ, or a non-sudo/non-Linux host yields `None`): this gate is
+/// advisory, not a security boundary (the operator can always bypass it with `--accept-risk`), so a
+/// missed refusal only costs a warning and the lock-out it guards is recoverable out-of-band.
+fn ssh_client_env_value() -> Option<String> {
+    // The plain env var first — present for a direct SSH session (no sudo).
+    if let Ok(v) = std::env::var("SSH_CLIENT")
+        && !v.is_empty()
+    {
+        return Some(v);
+    }
+    // Sudo stripped it: walk the session leader's environ (Linux only, only when under sudo).
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("SUDO_USER").is_some() {
+            return ssh_client_from_session_leader_environ();
+        }
+    }
+    None
+}
+
+/// Read `SSH_CLIENT` from the login session leader's `/proc/<sid>/environ` (Go's `/proc` fallback in
+/// `ssh_unix.go`). The session leader (`getsid(getpid())`) is the original login shell, which retains
+/// `SSH_CLIENT` even when the current `sudo`-elevated process does not. The environ file is a
+/// NUL-separated list of `KEY=VALUE` entries. Fail-OPEN: any error (no `/proc`, permission denied, no
+/// `SSH_CLIENT` entry) yields `None`. Linux-only.
+#[cfg(target_os = "linux")]
+fn ssh_client_from_session_leader_environ() -> Option<String> {
+    // SAFETY: getsid() with a real pid (our own) is infallible in practice and has no preconditions;
+    // it returns the session id (or -1 on error, which we treat as "no session" → fail open).
+    let sid = unsafe { libc::getsid(libc::getpid()) };
+    if sid < 0 {
+        return None;
+    }
+    let path = format!("/proc/{sid}/environ");
+    let bytes = std::fs::read(&path).ok()?;
+    // environ is NUL-separated `KEY=VALUE` entries; find the `SSH_CLIENT=` one and return its value.
+    const PREFIX: &[u8] = b"SSH_CLIENT=";
+    for entry in bytes.split(|&b| b == 0) {
+        if let Some(value) = entry.strip_prefix(PREFIX) {
+            // The value is the SSH_CLIENT string (`<ip> <cport> <sport>`); lossy-decode (it is ASCII
+            // in practice) and reject an empty one.
+            let v = String::from_utf8_lossy(value).into_owned();
+            return (!v.is_empty()).then_some(v);
+        }
+    }
+    None
 }
 
 /// Whether a named `risk` is in the operator's `--accept-risk` value — the Rust analogue of Go's
