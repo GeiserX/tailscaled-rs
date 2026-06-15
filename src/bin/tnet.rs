@@ -3411,6 +3411,25 @@ async fn run_ping(
     count: u32,
     until_direct: bool,
 ) -> Result<()> {
+    // Self-IP early return (Go ping.go: `if self { printf("%v is local Tailscale IP\n", ip); return nil }`).
+    // Pinging the node's OWN tailnet IP is a no-op that would otherwise hit the local netstack echo;
+    // Go short-circuits with a clear note + exit 0. We compare the target against this node's own
+    // addresses (Request::Ip). Parse both sides to an IpAddr so spelling variants normalize; a target
+    // that isn't a bare IP (or a status round-trip failure) simply falls through to the normal ping.
+    if let Ok(want) = ip.parse::<std::net::IpAddr>()
+        && let Ok(Response::Ip { ipv4, ipv6 }) = round_trip(socket, &Request::Ip).await
+    {
+        let is_self = [ipv4.as_deref(), ipv6.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter_map(|s| s.parse::<std::net::IpAddr>().ok())
+            .any(|self_ip| self_ip == want);
+        if is_self {
+            println!("{want} is local Tailscale IP");
+            return Ok(());
+        }
+    }
+
     let infinite = count == 0;
     let mut received = 0u32;
     let mut went_direct = false;
