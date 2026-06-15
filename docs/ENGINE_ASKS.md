@@ -794,3 +794,32 @@ delta-efficient.
 **Daemon impact once landed:** `NotifyView` grows `peers_changed`/`peers_removed` fields; `stream_notify`
 forwards them. Until then the daemon's full-`net_map` push is the faithful (if less efficient) behavior — an
 honest reduction, not a fake. Tracked in daemon bead tsd-iqq.11 (Phase 3). — daemon lane
+
+---
+
+## 29. Web-client session auth + owner identity — for the over-Tailscale management web UI (Go `ManageServerMode`)
+
+**Why:** Go's `tailscale web` has two faces. The loopback CLI server (`LoginServerMode`) is read-only + a
+login link — the daemon ships that faithfully (`tnet web` / `status --web`, incl. the login affordance, bead
+tsd-bvc). The FULL mutating UI is Go's **`ManageServerMode`**, hosted by the daemon on the node's tailnet
+IP:5252 (Go `RunWebClient` pref / `tailscale set --webclient`), reachable **over Tailscale only**, behind a
+**browser session cookie** completed through the control server's webclient auth-URL flow
+(`client/web/web.go serveTailscaleAuth` → Noise round-trips to control `…/machine/webclient/init|wait`).
+Adding mutation to the daemon's UNAUTHENTICATED loopback server would *exceed* Go (it bypasses the LocalAPI
+`SO_PEERCRED` write-gate — any local user / a CSRF'd browser could reconfigure the node), so web mutation
+faithfully belongs in ManageServerMode. But its auth model is engine-gated here:
+
+1. **A web-client session-auth flow** — Go `serveTailscaleAuth`: mint + confirm a browser session via a
+   Noise round-trip to control's webclient auth URL. The engine exposes no such primitive.
+2. **Owner identity on whois/self** — `WhoisReport.user` is **always `None` in this fork** (the engine
+   doesn't retain the owning login/email), so authz can't be bound to the node owner like Go does.
+
+**Ask:** surface (1) a control-backed webclient session mint/confirm on `Device`, and (2) the owning user
+identity on the whois/self netmap projection.
+
+**Daemon impact once landed:** promote `RunWebClient` from warn-only (currently a documented non-goal) to
+honored; host a second server inside `tailnetd` bound to the tailnet IP(s):5252, refusing non-Tailscale
+requests + requiring an authorized session, exposing the full mutating surface via the existing LocalAPI
+verbs + a `csrfProtect` same-origin guard. Until then the loopback read+login UI is the faithful subset (NOT
+a weaker any-tailnet-peer gate, which would *exceed* Go's permissiveness). Tracked in daemon bead tsd-bvc
+(the ManageServerMode half). — daemon lane
