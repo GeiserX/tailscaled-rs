@@ -752,3 +752,23 @@ sockets. No netmap/control round-trip — purely the local endpoint-discovery re
 **Daemon impact once landed:** `tnet debug restun` (WRITE — gated root/owner-uid like `debug rebind`),
 a thin sibling of the existing `debug rebind` handler. Consumed via a pin bump. Tracked in daemon bead
 tsd-rst. — daemon lane
+
+---
+
+## 27. `Device::tka_local_disable()` — disable tailnet lock for THIS node only (for `tnet lock local-disable`)
+
+**Why:** `tnet lock` ships `init`/`status`/`sign`/`disable` over the engine's `tka_{init,status,sign,disable}`.
+Go additionally has `lock local-disable` (`tailscale lock local-disable` → `NetworkLockForceLocalDisable`):
+turn tailnet lock off for **this node only** (a local escape hatch when the node is locked out and can't
+get a co-signature), distinct from the tailnet-wide `disable <secret>`. The engine exposes no
+force-local-disable entrypoint, so the verb can't be built. `disablement-kdf` (the offline Argon2i value
+derivation) IS shipped daemon-side (it needs no engine state — bead tsd-iqq.14 / PR #213); only
+`local-disable` is blocked.
+
+**Ask:** add `Device::tka_local_disable(&self) -> Result<(), Error>` (Go `ipnlocal.NetworkLockForceLocalDisable`)
+— force-disable the local TKA state for this node (drop the local authority + stop enforcing), without a
+control round-trip or affecting the tailnet's authority. Gated behind the existing TKA plumbing.
+
+**Daemon impact once landed:** `tnet lock local-disable` (WRITE — gated root/owner-uid like the other lock
+mutations), a thin LocalAPI verb + dispatch. Consumed via a pin bump. Tracked in daemon bead tsd-iqq.14
+(the local-disable half). — daemon lane
