@@ -1457,13 +1457,17 @@ async fn refuse_ssh_toggle_risk_if_needed(
     }
 }
 
-/// Map the `--advertise-routes` / `--advertise-routes-clear` flags to the wire field's
-/// `Option<Vec<String>>`. Any routes passed → `Some(routes)` (replace the set); else
-/// `--advertise-routes-clear` → `Some(vec![])` (advertise none); else `None` (leave the persisted
-/// set unchanged). A non-empty list takes precedence over the clear flag.
-fn resolve_advertise_routes(routes: Vec<String>, clear: bool) -> Option<Vec<String>> {
-    if !routes.is_empty() {
-        Some(routes)
+/// Map a `--<list>` / `--<list>-clear` flag pair to the wire field's `Option<Vec<String>>` — a
+/// **value-neutral** "replace, clear, or leave unchanged" resolver shared by every set-a-list pref
+/// (`--advertise-routes`, `--advertise-tags`, …). A non-empty `items` → `Some(items)` (replace the
+/// set); else `clear` → `Some(vec![])` (set to empty); else `None` (leave the persisted set
+/// unchanged). A non-empty list takes precedence over the clear flag. The name is deliberately NOT
+/// `*_routes` — it carries no route/tag-specific semantics, so reusing it for tags is correct, not a
+/// footgun. (Any value VALIDATION — CIDR parsing for routes, `tag:` form for tags — happens elsewhere,
+/// daemon-side; this only resolves the three-way replace/clear/unchanged intent.)
+fn resolve_list_or_clear(items: Vec<String>, clear: bool) -> Option<Vec<String>> {
+    if !items.is_empty() {
+        Some(items)
     } else if clear {
         Some(vec![])
     } else {
@@ -2053,10 +2057,10 @@ async fn run_up(
         ),
         // Passed routes replace the set; `--advertise-routes-clear` empties it; neither
         // leaves the persisted set unchanged.
-        advertise_routes: resolve_advertise_routes(advertise_routes, advertise_routes_clear),
+        advertise_routes: resolve_list_or_clear(advertise_routes, advertise_routes_clear),
         // Passed tags replace the set; `--clear-advertise-tags` empties it; neither leaves it
         // unchanged. Reuses the same Vec+clear→Option resolver as advertise-routes.
-        advertise_tags: resolve_advertise_routes(advertise_tags, advertise_tags_clear),
+        advertise_tags: resolve_list_or_clear(advertise_tags, advertise_tags_clear),
         // `--accept-routes`/`--no-accept-routes` tri-state (mirrors `--tun`); reuses the same
         // resolver as the `set` arm.
         accept_routes: resolve_accept_routes(accept_routes, no_accept_routes),
@@ -2420,9 +2424,9 @@ async fn run_set(
         ),
         // Passed routes replace the set; `--advertise-routes-clear` empties it; neither leaves
         // the persisted set unchanged.
-        advertise_routes: resolve_advertise_routes(advertise_routes, advertise_routes_clear),
+        advertise_routes: resolve_list_or_clear(advertise_routes, advertise_routes_clear),
         // Passed tags replace the set; `--clear-advertise-tags` empties it; neither unchanged.
-        advertise_tags: resolve_advertise_routes(advertise_tags, advertise_tags_clear),
+        advertise_tags: resolve_list_or_clear(advertise_tags, advertise_tags_clear),
         // `--ssh`/`--no-ssh` tri-state (mirrors `--tun`).
         ssh: resolve_ssh(ssh, no_ssh),
     };
@@ -8053,7 +8057,7 @@ mod tests {
             shields_up: resolve_shields_up(false, false),
             exit_node: resolve_exit_node(Some("100.64.0.9".to_string()), false),
             advertise_exit_node: resolve_advertise_exit_node(false, false),
-            advertise_routes: resolve_advertise_routes(vec![], false),
+            advertise_routes: resolve_list_or_clear(vec![], false),
             advertise_tags: None,
             ssh: resolve_ssh(false, false),
         };
@@ -8294,7 +8298,7 @@ mod tests {
             shields_up: resolve_shields_up(true, false),
             exit_node: resolve_exit_node(None, true),
             advertise_exit_node: resolve_advertise_exit_node(false, true),
-            advertise_routes: resolve_advertise_routes(vec![], true),
+            advertise_routes: resolve_list_or_clear(vec![], true),
             advertise_tags: None,
             ssh: resolve_ssh(true, false),
         };
@@ -8331,22 +8335,22 @@ mod tests {
     }
 
     #[test]
-    fn resolve_advertise_routes_set_clear_unchanged() {
+    fn resolve_list_or_clear_set_clear_unchanged() {
         // A non-empty list replaces the set.
         assert_eq!(
-            resolve_advertise_routes(
+            resolve_list_or_clear(
                 vec!["192.168.1.0/24".to_string(), "10.0.0.0/8".to_string()],
                 false
             ),
             Some(vec!["192.168.1.0/24".to_string(), "10.0.0.0/8".to_string()])
         );
         // No routes + clear flag → advertise none (empty set).
-        assert_eq!(resolve_advertise_routes(vec![], true), Some(vec![]));
+        assert_eq!(resolve_list_or_clear(vec![], true), Some(vec![]));
         // Neither → leave the persisted set unchanged.
-        assert_eq!(resolve_advertise_routes(vec![], false), None);
+        assert_eq!(resolve_list_or_clear(vec![], false), None);
         // A passed list takes precedence over the clear flag.
         assert_eq!(
-            resolve_advertise_routes(vec!["172.16.0.0/12".to_string()], true),
+            resolve_list_or_clear(vec!["172.16.0.0/12".to_string()], true),
             Some(vec!["172.16.0.0/12".to_string()]),
             "an explicit list wins over the clear flag"
         );
