@@ -369,6 +369,13 @@ enum Command {
         /// List known profiles (with a `*` marking the current one) instead of switching.
         #[arg(long)]
         list: bool,
+        /// With `--list`, emit the profiles as a JSON array (Go `tailscale switch --list --json`):
+        /// one object per profile with `id`, `nickname`, and `selected`. (Go also carries `tailnet`
+        /// and `account` per profile; this fork's engine does not surface those per-profile, so they
+        /// are emitted as `null` — an honest reduction, not a fake value. See bead tsd-91w.) Ignored
+        /// without `--list`.
+        #[arg(long, requires = "list")]
+        json: bool,
         /// The profile id to switch to (omit with `--list`). Ignored when `--list` is given.
         #[arg(value_name = "PROFILE")]
         target: Option<String>,
@@ -1718,7 +1725,12 @@ async fn main() -> Result<()> {
         // `switch` (Go `tailscale switch`): --list renders a table; `remove <id>` deletes; a bare
         // `<target>` switches. Handled inline — `--list` renders the Profiles reply, and the three
         // modes map to different requests.
-        Command::Switch { list, target, cmd } => run_switch(&socket, list, target, cmd).await,
+        Command::Switch {
+            list,
+            json,
+            target,
+            cmd,
+        } => run_switch(&socket, list, json, target, cmd).await,
         // `version` answers from the CLI's own crate version. WITHOUT `--daemon` it never contacts
         // the daemon (Go also prints the client version with no LocalAPI call) — handle it here and
         // return. WITH `--daemon` it round-trips `Request::Version` to learn the daemon's version,
@@ -2855,6 +2867,7 @@ fn stat_report(path: &std::path::Path) -> String {
 async fn run_switch(
     socket: &std::path::Path,
     list: bool,
+    json: bool,
     target: Option<String>,
     cmd: Option<SwitchCmd>,
 ) -> Result<()> {
@@ -2865,7 +2878,11 @@ async fn run_switch(
     if list {
         match round_trip(socket, &Request::ProfileList).await {
             Ok(Response::Profiles { profiles }) => {
-                print!("{}", format_profiles(&profiles));
+                if json {
+                    println!("{}", format_profiles_json(&profiles));
+                } else {
+                    print!("{}", format_profiles(&profiles));
+                }
                 return Ok(());
             }
             Ok(Response::Error { message }) => {
@@ -4968,6 +4985,40 @@ fn format_profiles(profiles: &[tailscaled_rs::localapi::ProfileEntry]) -> String
         }
     }
     out
+}
+
+/// Render the profiles as a JSON array for `tnet switch --list --json` (Go `tailscale switch --list
+/// --json`): one object per profile with `id`, `nickname`, `selected`, plus `tailnet`/`account` as
+/// `null`. Pure → unit-testable. Go's objects carry `{id, nickname, tailnet, account, selected}`; this
+/// fork's engine does not surface a per-profile tailnet/account (it has the profile id + display name +
+/// which is current — see [`tailscaled_rs::localapi::ProfileEntry`]), so those two are emitted as
+/// `null` rather than a fabricated value. `nickname` is the display name (Go's `ProfileStatus.Name`),
+/// `null` when it adds nothing beyond the id. The shape (key set + types) matches Go so a JSON consumer
+/// parses both identically; only the two engine-gated values are null here (an honest reduction).
+fn format_profiles_json(profiles: &[tailscaled_rs::localapi::ProfileEntry]) -> String {
+    let arr: Vec<serde_json::Value> = profiles
+        .iter()
+        .map(|p| {
+            // nickname = the display name when it adds information beyond the id, else null (matches
+            // the human renderer's "show the name only when it differs" rule).
+            let nickname = if p.name.is_empty() || p.name == p.id {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String(p.name.clone())
+            };
+            serde_json::json!({
+                "id": p.id,
+                "nickname": nickname,
+                // Engine-gated: this fork has no per-profile tailnet/account (Go fills these from the
+                // login profile). Emitted as null — the key is present (shape parity) but honestly empty.
+                "tailnet": serde_json::Value::Null,
+                "account": serde_json::Value::Null,
+                "selected": p.current,
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&serde_json::Value::Array(arr))
+        .unwrap_or_else(|_| "[]".to_string())
 }
 
 /// The canonical `(set-flag name, value)` projection of a [`PrefsView`], in the stable order
@@ -9854,6 +9905,42 @@ mod tests {
         assert!(!out.contains("* default"), "{out}");
         // Empty → placeholder.
         assert_eq!(format_profiles(&[]), "(no profiles)\n");
+    }
+
+    #[test]
+    fn format_profiles_json_shape_matches_go() {
+        use tailscaled_rs::localapi::ProfileEntry;
+        let json = format_profiles_json(&[
+            ProfileEntry {
+                id: "default".into(),
+                name: "default".into(),
+                current: false,
+            },
+            ProfileEntry {
+                id: "work".into(),
+                name: "Work tailnet".into(),
+                current: true,
+            },
+        ]);
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON array");
+        let arr = v.as_array().expect("top-level array");
+        assert_eq!(arr.len(), 2);
+        // Profile 0: name == id → nickname null; not selected.
+        assert_eq!(arr[0]["id"], "default");
+        assert!(
+            arr[0]["nickname"].is_null(),
+            "nickname null when == id: {json}"
+        );
+        assert_eq!(arr[0]["selected"], false);
+        // Profile 1: distinct name → nickname carries it; selected true.
+        assert_eq!(arr[1]["id"], "work");
+        assert_eq!(arr[1]["nickname"], "Work tailnet");
+        assert_eq!(arr[1]["selected"], true);
+        // Engine-gated fields present as null (shape parity with Go, honestly empty).
+        assert!(arr[1]["tailnet"].is_null());
+        assert!(arr[1]["account"].is_null());
+        // Empty → "[]".
+        assert_eq!(format_profiles_json(&[]), "[]");
     }
 
     #[test]
