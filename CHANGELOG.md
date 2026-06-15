@@ -25,6 +25,18 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.51.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.50.0...v0.51.0) (2026-06-15)
+
+
+### Features
+
+* **install:** wire systemd ExecStopPost=--cleanup and operator EnvironmentFile ([#225](https://github.com/GeiserX/tailscaled-rs/issues/225)) ([8a1bf4c](https://github.com/GeiserX/tailscaled-rs/commit/8a1bf4cc2ed0a5553a73f1cd6cd1ef4bf1ea22db))
+* **tailnetd:** add --port / PORT — consume Config.wireguard_listen_port ([#231](https://github.com/GeiserX/tailscaled-rs/issues/231)) ([62ea1c9](https://github.com/GeiserX/tailscaled-rs/commit/62ea1c9ed2511431fb50d0bcdb5fc97dd3b243df))
+* **tnet:** add debug local-creds + debug stat (Go tailscale debug parity) ([#227](https://github.com/GeiserX/tailscaled-rs/issues/227)) ([2e09b7f](https://github.com/GeiserX/tailscaled-rs/commit/2e09b7f00e8b1017010b677ac923934843b7ae77))
+* **tnet:** add debug restun (Go tailscale debug restun) — consume Device::re_stun ([#230](https://github.com/GeiserX/tailscaled-rs/issues/230)) ([b423e3a](https://github.com/GeiserX/tailscaled-rs/commit/b423e3a7797931056b66eebfc0e1119c00741099))
+* **tnet:** add ssh — host-key-pinned ssh over the tailnet (v0.40.0) ([#232](https://github.com/GeiserX/tailscaled-rs/issues/232)) ([97e411a](https://github.com/GeiserX/tailscaled-rs/commit/97e411a206471e764d4400502a103d922d77a2e3))
+* **tnet:** web UI login affordance — surface the auth URL ([#223](https://github.com/GeiserX/tailscaled-rs/issues/223)) ([f07fbc3](https://github.com/GeiserX/tailscaled-rs/commit/f07fbc3c4d2e6ab80f9adda221f06538542aeeea))
+
 ## [0.50.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.49.0...v0.50.0) (2026-06-15)
 
 
