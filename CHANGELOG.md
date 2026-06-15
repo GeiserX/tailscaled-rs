@@ -25,6 +25,22 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.50.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.49.0...v0.50.0) (2026-06-15)
+
+
+### Features
+
+* **daemon:** add --debug HTTP server exposing GET /debug/metrics (tsd-iqq.9) ([#215](https://github.com/GeiserX/tailscaled-rs/issues/215)) ([11ec005](https://github.com/GeiserX/tailscaled-rs/commit/11ec00569c89e81cb68c4b3991113998ffd2bc71))
+* **localapi:** WatchNotifications phase 1 — masked Notify stream (tsd-iqq.11) ([#220](https://github.com/GeiserX/tailscaled-rs/issues/220)) ([16679dc](https://github.com/GeiserX/tailscaled-rs/commit/16679dc815a6b195e2c239c7a8606d27a0c31967))
+* **localapi:** WatchNotifications phase 2 — prefs-change broadcast ([#221](https://github.com/GeiserX/tailscaled-rs/issues/221)) ([aba1a44](https://github.com/GeiserX/tailscaled-rs/commit/aba1a448a1e1f020a299dcc26738df77285ab44b))
+* **tnet:** add up --json (Go tailscale up --json) ([#219](https://github.com/GeiserX/tailscaled-rs/issues/219)) ([539a99a](https://github.com/GeiserX/tailscaled-rs/commit/539a99aece22c7ff71696955420025b39e5c74c4))
+* **tnet:** netcheck --format json|json-line + --every (tsd-iqq.13) ([#218](https://github.com/GeiserX/tailscaled-rs/issues/218)) ([6f31097](https://github.com/GeiserX/tailscaled-rs/commit/6f31097d3c6a085797612bfc0df9acb311c23061))
+
+
+### Bug Fixes
+
+* **tnet:** ping &lt;own-ip&gt; prints "is local Tailscale IP" + exit 0 (tsd-rqa) ([#222](https://github.com/GeiserX/tailscaled-rs/issues/222)) ([2843d65](https://github.com/GeiserX/tailscaled-rs/commit/2843d6523ce5ccb42a9f7c91b6295320a7cbe80c))
+
 ## [0.49.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.48.0...v0.49.0) (2026-06-15)
 
 
