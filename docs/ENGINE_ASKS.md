@@ -9,7 +9,24 @@ note the rev they were verified against (older "verified vs `e126bba`/v0.6.9" / 
 markers reflect what the pin provides). Bumps since v0.33.0: → v0.34.2 (tka chokepoint, cap parity, taildrop
 length-verify) → v0.35.3 (control-runner unbounded mailbox, tka rotation-drop, tunnel/derp fixes) →
 v0.35.8 (netcheck hysteresis, dataplane ACL, magicsock STUN, derp wire keys, taildrop symlink-refuse) →
-v0.39.0 (current pin) — all transparent (facade-internal, no daemon wiring), each clippy+test-verified.
+v0.39.0 → v0.40.0 (current pin) — all transparent except the `DeviceState` growth noted in the v0.40.0
+header below, each clippy+test-verified.
+
+> **Pin bump 3e81d862 (v0.39.0) → fe86ca00 (v0.40.0), 2026-06-15.** Probe-compiled first; the ONE
+> breaking change was caught + handled there: the engine's `#[non_exhaustive]` `DeviceState` grew two
+> reachable variants — `NeedsMachineAuth` (registered, awaiting admin approval, no auth URL) and
+> `Reauthenticating` (auto non-interactive re-auth on node-key expiry in progress). The daemon's
+> `state_from_device` (src/ipn/state.rs) now maps `NeedsMachineAuth → State::NeedsMachineAuth` (finally
+> *producing* the previously-parity-only ipn.State — this is the engine half of bead **tsd-ccv**, now
+> unblocked) and `Reauthenticating → State::Starting` (transient, no action), plus a forward-compat
+> `_ => Starting` wildcard. **SHIPS + CONSUMES three asks** (all via #263 "add engine surface for
+> daemon"): **#22** `Config.wireguard_listen_port: Option<u16>` (→ `tailnetd --port`/`PORT`), **#23**
+> `StatusNode.ssh_host_keys: Vec<String>` in known_hosts format (→ a faithful `tnet ssh` with pinned
+> host-key verification), **#26** `Device::re_stun()` (→ `tnet debug restun`, lighter than rebind). Also
+> pulls for free: auto re-auth on key expiry (#260), opt-in network-monitor auto-rebind (#261), zstd
+> map-response decode (#257), hostinfo Container/Env detection (#255), admin-approval polling instead of
+> dying (#262). NEXT to consume: wire `tailnetd --port`, `tnet ssh`, `tnet debug restun` (separate PRs
+> after this bump lands), and surface NeedsMachineAuth's "approve this device" hint.
 
 > **Pin bump 575104b1 (v0.32.0) → f8192568 (v0.33.0), 2026-06-13.** Clean bump — full gate green;
 > probe-compile clean (no breaking surface). **Completes the Tailnet Lock surface**: the engine now

@@ -23,10 +23,11 @@ pub enum State {
     /// future refinement could surface a dedicated "bringing up" signal as `Starting`.
     NeedsLogin,
     /// Registered to control, but the machine is not yet authorized by a tailnet admin (Go's
-    /// `ipn.NeedsMachineAuth`). See the `// LIMITATION:` note on [`Backend::derive_state`](super::Backend):
-    /// the engine does not surface this from a status snapshot, and no current code path produces it; it
-    /// would require [`Backend::up`](super::Backend::up) to branch on a typed registration error. Kept for `ipn.State`
-    /// parity.
+    /// `ipn.NeedsMachineAuth`). **Produced** by [`state_from_device`] when the engine reports
+    /// `DeviceState::NeedsMachineAuth` (engine ≥ v0.40.0) — a node awaiting admin approval on an
+    /// approval-gated tailnet, with no interactive auth URL (an admin must approve it out of band).
+    /// NOT produced by [`derive_state_from`], which sees only netmap-presence and cannot distinguish
+    /// this from `Starting` — see the `// LIMITATION:` note on [`Backend::derive_state`](super::Backend).
     NeedsMachineAuth,
     /// The node key is already in use by a different user/profile (Go's `ipn.InUseOtherUser`).
     /// Unreachable in this single-user, auth-key-only daemon; kept only for `ipn.State` parity.
@@ -193,6 +194,21 @@ pub(super) fn state_from_device(
         DeviceState::Running => (State::Running, None, None),
         DeviceState::Connecting => (State::Starting, None, None),
         DeviceState::NeedsLogin(url) => (State::NeedsLogin, Some(url.to_string()), None),
+        // Registered with a valid key but awaiting ADMIN APPROVAL on an approval-gated tailnet, and
+        // control offered NO interactive URL (nothing for a human to open — an admin must approve the
+        // node out of band). This is the engine half of the previously-unreachable `NeedsMachineAuth`
+        // ipn.State (Go's `ipn.State::NeedsMachineAuth`): map it to `State::NeedsMachineAuth` so the
+        // daemon/CLI can finally tell "approve this device in the admin console" apart from "still
+        // converging" (`Starting`). No auth_url (there is none) and no error (it is transient — the
+        // engine auto-transitions to `Running` once an admin approves, no re-registration).
+        DeviceState::NeedsMachineAuth => (State::NeedsMachineAuth, None, None),
+        // The node key expired and a NON-interactive auto re-auth is in progress (the runtime is
+        // rotating the key + re-registering with the stored auth key — Go `doLogin`). Transient and
+        // requires no human action (unlike `NeedsLogin`/`Expired`), so surface it as `Starting`
+        // (still converging) with no url and no error — the next good self-node flips back to
+        // `Running`. Reporting an `error`/url here would wrongly prompt the operator to act on a
+        // recovery the engine is already handling itself.
+        DeviceState::Reauthenticating => (State::Starting, None, None),
         // Key expiry is a re-auth prompt, not a hard failure: NeedsLogin with no url and no error
         // (an expiry must not be reported as a terminal registration failure).
         DeviceState::Expired => (State::NeedsLogin, None, None),
@@ -216,6 +232,15 @@ pub(super) fn state_from_device(
         // `error` (so the CLI never tells the operator to rotate a key that is actually fine) and no
         // auth_url. The next poll reflects the retry's outcome (Running, or a permanent Failed).
         DeviceState::Failed(_) => (State::Starting, None, None),
+        // `DeviceState` is `#[non_exhaustive]`: a future engine version may add a state this build
+        // does not know. Per the engine's own guidance (treat an unknown state as "still coming up"
+        // rather than failing to compile on upgrade), map any unknown variant to `Starting` — the
+        // safe "converging, no action needed" reading — with no url and no error. This is the only
+        // mapping that can't mislead: it never invents a login prompt or a failure for a state whose
+        // semantics we don't yet know. When a new variant is added, the explicit arms above should be
+        // extended to handle it specifically (this wildcard is the forward-compat floor, not a
+        // substitute for a deliberate mapping).
+        _ => (State::Starting, None, None),
     }
 }
 
@@ -417,6 +442,37 @@ mod tests {
         assert!(
             err.is_none(),
             "key expiry is a re-auth prompt, not a terminal failure → no error reason"
+        );
+    }
+
+    #[test]
+    fn device_needs_machine_auth_is_needs_machine_auth_no_url_no_error() {
+        // Awaiting admin approval on an approval-gated tailnet: control offered NO interactive URL
+        // (an admin must approve out of band). Go local.go nextStateLocked → ipn.NeedsMachineAuth,
+        // set with no auth URL and no ErrMessage (enterStateLocked treats it like Starting). So we
+        // surface State::NeedsMachineAuth with neither an auth_url nor an error — it is transient.
+        let (st, url, err) = state_from_device(tailscale::DeviceState::NeedsMachineAuth);
+        assert_eq!(st, State::NeedsMachineAuth);
+        assert!(url.is_none(), "no interactive URL exists for machine-auth");
+        assert!(
+            err.is_none(),
+            "awaiting admin approval is transient, not a failure"
+        );
+    }
+
+    #[test]
+    fn device_reauthenticating_is_starting_no_url_no_error() {
+        // Non-interactive auto re-auth in flight (stored authkey, auto-reauth on, TKA not enforcing):
+        // the engine is rotating the key + re-registering and will flip back to Running itself. Go's
+        // equivalent (AuthCantContinue()==false, netMap nil) stays in the Starting/converging path,
+        // never NeedsLogin — so map it to Starting with no url/error (prompting the operator would be
+        // wrong; a genuinely stuck re-auth surfaces separately as Expired → NeedsLogin).
+        let (st, url, err) = state_from_device(tailscale::DeviceState::Reauthenticating);
+        assert_eq!(st, State::Starting);
+        assert!(url.is_none());
+        assert!(
+            err.is_none(),
+            "an in-flight auto re-auth is convergence, not a failure"
         );
     }
 
