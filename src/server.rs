@@ -739,6 +739,37 @@ async fn dispatch(
         // re-read (a no-op while there are zero sources).
         Request::SyspolicyList => Backend::syspolicy_list(),
         Request::SyspolicyReload => Backend::syspolicy_reload(),
+        // `check-ip-forwarding` (Go `serveCheckIPForwarding`, read-only): OS sysctl readiness probe.
+        // Node-up independent (reads /proc, not the netmap); the transport mode (netstack vs TUN)
+        // decides whether the check even applies. Brief lock just to read `prefs_tun()`.
+        Request::CheckIpForwarding => {
+            let tun = { backend.lock().await.prefs_tun() };
+            Response::IpForwardingCheck {
+                warning: crate::ipforward::forwarding_warning(tun),
+            }
+        }
+        // `check-prefs` (Go `serveCheckPrefs`, write-gated above): validate a prospective prefs change
+        // WITHOUT applying it. Composes the named overrides over the current prefs under a brief lock
+        // and runs the bring-up validation; mutates nothing. `Ok`/`Error` like Go's `{}`/`{"Error":…}`.
+        Request::CheckPrefs {
+            exit_node,
+            advertise_exit_node,
+            advertise_routes,
+            ssh,
+        } => {
+            let result = {
+                let be = backend.lock().await;
+                be.check_prefs(exit_node, advertise_exit_node, advertise_routes, ssh)
+            };
+            match result {
+                Ok(()) => Response::Ok {
+                    message: "prefs are valid".into(),
+                },
+                Err(e) => Response::Error {
+                    message: format!("{e:#}"),
+                },
+            }
+        }
         // `cert <domain>` (Go `tailscale cert`): issue a TLS cert+key via the tailnet ACME flow.
         // Off-lock device call (issuance is a control round-trip, potentially slow). Needs the node up
         // (issuance goes through the live engine's control connection); fail-closed without `acme`.

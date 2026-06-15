@@ -735,6 +735,30 @@ enum DebugCmd {
     /// binding or recover after a network change, without restarting the node. Requires the node to
     /// be up. Write-gated (root/same-uid) — it mutates live datapath state.
     Rebind,
+    /// Check whether the OS forwards IP traffic — a subnet-router / exit-node readiness diagnostic (Go
+    /// `check-ip-forwarding`, normally run internally by `up`/`set`). Prints a warning if forwarding
+    /// is disabled, or nothing if it is fine. In netstack mode (the default) and on macOS this is a
+    /// no-op (the kernel does not forward our traffic); on Linux with a kernel TUN it reads the
+    /// forwarding sysctls.
+    CheckIpForwarding,
+    /// Validate a prospective prefs change WITHOUT applying it (Go `check-prefs`, normally the
+    /// fail-fast pre-flight for `up`/`set`). Composes the named overrides over the current prefs and
+    /// reports the first conflict (exit-node-vs-advertise, an unmasked advertised route, SSH without
+    /// the build feature) — or confirms the prefs are valid. Mutates nothing.
+    CheckPrefs {
+        /// Prospective exit-node selector (IP / MagicDNS name / stable id). Omit to keep the current.
+        #[arg(long, value_name = "NODE")]
+        exit_node: Option<String>,
+        /// Prospective advertise-exit-node intent.
+        #[arg(long)]
+        advertise_exit_node: Option<bool>,
+        /// Prospective advertised subnet routes (CIDRs), comma-separated. Omit to keep the current.
+        #[arg(long, value_name = "CIDR,CIDR", value_delimiter = ',')]
+        advertise_routes: Option<Vec<String>>,
+        /// Prospective SSH-server enable intent.
+        #[arg(long)]
+        ssh: Option<bool>,
+    },
 }
 
 /// `tnet serve` subcommands. Mirrors the TCP-forward subset of Go `tailscale serve`.
@@ -1521,6 +1545,22 @@ async fn main() -> Result<()> {
             } => run_debug_via(&site_or_route, cidr.as_deref()),
             // `debug rebind` is a write-gated daemon round-trip (re-creates the engine's UDP sockets).
             DebugCmd::Rebind => run_debug_rebind(&socket).await,
+            DebugCmd::CheckIpForwarding => run_check_ip_forwarding(&socket).await,
+            DebugCmd::CheckPrefs {
+                exit_node,
+                advertise_exit_node,
+                advertise_routes,
+                ssh,
+            } => {
+                run_check_prefs(
+                    &socket,
+                    exit_node,
+                    advertise_exit_node,
+                    advertise_routes,
+                    ssh,
+                )
+                .await
+            }
         },
         // `install` / `uninstall` (Go `tailscaled install-system-daemon` / `uninstall-system-daemon`):
         // purely LOCAL, privileged file + service-manager work — they never touch the LocalAPI socket.
@@ -2263,6 +2303,60 @@ async fn run_debug_rebind(socket: &std::path::Path) -> Result<()> {
         }
         Ok(other) => anyhow::bail!("unexpected response to debug rebind: {other:?}"),
         Err(e) => Err(e).with_context(|| format!("requesting rebind at {}", socket.display())),
+    }
+}
+
+/// `debug check-ip-forwarding` (Go `check-ip-forwarding`): print the OS IP-forwarding readiness
+/// warning, or "IP forwarding looks OK" when empty. A diagnostic — exit 0 either way (a warning is
+/// informational, not an error), matching how Go surfaces it as a non-fatal notice on `up`/`set`.
+async fn run_check_ip_forwarding(socket: &std::path::Path) -> Result<()> {
+    match round_trip(socket, &Request::CheckIpForwarding).await {
+        Ok(Response::IpForwardingCheck { warning }) => {
+            if warning.is_empty() {
+                println!("IP forwarding looks OK (or is not applicable in this mode).");
+            } else {
+                println!("{warning}");
+            }
+            Ok(())
+        }
+        Ok(Response::Error { message }) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        Ok(other) => anyhow::bail!("unexpected response to check-ip-forwarding: {other:?}"),
+        Err(e) => Err(e).with_context(|| format!("checking IP forwarding at {}", socket.display())),
+    }
+}
+
+/// `debug check-prefs` (Go `check-prefs`): validate a prospective prefs change without applying it.
+/// Prints the daemon's confirmation on success, or the violation(s) + exit 1 on a conflict — the same
+/// fail-fast contract `up`/`set` use internally.
+async fn run_check_prefs(
+    socket: &std::path::Path,
+    exit_node: Option<String>,
+    advertise_exit_node: Option<bool>,
+    advertise_routes: Option<Vec<String>>,
+    ssh: Option<bool>,
+) -> Result<()> {
+    // A bare `--exit-node ""` clears (Set's double-option convention); a present value sets it.
+    let exit_node = exit_node.map(|s| if s.is_empty() { None } else { Some(s) });
+    let req = Request::CheckPrefs {
+        exit_node,
+        advertise_exit_node,
+        advertise_routes,
+        ssh,
+    };
+    match round_trip(socket, &req).await {
+        Ok(Response::Ok { message }) => {
+            println!("{message}");
+            Ok(())
+        }
+        Ok(Response::Error { message }) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        Ok(other) => anyhow::bail!("unexpected response to check-prefs: {other:?}"),
+        Err(e) => Err(e).with_context(|| format!("checking prefs at {}", socket.display())),
     }
 }
 

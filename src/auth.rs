@@ -147,6 +147,9 @@ pub(crate) fn requires_write(request: &crate::localapi::Request) -> bool {
         // sources and mutates NO node state. So both are reads, like `status`/`dns status`.
         | Request::SyspolicyList
         | Request::SyspolicyReload
+        // `check-ip-forwarding` reads OS sysctls (a subnet-router readiness diagnostic). Go gates
+        // `serveCheckIPForwarding` on `PermitRead`, so it is a read like `status`.
+        | Request::CheckIpForwarding
         | Request::BugReport { .. }
         | Request::GetServeConfig
         | Request::FileList
@@ -195,7 +198,11 @@ pub(crate) fn requires_write(request: &crate::localapi::Request) -> bool {
         // reach them. Gate like `up`/`down`.
         | Request::LockInit { .. }
         | Request::LockSign { .. }
-        | Request::LockDisable { .. } => true,
+        | Request::LockDisable { .. }
+        // `check-prefs` validates a prospective prefs change without applying it. Go gates
+        // `serveCheckPrefs` on `PermitWrite` (it is the pre-flight for a write), so a socket-reachable
+        // non-owner must not be able to probe it; gate like `set`. It mutates nothing.
+        | Request::CheckPrefs { .. } => true,
     }
 }
 

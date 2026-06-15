@@ -2776,6 +2776,83 @@ impl Backend {
         diag::netcheck(dev).await
     }
 
+    /// Validate a prospective prefs change WITHOUT applying it (the `check-prefs` LocalAPI / Go
+    /// `LocalBackend.CheckPrefs`). Returns `Ok(())` if the resulting posture is valid, else an error
+    /// naming every violation (Go joins them; we do too). MUTATES NOTHING — it composes the named
+    /// overrides over a *clone* of the current prefs and runs the same validation the bring-up path
+    /// would, so a CLI can fail fast before an `up`/`set`.
+    ///
+    /// This fork mirrors the subset of Go's `checkPrefsLocked` rule chain that maps to its pref model:
+    /// (1) the exit-node selector is concrete (no unsupported `auto:`); (2) **exit-node-vs-advertise
+    /// conflict** — cannot use an exit node and advertise as one simultaneously (Go
+    /// `checkExitNodePrefsLocked`); (3) every advertised route is a masked CIDR (Go
+    /// `checkAdvertiseRoutes`); (4) SSH-server enable requires the `ssh` build feature (the local
+    /// analogue of Go's `checkSSHPrefsLocked` capability gate — a faithful, build-time check). Go's
+    /// operator/auto-update/profile-name/config-lock/Funnel-shields rules reference prefs this fork
+    /// does not model, so they are correctly N/A.
+    pub fn check_prefs(
+        &self,
+        exit_node: Option<Option<String>>,
+        advertise_exit_node: Option<bool>,
+        advertise_routes: Option<Vec<String>>,
+        ssh: Option<bool>,
+    ) -> Result<()> {
+        // Compose the prospective posture: the named override wins, else the current pref.
+        let prospective_exit_node = match &exit_node {
+            Some(v) => v.clone(),
+            None => self.prefs.exit_node.clone(),
+        };
+        let prospective_advertise_exit =
+            advertise_exit_node.unwrap_or(self.prefs.advertise_exit_node);
+        let prospective_routes = advertise_routes
+            .clone()
+            .unwrap_or_else(|| self.prefs.advertise_routes.clone());
+        let prospective_ssh = ssh.unwrap_or(self.prefs.ssh_enabled);
+
+        let mut errors: Vec<String> = Vec::new();
+
+        // (1) exit-node selector must be concrete (reuse the bring-up validator's rule).
+        if let Err(e) = validate_exit_node_selector(prospective_exit_node.as_deref()) {
+            errors.push(e.to_string());
+        }
+        // (2) exit-node-vs-advertise conflict (Go: "Cannot advertise an exit node and use an exit
+        // node at the same time."). A `Some(sel)` exit node means "use one".
+        if prospective_exit_node.is_some() && prospective_advertise_exit {
+            errors.push(
+                "Cannot advertise an exit node and use an exit node at the same time.".into(),
+            );
+        }
+        // (3) advertise-route CIDR masking (Go: "route %s has non-address bits set; expected %s").
+        for route in &prospective_routes {
+            match route.parse::<ipnet::IpNet>() {
+                Ok(net) => {
+                    let masked = net.trunc();
+                    if masked != net {
+                        errors.push(format!(
+                            "route {route} has non-address bits set; expected {masked}"
+                        ));
+                    }
+                }
+                Err(e) => errors.push(format!("route {route:?} is not a valid CIDR: {e}")),
+            }
+        }
+        // (4) SSH-server enable requires the `ssh` build feature (local analogue of Go's
+        // capability gate — a faithful build-time check; the netmap-capability check is engine-gated).
+        if prospective_ssh && cfg!(not(feature = "ssh")) {
+            errors.push(
+                "Unable to enable Tailscale SSH server: this build was compiled without the `ssh` \
+                 feature."
+                    .into(),
+            );
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow!(errors.join("\n")))
+        }
+    }
+
     /// Force the engine to rebind its UDP sockets (the `tnet debug rebind` path). Thin `pub` shim over
     /// [`diag::rebind`], kept on `Backend` so the `server.rs` dispatch call site is uniform with the
     /// other off-lock device operations. A **write** (mutates live datapath state).
@@ -3097,6 +3174,54 @@ mod tests {
             // present drive the real wipe/build paths, which keep the cache consistent on their own.
             has_node_key: false,
         }
+    }
+
+    #[test]
+    fn check_prefs_validates_without_mutating() {
+        // check-prefs (Go CheckPrefs): validate a prospective posture, mutate NOTHING.
+        let dir = std::env::temp_dir().join(format!("tailnetd-checkprefs-{}", std::process::id()));
+        let be = backend_for(&dir);
+
+        // Clean prospective change → Ok.
+        assert!(
+            be.check_prefs(Some(Some("100.64.0.9".into())), Some(false), None, None)
+                .is_ok(),
+            "a concrete exit node with advertise-exit off is valid"
+        );
+
+        // Exit-node-vs-advertise conflict → error naming the Go message.
+        let err = be
+            .check_prefs(Some(Some("100.64.0.9".into())), Some(true), None, None)
+            .expect_err("using + advertising an exit node must conflict");
+        assert!(
+            err.to_string()
+                .contains("Cannot advertise an exit node and use an exit node at the same time"),
+            "got {err:#}"
+        );
+
+        // An unmasked advertised route → error naming the masked form.
+        let err = be
+            .check_prefs(None, None, Some(vec!["10.0.0.5/24".into()]), None)
+            .expect_err("an unmasked CIDR must be rejected");
+        assert!(
+            err.to_string().contains("has non-address bits set")
+                && err.to_string().contains("10.0.0.0/24"),
+            "got {err:#}"
+        );
+
+        // `auto:` exit node → rejected (reuses the bring-up validator).
+        assert!(
+            be.check_prefs(Some(Some("auto:any".into())), None, None, None)
+                .is_err(),
+            "auto: exit-node selection is not supported"
+        );
+
+        // The check must not have persisted or mutated prefs — the backend's exit_node is still unset.
+        assert!(
+            be.prefs.exit_node.is_none() && be.prefs.advertise_routes.is_empty(),
+            "check_prefs must mutate nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
