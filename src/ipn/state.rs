@@ -193,6 +193,21 @@ pub(super) fn state_from_device(
         DeviceState::Running => (State::Running, None, None),
         DeviceState::Connecting => (State::Starting, None, None),
         DeviceState::NeedsLogin(url) => (State::NeedsLogin, Some(url.to_string()), None),
+        // Registered with a valid key but awaiting ADMIN APPROVAL on an approval-gated tailnet, and
+        // control offered NO interactive URL (nothing for a human to open — an admin must approve the
+        // node out of band). This is the engine half of the previously-unreachable `NeedsMachineAuth`
+        // ipn.State (Go's `ipn.State::NeedsMachineAuth`): map it to `State::NeedsMachineAuth` so the
+        // daemon/CLI can finally tell "approve this device in the admin console" apart from "still
+        // converging" (`Starting`). No auth_url (there is none) and no error (it is transient — the
+        // engine auto-transitions to `Running` once an admin approves, no re-registration).
+        DeviceState::NeedsMachineAuth => (State::NeedsMachineAuth, None, None),
+        // The node key expired and a NON-interactive auto re-auth is in progress (the runtime is
+        // rotating the key + re-registering with the stored auth key — Go `doLogin`). Transient and
+        // requires no human action (unlike `NeedsLogin`/`Expired`), so surface it as `Starting`
+        // (still converging) with no url and no error — the next good self-node flips back to
+        // `Running`. Reporting an `error`/url here would wrongly prompt the operator to act on a
+        // recovery the engine is already handling itself.
+        DeviceState::Reauthenticating => (State::Starting, None, None),
         // Key expiry is a re-auth prompt, not a hard failure: NeedsLogin with no url and no error
         // (an expiry must not be reported as a terminal registration failure).
         DeviceState::Expired => (State::NeedsLogin, None, None),
@@ -216,6 +231,15 @@ pub(super) fn state_from_device(
         // `error` (so the CLI never tells the operator to rotate a key that is actually fine) and no
         // auth_url. The next poll reflects the retry's outcome (Running, or a permanent Failed).
         DeviceState::Failed(_) => (State::Starting, None, None),
+        // `DeviceState` is `#[non_exhaustive]`: a future engine version may add a state this build
+        // does not know. Per the engine's own guidance (treat an unknown state as "still coming up"
+        // rather than failing to compile on upgrade), map any unknown variant to `Starting` — the
+        // safe "converging, no action needed" reading — with no url and no error. This is the only
+        // mapping that can't mislead: it never invents a login prompt or a failure for a state whose
+        // semantics we don't yet know. When a new variant is added, the explicit arms above should be
+        // extended to handle it specifically (this wildcard is the forward-compat floor, not a
+        // substitute for a deliberate mapping).
+        _ => (State::Starting, None, None),
     }
 }
 
