@@ -357,6 +357,15 @@ pub fn is_terminate_tls_serve(h: &TcpPortHandler) -> bool {
 /// Set (or replace) the TCP forward for `port` → `forward_to` (Go `SetTCPForwarding`). `forward_to`
 /// is stored verbatim as the dial target (`IP:port`). The map key is the port rendered as a string
 /// (see [`ServeConfig::tcp`](crate::localapi::ServeConfig::tcp) for why the key is a string).
+///
+/// TRUST MODEL: the forward target is an ARBITRARY local `host:port`, by design (Go parity — Go's
+/// `tailscale serve` likewise accepts any proxy host; the bare-port→`127.0.0.1` default is applied at
+/// the CLI in `normalize_serve_target`). Inbound tailnet (serve) or public-internet (funnel) bytes are
+/// then spliced to it, so a target like a metadata endpoint or another LAN host IS reachable through
+/// this node. The security boundary is the LocalAPI **write authorization** on `SetServeConfig`
+/// (root / daemon-owner uid — see `auth::requires_write`): only a principal already trusted to
+/// reconfigure the daemon can set a target. This is the inbound inverse of the proxy SSRF guard, and
+/// it is intentionally NOT restricted to loopback (that would diverge from Go).
 pub fn set_tcp_forward(cfg: &mut ServeConfig, port: u16, forward_to: String) {
     cfg.tcp.insert(
         port.to_string(),
@@ -375,14 +384,20 @@ pub fn funnel_host_port(host: &str, port: u16) -> String {
 }
 
 /// Turn Funnel on or off for `host`:`port` (Go `ServeConfig.SetFunnel`). On `on`, inserts the
-/// `host:port` → `true` entry; on `off`, removes the key (so an off port never lingers on the wire,
-/// matching Go's delete-and-nil-when-empty semantics — our `skip_serializing_if` omits an empty map).
+/// `host:port` → `true` entry; on `off`, removes EVERY key ending in `:port` regardless of host (so an
+/// off port never lingers on the wire — our `skip_serializing_if` omits an empty map).
+///
+/// `off` matches by `:port` suffix rather than the exact current `host:port` because the funnel
+/// arming path ([`funnel_ports`]) is itself host-insensitive (it parses the port out of every `true`
+/// key). If the node's MagicDNS name changed since the entry was written, an exact-key removal would
+/// leave the stale-host key behind and funnel would stay armed despite the operator's `off`. Removing
+/// by port closes that asymmetry. (A MagicDNS host never contains a `:`, so the suffix is unambiguous.)
 pub fn set_funnel(cfg: &mut ServeConfig, host: &str, port: u16, on: bool) {
-    let hp = funnel_host_port(host, port);
     if on {
-        cfg.allow_funnel.insert(hp, true);
+        cfg.allow_funnel.insert(funnel_host_port(host, port), true);
     } else {
-        cfg.allow_funnel.remove(&hp);
+        let suffix = format!(":{port}");
+        cfg.allow_funnel.retain(|hp, _| !hp.ends_with(&suffix));
     }
 }
 
@@ -455,7 +470,10 @@ pub async fn save(cfg: &ServeConfig, state_dir: &Path, profile_id: &str) -> std:
         tokio::fs::create_dir_all(dir).await?;
     }
     let bytes = serde_json::to_vec_pretty(cfg).expect("serve config serialize");
-    tokio::fs::write(&path, bytes).await
+    // Atomic write (temp+rename), the same crash-safety prefs uses: a crash mid-write must leave the
+    // OLD complete config or the NEW one, never a truncated file that `load` would discard back to an
+    // empty serve config (silently un-serving a node after a crash).
+    crate::prefs::atomic_write(&path, &bytes).await
 }
 
 #[cfg(test)]
@@ -1009,6 +1027,24 @@ mod tests {
         // Turning the last one off empties the map (so the wire omits AllowFunnel).
         set_funnel(&mut cfg, "host.example.ts.net", 8443, false);
         assert!(cfg.allow_funnel.is_empty());
+        assert!(funnel_ports(&cfg).is_empty());
+    }
+
+    #[test]
+    fn set_funnel_off_clears_a_stale_host_key_after_a_hostname_change() {
+        // `off` must remove by :port suffix regardless of host. If the node's MagicDNS name changed
+        // since funnel was enabled, the persisted key carries the OLD host; an `off` computed from the
+        // NEW host must still clear it (else funnel_ports keeps arming the port — funnel stuck on).
+        let mut cfg = ServeConfig::default();
+        set_funnel(&mut cfg, "old-name.example.ts.net", 443, true);
+        assert_eq!(funnel_ports(&cfg), std::collections::BTreeSet::from([443]));
+
+        // The node was renamed; `funnel 443 off` now resolves the key from the NEW host.
+        set_funnel(&mut cfg, "new-name.example.ts.net", 443, false);
+        assert!(
+            cfg.allow_funnel.is_empty(),
+            "off by :port must clear the stale old-host key, not leave funnel armed"
+        );
         assert!(funnel_ports(&cfg).is_empty());
     }
 

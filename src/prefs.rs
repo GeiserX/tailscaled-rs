@@ -217,7 +217,10 @@ impl Prefs {
 /// [`tokio::fs::rename`] it over `path` (atomic on POSIX within one filesystem). On any failure the
 /// temp file is removed best-effort so no stray `.tmp` is left behind. Same-dir staging is required —
 /// a cross-filesystem rename is neither atomic nor guaranteed to succeed.
-async fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+///
+/// `pub(crate)` so the other per-profile state writers (e.g. serve-config) get the same crash-safety
+/// instead of each open-coding a non-atomic `fs::write`.
+pub(crate) async fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
