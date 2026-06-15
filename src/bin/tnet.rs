@@ -5716,6 +5716,7 @@ async fn watch_status(socket: &std::path::Path, json: bool, filter: StatusFilter
     let mut line = serde_json::to_vec(&Request::Watch {
         initial_state: false,
         initial_netmap: false,
+        prefs: false,
     })?;
     line.push(b'\n');
     write_half.write_all(&line).await?;
@@ -5786,11 +5787,13 @@ async fn run_debug_watch_ipn(socket: &std::path::Path) -> Result<()> {
         .context("connect (is tailnetd running?)")?;
     let (read_half, mut write_half) = stream.into_split();
 
-    // The MASKED watch: both initial snapshots requested → the daemon streams `Response::Notify`
-    // frames (not `Response::Status`), front-loading the current state + peer set.
+    // The MASKED watch: all snapshots requested → the daemon streams `Response::Notify` frames (not
+    // `Response::Status`), front-loading the current state + peer set + prefs, then streaming each
+    // change (incl. a fresh prefs frame on every up/set/logout/switch/reload-config).
     let mut line = serde_json::to_vec(&Request::Watch {
         initial_state: true,
         initial_netmap: true,
+        prefs: true,
     })?;
     line.push(b'\n');
     write_half.write_all(&line).await?;
