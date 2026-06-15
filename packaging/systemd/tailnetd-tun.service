@@ -22,11 +22,12 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-# Type=simple, NOT Go's Type=notify. Go's tailscaled emits sd_notify(READY=1) once it is up, so its
-# unit is Type=notify; tailnetd does not send sd_notify yet, and Type=notify would make systemd block
-# the start until a readiness ping that never arrives, then SIGKILL at TimeoutStartSec. So we stay
-# Type=simple (ready == process exec'd) until the daemon learns sd_notify. See the sd_notify bead.
-Type=simple
+# Type=notify (matches Go's tailscaled): tailnetd sends sd_notify(READY=1) once the LocalAPI socket is
+# bound and the backend has loaded + attempted auto-start (i.e. it can actually serve), so systemd
+# holds `systemctl start` until the daemon is genuinely ready rather than merely exec'd. The daemon
+# reads $NOTIFY_SOCKET and emits the readiness datagram itself (no libsystemd dependency); run outside
+# systemd (NOTIFY_SOCKET unset) the notify is a harmless no-op.
+Type=notify
 
 # Operator tunables, optional. Go ships EnvironmentFile=/etc/default/tailscaled; we use the same seam
 # so an admin can set env knobs (e.g. TAILNETD_LOG, or extra engine env) WITHOUT editing this vendor

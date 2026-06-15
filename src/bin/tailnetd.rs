@@ -346,6 +346,12 @@ async fn main() -> Result<()> {
     // `TS_AUTH_KEY`.
     auto_start(&mut backend, config_authkey).await;
 
+    // Tell systemd we are ready (Go `tailscaled`'s `systemd.Ready()`): the LocalAPI socket is bound,
+    // the backend has loaded, and auto-start has been attempted — i.e. the daemon can now serve. A
+    // no-op off systemd (NOTIFY_SOCKET unset) and best-effort (never fatal). This is what lets the
+    // packaged unit move to `Type=notify` so `systemctl start` blocks until the daemon is genuinely up.
+    sd_notify_ready();
+
     let backend = Arc::new(Mutex::new(backend));
 
     // Serve the LocalAPI socket until SIGINT/SIGTERM, with SIGHUP handled *concurrently* as a reload
@@ -530,6 +536,120 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = sigint.recv() => tracing::info!("SIGINT received, shutting down"),
         _ = sigterm.recv() => tracing::info!("SIGTERM received, shutting down"),
+    }
+}
+
+/// Notify systemd that the daemon is up, the analogue of Go `tailscaled`'s `systemd.Ready()` (and what
+/// lets the unit move to `Type=notify`). Sends the `READY=1` datagram to the socket named by
+/// `$NOTIFY_SOCKET` (the sd_notify protocol), implemented directly over `libc` — no `libsystemd`
+/// dependency. A no-op (returns cleanly) when `$NOTIFY_SOCKET` is unset (foreground / non-systemd /
+/// macOS) or on any send failure: readiness notification is best-effort telemetry, never a reason to
+/// fail the daemon. Linux-only (the protocol is systemd-specific); a stub on other targets.
+///
+/// Call it once, AFTER the LocalAPI socket is bound and the backend has loaded + attempted auto-start
+/// — i.e. the point the daemon can actually serve — so `Type=notify` start-up completes exactly when
+/// the daemon is genuinely ready (not merely exec'd).
+#[cfg(target_os = "linux")]
+fn sd_notify_ready() {
+    let Some(socket) = std::env::var_os("NOTIFY_SOCKET") else {
+        return; // not run under systemd's notify protocol — nothing to do.
+    };
+    let path = std::path::Path::new(&socket);
+    let (addr, addr_len) = match notify_socket_sockaddr(path.as_os_str().as_encoded_bytes()) {
+        Some(pair) => pair,
+        None => {
+            tracing::debug!(
+                "NOTIFY_SOCKET set but unusable (empty or too long); skipping sd_notify"
+            );
+            return;
+        }
+    };
+    // SOCK_DGRAM AF_UNIX socket; CLOEXEC so it never leaks into the SSH/proxy subprocesses.
+    // SAFETY: socket() with constant args; returns -1 on failure (checked).
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        tracing::debug!("sd_notify: socket() failed; skipping readiness notification");
+        return;
+    }
+    const MSG: &[u8] = b"READY=1\n";
+    // SAFETY: `addr` is a validly-initialized sockaddr_un of `addr_len` bytes (built by
+    // `notify_socket_sockaddr`); MSG is a valid byte buffer; fd is the socket just opened. sendto on a
+    // SOCK_DGRAM unix socket is connectionless — no prior connect needed. Return value is checked.
+    let sent = unsafe {
+        libc::sendto(
+            fd,
+            MSG.as_ptr() as *const libc::c_void,
+            MSG.len(),
+            0,
+            &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+            addr_len,
+        )
+    };
+    // SAFETY: fd is the socket we opened and have not closed; close once.
+    unsafe { libc::close(fd) };
+    if sent < 0 {
+        tracing::debug!("sd_notify: sendto failed; readiness not delivered (non-fatal)");
+    } else {
+        tracing::info!("notified systemd: READY=1");
+    }
+}
+
+/// Non-Linux stub: the sd_notify protocol is systemd-specific, so there is nothing to do on
+/// macOS/other (launchd has its own readiness model). Kept so the call site is unconditional.
+#[cfg(not(target_os = "linux"))]
+fn sd_notify_ready() {}
+
+/// Build the `sockaddr_un` (+ its valid length) for a `$NOTIFY_SOCKET` value. Pure — no syscalls — so
+/// the address encoding (the fiddly part) is unit-testable. Returns `None` for an empty or too-long
+/// path (`> sun_path`), which the caller treats as "skip the notify".
+///
+/// Two address forms, per the sd_notify protocol:
+/// - **Abstract socket**: a value starting with `@` (or, historically, a NUL). The leading byte maps
+///   to a NUL in `sun_path[0]`, and the *rest* of the name follows; the address length covers exactly
+///   the used bytes (NUL + name), NOT the whole buffer, and the name is NOT NUL-terminated.
+/// - **Filesystem path**: a normal path copied into `sun_path`, NUL-terminated; the length covers the
+///   path + the terminating NUL.
+#[cfg(target_os = "linux")]
+fn notify_socket_sockaddr(value: &[u8]) -> Option<(libc::sockaddr_un, libc::socklen_t)> {
+    if value.is_empty() {
+        return None;
+    }
+    // SAFETY: an all-zero sockaddr_un is valid (AF_UNSPEC + empty path); we set the fields below.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    // The bytes we actually write into sun_path, and whether the first is the abstract-namespace NUL.
+    let sun_path_len = addr.sun_path.len();
+    // Base offset of sun_path within sockaddr_un, for the abstract-socket length computation.
+    let base = {
+        // offset_of is stable; compute the start of sun_path relative to the struct.
+        std::mem::offset_of!(libc::sockaddr_un, sun_path)
+    };
+    if value[0] == b'@' || value[0] == 0 {
+        // Abstract: sun_path[0] = NUL, then the remaining name bytes (skip the leading '@'/NUL marker).
+        let name = &value[1..];
+        // Need 1 (leading NUL) + name.len() bytes in sun_path; reject if it does not fit.
+        if 1 + name.len() > sun_path_len {
+            return None;
+        }
+        // sun_path[0] is already 0 (zeroed); copy the name after it. sun_path is c_char (i8) on Linux,
+        // so cast each byte through u8→c_char.
+        for (i, &b) in name.iter().enumerate() {
+            addr.sun_path[1 + i] = b as libc::c_char;
+        }
+        // Length = base offset + 1 (NUL) + name length (NO trailing NUL for abstract sockets).
+        let len = (base + 1 + name.len()) as libc::socklen_t;
+        Some((addr, len))
+    } else {
+        // Filesystem path: copy + NUL-terminate; need value.len()+1 bytes in sun_path.
+        if value.len() + 1 > sun_path_len {
+            return None;
+        }
+        for (i, &b) in value.iter().enumerate() {
+            addr.sun_path[i] = b as libc::c_char;
+        }
+        // sun_path[value.len()] stays 0 (the terminator, already zeroed).
+        let len = (base + value.len() + 1) as libc::socklen_t;
+        Some((addr, len))
     }
 }
 
@@ -844,6 +964,65 @@ mod tests {
     fn experiment_gate_accepts_exact_value() {
         assert!(experiment_gate_ok(Some(REQUIRED_EXPERIMENT_VALUE)));
         assert!(experiment_gate_ok(Some("this_is_unstable_software")));
+    }
+
+    // sd_notify address encoding (Linux-only — the helper is cfg(linux)). Validates the two
+    // $NOTIFY_SOCKET forms: a filesystem path (NUL-terminated in sun_path) and an abstract socket
+    // (leading '@' → NUL first byte, name follows, NO trailing NUL). The byte math (offsets + lengths)
+    // is the bug-prone part, so pin it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn notify_socket_sockaddr_encodes_path_and_abstract() {
+        let base = std::mem::offset_of!(libc::sockaddr_un, sun_path);
+
+        // Filesystem path: "/run/systemd/notify" → sun_path holds the bytes + a terminating NUL;
+        // len = base + path.len() + 1.
+        let path = b"/run/systemd/notify";
+        let (addr, len) = notify_socket_sockaddr(path).expect("path form must encode");
+        assert_eq!(addr.sun_family, libc::AF_UNIX as libc::sa_family_t);
+        assert_eq!(
+            len as usize,
+            base + path.len() + 1,
+            "path len = base + path + NUL"
+        );
+        // sun_path starts with the path bytes and is NUL-terminated at [path.len()].
+        for (i, &b) in path.iter().enumerate() {
+            assert_eq!(addr.sun_path[i] as u8, b);
+        }
+        assert_eq!(
+            addr.sun_path[path.len()] as u8,
+            0,
+            "path must be NUL-terminated"
+        );
+
+        // Abstract socket: "@/org/freedesktop/...": sun_path[0] = NUL, then the name AFTER the '@';
+        // len = base + 1 + name.len() with NO trailing NUL.
+        let abs = b"@abstractname";
+        let name = &abs[1..]; // "abstractname"
+        let (addr, len) = notify_socket_sockaddr(abs).expect("abstract form must encode");
+        assert_eq!(
+            len as usize,
+            base + 1 + name.len(),
+            "abstract len = base + NUL + name"
+        );
+        assert_eq!(
+            addr.sun_path[0] as u8, 0,
+            "abstract sockets lead with a NUL in sun_path"
+        );
+        for (i, &b) in name.iter().enumerate() {
+            assert_eq!(
+                addr.sun_path[1 + i] as u8,
+                b,
+                "name follows the leading NUL"
+            );
+        }
+
+        // Empty → None (nothing to notify).
+        assert!(notify_socket_sockaddr(b"").is_none());
+
+        // Too long for sun_path → None (rejected, not truncated). sun_path is ~108 bytes on Linux.
+        let too_long = vec![b'x'; 4096];
+        assert!(notify_socket_sockaddr(&too_long).is_none());
     }
 
     // `resume_decision` is the resume-vs-fresh-auth path selection shared by the boot and SIGHUP
