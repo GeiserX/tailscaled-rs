@@ -772,3 +772,25 @@ control round-trip or affecting the tailnet's authority. Gated behind the existi
 **Daemon impact once landed:** `tnet lock local-disable` (WRITE — gated root/owner-uid like the other lock
 mutations), a thin LocalAPI verb + dispatch. Consumed via a pin bump. Tracked in daemon bead tsd-iqq.14
 (the local-disable half). — daemon lane
+
+---
+
+## 28. Incremental peer deltas on the IPN bus — `Notify.PeerChangedPatch` / `PeersChanged` / `PeersRemoved` (for WatchNotifications peer-delta parity)
+
+**Why:** the daemon's WatchNotifications feed (`tnet`'s masked `Watch` → `Response::Notify`, bead
+tsd-iqq.11) is built on `Device::watch_ipn_bus`. At the current engine the bus's `Notify.net_map` is the
+**full** peer `Vec<StatusNode>` on every netmap change (`ts_runtime/src/ipn_bus.rs` clones the whole peer
+set), whereas Go's `ipn.Notify` carries **incremental** peer deltas — `PeerChangedPatch` (per-peer field
+patches), `PeersChanged`, `PeersRemoved` — so a watcher applies a small diff instead of re-ingesting the
+whole netmap each time. For a large tailnet this is a real efficiency gap (full-set re-broadcast per change
+vs a one-peer patch). The daemon already ships the full-set push (Phase 1/3), which is correct but not
+delta-efficient.
+
+**Ask:** add an incremental peer-change channel to the runtime + surface it on `Notify` — e.g.
+`Notify.peers_changed: Option<Vec<StatusNode>>` / `peers_removed: Option<Vec<StableNodeId>>` (or a
+`PeerChangedPatch`-style per-field patch), emitted on a netmap delta instead of (or alongside) the full
+`net_map`. Mirrors Go's `ipnlocal` netmap-diff path.
+
+**Daemon impact once landed:** `NotifyView` grows `peers_changed`/`peers_removed` fields; `stream_notify`
+forwards them. Until then the daemon's full-`net_map` push is the faithful (if less efficient) behavior — an
+honest reduction, not a fake. Tracked in daemon bead tsd-iqq.11 (Phase 3). — daemon lane
