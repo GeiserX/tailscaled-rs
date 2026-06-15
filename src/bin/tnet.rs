@@ -808,6 +808,22 @@ enum DebugCmd {
     /// closes the stream (node torn down / shutdown). Distinct from `tnet status --watch`, which stays
     /// on the bare status-stream path.
     WatchIpn,
+    /// Print how to reach the daemon's LocalAPI by hand (Go `tailscale debug local-creds`). Purely
+    /// local — emits a ready-to-run `curl` command for the resolved LocalAPI socket; no daemon
+    /// round-trip and nothing is mutated. On this fork the LocalAPI is a Unix-domain socket, so the
+    /// output is the `curl --unix-socket <path> …` form (Go prints this same form for its Unix socket;
+    /// its TCP-port+token form is Windows-only and does not apply here). Useful for poking the LocalAPI
+    /// with raw HTTP while debugging.
+    LocalCreds,
+    /// Stat one or more files and print their mode + size, listing directory entries (Go `tailscale
+    /// debug stat`). Purely local — a plain `lstat` of each path (symlinks are NOT followed, matching
+    /// Go's `os.Lstat`), no daemon round-trip. For a directory, its entries are listed (capped at 25,
+    /// like Go, then `...`). A path that cannot be stat-ed is reported inline and the rest continue.
+    Stat {
+        /// The files (or directories) to stat. Each is `lstat`-ed independently.
+        #[arg(value_name = "FILE", required = true)]
+        files: Vec<String>,
+    },
 }
 
 /// `tnet serve` subcommands. Mirrors the TCP-forward subset of Go `tailscale serve`.
@@ -1627,6 +1643,17 @@ async fn main() -> Result<()> {
             // `debug watch-ipn` streams the IPN-bus notify path (masked watch) — a long-lived
             // read-only stream printing one JSON `Notify` per line.
             DebugCmd::WatchIpn => run_debug_watch_ipn(&socket).await,
+            // `debug local-creds` prints the `curl` command for the resolved LocalAPI socket — purely
+            // local (it describes the socket the CLI WOULD talk to; no round-trip).
+            DebugCmd::LocalCreds => {
+                run_debug_local_creds(&socket);
+                Ok(())
+            }
+            // `debug stat` lstats each path locally — no socket round-trip.
+            DebugCmd::Stat { files } => {
+                run_debug_stat(&files);
+                Ok(())
+            }
         },
         // `install` / `uninstall` (Go `tailscaled install-system-daemon` / `uninstall-system-daemon`):
         // purely LOCAL, privileged file + service-manager work — they never touch the LocalAPI socket.
@@ -2688,6 +2715,80 @@ fn run_debug_via(site_or_route: &str, cidr: Option<&str>) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// `debug local-creds` (Go `tailscale debug local-creds`): print a ready-to-run `curl` command for the
+/// LocalAPI. Purely local — it only describes the socket the CLI resolved (`--socket`/`$TAILNETD_SOCKET`
+/// else the default `socket_path()`), never connecting. On this fork the LocalAPI is a Unix-domain
+/// socket, so we emit Go's Unix form (`curl --unix-socket <path> http://local-tailscaled.sock/…`); Go's
+/// alternate TCP-port-plus-token form is Windows-only (named-pipe / `safesocket.LocalTCPPortAndToken`)
+/// and has no analogue here. The host in the URL is a placeholder the socket transport ignores — kept as
+/// Go's `local-tailscaled.sock` literal so the printed command matches Go byte-for-byte where it applies.
+fn run_debug_local_creds(socket: &std::path::Path) {
+    println!(
+        "curl --unix-socket {} http://local-tailscaled.sock/localapi/v0/status",
+        socket.display()
+    );
+}
+
+/// `debug stat` (Go `tailscale debug stat`): `lstat` each path and print its mode + size; for a
+/// directory, list its entries (capped at 25, then `...`, matching Go). Purely local — no daemon
+/// round-trip. One bad path never aborts the batch (each is reported inline). Delegates the per-path
+/// formatting to the pure [`stat_report`] so the output shape is unit-testable.
+fn run_debug_stat(files: &[String]) {
+    for f in files {
+        print!("{}", stat_report(std::path::Path::new(f)));
+    }
+}
+
+/// Build the `debug stat` output for ONE path (pure → unit-testable; no stdout). `lstat`s `path`
+/// (symlinks NOT followed = Go's `os.Lstat`, so a symlink reports as a symlink, not its target). On
+/// success: `<path>: mode <octal>, size <n> bytes\n`, plus — for a directory — its entries (`  - <name>`,
+/// capped at 25 then `  ...`, matching Go's 25-entry cap). On any error (unstattable path, or a dir that
+/// cannot be read) the error is rendered inline so the caller's batch continues. The string always ends
+/// in a newline.
+fn stat_report(path: &std::path::Path) -> String {
+    use std::fmt::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut out = String::new();
+    let shown = path.display();
+    match std::fs::symlink_metadata(path) {
+        Err(e) => {
+            let _ = writeln!(out, "{shown}: {e}");
+        }
+        Ok(meta) => {
+            // Go prints `os.FileMode` (symbolic) + size; we print the raw unix mode bits octal (like
+            // `stat`/`ls`) + the size in bytes — the same two facts, in this fork's idiom.
+            let mode = meta.permissions().mode();
+            let _ = writeln!(out, "{shown}: mode {mode:o}, size {} bytes", meta.len());
+            // For a directory, list entries — capped at 25 (Go's cap), then a trailing `  ...`.
+            if meta.is_dir() {
+                match std::fs::read_dir(path) {
+                    Err(e) => {
+                        let _ = writeln!(out, "  (cannot read directory: {e})");
+                    }
+                    Ok(entries) => {
+                        for (i, entry) in entries.enumerate() {
+                            if i >= 25 {
+                                let _ = writeln!(out, "  ...");
+                                break;
+                            }
+                            match entry {
+                                Ok(e) => {
+                                    let _ =
+                                        writeln!(out, "  - {}", e.file_name().to_string_lossy());
+                                }
+                                Err(e) => {
+                                    let _ = writeln!(out, "  - (unreadable entry: {e})");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// `switch` (Go `tailscale switch`): `--list` renders a table; `remove <id>` deletes; a bare
@@ -10654,5 +10755,64 @@ mod tests {
              not a print panic); got {handler:?} (SIG_IGN={:?})",
             libc::SIG_IGN
         );
+    }
+
+    #[test]
+    fn stat_report_regular_file_has_mode_and_size() {
+        // A regular file → one line "<path>: mode <octal>, size <n> bytes\n", no entry list.
+        let dir = std::env::temp_dir().join(format!("tnet-stat-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("hello.txt");
+        std::fs::write(&f, b"12345").unwrap(); // 5 bytes
+        let report = super::stat_report(&f);
+        assert!(
+            report.contains("mode ") && report.contains("size 5 bytes"),
+            "expected mode+size for a 5-byte file, got: {report:?}"
+        );
+        // A plain file produces exactly one line (no directory-entry lines).
+        assert_eq!(
+            report.lines().count(),
+            1,
+            "file report must be one line: {report:?}"
+        );
+        assert!(report.ends_with('\n'), "report must end in a newline");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stat_report_missing_path_reports_error_inline() {
+        // A path that cannot be stat-ed → an inline "<path>: <err>" line (never a panic), so a batch
+        // continues past it.
+        let missing = std::env::temp_dir().join(format!(
+            "tnet-stat-nope-{}-does-not-exist",
+            std::process::id()
+        ));
+        let report = super::stat_report(&missing);
+        assert!(
+            report.contains(&missing.display().to_string()) && !report.contains("mode "),
+            "missing path must report an error (no mode line), got: {report:?}"
+        );
+        assert!(report.ends_with('\n'));
+    }
+
+    #[test]
+    fn stat_report_directory_lists_entries_capped_at_25() {
+        // A directory → the mode/size line PLUS one "  - <name>" per entry, capped at 25 then "  ...".
+        let dir = std::env::temp_dir().join(format!("tnet-stat-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..30 {
+            std::fs::write(dir.join(format!("f{i:02}")), b"").unwrap();
+        }
+        let report = super::stat_report(&dir);
+        let entry_lines = report.lines().filter(|l| l.starts_with("  - ")).count();
+        assert_eq!(
+            entry_lines, 25,
+            "must cap directory entries at 25, got {entry_lines}"
+        );
+        assert!(
+            report.lines().any(|l| l.trim() == "..."),
+            "must print a trailing `  ...` when entries exceed the cap: {report:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
