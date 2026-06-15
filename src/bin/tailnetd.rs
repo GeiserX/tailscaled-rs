@@ -113,6 +113,15 @@ struct Args {
     /// which has anything to gate here.
     #[arg(long)]
     no_logs_no_support: bool,
+    /// Run a debug HTTP server on `[host:]port` exposing `GET /debug/metrics` (Go `tailscaled
+    /// --debug`). Serves the daemon's Prometheus metrics (the same text `tnet metrics` returns) over
+    /// plain HTTP so a scraper can pull them without the unix LocalAPI socket. A bare port binds
+    /// `127.0.0.1` (the endpoint is UNAUTHENTICATED — metrics can carry operational detail, so the
+    /// bind address is the security boundary); pass a full address to bind elsewhere. Read-only.
+    /// Go's `/debug/pprof/*` is Go-runtime-specific and not served (a request gets a clear 404). Off
+    /// unless given.
+    #[arg(long, value_name = "[HOST:]PORT")]
+    debug: Option<String>,
 }
 
 /// Restore the default `SIGPIPE` disposition (terminate) before any output. The Rust runtime sets
@@ -250,6 +259,13 @@ async fn main() -> Result<()> {
         ),
         None => None,
     };
+    let debug_listen = match &args.debug {
+        Some(addr) => Some(
+            tailscaled_rs::debugserver::normalize_listen_addr(addr)
+                .context("invalid --debug address")?,
+        ),
+        None => None,
+    };
 
     // The prefs path the backend persists to / loads from; SIGHUP re-reads it to re-evaluate intent.
     let prefs_path = state_dir.join("prefs.json");
@@ -321,6 +337,8 @@ async fn main() -> Result<()> {
         let socks5_addr = socks5_listen.clone();
         let http_proxy_backend = Arc::clone(&backend);
         let http_proxy_addr = http_proxy_listen.clone();
+        let debug_backend = Arc::clone(&backend);
+        let debug_addr = debug_listen.clone();
         tokio::select! {
             r = tailscaled_rs::server::serve(&socket_path, server_backend, shutdown_signal()) => r,
             // The SOCKS5 proxy arm: a bind/serve error ends the daemon (matches Go). When no
@@ -329,6 +347,9 @@ async fn main() -> Result<()> {
             // The HTTP-proxy arm: same model — bind/serve error ends the daemon; `pending()` when the
             // `--outbound-http-proxy-listen` flag is absent.
             r = run_optional_http_proxy(http_proxy_addr, http_proxy_backend) => r,
+            // The debug-HTTP arm (Go `--debug`): same model — a bind/serve error ends the daemon;
+            // `pending()` when `--debug` is absent.
+            r = run_optional_debug(debug_addr, debug_backend) => r,
             // `sighup_reload_loop` never returns; this arm only wins if it somehow does (it logs and
             // exits the loop only if installing the SIGHUP handler fails), in which case we keep
             // serving — losing reload is not a reason to tear the daemon down.
@@ -448,6 +469,19 @@ async fn run_optional_http_proxy(
 ) -> anyhow::Result<()> {
     match listen {
         Some(addr) => tailscaled_rs::httpproxy::serve(&addr, backend, shutdown_signal()).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Run the debug HTTP server if `--debug` was given, else an inert future. Same uniform-`select!`-arm
+/// pattern as [`run_optional_socks5`] — a bind/serve error ends the daemon (Go does the same); when
+/// not configured, this is `pending()` and the arm never wins.
+async fn run_optional_debug(
+    listen: Option<String>,
+    backend: Arc<Mutex<tailscaled_rs::ipn::Backend>>,
+) -> anyhow::Result<()> {
+    match listen {
+        Some(addr) => tailscaled_rs::debugserver::serve(&addr, backend, shutdown_signal()).await,
         None => std::future::pending().await,
     }
 }
@@ -862,6 +896,14 @@ mod tests {
         assert!(!a.cleanup && !a.no_logs_no_support);
         let a = Args::parse_from(["tailnetd", "--cleanup", "--no-logs-no-support"]);
         assert!(a.cleanup && a.no_logs_no_support);
+        // `--debug [host:]port` (Go `tailscaled --debug`): None by default, the value when given.
+        assert!(Args::parse_from(["tailnetd"]).debug.is_none());
+        assert_eq!(
+            Args::parse_from(["tailnetd", "--debug", "9090"])
+                .debug
+                .as_deref(),
+            Some("9090")
+        );
     }
 
     #[test]

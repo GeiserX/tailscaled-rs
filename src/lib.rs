@@ -22,6 +22,7 @@
 
 pub mod auth;
 pub mod conffile;
+pub mod debugserver;
 pub mod hardening;
 pub mod httpproxy;
 pub mod ipforward;
