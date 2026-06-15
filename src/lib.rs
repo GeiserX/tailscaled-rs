@@ -24,6 +24,7 @@ pub mod auth;
 pub mod conffile;
 pub mod hardening;
 pub mod httpproxy;
+pub mod ipforward;
 pub mod ipn;
 pub mod localapi;
 pub mod prefs;

@@ -267,6 +267,43 @@ pub enum Request {
     /// no registered policy store (Linux/Unix) the forced re-read re-merges zero sources and yields
     /// the same empty snapshot as `list`.
     SyspolicyReload,
+    /// Check whether the OS is configured to forward IP traffic — a subnet-router / exit-node
+    /// readiness diagnostic (Go `tailscale`'s `check-ip-forwarding` LocalAPI, called by `up`/`set` on
+    /// the advertise-routes path). Replies with [`Response::IpForwardingCheck`] carrying a `warning`
+    /// string (empty = all good). Read-only — gated like [`Status`](Request::Status); node-up
+    /// independent (it reads OS sysctls, not the netmap). FAITHFUL OS-SPECIFICITY (matches Go): in
+    /// netstack mode there is nothing to check (the kernel does not forward — userspace does), so the
+    /// warning is always empty; on Linux with a kernel TUN it reads `/proc/sys/net/ipv4/ip_forward`
+    /// and `/proc/sys/net/ipv6/conf/all/forwarding`; on macOS/other it is a no-op (empty), exactly as
+    /// Go's `netutil.CheckIPForwarding` returns `nil` off Linux/BSD.
+    CheckIpForwarding,
+    /// Validate a prospective set of prefs WITHOUT applying them (Go `tailscale`'s `check-prefs`
+    /// LocalAPI → `LocalBackend.CheckPrefs`, called by `up`/`set` to fail fast). Replies with
+    /// [`Response::Ok`] on success or [`Response::Error`] naming the violation(s). A **write** (Go
+    /// gates `serveCheckPrefs` on `PermitWrite`), but it MUTATES NOTHING — it only runs the same
+    /// validation the bring-up path would. This fork mirrors the subset of Go's rule chain that maps
+    /// to its prefs: the exit-node-vs-advertise-exit-node conflict, SSH-server capability, and
+    /// advertise-route CIDR masking (Go's operator/auto-update/profile/config-lock rules reference
+    /// prefs this fork does not model). The fields are the same "leave unchanged unless named"
+    /// sentinels as [`Set`](Request::Set) — a check validates the prospective combined posture.
+    CheckPrefs {
+        /// Prospective exit-node selector (same double-option semantics as [`Set::exit_node`]).
+        #[serde(
+            default,
+            with = "::serde_with::rust::double_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        exit_node: Option<Option<String>>,
+        /// Prospective advertise-exit-node intent.
+        #[serde(default)]
+        advertise_exit_node: Option<bool>,
+        /// Prospective advertised subnet routes (CIDRs).
+        #[serde(default)]
+        advertise_routes: Option<Vec<String>>,
+        /// Prospective SSH-server enable intent.
+        #[serde(default)]
+        ssh: Option<bool>,
+    },
     /// Provision (or fetch) a TLS certificate + key for `domain` via the tailnet's ACME flow (Go
     /// `tailscale cert <domain>`). Replies with [`Response::Cert`] carrying the leaf+chain and the
     /// private key as PEM. Requires the node to be up (issuance goes through the live engine's
@@ -538,6 +575,14 @@ pub enum Response {
     /// The effective system policy snapshot (reply to [`Request::SyspolicyList`] /
     /// [`Request::SyspolicyReload`]), rendered by `tnet syspolicy list` / `reload`.
     Policy(PolicyReport),
+    /// The OS IP-forwarding readiness result (reply to [`Request::CheckIpForwarding`]). `warning` is
+    /// empty when forwarding is fine (or N/A — netstack/macOS); a non-empty string is the
+    /// human-readable warning the CLI prints (Go's `{"Warning": "..."}` shape, lower-cased on our
+    /// snake_case wire). Mirrors Go's `serveCheckIPForwarding` anonymous `{Warning string}`.
+    IpForwardingCheck {
+        /// Empty = forwarding OK / not applicable; non-empty = the warning to surface.
+        warning: String,
+    },
     /// An issued TLS certificate (reply to [`Request::Cert`]), written out by `tnet cert`. Both fields
     /// are PEM text: `cert_pem` is the leaf + intermediate chain, `key_pem` is the private key. The
     /// key is sensitive — the CLI writes it `0600` and the daemon never logs it.
