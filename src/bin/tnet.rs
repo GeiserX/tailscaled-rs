@@ -220,6 +220,17 @@ enum Command {
         /// pref. Requires the `identity-federation` daemon feature.
         #[arg(long, value_name = "AUDIENCE")]
         audience: Option<String>,
+        /// Emit machine-readable JSON instead of the human-readable output (Go `tailscale up
+        /// --json`). WARNING: the format is subject to change — Go labels it the same way, so do not
+        /// treat the shape as a stable interface. With `--json`, every human line (the `ok:` line, the
+        /// "To authenticate…" auth-URL block, the timeout/revert-guide text) is suppressed and the only
+        /// thing written is one JSON object: `{AuthURL, BackendState, Error}`, with empty fields
+        /// omitted (matching Go's `,omitempty`). NOTE: this fork emits NO `QR` field — Go gates QR
+        /// behind a build tag (`HasQRCodes`) and a QR encoder, which this fork does not carry; the
+        /// omission is the same honest reduced scope as a Go build without `HasQRCodes` (the field is
+        /// simply absent), not a stub.
+        #[arg(long)]
+        json: bool,
     },
     /// Tweak individual prefs on an already-configured node, without an up/down cycle (the analogue
     /// of Go's `tailscale set`). This never (re)authenticates and never changes whether the node is
@@ -1466,6 +1477,7 @@ async fn main() -> Result<()> {
             client_secret,
             id_token,
             audience,
+            json,
         } => {
             run_up(
                 &socket,
@@ -1500,6 +1512,7 @@ async fn main() -> Result<()> {
                 timeout,
                 accept_risk,
                 resolve_wif(client_id, client_secret, id_token, audience).await?,
+                json,
             )
             .await
         }
@@ -1892,6 +1905,7 @@ async fn run_up(
     timeout: Option<u64>,
     accept_risk: Option<String>,
     wif: WifFlags,
+    json: bool,
 ) -> Result<()> {
     // Risk gate (Go `--accept-risk`/`riskLoseSSH`): `--force-reauth` re-registers the node,
     // which can drop the very Tailscale-SSH session you're typing from. Refuse it over such a
@@ -1989,7 +2003,12 @@ async fn run_up(
         .with_context(|| format!("talking to daemon at {}", socket.display()))?;
     match response {
         Response::Ok { message } => {
-            println!("ok: {message}");
+            // Human mode prints the `ok:` acknowledgement; JSON mode emits NO human chatter — only
+            // the terminal JSON object below — so suppress it (Go `up --json` likewise prints just the
+            // JSON, no "Success." line).
+            if !json {
+                println!("ok: {message}");
+            }
             // Interactive login: an authkey-less `up` succeeds at the daemon, but the node now needs
             // a human to authorize it. The auth URL isn't known yet at `up`-time — it arrives once
             // the engine reaches `NeedsLogin` — so poll `status` briefly to surface it (or a
@@ -1997,26 +2016,52 @@ async fn run_up(
             if interactive_up {
                 match poll_for_auth_url(socket).await {
                     AuthOutcome::Url(url) => {
-                        println!();
-                        println!("To authenticate this node, visit:");
-                        println!("    {url}");
-                        println!();
-                        println!(
-                            "(the node will finish connecting automatically once authorized; \
+                        if json {
+                            // Go's auth-URL JSON path: `{AuthURL, BackendState}`. An auth URL is only
+                            // ever set in the `NeedsLogin` state (the engine reports
+                            // `DeviceState::NeedsLogin(url)`), so emit that state literal rather than
+                            // burning a second status round-trip just to read back a value we already
+                            // know — simple and correct.
+                            println!("{}", up_json_string(Some(&url), Some("NeedsLogin"), None));
+                        } else {
+                            println!();
+                            println!("To authenticate this node, visit:");
+                            println!("    {url}");
+                            println!();
+                            println!(
+                                "(the node will finish connecting automatically once authorized; \
                                   run `tnet status` to check)"
-                        );
+                            );
+                        }
                     }
                     AuthOutcome::Failed(reason) => {
                         // Registration hard-failed. An interactive `up` that terminally fails must
                         // not exit 0 implying success, and must not tell the operator to log in —
                         // re-running with the same key loops forever. Surface the reason and exit
                         // non-zero (mirroring the `Response::Error` path below).
-                        eprintln!();
-                        eprintln!("registration failed: {}", sanitize_multiline(&reason));
-                        eprintln!(
-                            "(this is a permanent failure — re-run `tnet up --authkey <NEW_KEY>` \
-                             with a fresh key; the same key will keep failing)"
-                        );
+                        if json {
+                            // Go's `printUpDoneJSON` on failure: `{BackendState, Error}`. Fetch the
+                            // daemon's actual state string for fidelity (a terminal failure leaves the
+                            // engine in a canonical `ipn.State`); if the status round-trip is
+                            // unavailable, omit BackendState and still report the Error. The reason is
+                            // control-influenced, so sanitize it (same as the human branch).
+                            let state = fetch_backend_state(socket).await;
+                            println!(
+                                "{}",
+                                up_json_string(
+                                    None,
+                                    state.as_deref(),
+                                    Some(&sanitize_multiline(&reason)),
+                                )
+                            );
+                        } else {
+                            eprintln!();
+                            eprintln!("registration failed: {}", sanitize_multiline(&reason));
+                            eprintln!(
+                                "(this is a permanent failure — re-run `tnet up --authkey <NEW_KEY>` \
+                                 with a fresh key; the same key will keep failing)"
+                            );
+                        }
                         std::process::exit(1);
                     }
                     AuthOutcome::None => {}
@@ -2031,8 +2076,29 @@ async fn run_up(
             if let Some(secs) = up_timeout
                 && let Err(e) = wait_for_running(socket, Some(secs)).await
             {
-                eprintln!("{e:#}");
+                // A timeout failing the wait is a terminal `up` failure. In JSON mode report it as
+                // `{BackendState, Error}` (Go's `printUpDoneJSON` error path) rather than the human
+                // stderr line; the daemon accepted the up but the node never reached Running.
+                if json {
+                    let state = fetch_backend_state(socket).await;
+                    println!(
+                        "{}",
+                        up_json_string(None, state.as_deref(), Some(&format!("{e:#}")))
+                    );
+                } else {
+                    eprintln!("{e:#}");
+                }
                 std::process::exit(1);
+            }
+            // Successful done path. In JSON mode, mirror Go's `printUpDoneJSON` on success:
+            // `{BackendState}` (the daemon's current state string). Fetch it via a status round-trip
+            // for fidelity rather than assuming "Running" — a non-`--timeout` up returns the instant
+            // the daemon accepts it, so the node may still be `Starting`; reporting the real state is
+            // the faithful choice. If status is momentarily unavailable, the object is empty (`{}`),
+            // never a fabricated state.
+            if json {
+                let state = fetch_backend_state(socket).await;
+                println!("{}", up_json_string(None, state.as_deref(), None));
             }
             Ok(())
         }
@@ -2040,15 +2106,83 @@ async fn run_up(
         // not mention (Go's accidental-revert guard). Render Go's guidance with a copy-pasteable
         // command and exit non-zero — nothing was changed on the node.
         Response::RevertGuard { reverts } => {
-            eprint!("{}", format_revert_guard(&reverts));
+            if json {
+                // This guard is a fork-specific pre-flight refusal with no Go-CLI equivalent in the
+                // same shape, so there is no Go JSON to mirror. In JSON mode, collapse the full human
+                // guide to a single short `{Error}` (JSON mode emits only JSON objects, never the
+                // multi-line copy-pasteable guide); the human path keeps the full guidance.
+                println!(
+                    "{}",
+                    up_json_string(
+                        None,
+                        None,
+                        Some(
+                            "refusing to revert unmentioned settings; re-run with --reset or \
+                             re-state them (run `tnet up` without --json to see the full guidance)",
+                        ),
+                    )
+                );
+            } else {
+                eprint!("{}", format_revert_guard(&reverts));
+            }
             std::process::exit(1);
         }
         Response::Error { message } => {
-            eprintln!("error: {message}");
+            // Go's `printUpDoneJSON` carries the daemon state, but a transport/daemon-refusal
+            // `Response::Error` gives us only a message (no state), so the faithful JSON shape here is
+            // `{Error}` alone. Human mode keeps the existing `error:` stderr line.
+            if json {
+                println!("{}", up_json_string(None, None, Some(&message)));
+            } else {
+                eprintln!("error: {message}");
+            }
             std::process::exit(1);
         }
         other => anyhow::bail!("unexpected response to up: {other:?}"),
     }
+}
+
+/// Best-effort fetch of the daemon's current IPN state string (`BackendState`) for `up --json`'s
+/// `{BackendState}` field. Does a single read-only `status` round-trip and returns the `state`
+/// (one of the seven [`crate::ipn::State`] names, e.g. `Running`/`Starting`/`NeedsLogin`); on any
+/// transport error it returns `None` so the caller simply omits the field rather than fabricating a
+/// state. Kept separate from [`poll_for_auth_url`] (which classifies into an [`AuthOutcome`]) because
+/// the JSON paths want the raw state string, exactly as Go reads `st.BackendState`.
+async fn fetch_backend_state(socket: &std::path::Path) -> Option<String> {
+    match round_trip(socket, &Request::Status).await {
+        Ok(Response::Status(s)) => Some(s.state),
+        _ => None,
+    }
+}
+
+/// Build the `tnet up --json` output object as a pretty-printed JSON string, mirroring Go
+/// `up --json`'s `upOutputJSON` (`{AuthURL, BackendState, Error}`). Each field is omitted when absent
+/// **or empty**, matching Go's `,omitempty` on every field; an all-empty call yields `{}`. The `QR`
+/// field Go gates behind `HasQRCodes` is intentionally absent in this fork (no QR encoder) — the same
+/// reduced shape as a Go build without that build tag.
+///
+/// Pure (no I/O) so the shape is unit-testable without a socket. Uses `serde_json` for escape-safe
+/// encoding; 2-space pretty (Go uses a tab on the auth-URL path and 2-space on the done path — the
+/// exact indent is not load-bearing, so this fork is consistently 2-space, the `serde_json` default).
+/// A serialization failure (not reachable for a flat string map) degrades to `{}` rather than panics.
+fn up_json_string(
+    auth_url: Option<&str>,
+    backend_state: Option<&str>,
+    error: Option<&str>,
+) -> String {
+    let mut map = serde_json::Map::new();
+    // `,omitempty` semantics: skip both `None` and `Some("")`.
+    let mut insert_nonempty = |key: &str, val: Option<&str>| {
+        if let Some(v) = val
+            && !v.is_empty()
+        {
+            map.insert(key.to_owned(), serde_json::Value::String(v.to_owned()));
+        }
+    };
+    insert_nonempty("AuthURL", auth_url);
+    insert_nonempty("BackendState", backend_state);
+    insert_nonempty("Error", error);
+    serde_json::to_string_pretty(&map).unwrap_or_else(|_| "{}".to_string())
 }
 
 /// `login` (Go `tailscale login`): (re)authenticate this node **without changing any prefs** — the
@@ -9899,6 +10033,77 @@ mod tests {
         // `--timeout 0` is the explicit "wait forever" value (Go's 0 = wait indefinitely); it must
         // parse as Some(0), distinct from absent (None) — `wait_for_running` maps both to no deadline.
         assert_eq!(up_timeout_of(&["tnet", "up", "--timeout", "0"]), Some(0));
+    }
+
+    #[test]
+    fn up_json_flag_parses_into_command_up() {
+        // `tnet up --json` parses to `Command::Up { json: true, .. }` (Go `tailscale up --json`);
+        // omitting it leaves `json` false (the human-output default). Pin both at the parse boundary
+        // since `run_up` keys its output mode on this exact field.
+        let up_json_of = |argv: &[&str]| -> bool {
+            match Cli::try_parse_from(argv).expect("parses").command {
+                Command::Up { json, .. } => json,
+                _ => panic!("expected Command::Up from {argv:?}"),
+            }
+        };
+        assert!(up_json_of(&["tnet", "up", "--json"]), "--json → json: true");
+        assert!(
+            !up_json_of(&["tnet", "up"]),
+            "no --json → json: false (human output)"
+        );
+    }
+
+    #[test]
+    fn up_json_string_matches_go_up_output_shape() {
+        // Pin the `up --json` object shape (Go `upOutputJSON`: `{AuthURL, BackendState, Error}`),
+        // including the `,omitempty` behavior on every field. The helper is pure, so assert on the
+        // returned string (parsed back) rather than capturing stdout.
+        let parse = |s: &str| -> serde_json::Value {
+            serde_json::from_str(s).expect("up_json_string must emit valid JSON")
+        };
+
+        // Auth-URL path: `{AuthURL, BackendState}`, no `Error` key (it was empty → omitted).
+        let v = parse(&up_json_string(
+            Some("https://controlplane.example/a/abc123"),
+            Some("NeedsLogin"),
+            None,
+        ));
+        assert_eq!(v["AuthURL"], "https://controlplane.example/a/abc123");
+        assert_eq!(v["BackendState"], "NeedsLogin");
+        assert!(
+            v.get("Error").is_none(),
+            "empty Error must be omitted (Go `,omitempty`)"
+        );
+        // No `QR` field in this fork (Go gates it behind HasQRCodes; we carry no QR encoder).
+        assert!(v.get("QR").is_none(), "this fork emits no QR field");
+
+        // Done path: `{BackendState}` only.
+        let v = parse(&up_json_string(None, Some("Running"), None));
+        assert_eq!(v["BackendState"], "Running");
+        assert!(v.get("AuthURL").is_none() && v.get("Error").is_none());
+
+        // Failure path: `{BackendState, Error}`.
+        let v = parse(&up_json_string(
+            None,
+            Some("NeedsLogin"),
+            Some("invalid key"),
+        ));
+        assert_eq!(v["BackendState"], "NeedsLogin");
+        assert_eq!(v["Error"], "invalid key");
+        assert!(v.get("AuthURL").is_none());
+
+        // All-empty (and explicit empty strings) → `{}`: every field omitted, valid empty object.
+        assert_eq!(up_json_string(None, None, None), "{}");
+        assert_eq!(
+            up_json_string(Some(""), Some(""), Some("")),
+            "{}",
+            "empty strings are omitted exactly like absent fields"
+        );
+
+        // Error-only path (Response::Error / RevertGuard in JSON mode): `{Error}` alone.
+        let v = parse(&up_json_string(None, None, Some("daemon refused")));
+        assert_eq!(v["Error"], "daemon refused");
+        assert!(v.get("AuthURL").is_none() && v.get("BackendState").is_none());
     }
 
     #[test]
