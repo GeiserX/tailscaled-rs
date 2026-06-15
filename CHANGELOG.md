@@ -25,6 +25,21 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.49.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.48.0...v0.49.0) (2026-06-15)
+
+
+### Features
+
+* **localapi:** add check-ip-forwarding + check-prefs verbs (tsd-iqq.8) ([#208](https://github.com/GeiserX/tailscaled-rs/issues/208)) ([68c48b3](https://github.com/GeiserX/tailscaled-rs/commit/68c48b31faad668ea6ae8c915ef625b4378f0018))
+* **tnet:** add ip --assert and whois --json (CLI-flag parity, tsd-iqq.13) ([#209](https://github.com/GeiserX/tailscaled-rs/issues/209)) ([5ce4f65](https://github.com/GeiserX/tailscaled-rs/commit/5ce4f6570e2bf29b098097f1ab93c8cff8c22604))
+* **tnet:** add reload-config LocalAPI verb + running-config adoption (tsd-iqq.7) ([#214](https://github.com/GeiserX/tailscaled-rs/issues/214)) ([16b1fe5](https://github.com/GeiserX/tailscaled-rs/commit/16b1fe512def4871013f306325b37661193082ab))
+
+
+### Bug Fixes
+
+* **cli:** neutralize U+2028/U+2029 + bidi overrides in terminal sanitizers (tsd-ct5) ([#212](https://github.com/GeiserX/tailscaled-rs/issues/212)) ([a9783c8](https://github.com/GeiserX/tailscaled-rs/commit/a9783c8ae59b68556f8ae90d71a716452d25640c))
+* **funnel:** warn on non-loopback backend; correct stale CI runner comment ([#211](https://github.com/GeiserX/tailscaled-rs/issues/211)) ([1bec62a](https://github.com/GeiserX/tailscaled-rs/commit/1bec62a7f23ccd8a6ea9c43275927127a56b159b))
+
 ## [0.48.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.47.1...v0.48.0) (2026-06-15)
 
 
