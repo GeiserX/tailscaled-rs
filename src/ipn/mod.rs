@@ -2883,6 +2883,20 @@ impl Backend {
     /// web serve is full-replaced (an emptied web config is cleared) — all without disturbing the
     /// device.
     pub async fn set_serve_config(&mut self, cfg: &serve::ServeConfig) -> Result<()> {
+        // Heads-up if a funnel-enabled port forwards to a NON-loopback backend: funnel publishes to
+        // the PUBLIC internet, so a non-loopback target means inbound internet traffic is spliced to
+        // something other than this host's loopback (another LAN host, a metadata endpoint, a public
+        // IP). This is allowed (the operator asked for it; the security boundary is SetServeConfig's
+        // write authorization), so it is a WARN, not a refusal — exposing an internal service to the
+        // internet should not be silent. (tsd-6nk)
+        for (port, backend) in serve::funnel_nonloopback_backends(cfg) {
+            tracing::warn!(
+                port,
+                backend = %backend,
+                "funnel: port {port} is published to the PUBLIC internet and forwards to a \
+                 non-loopback backend {backend} — inbound internet traffic will reach it"
+            );
+        }
         serve::save(cfg, &self.state_dir, &self.current_profile)
             .await
             .with_context(|| "persisting serve-config")?;
