@@ -73,6 +73,15 @@ pub enum Request {
         /// [`initial_state`](Request::Watch::initial_state).
         #[serde(default, skip_serializing_if = "core::ops::Not::not")]
         initial_netmap: bool,
+        /// Stream the node's prefs as [`NotifyView::prefs`]: a front-loaded snapshot on subscribe,
+        /// then a fresh frame on every prefs change (`up`/`set`/`logout`/`switch`/`reload-config`).
+        /// The faithful analogue of Go's `ipn.NotifyInitialPrefs` + ongoing `Notify.Prefs`. Unlike
+        /// `initial_state`/`initial_netmap` this is **daemon-built**, not an engine `NotifyWatchOpt`
+        /// bit — this fork's prefs are daemon-owned (the engine has no prefs cell), so the daemon
+        /// broadcasts them from its own `persist_prefs` chokepoint. Same `#[serde(default)]` +
+        /// `skip_serializing_if` back-compat discipline (a bare watch stays `{"cmd":"watch"}`).
+        #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+        prefs: bool,
     },
     /// Bring the node up (`WantRunning = true`), optionally (re)setting login/config fields.
     Up {
@@ -932,7 +941,7 @@ pub struct StatusReport {
 /// on the wire and falls back to [`PrefsView::default`], so a JSON projection missing any field
 /// deserializes instead of hard-erroring. Fields keep their `skip_serializing_if` so empty
 /// optionals/collections are still dropped from the emitted wire.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PrefsView {
     /// The requested hostname (Go `--hostname` / `Prefs.Hostname`), or `None` to use the OS hostname.
@@ -1379,6 +1388,13 @@ pub struct NotifyView {
     /// engine has no incremental peer-patch feed). `None` when this frame carried no netmap change.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub net_map: Option<Vec<PeerReport>>,
+    /// The node's current prefs, if the `prefs` mask bit was set (Go `Notify.Prefs`). A front-loaded
+    /// snapshot on subscribe, then a fresh frame on every prefs change. Reuses the same [`PrefsView`]
+    /// projection [`StatusReport::prefs`] / `GetPrefs` use, so the watch feed and a one-shot read
+    /// describe prefs identically. DAEMON-built (not an engine `Notify` field — this fork's prefs are
+    /// daemon-owned). `None` when this frame carried no prefs change (or the `prefs` bit was unset).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefs: Option<PrefsView>,
 }
 
 /// A single peer entry in a [`StatusReport`].
@@ -1554,6 +1570,7 @@ mod tests {
             serde_json::to_string(&Request::Watch {
                 initial_state: false,
                 initial_netmap: false,
+                prefs: false,
             })
             .unwrap(),
             r#"{"cmd":"watch"}"#
@@ -1563,31 +1580,45 @@ mod tests {
             Request::Watch {
                 initial_state: false,
                 initial_netmap: false,
+                prefs: false,
             }
         ));
         // A masked watch round-trips its bits (the Notify-path selector): each `true` field appears on
-        // the wire, and the masked request decodes back to the same flags.
+        // the wire, and the masked request decodes back to the same flags. (`prefs` is the Phase-2
+        // daemon-built bit; it serializes/parses identically to the engine bits.)
         assert_eq!(
             serde_json::to_string(&Request::Watch {
                 initial_state: true,
                 initial_netmap: true,
+                prefs: true,
             })
             .unwrap(),
-            r#"{"cmd":"watch","initial_state":true,"initial_netmap":true}"#
+            r#"{"cmd":"watch","initial_state":true,"initial_netmap":true,"prefs":true}"#
         );
         match serde_json::from_str::<Request>(
-            r#"{"cmd":"watch","initial_state":true,"initial_netmap":true}"#,
+            r#"{"cmd":"watch","initial_state":true,"initial_netmap":true,"prefs":true}"#,
         )
         .unwrap()
         {
             Request::Watch {
                 initial_state,
                 initial_netmap,
+                prefs,
             } => {
-                assert!(initial_state && initial_netmap);
+                assert!(initial_state && initial_netmap && prefs);
             }
             other => panic!("expected masked Watch, got {other:?}"),
         }
+        // A `prefs`-only watch (the Phase-2 daemon-built path) is also masked — only `prefs` on the wire.
+        assert_eq!(
+            serde_json::to_string(&Request::Watch {
+                initial_state: false,
+                initial_netmap: false,
+                prefs: true,
+            })
+            .unwrap(),
+            r#"{"cmd":"watch","prefs":true}"#
+        );
     }
 
     #[test]

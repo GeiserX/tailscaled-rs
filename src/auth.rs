@@ -384,14 +384,17 @@ mod tests {
             !requires_write(&Request::Watch {
                 initial_state: false,
                 initial_netmap: false,
+                prefs: false,
             }),
             "bare watch only streams status snapshots — a read, gated exactly like status"
         );
-        // A masked watch (the Notify path) is equally a read — the mask never makes it mutate.
+        // A masked watch (the Notify path, incl. the daemon-built prefs feed) is equally a read — the
+        // mask never makes it mutate.
         assert!(
             !requires_write(&Request::Watch {
                 initial_state: true,
                 initial_netmap: true,
+                prefs: true,
             }),
             "masked watch only streams notifications — still a read"
         );

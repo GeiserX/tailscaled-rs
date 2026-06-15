@@ -1203,6 +1203,13 @@ pub struct Backend {
     /// new receiver rather than going deaf. Bumped in lockstep with `generation` via
     /// [`bump_generation`](Backend::bump_generation).
     lifecycle_tx: tokio::sync::watch::Sender<u64>,
+    /// Wakes prefs watchers (a masked `Watch` with the `prefs` bit) on every prefs change. A tick
+    /// channel (`()` payload): a receiver re-reads [`prefs_view`](Backend::prefs_view) on each tick
+    /// rather than the value riding the channel — the same "tick, then re-read the source" pattern
+    /// the streaming `status` watcher uses for state. Bumped from [`persist_prefs`](Backend::persist_prefs),
+    /// the single chokepoint EVERY prefs mutation (`up`/`set`/`logout`/`switch`/`reload-config`)
+    /// funnels through, so one send-site covers them all. Daemon-owned (the engine has no prefs cell).
+    prefs_tx: tokio::sync::watch::Sender<()>,
     /// Whether **this process** has attempted a boot-time auto-start (set by
     /// [`mark_boot_attempted_up`](Backend::mark_boot_attempted_up)). Process-local and deliberately
     /// NOT persisted: it lets the SIGHUP reload path distinguish "retry a bring-up we already
@@ -1288,6 +1295,7 @@ impl Backend {
             .await
             .with_context(|| format!("loading prefs from {}", prefs_path.display()))?;
         let (lifecycle_tx, _) = tokio::sync::watch::channel(0u64);
+        let (prefs_tx, _) = tokio::sync::watch::channel(());
         let mut backend = Self {
             prefs,
             state_dir: state_dir.to_path_buf(),
@@ -1305,6 +1313,7 @@ impl Backend {
             generation: 0,
             boot_attempted_up: false,
             lifecycle_tx,
+            prefs_tx,
             // Seed the cache once, at startup, from an actual on-disk check — startup is not the hot
             // path, and every later mutation is tracked at its transition (see the field doc's
             // invariant). `has_persisted_node_key` reads only `key_path`, which is already set above.
@@ -3281,7 +3290,21 @@ impl Backend {
         self.prefs
             .save(&self.prefs_path)
             .await
-            .with_context(|| format!("saving prefs to {}", self.prefs_path.display()))
+            .with_context(|| format!("saving prefs to {}", self.prefs_path.display()))?;
+        // Wake any prefs watchers (a masked `Watch` with the `prefs` bit) — this is the single
+        // chokepoint every prefs mutation funnels through, so one tick here covers up/set/logout/
+        // switch/reload-config. A failed send (no subscribers) is fine — `watch::Sender::send` errors
+        // only when there are zero receivers, which is the common case (no one is watching prefs).
+        let _ = self.prefs_tx.send(());
+        Ok(())
+    }
+
+    /// Subscribe to prefs-change ticks (a masked `Watch` with the `prefs` bit). The receiver re-reads
+    /// [`prefs_view`](Backend::prefs_view) on each tick. `subscribe()` starts synced (no spurious
+    /// initial tick), so a watcher emits its first prefs frame from its own initial snapshot, not from
+    /// this channel.
+    pub fn watch_prefs(&self) -> tokio::sync::watch::Receiver<()> {
+        self.prefs_tx.subscribe()
     }
 
     /// Apply a declarative `--config` document over the loaded prefs and persist the result, returning
@@ -3437,6 +3460,7 @@ mod tests {
             generation: 0,
             boot_attempted_up: false,
             lifecycle_tx: tokio::sync::watch::channel(0u64).0,
+            prefs_tx: tokio::sync::watch::channel(()).0,
             // Cache starts `false` (a fresh backend, no key checked yet). Tests that need a key
             // present drive the real wipe/build paths, which keep the cache consistent on their own.
             has_node_key: false,

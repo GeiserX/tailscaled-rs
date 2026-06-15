@@ -235,6 +235,7 @@ async fn handle_conn(
                     Ok(Request::Watch {
                         initial_state,
                         initial_netmap,
+                        prefs,
                     }) => {
                         // A long-lived stream: take a permit from the SEPARATE stream budget so a
                         // flood of `Watch` connections can't starve the short-lived control pool. If
@@ -253,13 +254,19 @@ async fn handle_conn(
                             .await?;
                             break;
                         };
-                        if !initial_state && !initial_netmap {
+                        if !initial_state && !initial_netmap && !prefs {
                             // Bare watch → the legacy status-stream path, untouched.
                             stream_watch(&mut write_half, &backend).await?;
                         } else {
                             // Masked watch → the IPN-bus notify-stream path.
-                            stream_notify(&mut write_half, &backend, initial_state, initial_netmap)
-                                .await?;
+                            stream_notify(
+                                &mut write_half,
+                                &backend,
+                                initial_state,
+                                initial_netmap,
+                                prefs,
+                            )
+                            .await?;
                         }
                         break;
                     }
@@ -468,12 +475,14 @@ async fn stream_notify(
     backend: &Arc<Mutex<Backend>>,
     initial_state: bool,
     initial_netmap: bool,
+    prefs: bool,
 ) -> Result<()> {
     use tailscale::NotifyWatchOpt;
 
-    // Translate the request's mask bools into the engine's `NotifyWatchOpt` once (the same mask is
-    // re-applied to every epoch's fresh subscription so a replacement device front-loads its snapshot
-    // too). `empty()` carries no initial snapshot; each requested bit adds its front-load.
+    // Translate the request's ENGINE mask bools into the engine's `NotifyWatchOpt` once (the same mask
+    // is re-applied to every epoch's fresh subscription so a replacement device front-loads its
+    // snapshot too). `empty()` carries no initial snapshot; each requested bit adds its front-load.
+    // (`prefs` is daemon-built, NOT an engine bit, so it is handled separately below.)
     let mut mask = NotifyWatchOpt::empty();
     if initial_state {
         mask = mask | NotifyWatchOpt::INITIAL_STATE;
@@ -482,13 +491,21 @@ async fn stream_notify(
         mask = mask | NotifyWatchOpt::INITIAL_NETMAP;
     }
 
-    // Subscribe to lifecycle BEFORE deriving the first device so an up/down landing between the device
-    // clone and the subscribe is never lost (`subscribe()` starts synced to the current generation) —
-    // the same ordering `stream_watch` relies on.
-    let mut life = {
+    // Subscribe to lifecycle (and, when the `prefs` bit is set, prefs-change ticks) BEFORE deriving the
+    // first device so a transition landing between the device clone and the subscribe is never lost
+    // (`subscribe()` starts synced) — the same ordering `stream_watch` relies on. The prefs watcher is
+    // independent of the device epoch (prefs change whether or not the node is up), so it lives across
+    // the outer loop and is selected in BOTH the device-present and device-absent arms.
+    let (mut life, mut prefs_rx) = {
         let be = backend.lock().await;
-        be.watch_lifecycle()
+        (be.watch_lifecycle(), be.watch_prefs())
     };
+
+    // `prefs` front-load: emit the current prefs as the first frame (Go `NotifyInitialPrefs`). Done
+    // once up front (daemon-built, not tied to a device epoch). A write error = client gone.
+    if prefs && emit_prefs_frame(write_half, backend).await.is_err() {
+        return Ok(());
+    }
 
     // Outer loop: one "device epoch" per iteration. Re-entered whenever the device is replaced
     // (down+up) or torn down (down) — re-deriving the current device + a fresh bus watcher each time.
@@ -498,13 +515,26 @@ async fn stream_notify(
         let dev = { backend.lock().await.device_handle() };
 
         let Some(dev) = dev else {
-            // No device this epoch: nothing to stream. Wait only for the next lifecycle change, then
-            // re-derive at the top (an `up` may now have installed a device). Mirrors `stream_watch`'s
-            // None arm.
-            if life.changed().await.is_err() {
-                return Ok(()); // lifecycle sender dropped (daemon gone)
+            // No device this epoch: nothing to stream from the bus. Wait for the next lifecycle change
+            // — but ALSO keep serving prefs ticks if the `prefs` bit is set (prefs can change while the
+            // node is down, e.g. a `set` on a down node), so a prefs watcher isn't deaf between epochs.
+            tokio::select! {
+                res = life.changed() => {
+                    if res.is_err() {
+                        return Ok(()); // lifecycle sender dropped (daemon gone)
+                    }
+                    continue; // re-derive at the top (an `up` may now have installed a device)
+                }
+                res = prefs_rx.changed(), if prefs => {
+                    if res.is_err() {
+                        return Ok(()); // prefs sender dropped (daemon gone)
+                    }
+                    if emit_prefs_frame(write_half, backend).await.is_err() {
+                        return Ok(()); // client hung up
+                    }
+                    continue; // still no device — loop back to the device-derive/wait
+                }
             }
-            continue;
         };
 
         // Attach a fresh IPN-bus watcher OFF-LOCK. The mask front-loads this device's current
@@ -560,9 +590,37 @@ async fn stream_notify(
                     // the new device, re-subscribes with the mask, and re-snapshots it.
                     break;
                 }
+                // Prefs ticks (only armed when the `prefs` bit is set): emit a fresh prefs frame in
+                // place, without disturbing this device epoch's bus stream.
+                res = prefs_rx.changed(), if prefs => {
+                    if res.is_err() {
+                        return Ok(()); // prefs sender dropped (daemon gone)
+                    }
+                    if emit_prefs_frame(write_half, backend).await.is_err() {
+                        return Ok(()); // client hung up
+                    }
+                }
             }
         }
     }
+}
+
+/// Emit one `Response::Notify { prefs: Some(current prefs) }` frame (the daemon-built prefs feed).
+/// A brief await-free lock reads the projection; returns `Err` if the client hung up (so the caller
+/// returns `Ok(())` and ends the stream). Shared by the front-load + both prefs select arms.
+async fn emit_prefs_frame(
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    backend: &Arc<Mutex<Backend>>,
+) -> Result<()> {
+    let view = { backend.lock().await.prefs_view() };
+    write_response(
+        write_half,
+        &Response::Notify(crate::localapi::NotifyView {
+            prefs: Some(view),
+            ..Default::default()
+        }),
+    )
+    .await
 }
 
 /// Project one engine [`Notify`](tailscale::Notify) into the LocalAPI [`NotifyView`] wire shape,
@@ -597,6 +655,10 @@ fn project_notify(notify: tailscale::Notify) -> Option<crate::localapi::NotifyVi
         error,
         browse_to_url,
         net_map,
+        // `prefs` is the daemon-built field, never sourced from an engine `Notify` — `project_notify`
+        // only maps engine fields, so prefs is always `None` here (the prefs feed is emitted separately
+        // by `emit_prefs_frame`).
+        prefs: None,
     };
     // The engine never emits an all-`None` Notify, but guard the projection anyway: a frame with no
     // populated field carries nothing for a consumer to apply.
