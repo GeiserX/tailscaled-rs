@@ -25,6 +25,24 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.48.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.47.1...v0.48.0) (2026-06-15)
+
+
+### Features
+
+* **daemon:** add --cleanup, --no-logs-no-support, and rich --version ([#201](https://github.com/GeiserX/tailscaled-rs/issues/201)) ([9140508](https://github.com/GeiserX/tailscaled-rs/commit/91405081fc43ef02ad1848f7ec527a4a51767548))
+* **tnet:** add `debug rebind` (force engine UDP socket rebind) ([#203](https://github.com/GeiserX/tailscaled-rs/issues/203)) ([f102544](https://github.com/GeiserX/tailscaled-rs/commit/f1025442566fcd94ba0156c1192687b17cdcf64d))
+* **tnet:** add `debug via` for 4via6 route encode/decode ([#202](https://github.com/GeiserX/tailscaled-rs/issues/202)) ([badfd03](https://github.com/GeiserX/tailscaled-rs/commit/badfd0357ddf38378b0ce5dd0a3febf443746df9))
+
+
+### Bug Fixes
+
+* **conffile:** match Go ConfigVAlpha wire keys; drop non-Go AdvertiseTags ([#205](https://github.com/GeiserX/tailscaled-rs/issues/205)) ([1379087](https://github.com/GeiserX/tailscaled-rs/commit/1379087a48ca8d09dadd86665f8cc02a2b517967))
+* **httpproxy:** bound and harden the Tailscale-Connect-Error header ([#204](https://github.com/GeiserX/tailscaled-rs/issues/204)) ([afb707f](https://github.com/GeiserX/tailscaled-rs/commit/afb707f6f9327470cbd042fe7f44c4c171d43967))
+* **serve:** atomic config save + funnel-off clears stale-host key ([#207](https://github.com/GeiserX/tailscaled-rs/issues/207)) ([8ae6ea5](https://github.com/GeiserX/tailscaled-rs/commit/8ae6ea59807ae42a682e0eb683e603dabdef2bc9))
+* **status:** Go-faithful exit-node ID, --watch json/filters, peer IPv6 ([#206](https://github.com/GeiserX/tailscaled-rs/issues/206)) ([0d3eb90](https://github.com/GeiserX/tailscaled-rs/commit/0d3eb90a614eeee533994b2314222e2d6a39592c))
+* **up:** wipe key before --reset mutates in-memory prefs ([#199](https://github.com/GeiserX/tailscaled-rs/issues/199)) ([497fd19](https://github.com/GeiserX/tailscaled-rs/commit/497fd19c1f32532b818d31e3a4e2bf6afa06012d))
+
 ## [0.47.1](https://github.com/GeiserX/tailscaled-rs/compare/v0.47.0...v0.47.1) (2026-06-14)
 
 
