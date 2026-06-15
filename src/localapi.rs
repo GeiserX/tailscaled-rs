@@ -1452,6 +1452,14 @@ pub struct PeerReport {
     /// the home DERP region is known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay: Option<String>,
+    /// The peer's advertised SSH host public keys, in `known_hosts` format (Go
+    /// `ipnstate.PeerStatus.SSH_HostKeys`). Used by `tnet ssh` to pin the peer's host key
+    /// (`StrictHostKeyChecking=yes` against a generated `ssh_known_hosts`), so the connection verifies
+    /// the host key from the netmap instead of a TOFU prompt. Empty when control advertised none
+    /// (never fabricated). `#[serde(default)]` keeps the wire backward-compatible with clients/daemons
+    /// that predate this field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ssh_host_keys: Vec<String>,
 }
 
 #[cfg(test)]

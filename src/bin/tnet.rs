@@ -692,6 +692,26 @@ enum Command {
         #[arg(value_name = "PORT")]
         port: u16,
     },
+    /// SSH to a tailnet machine (Go `tailscale ssh [user@]<host> [args...]`). Resolves the peer
+    /// against the current netmap, writes a `ssh_known_hosts` file pinned from the peer's advertised
+    /// SSH host keys, and execs the system `ssh` with `StrictHostKeyChecking=yes` + a `ProxyCommand`
+    /// that tunnels the connection over the tailnet via `tnet nc` — so `ssh` verifies the host key
+    /// from the netmap (no TOFU prompt, no MITM window) and reaches the peer without a TUN/route.
+    /// Requires the system `ssh` binary on `PATH`. Any trailing args are passed through to `ssh`.
+    Ssh {
+        /// Target as `[user@]host`. `host` is a peer's MagicDNS name (or bare hostname) or tailnet IP;
+        /// `user` defaults to the current local user when omitted (Go's behavior).
+        #[arg(value_name = "[USER@]HOST")]
+        target: String,
+        /// Extra arguments passed verbatim to the system `ssh` after the destination (e.g. a remote
+        /// command, or `ssh` flags). Everything here goes to `ssh`, not to `tnet`.
+        #[arg(
+            value_name = "SSH_ARGS",
+            trailing_var_arg = true,
+            allow_hyphen_values = true
+        )]
+        args: Vec<String>,
+    },
     /// Expose a local service on the tailnet (Go `tailscale serve`): `tcp` (raw TCP forward, the
     /// daemon's own accept loop) and `https`/`http` (web reverse-proxy, terminated + served by the
     /// engine for the node's MagicDNS name). HTTPS issuance needs the `acme` feature + a SaaS tailnet.
@@ -1469,6 +1489,11 @@ async fn main() -> Result<()> {
     // cleanly instead of panicking the print. Must run before any stdout write.
     reset_sigpipe();
     let cli = Cli::parse();
+    // Capture the EXPLICIT `--socket` override (if any) before resolving the default — `ssh`'s
+    // ProxyCommand must re-pass it to the `tnet nc` subprocess so the tunnel hits the same daemon
+    // (Go threads the same `socketArg` only when a non-default socket is set). `None` ⇒ default socket
+    // ⇒ no `--socket` needed on the ProxyCommand.
+    let explicit_socket = cli.socket.clone();
     let socket = cli.socket.unwrap_or_else(tailscaled_rs::socket_path);
 
     match cli.command {
@@ -1600,6 +1625,12 @@ async fn main() -> Result<()> {
         Command::Nc { host, port } => run_nc(&socket, &host, port)
             .await
             .with_context(|| format!("nc to {host}:{port} via {}", socket.display())),
+        // `ssh`: resolve the peer + its host keys via Status, write a pinned ssh_known_hosts, then
+        // exec the system `ssh` with a ProxyCommand through `tnet nc`. On success this never returns
+        // (it execs); on a resolution/setup failure it returns an error.
+        Command::Ssh { target, args } => {
+            run_ssh(&socket, explicit_socket.as_deref(), &target, &args).await
+        }
         // `serve`: read-modify-write the ServeConfig (tcp/reset) or render it (status). Inline because
         // tcp/reset must GET the current config, mutate, then SET it.
         Command::Serve { cmd } => run_serve(&socket, cmd)
@@ -6662,6 +6693,294 @@ async fn run_nc(socket: &std::path::Path, host: &str, port: u16) -> Result<()> {
     Ok(())
 }
 
+/// `tnet ssh [user@]<host> [args...]` (Go `tailscale ssh`): resolve the peer + its advertised SSH host
+/// keys via the daemon status, write a pinned `ssh_known_hosts`, then exec the system `ssh` with a
+/// `ProxyCommand` that tunnels over the tailnet through `tnet nc`.
+///
+/// Faithful to Go's `runSSH`:
+/// - Split `[user@]host` on the first `@`; an absent user defaults to the current local user.
+/// - Resolve `host` against the netmap (`Status`): match a peer by MagicDNS/display name OR tailnet
+///   IP. The SSH destination host is the peer's display name (its DNSName) so the host-key line keyed
+///   by that name matches; if it has none we fall back to its IPv4.
+/// - Write `<config-dir>/tailscale/ssh_known_hosts` (dir `0700`, file `0644`) from the peer's
+///   `ssh_host_keys` — one `<host> <key>` line per (host identifier × key), where host identifiers are
+///   the peer's name and each of its tailnet IPs (Go's `genKnownHosts`).
+/// - Exec `ssh` with `-o UpdateHostKeys no`, `-o StrictHostKeyChecking yes`,
+///   `-o CanonicalizeHostname no`, `-o UserKnownHostsFile <file>`, and `-o ProxyCommand <tnet> [--socket
+///   <s>] nc %h %p` (our own binary's `nc`), then `user@host` and the passthrough args.
+///
+/// Returns an error on a resolution/setup failure; on success it never returns (it `exec`s, replacing
+/// this process with `ssh`). Requires the system `ssh` binary on `PATH`.
+async fn run_ssh(
+    socket: &std::path::Path,
+    explicit_socket: Option<&std::path::Path>,
+    target: &str,
+    extra_args: &[String],
+) -> Result<()> {
+    use std::os::unix::process::CommandExt as _;
+
+    // 1. Parse `[user@]host`. Split on the FIRST `@` (Go `strings.Cut`); empty user → current local
+    //    user. A trailing/empty host is rejected (nothing to resolve).
+    let (user, host) = match target.split_once('@') {
+        Some((u, h)) => (u.to_string(), h.to_string()),
+        None => (current_login_user(), target.to_string()),
+    };
+    if host.is_empty() {
+        anyhow::bail!("ssh: empty host in target {target:?} (expected `[user@]host`)");
+    }
+    if user.is_empty() {
+        anyhow::bail!("ssh: empty user in target {target:?} (use `host` for the current user)");
+    }
+    // SECURITY: the username becomes the left half of the `user@host` argv element handed to `ssh`. A
+    // username that LEADS WITH `-` would make `user@host` parse as an ssh option (getopt flag
+    // injection — e.g. `-oProxyCommand=…@host` overrides the tunnel), and whitespace/`@` would split
+    // or malform the destination. The user half can come from an UNTRUSTED env var (`$USER`/`$LOGNAME`
+    // via `current_login_user`, unlike Go which reads the OS passwd entry), so guard it regardless of
+    // source. Reject rather than sanitize — a `-`-leading or whitespace username is operator/env error,
+    // and silently rewriting it would surprise. (The host half cannot lead with `-` because `user@` is
+    // always prefixed; it is resolved against the netmap below, not taken raw.)
+    if user.starts_with('-') || user.contains([' ', '\t', '\n', '\r', '@']) {
+        anyhow::bail!(
+            "ssh: refusing unsafe username {user:?} (leads with '-' or contains whitespace/@) — pass \
+             an explicit `user@host` with a valid username"
+        );
+    }
+
+    // 2. Resolve the peer against the netmap. Fetch Status (not whois — that is IP-only) so a NAME
+    //    also resolves, mirroring `ip <peer>` / Go's `peerStatusFromArg`.
+    let status = match round_trip(socket, &Request::Status).await {
+        Ok(Response::Status(s)) => s,
+        Ok(Response::Error { message }) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        Ok(other) => anyhow::bail!("unexpected response to status request: {other:?}"),
+        Err(e) => {
+            return Err(e).with_context(|| format!("querying status at {}", socket.display()));
+        }
+    };
+    let peer = match status
+        .peers
+        .iter()
+        .find(|p| p.name == host || p.ipv4 == host || p.ipv6.as_deref() == Some(host.as_str()))
+    {
+        Some(p) => p,
+        None => {
+            eprintln!("ssh: no peer matching {host:?} in the current netmap (run `tnet status`)");
+            std::process::exit(1);
+        }
+    };
+
+    // 3. Build the pinned known_hosts from the peer's advertised SSH host keys. Without them we cannot
+    //    pin the host key; rather than silently downgrade to a TOFU prompt (a weaker posture than Go's
+    //    StrictHostKeyChecking=yes), refuse — the operator gets a clear reason. (A peer that does not
+    //    run Tailscale SSH simply has none; `tnet ssh` to it is not meaningful.)
+    if peer.ssh_host_keys.is_empty() {
+        eprintln!(
+            "ssh: peer {host:?} advertises no SSH host keys (it is not running Tailscale SSH, or \
+             control has not provisioned them) — cannot verify the host key, refusing to connect"
+        );
+        std::process::exit(1);
+    }
+    // The SSH destination host: prefer the peer's display name (its DNSName — the host-key line keyed
+    // by it then matches), else fall back to its IPv4. Either way the known_hosts carries lines for
+    // BOTH the name and the IPs, so the match holds regardless.
+    let ssh_host = if peer.name.is_empty() {
+        peer.ipv4.clone()
+    } else {
+        peer.name.clone()
+    };
+    let known_hosts_path =
+        write_ssh_known_hosts(peer).context("writing the pinned ssh_known_hosts file")?;
+
+    // 4. Locate the system `ssh` binary. We exec it (replacing this process) so the user gets a normal
+    //    interactive ssh session with the terminal wired straight through.
+    let ssh_bin = find_ssh().context("locating the system `ssh` binary")?;
+
+    // 5. The ProxyCommand tunnels the TCP stream over the tailnet via our OWN binary's `nc`
+    //    subcommand. `%h`/`%p` are ssh's host/port tokens. Re-pass `--socket` only when the user set a
+    //    non-default one (so the tunnel hits the same daemon), matching Go's conditional `socketArg`.
+    let self_exe =
+        std::env::current_exe().context("resolving the running `tnet` executable path")?;
+    let self_exe = self_exe.to_string_lossy();
+    let proxy_command = match explicit_socket {
+        // Bind the socket value to the flag with `=` (Go's `--socket=%q` form) so it is a SINGLE shell
+        // token after ssh splits the ProxyCommand — the value can never be seen as a separate
+        // argument, even before the inner `tnet` re-parses it. (The value is also `shell_quote`d, so
+        // this is belt-and-suspenders.)
+        Some(s) => format!(
+            "ProxyCommand {} --socket={} nc %h %p",
+            shell_quote(&self_exe),
+            shell_quote(&s.to_string_lossy())
+        ),
+        None => format!("ProxyCommand {} nc %h %p", shell_quote(&self_exe)),
+    };
+
+    // 6. Build the ssh argv (Go's exact `-o` set) and exec.
+    let mut cmd = std::process::Command::new(&ssh_bin);
+    cmd.arg("-o").arg("UpdateHostKeys no");
+    cmd.arg("-o").arg("StrictHostKeyChecking yes");
+    // Per Go (tailscale/tailscale#10348): keep ssh from canonicalizing the MagicDNS name, which would
+    // turn it into something the known_hosts line is not keyed by.
+    cmd.arg("-o").arg("CanonicalizeHostname no");
+    cmd.arg("-o")
+        .arg(format!("UserKnownHostsFile {}", known_hosts_path.display()));
+    cmd.arg("-o").arg(proxy_command);
+    cmd.arg(format!("{user}@{ssh_host}"));
+    cmd.args(extra_args);
+
+    // exec replaces this process; it only returns on failure (e.g. ssh binary vanished between the
+    // find and the exec). A returned value is therefore always an error.
+    let err = cmd.exec();
+    Err(anyhow::Error::from(err).context(format!("exec {}", ssh_bin.display())))
+}
+
+/// The current local login user, for the default SSH username when the target omits `user@` (Go uses
+/// `user.Current().Username`). Falls back through `$USER`/`$LOGNAME`, then `id -un`, then `"root"` —
+/// a best-effort that mirrors what a shell would use; the user can always pass `user@host` explicitly.
+fn current_login_user() -> String {
+    if let Ok(u) = std::env::var("USER")
+        && !u.is_empty()
+    {
+        return u;
+    }
+    if let Ok(u) = std::env::var("LOGNAME")
+        && !u.is_empty()
+    {
+        return u;
+    }
+    if let Ok(out) = std::process::Command::new("id").arg("-un").output()
+        && out.status.success()
+    {
+        let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !name.is_empty() {
+            return name;
+        }
+    }
+    "root".to_string()
+}
+
+/// Locate the system `ssh` binary by scanning `$PATH` (Go's `findSSH` via `exec.LookPath`). Returns the
+/// first executable `ssh` found, else an error naming the miss so the operator can install/adjust PATH.
+fn find_ssh() -> Result<std::path::PathBuf> {
+    let path = std::env::var_os("PATH").context("PATH is not set, cannot locate `ssh`")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join("ssh");
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    anyhow::bail!("could not find an `ssh` binary on PATH; install OpenSSH to use `tnet ssh`")
+}
+
+/// Write the peer's advertised SSH host keys to `<config-dir>/tailscale/ssh_known_hosts` (Go's
+/// `writeKnownHosts`): dir created `0700`, file written `0644`. Returns the file path for ssh's
+/// `UserKnownHostsFile`. The file content is built by [`render_known_hosts`] (pure, tested).
+fn write_ssh_known_hosts(peer: &tailscaled_rs::localapi::PeerReport) -> Result<std::path::PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+
+    let dir = ssh_conf_dir().context("resolving the tailscale config directory")?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join("ssh_known_hosts");
+    let content = render_known_hosts(peer);
+    // Write 0644 (world-readable host keys are not secret — they are public keys, and ssh reads the
+    // file as the invoking user). Truncate+rewrite each run so a stale peer's keys never linger.
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o644)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    f.write_all(content.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
+}
+
+/// The directory for the daemon's per-user config files (`<config-dir>/tailscale`), mirroring Go's
+/// `tsConfDir` (the OS user-config dir joined with `tailscale`). Used for `ssh_known_hosts`.
+fn ssh_conf_dir() -> Result<std::path::PathBuf> {
+    // XDG_CONFIG_HOME, else ~/.config (Linux), else $HOME/Library/Application Support (macOS-ish) —
+    // but keep it simple + cross-platform: XDG_CONFIG_HOME or $HOME/.config, then /tailscale.
+    let base = if let Some(x) = std::env::var_os("XDG_CONFIG_HOME").filter(|s| !s.is_empty()) {
+        std::path::PathBuf::from(x)
+    } else if let Some(h) = std::env::var_os("HOME").filter(|s| !s.is_empty()) {
+        std::path::PathBuf::from(h).join(".config")
+    } else {
+        anyhow::bail!("neither XDG_CONFIG_HOME nor HOME is set; cannot place ssh_known_hosts");
+    };
+    Ok(base.join("tailscale"))
+}
+
+/// Build the `ssh_known_hosts` content for `peer` (Go's `genKnownHosts`): for each advertised host key,
+/// emit a `<host> <key>` line for the peer's name AND each of its tailnet IPs. Keys containing a
+/// newline/carriage-return are skipped (a control-supplied key must not forge extra lines — the same
+/// injection-class guard the structured CLI output uses). Pure → unit-testable.
+fn render_known_hosts(peer: &tailscaled_rs::localapi::PeerReport) -> String {
+    // Host identifiers: the display name (when non-empty) + every tailnet IP we know.
+    //
+    // SECURITY: the host field is control-supplied (peer.name derives from the wire Node.name, which
+    // this fork — unlike Go talking to Tailscale's sanitizing coordination server — accepts verbatim
+    // from arbitrary/self-hosted control). A name containing a newline could forge an extra
+    // known_hosts line (e.g. a `*` wildcard pinning an attacker key), and a space/tab would split the
+    // line into a bogus host token; a leading `#` would turn the line into a comment. So the host
+    // identifier is guarded EXACTLY like the key below — a known_hosts host token must contain no
+    // whitespace/CR/LF and not lead with `#`. The IPs are typed (`IpAddr` → always numeric) and so are
+    // inherently safe, but we run them through the same `is_safe_known_hosts_host` gate uniformly. A
+    // peer whose name is unsafe simply contributes no name-keyed line (its IP lines still work).
+    fn is_safe_known_hosts_host(h: &str) -> bool {
+        !h.is_empty() && !h.starts_with('#') && !h.contains([' ', '\t', '\n', '\r'])
+    }
+    let mut hosts: Vec<&str> = Vec::new();
+    if is_safe_known_hosts_host(&peer.name) {
+        hosts.push(peer.name.as_str());
+    }
+    if is_safe_known_hosts_host(&peer.ipv4) {
+        hosts.push(peer.ipv4.as_str());
+    }
+    if let Some(v6) = peer.ipv6.as_deref().filter(|s| is_safe_known_hosts_host(s)) {
+        hosts.push(v6);
+    }
+    let mut out = String::new();
+    for key in &peer.ssh_host_keys {
+        let key = key.trim();
+        // Skip a key that would break the one-line-per-entry format (CR/LF injection guard).
+        if key.is_empty() || key.contains('\n') || key.contains('\r') {
+            continue;
+        }
+        for host in &hosts {
+            out.push_str(host);
+            out.push(' ');
+            out.push_str(key);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Minimal POSIX single-quote shell-quoting for an ssh `-o ProxyCommand` token (the value is passed to
+/// ssh, which re-parses it with a shell). Wrap in single quotes and escape any embedded single quote as
+/// `'\''`. Our inputs are a binary path + a socket path, but quoting keeps a space/quote in either from
+/// breaking the ProxyCommand.
+fn shell_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 /// Normalize a `serve --tcp` forward target: a bare port `5000` → `127.0.0.1:5000`; a `host:port`
 /// passes through. Mirrors Go's `ExpandProxyTargetValue(target, ["tcp"], "tcp")` host extraction.
 fn normalize_serve_target(target: &str) -> String {
@@ -7274,6 +7593,129 @@ mod tests {
         assert!(run_debug_via("not-an-addr", None).is_err());
         // A negative/garbage site id with a cidr errors on the parse.
         assert!(run_debug_via("-1", Some("10.0.0.0/8")).is_err());
+    }
+
+    #[test]
+    fn render_known_hosts_emits_name_and_ips_per_key() {
+        use tailscaled_rs::localapi::PeerReport;
+        // Go's genKnownHosts: one `<host> <key>` line per (host-identifier × key), where the host
+        // identifiers are the peer's name + each tailnet IP. Two keys × three hosts (name, v4, v6) = 6.
+        let peer = PeerReport {
+            name: "host.example.ts.net".into(),
+            ipv4: "100.64.0.2".into(),
+            ipv6: Some("fd7a:115c:a1e0::2".into()),
+            ssh_host_keys: vec![
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5key1".into(),
+                "ecdsa-sha2-nistp256 AAAAE2VjZHNhkey2".into(),
+            ],
+            ..Default::default()
+        };
+        let out = render_known_hosts(&peer);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines.len(),
+            6,
+            "2 keys × 3 host identifiers = 6 lines: {out:?}"
+        );
+        // Each line is `<host> <key>` and every host identifier is keyed to each key.
+        assert!(out.contains("host.example.ts.net ssh-ed25519 AAAAC3NzaC1lZDI1NTE5key1"));
+        assert!(out.contains("100.64.0.2 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5key1"));
+        assert!(out.contains("fd7a:115c:a1e0::2 ecdsa-sha2-nistp256 AAAAE2VjZHNhkey2"));
+        assert!(out.ends_with('\n'));
+    }
+
+    #[test]
+    fn render_known_hosts_skips_crlf_injected_keys() {
+        use tailscaled_rs::localapi::PeerReport;
+        // A control-supplied host key with an embedded newline must NOT be able to forge extra
+        // known_hosts lines (CR/LF injection guard) — the bad key is skipped entirely.
+        let peer = PeerReport {
+            name: "h".into(),
+            ipv4: "100.64.0.5".into(),
+            ssh_host_keys: vec![
+                "ssh-ed25519 good".into(),
+                "ssh-ed25519 evil\n100.64.0.5 ssh-ed25519 forged".into(),
+                "ssh-ed25519 also\rbad".into(),
+            ],
+            ..Default::default()
+        };
+        let out = render_known_hosts(&peer);
+        // Only the good key survives → 2 hosts (name + v4) × 1 key = 2 lines; no "forged"/"evil"/"bad".
+        assert_eq!(
+            out.lines().count(),
+            2,
+            "only the clean key is emitted: {out:?}"
+        );
+        assert!(!out.contains("forged"));
+        assert!(!out.contains("evil"));
+        assert!(!out.contains("bad"));
+        assert!(out.contains("h ssh-ed25519 good"));
+        assert!(out.contains("100.64.0.5 ssh-ed25519 good"));
+    }
+
+    #[test]
+    fn render_known_hosts_skips_crlf_injected_host_name() {
+        use tailscaled_rs::localapi::PeerReport;
+        // SECURITY (M1): a control-supplied peer.name with an embedded newline must NOT forge an extra
+        // known_hosts line (e.g. a `*` wildcard pinning an attacker key). The unsafe NAME contributes
+        // no line; the peer's IP (safe, numeric) still gets its line, so a real connection by IP works.
+        let peer = PeerReport {
+            name: "victim.ts.net\n* ssh-ed25519 ATTACKERKEY".into(),
+            ipv4: "100.64.0.9".into(),
+            ssh_host_keys: vec!["ssh-ed25519 realkey".into()],
+            ..Default::default()
+        };
+        let out = render_known_hosts(&peer);
+        // The forged `*` wildcard line must NOT appear, and no ATTACKERKEY anywhere.
+        assert!(
+            !out.contains('*'),
+            "must not forge a wildcard host line: {out:?}"
+        );
+        assert!(!out.contains("ATTACKERKEY"));
+        // Only the safe IP host keyed to the real key survives → exactly one line.
+        assert_eq!(out, "100.64.0.9 ssh-ed25519 realkey\n", "got: {out:?}");
+    }
+
+    #[test]
+    fn render_known_hosts_skips_host_with_space_or_leading_hash() {
+        use tailscaled_rs::localapi::PeerReport;
+        // A name with a space would split into a bogus host token; a leading `#` would comment the
+        // line out. Both are rejected as host identifiers (the IP still works).
+        let spaced = PeerReport {
+            name: "a b".into(),
+            ipv4: "100.64.0.3".into(),
+            ssh_host_keys: vec!["ssh-ed25519 k".into()],
+            ..Default::default()
+        };
+        assert_eq!(render_known_hosts(&spaced), "100.64.0.3 ssh-ed25519 k\n");
+        let hashed = PeerReport {
+            name: "#cmt".into(),
+            ipv4: "100.64.0.4".into(),
+            ssh_host_keys: vec!["ssh-ed25519 k".into()],
+            ..Default::default()
+        };
+        assert_eq!(render_known_hosts(&hashed), "100.64.0.4 ssh-ed25519 k\n");
+    }
+
+    #[test]
+    fn render_known_hosts_empty_when_no_keys() {
+        use tailscaled_rs::localapi::PeerReport;
+        // A peer with no advertised SSH host keys produces an empty file (run_ssh refuses BEFORE
+        // calling this in that case, but the renderer is still well-defined → empty string).
+        let peer = PeerReport {
+            name: "h".into(),
+            ipv4: "100.64.0.7".into(),
+            ..Default::default()
+        };
+        assert_eq!(render_known_hosts(&peer), "");
+    }
+
+    #[test]
+    fn shell_quote_wraps_and_escapes() {
+        // Single-quote wrapping for the ProxyCommand tokens; an embedded quote becomes '\'' .
+        assert_eq!(shell_quote("/usr/bin/tnet"), "'/usr/bin/tnet'");
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
     }
 
     /// Build a minimal `StatusReport` in the given state with no auth_url/error, no peers.
