@@ -1149,6 +1149,15 @@ pub struct Backend {
     /// config to reload), and it is deliberately profile-independent: a `switch` does not change which
     /// `--config` file the daemon was launched with.
     config_path: Option<PathBuf>,
+    /// The WireGuard/disco UDP listen port (Go `tailscaled --port` / `PORT`), or `None` for an
+    /// OS-chosen ephemeral port (the default). Set once from `tailnetd`'s `main()` via
+    /// [`set_listen_port`](Backend::set_listen_port) right after [`load`](Backend::load) when `--port`
+    /// (or `PORT`) is given, and threaded into the engine [`tailscale::Config`] by
+    /// [`build_config`](Backend::build_config). Like `config_path`, this is process-local boot
+    /// configuration: NOT a pref, NOT persisted, and profile-independent (a `switch` does not change
+    /// the listen port the daemon was launched with). `Some(p)` pins the bind so the node's UDP
+    /// endpoint is stable across restarts; the engine falls back to an ephemeral port if `p` is taken.
+    listen_port: Option<u16>,
     /// The running engine, if up. `None` when stopped/needs-login.
     ///
     /// Held behind an [`Arc`](std::sync::Arc) (not a bare `Device`) so the engine handle can be
@@ -1305,6 +1314,9 @@ impl Backend {
             // No `--config` by default; `tailnetd`'s `main()` calls `set_config_path` right after this
             // when `--config <file>` was given, so `reload_config` can later re-read that exact file.
             config_path: None,
+            // No fixed listen port by default (ephemeral, OS-chosen — Go's port 0); `tailnetd`'s
+            // `main()` calls `set_listen_port` right after this when `--port`/`PORT` was given.
+            listen_port: None,
             device: None,
             ssh_task: None,
             serve_tasks: Vec::new(),
@@ -1331,6 +1343,17 @@ impl Backend {
     /// (last write wins), though the daemon only ever calls it once at boot.
     pub fn set_config_path(&mut self, path: PathBuf) {
         self.config_path = Some(path);
+    }
+
+    /// Record the WireGuard/disco UDP listen port the daemon was started with (Go `tailscaled --port`
+    /// / `PORT`), threaded into the engine config by [`build_config`](Backend::build_config). Called
+    /// once from `tailnetd`'s `main()` right after [`load`](Backend::load) when `--port`/`PORT` was
+    /// given — separate from `load` (like [`set_config_path`](Backend::set_config_path)) so the common
+    /// (ephemeral-port) startup path stays untouched. `None` is never passed (the caller only calls
+    /// this when a port was given); a `Some(0)` would be honored verbatim by the engine as "pick any",
+    /// equivalent to the default. Idempotent (last write wins); the daemon calls it once at boot.
+    pub fn set_listen_port(&mut self, port: u16) {
+        self.listen_port = Some(port);
     }
 
     /// List the known profiles (the analogue of Go `tailscale switch --list`). Returns one entry per
@@ -2482,7 +2505,7 @@ impl Backend {
     /// [`config::build_config`] for the full control-server-precedence / leak-safety / preflight
     /// rationale.
     async fn build_config(&self) -> Result<tailscale::Config> {
-        config::build_config(&self.prefs, &self.key_path).await
+        config::build_config(&self.prefs, &self.key_path, self.listen_port).await
     }
 
     /// Bring the node down (`WantRunning = false`) without logging out; tears down the engine.
@@ -3452,6 +3475,8 @@ mod tests {
             // No `--config` by default; the reload-config tests set this explicitly when exercising
             // the re-read path (`set_config_path`).
             config_path: None,
+            // No fixed listen port by default (ephemeral); tests that exercise it set it explicitly.
+            listen_port: None,
             device: None,
             ssh_task: None,
             serve_tasks: Vec::new(),

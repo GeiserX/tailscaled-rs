@@ -25,7 +25,11 @@ use crate::prefs::Prefs;
 /// over the *non*-env default), then prefs override hostname/ephemeral/accept_routes, and finally
 /// `prefs.control_url` overrides the control server last so an explicit pref always wins over the
 /// environment.
-pub(super) async fn build_config(prefs: &Prefs, key_path: &Path) -> Result<tailscale::Config> {
+pub(super) async fn build_config(
+    prefs: &Prefs,
+    key_path: &Path,
+    listen_port: Option<u16>,
+) -> Result<tailscale::Config> {
     // Start from the env-aware default so `TS_CONTROL_URL` (and the other `TS_*` vars) are
     // honored, then fold in the persisted node key — `default_with_key_file` does the same
     // `load_key_file` but over the plain (non-env) default, which would silently ignore the env.
@@ -217,6 +221,13 @@ pub(super) async fn build_config(prefs: &Prefs, key_path: &Path) -> Result<tails
     // refused. Sending (`file_cp`) does NOT depend on this; only receiving does. The raw pref
     // string maps straight to the engine's `Option<PathBuf>` (no parse can fail).
     config.taildrop_dir = prefs.taildrop_dir.as_ref().map(PathBuf::from);
+    // WireGuard/disco UDP listen port (Go `tailscaled --port` / `PORT`). A daemon-startup setting, not
+    // a pref — it is fixed for the process lifetime, so it is threaded in here rather than stored in
+    // `Prefs`. `None` (the default + Go's `0`) lets the OS pick an ephemeral port; `Some(p)` pins the
+    // magicsock bind to `p` so the node's UDP endpoint is stable across restarts (what a fixed-pinhole
+    // firewall needs). The engine falls back to an ephemeral port if `p` is already taken at startup
+    // (a collision must not fail bring-up), so this is a *preference*, not a hard requirement.
+    config.wireguard_listen_port = listen_port;
     Ok(config)
 }
 
@@ -239,11 +250,46 @@ mod tests {
             control_url: control_url.map(String::from),
             ..Default::default()
         };
-        let cfg = build_config(&prefs, &key_path)
+        let cfg = build_config(&prefs, &key_path, None)
             .await
             .expect("build_config should succeed for a valid control_url");
         let _ = std::fs::remove_file(&key_path);
         cfg
+    }
+
+    /// Run `build_config` with the given `listen_port` over a throwaway key path (the port path does
+    /// not touch control, so default prefs suffice). Returns the built engine config.
+    async fn config_for_listen_port(listen_port: Option<u16>) -> tailscale::Config {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let key_path = std::env::temp_dir().join(format!(
+            "tailnetd-portcfgtest-{}-{}.key",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cfg = build_config(&Prefs::default(), &key_path, listen_port)
+            .await
+            .expect("build_config should succeed");
+        let _ = std::fs::remove_file(&key_path);
+        cfg
+    }
+
+    #[tokio::test]
+    async fn listen_port_none_is_ephemeral_some_is_pinned() {
+        // `--port`/`PORT` threads through to the engine's wireguard_listen_port: None (default) leaves
+        // the OS-chosen ephemeral port; Some(p) pins the magicsock bind. Pin both so a refactor that
+        // drops the threading (or maps it to the wrong field) is caught.
+        let ephemeral = config_for_listen_port(None).await;
+        assert_eq!(
+            ephemeral.wireguard_listen_port, None,
+            "no --port → ephemeral (None), matching Go's port 0"
+        );
+        let pinned = config_for_listen_port(Some(41641)).await;
+        assert_eq!(
+            pinned.wireguard_listen_port,
+            Some(41641),
+            "--port 41641 must pin the engine's WireGuard listen port"
+        );
     }
 
     #[tokio::test]

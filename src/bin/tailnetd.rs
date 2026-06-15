@@ -42,12 +42,11 @@ const LONG_VERSION: &str = concat!(
 /// resolution (`tailscaled_rs::state_dir` / `socket_path`) is unchanged, so existing env-driven
 /// deployments behave exactly as before.
 ///
-/// Two Go daemon flags Go also exposes are deliberately NOT daemon-startup flags in this fork, for
-/// different reasons: `--tun` (and its name/MTU) is a **pref**, set via `tnet up`
-/// (`--tun`/`--tun-name`/`--tun-mtu`); `--port` (the WireGuard listen port) is **engine-gated** —
-/// the `tailscale` engine binds an ephemeral port and exposes no configurable listen port, so there
-/// is nothing for a daemon flag to set (tracked if/when the engine adds the knob). `--config`
-/// (declarative `ipn.ConfigVAlpha`) is a tracked follow-up that hangs off this flag surface.
+/// One Go daemon flag Go also exposes is deliberately NOT a daemon-startup flag here: `--tun` (and
+/// its name/MTU) is a **pref**, set via `tnet up` (`--tun`/`--tun-name`/`--tun-mtu`), not a launch
+/// flag. `--port` (the WireGuard/disco UDP listen port) IS a startup flag (see below) — the engine
+/// gained a configurable listen port in v0.40.0. `--config` (declarative `ipn.ConfigVAlpha`) is a
+/// tracked follow-up that hangs off this flag surface.
 #[derive(Parser, Debug)]
 #[command(
     name = "tailnetd",
@@ -72,6 +71,15 @@ struct Args {
     /// env filter when given. Go `tailscaled --verbose`.
     #[arg(long, short = 'v', value_name = "LEVEL")]
     verbose: Option<u8>,
+    /// Fixed UDP port for WireGuard + disco (Go `tailscaled --port`). When omitted, falls back to the
+    /// `PORT` env var (Go's `EnvironmentFile` convention; the explicit flag wins), and if neither is
+    /// set the OS picks an ephemeral port (Go's port `0`, the default) — fine for the common
+    /// NAT-traversal case. Pin it (`--port 41641`, Go's default) when behind a firewall that only
+    /// forwards/pinholes a fixed UDP port, so the node's endpoint is stable across restarts. If the
+    /// chosen port is already taken at startup the engine falls back to an ephemeral port rather than
+    /// failing bring-up (a collision never takes the node down). `0` means "pick any" (= omitting it).
+    #[arg(long, value_name = "PORT")]
+    port: Option<u16>,
     /// Declarative config file (Go `tailscaled --config`, the `ipn.ConfigVAlpha` JSON). Loaded at
     /// startup and merged over the persisted prefs — the headless/automated path for setting prefs
     /// without an interactive `tnet up`. An `AuthKey` (or `file:<path>`) in the config registers the
@@ -271,6 +279,28 @@ async fn main() -> Result<()> {
     let prefs_path = state_dir.join("prefs.json");
 
     let mut backend = Backend::load(&state_dir).await?;
+
+    // `--port <PORT>` / `PORT=` (Go `tailscaled --port`): pin the WireGuard/disco UDP listen port.
+    // A daemon-startup setting, not a pref — threaded onto the engine config by `build_config`. The
+    // explicit `--port` flag wins; absent that, fall back to the `PORT` env var (Go's `EnvironmentFile`
+    // convention — the packaged systemd unit's `EnvironmentFile=-/etc/default/tailnetd` can set it). A
+    // malformed `PORT` (non-numeric / out of range) fails the daemon HARD rather than silently using an
+    // ephemeral port — a misconfigured fixed-pinhole deploy must not start with the wrong endpoint.
+    // Neither given ⇒ the backend's default `None` ⇒ an OS-chosen ephemeral port (untouched path).
+    let listen_port = match args.port {
+        Some(p) => Some(p),
+        None => match std::env::var("PORT") {
+            Ok(s) => Some(
+                s.parse::<u16>()
+                    .with_context(|| format!("invalid PORT env value {s:?}: expected a u16"))?,
+            ),
+            Err(_) => None,
+        },
+    };
+    if let Some(port) = listen_port {
+        backend.set_listen_port(port);
+        tracing::info!(port, "pinning WireGuard/disco listen port (--port/PORT)");
+    }
 
     // `--config <file>`: load the declarative config and merge it over the just-loaded prefs (Go
     // `tailscaled --config`). The merge is layered + persisted by `apply_config`, so the config
