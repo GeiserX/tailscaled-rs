@@ -2966,6 +2966,14 @@ impl Backend {
         diag::netcheck(dev).await
     }
 
+    /// Suggest the best available exit node (the `tnet exit-node suggest` path). Thin `pub` shim over
+    /// [`diag::suggest_exit_node`], uniform with the other off-lock diagnostics. See it for the
+    /// `suggest_exit_node()` → [`Response::ExitNodeSuggestion`](crate::localapi::Response) mapping
+    /// (`Ok(None)` = no eligible candidate, an honest empty result, not an error).
+    pub async fn suggest_exit_node(dev: &tailscale::Device) -> crate::localapi::Response {
+        diag::suggest_exit_node(dev).await
+    }
+
     /// Validate a prospective prefs change WITHOUT applying it (the `check-prefs` LocalAPI / Go
     /// `LocalBackend.CheckPrefs`). Returns `Ok(())` if the resulting posture is valid, else an error
     /// naming every violation (Go joins them; we do too). MUTATES NOTHING — it composes the named

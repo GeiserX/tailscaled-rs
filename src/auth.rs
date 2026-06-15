@@ -144,6 +144,10 @@ pub(crate) fn requires_write(request: &crate::localapi::Request) -> bool {
         | Request::DnsStatus
         | Request::DnsQuery { .. }
         | Request::Netcheck
+        // `SuggestExitNode` computes a best-exit-node suggestion from the netmap + latency and mutates
+        // NOTHING (engaging the node is a separate `set --exit-node`), so it is a read like
+        // `status`/`netcheck`. Go's `SuggestExitNode` LocalAPI handler is likewise a GET.
+        | Request::SuggestExitNode
         // `syspolicy list`/`reload` (Go `tailscale syspolicy`) only read the effective MDM/system
         // policy. Go gates BOTH on `PermitRead` — its LocalAPI `policy/` handler checks only
         // `PermitRead`, even for the POST/reload, because "reload" re-reads the external policy

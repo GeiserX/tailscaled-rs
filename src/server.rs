@@ -979,6 +979,17 @@ async fn dispatch(
                 },
             }
         }
+        // `exit-node suggest` (Go `tailscale exit-node suggest`, read-only). Off-lock device call;
+        // needs the node up (the suggestion comes from the live netmap + measured DERP latency).
+        Request::SuggestExitNode => {
+            let dev = { backend.lock().await.device_handle() };
+            match dev {
+                Some(dev) => Backend::suggest_exit_node(&dev).await,
+                None => Response::Error {
+                    message: "node is not up".into(),
+                },
+            }
+        }
         // `debug rebind` (Go `tailscale debug rebind`, WRITE — re-creates the engine's UDP sockets).
         // Off-lock device call; needs the node up (there is no datapath to rebind otherwise). The
         // write-gate is enforced above by `auth::authorize`.

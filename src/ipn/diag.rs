@@ -334,6 +334,29 @@ pub(super) async fn netcheck(dev: &tailscale::Device) -> Response {
     }
 }
 
+/// Suggest the best available exit node (the `tnet exit-node suggest` / Go `tailscale exit-node
+/// suggest` → `LocalClient.SuggestExitNode` path). Maps the engine's `Device::suggest_exit_node()`:
+/// `Ok(Some(s))` → [`Response::ExitNodeSuggestion`] carrying the node's stable id + display name (the
+/// CLI prints it with a `--exit-node=<id>` hint); `Ok(None)` → `ExitNodeSuggestion(None)`, an **honest
+/// empty result** (no eligible candidate — mirroring Go returning an empty response, NOT an error);
+/// an engine error (e.g. no netcheck report yet → no measured preferred DERP region for the
+/// latency ranking) → a clear [`Response::Error`]. Read-only — it computes a suggestion, mutates
+/// nothing (engaging the node is a separate `set --exit-node`).
+pub(super) async fn suggest_exit_node(dev: &tailscale::Device) -> Response {
+    match dev.suggest_exit_node().await {
+        Ok(Some(s)) => Response::ExitNodeSuggestion {
+            suggestion: Some(crate::localapi::ExitNodeSuggestionView {
+                id: s.id.0,
+                name: s.name,
+            }),
+        },
+        Ok(None) => Response::ExitNodeSuggestion { suggestion: None },
+        Err(e) => Response::Error {
+            message: format!("exit-node suggest failed: {e:?}"),
+        },
+    }
+}
+
 /// Force the engine to rebind its UDP sockets (the `tnet debug rebind` / Go `tailscale debug rebind`
 /// path). A connectivity-recovery knob: it tears down and re-creates magicsock's underlying UDP
 /// sockets, which can clear a wedged NAT binding or recover after a network-interface change without
