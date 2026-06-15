@@ -732,6 +732,25 @@ async fn dispatch(
                 },
             }
         }
+        // `reload-config` (Go `tailscaled`'s `reload-config` → `LocalBackend.ReloadConfig`): re-read the
+        // `--config` file and adopt the changed fields into the running node. Like `Set`, this can drive
+        // an off-lock device rebuild (when the node is up), so it goes through the `ipn::drive_reload_config`
+        // free function — which mirrors `drive_set`'s three-phase lock discipline — rather than holding
+        // the backend lock across the multi-second `Device::new` handshake. The daemon re-reads + merges
+        // + persists under a brief lock, then rebuilds off-lock if a device is up; a node-down reload
+        // just persists (applies on the next `up`). `reload_config` fails clearly when there is no
+        // `--config` in use or the file is now malformed (running node untouched).
+        Request::ReloadConfig => match ipn::drive_reload_config(backend).await {
+            Ok(()) => {
+                tracing::info!("reload-config reconciled");
+                Response::Ok {
+                    message: "configuration reloaded".to_string(),
+                }
+            }
+            Err(e) => Response::Error {
+                message: format!("{e:#}"),
+            },
+        },
         // `syspolicy list`/`reload` (Go `tailscale syspolicy`, read-only). NO lock + NO device:
         // policy resolution reads OS/registered policy stores, independent of node lifecycle, so it
         // works whether or not the node is up (and never touches the engine). On Linux/Unix no store

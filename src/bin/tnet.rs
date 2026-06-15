@@ -320,6 +320,15 @@ enum Command {
     /// which keeps the registration for a seamless reconnect, `logout` ends it. Mirrors Go
     /// `tailscale logout`.
     Logout,
+    /// Re-read the daemon's `--config` file and adopt the changed settings into the running node. The
+    /// operator-facing form of Go `tailscaled`'s internal `reload-config` (which Go also triggers on
+    /// SIGHUP): edit the declarative config the daemon was started with, then run this to apply the
+    /// changes WITHOUT restarting. The settings merge over the current prefs (an unset config field is
+    /// left as-is); if the node is up, the engine is rebuilt from the updated settings (a brief
+    /// reconnect). Requires the daemon to have been started with `--config` (errors otherwise), and a
+    /// now-malformed config is rejected with the running node left untouched. A reloaded config's auth
+    /// key is ignored (a reload is not a re-login).
+    ReloadConfig,
     /// Authenticate this node with the control plane (Go `tailscale login`). With no `--authkey`, this
     /// is an **interactive login**: the node contacts control, reaches `NeedsLogin`, and the auth URL
     /// is printed for you to open in a browser; the node finishes connecting once you authorize it.
@@ -1592,6 +1601,11 @@ async fn main() -> Result<()> {
             .context("removing the tailnetd system service"),
         Command::Down => dispatch_simple(&socket, Request::Down).await,
         Command::Logout => dispatch_simple(&socket, Request::Logout).await,
+        // `reload-config` (Go `tailscaled`'s `reload-config`): re-read the daemon's `--config` and adopt
+        // it into the running node. A dedicated renderer (not `dispatch_simple`) so it prints a clean
+        // success line and exits 1 on the daemon's error (no `--config` in use / malformed file), like
+        // `debug rebind`.
+        Command::ReloadConfig => run_reload_config(&socket).await,
         // `login` (Go `tailscale login`): interactive (or authkey) (re)authentication that changes no
         // prefs — `up`'s auth half on its own. Reuses the interactive-login machinery.
         Command::Login {
@@ -2330,6 +2344,27 @@ async fn run_debug_rebind(socket: &std::path::Path) -> Result<()> {
         }
         Ok(other) => anyhow::bail!("unexpected response to debug rebind: {other:?}"),
         Err(e) => Err(e).with_context(|| format!("requesting rebind at {}", socket.display())),
+    }
+}
+
+/// `reload-config` (Go `tailscaled`'s `reload-config`): ask the daemon to re-read its `--config` file
+/// and adopt the changes into the running node. Prints the daemon's confirmation on success; on the
+/// daemon's error (no `--config` in use, or a now-malformed file — the node is left untouched in both
+/// cases) it prints the message and exits 1. Mirrors `run_debug_rebind`'s Ok/Error shape.
+async fn run_reload_config(socket: &std::path::Path) -> Result<()> {
+    match round_trip(socket, &Request::ReloadConfig).await {
+        Ok(Response::Ok { message }) => {
+            println!("{message}");
+            Ok(())
+        }
+        Ok(Response::Error { message }) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        Ok(other) => anyhow::bail!("unexpected response to reload-config: {other:?}"),
+        Err(e) => {
+            Err(e).with_context(|| format!("requesting reload-config at {}", socket.display()))
+        }
     }
 }
 
