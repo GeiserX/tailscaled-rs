@@ -339,8 +339,8 @@ pub(super) async fn netcheck(dev: &tailscale::Device) -> Response {
 /// sockets, which can clear a wedged NAT binding or recover after a network-interface change without
 /// a full node restart. A **write** (it mutates live datapath state) — the server gates it like
 /// `down`/`logout`. Maps the engine's `Device::rebind()` to a [`Response::Ok`]; an engine error
-/// surfaces as a clear [`Response::Error`]. Go pairs this with `restun`; this fork exposes only
-/// `rebind` for now (the engine has no re-STUN entrypoint yet — tracked in the engine asks).
+/// surfaces as a clear [`Response::Error`]. Go pairs this with `restun` ([`re_stun`]) — the lighter
+/// knob that re-probes STUN without swapping the socket.
 pub(super) async fn rebind(dev: &tailscale::Device) -> Response {
     match dev.rebind().await {
         Ok(()) => Response::Ok {
@@ -348,6 +348,28 @@ pub(super) async fn rebind(dev: &tailscale::Device) -> Response {
         },
         Err(e) => Response::Error {
             message: format!("rebind failed: {e:?}"),
+        },
+    }
+}
+
+/// Force an immediate STUN re-probe / endpoint re-derivation **without** rebinding the socket (the
+/// `tnet debug restun` / Go `tailscale debug restun` → magicsock `Conn.ReSTUN("debug")` path).
+///
+/// Strictly lighter than [`rebind`]: it keeps the existing UDP socket and its NAT mapping and only
+/// re-runs the STUN sweep now (re-learning this node's reflexive/public address), instead of waiting
+/// out the periodic (~23s, jittered) prober. Reach for it when this node's public endpoint may have
+/// changed (e.g. a NAT rebinding) but the socket itself is still fine. A **write** (mutates live
+/// datapath endpoint state) — the server gates it like `down`/`logout`. Maps the engine's
+/// `Device::re_stun()` to a [`Response::Ok`]; an engine error surfaces as a clear [`Response::Error`].
+/// Per the engine, a no-op when the underlay socket failed to bind at startup (DERP-only) or while no
+/// peer is configured — that still reports success (the re-probe was issued; there was nothing to do).
+pub(super) async fn re_stun(dev: &tailscale::Device) -> Response {
+    match dev.re_stun().await {
+        Ok(()) => Response::Ok {
+            message: "restun: forced a STUN re-probe (socket unchanged)".to_string(),
+        },
+        Err(e) => Response::Error {
+            message: format!("restun failed: {e:?}"),
         },
     }
 }

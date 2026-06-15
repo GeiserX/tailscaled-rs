@@ -3023,6 +3023,13 @@ impl Backend {
         diag::rebind(dev).await
     }
 
+    /// Force an immediate STUN re-probe without rebinding the socket (the `tnet debug restun` path).
+    /// Thin `pub` shim over [`diag::re_stun`], uniform with [`Backend::rebind`]. A **write** (mutates
+    /// live datapath endpoint state) — strictly lighter than `rebind` (no socket churn).
+    pub async fn re_stun(dev: &tailscale::Device) -> crate::localapi::Response {
+        diag::re_stun(dev).await
+    }
+
     /// Provision a TLS cert+key for `domain` via the tailnet ACME flow (the `tnet cert` path). Thin
     /// `pub` shim over [`diag::cert_pair`], kept on `Backend` so the `server.rs` dispatch call site is
     /// uniform with the other off-lock device operations. Fail-closed: a non-`acme` build, or any ACME

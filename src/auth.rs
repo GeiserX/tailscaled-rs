@@ -191,6 +191,10 @@ pub(crate) fn requires_write(request: &crate::localapi::Request) -> bool {
         // magicsock debug pokes on write). A socket-reachable non-owner must not be able to disrupt
         // connectivity, so it gates like `down`.
         | Request::DebugRebind
+        // `DebugReStun` forces a STUN re-probe — also a live-datapath mutation (the magicsock endpoint
+        // re-derivation), gated on write exactly like `DebugRebind`. Even though it is lighter (no
+        // socket swap), a non-owner must not be able to poke the datapath, so it is never a read.
+        | Request::DebugReStun
         // `ReloadConfig` re-reads the `--config` file and RECONFIGURES the running node (it merges +
         // persists the prefs and, on a live node, rebuilds the engine — a brief reconnect). Go gates
         // `serveReloadConfig` on `PermitWrite`; a socket-reachable non-owner must not be able to
@@ -334,6 +338,10 @@ mod tests {
         assert!(
             requires_write(&Request::DebugRebind),
             "debug rebind re-creates the engine's UDP sockets — a live-datapath mutation, gated like down"
+        );
+        assert!(
+            requires_write(&Request::DebugReStun),
+            "debug restun forces a STUN re-probe (live-datapath endpoint mutation) — a write, gated like down"
         );
         assert!(
             requires_write(&Request::ReloadConfig),

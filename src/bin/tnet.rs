@@ -776,6 +776,12 @@ enum DebugCmd {
     /// binding or recover after a network change, without restarting the node. Requires the node to
     /// be up. Write-gated (root/same-uid) — it mutates live datapath state.
     Rebind,
+    /// Force the daemon's engine to re-run STUN now (Go `tailscale debug restun`), re-deriving this
+    /// node's public/reflexive endpoint WITHOUT rebinding the socket. Strictly lighter than `rebind`
+    /// (no socket churn, the NAT mapping is kept) — reach for it first when the public endpoint may
+    /// have changed (e.g. a NAT rebinding) but the socket is otherwise fine, instead of waiting out
+    /// the periodic prober. Requires the node to be up. Write-gated (root/same-uid).
+    Restun,
     /// Check whether the OS forwards IP traffic — a subnet-router / exit-node readiness diagnostic (Go
     /// `check-ip-forwarding`, normally run internally by `up`/`set`). Prints a warning if forwarding
     /// is disabled, or nothing if it is fine. In netstack mode (the default) and on macOS this is a
@@ -1624,6 +1630,8 @@ async fn main() -> Result<()> {
             } => run_debug_via(&site_or_route, cidr.as_deref()),
             // `debug rebind` is a write-gated daemon round-trip (re-creates the engine's UDP sockets).
             DebugCmd::Rebind => run_debug_rebind(&socket).await,
+            // `debug restun` is a write-gated daemon round-trip (re-probes STUN; no socket swap).
+            DebugCmd::Restun => run_debug_restun(&socket).await,
             DebugCmd::CheckIpForwarding => run_check_ip_forwarding(&socket).await,
             DebugCmd::CheckPrefs {
                 exit_node,
@@ -2532,6 +2540,25 @@ async fn run_debug_rebind(socket: &std::path::Path) -> Result<()> {
         }
         Ok(other) => anyhow::bail!("unexpected response to debug rebind: {other:?}"),
         Err(e) => Err(e).with_context(|| format!("requesting rebind at {}", socket.display())),
+    }
+}
+
+/// `debug restun` (Go `tailscale debug restun`): ask the daemon to force a STUN re-probe without
+/// rebinding the socket. A write (gated root/same-uid by the daemon); needs the node up. Prints the
+/// daemon's confirmation, or surfaces a clear error (node down / not authorized / engine failure).
+/// Mirrors [`run_debug_rebind`]'s Ok/Error shape.
+async fn run_debug_restun(socket: &std::path::Path) -> Result<()> {
+    match round_trip(socket, &Request::DebugReStun).await {
+        Ok(Response::Ok { message }) => {
+            println!("{message}");
+            Ok(())
+        }
+        Ok(Response::Error { message }) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        Ok(other) => anyhow::bail!("unexpected response to debug restun: {other:?}"),
+        Err(e) => Err(e).with_context(|| format!("requesting restun at {}", socket.display())),
     }
 }
 
