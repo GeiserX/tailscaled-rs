@@ -73,6 +73,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Secret strings: zeroize-on-drop, no Debug/serialize by default (auth keys / tokens in the daemon).
 secrecy = "0.10"
+# `tnet lock disablement-kdf`: derive a tailnet-lock disablement VALUE from a disablement SECRET — the
+# pure-local, offline Argon2i KDF Go `tka.DisablementKDF` uses (`argon2.Key`, i.e. Argon2i, NOT the
+# crate-default Argon2id). `default-features = false` keeps it alloc-only. Byte-for-byte verified
+# against Go v1.100.0 goldens in the command's test.
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 # Peer-process euid for the same-user LocalAPI write policy. libc is already in the tree
 # (transitively via the engine); used only for geteuid() on unix.
 libc = "0.2"

@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use secrecy::{ExposeSecret, SecretString};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -894,6 +894,18 @@ enum LockCmd {
         #[arg(value_name = "SECRET")]
         secret: String,
     },
+    /// Derive the tailnet-lock disablement VALUE from a disablement SECRET (Go `tailscale lock
+    /// disablement-kdf`). Pure local, offline compute — no daemon, no node needed. You run this BEFORE
+    /// enabling lock to pre-compute the value(s) to embed in the authority, keeping the raw secret(s)
+    /// offline; presenting the matching secret later (`lock disable`) turns the lock off. Prints
+    /// `disablement:<hex>` exactly like Go. The KDF is Argon2i (NOT Argon2id) over the secret with
+    /// Tailscale's fixed salt — byte-for-byte matching `tka.DisablementKDF`.
+    #[command(name = "disablement-kdf")]
+    DisablementKdf {
+        /// The disablement secret, hex-encoded.
+        #[arg(value_name = "HEX-SECRET")]
+        secret: String,
+    },
 }
 
 /// `tnet dns` subcommands: `status` (the control-pushed config) and `query` (resolve a name through
@@ -1722,6 +1734,11 @@ async fn main() -> Result<()> {
         Command::Lock {
             cmd: LockCmd::Disable { secret },
         } => run_lock_disable(&socket, &secret).await,
+        // `lock disablement-kdf` (Go `tailscale lock disablement-kdf`): pure-local Argon2i derivation,
+        // no socket round-trip.
+        Command::Lock {
+            cmd: LockCmd::DisablementKdf { secret },
+        } => run_lock_disablement_kdf(&secret),
         // `dns status` (Go `tailscale dns status`): fetch + render the control-pushed MagicDNS config.
         Command::Dns {
             cmd: DnsCmd::Status { json },
@@ -3457,6 +3474,56 @@ async fn run_lock_disable(socket: &std::path::Path, secret: &str) -> Result<()> 
         }
         other => anyhow::bail!("unexpected response to lock disable: {other:?}"),
     }
+}
+
+/// `lock disablement-kdf` (Go `tailscale lock disablement-kdf`): derive the disablement VALUE from a
+/// hex-encoded disablement SECRET and print `disablement:<hex>`. Pure local, offline — no daemon.
+///
+/// The KDF is byte-for-byte Go `tka.DisablementKDF` (`tka/state.go`, v1.100.0):
+/// `argon2.Key(secret, "tailscale network-lock disablement salt", time=4, mem=16*1024 KiB, threads=4,
+/// keyLen=32)`. Go's `argon2.Key` is **Argon2i** (the data-independent variant) — NOT Argon2id, which
+/// the `argon2` crate defaults to and which would produce entirely different digests — so the
+/// algorithm is selected explicitly. Verified against Go goldens in the test below.
+fn run_lock_disablement_kdf(secret_hex: &str) -> Result<()> {
+    use argon2::{Algorithm, Argon2, Params, Version};
+
+    let secret = hex_decode_lower(secret_hex)
+        .with_context(|| "disablement secret must be hex-encoded".to_string())?;
+
+    // Go `tka.DisablementKDF` parameters (tka/state.go): t=4, m=16 MiB (16*1024 KiB), p=4, out=32B.
+    let salt = b"tailscale network-lock disablement salt";
+    let params =
+        Params::new(16 * 1024, 4, 4, Some(32)).map_err(|e| anyhow!("argon2 params: {e}"))?;
+    // Argon2**i** + version 0x13 (the libargon2/Go default), to match Go's `argon2.Key` exactly.
+    let argon = Argon2::new(Algorithm::Argon2i, Version::V0x13, params);
+    let mut out = [0u8; 32];
+    argon
+        .hash_password_into(&secret, salt, &mut out)
+        .map_err(|e| anyhow!("argon2 derivation failed: {e}"))?;
+
+    // Go prints `disablement:%x` (lower-hex), so render the bytes the same way.
+    let mut hex = String::with_capacity(2 * out.len());
+    for b in out {
+        hex.push_str(&format!("{b:02x}"));
+    }
+    println!("disablement:{hex}");
+    Ok(())
+}
+
+/// Decode a lower/upper-hex string to bytes (the disablement secret is hex). A small local helper so
+/// the `lock disablement-kdf` path has no extra dependency beyond the `argon2` KDF itself.
+fn hex_decode_lower(s: &str) -> Result<Vec<u8>> {
+    let s = s.trim();
+    if !s.len().is_multiple_of(2) {
+        anyhow::bail!("odd-length hex string");
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&s[i..i + 2], 16)
+                .map_err(|_| anyhow!("invalid hex byte {:?}", &s[i..i + 2]))
+        })
+        .collect()
 }
 
 /// `dns status` (Go `tailscale dns status`): fetch + render the control-pushed MagicDNS config.
@@ -9707,6 +9774,45 @@ mod tests {
             Cli::try_parse_from(["tnet", "id-token"]).is_err(),
             "audience is required"
         );
+    }
+
+    #[test]
+    fn disablement_kdf_matches_go_goldens() {
+        // The disablement KDF is a security primitive: a wrong digest means a lock initialized with
+        // these values could never be disabled (the operator's secret would hash to something not in
+        // the authority's set). Pin it byte-for-byte against Go `tka.DisablementKDF` v1.100.0 goldens.
+        // Re-derive the value the same way the command does (the command only adds the
+        // `disablement:`-prefix + print), so this proves the Argon2**i** selection + params + salt.
+        use argon2::{Algorithm, Argon2, Params, Version};
+        let kdf = |secret: &[u8]| -> String {
+            let params = Params::new(16 * 1024, 4, 4, Some(32)).unwrap();
+            let argon = Argon2::new(Algorithm::Argon2i, Version::V0x13, params);
+            let mut out = [0u8; 32];
+            argon
+                .hash_password_into(secret, b"tailscale network-lock disablement salt", &mut out)
+                .unwrap();
+            out.iter().map(|b| format!("{b:02x}")).collect()
+        };
+        // Goldens straight from Go `tka.DisablementKDF` (v1.100.0).
+        assert_eq!(
+            kdf(&[0u8; 32]),
+            "f56df7e85d257a51c0aa17d2600502182359a1224b892ff4667002a7bc71aa56",
+            "all-zero 32B"
+        );
+        assert_eq!(
+            kdf(&[0xFFu8; 32]),
+            "fe74d82e0971202e69143984381f1834f0f3364e61e239a7d935c218e321811f",
+            "all-0xFF 32B"
+        );
+        assert_eq!(
+            kdf(&[0xA5u8; 32]),
+            "c3fea8a0d70ede2555990ca60d70a8a03cbe627d2c9f3cb0e2ba7093d0884e2f",
+            "all-0xA5 32B (proves Argon2i, not Argon2id)"
+        );
+        // The hex decoder round-trips an odd/invalid input as an error, not a panic.
+        assert!(hex_decode_lower("abc").is_err(), "odd-length hex rejected");
+        assert!(hex_decode_lower("zz").is_err(), "non-hex rejected");
+        assert_eq!(hex_decode_lower("00ff").unwrap(), vec![0x00, 0xff]);
     }
 
     #[test]
