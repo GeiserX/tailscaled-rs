@@ -612,9 +612,21 @@ enum Command {
     /// measures DERP-region latency ONLY — Go's UDP/IPv4/IPv6/MappingVariesByDestIP/PortMapping flags
     /// are not measured, and DERP regions are shown by id (the engine carries no region name).
     Netcheck {
-        /// Output as JSON.
-        #[arg(long)]
+        /// Output as JSON (back-compat alias for `--format json`). Prefer `--format`.
+        #[arg(long, conflicts_with = "format")]
         json: bool,
+        /// Output format (Go `tailscale netcheck --format`): empty = human-readable, `json` =
+        /// pretty/tab-indented JSON, `json-line` = a single compact JSON line (one report per line,
+        /// handy with `--every`). NOTE: the JSON shape is a reduced fork shape (DERP-region latency
+        /// only — see the report doc) and is not a stable interface, matching Go's own caveat.
+        #[arg(long, value_name = "FMT", value_parser = ["json", "json-line"])]
+        format: Option<String>,
+        /// If set, repeat the report every N SECONDS (Go `tailscale netcheck --every <dur>`; this fork
+        /// takes whole seconds rather than a Go-duration string, to avoid a duration-parser dep). Each
+        /// report is separated by a blank line (human) or printed one-per-line (`--format json-line`).
+        /// Runs until interrupted (Ctrl-C). Omit for a single report.
+        #[arg(long, value_name = "SECONDS")]
+        every: Option<u64>,
     },
     /// Exit-node commands. `list` shows tailnet peers offering to be exit nodes. Mirrors Go
     /// `tailscale exit-node`.
@@ -1761,7 +1773,11 @@ async fn main() -> Result<()> {
             cmd: DnsCmd::Query { name, qtype, json },
         } => run_dns_query(&socket, &name, &qtype, json).await,
         // `netcheck` (Go `tailscale netcheck`): fetch + render the net-report (DERP-region latency).
-        Command::Netcheck { json } => run_netcheck(&socket, json).await,
+        Command::Netcheck {
+            json,
+            format,
+            every,
+        } => run_netcheck(&socket, json, format, every).await,
         // `exit-node list` (Go `tailscale exit-node list`): reuse Status, filter to exit-node peers.
         Command::ExitNode {
             cmd: ExitNodeCmd::List,
@@ -3669,20 +3685,73 @@ fn rcode_name(rcode: u8) -> String {
 }
 
 /// `netcheck` (Go `tailscale netcheck`): fetch + render the net-report (DERP-region latency).
-async fn run_netcheck(socket: &std::path::Path, json: bool) -> Result<()> {
-    let report = match round_trip(socket, &Request::Netcheck).await {
-        Ok(Response::Netcheck(r)) => r,
+async fn run_netcheck(
+    socket: &std::path::Path,
+    json: bool,
+    format: Option<String>,
+    every: Option<u64>,
+) -> Result<()> {
+    // Resolve the output mode: an explicit `--format` wins; the legacy `--json` bool maps to pretty
+    // JSON; otherwise human-readable. (clap already rejects `--json` + `--format` together.)
+    let mode = match format.as_deref() {
+        Some("json-line") => NetcheckFormat::JsonLine,
+        Some("json") => NetcheckFormat::Json,
+        _ if json => NetcheckFormat::Json,
+        _ => NetcheckFormat::Human,
+    };
+
+    match every {
+        // Single report (the default).
+        None => {
+            let report = fetch_netcheck(socket).await?;
+            print!("{}", format_netcheck(&report, mode));
+            Ok(())
+        }
+        // `--every N`: repeat every N seconds until interrupted, separating reports the way the mode
+        // wants (a blank line between human reports; json-line is already one-per-line).
+        Some(secs) => {
+            let interval = std::time::Duration::from_secs(secs.max(1));
+            let mut first = true;
+            loop {
+                let report = fetch_netcheck(socket).await?;
+                if !first && matches!(mode, NetcheckFormat::Human | NetcheckFormat::Json) {
+                    println!();
+                }
+                first = false;
+                print!("{}", format_netcheck(&report, mode));
+                use std::io::Write as _;
+                let _ = std::io::stdout().flush();
+                tokio::time::sleep(interval).await;
+            }
+        }
+    }
+}
+
+/// Fetch one netcheck report from the daemon (a single `Request::Netcheck` round-trip). A plain
+/// `async fn` rather than a closure so the `&Path` borrow doesn't outlive a closure's return future
+/// (the `--every` loop calls it repeatedly). A daemon `Error` reply exits 1 (the report can't be
+/// produced); a transport error propagates with context.
+async fn fetch_netcheck(
+    socket: &std::path::Path,
+) -> Result<tailscaled_rs::localapi::NetcheckReport> {
+    match round_trip(socket, &Request::Netcheck).await {
+        Ok(Response::Netcheck(r)) => Ok(r),
         Ok(Response::Error { message }) => {
             eprintln!("error: {message}");
             std::process::exit(1);
         }
         Ok(other) => anyhow::bail!("unexpected response to netcheck: {other:?}"),
-        Err(e) => {
-            return Err(e).with_context(|| format!("querying netcheck at {}", socket.display()));
-        }
-    };
-    print!("{}", format_netcheck(&report, json));
-    Ok(())
+        Err(e) => Err(e).with_context(|| format!("querying netcheck at {}", socket.display())),
+    }
+}
+
+/// How `tnet netcheck` renders a report (Go `--format`): human-readable, pretty/tab-indented JSON, or
+/// a single compact JSON line per report (`json-line`, handy with `--every`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetcheckFormat {
+    Human,
+    Json,
+    JsonLine,
 }
 
 /// `syspolicy list` / `reload` (Go `tailscale syspolicy`): round-trip the given request (which the
@@ -4351,8 +4420,8 @@ fn decode_dns_header(response_hex: &str) -> Option<DnsHeader> {
 /// **key order is `serde_json`'s lexicographic string order** (`"10"` before `"2"`), not Go's numeric
 /// map order — immaterial, since JSON object key order is non-semantic (and Go marks this format
 /// unstable). Pure (returns the string incl. its trailing newline) → unit-testable.
-fn format_netcheck(r: &tailscaled_rs::localapi::NetcheckReport, json: bool) -> String {
-    if json {
+fn format_netcheck(r: &tailscaled_rs::localapi::NetcheckReport, mode: NetcheckFormat) -> String {
+    if matches!(mode, NetcheckFormat::Json | NetcheckFormat::JsonLine) {
         use serde_json::{Map, Value, json};
         let mut root = Map::new();
         // Go's `PreferredDERP int // or 0 for unknown` — a plain number, 0 when unknown (never null).
@@ -4373,11 +4442,20 @@ fn format_netcheck(r: &tailscaled_rs::localapi::NetcheckReport, json: bool) -> S
             latency_obj.insert(id.to_string(), json!(ns));
         }
         root.insert("RegionLatency".into(), Value::Object(latency_obj));
-        // Tab indent, matching Go's `json.MarshalIndent(report, "", "\t")`.
-        return format!(
-            "{}\n",
-            to_string_pretty_tabs(&root).unwrap_or_else(|_| "{}".to_string())
-        );
+        return match mode {
+            // `json`: tab-indented, matching Go's `json.MarshalIndent(report, "", "\t")`.
+            NetcheckFormat::Json => format!(
+                "{}\n",
+                to_string_pretty_tabs(&root).unwrap_or_else(|_| "{}".to_string())
+            ),
+            // `json-line`: one compact JSON object per line (Go's `--format json-line`), so `--every`
+            // emits a clean stream a consumer can read line-by-line.
+            NetcheckFormat::JsonLine => format!(
+                "{}\n",
+                serde_json::to_string(&root).unwrap_or_else(|_| "{}".to_string())
+            ),
+            NetcheckFormat::Human => unreachable!("guarded by the matches! above"),
+        };
     }
 
     let mut out = String::from("Report:\n");
@@ -8551,7 +8629,7 @@ mod tests {
         };
         // Human form: the preferred region, per-region latency lines (formatted to 0.1ms), and the
         // honest omission note.
-        let h = format_netcheck(&report, false);
+        let h = format_netcheck(&report, NetcheckFormat::Human);
         assert!(h.contains("Report:"), "{h}");
         assert!(h.contains("* Nearest DERP: region 1"), "{h}");
         assert!(h.contains("- region 1: 23.4ms"), "{h}");
@@ -8563,7 +8641,7 @@ mod tests {
         // JSON form: Go's field names + value encoding — a bare numeric PreferredDERP and a
         // RegionLatency map keyed by stringified region id with integer-NANOSECOND values
         // (`map[int]time.Duration` marshalled as ns). 23.42ms = 23_420_000ns; 41.7ms = 41_700_000ns.
-        let j = format_netcheck(&report, true);
+        let j = format_netcheck(&report, NetcheckFormat::Json);
         let v: serde_json::Value = serde_json::from_str(&j).unwrap();
         assert_eq!(v["PreferredDERP"], serde_json::json!(1));
         assert_eq!(v["RegionLatency"]["1"], serde_json::json!(23_420_000_i64));
@@ -8592,7 +8670,7 @@ mod tests {
         // The pre-measurement / default report: no preferred region + no measured latency → the two
         // none-lines, plus the honest note.
         let empty = NetcheckReport::default();
-        let h = format_netcheck(&empty, false);
+        let h = format_netcheck(&empty, NetcheckFormat::Human);
         assert!(h.contains("Report:"), "{h}");
         assert!(
             h.contains("* Nearest DERP: (none — not measured yet)"),
@@ -8602,9 +8680,39 @@ mod tests {
         assert!(h.contains("DERP-region latency only"), "{h}");
         // JSON: a default report carries PreferredDERP 0 (Go's "0 for unknown", NOT null) + an empty
         // RegionLatency object (Go's `map[int]time.Duration`, empty → `{}`, not `[]`).
-        let v: serde_json::Value = serde_json::from_str(&format_netcheck(&empty, true)).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&format_netcheck(&empty, NetcheckFormat::Json)).unwrap();
         assert_eq!(v["PreferredDERP"], serde_json::json!(0));
         assert_eq!(v["RegionLatency"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn format_netcheck_json_line_is_one_compact_line() {
+        use tailscaled_rs::localapi::{NetcheckReport, RegionLatencyView};
+        // `--format json-line`: a single compact JSON object per report (no tabs/newlines inside), so
+        // `--every` produces a clean line-per-report stream. Same fields as `json`, just compact.
+        let report = NetcheckReport {
+            preferred_derp: Some(2),
+            region_latencies: vec![RegionLatencyView {
+                region_id: 2,
+                latency_ms: 23.4,
+            }],
+        };
+        let line = format_netcheck(&report, NetcheckFormat::JsonLine);
+        // Exactly one trailing newline, none embedded, no tab indentation.
+        assert_eq!(
+            line.matches('\n').count(),
+            1,
+            "json-line is one line + trailing \\n: {line:?}"
+        );
+        assert!(
+            !line.trim_end().contains('\n') && !line.contains('\t'),
+            "compact: {line:?}"
+        );
+        // Still valid JSON with the Go-cased fields + ns-encoded latency (23.4ms → 23_400_000 ns).
+        let v: serde_json::Value = serde_json::from_str(line.trim_end()).expect("valid JSON line");
+        assert_eq!(v["PreferredDERP"], serde_json::json!(2));
+        assert_eq!(v["RegionLatency"]["2"], serde_json::json!(23_400_000_i64));
     }
 
     #[test]
