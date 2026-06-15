@@ -2,14 +2,14 @@
 
 This lists the changes the downstream daemon (`tailscaled-rs`) needs from the `tailscale-rs`
 library to unblock end-to-end features. Each ask is self-contained, additive, and
-backward-compatible. The daemon pins engine rev `faf46b34` (`v0.35.8`); individual asks
+backward-compatible. The daemon pins engine rev `3e81d862` (`v0.39.0`); individual asks
 note the rev they were verified against (older "verified vs `e126bba`/v0.6.9" / `81446f88`/v0.28.2
 / `6035651b`/v0.29.1 / `f3793636`/v0.31.0 / `575104b1`/v0.32.0 / `f8192568`/v0.33.0 / `1694d208`/v0.34.2
-notes below predate the current pin and are kept as historical context — the SHIPPED markers reflect
-what the pin provides). Bumps since v0.33.0: → v0.34.2 (tka chokepoint, cap parity, taildrop
+/ `faf46b34`/v0.35.8 notes below predate the current pin and are kept as historical context — the SHIPPED
+markers reflect what the pin provides). Bumps since v0.33.0: → v0.34.2 (tka chokepoint, cap parity, taildrop
 length-verify) → v0.35.3 (control-runner unbounded mailbox, tka rotation-drop, tunnel/derp fixes) →
-v0.35.8 (netcheck hysteresis, dataplane ACL, magicsock STUN, derp wire keys, taildrop symlink-refuse) —
-all transparent (facade-internal, no daemon wiring), each clippy+test-verified.
+v0.35.8 (netcheck hysteresis, dataplane ACL, magicsock STUN, derp wire keys, taildrop symlink-refuse) →
+v0.39.0 (current pin) — all transparent (facade-internal, no daemon wiring), each clippy+test-verified.
 
 > **Pin bump 575104b1 (v0.32.0) → f8192568 (v0.33.0), 2026-06-13.** Clean bump — full gate green;
 > probe-compile clean (no breaking surface). **Completes the Tailnet Lock surface**: the engine now
@@ -823,3 +823,45 @@ requests + requiring an authorized session, exposing the full mutating surface v
 verbs + a `csrfProtect` same-origin guard. Until then the loopback read+login UI is the faithful subset (NOT
 a weaker any-tailnet-peer gate, which would *exceed* Go's permissiveness). Tracked in daemon bead tsd-bvc
 (the ManageServerMode half). — daemon lane
+
+## 30. (BUG — serve path mux uses substring match, not segment-boundary) `serve_path` `path.starts_with(prefix)` over-matches
+
+**Severity: MEDIUM** (a request can be routed to the WRONG serve handler — e.g. an unauthenticated path
+bleeds into a mount intended for a different, possibly sensitive, prefix). **Found by reading the engine
+source while triaging daemon bead tsd-k4q** (verified against the pinned engine rev `3e81d862` / v0.39.0).
+
+**The bug (`ts_runtime/src/serve.rs`, `serve_path`, pinned rev `3e81d862`):** the Path-mux handler
+selection is a raw string prefix test —
+
+```rust
+// Longest-matching prefix wins.
+let matched = handlers
+    .iter()
+    .filter(|(prefix, _)| path.starts_with(prefix.as_str()))   // <-- substring, not segment-aware
+    .max_by_key(|(prefix, _)| prefix.len())
+    .map(|(_, target)| target);
+```
+
+`str::starts_with` is a byte-substring test, so a mount registered at `/api` **also matches a request to
+`/apifoo`** (and `/api-internal`, `/apixyz`, …). It should match only `/api` exactly and `/api/<subpath>`.
+A handler mounted at a sensitive prefix can therefore be reached by an unintended sibling path, and the
+longest-prefix tiebreak doesn't save it (there may be no more-specific mount).
+
+**Go's behavior (primary source, `ipn/ipnlocal/serve.go` `getServeHandler` @ v1.100.0):** matching is
+**segment-based**, not substring. Go first tries an exact `Handlers().GetOk(r.URL.Path)`, then walks up
+**path segments** via `path.Clean` + `path.Dir`, probing `pth + "/"` then `pth` at each level until `/`.
+Because `path.Dir("/apifoo")` is `/` (it never yields `/api`), a `/api` mount matches **only** `/api` and
+`/api/...` — `/apifoo` matches neither. (The matched mount is then `http.StripPrefix(TrimSuffix(mountPoint,
+"/"))`-ed off before proxying.)
+
+**Ask:** make the `serve_path` prefix test segment-aware so it matches Go. Minimal fix: a mount `prefix`
+matches `path` iff `path == prefix` **or** `path` starts with `prefix` followed by a `/` boundary (taking
+the trailing slash on the mount into account, as Go does), rather than a bare `path.starts_with(prefix)`.
+Equivalently, port Go's exact-then-walk-up-segments loop. Keep the longest-match tiebreak (Go effectively
+prefers the most-specific / trailing-slash mount). A regression test: mounts `{"/api": A, "/": B}`, request
+`/apifoo` ⇒ must route to `B` (root), NOT `A`; request `/api/x` ⇒ `A`; request `/api` ⇒ `A`.
+
+**Daemon impact once landed:** none in the daemon — the daemon only *builds* the `ServeTarget::Path`
+handler map (`src/ipn/serve.rs` `handler_to_target`/`http_handler_to_target`); the request-time mux is
+entirely engine-owned, so this fix is transparent to the daemon (no wiring change). Tracked in daemon bead
+tsd-k4q. — daemon lane
