@@ -25,6 +25,21 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.52.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.51.0...v0.52.0) (2026-06-15)
+
+
+### Features
+
+* **tailnetd:** emit sd_notify(READY=1) + flip systemd units to Type=notify ([#233](https://github.com/GeiserX/tailscaled-rs/issues/233)) ([2dd488d](https://github.com/GeiserX/tailscaled-rs/commit/2dd488d51f627faf30c013f49a551eb90fa8abb7))
+* **tnet:** add switch --list --json (Go tailscale switch --list --json) ([#235](https://github.com/GeiserX/tailscaled-rs/issues/235)) ([069d9eb](https://github.com/GeiserX/tailscaled-rs/commit/069d9ebbfd78c5c88826b98e74057c6807d5494a))
+* **tnet:** exit-node suggest + bump engine v0.40.0 → v0.41.0 (ask [#24](https://github.com/GeiserX/tailscaled-rs/issues/24)) ([#239](https://github.com/GeiserX/tailscaled-rs/issues/239)) ([024d85b](https://github.com/GeiserX/tailscaled-rs/commit/024d85bb05464537ff6bbfc2d7021ed82b898b7b))
+* **tnet:** is_ssh_over_tailscale reads /proc session-leader environ under sudo ([#238](https://github.com/GeiserX/tailscaled-rs/issues/238)) ([cd1f0da](https://github.com/GeiserX/tailscaled-rs/commit/cd1f0da7e354fb6c3be67b5c9431e45839017a51))
+
+
+### Bug Fixes
+
+* **tnet:** reject `file get <name> -` clearly instead of writing a file named "-" ([#236](https://github.com/GeiserX/tailscaled-rs/issues/236)) ([3bd97dc](https://github.com/GeiserX/tailscaled-rs/commit/3bd97dc05d44e15b154b5bde7104a06c67b50c77))
+
 ## [0.51.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.50.0...v0.51.0) (2026-06-15)
 
 
