@@ -2553,7 +2553,6 @@ mod tests {
                 exit_node,
                 advertise_exit_node,
                 advertise_routes,
-                advertise_tags: _,
                 ..
             } => {
                 assert_eq!(
