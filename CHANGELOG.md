@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.52.1](https://github.com/GeiserX/tailscaled-rs/compare/v0.52.0...v0.52.1) (2026-07-20)
+
+
+### Bug Fixes
+
+* **clippy:** drop redundant `advertise_tags: _` wildcard before `..` ([#249](https://github.com/GeiserX/tailscaled-rs/issues/249)) ([33c3285](https://github.com/GeiserX/tailscaled-rs/commit/33c3285f63bef0e16ce3561fe2258ac16532cbeb))
+
 ## [0.52.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.51.0...v0.52.0) (2026-06-15)
 
 
