@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.52.2](https://github.com/GeiserX/tailscaled-rs/compare/v0.52.1...v0.52.2) (2026-08-12)
+
+
+### Bug Fixes
+
+* **deps:** bump engine rev to pull russh 0.62.6 (4 security advisories) ([#256](https://github.com/GeiserX/tailscaled-rs/issues/256)) ([602bfc7](https://github.com/GeiserX/tailscaled-rs/commit/602bfc7c652d8cee05f0f43533a7b9c68e911d76))
+
 ## [0.52.1](https://github.com/GeiserX/tailscaled-rs/compare/v0.52.0...v0.52.1) (2026-07-20)
 
 
