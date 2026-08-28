@@ -11,8 +11,8 @@ This document covers three related maintainer responsibilities:
    moving the daemon to a newer engine commit.
 2. **[Capability-version tracking discipline](#2-capability-version-tracking-discipline)** — why the
    advertised control-protocol `CapabilityVersion` matters, and how to treat it at bump time.
-3. **[The engine on crates.io](#3-the-engine-on-cratesio)** — why a `rev` pin blocks publishing the
-   daemon, and what it takes to trade it for a registry version.
+3. **[The engine on crates.io](#3-the-engine-on-cratesio)** — why a version-less `rev` pin blocks
+   publishing the daemon, and what it takes to trade it for a registry version.
 
 > The engine carries **unaudited cryptography** and offers **no stability guarantees**. Treat
 > every engine bump as a tested change, never a blind `cargo update`.
@@ -245,10 +245,14 @@ engine-bump time.**
 
 ### Why this matters
 
-`cargo publish` refuses any crate that carries a `git` dependency. The daemon's engine deps are
-`git` + `rev` (see [`Cargo.toml`](../Cargo.toml)), so **`tailscaled-rs` cannot be published to
-crates.io until those become registry dependencies** — and that is only possible if the whole
-engine is on crates.io first, transitive crates included.
+`cargo publish` refuses a dependency that specifies **no version requirement** — not a `git`
+dependency as such. The daemon's three engine deps are `git` + `rev` with no version (see
+[`Cargo.toml`](../Cargo.toml)), which is exactly that case, so **`tailscaled-rs` cannot be
+published as the manifest stands.** The remedy is a version requirement on those deps, and that
+is not necessarily a source swap: Cargo accepts a `version` *alongside* `git` + `rev` (see
+[below](#trading-the-rev-for-a-version)). Either route needs the engine on crates.io first — every
+`geiserx_*` crate the daemon's graph actually resolves, transitive and feature-gated ones
+included.
 
 ### Where the engine stands
 
@@ -282,8 +286,9 @@ that was **already published from an earlier commit**. Reading `0.43.0` out of t
 depending on `version = "0.43.0"` therefore does not get you the pinned tree — it gets you
 whatever was released as `0.43.0`, potentially a month and several fixes earlier.
 
-The reliable direction is the other way round: every published crate records the commit it was cut
-from, in `.cargo_vcs_info.json`.
+The reliable direction is the other way round: a crate published from a git checkout records the
+commit it was cut from, in `.cargo_vcs_info.json`. Cargo writes that file only when it packages
+from inside a repository, so confirm it is present rather than assuming every release has one.
 
 ```bash
 curl -sL https://crates.io/api/v1/crates/geiserx_tailscale/<version>/download | tar -xz -C /tmp
