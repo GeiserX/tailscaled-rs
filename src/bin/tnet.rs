@@ -745,6 +745,13 @@ enum Command {
         #[command(subcommand)]
         cmd: DebugCmd,
     },
+    /// Generate configuration for other tools from the tailnet's state (Go `tailscale configure`).
+    /// Local file generation only — every generator reads the daemon's `status` and writes a file;
+    /// none of them change the node's own configuration.
+    Configure {
+        #[command(subcommand)]
+        cmd: ConfigureCmd,
+    },
     /// Install tailnetd as a system service (systemd/launchd) that starts at boot. Requires root.
     Install,
     /// Remove the tailnetd system service. Requires root; leaves node state.
@@ -1154,6 +1161,39 @@ impl From<ConflictArg> for tailscaled_rs::localapi::ConflictPolicy {
             ConflictArg::Rename => ConflictPolicy::Rename,
         }
     }
+}
+
+/// `tnet configure` subcommands (Go `tailscale configure`) — generators that render a config file
+/// for some *other* tool from the current netmap. Only `kubeconfig` is implemented; Go's
+/// Synology / systemd-sysext / JetKVM generators are host glue for platforms this fork does not
+/// package for yet.
+#[derive(Subcommand)]
+enum ConfigureCmd {
+    /// Write a kubeconfig pointing `kubectl` at a tailnet peer that fronts a Kubernetes API server
+    /// (Go `tailscale configure kubeconfig <host-or-fqdn>`).
+    ///
+    /// Purely local: the peer is resolved against the daemon's current netmap (`status`), and the
+    /// generated document names that peer's MagicDNS FQDN as the cluster server with **no**
+    /// credentials — the peer's Tailscale API-server proxy authenticates the caller by its tailnet
+    /// identity, so `kubectl` needs nothing but the URL.
+    ///
+    /// DEVIATION from Go: this build writes a STANDALONE kubeconfig; it does not merge the generated
+    /// context into an existing one (that needs a YAML parser). An existing destination file is
+    /// therefore refused unless `--force`, which replaces it wholesale. To merge by hand, print the
+    /// document with `--output -` and combine it using `kubectl config view --flatten`.
+    Kubeconfig {
+        /// The peer to point kubectl at: its MagicDNS FQDN, its bare hostname, or a tailnet IP.
+        #[arg(value_name = "HOST_OR_FQDN")]
+        target: String,
+        /// Where to write the kubeconfig; `-` prints it to stdout instead. Defaults to the file
+        /// kubectl itself would read: `$KUBECONFIG` when that names exactly one path, else
+        /// `~/.kube/config`.
+        #[arg(long, value_name = "PATH")]
+        output: Option<String>,
+        /// Replace an existing destination file instead of refusing it (see the merge note above).
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 /// Map the `--exit-node` / `--clear-exit-node` flag pair to the wire field's double `Option`.
@@ -1760,6 +1800,17 @@ async fn main() -> Result<()> {
                 run_debug_stat(&files);
                 Ok(())
             }
+        },
+        // `configure kubeconfig`: pure local file generation on top of a Status resolve — the daemon
+        // already answers `status`, so this adds no LocalAPI verb and never mutates node state.
+        Command::Configure { cmd } => match cmd {
+            ConfigureCmd::Kubeconfig {
+                target,
+                output,
+                force,
+            } => run_configure_kubeconfig(&socket, &target, output.as_deref(), force)
+                .await
+                .with_context(|| format!("configure kubeconfig {target}")),
         },
         // `install` / `uninstall` (Go `tailscaled install-system-daemon` / `uninstall-system-daemon`):
         // purely LOCAL, privileged file + service-manager work — they never touch the LocalAPI socket.
@@ -7691,6 +7742,283 @@ fn format_serve_status(cfg: &tailscaled_rs::localapi::ServeConfig, _json: bool) 
     out
 }
 
+/// Where `configure kubeconfig` puts the document it generates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KubeconfigDest {
+    /// `--output -`: print to stdout and touch no file.
+    Stdout,
+    /// A real path — an explicit `--output`, or the resolved default.
+    File(PathBuf),
+}
+
+/// `configure kubeconfig <host-or-fqdn>` (Go `tailscale configure kubeconfig`): resolve the peer
+/// against the netmap, render a kubeconfig for it, and write it.
+///
+/// The whole command is local: one `status` round-trip plus a file write. Nothing is sent to the
+/// peer and no node state changes, so it is safe to run before the cluster is reachable.
+async fn run_configure_kubeconfig(
+    socket: &std::path::Path,
+    target: &str,
+    output: Option<&str>,
+    force: bool,
+) -> Result<()> {
+    // Resolve the destination BEFORE the round-trip: `$KUBECONFIG` naming a merge-list (which this
+    // build cannot honour) is an argument error, and reporting it should not depend on the daemon
+    // being up.
+    let dest = resolve_kubeconfig_dest(output)?;
+
+    let status = match round_trip(socket, &Request::Status).await {
+        Ok(Response::Status(s)) => s,
+        Ok(Response::Error { message }) => anyhow::bail!("{message}"),
+        Ok(other) => anyhow::bail!("unexpected response to status: {other:?}"),
+        Err(e) => {
+            return Err(e).with_context(|| format!("querying status at {}", socket.display()));
+        }
+    };
+    // Go refuses unless the backend is Running. Matching that matters here: peers resolved from an
+    // absent or stale netmap would silently yield a kubeconfig for the wrong cluster — or, worse, a
+    // "no such peer" error that reads as "the cluster is gone" when the node is merely down.
+    if status.state != "Running" {
+        anyhow::bail!(
+            "the node is not running (state: {}) — run `tnet up` first so the netmap can resolve {:?}",
+            sanitize_for_terminal(&status.state),
+            sanitize_for_terminal(target),
+        );
+    }
+
+    let fqdn = resolve_kubeconfig_peer(&status, target)?;
+    let doc = render_kubeconfig(&fqdn)?;
+    match dest {
+        KubeconfigDest::Stdout => print!("{doc}"),
+        KubeconfigDest::File(path) => {
+            write_kubeconfig(&path, &doc, force)?;
+            println!(
+                "wrote {}: cluster, user and current-context {}",
+                path.display(),
+                sanitize_for_terminal(&fqdn),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Resolve `target` — a MagicDNS FQDN, a bare hostname, or a tailnet IP — to the peer's FQDN, the
+/// name the generated kubeconfig points `kubectl` at.
+///
+/// Mirrors Go's peer scan in `runConfigureKubeconfig`: the DNS root dot is trimmed and names compare
+/// ASCII-case-insensitively (DNS names are case-insensitive), while IPs compare exactly. Peers only,
+/// never this node — the API-server proxy runs on the *cluster's* node, which is what Go scans.
+///
+/// DEVIATION from Go: Go additionally requires the peer to advertise the
+/// `https://tailscale.com/cap/kubernetes` node capability, so a name that is not a Kubernetes
+/// front-end fails to match at all. The engine does not surface per-peer capabilities in
+/// [`PeerReport`](tailscaled_rs::localapi::PeerReport), so this resolve is name/IP only: pointing it
+/// at a peer that runs no API-server proxy produces a kubeconfig whose server simply refuses
+/// connections, rather than an up-front "not a cluster" error.
+fn resolve_kubeconfig_peer(
+    status: &tailscaled_rs::localapi::StatusReport,
+    target: &str,
+) -> Result<String> {
+    let want = target.trim_end_matches('.');
+    if want.is_empty() {
+        anyhow::bail!(
+            "empty peer name/address — pass a peer's MagicDNS name, hostname or tailnet IP"
+        );
+    }
+    let peer = status
+        .peers
+        .iter()
+        .find(|p| {
+            let name = p.name.trim_end_matches('.');
+            // Full name, then the bare first label (Go compares both `DNSName` and `HostName`), then
+            // either tailnet IP.
+            name.eq_ignore_ascii_case(want)
+                || name
+                    .split_once('.')
+                    .is_some_and(|(host, _)| host.eq_ignore_ascii_case(want))
+                || p.ipv4 == want
+                || p.ipv6.as_deref() == Some(want)
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "no peer matching {:?} in the current netmap (run `tnet status` to list them)",
+                sanitize_for_terminal(target)
+            )
+        })?;
+    let fqdn = peer.name.trim_end_matches('.');
+    if fqdn.is_empty() {
+        anyhow::bail!(
+            "peer {:?} has no MagicDNS name, so there is no server name to put in a kubeconfig (the \
+             API-server proxy's certificate is issued for the name, not the IP)",
+            sanitize_for_terminal(target)
+        );
+    }
+    Ok(fqdn.to_string())
+}
+
+/// Render the kubeconfig document for `fqdn`.
+///
+/// The shape Go gets from `k8s.io/client-go`'s `clientcmd.WriteToFile` on a fresh config: one
+/// cluster, one credential-free user and one context, all three named by the peer's FQDN, with
+/// `current-context` selecting it. Top-level keys are alphabetical because client-go serializes
+/// through `sigs.k8s.io/yaml` (a JSON round-trip, which sorts keys) — emitting the same order keeps a
+/// diff against a kubectl-written file quiet.
+///
+/// The user entry carries no credentials on purpose: the peer's Tailscale Kubernetes API-server
+/// proxy authenticates the caller by its tailnet identity, so `kubectl` needs only the server URL.
+fn render_kubeconfig(fqdn: &str) -> Result<String> {
+    // SECURITY: `fqdn` is CONTROL-supplied (it derives from the wire `Node.name`, which this fork —
+    // unlike Go talking to Tailscale's sanitizing coordination server — accepts verbatim from an
+    // arbitrary or self-hosted control plane). It is interpolated into the YAML as a bare scalar AND
+    // into the `https://…` server URL, so a name carrying a newline, `:`, `#` or a quote could forge
+    // extra YAML keys (a second `server:` aimed elsewhere) or a different URL authority. Restrict it
+    // to the letter-digit-hyphen-dot DNS alphabet — the only shape a MagicDNS name legitimately has —
+    // and refuse anything else instead of quoting it: a peer name outside that set is not a usable
+    // kubeconfig server anyway, so quoting would only hide the problem.
+    if !is_plain_dns_name(fqdn) {
+        anyhow::bail!(
+            "peer name {:?} is not a plain DNS name (letters, digits, '-' and '.'), so it cannot be \
+             used as a kubeconfig server",
+            sanitize_for_terminal(fqdn)
+        );
+    }
+    Ok(format!(
+        "apiVersion: v1
+clusters:
+- cluster:
+    server: https://{fqdn}
+  name: {fqdn}
+contexts:
+- context:
+    cluster: {fqdn}
+    user: {fqdn}
+  name: {fqdn}
+current-context: {fqdn}
+kind: Config
+preferences: {{}}
+users:
+- name: {fqdn}
+  user: {{}}
+"
+    ))
+}
+
+/// Whether `s` is a plain DNS name: at most 253 ASCII characters split on `.` into non-empty labels
+/// of at most 63 letter/digit/hyphen characters that neither start nor end with a hyphen.
+///
+/// Deliberately stricter than what a resolver would accept (no trailing root dot, no underscores, no
+/// IDN escapes): this gates a control-supplied name on its way into a generated config file, so the
+/// narrow alphabet is the point, not an approximation of RFC 1035.
+fn is_plain_dns_name(s: &str) -> bool {
+    if s.is_empty() || s.len() > 253 {
+        return false;
+    }
+    s.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    })
+}
+
+/// Resolve where the kubeconfig goes: an explicit `--output` (with `-` meaning stdout), else the
+/// file kubectl itself would read.
+fn resolve_kubeconfig_dest(output: Option<&str>) -> Result<KubeconfigDest> {
+    match output {
+        Some("-") => Ok(KubeconfigDest::Stdout),
+        // An empty `--output` would otherwise reach `open("")` and surface as a bare ENOENT.
+        Some("") => anyhow::bail!("--output is empty — pass a path, or `-` for stdout"),
+        Some(path) => Ok(KubeconfigDest::File(PathBuf::from(path))),
+        None => Ok(KubeconfigDest::File(default_kubeconfig_path(
+            std::env::var_os("KUBECONFIG").as_deref(),
+            std::env::var_os("HOME").as_deref(),
+        )?)),
+    }
+}
+
+/// The default kubeconfig path, from the environment kubectl reads: `$KUBECONFIG` if set, else
+/// `$HOME/.kube/config`. Takes both values as arguments (rather than reading the environment) so it
+/// is unit-testable without mutating process-global state.
+///
+/// `$KUBECONFIG` is a PATH-style *list* that kubectl MERGES — and merging is exactly what this build
+/// does not do — so a multi-entry list is refused rather than silently overwriting the first file and
+/// dropping every cluster the rest of the list contributed.
+fn default_kubeconfig_path(
+    kubeconfig: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf> {
+    if let Some(list) = kubeconfig.filter(|k| !k.is_empty()) {
+        let mut entries = std::env::split_paths(list);
+        let first = entries.next().unwrap_or_default();
+        if entries.next().is_some() {
+            anyhow::bail!(
+                "$KUBECONFIG names more than one file, which kubectl would merge; this build writes \
+                 a single standalone kubeconfig and cannot merge — pass an explicit `--output <PATH>` \
+                 (or `--output -` for stdout)"
+            );
+        }
+        if first.as_os_str().is_empty() {
+            anyhow::bail!(
+                "$KUBECONFIG is set but names no path — unset it, or pass `--output <PATH>`"
+            );
+        }
+        return Ok(first);
+    }
+    let home = home.filter(|h| !h.is_empty()).ok_or_else(|| {
+        anyhow!("$HOME is not set — pass `--output <PATH>` to place the kubeconfig")
+    })?;
+    Ok(PathBuf::from(home).join(".kube").join("config"))
+}
+
+/// Write the generated kubeconfig to `path`, creating its parent directory.
+///
+/// Without `force` an existing file is REFUSED: this build generates a standalone document rather
+/// than merging, so replacing a real `~/.kube/config` would drop every other cluster it holds. The
+/// existence check IS the create (`create_new`), so there is no stat-then-open window and a symlink
+/// planted at the path is not followed.
+///
+/// Mode `0600` under a `0700` parent: a kubeconfig conventionally carries credentials, and even this
+/// credential-free one names an internal cluster endpoint. (The mode applies only when this call
+/// creates the file — a `force` replacement truncates in place, so it keeps the existing file's
+/// ownership and permissions and writes through a symlink the operator put at the path on purpose.)
+fn write_kubeconfig(path: &std::path::Path, doc: &str, force: bool) -> Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).mode(0o600);
+    if force {
+        opts.create(true).truncate(true);
+    } else {
+        opts.create_new(true);
+    }
+    let mut file = opts.open(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            anyhow!(
+                "{} already exists — this build writes a standalone kubeconfig and does not merge \
+                 into an existing one; re-run with `--output -` to print it (then merge it yourself \
+                 with `kubectl config view --flatten`), or with `--force` to replace the file",
+                path.display()
+            )
+        } else {
+            anyhow::Error::from(e).context(format!("opening {}", path.display()))
+        }
+    })?;
+    file.write_all(doc.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11481,6 +11809,229 @@ mod tests {
             report.lines().any(|l| l.trim() == "..."),
             "must print a trailing `  ...` when entries exceed the cap: {report:?}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A netmap peer for the `configure kubeconfig` resolve tests.
+    fn kube_peer(
+        name: &str,
+        ipv4: &str,
+        ipv6: Option<&str>,
+    ) -> tailscaled_rs::localapi::PeerReport {
+        tailscaled_rs::localapi::PeerReport {
+            name: name.to_string(),
+            ipv4: ipv4.to_string(),
+            ipv6: ipv6.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// A `Running` status carrying one Kubernetes-ish peer.
+    fn kube_status() -> StatusReport {
+        let mut s = report("Running");
+        s.peers = vec![
+            kube_peer(
+                "k8s.tail0123.ts.net",
+                "100.64.0.7",
+                Some("fd7a:115c:a1e0::7"),
+            ),
+            kube_peer("other.tail0123.ts.net", "100.64.0.8", None),
+        ];
+        s
+    }
+
+    #[test]
+    fn render_kubeconfig_matches_the_clientcmd_shape() {
+        // The document Go's `clientcmd.WriteToFile` writes for a fresh config with one cluster/user/
+        // context: alphabetical top-level keys, a credential-free user, current-context selected.
+        let out = render_kubeconfig("k8s.tail0123.ts.net").unwrap();
+        // The golden is written flush-left (it is a YAML document, and its own indentation is
+        // significant) — every line here is exactly a line of the emitted file.
+        assert_eq!(
+            out,
+            "apiVersion: v1
+clusters:
+- cluster:
+    server: https://k8s.tail0123.ts.net
+  name: k8s.tail0123.ts.net
+contexts:
+- context:
+    cluster: k8s.tail0123.ts.net
+    user: k8s.tail0123.ts.net
+  name: k8s.tail0123.ts.net
+current-context: k8s.tail0123.ts.net
+kind: Config
+preferences: {}
+users:
+- name: k8s.tail0123.ts.net
+  user: {}
+"
+        );
+    }
+
+    #[test]
+    fn render_kubeconfig_rejects_names_that_could_forge_yaml() {
+        // The peer name is control-supplied. A newline could append a second `server:` key, and a
+        // `:`/`#`/quote/space would break the bare scalar — all must be refused, not quoted.
+        for hostile in [
+            "evil\n  server: https://attacker.example",
+            "a b",
+            "a:1",
+            "a#c",
+            "a\"b",
+            "a'b",
+            "*",
+            "",
+            "a..b",
+            "-lead.example",
+            "trail-.example",
+            "under_score.example",
+            "héllo.example",
+        ] {
+            assert!(
+                render_kubeconfig(hostile).is_err(),
+                "must refuse {hostile:?} as a kubeconfig server name"
+            );
+        }
+        // A 254-character name (over the DNS cap) is refused too.
+        let too_long = format!("{}.example", "a".repeat(250));
+        assert!(render_kubeconfig(&too_long).is_err());
+        // A 64-character label (over the per-label cap) is refused.
+        assert!(render_kubeconfig(&format!("{}.example", "a".repeat(64))).is_err());
+    }
+
+    #[test]
+    fn is_plain_dns_name_accepts_real_magicdns_names() {
+        for ok in [
+            "k8s.tail0123.ts.net",
+            "host-1.example",
+            "a",
+            "A.B",
+            &"a".repeat(63),
+        ] {
+            assert!(is_plain_dns_name(ok), "must accept {ok:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_kubeconfig_peer_matches_fqdn_hostname_and_ips() {
+        let status = kube_status();
+        // Full FQDN, bare hostname, either tailnet IP, a trailing root dot, and mixed case all
+        // resolve to the same peer FQDN (Go compares DNSName and HostName case-insensitively).
+        for target in [
+            "k8s.tail0123.ts.net",
+            "k8s.tail0123.ts.net.",
+            "K8S.Tail0123.TS.NET",
+            "k8s",
+            "K8S",
+            "100.64.0.7",
+            "fd7a:115c:a1e0::7",
+        ] {
+            assert_eq!(
+                resolve_kubeconfig_peer(&status, target).unwrap(),
+                "k8s.tail0123.ts.net",
+                "{target:?} must resolve to the peer's FQDN"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_kubeconfig_peer_rejects_unknown_empty_and_nameless() {
+        let status = kube_status();
+        assert!(resolve_kubeconfig_peer(&status, "nope").is_err());
+        assert!(resolve_kubeconfig_peer(&status, "100.64.0.99").is_err());
+        assert!(resolve_kubeconfig_peer(&status, "").is_err());
+        // A trailing-dot-only target trims to empty rather than matching every peer.
+        assert!(resolve_kubeconfig_peer(&status, ".").is_err());
+        // A peer the engine gave no name: matchable by IP, but there is no server name to emit.
+        let mut nameless = report("Running");
+        nameless.peers = vec![kube_peer("", "100.64.0.9", None)];
+        assert!(resolve_kubeconfig_peer(&nameless, "100.64.0.9").is_err());
+    }
+
+    #[test]
+    fn default_kubeconfig_path_prefers_kubeconfig_then_home() {
+        use std::ffi::OsStr;
+        // A single-entry $KUBECONFIG wins.
+        assert_eq!(
+            default_kubeconfig_path(
+                Some(OsStr::new("/tmp/kc.yaml")),
+                Some(OsStr::new("/home/u"))
+            )
+            .unwrap(),
+            PathBuf::from("/tmp/kc.yaml")
+        );
+        // Unset/empty $KUBECONFIG falls back to $HOME/.kube/config.
+        assert_eq!(
+            default_kubeconfig_path(None, Some(OsStr::new("/home/u"))).unwrap(),
+            PathBuf::from("/home/u/.kube/config")
+        );
+        assert_eq!(
+            default_kubeconfig_path(Some(OsStr::new("")), Some(OsStr::new("/home/u"))).unwrap(),
+            PathBuf::from("/home/u/.kube/config")
+        );
+        // A merge-list $KUBECONFIG is refused (we cannot merge), as is a list of empty entries.
+        assert!(
+            default_kubeconfig_path(Some(OsStr::new("/a:/b")), Some(OsStr::new("/home/u")))
+                .is_err()
+        );
+        assert!(
+            default_kubeconfig_path(Some(OsStr::new(":")), Some(OsStr::new("/home/u"))).is_err()
+        );
+        // No $KUBECONFIG and no $HOME: nowhere to default to.
+        assert!(default_kubeconfig_path(None, None).is_err());
+        assert!(default_kubeconfig_path(None, Some(OsStr::new(""))).is_err());
+    }
+
+    #[test]
+    fn resolve_kubeconfig_dest_honours_dash_and_explicit_paths() {
+        assert_eq!(
+            resolve_kubeconfig_dest(Some("-")).unwrap(),
+            KubeconfigDest::Stdout
+        );
+        assert_eq!(
+            resolve_kubeconfig_dest(Some("/tmp/kc.yaml")).unwrap(),
+            KubeconfigDest::File(PathBuf::from("/tmp/kc.yaml"))
+        );
+        // An empty `--output` is an argument error, not a path.
+        assert!(resolve_kubeconfig_dest(Some("")).is_err());
+    }
+
+    #[test]
+    fn write_kubeconfig_creates_refuses_then_replaces() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("tnet-kubeconfig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join(".kube").join("config");
+
+        // First write creates the parent directory and the file, 0600.
+        write_kubeconfig(&path, "first\n", false).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first\n");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "kubeconfig must not be group/world readable");
+        assert_eq!(
+            std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "the created parent directory must be private"
+        );
+
+        // Second write refuses (no merge) and leaves the existing content untouched.
+        let err = write_kubeconfig(&path, "second\n", false).unwrap_err();
+        assert!(
+            err.to_string().contains("already exists"),
+            "the refusal must say why: {err}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first\n");
+
+        // `--force` replaces it wholesale, with no leftover tail from the longer old content.
+        write_kubeconfig(&path, "3\n", true).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "3\n");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -169,7 +169,7 @@ would violate the honest-omission rule). Each rides the next pin bump once its a
 
 | Item | Bead | Note |
 | --- | --- | --- |
-| `tnet configure kubeconfig` (pure-local kubeconfig YAML gen + Status resolve) | `tsd-37m`, `tsd-k47` | Deferred: merging an existing `~/.kube/config` needs a YAML parser dependency for one niche command this fork has no k8s-operator integration to use. |
+| `tnet configure kubeconfig` merge into an existing `~/.kube/config` | `tsd-k47` | The generator itself shipped (`tsd-37m`): `configure kubeconfig <peer>` resolves the peer off `status` and writes a standalone kubeconfig (`--output -` prints it). Only the *merge* is deferred — it needs a YAML parser dependency for one niche command this fork has no k8s-operator integration to use. |
 | Small flag/grammar batch (`cert --min-validity`/`--serve-demo`, `netcheck --bind-address`, `status --browser`, etc.) | `tsd-dru` | Several items already shipped (`switch --json`, `version --track`, `metrics print`, `login`). Residual `logout --reason` is engine-gated (engine `logout()` takes no reason). |
 | `file cp` residual Go-fidelity gaps (stdin streaming, rich pre-send errors, offline-warning, system-DNS fallback) | `tsd-52k` | stdin streaming needs a daemon→client stream-back protocol. |
 | Taildrop `file get` dest parent-dir validation (symlinked ancestor) + same-uid trust doc | `tsd-k97` | The write is `SO_PEERCRED` same-uid-gated; a symlinked ancestor is the caller's own-namespace concern (matches Go's residual). Mostly a trust-model doc. |
@@ -238,6 +238,11 @@ not silently weaker than Go. They are surfaced to the user where relevant.
 - **Outbound HTTP proxy** implements CONNECT only; absolute-form forwarding returns `501`.
 - **`update`** verifies **integrity** (SHA-256), not **authenticity** (no signature chain) — stated
   plainly.
+- **`configure kubeconfig`** writes a **standalone** kubeconfig and refuses an existing destination file
+  unless `--force`; Go merges the generated context into `~/.kube/config` through client-go's YAML
+  loader. It also resolves the target by name/IP alone — Go additionally requires the peer to advertise
+  the `tailscale.com/cap/kubernetes` node capability, which the engine does not surface per peer, so a
+  wrong target yields a kubeconfig whose server refuses connections instead of an up-front error.
 
 These are the subject of `tsd-efv` (document the Go-tooling-compatibility boundary cleanly).
 
