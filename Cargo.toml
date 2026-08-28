@@ -43,12 +43,15 @@ path = "src/bin/tnet.rs"
 # registry dependency any more. Re-check that for whatever the pin resolves to with
 # `scripts/check-engine-on-crates-io.sh`.
 #
-# The pin nonetheless stays a `rev`, because the switch is NOT a same-version source swap. crates.io
-# `geiserx_tailscale` 0.43.0 was cut a month BEFORE this commit and does not carry the russh
-# security bump this rev exists for; the release cut from *this* tree is 0.43.1. Moving to
-# `version = "0.43.1"` is therefore a deliberate engine-version change, gated on the bump
-# discipline in `docs/ENGINE.md` — and it is what publishing the daemon needs, since
-# `cargo publish` rejects a git dependency.
+# The pin nonetheless stays a `rev`, and `version = "0.43.1"` cannot simply be added next to it:
+# this rev sits one commit BEFORE the 0.43.1 release commit, so the tree it points at still
+# self-reports 0.43.0 and Cargo refuses the pair ("candidate versions found which didn't match").
+# The requirements that 0.43.0 does satisfy all publish a dependency on engine source we never
+# build — `^0.43` floats consumers to 0.43.3, `=0.43.0` predates the russh security bump this rev
+# exists for. What publishing needs is for the pin and the release to agree: move the rev onto
+# bb83dfad (`chore(main): release 0.43.1`), whose whole diff from here is version metadata, and the
+# two become the same source under the same number. `scripts/engine-release-for-pin.sh` checks
+# that; `docs/ENGINE.md` §3 has the reasoning.
 #
 # Local engine iteration (optional): a *gitignored* `.cargo/config.toml` with
 #   paths = ["/path/to/your/tailscale-rs/checkout"]

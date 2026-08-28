@@ -282,28 +282,36 @@ that was **already published from an earlier commit**. Reading `0.43.0` out of t
 depending on `version = "0.43.0"` therefore does not get you the pinned tree — it gets you
 whatever was released as `0.43.0`, potentially a month and several fixes earlier.
 
-The reliable direction is the other way round: every published crate records the commit it was cut
-from, in `.cargo_vcs_info.json`.
+The obvious inversion — every published crate records the commit it was cut from, in
+`.cargo_vcs_info.json`, so compare that `sha1` against the pinned `rev` — **does not work, and
+cannot**. release-please publishes *from the release commit*. The daemon pins the tree it built and
+tested, which is that release commit's **ancestor**. The two sha1s are different by construction,
+so the comparison returns "no match" for every release that will ever exist and offers no way
+forward. (For the current pin `9d847a6e`, the four `0.43.x` tarballs report `43dac461`, `bb83dfad`,
+`4faa0ec1` and `074285e4`. None is the pin. Two also carry `"dirty": true`, which is normal for a
+release-please publish and not by itself a reason to distrust the tarball.)
+
+Walk **forward** from the pin instead: the release that carries a given rev is the first
+`chore(main): release …` commit descended from it, and the rev's source is that release's source
+exactly when nothing but version metadata landed in between.
 
 ```bash
-curl -sL https://crates.io/api/v1/crates/geiserx_tailscale/<version>/download | tar -xz -C /tmp
-cat /tmp/geiserx_tailscale-<version>/.cargo_vcs_info.json
+scripts/engine-release-for-pin.sh          # defaults to the rev pinned in Cargo.toml
 ```
 
-Match that `sha1` against the pinned `rev` to know whether a given release really is the tree the
-daemon is built and tested against. Read the flag next to it too: a `"dirty": true` means the
-tarball was cut from a modified working tree at that commit, so the sha1 is a starting point for
-the comparison rather than proof the contents are identical.
+The script blobless-clones the engine, finds that release commit, checks the intervening diff
+against the set of files release-please is allowed to touch (rejecting anything else, and calling
+out `Cargo.lock` movement separately — a dependency's lockfile does not affect what `tailscaled-rs`
+resolves, because our own `Cargo.lock` pins the whole graph either way), confirms the version is
+published and unyanked, and exits non-zero if any of that fails.
+
+For the pin in this tree it reports `geiserx_tailscale 0.43.1`, one commit ahead, whose diff from
+the pin is only `Cargo.toml` version fields, `CHANGELOG.md` and `.release-please-manifest.json`. So
+**crates.io `geiserx_tailscale` 0.43.1 is the engine source the daemon builds and tests today.**
 
 ### Trading the `rev` for a version
 
-Because of the above, replacing `git` + `rev` with `version = "…"` is **an engine-version change,
-not a source swap**, even when the numbers look adjacent. Run it through the full bump discipline
-in [§1](#1-bumping-the-engine-rev) — including the live smoke test and the capver re-check in
-[§2](#2-capability-version-tracking-discipline) — and pick the release whose `.cargo_vcs_info.json`
-sha1 you have actually reviewed.
-
-Cargo also allows a `version` *alongside* `git` + `rev`, and says so when it refuses to package:
+Cargo allows a `version` *alongside* `git` + `rev`, and says so when it refuses to package:
 
 ```
 all dependencies must have a version requirement specified when packaging.
@@ -312,8 +320,40 @@ Note: The packaged dependency will use the version from crates.io,
 the `git` specification will be removed from the dependency declaration.
 ```
 
-That unblocks `cargo publish` without changing what this repo builds, because the `git` source
-still wins locally and in CI. It is a real option, but it is not free: everyone who consumes the
-*published* daemon then builds against the crates.io release while our own gate ran against the
-pinned commit. Only take it with a release whose `.cargo_vcs_info.json` sha1 matches the pin, and
-keep the two in lockstep from then on.
+The catch is that the version requirement must **also be satisfied by the git source**, and a
+between-releases pin self-reports the previous version. Naming the release the pin actually
+corresponds to does not resolve at all:
+
+```
+$ cargo metadata            # with version = "0.43.1" next to rev = 9d847a6e
+error: failed to select a version for the requirement `geiserx_tailscale = "^0.43.1"`
+candidate versions found which didn't match: 0.43.0
+location searched: Git repository https://github.com/GeiserX/tailscale-rs?rev=9d847a6e…
+```
+
+So the only requirements that can sit next to *this* pin are ones `0.43.0` satisfies — and each
+publishes a dependency on engine source the daemon has never built:
+
+| Requirement | Resolves locally to | Published consumers get |
+| --- | --- | --- |
+| `version = "0.43.1"` | **fails to resolve** | — |
+| `version = "0.43"` | the pin (`0.43.0` from git) | `^0.43` — whatever `0.43.x` is newest, `0.43.3` today |
+| `version = "=0.43.0"` | the pin (`0.43.0` from git) | the release from a month before the pin, without the russh security bump the pin exists for |
+
+`cargo publish --dry-run` does succeed with `version = "0.43"`, and its verification build compiles
+the daemon against `geiserx_* 0.43.3` — code no gate in this repo has ever run. That is the shape
+of the hazard: green locally, a different engine for everyone downstream.
+
+**The way through is to make the pin and the release agree.** Move the `rev` onto the release
+commit that already carries the pinned source — for this tree, `9d847a6e` → `bb83dfad`
+(`chore(main): release 0.43.1`), whose entire diff from the pin is version metadata. The pinned
+tree then self-reports `0.43.1`, `version = "0.43.1"` resolves, and the engine deps can become
+registry deps with the daemon still building the exact source it builds now.
+
+That is a pin edit, so it goes through [§1](#1-bumping-the-engine-rev) and the capver re-check in
+[§2](#2-capability-version-tracking-discipline) — but it is a **source-identical** one, which is a
+much cheaper thing to review than the engine-version change this section used to call for. Confirm
+it with `scripts/engine-release-for-pin.sh` before and after.
+
+Keep the pin on release commits from then on, and the question stops recurring: at distance 0 the
+manifest version and the published version are the same number, and the script says so.

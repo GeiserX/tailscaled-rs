@@ -149,8 +149,8 @@ would violate the honest-omission rule). Each rides the next pin bump once its a
 
 | Item | Bead | Note |
 | --- | --- | --- |
-| Publish `tailscaled-rs` to crates.io | `tsd-6y1` | Blocked only by the daemon's own `git`+`rev` engine pin now that `tsd-d6n` is cleared: `cargo publish` rejects a git dependency. |
-| Get the `tailscale-rs` engine onto crates.io | `tsd-d6n` | **Done upstream** — every `geiserx_*` engine crate in the daemon's resolved graph is published and unyanked at the locked version (`scripts/check-engine-on-crates-io.sh` re-checks it for whatever the pin resolves to). What is left is daemon-side and belongs to `tsd-6y1`: trading the `git`+`rev` pin for a registry `version`, which is an engine-version change rather than a source swap — see [`docs/ENGINE.md` §3](ENGINE.md#3-the-engine-on-cratesio). |
+| Publish `tailscaled-rs` to crates.io | `tsd-6y1` | Blocked only by the daemon's own `git`+`rev` engine pin now that `tsd-d6n` is cleared: `cargo publish` rejects a git dependency. One step left, and it is a source-identical one — move the pin from `9d847a6e` onto the `0.43.1` release commit it is the parent of, then depend on `version = "0.43.1"` (`scripts/engine-release-for-pin.sh`, [`docs/ENGINE.md` §3](ENGINE.md#3-the-engine-on-cratesio)). The name `tailscaled-rs` is still unclaimed on crates.io. |
+| Get the `tailscale-rs` engine onto crates.io | `tsd-d6n` | **Done upstream** — every `geiserx_*` engine crate in the daemon's resolved graph is published and unyanked at the locked version (`scripts/check-engine-on-crates-io.sh` re-checks it for whatever the pin resolves to). What is left is daemon-side and belongs to `tsd-6y1`: trading the `git`+`rev` pin for a registry `version` — see [`docs/ENGINE.md` §3](ENGINE.md#3-the-engine-on-cratesio). |
 | `.deb` / `.rpm` packaging (nfpm) + ship the `acme` feature in distributed builds | `tsd-k4a` | On a stock (feature-less) build, `cert`/`serve-https`/`funnel` are inert — distributed builds must enable `acme`. |
 | Homebrew tap | `tsd-0s6` | |
 | Release & distribution epic / repo finalization | `tsd-9ye`, `tsd-aiz` | |
