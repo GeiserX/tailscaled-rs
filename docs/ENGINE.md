@@ -5,12 +5,14 @@
 `tailscale`). The daemon links the engine at a **single pinned revision** so every build —
 CI, a fresh clone, a release — produces the exact same engine.
 
-This document covers two related maintainer responsibilities:
+This document covers three related maintainer responsibilities:
 
 1. **[Bumping the engine rev + `Cargo.lock`](#1-bumping-the-engine-rev)** — the deliberate process for
    moving the daemon to a newer engine commit.
 2. **[Capability-version tracking discipline](#2-capability-version-tracking-discipline)** — why the
    advertised control-protocol `CapabilityVersion` matters, and how to treat it at bump time.
+3. **[The engine on crates.io](#3-the-engine-on-cratesio)** — why a `rev` pin blocks publishing the
+   daemon, and what it takes to trade it for a registry version.
 
 > The engine carries **unaudited cryptography** and offers **no stability guarantees**. Treat
 > every engine bump as a tested change, never a blind `cargo update`.
@@ -236,3 +238,82 @@ consumes**. The daemon's job is not to manage capver — it is to (a) inherit it
 chosen engine rev, and (b) re-verify, at each bump, that the inherited value and its behavior are
 intentional and tested. That is the whole of the daemon-side discipline: **track it at
 engine-bump time.**
+
+---
+
+## 3. The engine on crates.io
+
+### Why this matters
+
+`cargo publish` refuses any crate that carries a `git` dependency. The daemon's engine deps are
+`git` + `rev` (see [`Cargo.toml`](../Cargo.toml)), so **`tailscaled-rs` cannot be published to
+crates.io until those become registry dependencies** — and that is only possible if the whole
+engine is on crates.io first, transitive crates included.
+
+### Where the engine stands
+
+The engine workspace publishes under the **`geiserx_*`** namespace: the facade
+`geiserx_tailscale` plus a `geiserx_ts_*` crate for each published workspace member. The importable
+lib names are unchanged, which is why `use tailscale::…` and the `package = "geiserx_…"` renames in
+`Cargo.toml` coexist.
+
+Every `geiserx_*` crate in the daemon's resolved graph is published — including the ones only an
+optional feature (`tun`, `ssh`, `acme`, `identity-federation`) pulls in. The engine's other
+workspace members are either published but unused here (its FFI / Python / netmon crates) or marked
+`publish = false` upstream (dev and test tooling). The daemon links none of them, so neither group
+gates anything.
+
+Do not take that on trust — it is a property of whatever the pin currently resolves to, and every
+bump re-opens it. Check it against the lockfile:
+
+```bash
+scripts/check-engine-on-crates-io.sh
+```
+
+The script reads `Cargo.lock` (so it sees the full resolved graph, not just the three deps named
+in `Cargo.toml`), asks the crates.io sparse index whether each engine crate is published and
+unyanked at exactly the locked version, and exits non-zero if any is not.
+
+### The trap: a rev's version number is not its release
+
+Engine releases are cut by release-please, which bumps every workspace `version` in a **release
+commit**. So at any commit *between* releases, the version in the engine's manifests is the one
+that was **already published from an earlier commit**. Reading `0.43.0` out of the pinned tree and
+depending on `version = "0.43.0"` therefore does not get you the pinned tree — it gets you
+whatever was released as `0.43.0`, potentially a month and several fixes earlier.
+
+The reliable direction is the other way round: every published crate records the commit it was cut
+from, in `.cargo_vcs_info.json`.
+
+```bash
+curl -sL https://crates.io/api/v1/crates/geiserx_tailscale/<version>/download | tar -xz -C /tmp
+cat /tmp/geiserx_tailscale-<version>/.cargo_vcs_info.json
+```
+
+Match that `sha1` against the pinned `rev` to know whether a given release really is the tree the
+daemon is built and tested against. Read the flag next to it too: a `"dirty": true` means the
+tarball was cut from a modified working tree at that commit, so the sha1 is a starting point for
+the comparison rather than proof the contents are identical.
+
+### Trading the `rev` for a version
+
+Because of the above, replacing `git` + `rev` with `version = "…"` is **an engine-version change,
+not a source swap**, even when the numbers look adjacent. Run it through the full bump discipline
+in [§1](#1-bumping-the-engine-rev) — including the live smoke test and the capver re-check in
+[§2](#2-capability-version-tracking-discipline) — and pick the release whose `.cargo_vcs_info.json`
+sha1 you have actually reviewed.
+
+Cargo also allows a `version` *alongside* `git` + `rev`, and says so when it refuses to package:
+
+```
+all dependencies must have a version requirement specified when packaging.
+dependency `geiserx_tailscale` does not specify a version
+Note: The packaged dependency will use the version from crates.io,
+the `git` specification will be removed from the dependency declaration.
+```
+
+That unblocks `cargo publish` without changing what this repo builds, because the `git` source
+still wins locally and in CI. It is a real option, but it is not free: everyone who consumes the
+*published* daemon then builds against the crates.io release while our own gate ran against the
+pinned commit. Only take it with a release whose `.cargo_vcs_info.json` sha1 matches the pin, and
+keep the two in lockstep from then on.
