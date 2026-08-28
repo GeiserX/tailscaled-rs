@@ -96,7 +96,7 @@ Closed this migration so far (50 beads). The consumed engine capabilities and sh
 - **Connectivity:** exit-node use/advertise + **suggest**, advertise-routes, accept-routes/dns,
   shields-up, TUN data path (feature `tun`), `--port`/`PORT` listen-port pinning.
 - **Services:** serve (tcp/https/http/redirect/status/reset), funnel on/off, Taildrop `cp`/`get`/`list`,
-  TLS `cert` (feature `acme`), `nc`.
+  TLS `cert` (feature `acme`), `nc`, `configure kubeconfig` (standalone generation; no merge).
 - **SSH:** Tailscale SSH **server** (feature `ssh`, control-policy authz, privilege drop) + host-key-
   pinned SSH **client** (`tnet ssh`).
 - **Tailnet lock:** `init`/`status`/`sign`/`disable`/`disablement-kdf`.
@@ -169,7 +169,7 @@ would violate the honest-omission rule). Each rides the next pin bump once its a
 
 | Item | Bead | Note |
 | --- | --- | --- |
-| `tnet configure kubeconfig` (pure-local kubeconfig YAML gen + Status resolve) | `tsd-37m`, `tsd-k47` | Deferred: merging an existing `~/.kube/config` needs a YAML parser dependency for one niche command this fork has no k8s-operator integration to use. |
+| `tnet configure kubeconfig` merging into an existing `~/.kube/config` | `tsd-k47` | Generation shipped (`tsd-37m`): `configure kubeconfig <peer>` resolves the auth-proxy peer against Status and emits a **standalone** kubeconfig (stdout, or `--output PATH`). Merging stays deferred: it needs a YAML parser dependency for one niche command this fork has no k8s-operator integration to use. |
 | Small flag/grammar batch (`cert --min-validity`/`--serve-demo`, `netcheck --bind-address`, `status --browser`, etc.) | `tsd-dru` | Several items already shipped (`switch --json`, `version --track`, `metrics print`, `login`). Residual `logout --reason` is engine-gated (engine `logout()` takes no reason). |
 | `file cp` residual Go-fidelity gaps (stdin streaming, rich pre-send errors, offline-warning, system-DNS fallback) | `tsd-52k` | stdin streaming needs a daemon→client stream-back protocol. |
 | Taildrop `file get` dest parent-dir validation (symlinked ancestor) + same-uid trust doc | `tsd-k97` | The write is `SO_PEERCRED` same-uid-gated; a symlinked ancestor is the caller's own-namespace concern (matches Go's residual). Mostly a trust-model doc. |
@@ -262,7 +262,7 @@ These are the subject of `tsd-efv` (document the Go-tooling-compatibility bounda
 ### Features / tasks / bugs
 - **P2:** `tsd-1m9` pref flags (#21) · `tsd-6y1` crates.io (daemon) · `tsd-d6n` crates.io (engine) ·
   `tsd-k4a` .deb/.rpm + ship acme · `tsd-m8s` Linux OS-DNS configurator · `tsd-q8o` external crypto audit.
-- **P3:** `tsd-1yw` Windows support · `tsd-37m` configure kubeconfig · `tsd-52k` file-cp residual gaps ·
+- **P3:** `tsd-1yw` Windows support · `tsd-52k` file-cp residual gaps ·
   `tsd-6hx` live e2e campaign · `tsd-91w` profiles/multi-account · `tsd-b15` debug subcommands ·
   `tsd-c3w` serve/funnel v2 grammar · `tsd-efv` document reduced shapes · `tsd-euv` HTTP/1-over-UDS ·
   `tsd-ioh` MagicDNS OS integration · `tsd-iqq.10` `--state mem:` · `tsd-iqq.12` set-expiry/reset-auth
@@ -271,7 +271,7 @@ These are the subject of `tsd-efv` (document the Go-tooling-compatibility bounda
 - **P4:** `tsd-0s6` Homebrew tap · `tsd-1hr` file get --wait/--loop (#20) · `tsd-49c` live proxy-splice
   proof · `tsd-9et` live interactive-login vs Headscale · `tsd-dru` small flag batch · `tsd-eka`
   Taildrive (engine-gated) · `tsd-iqq.5` captive-portal detection · `tsd-iqq.16` reload-config refactor ·
-  `tsd-k47` configure kubeconfig (local YAML) · `tsd-k4q` serve path-mux bug (#30) · `tsd-k97` file-get
+  `tsd-k47` configure kubeconfig merge · `tsd-k4q` serve path-mux bug (#30) · `tsd-k97` file-get
   dest parent validation · `tsd-rjf` serve redirect var-expansion doc.
 
 > The authoritative live backlog is the bead set (`bd list --status open`) + `docs/ENGINE_ASKS.md`. This
