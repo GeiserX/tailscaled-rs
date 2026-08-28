@@ -1118,20 +1118,24 @@ enum FileCmd {
     ///
     /// The final argument is the destination peer and MUST end in a colon (`peer-b:`,
     /// `100.64.0.9:`, or `[fd7a::1]:` for an IPv6 literal) — matching Go, which uses the trailing
-    /// colon to disambiguate a peer from a file path. One or more files may precede it. With
-    /// `--targets` (and no files/target), instead lists the peers you can send to.
+    /// colon to disambiguate a peer from a file path. One or more files may precede it, and `-`
+    /// sends stdin. With `--targets` (and no files/target), instead lists the peers you can send to.
     ///
-    /// NOTE: unlike Go, this build does NOT support `-` (stdin) as a file — the daemon opens each
-    /// path itself (tnet + tailnetd are same-host/same-user), so there is no stdin to hand it; pass a
-    /// real file path. Streaming stdin over the LocalAPI is a tracked follow-up.
+    /// A destination the netmap does not know is looked up with the system resolver, and an offline
+    /// target is warned about on stderr before the transfer starts.
+    ///
+    /// NOTE on `-`: the daemon opens each path itself (tnet + tailnetd are same-host/same-user), so
+    /// stdin is spooled to a private temp file first and that path is sent. It must therefore fit in
+    /// the temp filesystem — unlike Go, which streams it.
     Cp {
         /// The files to send, followed by the destination `<peer>:` (trailing colon required). Empty
-        /// only when `--targets` is given. `-` (stdin) is not supported by this build.
+        /// only when `--targets` is given. `-` reads stdin (single file only).
         #[arg(value_name = "FILES... TARGET:")]
         args: Vec<String>,
         /// Destination filename override (Go `--name`): with a single explicit file, send it under
-        /// this name instead of its base name. Cannot be combined with multiple files. (Go also uses
-        /// `--name` to name stdin content, but this build does not support stdin.)
+        /// this name instead of its base name. Cannot be combined with multiple files. With `-`
+        /// (stdin) it names the content; without it, stdin is sent as `stdin` plus an extension
+        /// guessed from its leading bytes.
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
         /// Instead of sending, list the tailnet peers you can Taildrop to (Go `file cp --targets` /
@@ -4507,9 +4511,14 @@ async fn run_file(socket: &std::path::Path, cmd: FileCmd) -> Result<()> {
 /// With `targets` (and no positional args), lists the Taildrop-able peers. Otherwise the LAST arg is
 /// the destination peer and MUST end in a colon (Go's disambiguator); the rest are files to send, one
 /// `FileCp` round-trip each, with the `--name` override (when given) carried to the daemon so the
-/// file is sent under that name. `--name` is rejected with multiple files (matching Go). NOTE: stdin
-/// (`-`) is NOT supported by this build — the daemon opens each path itself (same-host); a `-` is
-/// rejected by `resolve_cp_file`.
+/// file is sent under that name. `--name` is rejected with multiple files (matching Go), and `-`
+/// (stdin) may not be mixed with other files.
+///
+/// Before the first send it runs Go's pre-flight ([`cp_preflight`]): resolve the destination against
+/// the daemon's Taildrop target list, falling back to the system resolver for a name the netmap does
+/// not know, and warn on stderr when the target is known to be offline. The pre-flight is advisory
+/// only — the daemon re-resolves and is the one that refuses an ineligible target, so a pre-flight
+/// that cannot answer (older daemon, node not up) never fails a send that would otherwise work.
 async fn run_file_cp(
     socket: &std::path::Path,
     args: Vec<String>,
@@ -4541,18 +4550,34 @@ async fn run_file_cp(
         }
     }
 
+    // Pre-flight the destination once, not per file: resolve it against the Taildrop target list
+    // (with a system-DNS fallback) so a MagicDNS name only the host resolver knows still reaches the
+    // right peer, and so an offline target is called out BEFORE the transfer starts stalling.
+    let (send_to, online) = cp_preflight(socket, &peer).await;
+    if online == Some(false) {
+        // Go: `# warning: <target> is offline`. A warning, not an error — the send is still
+        // attempted (control's liveness view can lag, and the peer may be back), it just times out
+        // against an unreachable peerAPI if the peer really is gone. Worth saying UP FRONT, because
+        // otherwise the only symptom is a `cp` that hangs. Printed with the target the operator
+        // typed, not the address it resolved to.
+        eprintln!("# warning: {peer} is offline");
+    }
+
     // Send each file as its own transfer. A failure on one file is reported and makes the command
     // exit non-zero, but does not abort the remaining sends (mirrors a best-effort batch).
     let mut had_error = false;
     for file in files {
-        let (path, send_name) = resolve_cp_file(file, name.as_deref())?;
+        // Resolving a source may spool stdin to disk; `source` owns that spool and unlinks it when
+        // it drops at the end of this iteration, so a failed send leaves nothing behind.
+        let source = resolve_cp_source(file, name.as_deref()).await?;
         let req = Request::FileCp {
-            path,
-            peer: peer.clone(),
-            // Thread `--name` onto the wire so the daemon actually sends the file under that name
-            // (Go `--name`); `None` lets the daemon derive the basename. The multi-file guard above
+            path: source.path.clone(),
+            peer: send_to.clone(),
+            // Thread the send name onto the wire so the daemon sends the file under it (Go
+            // `--name`); `None` lets the daemon derive the basename. The multi-file guard above
             // already rejects `--name` with >1 file, so this only ever overrides a single send.
-            name: name.clone(),
+            // A stdin source always sets it — the spool's temp path is not a name to send under.
+            name: source.wire_name.clone(),
         };
         match round_trip(socket, &req)
             .await
@@ -4560,7 +4585,7 @@ async fn run_file_cp(
         {
             Response::Ok { message } => println!("ok: {message}"),
             Response::Error { message } => {
-                eprintln!("error: sending {send_name}: {message}");
+                eprintln!("error: sending {}: {message}", source.display);
                 had_error = true;
             }
             other => anyhow::bail!("unexpected response to file cp: {other:?}"),
@@ -4570,6 +4595,78 @@ async fn run_file_cp(
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// Resolve a `file cp` destination the way Go's `runCp` does before pushing anything, returning the
+/// selector to put on the wire and the target's online tri-state (`None` = not found or unknown).
+///
+/// Go's CLI calls `FileTargets` and matches the destination against it, so it can (a) fall back to
+/// the SYSTEM resolver for a name the netmap does not carry — `tailscaleIPFromArg`'s last step, which
+/// is what makes a search-domain-qualified or `/etc/hosts` name work — and (b) warn about an offline
+/// peer before the transfer stalls. Both need the target LIST, which only the read-only
+/// `FileTargets` request exposes; a point `FileCp` cannot report "this peer is offline but I sent
+/// anyway".
+///
+/// Deliberately infallible: every failure path returns the caller's own selector unchanged. The
+/// daemon re-resolves the selector and owns the authoritative refusal, so this pre-flight must only
+/// ever *add* information — an older daemon, a node that is not up, or a resolver that cannot answer
+/// must not turn a send that would have worked into an error. The DNS fallback likewise only
+/// substitutes an address that actually matched a target; an answer that matches nothing is dropped
+/// so the daemon's error still names what the operator typed.
+async fn cp_preflight(socket: &std::path::Path, peer: &str) -> (String, Option<bool>) {
+    let Ok(Response::FileTargets { targets }) = round_trip(socket, &Request::FileTargets).await
+    else {
+        return (peer.to_string(), None);
+    };
+    if let Some(target) = find_cp_target(&targets, peer) {
+        return (peer.to_string(), target.online);
+    }
+    // A literal address that matched no target is already as resolved as it gets.
+    if peer.parse::<std::net::IpAddr>().is_ok() {
+        return (peer.to_string(), None);
+    }
+    // Not a netmap name: ask the system resolver (Go `net.Resolver.LookupHost`). The port is a
+    // placeholder — `lookup_host` needs one and only the addresses are used.
+    let Ok(addrs) = tokio::net::lookup_host((peer, 0u16)).await else {
+        return (peer.to_string(), None);
+    };
+    for addr in addrs {
+        let ip = addr.ip().to_string();
+        if let Some(target) = find_cp_target(&targets, &ip) {
+            return (ip, target.online);
+        }
+    }
+    (peer.to_string(), None)
+}
+
+/// Find the Taildrop target a `file cp` destination selector names, or `None`.
+///
+/// An IP selector is compared as a PARSED address so `100.64.0.9` and a target's own rendering match
+/// regardless of IPv6 spelling. A name is compared in the same canonical form the engine's peer index
+/// uses — lowercased, one trailing dot stripped — against both the target's full MagicDNS name and its
+/// first label, since the engine resolves a bare hostname as readily as an FQDN and the operator may
+/// type either. Pure → unit-testable without a daemon.
+fn find_cp_target<'a>(
+    targets: &'a [tailscaled_rs::localapi::FileTargetReport],
+    selector: &str,
+) -> Option<&'a tailscaled_rs::localapi::FileTargetReport> {
+    if let Ok(want) = selector.parse::<std::net::IpAddr>() {
+        return targets
+            .iter()
+            .find(|t| t.ip.parse::<std::net::IpAddr>().is_ok_and(|ip| ip == want));
+    }
+    let want = canon_peer_name(selector);
+    targets.iter().find(|t| {
+        let name = canon_peer_name(&t.name);
+        name == want || name.split('.').next().is_some_and(|label| label == want)
+    })
+}
+
+/// Canonicalize a MagicDNS name for comparison: lowercased, with a single trailing dot stripped.
+/// Mirrors the engine peer index's own canonicalization, so the CLI's target matching agrees with the
+/// lookup the daemon will do. Pure.
+fn canon_peer_name(name: &str) -> String {
+    name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase()
 }
 
 /// `tnet file cp --targets`: round-trip [`Request::FileTargets`] and render the peer list.
@@ -4590,24 +4687,202 @@ async fn run_file_targets(socket: &std::path::Path) -> Result<()> {
     }
 }
 
-/// Resolve one `cp` file argument to `(path_to_send, display_name)`. A `-` means stdin, which this
-/// daemon's same-host `FileCp` (the daemon opens the path itself) cannot stream, so `-` is rejected
-/// with an actionable message rather than silently mis-sent. Pure enough to reason about; the stdin
-/// limitation is a fork constraint documented at the call site.
-fn resolve_cp_file(file: &str, name: Option<&str>) -> Result<(String, String)> {
-    if file == "-" {
-        // The daemon opens the file by path (tnet + tailnetd are same-host/same-user); there is no
-        // path for stdin to hand it. Rather than fake it, reject clearly. (A future stdin path would
-        // need the CLI to stream bytes over the LocalAPI — tracked separately.)
-        anyhow::bail!(
-            "stdin ('-') is not supported by this build's `file cp`; pass a file path instead"
-        );
+/// One `file cp` source, resolved to something the daemon can open.
+///
+/// For a real path this is a thin wrapper over the argument. For `-` (stdin) it also OWNS the spool
+/// file the bytes were written to: [`Drop`] unlinks it, so the spool cannot outlive the send whether
+/// that send succeeded, failed, or the CLI bailed out in between.
+struct CpSource {
+    /// The path the daemon opens — the operator's argument, or the stdin spool.
+    path: String,
+    /// The name to send the file under (`FileCp`'s `name`); `None` lets the daemon use the basename.
+    wire_name: Option<String>,
+    /// What the CLI calls this source in its own error lines.
+    display: String,
+    /// Whether [`path`](CpSource::path) is a spool this value must delete.
+    spool: bool,
+}
+
+impl Drop for CpSource {
+    fn drop(&mut self) {
+        if self.spool {
+            // Best-effort: the send is already over, and a temp file we failed to remove is not
+            // worth failing the command for.
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
+}
+
+/// Resolve one `cp` file argument into a [`CpSource`] — a real path as-is, or `-` spooled from stdin.
+async fn resolve_cp_source(file: &str, name: Option<&str>) -> Result<CpSource> {
+    if file == "-" {
+        return spool_stdin(name).await;
+    }
+    let (path, display) = resolve_cp_file(file, name);
+    Ok(CpSource {
+        path,
+        wire_name: name.map(str::to_string),
+        display,
+        spool: false,
+    })
+}
+
+/// Resolve one non-stdin `cp` file argument to `(path_to_send, display_name)`. The daemon opens the
+/// path itself (tnet + tailnetd are same-host/same-user), so the argument travels verbatim; the
+/// display name is only for the CLI's own error lines. Pure → unit-testable.
+fn resolve_cp_file(file: &str, name: Option<&str>) -> (String, String) {
     // Display name for error/progress lines: the override, else the file's base name.
     let display = name
         .map(str::to_string)
         .unwrap_or_else(|| basename(file).to_string());
-    Ok((file.to_string(), display))
+    (file.to_string(), display)
+}
+
+/// Spool stdin to a private temp file and describe it as a [`CpSource`].
+///
+/// ## Why a spool and not a stream
+///
+/// Go streams stdin straight into the peerAPI PUT. This build's `FileCp` hands the daemon a PATH and
+/// the daemon does the opening (same-host, same-user — see the daemon's `file_cp`), so there is no
+/// byte channel for stdin to ride and streaming it would mean a new client→daemon framing on the
+/// LocalAPI. Spooling gets the command Go's observable behaviour without that: `cat x | tnet file cp
+/// - peer:` works, `--name` names the transfer, and the receiver sees one ordinary Taildrop file.
+///
+/// The honest deviation is buffering: the content lands in the temp filesystem before any of it
+/// moves, so stdin must FIT there, and an endless producer fills the disk instead of streaming
+/// forever. Nothing is left behind either way — [`CpSource`]'s `Drop` unlinks the spool.
+///
+/// ## Spool hardening
+///
+/// Created `O_EXCL` with mode `0600`, so a local attacker can neither pre-plant the path (to redirect
+/// the write or feed the daemon their own bytes) nor read the piped content out of it; the daemon
+/// opens it back with `O_NOFOLLOW`. The pid+nanosecond suffix is only for uniqueness — `O_EXCL` is
+/// the actual control.
+async fn spool_stdin(name: Option<&str>) -> Result<CpSource> {
+    let name = name.map(str::to_string);
+    // Blocking: reading stdin to completion and writing it out is ordinary blocking I/O, and this
+    // CLI has nothing else to run meanwhile — keep it off the async worker rather than pretend.
+    tokio::task::spawn_blocking(move || spool_stdin_blocking(name.as_deref()))
+        .await
+        .context("spooling stdin for 'file cp -'")?
+}
+
+/// The blocking body of [`spool_stdin`]: create the spool, drain stdin into it, then pick the send
+/// name (the `--name` override, else Go's `stdin`-plus-sniffed-extension).
+fn spool_stdin_blocking(name: Option<&str>) -> Result<CpSource> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("tnet-cp-stdin.{}.{nanos:x}", std::process::id()));
+    // One UTF-8 rendering of the path, used BOTH for the wire and for the unlink: the daemon opens
+    // exactly the file this process created, and this process deletes exactly that file. A non-UTF-8
+    // temp dir cannot travel the JSON LocalAPI at all — say so rather than send something lossy.
+    let path_str = path
+        .to_str()
+        .with_context(|| {
+            format!(
+                "the temp directory path is not valid UTF-8: {}",
+                path.display()
+            )
+        })?
+        .to_string();
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("creating the stdin spool {}", path.display()))?;
+
+    // Take ownership of the path NOW: every error below unlinks the spool on the way out.
+    let mut source = CpSource {
+        path: path_str,
+        wire_name: None,
+        display: "stdin".to_string(),
+        spool: true,
+    };
+
+    std::io::copy(&mut std::io::stdin().lock(), &mut file)
+        .with_context(|| format!("spooling stdin to {}", path.display()))?;
+    drop(file);
+
+    let send_name = match name {
+        Some(n) => n.to_string(),
+        None => {
+            // Sniff the leading bytes back off the spool for the extension (Go reads the same prefix
+            // out of the stream before pushing it). A read failure is not fatal — fall back to the
+            // bare `stdin` name rather than lose the transfer over a nicety.
+            let mut head = Vec::new();
+            let _ =
+                std::fs::File::open(&path).and_then(|f| f.take(SNIFF_BYTES).read_to_end(&mut head));
+            stdin_send_name(&head)
+        }
+    };
+    source.display = send_name.clone();
+    source.wire_name = Some(send_name);
+    Ok(source)
+}
+
+/// How many leading bytes [`stdin_send_name`] looks at, matching the prefix Go's
+/// `http.DetectContentType` inspects.
+const SNIFF_BYTES: u64 = 512;
+
+/// The name stdin content is sent under when no `--name` was given: `stdin`, plus an extension
+/// guessed from its leading bytes — Go's `pickStdinFilename`.
+///
+/// An APPROXIMATION by necessity: Go derives the extension from `http.DetectContentType` plus
+/// `mime.ExtensionsByType`, whose answer depends on the host's MIME database, so there is no fixed
+/// string to be byte-faithful to. This sniffs a short list of unambiguous magic numbers, calls
+/// anything that reads as text `.txt`, and otherwise sends a bare `stdin` rather than guess. Pure →
+/// unit-testable.
+fn stdin_send_name(head: &[u8]) -> String {
+    format!("stdin{}", sniff_stdin_extension(head))
+}
+
+/// The extension [`stdin_send_name`] appends, or `""` when the content cannot be named confidently.
+fn sniff_stdin_extension(head: &[u8]) -> &'static str {
+    // Magic numbers only — formats whose first bytes identify them outright. Anything needing real
+    // parsing to recognise is left unnamed instead of guessed at.
+    const MAGIC: &[(&[u8], &str)] = &[
+        (b"\x89PNG\r\n\x1a\n", ".png"),
+        (b"\xff\xd8\xff", ".jpg"),
+        (b"GIF87a", ".gif"),
+        (b"GIF89a", ".gif"),
+        (b"%PDF-", ".pdf"),
+        (b"\x1f\x8b", ".gz"),
+        (b"PK\x03\x04", ".zip"),
+    ];
+    for (magic, ext) in MAGIC {
+        if head.starts_with(magic) {
+            return ext;
+        }
+    }
+    if head.is_empty() {
+        return "";
+    }
+    let text = match std::str::from_utf8(head) {
+        Ok(s) => s,
+        // A multi-byte character cut in half by the sniff window is a truncation artefact, not
+        // evidence of binary content — judge the part that did decode.
+        Err(e) if e.error_len().is_none() => {
+            std::str::from_utf8(&head[..e.valid_up_to()]).unwrap_or("")
+        }
+        Err(_) => return "",
+    };
+    // Text is text when nothing in it is a control character other than the three that legitimately
+    // appear in one. A NUL or an escape sequence means binary (or a terminal payload) — leave it
+    // unnamed. An empty valid prefix (the whole window was one truncated character) decides nothing.
+    if !text.is_empty()
+        && text
+            .chars()
+            .all(|c| !c.is_control() || matches!(c, '\t' | '\n' | '\r'))
+    {
+        return ".txt";
+    }
+    ""
 }
 
 /// The base name of a path (the final `/`-separated component), for `cp` display. Pure.
@@ -8913,6 +9188,125 @@ mod tests {
             parse_cp_target("[1.2.3.4]:").is_err(),
             "brackets around a v4 literal must be rejected"
         );
+    }
+
+    #[test]
+    fn cp_source_unlinks_only_its_own_spool() {
+        // The stdin spool is this process's to delete...
+        let path = std::env::temp_dir().join(format!("tnet-cp-drop-test.{}", std::process::id()));
+        std::fs::write(&path, b"payload").expect("write the fake spool");
+        drop(CpSource {
+            path: path.display().to_string(),
+            wire_name: Some("stdin".to_string()),
+            display: "stdin".to_string(),
+            spool: true,
+        });
+        assert!(!path.exists(), "a spool must not outlive its CpSource");
+
+        // ...but a path the operator named is THEIRS. Dropping the source must never remove it.
+        std::fs::write(&path, b"payload").expect("write the operator's file");
+        drop(CpSource {
+            path: path.display().to_string(),
+            wire_name: None,
+            display: "payload".to_string(),
+            spool: false,
+        });
+        assert!(path.exists(), "a real source file must survive the send");
+        std::fs::remove_file(&path).expect("clean up");
+    }
+
+    #[test]
+    fn find_cp_target_matches_ip_name_and_bare_hostname() {
+        use tailscaled_rs::localapi::FileTargetReport;
+        let targets = vec![
+            FileTargetReport {
+                ip: "100.64.0.2".to_string(),
+                name: "laptop.tail1234.ts.net".to_string(),
+                online: Some(true),
+            },
+            FileTargetReport {
+                ip: "100.64.0.3".to_string(),
+                name: "desktop.tail1234.ts.net".to_string(),
+                online: Some(false),
+            },
+        ];
+        // Exact IP.
+        assert_eq!(
+            find_cp_target(&targets, "100.64.0.3").map(|t| t.name.as_str()),
+            Some("desktop.tail1234.ts.net")
+        );
+        // Full MagicDNS name, any case, trailing dot or not — the engine's own canonicalization.
+        assert_eq!(
+            find_cp_target(&targets, "LAPTOP.Tail1234.ts.net.").map(|t| t.ip.as_str()),
+            Some("100.64.0.2")
+        );
+        // Bare hostname: the engine indexes it too, so the CLI must match it as well.
+        assert_eq!(
+            find_cp_target(&targets, "desktop").map(|t| t.ip.as_str()),
+            Some("100.64.0.3")
+        );
+        // The offline peer's tri-state survives, which is what drives the warning.
+        assert_eq!(
+            find_cp_target(&targets, "desktop").unwrap().online,
+            Some(false)
+        );
+        // No match → None (the daemon, not the pre-flight, decides what that means).
+        assert!(find_cp_target(&targets, "phone").is_none());
+        assert!(find_cp_target(&targets, "100.64.0.9").is_none());
+    }
+
+    #[test]
+    fn find_cp_target_compares_addresses_not_strings() {
+        use tailscaled_rs::localapi::FileTargetReport;
+        // An IPv6 target rendered one way must still match the same address typed another way —
+        // hence the parse-then-compare rather than a string equality.
+        let targets = vec![FileTargetReport {
+            ip: "fd7a:115c:a1e0::1".to_string(),
+            name: "v6peer".to_string(),
+            online: None,
+        }];
+        assert!(find_cp_target(&targets, "fd7a:115c:a1e0:0:0:0:0:1").is_some());
+    }
+
+    #[test]
+    fn stdin_send_name_uses_magic_numbers_then_text_then_nothing() {
+        // Unambiguous magic numbers get their extension (Go names stdin by sniffed content type).
+        assert_eq!(stdin_send_name(b"\x89PNG\r\n\x1a\nrest"), "stdin.png");
+        assert_eq!(stdin_send_name(b"%PDF-1.7 ..."), "stdin.pdf");
+        assert_eq!(stdin_send_name(b"GIF89a...."), "stdin.gif");
+        // Plain text (tab/newline/CR are legitimate in text) → .txt.
+        assert_eq!(stdin_send_name(b"hello\tworld\r\n"), "stdin.txt");
+        // UTF-8 text is text.
+        assert_eq!(stdin_send_name("héllo\n".as_bytes()), "stdin.txt");
+        // Unrecognised binary is left unnamed rather than guessed at.
+        assert_eq!(stdin_send_name(b"\x00\x01\x02\x03"), "stdin");
+        // Escape sequences are not text: a sniffed name must never carry terminal control bytes
+        // into a `.txt` claim.
+        assert_eq!(stdin_send_name(b"\x1b[31mred"), "stdin");
+        // Empty stdin decides nothing.
+        assert_eq!(stdin_send_name(b""), "stdin");
+    }
+
+    #[test]
+    fn stdin_sniff_tolerates_a_character_cut_by_the_window() {
+        // A multi-byte character sliced by the 512-byte sniff window is a truncation artefact, not
+        // binary content: the valid prefix still reads as text.
+        let mut head = "ok ".as_bytes().to_vec();
+        head.extend_from_slice(&"é".as_bytes()[..1]); // leading byte only
+        assert_eq!(stdin_send_name(&head), "stdin.txt");
+        // But a genuinely invalid sequence (a stray continuation byte) is not text.
+        assert_eq!(stdin_send_name(b"ok \x80\x80"), "stdin");
+    }
+
+    #[test]
+    fn resolve_cp_file_passes_the_path_through_and_labels_it() {
+        // The daemon opens the path, so the argument travels verbatim; only the label changes.
+        let (path, display) = resolve_cp_file("/tmp/a/b.txt", None);
+        assert_eq!(path, "/tmp/a/b.txt");
+        assert_eq!(display, "b.txt");
+        // `--name` relabels the send (and is what the daemon is told to name it).
+        let (_, display) = resolve_cp_file("/tmp/a/b.txt", Some("renamed.txt"));
+        assert_eq!(display, "renamed.txt");
     }
 
     #[test]

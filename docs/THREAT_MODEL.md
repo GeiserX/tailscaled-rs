@@ -254,6 +254,29 @@ text from corrupting the operator's terminal or spoofing a structured listing. N
 where the fork is **deliberately stricter than Go**: upstream `tailscale` prints `ComputedName` and
 the DNS fields raw and *is* susceptible to escape/column injection in these listings.
 
+### 4.9 The `file cp -` stdin spool is `O_EXCL`-created and `0600` — adversary (a)
+
+`tnet file cp - <peer>:` cannot hand the daemon a byte stream (`FileCp` carries a *path*; the daemon
+does the opening), so the CLI first spools stdin to a file in the system temp directory and sends
+that path. That directory is typically world-writable and shared, which raises two local-user
+concerns — both closed at creation time, not by a secret name:
+
+- **Pre-planting.** The spool is opened `create_new` (`O_EXCL`), so a local user who guesses or
+  watches for the path cannot have a file or a symlink already sitting there: the open *fails*
+  rather than writing through someone else's link into a file the daemon would then read and send.
+  The pid+nanosecond suffix is for uniqueness only and is explicitly **not** a security control.
+- **Reading the piped content.** The spool is created mode `0600`, so the bytes on their way to the
+  peer are not readable by other local users while they sit on disk.
+
+The daemon re-opens the path with `O_NOFOLLOW` and the same regular-file-only check it applies to any
+`file cp` source, so a symlink swapped in after the CLI closes the spool is refused rather than
+followed. The spool is unlinked when the send finishes — success, failure, or early exit alike.
+
+Residual, and accepted: the content is **at rest** on the temp filesystem for the duration of the
+transfer (Go, which streams, never writes it down), and a caller who can already write as this user
+can read their own spool. Both are inside the same-uid trust boundary the LocalAPI write policy
+already assumes.
+
 ---
 
 ## 5. What is NOT mitigated (blunt)

@@ -171,7 +171,7 @@ would violate the honest-omission rule). Each rides the next pin bump once its a
 | --- | --- | --- |
 | `tnet configure kubeconfig` merging into an existing `~/.kube/config` | `tsd-k47` | Generation shipped (`tsd-37m`): `configure kubeconfig <peer>` resolves the auth-proxy peer against Status and emits a **standalone** kubeconfig (stdout, or `--output PATH`). Merging stays deferred: it needs a YAML parser dependency for one niche command this fork has no k8s-operator integration to use. |
 | Small flag/grammar batch (`cert --min-validity`/`--serve-demo`, `netcheck --bind-address`, `status --browser`, etc.) | `tsd-dru` | Several items already shipped (`switch --json`, `version --track`, `metrics print`, `login`). Residual `logout --reason` is engine-gated (engine `logout()` takes no reason). |
-| `file cp` residual Go-fidelity gaps (stdin streaming, rich pre-send errors, offline-warning, system-DNS fallback) | `tsd-52k` | stdin streaming needs a daemon→client stream-back protocol. |
+| `file cp` residual Go-fidelity gaps (stdin streaming, rich pre-send errors, offline-warning, system-DNS fallback) | `tsd-52k` | **Shipped.** Rich pre-send errors are daemon-side (Go's `fileTargetErrorDetail`: Taildrop not enabled for the tailnet / user mismatch / target does not support receiving files), refused before the file is opened. The offline warning and the system-DNS fallback are CLI-side, off one read-only `file-targets` round-trip (Go's own pre-flight). `-` (stdin) works, with one deviation: the CLI spools stdin to a `0600`, `O_EXCL`-created temp file and sends that path — `FileCp` hands the daemon a path, not a byte stream — so stdin must fit in the temp filesystem where Go would stream it. A real client→daemon stream would need new LocalAPI framing and is not worth it for this. |
 | Taildrop `file get` dest parent-dir validation (symlinked ancestor) + same-uid trust doc | `tsd-k97` | The write is `SO_PEERCRED` same-uid-gated; a symlinked ancestor is the caller's own-namespace concern (matches Go's residual). Mostly a trust-model doc. |
 | `serve redirect` `${HOST}`/`${REQUEST_URI}` expansion (doc claims it; engine doesn't do it) | `tsd-rjf` | Correct the doc, or implement with re-validation. |
 
@@ -262,8 +262,8 @@ These are the subject of `tsd-efv` (document the Go-tooling-compatibility bounda
 ### Features / tasks / bugs
 - **P2:** `tsd-1m9` pref flags (#21) · `tsd-6y1` crates.io (daemon) · `tsd-d6n` crates.io (engine) ·
   `tsd-k4a` .deb/.rpm + ship acme · `tsd-m8s` Linux OS-DNS configurator · `tsd-q8o` external crypto audit.
-- **P3:** `tsd-1yw` Windows support · `tsd-52k` file-cp residual gaps ·
-  `tsd-6hx` live e2e campaign · `tsd-91w` profiles/multi-account · `tsd-b15` debug subcommands ·
+- **P3:** `tsd-1yw` Windows support · `tsd-6hx` live e2e campaign ·
+  `tsd-91w` profiles/multi-account · `tsd-b15` debug subcommands ·
   `tsd-c3w` serve/funnel v2 grammar · `tsd-efv` document reduced shapes · `tsd-euv` HTTP/1-over-UDS ·
   `tsd-ioh` MagicDNS OS integration · `tsd-iqq.10` `--state mem:` · `tsd-iqq.12` set-expiry/reset-auth
   (engine-gated) · `tsd-iqq.15` peer-by-id (engine-gated) · `tsd-nee` lock add/remove/log (#25) ·

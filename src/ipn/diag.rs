@@ -574,6 +574,16 @@ pub(super) async fn ping(dev: &tailscale::Device, ip: &str, timeout_ms: Option<u
 /// as an [`IpAddr`](std::net::IpAddr) is looked up by tailnet IP, otherwise by MagicDNS name. The
 /// engine derives the destination solely from the resolved peer's own node record, so a raw
 /// address can never be targeted directly.
+///
+/// ## Pre-send target check
+///
+/// Resolving a peer is not the same as that peer being able to receive: Taildrop needs the tailnet
+/// to have file sharing enabled, the peer to be ours (or an explicit ACL file-sharing target), and
+/// the peer to advertise a peerAPI. Those are exactly the predicates the engine's `file_targets()`
+/// filter applies, but it expresses a failure by omitting the peer from a list — which a
+/// *point* send has no way to read. So [`cp_target_refusal`] re-asks them here and refuses with the
+/// specific reason (Go's `fileTargetErrorDetail`), before the file is opened, instead of letting the
+/// transfer set up and come back as an opaque engine `BadRequest`.
 pub(super) async fn file_cp(
     dev: &tailscale::Device,
     path: &str,
@@ -599,6 +609,31 @@ pub(super) async fn file_cp(
             };
         }
     };
+    // Pre-send target eligibility (Go's `getTargetStableID` + `fileTargetErrorDetail`): a peer that
+    // resolves is not automatically a peer that can RECEIVE. Ask the same three questions the engine's
+    // `file_targets()` filter asks and refuse here, BEFORE the file is opened, naming which of them
+    // failed — otherwise the only signal is the engine's opaque `BadRequest` after the transfer has
+    // already been set up. The self node supplies the two halves the peer record cannot: whether this
+    // tailnet has Taildrop enabled at all, and which user owns us.
+    let self_node = match dev.self_node().await {
+        Ok(node) => node,
+        Err(e) => {
+            return Response::Error {
+                message: format!("cannot read this node's own record: {e:?}"),
+            };
+        }
+    };
+    if let Some(detail) = cp_target_refusal(
+        self_node.can_share_files(),
+        peer_node.user_id == self_node.user_id,
+        peer_node.is_file_sharing_target(),
+        peer_node.peerapi_addr().is_some(),
+    ) {
+        // Go's shape: `can't send to <target>: <detail>`.
+        return Response::Error {
+            message: format!("can't send to {peer}: {detail}"),
+        };
+    }
     // The send name: Go's `--name` override when given, else the path's final component (basename),
     // like Go's `file cp`. A `--name` is itself validated to a single safe component below; a path
     // with no basename (e.g. `/`) and no override has nothing meaningful to name the transfer —
@@ -668,6 +703,47 @@ pub(super) async fn file_cp(
             message: format!("taildrop send failed: {e:?}"),
         },
     }
+}
+
+/// Why a resolved peer cannot receive a Taildrop send, or `None` when it can — the pure core of
+/// [`file_cp`]'s pre-send check and the analogue of Go's `fileTargetErrorDetail`.
+///
+/// The four inputs are exactly the predicates the engine's own send-target filter
+/// (`build_file_targets`) applies, split out so the reason survives instead of collapsing to an
+/// empty target list:
+///
+/// * `self_can_share` — this node holds the file-sharing node attribute (control grants it when the
+///   admin enables Taildrop for the tailnet). The engine gates the whole target list on it, so
+///   without it `tnet file cp --targets` is already empty; refusing the send too keeps the two
+///   consistent instead of letting a `cp` proceed to a peer the same daemon says is not a target.
+/// * `same_owner` / `peer_is_sharing_target` — Go's two-way OR: the peer is eligible when this node's
+///   user owns it, **or** an ACL grant made it an explicit file-sharing target. Failing both is Go's
+///   "user mismatch".
+/// * `peer_has_peerapi` — the peer advertises a reachable peerAPI. Without one there is nothing to
+///   PUT the file to (Go: "target does not support receiving files").
+///
+/// Ordered most-general-first so the operator sees the outermost cause: a tailnet with Taildrop
+/// switched off is reported as such rather than as a per-peer problem. Pure → unit-testable without
+/// an engine.
+fn cp_target_refusal(
+    self_can_share: bool,
+    same_owner: bool,
+    peer_is_sharing_target: bool,
+    peer_has_peerapi: bool,
+) -> Option<&'static str> {
+    if !self_can_share {
+        return Some(
+            "this node does not hold the file-sharing capability (Taildrop is not enabled for this \
+             tailnet)",
+        );
+    }
+    if !same_owner && !peer_is_sharing_target {
+        return Some("user mismatch");
+    }
+    if !peer_has_peerapi {
+        return Some("target does not support receiving files");
+    }
+    None
 }
 
 /// Whether a Taildrop SEND name (`--name` override or a derived basename) is a safe single file-name
@@ -1709,6 +1785,29 @@ mod tests {
         assert!(!cp_send_name_ok("../escape"));
         assert!(!cp_send_name_ok("a\\b"));
         assert!(!cp_send_name_ok("a\0b"));
+    }
+
+    #[test]
+    fn cp_target_refusal_names_the_outermost_cause() {
+        use super::cp_target_refusal;
+        // Fully eligible: same owner, a peerAPI to PUT to, Taildrop enabled → no refusal.
+        assert_eq!(cp_target_refusal(true, true, false, true), None);
+        // Cross-owner is fine when an ACL grant made the peer an explicit target (Go's two-way OR).
+        assert_eq!(cp_target_refusal(true, false, true, true), None);
+        // The tailnet-wide gate outranks every per-peer question: an otherwise perfect target is
+        // still refused, and the message must not blame the peer.
+        let detail = cp_target_refusal(false, true, true, true).expect("must refuse");
+        assert!(detail.contains("file-sharing capability"), "got: {detail}");
+        // Neither owner nor ACL grant → Go's "user mismatch".
+        assert_eq!(
+            cp_target_refusal(true, false, false, true),
+            Some("user mismatch")
+        );
+        // Eligible peer with no peerAPI advertised → nothing to send to.
+        assert_eq!(
+            cp_target_refusal(true, true, false, false),
+            Some("target does not support receiving files")
+        );
     }
 
     #[test]
