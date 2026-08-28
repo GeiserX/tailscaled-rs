@@ -7,6 +7,49 @@ license = "BSD-3-Clause"
 repository = "https://github.com/GeiserX/tailscaled-rs"
 description = "An independent, from-scratch Rust system daemon that joins a WireGuard-based mesh overlay, speaking the Tailscale control protocol. Wraps the tailscale-rs engine in a long-running, IPC-controlled daemon (the layer the embeddable library omits). Not affiliated with, endorsed by, or sponsored by Tailscale Inc.; 'Tailscale' is a trademark of Tailscale Inc."
 
+# crates.io metadata. `readme` is what renders on the crate page; `documentation` points at docs.rs
+# rather than the repo so the API docs win over the marketing page.
+readme = "README.md"
+documentation = "https://docs.rs/tailscaled-rs"
+# Deliberately trademark-free: the crate NAME and `description` already name Tailscale/WireGuard
+# nominatively (with the disclaimer), but a keyword is a discoverability claim rather than a
+# description, so these stay generic. See the trademark note in `README.md`/`NOTICE`.
+keywords = ["vpn", "mesh", "overlay-network", "daemon"]
+categories = ["network-programming", "command-line-utilities"]
+
+# What actually ships in the `.crate` tarball.
+#
+# This is an ALLOWLIST (`include`), not an `exclude`, and that choice is the point: a crates.io
+# publish is PERMANENT — a bad version can be yanked, never deleted or edited — and this repo
+# accumulates local tooling at the root over time (issue-tracker state, agent instruction files, CI
+# and bot config). With an `exclude` list, every such file added later would silently land in the
+# next publish and stay there forever. With an allowlist, anything new is out until someone
+# deliberately adds it here.
+#
+# Verified against `cargo package --list`: without this, the tarball also carried `.beads/`
+# (including ~30 KB of issue-tracker interaction logs) and its git hooks, `CLAUDE.md`/`AGENTS.md`,
+# `.github/`, `.coderabbit.yaml`, `codecov.yml`, `Cross.toml`, the release-please config, and a
+# 151 KB GitHub social-preview PNG — none of which a consumer of the crate can use.
+#
+# `packaging/` is NOT optional extras: `src/ipn/install.rs` `include_str!`s the systemd units and
+# the launchd plist, so the crate does not COMPILE without it. `Cargo.toml` and `Cargo.lock` are
+# added by cargo itself and need no entry.
+#
+# Left out on purpose: `tests/` + `test-support/` (the headscale end-to-end fixtures are
+# development infrastructure — they need Docker and a live control plane, and are meaningless
+# outside a clone of the repo).
+include = [
+    "/src/**/*.rs",
+    "/build.rs",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+    "/NOTICE",
+    "/docs/*.md",
+    "/docs/images/banner.svg",
+    "/packaging/**/*",
+]
+
 # Lint policy. `unreachable_pub` keeps the API surface honest: an item declared `pub` that is not
 # actually reachable outside its module should be `pub(super)`/`pub(crate)` instead. Kept at `warn`
 # (not `deny`) so it surfaces drift in local builds + CI logs without unexpectedly breaking the build.

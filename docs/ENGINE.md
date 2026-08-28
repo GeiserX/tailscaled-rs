@@ -317,3 +317,37 @@ still wins locally and in CI. It is a real option, but it is not free: everyone 
 *published* daemon then builds against the crates.io release while our own gate ran against the
 pinned commit. Only take it with a release whose `.cargo_vcs_info.json` sha1 matches the pin, and
 keep the two in lockstep from then on.
+
+### Where that lands at the current pin
+
+Running the `.cargo_vcs_info.json` check above across the published `0.43.x` line, against the
+pinned rev `9d847a6e`:
+
+| crates.io release | cut from | relative to the pin | `dirty` |
+| --- | --- | --- | --- |
+| `0.43.0` | `43dac461` | **8 commits behind** | yes |
+| `0.43.1` | `bb83dfad` | **1 commit ahead** — the release-please commit, `+42/-42` in `Cargo.toml` plus changelog/manifest, **no source change** | yes |
+| `0.43.2` | `4faa0ec1` | diverged | no |
+| `0.43.3` | `074285e4` | diverged | no |
+
+So **no published release was cut from the pinned commit itself**, and the closest match in content
+is `0.43.1` — the pinned tree plus a version-bump-only release commit.
+
+That makes the `version`-alongside-`rev` shortcut unavailable at this pin, and not as a matter of
+taste. Cargo requires the `git` source to *satisfy* the version requirement, and the pinned tree
+carries `0.43.0`, so `version = "0.43.1"` is rejected outright:
+
+```
+error: failed to select a version for the requirement `geiserx_tailscale = "^0.43.1"`
+candidate versions found which didn't match: 0.43.0
+location searched: Git repository https://github.com/GeiserX/tailscale-rs?rev=9d847a6e…
+```
+
+The only requirement the pin accepts is `version = "0.43.0"` — which is the release **8 commits
+behind** the pin, the one that predates the russh security bump this rev exists for. The shortcut
+can therefore only be taken by advertising a floor we deliberately moved off.
+
+**Conclusion: publishing needs the pin moved to a release, not worked around.** Move it to
+`0.43.1` (content-equal to the tree we have gated, so the smoke test carries over — re-verify the
+`dirty` flag) or forward to `0.43.3`, through the full §1 bump discipline and the §2 capver
+re-check. Everything else about the package is already publish-ready.
