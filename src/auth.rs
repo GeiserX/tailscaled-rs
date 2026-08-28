@@ -161,7 +161,12 @@ pub(crate) fn requires_write(request: &crate::localapi::Request) -> bool {
         | Request::GetServeConfig
         | Request::FileList
         // `file cp --targets` only enumerates peers we could send to — a read, like `status`/`list`.
-        | Request::FileTargets => false,
+        | Request::FileTargets
+        // `file cp`'s pre-send target check resolves ONE peer and reports whether it is an eligible
+        // Taildrop target. It sends nothing and mutates nothing — it is the single-peer projection of
+        // `FileTargets`, so it gates identically (a read). Go likewise composes this check from two
+        // `PermitRead` LocalAPI routes (`status` + `file-targets`).
+        | Request::FileCpTarget { .. } => false,
         // Writes: lifecycle/prefs mutations plus the Taildrop transfers. `FileCp` initiates a send
         // and `FileGet` consumes/deletes an inbound file, so both mutate and gate like `up`/`down`.
         Request::Up { .. }
@@ -386,6 +391,14 @@ mod tests {
         // `file cp --targets` only enumerates eligible peers — a read, like `list`/`status`.
         assert!(!requires_write(&Request::FileTargets));
         assert_eq!(authorize(&Request::FileTargets, Access::ReadOnly), Ok(()));
+        // `file cp`'s pre-send target check is that same enumeration narrowed to one peer: it
+        // resolves and reports, never sends. It must stay a read — a read-only caller has to be able
+        // to ask "can I send here?" (and get Go's offline warning) exactly as it can list targets.
+        let check = Request::FileCpTarget {
+            peer: "100.64.0.2".to_string(),
+        };
+        assert!(!requires_write(&check));
+        assert_eq!(authorize(&check, Access::ReadOnly), Ok(()));
     }
 
     #[test]

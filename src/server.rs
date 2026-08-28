@@ -1429,6 +1429,18 @@ async fn dispatch(
                 },
             }
         }
+        // `file cp`'s pre-send target check: resolve ONE peer and report whether it can receive a
+        // file (and whether it is offline), or why it cannot. Read-only, off-lock like `FileTargets`
+        // — it awaits the peer set and the self node, and sends nothing.
+        Request::FileCpTarget { peer } => {
+            let dev = { backend.lock().await.device_handle() };
+            match dev {
+                Some(dev) => Backend::file_cp_target(&dev, &peer).await,
+                None => Response::Error {
+                    message: "node is not up".into(),
+                },
+            }
+        }
         // `file cp --targets` enumerates eligible Taildrop peers. Read-only, off-lock like the other
         // diagnostics (the engine's `file_targets` awaits the peer set).
         Request::FileTargets => {

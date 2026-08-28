@@ -491,6 +491,12 @@ async fn new_taildrop_wire_requests_dispatch_and_report_node_not_up_offline() {
             "file cp --targets (FileTargets, read)",
             Request::FileTargets,
         ),
+        (
+            "file cp pre-send check (FileCpTarget, read)",
+            Request::FileCpTarget {
+                peer: "100.64.0.2".to_string(),
+            },
+        ),
     ];
 
     for (label, req) in cases {
@@ -565,6 +571,42 @@ async fn wire_format_discriminants_are_stable() {
     let parsed: Request = serde_json::from_str(r#"{"cmd":"file_cp","path":"/p","peer":"x"}"#)
         .expect("parse file_cp without name (back-compat)");
     assert!(matches!(parsed, Request::FileCp { name: None, .. }));
+
+    // The `file cp` pre-send check. The CLI now runs this before EVERY send, so its tag is on the
+    // hot path of an existing command, not just a new one.
+    assert_eq!(
+        serde_json::to_string(&Request::FileCpTarget {
+            peer: "peer-b".into()
+        })
+        .expect("serialize FileCpTarget"),
+        r#"{"cmd":"file_cp_target","peer":"peer-b"}"#,
+        "file_cp_target request wire format drifted"
+    );
+}
+
+/// A daemon that predates `file_cp_target` answers the check with its `bad request:` parse error,
+/// and the CLI keys off exactly that prefix to skip the check and send anyway (see `check_cp_target`
+/// in `src/bin/tnet.rs`). Pin the marker here, against the REAL server loop: if the parse-failure
+/// reply ever stops starting with `bad request:`, a new CLI talking to an old daemon would stop
+/// degrading gracefully and start failing every `file cp` outright.
+#[tokio::test]
+async fn unknown_request_error_keeps_the_bad_request_marker() {
+    let harness = Harness::start().await;
+
+    // Stand in for a verb this daemon does not know — the shape an OLD daemon sees when a NEW CLI
+    // sends `file_cp_target`.
+    match harness
+        .round_trip(r#"{"cmd":"file_cp_target_from_the_future"}"#)
+        .await
+    {
+        Response::Error { message } => assert!(
+            message.starts_with("bad request:"),
+            "unparseable-request marker drifted; the CLI's mixed-version fallback keys on it: {message}"
+        ),
+        other => panic!("expected Response::Error for an unknown command, got {other:?}"),
+    }
+
+    harness.shutdown_and_verify().await;
 }
 
 /// 5. WATCH wake-edge regression (the lost-wakeup fix in `Backend::finish_up`).

@@ -3182,6 +3182,15 @@ impl Backend {
         diag::file_list(dev)
     }
 
+    /// Pre-send check for one `file cp` destination (the `tnet file cp` prologue / Go `runCp`'s
+    /// `getTargetStableID` + `fileTargetErrorDetail`). A thin `pub` shim over
+    /// [`diag::file_cp_target`], kept on `Backend` so the `server.rs` dispatch call site matches the
+    /// other off-lock diagnostics. See [`diag::file_cp_target`] for why the check lives in the daemon
+    /// rather than being composed client-side the way Go composes it.
+    pub async fn file_cp_target(dev: &tailscale::Device, peer: &str) -> crate::localapi::Response {
+        diag::file_cp_target(dev, peer).await
+    }
+
     /// List the tailnet peers this node can Taildrop *to* (the `tnet file cp --targets` / Go
     /// `tailscale file cp --targets` path). A thin `pub` shim over [`diag::file_targets`], kept on
     /// `Backend` so the `server.rs` dispatch call site matches the other off-lock diagnostics.

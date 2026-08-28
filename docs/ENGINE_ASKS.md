@@ -893,3 +893,43 @@ prefers the most-specific / trailing-slash mount). A regression test: mounts `{"
 handler map (`src/ipn/serve.rs` `handler_to_target`/`http_handler_to_target`); the request-time mux is
 entirely engine-owned, so this fix is transparent to the daemon (no wiring change). Tracked in daemon bead
 tsd-k4q. — daemon lane
+
+## 31. Unknown-length Taildrop send — a chunked/streaming `Device::send_file` (for a truly streamed `tnet file cp -`)
+
+**Why:** Go's `tailscale file cp - peer:` streams stdin straight to the peer: `runCp` hands
+`localClient.PushFile` a `contentLength` of `-1`, Go's HTTP client turns an unknown `ContentLength` into
+a **chunked** request body, and the peerAPI receiver consumes it to EOF. Nothing is buffered — piping a
+50 GB `tar` through `tailscale file cp -` costs no disk on the sending host.
+
+The engine's send path cannot express that. `Device::send_file(peer, name, content_length: u64, reader)`
+(verified at the pinned rev `9d847a6e`, `src/lib.rs`) forwards to
+`ts_runtime::taildrop_send::send_file`, which writes a fixed request head:
+
+```rust
+let head = format!(
+    "PUT /v0/put/{} HTTP/1.1\r\nHost: {dst}\r\nContent-Length: {content_length}\r\n\
+     Connection: close\r\n\r\n",
+    path_escape(name),
+);
+```
+
+`content_length` is a `u64` with no sentinel and no `Transfer-Encoding: chunked` alternative, so the byte
+count must be known **before** the transfer opens — and the only way to learn that about a pipe is to read
+it to the end.
+
+**What the daemon does today (bead `tsd-52k`):** `tnet file cp -` spools stdin to a mode-`0600`
+temporary file under `TMPDIR`, sends that (the size is then known), and unlinks it when the send returns.
+Functionally the Go command works; the deviation is the temporary copy — disk proportional to the piped
+data, and a `SIGKILL` mid-send can leave one behind. It is deliberately *not* worked around any harder
+than that: a daemon-side spool would only move the same copy to the daemon's filesystem.
+
+**Ask:** let a caller send a body whose length is not known up front. Either (a) add
+`Device::send_file_streaming(peer, name, reader)` (no length) that emits `Transfer-Encoding: chunked`
+and frames the reader, or (b) widen the existing length parameter to `Option<u64>`, where `None` selects
+the chunked path — matching Go's `-1` sentinel. The receiving half needs no daemon-side change: Go's
+peerAPI already accepts a chunked `PUT`, so whatever the engine's own receive store does for a chunked
+body is the same question on both sides of this fork.
+
+**Daemon impact once landed:** `run_file_cp` drops the spool entirely and hands the engine
+`tokio::io::stdin()`, deleting `spool_stdin`/`SpoolFile` (src/bin/tnet.rs) — the CLI is already shaped for
+it, since `-` resolves through a single `CpSource` whose only stdin-specific part is the spool. — daemon lane

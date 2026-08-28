@@ -505,6 +505,28 @@ pub enum Request {
     /// eligibility filter: a reachable peerAPI **and** same-owner-or-shared, gated on this node holding
     /// the file-sharing capability) into [`Response::FileTargets`].
     FileTargets,
+    /// Pre-send check for one `file cp` destination: resolve `peer` against the netmap and report
+    /// whether it is a usable Taildrop target — the daemon-side analogue of the prologue Go's
+    /// `runCp` performs in the CLI (`getTargetStableID` + `fileTargetErrorDetail` in
+    /// `cmd/tailscale/cli/file.go`). Read-only: it resolves and inspects, and sends nothing.
+    ///
+    /// Why this is a daemon verb at all, when Go composes it client-side from `Status` +
+    /// `FileTargets`: Go's `fileTargetErrorDetail` distinguishes "owned by different user" from
+    /// "running an old Tailscale version" by comparing the peer's `UserID` against self's, and this
+    /// fork's [`StatusReport`] carries no per-peer user id (the engine's `StatusNode` has none — only
+    /// the domain `Node` behind `peer_by_*` does). Asking the daemon, which holds that node record,
+    /// keeps the full Go error vocabulary without widening the status wire with an ownership field
+    /// every other caller would ignore.
+    ///
+    /// The reply is [`Response::FileCpTarget`] when the peer IS an eligible target (carrying its
+    /// online tri-state, so the CLI can print Go's `# warning: <target> is offline` BEFORE starting a
+    /// transfer that will hang), or [`Response::Error`] carrying Go's verbatim detail wording when it
+    /// is not.
+    FileCpTarget {
+        /// Destination peer: a tailnet IP or MagicDNS name — the same selector
+        /// [`FileCp`](Request::FileCp) takes.
+        peer: String,
+    },
     /// Capture the dataplane's plaintext packets to a pcap file for `seconds`, then stop (Go
     /// `tailscale debug capture`). A WRITE: it installs a dataplane capture hook and writes a file as
     /// the daemon's uid, so it's gated like `up`/`down`. The daemon owns a `BufWriter<File>` at `path`,
@@ -609,6 +631,13 @@ pub enum Response {
     FileTargets {
         /// One entry per eligible target peer.
         targets: Vec<FileTargetReport>,
+    },
+    /// The destination named by [`Request::FileCpTarget`] IS an eligible Taildrop target (reply to
+    /// that request; an ineligible one gets a [`Response::Error`] instead, carrying Go's detail
+    /// wording). Reported so the CLI can warn about an offline peer before it starts a send.
+    FileCpTarget {
+        /// The target peer, as the engine resolved it.
+        target: FileTargetReport,
     },
     /// The daemon's own version (reply to [`Request::Version`]) — the analogue of Go's
     /// `ipnstate.Status.Version`, used by `tnet version --daemon`.
@@ -1687,6 +1716,54 @@ mod tests {
                 assert_eq!(seconds, None);
             }
             other => panic!("expected DebugCapture, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn request_file_cp_target_wire_format() {
+        // The CLI runs this check before every `file cp` send, so its `cmd` tag and field name are a
+        // hard contract: a rename here makes `file cp` fail its pre-send check against a daemon that
+        // still speaks the old tag.
+        assert_eq!(
+            serde_json::to_string(&Request::FileCpTarget {
+                peer: "peer-b".into(),
+            })
+            .unwrap(),
+            r#"{"cmd":"file_cp_target","peer":"peer-b"}"#
+        );
+        match serde_json::from_str::<Request>(r#"{"cmd":"file_cp_target","peer":"100.64.0.2"}"#)
+            .unwrap()
+        {
+            Request::FileCpTarget { peer } => assert_eq!(peer, "100.64.0.2"),
+            other => panic!("expected FileCpTarget, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_file_cp_target_wire_format() {
+        // The reply's `online` tri-state is what the CLI warns on, so it must survive the wire as
+        // three distinct values — an omitted key is `None` ("control did not say"), NOT `false`.
+        assert_eq!(
+            serde_json::to_string(&Response::FileCpTarget {
+                target: FileTargetReport {
+                    ip: "100.64.0.2".into(),
+                    name: "peer-b".into(),
+                    online: Some(false),
+                },
+            })
+            .unwrap(),
+            r#"{"kind":"file_cp_target","target":{"ip":"100.64.0.2","name":"peer-b","online":false}}"#
+        );
+        match serde_json::from_str::<Response>(
+            r#"{"kind":"file_cp_target","target":{"ip":"100.64.0.2","name":"peer-b"}}"#,
+        )
+        .unwrap()
+        {
+            Response::FileCpTarget { target } => assert_eq!(
+                target.online, None,
+                "an omitted online key must stay unknown, never collapse to offline"
+            ),
+            other => panic!("expected FileCpTarget, got {other:?}"),
         }
     }
 

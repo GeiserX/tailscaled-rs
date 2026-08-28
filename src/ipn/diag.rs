@@ -734,29 +734,145 @@ pub(super) fn file_list(dev: &tailscale::Device) -> Response {
 /// diagnostics; the device-absent "node is not up" branch lives at the caller.
 pub(super) async fn file_targets(dev: &tailscale::Device) -> Response {
     match dev.file_targets().await {
-        Ok(targets) => {
-            let targets = targets
-                .into_iter()
-                .map(|t| {
-                    let node = t.node;
-                    crate::localapi::FileTargetReport {
-                        // Primary tailnet IPv4 (Go prints `Node.Addresses[0]`).
-                        ip: node.tailnet_address.ipv4.addr().to_string(),
-                        // Display name: MagicDNS FQDN when known, else the bare hostname (Go
-                        // `Node.ComputedName`). `false` = no trailing dot, matching the status view.
-                        name: node
-                            .fqdn_opt(false)
-                            .unwrap_or_else(|| node.hostname.clone()),
-                        // Tri-state online (Go distinguishes online/offline/unknown; do not collapse).
-                        online: node.online,
-                    }
-                })
-                .collect();
-            Response::FileTargets { targets }
-        }
+        Ok(targets) => Response::FileTargets {
+            targets: targets.into_iter().map(file_target_report).collect(),
+        },
         Err(e) => Response::Error {
             message: format!("listing file targets failed: {e:?}"),
         },
+    }
+}
+
+/// Project one engine [`FileTarget`](tailscale::FileTarget) into the wire
+/// [`FileTargetReport`](crate::localapi::FileTargetReport) — the SINGLE source of truth for that
+/// mapping, shared by [`file_targets`] (the whole list, for `file cp --targets`) and
+/// [`file_cp_target`] (one peer, for the pre-send check). Factored out so the list view and the
+/// pre-send check can never describe the same peer differently.
+fn file_target_report(t: tailscale::FileTarget) -> crate::localapi::FileTargetReport {
+    let node = t.node;
+    crate::localapi::FileTargetReport {
+        // Primary tailnet IPv4 (Go prints `Node.Addresses[0]`).
+        ip: node.tailnet_address.ipv4.addr().to_string(),
+        // Display name: MagicDNS FQDN when known, else the bare hostname (Go `Node.ComputedName`).
+        // `false` = no trailing dot, matching the status view.
+        name: node
+            .fqdn_opt(false)
+            .unwrap_or_else(|| node.hostname.clone()),
+        // Tri-state online (Go distinguishes online/offline/unknown; do not collapse).
+        online: node.online,
+    }
+}
+
+/// Pre-send check for ONE `file cp` destination (the [`Request::FileCpTarget`](crate::localapi::Request::FileCpTarget)
+/// verb): resolve `peer` and report whether it is an eligible Taildrop target, or WHY it is not.
+///
+/// This is the daemon-side port of the prologue Go's `runCp` runs in the CLI before it pushes a
+/// single byte — `getTargetStableID` plus `fileTargetErrorDetail` (`cmd/tailscale/cli/file.go`).
+/// Read-only: it resolves a peer and reads the eligible-target list, and sends nothing.
+///
+/// Two outcomes, both of which the CLI needs *before* it starts a transfer:
+///
+/// * **Eligible** → [`Response::FileCpTarget`] carrying the peer's
+///   [`FileTargetReport`](crate::localapi::FileTargetReport), whose tri-state `online` lets the CLI
+///   print Go's `# warning: <target> is offline` up front. Warning after the fact would be useless:
+///   a send to an offline peer is exactly the case that hangs until it times out.
+/// * **Ineligible** → [`Response::Error`] whose message is Go's verbatim detail wording (see
+///   [`resolved_target_error_detail`] and [`unresolved_target_detail`]), so the operator is told
+///   *which* of the four reasons applies instead of a bare "no tailnet peer matches".
+///
+/// Eligibility is deliberately NOT re-derived here: it is membership in the very list
+/// [`file_targets`] returns (the engine's `file_targets`, which applies Go's reachable-peerAPI +
+/// same-owner-or-shared filter, itself gated on this node holding the file-sharing capability). A
+/// peer resolves through the netmap but is matched against that list by stable id, so "in the
+/// netmap" and "can actually receive a file" stay distinct — which is the whole point of Go's
+/// detail messages.
+///
+/// Takes the engine handle as `dev` so the LocalAPI server runs it off-lock like the other
+/// diagnostics; the device-absent "node is not up" branch lives at the caller.
+pub(super) async fn file_cp_target(dev: &tailscale::Device, peer: &str) -> Response {
+    // Resolve the selector exactly as [`file_cp`] does — a bare IP by tailnet-IP lookup, anything
+    // else by MagicDNS name — so the check can never answer for a different peer than the send would
+    // pick.
+    let resolved = match peer.parse::<std::net::IpAddr>() {
+        Ok(addr) => dev.peer_by_tailnet_ip(addr).await,
+        Err(_) => dev.peer_by_name(peer).await,
+    };
+    let node = match resolved {
+        Ok(node) => node,
+        Err(e) => {
+            return Response::Error {
+                message: format!("resolve peer {peer:?} failed: {e:?}"),
+            };
+        }
+    };
+    // Nothing resolved: no point asking for the target list, the answer is already the detail.
+    let Some(node) = node else {
+        return Response::Error {
+            message: unresolved_target_detail(peer),
+        };
+    };
+    let targets = match dev.file_targets().await {
+        Ok(targets) => targets,
+        Err(e) => {
+            return Response::Error {
+                message: format!("listing file targets failed: {e:?}"),
+            };
+        }
+    };
+    // Eligible iff the resolved node is in the target list. Matched by stable id (the durable peer
+    // identifier), not by name or address, so a peer with several addresses still matches once.
+    match targets
+        .into_iter()
+        .find(|t| t.node.stable_id == node.stable_id)
+    {
+        Some(t) => Response::FileCpTarget {
+            target: file_target_report(t),
+        },
+        // In the netmap, but not sendable-to — the branch that needs the ownership comparison.
+        None => Response::Error {
+            message: resolved_target_error_detail(dev, &node).await,
+        },
+    }
+}
+
+/// Why a peer that IS in the netmap still cannot receive a file — the resolved half of Go's
+/// `fileTargetErrorDetail` (`cmd/tailscale/cli/file.go`), whose wording is reproduced verbatim so an
+/// operator who knows the Go CLI reads the same diagnosis here.
+///
+/// Go splits this case by ownership: a peer owned by a *different* user (and not shared with us) can
+/// never receive our files, which is a permissions answer, not a connectivity one; a peer owned by
+/// *us* that still is not a target is one whose node record advertises no reachable peerAPI — in Go's
+/// fleet that means an old client, hence its "old Tailscale version" wording. Ownership is compared
+/// against [`self_node`](tailscale::Device::self_node); if that lookup fails we cannot claim a
+/// mismatch, so we fall through to the non-ownership answer rather than accuse the wrong side.
+async fn resolved_target_error_detail(
+    dev: &tailscale::Device,
+    node: &tailscale::NodeInfo,
+) -> String {
+    // `user_id` is `0` for a tagged/ownerless node, which is a real value on both sides of this
+    // comparison — a tagged peer and a tagged self compare equal, matching Go, which likewise
+    // compares the raw `Node.User` ids.
+    let different_owner = matches!(dev.self_node().await, Ok(me) if me.user_id != node.user_id);
+    if different_owner {
+        "owned by different user; can only send files to your own devices".to_string()
+    } else {
+        "target seems to be running an old Tailscale version".to_string()
+    }
+}
+
+/// Why a selector that resolved to NO netmap node is not a valid Taildrop destination — the
+/// unresolved half of Go's `fileTargetErrorDetail`, and the half that needs no engine: an address
+/// outside the ranges control assigns to nodes
+/// ([`is_tailscale_ip`](ts_control::is_tailscale_ip), Go `tsaddr.IsTailscaleIP`) was never a tailnet
+/// address in the first place, which is a different mistake from naming a node that is not in this
+/// tailnet — and Go says so. A non-IP selector (a name) can only be the latter. Pure →
+/// unit-testable.
+fn unresolved_target_detail(peer: &str) -> String {
+    match peer.parse::<std::net::IpAddr>() {
+        Ok(ip) if !ts_control::is_tailscale_ip(ip) => {
+            format!("unknown target; {ip} is not a Tailscale IP address")
+        }
+        _ => "unknown target; not in your tailnet".to_string(),
     }
 }
 
@@ -1691,6 +1807,42 @@ mod tests {
             rfc,
             t.to_string(),
             "to_rfc3339 must differ from the Display form"
+        );
+    }
+
+    #[test]
+    fn unresolved_target_detail_matches_go_wording() {
+        use super::unresolved_target_detail;
+        // An address outside the ranges control assigns to nodes was never a tailnet address: Go
+        // names the address in the message, so an operator sees WHICH value it judged.
+        assert_eq!(
+            unresolved_target_detail("8.8.8.8"),
+            "unknown target; 8.8.8.8 is not a Tailscale IP address"
+        );
+        assert_eq!(
+            unresolved_target_detail("2606:4700::1111"),
+            "unknown target; 2606:4700::1111 is not a Tailscale IP address"
+        );
+        // A well-formed tailnet address (v4 CGNAT / v6 ULA) that resolved to no node is the OTHER
+        // mistake — the address is plausible, the node just is not in this tailnet.
+        assert_eq!(
+            unresolved_target_detail("100.64.0.9"),
+            "unknown target; not in your tailnet"
+        );
+        assert_eq!(
+            unresolved_target_detail("fd7a:115c:a1e0::1"),
+            "unknown target; not in your tailnet"
+        );
+        // A name is never "not a Tailscale IP address" — it was never an address at all.
+        assert_eq!(
+            unresolved_target_detail("peer-b"),
+            "unknown target; not in your tailnet"
+        );
+        // The ChromeOS carve-out inside the CGNAT range is NOT a Tailscale address (the engine's
+        // `is_tailscale_ip` excludes 100.115.92.0/23), so it takes the sharper branch.
+        assert_eq!(
+            unresolved_target_detail("100.115.92.5"),
+            "unknown target; 100.115.92.5 is not a Tailscale IP address"
         );
     }
 
