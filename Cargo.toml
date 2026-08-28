@@ -35,8 +35,20 @@ path = "src/bin/tnet.rs"
 # name), published crate (package) name `geiserx_tailscale` — the workspace renamed every crate to
 # the `geiserx_*` namespace for crates.io publication, but kept the importable lib name `tailscale`,
 # so `use tailscale::...` is unchanged. Pinned to a specific rev for reproducible builds; Cargo.lock
-# is committed so CI and every clone build the exact same engine. (When `geiserx_tailscale` v0.6.7+
-# is live on crates.io, this can move to a plain `version`-based crates.io dep.)
+# is committed so CI and every clone build the exact same engine.
+#
+# crates.io: the engine is published. Every `geiserx_*` crate in this daemon's resolved graph —
+# the facade plus the 39 `geiserx_ts_*` crates it pulls in, including the ones only an optional
+# feature reaches — is on crates.io at the version locked here, so nothing upstream blocks a
+# registry dependency any more. Re-check that for whatever the pin resolves to with
+# `scripts/check-engine-on-crates-io.sh`.
+#
+# The pin nonetheless stays a `rev`, because the switch is NOT a same-version source swap. crates.io
+# `geiserx_tailscale` 0.43.0 was cut a month BEFORE this commit and does not carry the russh
+# security bump this rev exists for; the release cut from *this* tree is 0.43.1. Moving to
+# `version = "0.43.1"` is therefore a deliberate engine-version change, gated on the bump
+# discipline in `docs/ENGINE.md` — and it is what publishing the daemon needs, since
+# `cargo publish` rejects a git dependency.
 #
 # Local engine iteration (optional): a *gitignored* `.cargo/config.toml` with
 #   paths = ["/path/to/your/tailscale-rs/checkout"]
