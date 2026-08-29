@@ -23,6 +23,7 @@ use tokio::task::JoinSet;
 use crate::auth::{self, Access, AuthPolicy};
 use crate::ipn::{self, Backend};
 use crate::localapi::{Request, Response};
+use crate::portmap;
 
 /// Max bytes for a single newline-delimited request line. LocalAPI requests are tiny JSON, so this
 /// is generous; its only job is to stop a single newline-less connection from growing the read
@@ -319,6 +320,63 @@ async fn handle_conn(
                             break;
                         }
                     }
+                    // `debug portmap` is terminal for this connection like `Watch`, and a WRITE like
+                    // `Nc` (it punches a hole in the LAN router), so it is authorized here before any
+                    // packet leaves. Its reply is a stream of transcript lines and then EOF.
+                    Ok(Request::DebugPortmap {
+                        duration_ms,
+                        ty,
+                        gateway_and_self,
+                        log_http,
+                    }) => {
+                        let request = Request::DebugPortmap {
+                            duration_ms,
+                            ty: ty.clone(),
+                            gateway_and_self: gateway_and_self.clone(),
+                            log_http,
+                        };
+                        if auth::authorize(&request, access).is_err() {
+                            tracing::warn!(peer_uid = ?peer_uid, "denied LocalAPI debug portmap: caller lacks write permission");
+                            write_response(
+                                &mut write_half,
+                                &Response::Error {
+                                    message: "permission denied: debug portmap requires root or the same user that owns the daemon".into(),
+                                },
+                            )
+                            .await?;
+                            continue;
+                        }
+                        // Refuse a malformed request BEFORE hijacking the connection, so the client
+                        // gets one clear error line and can try again — Go answers these two with a
+                        // 400 for the same reason.
+                        let opts =
+                            match debug_portmap_opts(duration_ms, ty, gateway_and_self, log_http) {
+                                Ok(opts) => opts,
+                                Err(message) => {
+                                    write_response(&mut write_half, &Response::Error { message })
+                                        .await?;
+                                    continue;
+                                }
+                            };
+                        // A long-lived stream (the run is bounded by its own `duration`, which the
+                        // caller chooses): take a permit from the SEPARATE stream budget, after the
+                        // auth check so a denied run never consumes one.
+                        let Ok(_stream_permit) = Arc::clone(&stream_limit).try_acquire_owned()
+                        else {
+                            tracing::warn!("LocalAPI: stream cap reached; refusing debug portmap");
+                            write_response(
+                                &mut write_half,
+                                &Response::Error {
+                                    message: "too many concurrent watch/nc streams; try again"
+                                        .into(),
+                                },
+                            )
+                            .await?;
+                            continue;
+                        };
+                        stream_debug_portmap(&mut write_half, opts).await?;
+                        break;
+                    }
                     Ok(req) => {
                         let response = dispatch(req, access, peer_uid, &backend).await;
                         write_response(&mut write_half, &response).await?;
@@ -332,6 +390,78 @@ async fn handle_conn(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Build the port-mapper options from a [`Request::DebugPortmap`], refusing what Go's endpoint
+/// answers 400 for.
+///
+/// Two refusals, both Go's: an unrecognized `--type` ("unknown portmap debug type" — a typo must
+/// not silently run every protocol) and a malformed `gateway_and_self` override. A zero duration is
+/// refused as well; Go reaches the same outcome via `time.ParseDuration`, which rejects the empty
+/// value its CLI would have to send to mean "no time at all".
+fn debug_portmap_opts(
+    duration_ms: Option<u64>,
+    ty: Option<String>,
+    gateway_and_self: Option<String>,
+    log_http: bool,
+) -> Result<portmap::debug::DebugPortmapOpts, String> {
+    let ty = ty.unwrap_or_default();
+    // Validate the selector here so the refusal is a clean error line rather than the first line of
+    // a transcript that then stops.
+    portmap::DebugKnobs::for_debug_type(&ty).map_err(|e| e.to_string())?;
+    let duration = match duration_ms {
+        None => portmap::debug::DEFAULT_DURATION,
+        Some(0) => return Err("debug portmap: duration must be greater than zero".into()),
+        Some(ms) => std::time::Duration::from_millis(ms),
+    };
+    let gateway_and_self = match gateway_and_self.as_deref().filter(|v| !v.is_empty()) {
+        None => None,
+        Some(v) => Some(portmap::debug::parse_gateway_and_self(v).map_err(|e| e.to_string())?),
+    };
+    Ok(portmap::debug::DebugPortmapOpts {
+        duration,
+        ty,
+        gateway_and_self,
+        log_http,
+    })
+}
+
+/// Stream a `debug portmap` run over a connection: one [`Response::DebugPortmapLine`] per transcript
+/// line, as the run produces it, then return (the caller closes the connection, which is the client's
+/// end-of-transcript signal). The analogue of Go's handler flushing each line of its `text/plain`
+/// body.
+///
+/// The run is spawned rather than awaited inline so its log sink — a plain `Fn(&str)` the port mapper
+/// calls from wherever it happens to be, including a blocking UPnP thread — can hand lines to this
+/// async writer through a channel. When the run ends it drops the last sender, the channel closes,
+/// and the loop below ends: no separate "done" signalling, and no way to lose the tail of the
+/// transcript.
+async fn stream_debug_portmap(
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    opts: portmap::debug::DebugPortmapOpts,
+) -> Result<()> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let sink: portmap::LogSink = Arc::new(move |line: &str| {
+        // A send failure means this connection is already gone; the run is bounded by its own
+        // deadline, so there is nothing to do but drop the line (Go likewise discards lines logged
+        // after its handler returned).
+        let _ = tx.send(line.to_string());
+    });
+    let run = tokio::spawn(async move {
+        // The `Err` case is an unknown `--type`, which `debug_portmap_opts` already refused before
+        // this connection was hijacked, so there is nothing left to report here.
+        let _ = portmap::debug::run(&opts, portmap::Logger::new(sink, true)).await;
+    });
+
+    while let Some(line) = rx.recv().await {
+        write_response(write_half, &Response::DebugPortmapLine { line }).await?;
+    }
+    // The run has dropped its sink; join it so the task is finished (and any panic surfaces) before
+    // the connection closes.
+    if let Err(e) = run.await {
+        tracing::warn!(error = %e, "LocalAPI: debug portmap run failed");
     }
     Ok(())
 }
@@ -868,6 +998,13 @@ async fn dispatch(
             let be = backend.lock().await;
             Response::Status(be.status().await)
         }
+        // `DebugPortmap` is likewise intercepted in `handle_conn` (it streams its transcript and then
+        // closes the connection) and never reaches `dispatch`. Unlike `Watch` there is no sensible
+        // one-shot form of it — a port-map run IS its transcript — so a stray one is an explicit
+        // error rather than a silently degraded reply.
+        Request::DebugPortmap { .. } => Response::Error {
+            message: "debug portmap is a streaming command; it is handled on the connection".into(),
+        },
         // `nc` is intercepted in `handle_conn` (it hijacks the connection to splice) and never reaches
         // `dispatch`; this arm exists only for match exhaustiveness.
         Request::Nc { .. } => Response::Error {

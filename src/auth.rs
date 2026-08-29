@@ -195,6 +195,11 @@ pub(crate) fn requires_write(request: &crate::localapi::Request) -> bool {
         // magicsock debug pokes on write). A socket-reachable non-owner must not be able to disrupt
         // connectivity, so it gates like `down`.
         | Request::DebugRebind
+        // `DebugPortmap` runs the port mapper: it sends probe traffic from this host AND asks the
+        // LAN router to install a real forwarding entry pointing at this machine. Go gates
+        // `serveDebugPortmap` on `PermitWrite` for exactly that reason — punching a hole in the
+        // household NAT is not a read — so a socket-reachable non-owner must not be able to do it.
+        | Request::DebugPortmap { .. }
         // `DebugReStun` forces a STUN re-probe — also a live-datapath mutation (the magicsock endpoint
         // re-derivation), gated on write exactly like `DebugRebind`. Even though it is lighter (no
         // socket swap), a non-owner must not be able to poke the datapath, so it is never a read.
@@ -384,6 +389,17 @@ mod tests {
         assert!(
             !requires_write(&Request::Netcheck),
             "netcheck only reads the net-report (DERP-region latency) — a read, gated like status"
+        );
+        assert!(
+            requires_write(&Request::DebugPortmap {
+                duration_ms: None,
+                ty: None,
+                gateway_and_self: None,
+                log_http: false,
+            }),
+            "debug portmap asks the LAN router to forward an external port to this machine — a \
+             write (Go gates serveDebugPortmap on PermitWrite), so a socket-reachable non-owner \
+             must not be able to punch a hole in the household NAT"
         );
     }
 

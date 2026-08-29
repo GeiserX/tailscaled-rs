@@ -747,3 +747,158 @@ async fn lifecycle_subscriber_observes_generation_advance_on_up_path() {
 
     harness.shutdown_and_verify().await;
 }
+
+/// `debug portmap` streams a transcript over the socket and then closes the connection.
+///
+/// The gateway/self pair is overridden to a documentation address (RFC 5737 TEST-NET-1), so the run
+/// is hermetic in the sense that matters: nothing on the network can answer it, and the assertion is
+/// about the daemon's streaming contract — line frames, in order, terminated by EOF — not about any
+/// router's behaviour. It also pins the two facts a `tnet debug portmap` user reads first: which
+/// gateway was used, and what the probe found.
+#[tokio::test]
+async fn debug_portmap_streams_a_transcript_then_closes_the_connection() {
+    let harness = Harness::start().await;
+
+    let stream = UnixStream::connect(&harness.socket_path)
+        .await
+        .expect("CLI connect to LocalAPI socket for debug portmap");
+    let (read_half, mut write_half) = stream.into_split();
+    let request = Request::DebugPortmap {
+        duration_ms: Some(2_000),
+        ty: None,
+        gateway_and_self: Some("192.0.2.1/192.0.2.42".to_string()),
+        log_http: false,
+    };
+    let mut line = serde_json::to_vec(&request).expect("serialize debug portmap request");
+    line.push(b'\n');
+    write_half.write_all(&line).await.expect("write request");
+    write_half.flush().await.expect("flush request");
+
+    let mut reader = BufReader::new(read_half);
+    let mut transcript: Vec<String> = Vec::new();
+    // Bounded: a run that never terminates must fail the test rather than hang it.
+    let read_all = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let mut buf = String::new();
+            let n = reader.read_line(&mut buf).await.expect("read stream line");
+            if n == 0 {
+                break; // the daemon closed the connection: end of the run
+            }
+            match serde_json::from_str::<Response>(buf.trim_end())
+                .unwrap_or_else(|e| panic!("stream line was not Response JSON ({e}): {buf:?}"))
+            {
+                Response::DebugPortmapLine { line } => transcript.push(line),
+                other => panic!("unexpected frame on the portmap stream: {other:?}"),
+            }
+        }
+    })
+    .await;
+    read_all.expect("the portmap stream must end within the run's duration");
+
+    assert!(
+        transcript
+            .iter()
+            .any(|l| l == "gw=192.0.2.1; self=192.0.2.42"),
+        "the run must report the gateway/self pair it used: {transcript:?}"
+    );
+    assert!(
+        transcript.iter().any(|l| l.starts_with("Probe: {PCP:")),
+        "the run must report the probe result: {transcript:?}"
+    );
+
+    harness.shutdown_and_verify().await;
+}
+
+/// An unknown `--type` is refused with one error line, and the connection stays usable.
+///
+/// Go's endpoint answers 400 "unknown portmap debug type" for exactly this. The refusal must happen
+/// BEFORE the connection is hijacked for streaming — otherwise a typo would look like an empty run —
+/// which is what the follow-up round trip on the same connection proves.
+#[tokio::test]
+async fn debug_portmap_refuses_an_unknown_type_without_hijacking_the_connection() {
+    let harness = Harness::start().await;
+
+    let stream = UnixStream::connect(&harness.socket_path)
+        .await
+        .expect("CLI connect to LocalAPI socket");
+    let (read_half, mut write_half) = stream.into_split();
+    let mut line = serde_json::to_vec(&Request::DebugPortmap {
+        duration_ms: Some(1_000),
+        ty: Some("upnpp".to_string()),
+        gateway_and_self: None,
+        log_http: false,
+    })
+    .expect("serialize");
+    line.push(b'\n');
+    write_half.write_all(&line).await.expect("write request");
+    write_half.flush().await.expect("flush request");
+
+    let mut reader = BufReader::new(read_half);
+    let mut response_line = String::new();
+    reader
+        .read_line(&mut response_line)
+        .await
+        .expect("read refusal");
+    match serde_json::from_str::<Response>(response_line.trim_end()).expect("Response JSON") {
+        Response::Error { message } => {
+            assert_eq!(message, "unknown portmap debug type");
+        }
+        other => panic!("expected an Error refusal, got {other:?}"),
+    }
+
+    // The connection was never hijacked, so it still serves ordinary commands.
+    write_half
+        .write_all(b"{\"cmd\":\"status\"}\n")
+        .await
+        .expect("write status on the same connection");
+    write_half.flush().await.expect("flush");
+    let mut status_line = String::new();
+    reader
+        .read_line(&mut status_line)
+        .await
+        .expect("read status");
+    assert!(
+        matches!(
+            serde_json::from_str::<Response>(status_line.trim_end()).expect("Response JSON"),
+            Response::Status(_)
+        ),
+        "a refused portmap must leave the connection serving: {status_line:?}"
+    );
+
+    harness.shutdown_and_verify().await;
+}
+
+/// A malformed `gateway_and_self` override is refused, not obeyed halfway — and, crucially, does not
+/// take the daemon down. Go's handler parses this value with `netip.MustParseAddr`, which **panics**
+/// on bad input; this port refuses it, and the daemon is still answering afterwards.
+#[tokio::test]
+async fn debug_portmap_refuses_a_malformed_gateway_override() {
+    let harness = Harness::start().await;
+
+    let response = harness
+        .round_trip(
+            &serde_json::to_string(&Request::DebugPortmap {
+                duration_ms: Some(1_000),
+                ty: None,
+                gateway_and_self: Some("bogus/192.0.2.42".to_string()),
+                log_http: false,
+            })
+            .expect("serialize"),
+        )
+        .await;
+    match response {
+        Response::Error { message } => assert!(
+            message.contains("invalid IPv4 address"),
+            "the refusal must name the bad value: {message}"
+        ),
+        other => panic!("expected an Error refusal, got {other:?}"),
+    }
+
+    // Still alive (a panicking handler would have taken the whole daemon with it).
+    assert!(matches!(
+        harness.round_trip("{\"cmd\":\"status\"}").await,
+        Response::Status(_)
+    ));
+
+    harness.shutdown_and_verify().await;
+}

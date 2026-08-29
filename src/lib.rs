@@ -17,6 +17,9 @@
 //! - [`server`] — the LocalAPI server, a Unix-domain-socket IPC surface the CLI talks to.
 //! - [`hardening`] — best-effort OS-level protection (no-coredump / no-ptrace / no-swap) for the
 //!   secrets the engine holds in memory, the in-RAM analogue of [`ensure_state_dir_secure`].
+//! - [`portmap`] — a NAT-PMP / PCP / UPnP-IGD client: ask the LAN router for an externally reachable
+//!   `ip:port`, which is what makes a direct connection possible behind a NAT that STUN alone cannot
+//!   traverse. Drives `tnet debug portmap`.
 //!
 //! Two binaries consume it: `tailnetd` (the daemon) and `tnet` (the thin CLI client).
 
@@ -28,6 +31,7 @@ pub mod httpproxy;
 pub mod ipforward;
 pub mod ipn;
 pub mod localapi;
+pub mod portmap;
 pub mod prefs;
 pub mod server;
 pub mod socks5;

@@ -988,6 +988,38 @@ enum DebugCmd {
     /// have changed (e.g. a NAT rebinding) but the socket is otherwise fine, instead of waiting out
     /// the periodic prober. Requires the node to be up. Write-gated (root/same-uid).
     Restun,
+    /// Run the port mapper against this network and print what it finds (Go `tailscale debug
+    /// portmap`).
+    ///
+    /// Asks the LAN router — over NAT-PMP, PCP and UPnP-IGD — whether it will hand this node an
+    /// externally reachable `ip:port`. That mapping is what lets a peer reach this node DIRECTLY
+    /// from behind a NAT that STUN alone cannot traverse; a network that offers none is a network
+    /// where connections fall back to a DERP relay. The whole run is printed as it happens (gateway,
+    /// probe result, mapping), so a router that half-answers is visible.
+    ///
+    /// Write-gated (root/same-uid): the run sends probe traffic from this host and asks the router to
+    /// install a real forwarding entry pointing at it. Unlike most diagnostics it does NOT need the
+    /// node to be up — the conversation is with the router, not the tailnet.
+    Portmap {
+        /// How long the whole run may take, as a Go duration (`5s`, `1500ms`, `1m30s`). Default `5s`.
+        #[arg(long, value_name = "DURATION", default_value = "5s")]
+        duration: String,
+        /// Exercise ONE protocol instead of all three: `pmp`, `pcp` or `upnp`. Anything else is
+        /// refused (Go: "unknown portmap debug type").
+        #[arg(long = "type", value_name = "TYPE")]
+        ty: Option<String>,
+        /// Override the autodetected gateway IP. Must be passed together with `--self-addr`.
+        #[arg(long = "gateway-addr", value_name = "IP")]
+        gateway_addr: Option<String>,
+        /// Override the autodetected address of this host. Must be passed together with
+        /// `--gateway-addr`.
+        #[arg(long = "self-addr", value_name = "IP")]
+        self_addr: Option<String>,
+        /// Print every UPnP HTTP request and response (Go `--log-http`) — for debugging a router
+        /// whose SOAP replies are the problem.
+        #[arg(long = "log-http")]
+        log_http: bool,
+    },
     /// Check whether the OS forwards IP traffic — a subnet-router / exit-node readiness diagnostic (Go
     /// `check-ip-forwarding`, normally run internally by `up`/`set`). Prints a warning if forwarding
     /// is disabled, or nothing if it is fine. In netstack mode (the default) and on macOS this is a
@@ -2076,6 +2108,14 @@ async fn main() -> Result<()> {
             DebugCmd::Rebind => run_debug_rebind(&socket).await,
             // `debug restun` is a write-gated daemon round-trip (re-probes STUN; no socket swap).
             DebugCmd::Restun => run_debug_restun(&socket).await,
+            // `debug portmap` is a write-gated STREAM: the daemon narrates the run line by line.
+            DebugCmd::Portmap {
+                duration,
+                ty,
+                gateway_addr,
+                self_addr,
+                log_http,
+            } => run_debug_portmap(&socket, &duration, ty, gateway_addr, self_addr, log_http).await,
             DebugCmd::CheckIpForwarding => run_check_ip_forwarding(&socket).await,
             DebugCmd::CheckPrefs {
                 exit_node,
@@ -3055,6 +3095,161 @@ async fn run_debug_restun(socket: &std::path::Path) -> Result<()> {
         Ok(other) => anyhow::bail!("unexpected response to debug restun: {other:?}"),
         Err(e) => Err(e).with_context(|| format!("requesting restun at {}", socket.display())),
     }
+}
+
+/// Parse a Go `time.ParseDuration` string (`5s`, `1500ms`, `1m30s`, `1.5h`).
+///
+/// Ported so `tnet debug portmap --duration` takes the SAME argument as `tailscale debug portmap
+/// -duration` — a ported command that needs its flag values rewritten is not ported. That includes
+/// Go's refusals: a bare number has no unit and is rejected (`5` is not five seconds, which is
+/// exactly the mistake a silent default would hide), and an unknown unit is named in the error.
+///
+/// Supported units, as in Go: `ns`, `us`/`µs`, `ms`, `s`, `m`, `h`. The one Go form deliberately not
+/// accepted is a NEGATIVE duration: Go's parser allows it, but a negative timeout has no meaning for
+/// this command, so it is refused here rather than silently becoming "already expired".
+fn parse_go_duration(s: &str) -> Result<std::time::Duration> {
+    if s.is_empty() {
+        anyhow::bail!("time: invalid duration {s:?}");
+    }
+    // Go accepts a leading sign; "0" (and "+0", "-0") needs no unit.
+    let (negative, rest) = match s.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    if rest.chars().all(|c| c == '0') && !rest.is_empty() {
+        return Ok(std::time::Duration::ZERO);
+    }
+    if negative {
+        anyhow::bail!("duration {s:?} must not be negative");
+    }
+
+    let mut total = std::time::Duration::ZERO;
+    let mut cursor = rest;
+    let mut saw_component = false;
+    while !cursor.is_empty() {
+        let value_len = cursor
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(cursor.len());
+        if value_len == 0 {
+            anyhow::bail!("time: invalid duration {s:?}");
+        }
+        let value: f64 = cursor[..value_len]
+            .parse()
+            .map_err(|_| anyhow::anyhow!("time: invalid duration {s:?}"))?;
+        cursor = &cursor[value_len..];
+        let unit_len = cursor
+            .find(|c: char| c.is_ascii_digit())
+            .unwrap_or(cursor.len());
+        let unit = &cursor[..unit_len];
+        if unit.is_empty() {
+            anyhow::bail!("time: missing unit in duration {s:?}");
+        }
+        cursor = &cursor[unit_len..];
+        let nanos_per_unit: f64 = match unit {
+            "ns" => 1.0,
+            "us" | "µs" | "μs" => 1_000.0,
+            "ms" => 1_000_000.0,
+            "s" => 1_000_000_000.0,
+            "m" => 60.0 * 1_000_000_000.0,
+            "h" => 3600.0 * 1_000_000_000.0,
+            other => anyhow::bail!("time: unknown unit {other:?} in duration {s:?}"),
+        };
+        total += std::time::Duration::from_nanos((value * nanos_per_unit) as u64);
+        saw_component = true;
+    }
+    if !saw_component {
+        anyhow::bail!("time: invalid duration {s:?}");
+    }
+    Ok(total)
+}
+
+/// Turn the `--gateway-addr` / `--self-addr` pair into the daemon's `gateway_and_self` parameter.
+///
+/// The refusal is Go's, verbatim in intent: the two flags are meaningless apart — a gateway with no
+/// self address cannot form a PCP request, and a self address with no gateway has nothing to send to
+/// — so passing one without the other is a usage error, not a half-applied override.
+fn gateway_and_self_param(
+    gateway_addr: Option<String>,
+    self_addr: Option<String>,
+) -> Result<Option<String>> {
+    match (gateway_addr, self_addr) {
+        (None, None) => Ok(None),
+        (Some(gw), Some(self_ip)) => {
+            // Parse both here so a typo is caught by the CLI rather than by the daemon mid-run.
+            let gw: std::net::Ipv4Addr = gw
+                .parse()
+                .with_context(|| format!("invalid --gateway-addr {gw:?}"))?;
+            let self_ip: std::net::Ipv4Addr = self_ip
+                .parse()
+                .with_context(|| format!("invalid --self-addr {self_ip:?}"))?;
+            Ok(Some(format!("{gw}/{self_ip}")))
+        }
+        _ => anyhow::bail!(
+            "if one of --gateway-addr and --self-addr is provided, the other must be as well"
+        ),
+    }
+}
+
+/// `debug portmap` (Go `tailscale debug portmap`): ask the daemon to run the port mapper and print
+/// its transcript line by line as it arrives.
+///
+/// A streaming command, like `debug watch-ipn`: the daemon writes one `DebugPortmapLine` frame per
+/// log line and then closes the connection, which is the end of the run. Lines are printed as they
+/// come rather than buffered, because watching WHERE a run stalls (no gateway? probe silent? mapping
+/// refused?) is most of the diagnostic value.
+async fn run_debug_portmap(
+    socket: &std::path::Path,
+    duration: &str,
+    ty: Option<String>,
+    gateway_addr: Option<String>,
+    self_addr: Option<String>,
+    log_http: bool,
+) -> Result<()> {
+    let duration = parse_go_duration(duration).context("parsing --duration")?;
+    if duration.is_zero() {
+        anyhow::bail!("--duration must be greater than zero");
+    }
+    let gateway_and_self = gateway_and_self_param(gateway_addr, self_addr)?;
+
+    let stream = UnixStream::connect(socket)
+        .await
+        .context("connect (is tailnetd running?)")?;
+    let (read_half, mut write_half) = stream.into_split();
+    let mut line = serde_json::to_vec(&Request::DebugPortmap {
+        duration_ms: Some(duration.as_millis() as u64),
+        ty,
+        gateway_and_self,
+        log_http,
+    })?;
+    line.push(b'\n');
+    write_half.write_all(&line).await?;
+    write_half.flush().await?;
+
+    let mut reader = BufReader::new(read_half);
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        let n = reader.read_line(&mut buf).await?;
+        if n == 0 {
+            // The daemon closed the connection: the run is over.
+            break;
+        }
+        let trimmed = buf.trim_end_matches(['\r', '\n']);
+        if trimmed.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Response>(trimmed)
+            .with_context(|| format!("parsing daemon portmap stream line: {trimmed:?}"))?
+        {
+            Response::DebugPortmapLine { line } => println!("{line}"),
+            Response::Error { message } => {
+                eprintln!("error: {message}");
+                std::process::exit(1);
+            }
+            other => eprintln!("warning: unexpected reply on portmap stream: {other:?}"),
+        }
+    }
+    Ok(())
 }
 
 /// `reload-config` (Go `tailscaled`'s `reload-config`): ask the daemon to re-read its `--config` file
@@ -12705,6 +12900,151 @@ mod tests {
             "wait should honor the ~1s timeout, took {:?}",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn go_duration_strings_parse_like_time_parse_duration() {
+        use std::time::Duration;
+        assert_eq!(parse_go_duration("5s").unwrap(), Duration::from_secs(5));
+        assert_eq!(
+            parse_go_duration("1500ms").unwrap(),
+            Duration::from_millis(1500)
+        );
+        assert_eq!(parse_go_duration("1m30s").unwrap(), Duration::from_secs(90));
+        assert_eq!(
+            parse_go_duration("1.5s").unwrap(),
+            Duration::from_millis(1500)
+        );
+        assert_eq!(parse_go_duration("2h").unwrap(), Duration::from_secs(7200));
+        assert_eq!(
+            parse_go_duration("250us").unwrap(),
+            Duration::from_micros(250)
+        );
+        assert_eq!(
+            parse_go_duration("100ns").unwrap(),
+            Duration::from_nanos(100)
+        );
+        // Go accepts a bare "0" without a unit; nothing else may omit one.
+        assert_eq!(parse_go_duration("0").unwrap(), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_duration_without_a_unit_is_refused_not_guessed() {
+        // The refusal that matters: `--duration 5` must NOT quietly mean five of anything. Go's
+        // parser says so, and a ported flag has to say so too.
+        let err = parse_go_duration("5").expect_err("a bare number has no unit");
+        assert_eq!(err.to_string(), "time: missing unit in duration \"5\"");
+        let err = parse_go_duration("5x").expect_err("x is not a duration unit");
+        assert_eq!(
+            err.to_string(),
+            "time: unknown unit \"x\" in duration \"5x\""
+        );
+        let err = parse_go_duration("abc").expect_err("not a duration at all");
+        assert_eq!(err.to_string(), "time: invalid duration \"abc\"");
+        let err = parse_go_duration("").expect_err("the empty string is not a duration");
+        assert_eq!(err.to_string(), "time: invalid duration \"\"");
+        // Deliberate divergence from Go: a negative duration parses there, but means nothing here.
+        assert!(parse_go_duration("-5s").is_err());
+    }
+
+    #[test]
+    fn gateway_and_self_must_be_given_together() {
+        // Go: "if one of --gateway-addr and --self-addr is provided, the other must be as well".
+        // Half an override is a usage error, never a half-applied override.
+        let err = gateway_and_self_param(Some("192.168.1.1".into()), None)
+            .expect_err("--gateway-addr alone must be refused");
+        assert_eq!(
+            err.to_string(),
+            "if one of --gateway-addr and --self-addr is provided, the other must be as well"
+        );
+        let err = gateway_and_self_param(None, Some("192.168.1.42".into()))
+            .expect_err("--self-addr alone must be refused");
+        assert_eq!(
+            err.to_string(),
+            "if one of --gateway-addr and --self-addr is provided, the other must be as well"
+        );
+    }
+
+    #[test]
+    fn a_full_gateway_and_self_pair_becomes_the_wire_parameter() {
+        assert_eq!(
+            gateway_and_self_param(Some("192.168.1.1".into()), Some("192.168.1.42".into()))
+                .expect("a complete pair is accepted")
+                .as_deref(),
+            Some("192.168.1.1/192.168.1.42")
+        );
+        // Neither flag → no override, which is the normal autodetecting run.
+        assert_eq!(
+            gateway_and_self_param(None, None).expect("no override is fine"),
+            None
+        );
+        // A typo is caught by the CLI rather than by the daemon mid-run.
+        assert!(
+            gateway_and_self_param(Some("not-an-ip".into()), Some("192.168.1.42".into())).is_err()
+        );
+    }
+
+    #[test]
+    fn debug_portmap_flags_parse_into_the_command() {
+        let cmd = Cli::try_parse_from([
+            "tnet",
+            "debug",
+            "portmap",
+            "--duration",
+            "10s",
+            "--type",
+            "upnp",
+            "--gateway-addr",
+            "192.168.1.1",
+            "--self-addr",
+            "192.168.1.42",
+            "--log-http",
+        ])
+        .expect("the Go flag grammar must parse")
+        .command;
+        match cmd {
+            Command::Debug {
+                cmd:
+                    DebugCmd::Portmap {
+                        duration,
+                        ty,
+                        gateway_addr,
+                        self_addr,
+                        log_http,
+                    },
+            } => {
+                assert_eq!(duration, "10s");
+                assert_eq!(ty.as_deref(), Some("upnp"));
+                assert_eq!(gateway_addr.as_deref(), Some("192.168.1.1"));
+                assert_eq!(self_addr.as_deref(), Some("192.168.1.42"));
+                assert!(log_http);
+            }
+            _ => panic!("expected Command::Debug{{ DebugCmd::Portmap }}"),
+        }
+
+        // The bare form: Go's defaults — 5s, every protocol, no override, no HTTP log.
+        match Cli::try_parse_from(["tnet", "debug", "portmap"])
+            .expect("the bare form must parse")
+            .command
+        {
+            Command::Debug {
+                cmd:
+                    DebugCmd::Portmap {
+                        duration,
+                        ty,
+                        gateway_addr,
+                        self_addr,
+                        log_http,
+                    },
+            } => {
+                assert_eq!(duration, "5s", "Go's -duration default");
+                assert_eq!(ty, None);
+                assert_eq!(gateway_addr, None);
+                assert_eq!(self_addr, None);
+                assert!(!log_http);
+            }
+            _ => panic!("expected Command::Debug{{ DebugCmd::Portmap }}"),
+        }
     }
 
     #[test]

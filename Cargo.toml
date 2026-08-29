@@ -150,6 +150,13 @@ sha2 = "0.10"
 # pin it directly (with the rust backend) so the updater can name it and it can't be dropped.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 tar = "0.4"
+# OS CSPRNG for the port mapper (`src/portmap`): PCP's 96-bit mapping nonce (RFC 6887 makes it the
+# client's proof of ownership of a mapping, so it must be real randomness, not a counter) and the
+# random high external port UPnP asks for. `getrandom` is the minimal way to reach the platform
+# entropy syscall — already in the tree transitively via ring/rustls, named directly here so the port
+# mapper cannot lose it to an unrelated dependency change. NOT `rand`, which is an optional
+# `ssh`-feature dependency: the port mapper is in the default build.
+getrandom = "0.3"
 # RNG for generating the Tailscale SSH server's host key (`russh::keys::PrivateKey::random`). Must
 # be `rand 0.10` — russh 0.61's `ssh-key` bounds `random` on `rand_core 0.10`'s `CryptoRng`, which
 # `rand 0.9`'s `ThreadRng` does NOT implement (verified: build fails with a CryptoRng trait-bound

@@ -610,6 +610,43 @@ pub enum Request {
     /// contract). Replies with [`Response::Ok`]/[`Response::Error`]. NOTE: a reloaded config's `AuthKey`
     /// is deliberately ignored (a reload is not a re-registration — see the daemon's `reload_config`).
     ReloadConfig,
+    /// Run the port mapper against the current network and stream what it finds (Go `tailscale debug
+    /// portmap` → the `debug-portmap` LocalAPI route), rendered by `tnet debug portmap`.
+    ///
+    /// Ask the LAN router — over NAT-PMP, PCP and UPnP-IGD — whether it will hand this node an
+    /// externally reachable `ip:port`, which is the thing that decides whether a NAT can be traversed
+    /// directly instead of relaying through DERP. The reply is a STREAM: one
+    /// [`Response::DebugPortmapLine`] per log line, in real time, then the connection closes — the
+    /// analogue of Go's flushed `text/plain` body, so a run that stalls still shows how far it got.
+    ///
+    /// A **write**: Go gates `serveDebugPortmap` on `PermitWrite`, and the run sends probe traffic
+    /// from this host and creates a real forwarding entry on the router. Needs no engine — the port
+    /// mapper talks to the router, not to the tailnet — so unlike `netcheck` it works with the node
+    /// down.
+    DebugPortmap {
+        /// How long the whole run may take, in milliseconds. `None` = the daemon's 5s default (Go's
+        /// `-duration` default).
+        ///
+        /// Milliseconds rather than Go's duration STRING (`"5s"`) because this wire is typed JSON,
+        /// not a query string: the CLI parses Go's `--duration 5s` grammar (including its refusals)
+        /// and sends the resolved value, so the daemon never has to re-implement `time.ParseDuration`
+        /// to reject `"5"`.
+        #[serde(default)]
+        duration_ms: Option<u64>,
+        /// Which protocol to exercise: `None`/empty = all of them, else `pmp`, `pcp` or `upnp`. An
+        /// unrecognized value is REFUSED (Go answers 400 "unknown portmap debug type") rather than
+        /// silently running everything.
+        #[serde(default)]
+        ty: Option<String>,
+        /// Override the autodetected gateway and self address, as Go's `gateway_and_self` parameter:
+        /// `"<gateway>/<self>"`. Both halves or neither — the CLI refuses a half-given pair before it
+        /// reaches here.
+        #[serde(default)]
+        gateway_and_self: Option<String>,
+        /// Log every UPnP HTTP request and response (Go's `-log-http`).
+        #[serde(default)]
+        log_http: bool,
+    },
 }
 
 /// The daemon's reply to a [`Request`].
@@ -773,6 +810,17 @@ pub enum Response {
         /// operator must re-mention to keep (already rendered to a flag-value string by the daemon's
         /// pref projection — e.g. `"10.0.0.0/8,192.168.1.0/24"`, `"true"`, an exit-node selector).
         reverts: Vec<RevertedPref>,
+    },
+    /// One line of a [`Request::DebugPortmap`] run's transcript, streamed as it is produced.
+    ///
+    /// The reply to a `debug portmap` is a sequence of these and then EOF (the daemon closes the
+    /// connection when the run ends), rather than one summary frame at the end: a port-map run is a
+    /// diagnostic whose *progress* is the information — how far it got before it stalled is exactly
+    /// what an operator watching a NAT that never answers needs to see. Mirrors Go, which flushes
+    /// each line of the `text/plain` body to the client.
+    DebugPortmapLine {
+        /// The line, without a trailing newline (the CLI adds one when it prints it).
+        line: String,
     },
     /// A command failed.
     Error {
@@ -1701,6 +1749,76 @@ mod tests {
             serde_json::from_str::<Request>(r#"{"cmd":"reload_config"}"#).unwrap(),
             Request::ReloadConfig
         ));
+    }
+
+    #[test]
+    fn request_debug_portmap_wire_format() {
+        // The `debug portmap` request + its streamed line frames must survive the wire, and the
+        // omitted-field defaults must keep a minimal request minimal: a bare run is `--type ""`,
+        // no override, the daemon's default duration.
+        assert_eq!(
+            serde_json::to_string(&Request::DebugPortmap {
+                duration_ms: None,
+                ty: None,
+                gateway_and_self: None,
+                log_http: false,
+            })
+            .unwrap(),
+            r#"{"cmd":"debug_portmap","duration_ms":null,"ty":null,"gateway_and_self":null,"log_http":false}"#
+        );
+        // Every field omitted must still parse (an older CLI sending only the discriminant).
+        assert!(matches!(
+            serde_json::from_str::<Request>(r#"{"cmd":"debug_portmap"}"#).unwrap(),
+            Request::DebugPortmap {
+                duration_ms: None,
+                ty: None,
+                gateway_and_self: None,
+                log_http: false,
+            }
+        ));
+        let full = Request::DebugPortmap {
+            duration_ms: Some(5000),
+            ty: Some("upnp".to_string()),
+            gateway_and_self: Some("192.168.1.1/192.168.1.42".to_string()),
+            log_http: true,
+        };
+        let round_tripped: Request = serde_json::from_str(&serde_json::to_string(&full).unwrap())
+            .expect("a full debug-portmap request must round-trip");
+        match round_tripped {
+            Request::DebugPortmap {
+                duration_ms,
+                ty,
+                gateway_and_self,
+                log_http,
+            } => {
+                assert_eq!(duration_ms, Some(5000));
+                assert_eq!(ty.as_deref(), Some("upnp"));
+                assert_eq!(
+                    gateway_and_self.as_deref(),
+                    Some("192.168.1.1/192.168.1.42")
+                );
+                assert!(log_http);
+            }
+            other => panic!("expected DebugPortmap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_debug_portmap_line_wire_format() {
+        let frame = Response::DebugPortmapLine {
+            line: "Probe: {PCP:false PMP:true UPnP:false}".to_string(),
+        };
+        let encoded = serde_json::to_string(&frame).unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"kind":"debug_portmap_line","line":"Probe: {PCP:false PMP:true UPnP:false}"}"#
+        );
+        match serde_json::from_str::<Response>(&encoded).unwrap() {
+            Response::DebugPortmapLine { line } => {
+                assert_eq!(line, "Probe: {PCP:false PMP:true UPnP:false}");
+            }
+            other => panic!("expected DebugPortmapLine, got {other:?}"),
+        }
     }
 
     #[test]

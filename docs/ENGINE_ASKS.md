@@ -1016,3 +1016,35 @@ part of `detect()` today (`Hostname`, `Package`/`PACKAGE_TSNET`, `RoutableIPs`, 
 **Daemon impact once landed:** `tnet debug hostinfo` (READ) — with (a) a pure-local print like the
 existing `debug env`/`debug build-info`; with (b) a thin read-only LocalAPI verb. Consumed via a pin
 bump. Tracked in daemon bead tsd-b15. — daemon lane
+
+## 33. Consume an externally-mapped endpoint in magicsock (for the port mapper to improve connectivity)
+
+**Why:** the daemon now ships a complete port-mapping client — NAT-PMP (RFC 6886), PCP (RFC 6887) and
+UPnP-IGD, ported from Go `net/portmapper` — in `src/portmap`, driven by `tnet debug portmap` (Go
+`tailscale debug portmap`). It finds the LAN gateway, asks it over all three protocols, and reports
+the external `ip:port` the router grants.
+
+That is only half of what a port mapper is for. In Go the mapping is *consumed*: `magicsock` runs a
+`portmapper.Client`, and a mapping it obtains becomes one of the node's advertised endpoints (Go
+`magicsock.Conn.determineEndpoints` includes the portmapped addr, and `netcheck` reports
+`Report.PortMapping`). That is what turns a DERP-relayed connection into a direct one behind a NAT
+that STUN alone cannot traverse — the actual connectivity win.
+
+The daemon cannot do that half. Endpoint determination is magicsock's, magicsock is engine-owned, and
+at pin `9d847a6e`/v0.43.0 the engine has **no port-mapping code and no seam to inject an endpoint**:
+nothing on `Device` or `Config` accepts an externally-discovered `ip:port` to advertise, and there is
+no hook to register an endpoint source. Verified against that pin. A daemon-side workaround is not
+possible even in principle — the daemon never touches packets, and an endpoint the control plane is
+never told about does nothing for a peer trying to dial this node.
+
+**Ask:** either (a) a `Device`-level seam the daemon can push a mapping through — e.g.
+`Device::set_portmapped_endpoint(Option<SocketAddr>)`, which magicsock adds to (and expires from) its
+advertised endpoint set — or, better because it keeps the renewal loop next to the socket that needs
+it, (b) a port-mapping client inside the engine, driven by magicsock and netcheck the way Go does it,
+with `NetcheckReport` gaining Go's `PortMapping` (UPnP/PMP/PCP) flags. (a) is the smaller change and
+would let the daemon's existing client (which already renews nothing, precisely because there is no
+consumer) grow a renewal loop; (b) is the faithful architecture.
+
+**Daemon impact once landed:** the port mapper stops being diagnostic-only and starts improving direct
+connectivity, and `tnet netcheck` can report Go's PortMapping flags (today honestly omitted). Consumed
+via a pin bump. Tracked in daemon bead tsd-vxb. — engine lane
