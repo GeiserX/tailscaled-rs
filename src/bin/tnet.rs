@@ -898,6 +898,18 @@ enum DebugCmd {
         #[arg(value_name = "FILE", required = true)]
         files: Vec<String>,
     },
+    /// Print how this binary was built, as JSON (Go `tailscale debug go-buildinfo`, which dumps Go's
+    /// `runtime/debug.BuildInfo`). Purely local — every value is stamped at compile time by
+    /// `build.rs`, so there is no daemon round-trip and nothing is mutated.
+    ///
+    /// Named `build-info` because the report is a Rust one — the compiler is `rustc`, not Go — but
+    /// `go-buildinfo` is kept as an alias so Go muscle memory and existing scripts work unchanged.
+    /// The shape mirrors Go's: `path`/`main`/`deps`/`settings`, with the `vcs.revision` and
+    /// `vcs.modified` setting keys spelled exactly as Go spells them. `deps` carries the one
+    /// dependency worth pinning a bug report to — the resolved `tailscale-rs` engine version + git
+    /// rev, which a stripped release binary otherwise records nowhere.
+    #[command(visible_alias = "go-buildinfo")]
+    BuildInfo,
 }
 
 /// `tnet serve` subcommands. Mirrors the TCP-forward subset of Go `tailscale serve`.
@@ -1799,6 +1811,11 @@ async fn main() -> Result<()> {
             // `debug stat` lstats each path locally — no socket round-trip.
             DebugCmd::Stat { files } => {
                 run_debug_stat(&files);
+                Ok(())
+            }
+            // `debug build-info` prints compile-time stamps — purely local, no socket round-trip.
+            DebugCmd::BuildInfo => {
+                run_debug_build_info();
                 Ok(())
             }
         },
@@ -2974,6 +2991,108 @@ fn stat_report(path: &std::path::Path) -> String {
         }
     }
     out
+}
+
+/// The compile-time facts `debug build-info` renders. Grouped into one struct so the pure renderer
+/// takes a single argument (and so a test can vary one field without a ten-argument call).
+struct BuildInfo<'a> {
+    /// This binary's name (`CARGO_BIN_NAME`) — Go's `BuildInfo.Path`.
+    bin: &'a str,
+    /// The cargo package this binary came from — Go's `BuildInfo.Main.Path`.
+    package: &'a str,
+    /// The package version — Go's `BuildInfo.Main.Version`.
+    version: &'a str,
+    /// The `rustc --version` line that built us — Go's `BuildInfo.GoVersion`.
+    compiler: &'a str,
+    /// The target triple, which carries what Go splits into the `GOOS` + `GOARCH` settings.
+    target: &'a str,
+    /// The cargo profile (`debug` / `release`).
+    profile: &'a str,
+    /// Enabled cargo features, comma-separated; empty on a default build.
+    features: &'a str,
+    /// `build.rs`'s git stamp: a short SHA, `-dirty`-suffixed when the tree was dirty at build time,
+    /// or `unknown` outside a checkout.
+    commit: &'a str,
+    /// The resolved engine version + git rev from `Cargo.lock` (either may be `unknown`).
+    engine_version: &'a str,
+    engine_rev: &'a str,
+}
+
+/// The cargo features this binary was built with, in manifest order, comma-separated (empty on a
+/// default build). Resolved with `cfg!` rather than a build-script env so it reports what this
+/// *binary* actually has compiled in, which is the question a bug report needs answered.
+fn enabled_features() -> String {
+    [
+        ("tun", cfg!(feature = "tun")),
+        ("ssh", cfg!(feature = "ssh")),
+        ("acme", cfg!(feature = "acme")),
+        ("identity-federation", cfg!(feature = "identity-federation")),
+    ]
+    .into_iter()
+    .filter_map(|(name, on)| on.then_some(name))
+    .collect::<Vec<_>>()
+    .join(",")
+}
+
+/// Render `debug build-info` (pure → unit-testable; no stdout). Mirrors the *shape* of Go's
+/// `runtime/debug.BuildInfo` JSON — `path`, `main`, `deps`, `settings` — with Rust-true values, and
+/// keeps Go's `vcs.revision` / `vcs.modified` setting keys verbatim so a script that already greps
+/// them keeps working. `-dirty` on the git stamp is split back out into `vcs.modified` (Go records
+/// the two separately); an `unknown` stamp reports `vcs.modified: false` because a build with no git
+/// to ask cannot claim the tree was modified. The string always ends in a newline.
+fn build_info_json(b: &BuildInfo<'_>) -> String {
+    let (revision, modified) = match b.commit.strip_suffix("-dirty") {
+        Some(sha) => (sha, true),
+        None => (b.commit, false),
+    };
+    let value = serde_json::json!({
+        "compiler": b.compiler,
+        "path": b.bin,
+        "main": { "path": b.package, "version": b.version },
+        // One dep, deliberately: the engine is the only dependency whose exact build a datapath bug
+        // report has to be pinned to. The rest of the graph is in the committed `Cargo.lock`.
+        "deps": [{
+            "path": ENGINE_PACKAGE,
+            "version": b.engine_version,
+            "rev": b.engine_rev,
+        }],
+        "settings": [
+            { "key": "profile", "value": b.profile },
+            { "key": "target", "value": b.target },
+            { "key": "features", "value": b.features },
+            { "key": "vcs.revision", "value": revision },
+            { "key": "vcs.modified", "value": modified.to_string() },
+        ],
+    });
+    // Serializing a `serde_json::Value` cannot fail; fall back defensively rather than panic.
+    format!(
+        "{}\n",
+        serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())
+    )
+}
+
+/// The engine facade's crate (package) name, as `Cargo.lock` records it and as `build.rs` looked it
+/// up. Kept in one place so the reported `deps[].path` cannot drift from the stamp it describes.
+const ENGINE_PACKAGE: &str = "geiserx_tailscale";
+
+/// `debug build-info` (Go `tailscale debug go-buildinfo`): print this binary's build facts as JSON.
+/// Purely local — every value is a compile-time stamp, so there is no daemon round-trip.
+fn run_debug_build_info() {
+    print!(
+        "{}",
+        build_info_json(&BuildInfo {
+            bin: env!("CARGO_BIN_NAME"),
+            package: env!("CARGO_PKG_NAME"),
+            version: env!("CARGO_PKG_VERSION"),
+            compiler: env!("TAILNETD_RUSTC_VERSION"),
+            target: env!("TAILNETD_BUILD_TARGET"),
+            profile: env!("TAILNETD_BUILD_PROFILE"),
+            features: &enabled_features(),
+            commit: env!("TAILNETD_GIT_COMMIT"),
+            engine_version: env!("TAILNETD_ENGINE_VERSION"),
+            engine_rev: env!("TAILNETD_ENGINE_REV"),
+        })
+    );
 }
 
 /// `switch` (Go `tailscale switch`): `--list` renders a table; `remove <id>` deletes; a bare
@@ -11742,6 +11861,117 @@ mod tests {
             "must print a trailing `  ...` when entries exceed the cap: {report:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- `debug build-info` (Go `tailscale debug go-buildinfo`) ---------------------------------
+
+    /// A fully-populated stamp set, so each test can override the one field it is about.
+    fn sample_build_info() -> super::BuildInfo<'static> {
+        super::BuildInfo {
+            bin: "tnet",
+            package: "tailscaled-rs",
+            version: "0.52.2",
+            compiler: "rustc 1.95.0 (deadbeef0 2026-01-01)",
+            target: "x86_64-unknown-linux-gnu",
+            profile: "release",
+            features: "",
+            commit: "a94d619ab",
+            engine_version: "0.43.0",
+            engine_rev: "9d847a6e252c0b268f823145ccfa4fc04006798d",
+        }
+    }
+
+    /// Parse the rendered report back, and pull one `settings` entry's value out by key.
+    fn setting(v: &serde_json::Value, key: &str) -> String {
+        v["settings"]
+            .as_array()
+            .expect("settings must be an array")
+            .iter()
+            .find(|e| e["key"] == key)
+            .unwrap_or_else(|| panic!("no `{key}` setting in {v}"))["value"]
+            .as_str()
+            .expect("a setting value is a string")
+            .to_string()
+    }
+
+    #[test]
+    fn build_info_json_reports_every_stamp() {
+        let out = super::build_info_json(&sample_build_info());
+        assert!(out.ends_with('\n'), "report must end in a newline: {out:?}");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("report must be valid JSON");
+        // Go's top-level shape: the binary path, the main module, and the compiler version.
+        assert_eq!(v["path"], "tnet");
+        assert_eq!(v["main"]["path"], "tailscaled-rs");
+        assert_eq!(v["main"]["version"], "0.52.2");
+        assert_eq!(v["compiler"], "rustc 1.95.0 (deadbeef0 2026-01-01)");
+        // The one dep that matters: the engine, named + versioned + pinned to its rev.
+        assert_eq!(v["deps"][0]["path"], "geiserx_tailscale");
+        assert_eq!(v["deps"][0]["version"], "0.43.0");
+        assert_eq!(
+            v["deps"][0]["rev"],
+            "9d847a6e252c0b268f823145ccfa4fc04006798d"
+        );
+        assert_eq!(setting(&v, "profile"), "release");
+        assert_eq!(setting(&v, "target"), "x86_64-unknown-linux-gnu");
+        assert_eq!(setting(&v, "features"), "");
+    }
+
+    #[test]
+    fn build_info_json_splits_the_dirty_suffix_into_vcs_modified() {
+        // A clean stamp: the SHA passes through untouched and `vcs.modified` is false.
+        let clean = super::build_info_json(&sample_build_info());
+        let clean: serde_json::Value = serde_json::from_str(&clean).unwrap();
+        assert_eq!(setting(&clean, "vcs.revision"), "a94d619ab");
+        assert_eq!(setting(&clean, "vcs.modified"), "false");
+        // `build.rs` folds dirtiness into a `-dirty` suffix; Go records the two separately, so the
+        // renderer splits them back apart rather than leaking the suffix into the revision.
+        let dirty = super::build_info_json(&super::BuildInfo {
+            commit: "a94d619ab-dirty",
+            ..sample_build_info()
+        });
+        let dirty: serde_json::Value = serde_json::from_str(&dirty).unwrap();
+        assert_eq!(setting(&dirty, "vcs.revision"), "a94d619ab");
+        assert_eq!(setting(&dirty, "vcs.modified"), "true");
+    }
+
+    #[test]
+    fn build_info_json_survives_an_unstamped_build() {
+        // Built from a tarball with no `.git` and no lockfile entry: every stamp degrades to
+        // `unknown` (build.rs never fails the build), and the report must still be valid JSON with
+        // no false "modified" claim.
+        let out = super::build_info_json(&super::BuildInfo {
+            compiler: "unknown",
+            target: "unknown",
+            profile: "unknown",
+            commit: "unknown",
+            engine_version: "unknown",
+            engine_rev: "unknown",
+            ..sample_build_info()
+        });
+        let v: serde_json::Value = serde_json::from_str(&out).expect("report must be valid JSON");
+        assert_eq!(setting(&v, "vcs.revision"), "unknown");
+        assert_eq!(setting(&v, "vcs.modified"), "false");
+        assert_eq!(v["deps"][0]["rev"], "unknown");
+    }
+
+    #[test]
+    fn build_info_json_lists_enabled_features() {
+        // The live probe reports whatever THIS build enabled, so assert its shape rather than a
+        // fixed string (the crate is also built with `--features ssh`/`acme` elsewhere): every name
+        // it emits must be one of the manifest's optional features, comma-separated, no blanks.
+        let live = super::enabled_features();
+        for name in live.split(',').filter(|s| !s.is_empty()) {
+            assert!(
+                ["tun", "ssh", "acme", "identity-federation"].contains(&name),
+                "unknown feature name {name:?} in {live:?}"
+            );
+        }
+        let out = super::build_info_json(&super::BuildInfo {
+            features: "ssh,acme",
+            ..sample_build_info()
+        });
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(setting(&v, "features"), "ssh,acme");
     }
 
     // --- `configure kubeconfig` (Go `tailscale configure kubeconfig`) ---------------------------

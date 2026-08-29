@@ -957,3 +957,37 @@ pure daemon-side work); (b) unblocks the not-replying warning and a `--verbose`/
 (c) upgrades the pre-send refusal from a post-hoc `taildrop send failed: BadRequest` to Go's specific
 message. None of the three is a blocker for the daemon-buildable half of tsd-52k, which lands without
 a pin bump.
+
+---
+
+## 32. Re-export the host-environment detector — `ts_control::hostinfo::HostInfoData` (for `tnet debug hostinfo`)
+
+**Why:** Go's `tailscale debug hostinfo` (`cmd/tailscale/cli/debug.go`, v1.100.0) is a **purely local**
+command: it calls `hostinfo.New()` in the CLI process and prints the result as JSON. It is how an
+operator sees what the node advertises about itself to control — the field set control uses for
+`Distro`/`OS`/`Container`/`Env`-conditioned behaviour — without a daemon round-trip.
+
+The engine already computes exactly that, and computes it *well*: `HostInfoData::detect()`
+(`ts_control/src/hostinfo.rs`, verified against the pinned `9d847a6e` / v0.43.0) fills `ipn_version`,
+`os`, `os_version`, `go_arch`, `go_version`, `machine`, `distro`/`distro_version`/`distro_code_name`,
+`container` and `env`, mirroring the Go fields one-for-one. The struct and its `detect()` are both
+`pub`. The **only** thing blocking `tnet debug hostinfo` is that the module is declared `mod hostinfo;`
+in `ts_control/src/lib.rs` — private, with no `pub use` — so neither `HostInfoData` nor `detect()` is
+nameable from outside the crate.
+
+Re-implementing the detection daemon-side is the wrong fix and we have deliberately not done it: the
+whole point of `debug hostinfo` is to show *what the engine actually sends*, so a parallel copy would
+drift into confidently reporting the wrong thing the first time either side changed.
+
+**Ask:** make the existing detector reachable — either `pub mod hostinfo;` or, matching the crate's
+prevailing style, `pub use hostinfo::HostInfoData;` alongside the other root re-exports in
+`ts_control/src/lib.rs:52-91`. No new code, no behaviour change, no new surface to maintain: the type
+is already `pub` and already documented. (Nice-to-have, strictly optional: a `Serialize` derive on
+`HostInfoData` + `EnvType` so the daemon does not have to hand-roll the JSON projection.)
+
+**Daemon impact once landed:** `tnet debug hostinfo` (READ, purely local — no LocalAPI round-trip at
+all, exactly like Go), a ~20-line renderer over `HostInfoData::detect()`. It is the last of the six
+subcommands named in daemon bead **tsd-b15**'s title that is not shipped. Consumed via a pin bump.
+The bead's sibling gaps (`netmap`, `derp-map`, `control-knobs`, the magicsock knobs) are blocked much
+deeper — `Device::watch_netmap` yields only `Vec<StatusNode>`, and no DERP map or magicsock knob is
+reachable from the facade — and are NOT part of this ask. — daemon lane

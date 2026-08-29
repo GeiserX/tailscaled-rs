@@ -107,7 +107,7 @@ Closed this migration so far (50 beads). The consumed engine capabilities and sh
   hardening, IP-forwarding readiness check, link-change auto-rebind, `is_ssh_over_tailscale` `/proc`
   sudo-fallback.
 - **`debug`:** capture, prefs, env, metrics, via, rebind, restun, check-ip-forwarding, check-prefs,
-  watch-ipn, local-creds, stat.
+  watch-ipn, local-creds, stat, build-info (alias `go-buildinfo`).
 
 ---
 
@@ -129,7 +129,7 @@ would violate the honest-omission rule). Each rides the next pin bump once its a
 | Mutating web UI (Go `ManageServerMode`) | `tsd-bvc` (closed-partial) | **#29** | Needs a control-backed web-client session-auth flow + owner identity on whois. The read-only loopback UI ships; mutation would *exceed* Go without this. |
 | `file get --wait` / `--loop` | `tsd-1hr` | **#20** | Needs a Taildrop file-arrival bus signal; the engine exposes only a `waiting_files()` poll. Busy-polling would be a CPU-spin facsimile. |
 | `tnet drive` (Taildrive) | `tsd-eka` | — | Needs a whole engine WebDAV / virtual-disk subsystem; none exists. |
-| `debug` rich reads (`netmap`/`hostinfo`/`derp-map`/`control-knobs`) + magicsock knobs (`rotate-disco-key`, `derp-set-on-demand`, `break-*-conns`, `force-netmap-update`, `peer-endpoint-changes`, `set-expire`, `ts2021`, `dial-types`, `peer-relay-servers`) | `tsd-b15` | — | Each needs a netmap field or magicsock knob the engine doesn't expose. The clean pure-local cherry-picks (`prefs`/`env`/`via`/`local-creds`/`stat`/`restun`) are already shipped. |
+| `debug` rich reads (`netmap`/`hostinfo`/`derp-map`/`control-knobs`) + magicsock knobs (`rotate-disco-key`, `derp-set-on-demand`, `break-*-conns`, `force-netmap-update`, `peer-endpoint-changes`, `set-expire`, `ts2021`, `dial-types`, `peer-relay-servers`) | `tsd-b15` | — | Each needs a netmap field or magicsock knob the engine doesn't expose. The clean pure-local cherry-picks (`prefs`/`env`/`via`/`local-creds`/`stat`/`restun`/`build-info`) are already shipped. `hostinfo` is the *closest* of the rest — Go's is a pure-local `hostinfo.New()` dump, and the engine already computes exactly that in `ts_control::hostinfo::HostInfoData::detect()`; it is blocked only because the module is private (`mod hostinfo;`, no re-export) — see engine ask #32. `netmap`/`derp-map` are blocked deeper: `Device::watch_netmap` yields `Vec<StatusNode>` (the same peer view `status` renders), and no DERP map is reachable from the facade at all. |
 | `serve_path` segment-boundary match (`/apifoo` must not match a `/api` mount) | `tsd-k4q` | **#30** | Engine bug (the request-time mux is engine-owned); the fix is transparent to the daemon. |
 
 ### 4.2 Large multi-day subsystems (daemon-buildable, but each is a significant project)
