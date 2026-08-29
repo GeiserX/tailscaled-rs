@@ -484,9 +484,12 @@ enum Command {
         /// With `--list`, emit the profiles as a JSON array (Go `tailscale switch --list --json`):
         /// one object per profile with `id`, `nickname`, and `selected`. (Go also carries `tailnet`
         /// and `account` per profile; this fork's engine does not surface those per-profile, so they
-        /// are emitted as `null` — an honest reduction, not a fake value. See bead tsd-91w.) Ignored
-        /// without `--list`.
-        #[arg(long, requires = "list")]
+        /// are emitted as `null` — an honest reduction, not a fake value. See bead tsd-91w.)
+        ///
+        /// Only valid with `--list`: without it, this refuses like Go does — see
+        /// [`switch_usage_refusal`]. The check is deliberately NOT a clap `requires = "list"`, so the
+        /// message and the exit code are Go's rather than clap's.
+        #[arg(long)]
         json: bool,
         /// The profile id to switch to (omit with `--list`). Ignored when `--list` is given.
         #[arg(value_name = "PROFILE")]
@@ -724,8 +727,10 @@ enum Command {
         #[arg(long, value_name = "TRACK")]
         track: Option<String>,
     },
-    /// Tailnet Lock (TKA) commands. Currently `status` (read-only): whether lock is in use, the
-    /// authority head, and any pending disablement. Mirrors Go `tailscale lock status`.
+    /// Tailnet Lock (TKA) commands. The read-only pair mirrors Go `tailscale lock status` (whether
+    /// lock is in use, the authority head, any pending disablement) and Go `tailscale lock log` (the
+    /// update-chain history, newest first); `init`/`sign`/`disable` mutate the lock and
+    /// `disablement-kdf` is a pure-local derivation.
     Lock {
         #[command(subcommand)]
         cmd: LockCmd,
@@ -831,26 +836,52 @@ enum Command {
         )]
         args: Vec<String>,
     },
-    /// Expose a local service on the tailnet (Go `tailscale serve`): `tcp` (raw TCP forward, the
-    /// daemon's own accept loop) and `https`/`http` (web reverse-proxy, terminated + served by the
-    /// engine for the node's MagicDNS name). HTTPS issuance needs the `acme` feature + a SaaS tailnet.
+    /// Expose a local service on the tailnet (Go `tailscale serve`), in either of two grammars.
+    ///
+    /// The Go v1.100.0 FLAG grammar (`cmd/tailscale/cli/serve_v2.go`) — `tnet serve [flags]
+    /// <target> [off]`, where the listener is named by exactly one of `--https=PORT` /
+    /// `--http=PORT` / `--tcp=PORT` / `--tls-terminated-tcp=PORT` (none given = `--https=443`,
+    /// Go's default). A scripted `tailscale serve` invocation ports over unchanged.
+    ///
+    /// The fork's positional SUB-VERBS (`serve tcp|https|http|redirect <port> <target>`) — kept as
+    /// a documented superset. `redirect` exists only here: Go's CLI has no redirect verb at
+    /// v1.100.0, though the engine serves one.
+    ///
+    /// `serve status`/`serve reset` work under both. Like Go, a flag-grammar serve runs in the
+    /// FOREGROUND by default and undoes itself on Ctrl-C; pass `--bg` to persist it and exit.
+    ///
+    /// DEVIATIONS from Go, each of which fails loudly rather than silently doing nothing:
+    /// `--service`, `--tun`, `--accept-app-caps` and `--proxy-protocol` are parsed (so the error
+    /// names the gap instead of clap rejecting an "unexpected argument") but refused — see the
+    /// per-flag help. Go's foreground serve is torn down by the DAEMON when the CLI's IPN-bus
+    /// session drops; this build restores the previous config from the CLI's own signal handler, so
+    /// a `SIGKILL`ed foreground `tnet serve` leaves its config behind (use `serve reset`).
+    #[command(args_conflicts_with_subcommands = true)]
     Serve {
+        /// `status`/`reset`, or one of the fork's positional sub-verbs.
         #[command(subcommand)]
-        cmd: ServeCmd,
+        cmd: Option<ServeCmd>,
+        #[command(flatten)]
+        flags: ServeFlags,
     },
     /// Expose a tailnet port to the PUBLIC internet via Tailscale Funnel (Go `tailscale funnel`).
-    /// `funnel <port> on` enables Funnel for a port; `off` disables it. Configure `serve https <port>
-    /// <target>` so there is a proxy backend to expose (order doesn't matter — the funnel lane picks up
-    /// whatever serve exists). The node must have Funnel enabled for the tailnet (the `https` +
-    /// `funnel` node attributes) and the port must be Funnel-allowed; the public ingress path needs a
-    /// real Tailscale SaaS tailnet (a self-hosted control plane has no ingress relay).
+    /// Takes the same flag grammar as `serve` (`tnet funnel [flags] <target> [off]`), plus
+    /// `funnel status`/`funnel reset` and the legacy `funnel <port> on|off` toggle this fork
+    /// shipped first. A funnel needs a serve to expose: the flag grammar configures both in one
+    /// call, while `funnel <port> on` only flips the switch and warns when the port has no proxy
+    /// backend yet.
+    ///
+    /// The node must have Funnel enabled for the tailnet (the `https` + `funnel` node attributes)
+    /// and the port must be Funnel-allowed; the public ingress path needs a real Tailscale SaaS
+    /// tailnet (a self-hosted control plane has no ingress relay). Turning a funnel off leaves the
+    /// underlying serve in place — use `serve --https=PORT off` (or `serve reset`) to remove that.
+    #[command(args_conflicts_with_subcommands = true)]
     Funnel {
-        /// The tailnet port to expose (must already have a `serve https`/`http` handler).
-        #[arg(value_name = "PORT")]
-        port: u16,
-        /// `on` to enable Funnel for the port, `off` to disable it.
-        #[arg(value_name = "ON_OFF", value_parser = ["on", "off"])]
-        on_off: String,
+        /// `status` or `reset` (both are Go aliases for their `serve` counterparts).
+        #[command(subcommand)]
+        cmd: Option<FunnelCmd>,
+        #[command(flatten)]
+        flags: ServeFlags,
     },
     /// Debugging tools (Go `tailscale debug`).
     Debug {
@@ -1104,6 +1135,93 @@ enum ServeCmd {
     Reset,
 }
 
+/// `tnet funnel` subcommands. Go's `funnel status`/`funnel reset` are plain aliases for their
+/// `serve` counterparts (one config backs both), and so are these.
+#[derive(Subcommand)]
+enum FunnelCmd {
+    /// Show the current serve/funnel configuration (Go `funnel status`; same output as `serve
+    /// status`, funnel section included).
+    Status {
+        /// Output as JSON (the raw ServeConfig).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Clear the entire serve configuration, funnel included (Go `funnel reset`; identical to
+    /// `serve reset` — one ServeConfig backs both).
+    Reset,
+}
+
+/// The Go v1.100.0 `serve`/`funnel` flag grammar (`cmd/tailscale/cli/serve_v2.go`), shared verbatim
+/// by both commands exactly as Go shares it: `tnet <serve|funnel> [flags] <target> [off]`.
+///
+/// Four of these flags are accepted by the parser but REFUSED at runtime
+/// ([`reject_unsupported_serve_flags`]). That is deliberate: a script written against Go gets an
+/// error naming the missing capability instead of clap's opaque "unexpected argument", and the
+/// grammar stays a superset so the same command line keeps working the day the gap closes.
+#[derive(clap::Args, Debug, Default, Clone)]
+struct ServeFlags {
+    /// Persist the serve and exit, instead of holding it for the lifetime of this command. Go's
+    /// `--bg`; like Go, the default is the FOREGROUND — the serve is installed, this process blocks,
+    /// and the previous serve config is restored when you interrupt it (Ctrl-C / `SIGTERM`).
+    #[arg(long)]
+    bg: bool,
+    /// Terminate TLS on this tailnet port and reverse-proxy to `<TARGET>` (Go `--https=PORT`). This
+    /// is the default listener: with none of the four port flags given, `serve`/`funnel` act as
+    /// `--https=443`, matching Go.
+    #[arg(long, value_name = "PORT", conflicts_with_all = ["http", "tcp", "tls_terminated_tcp"])]
+    https: Option<u16>,
+    /// Serve plain HTTP on this tailnet port, reverse-proxying to `<TARGET>` (Go `--http=PORT`).
+    #[arg(long, value_name = "PORT", conflicts_with_all = ["tcp", "tls_terminated_tcp"])]
+    http: Option<u16>,
+    /// Forward raw TCP on this tailnet port to `<TARGET>` with no TLS (Go `--tcp=PORT`). Served by
+    /// the daemon's own accept loop.
+    #[arg(long, value_name = "PORT", conflicts_with_all = ["tls_terminated_tcp"])]
+    tcp: Option<u16>,
+    /// Terminate TLS on this tailnet port with the node's cert, then splice the plaintext stream to
+    /// `<TARGET>` as raw TCP (Go `--tls-terminated-tcp=PORT`) — no HTTP parsing or reverse-proxying.
+    /// Needs an issuable cert, like `--https`.
+    #[arg(long = "tls-terminated-tcp", value_name = "PORT")]
+    tls_terminated_tcp: Option<u16>,
+    /// Mount the handler at this URL path prefix instead of `/` (Go `--set-path`). HTTP(S) only;
+    /// with several mounts on one port the longest-matching prefix wins (unmatched = 404).
+    #[arg(long = "set-path", value_name = "MOUNT")]
+    set_path: Option<String>,
+    /// NOT SUPPORTED by this build (Go `--service=svc:<name>`): attach the serve to a Tailscale
+    /// Service (VIP) rather than to this node. Refused rather than ignored — the LocalAPI
+    /// `ServeConfig` here carries no `Services` map, and Services are a control-plane + netmap
+    /// feature the pinned engine does not surface.
+    #[arg(long, value_name = "SERVICE")]
+    service: Option<String>,
+    /// NOT SUPPORTED by this build (Go `--tun`): serve on the kernel TUN interface instead of the
+    /// userspace netstack. Refused rather than ignored — this daemon's serve lanes are netstack-only.
+    #[arg(long)]
+    tun: bool,
+    /// NOT SUPPORTED by this build (Go `--proxy-protocol=1|2`): prepend a PROXY-protocol header to
+    /// each `--tls-terminated-tcp` connection. Refused rather than ignored — the engine's TCP serve
+    /// target cannot emit the header, and the daemon already fails such a config closed rather than
+    /// silently dropping it (which would hand the backend an unmarked, wrongly-attributed stream).
+    #[arg(long = "proxy-protocol", value_name = "VERSION")]
+    proxy_protocol: Option<u8>,
+    /// NOT SUPPORTED by this build (Go `--accept-app-caps`): forward the caller's app capabilities
+    /// to the backend. Refused rather than ignored — the daemon's serve lanes add no such headers,
+    /// so accepting the flag would promise an authorization signal that never arrives.
+    #[arg(long = "accept-app-caps")]
+    accept_app_caps: bool,
+    /// Accepted and ignored (Go `--yes`): pre-approve Go's interactive funnel confirmation. This
+    /// CLI never prompts, so the flag is a no-op kept so Go-shaped scripts run unedited.
+    #[arg(long)]
+    yes: bool,
+    /// What to serve: a proxy backend (`host:port`, a bare port for `127.0.0.1:<port>`, or a
+    /// `tcp://host:port` URL), or `text:<body>` for a fixed plaintext body on an HTTP(S) port. The
+    /// literal `off` here removes the serve on the named port instead (Go `serve <target> off`).
+    #[arg(value_name = "TARGET")]
+    target: Option<String>,
+    /// A trailing `off` (Go `serve --https=PORT <target> off`), which removes that port's serve. For
+    /// `funnel` this position also takes the legacy `on`/`off` of `funnel <port> on|off`.
+    #[arg(value_name = "OFF")]
+    off: Option<String>,
+}
+
 /// `tnet metrics` subcommands. Bare `tnet metrics` prints to stdout; `print` is the explicit
 /// stdout form (Go `tailscale metrics print`); `write <path>` writes a file.
 #[derive(Subcommand)]
@@ -1137,6 +1255,19 @@ enum LockCmd {
     },
     /// Show Tailnet Lock status (read-only).
     Status {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the changes applied to Tailnet Lock — the update (AUM) chain, newest first (Go
+    /// `tailscale lock log`). Read-only, and read *locally*: the entries come from the AUM chain this
+    /// node has already synced and verified, so there is no control round-trip and the history stops
+    /// at whatever this node has seen.
+    Log {
+        /// Maximum number of updates to list, counted back from the chain head (Go `--limit`, same
+        /// default of 50).
+        #[arg(long, value_name = "N", default_value_t = 50)]
+        limit: usize,
         /// Output as JSON.
         #[arg(long)]
         json: bool,
@@ -1236,9 +1367,14 @@ enum SyspolicyCmd {
 /// The `tnet switch` subcommands. Mirrors Go's `tailscale switch remove`.
 #[derive(Subcommand)]
 enum SwitchCmd {
-    /// Remove a profile (delete its prefs + node key). Cannot remove the current or default profile.
+    /// Remove a profile (delete its prefs + node key). The profile may be named by id or by display
+    /// name, like `switch` itself; a name that matches no profile is refused (Go: `No profile named
+    /// %q`) rather than reported as a removal. Cannot remove the current or default profile.
     Remove {
-        /// The profile id to remove.
+        /// The profile id (or display name) to remove.
+        ///
+        /// Required, so clap supplies the arity refusal Go hand-rolls as
+        /// `usage: tailscale switch remove NAME`.
         #[arg(value_name = "PROFILE")]
         target: String,
     },
@@ -1931,14 +2067,14 @@ async fn main() -> Result<()> {
         Command::Ssh { target, args } => {
             run_ssh(&socket, explicit_socket.as_deref(), &target, &args).await
         }
-        // `serve`: read-modify-write the ServeConfig (tcp/reset) or render it (status). Inline because
-        // tcp/reset must GET the current config, mutate, then SET it.
-        Command::Serve { cmd } => run_serve(&socket, cmd)
+        // `serve`: read-modify-write the ServeConfig (every set/off path) or render it (status).
+        // Inline because each mutation must GET the current config, mutate, then SET it.
+        Command::Serve { cmd, flags } => run_serve(&socket, cmd, flags)
             .await
             .with_context(|| format!("serve via {}", socket.display())),
-        // `funnel <port> on|off`: GET status (for the node's MagicDNS name → the HostPort key) + the
-        // current ServeConfig, toggle AllowFunnel, SET it back. Inline (read-modify-write, like serve).
-        Command::Funnel { port, on_off } => run_funnel(&socket, port, &on_off)
+        // `funnel`: the same read-modify-write, plus the AllowFunnel toggle keyed by the node's
+        // MagicDNS name (fetched from Status).
+        Command::Funnel { cmd, flags } => run_funnel(&socket, cmd, flags)
             .await
             .with_context(|| format!("funnel via {}", socket.display())),
         // `debug capture`: send DebugCapture (a long-lived write — the daemon taps the dataplane for
@@ -2157,6 +2293,10 @@ async fn main() -> Result<()> {
         Command::Lock {
             cmd: LockCmd::Status { json },
         } => run_lock_status(&socket, json).await,
+        // `lock log` (Go `tailscale lock log`): fetch + render the TKA update-chain history.
+        Command::Lock {
+            cmd: LockCmd::Log { limit, json },
+        } => run_lock_log(&socket, limit, json).await,
         // `lock sign` (Go `tailscale lock sign`): co-sign a node key into the lock.
         Command::Lock {
             cmd: LockCmd::Sign { node_key },
@@ -3329,6 +3469,42 @@ fn build_info_json(
 /// `switch` (Go `tailscale switch`): `--list` renders a table; `remove <id>` deletes; a bare
 /// `<target>` switches. `--list` renders the Profiles reply, and the three modes map to different
 /// requests.
+/// The refusal `tnet switch` owes its own flags *before* it contacts the daemon, or `None` when the
+/// invocation is usable. Ported from Go's `switchProfile` (`cmd/tailscale/cli/switch.go`), which
+/// checks in exactly this order:
+///
+/// 1. `--list` wins outright — Go dispatches to `listProfiles`/`listProfilesJSON` first, so
+///    `--list --json` is the JSON listing and a stray `<target>` alongside `--list` is ignored
+///    (never a refusal).
+/// 2. `--json` without `--list` is refused: `--json` only ever selects the *listing's* format, so
+///    pairing it with a switch target asks for JSON output that does not exist. Go prints
+///    `--json argument cannot be used with tailscale switch NAME` and exits 1.
+/// 3. no target left → the usage line, exit 1.
+///
+/// The `remove` subcommand is exempt: Go's ffcli dispatches the subcommand before `switch`'s own
+/// `Exec` ever runs, so `switch`'s flag rules do not apply to it (clap parses the same shape here).
+///
+/// Both messages go to **stdout** and exit **1**, matching Go's `outln` + `os.Exit(1)` — not clap's
+/// stderr + exit 2, which is why this is a hand-rolled check and not an `#[arg(requires = ...)]`.
+/// Pure (no I/O, no process exit) so the whole refusal table is unit-testable.
+fn switch_usage_refusal(
+    list: bool,
+    json: bool,
+    target: Option<&str>,
+    has_subcommand: bool,
+) -> Option<&'static str> {
+    if has_subcommand || list {
+        return None;
+    }
+    if json {
+        return Some("--json argument cannot be used with tnet switch NAME");
+    }
+    if target.is_none() {
+        return Some("usage: tnet switch NAME");
+    }
+    None
+}
+
 async fn run_switch(
     socket: &std::path::Path,
     list: bool,
@@ -3336,6 +3512,11 @@ async fn run_switch(
     target: Option<String>,
     cmd: Option<SwitchCmd>,
 ) -> Result<()> {
+    // Go's own flag refusals first (stdout + exit 1), before any daemon round-trip.
+    if let Some(message) = switch_usage_refusal(list, json, target.as_deref(), cmd.is_some()) {
+        println!("{message}");
+        std::process::exit(1);
+    }
     // `switch remove <id>` (subcommand) takes precedence.
     if let Some(SwitchCmd::Remove { target }) = cmd {
         return send_ok_or_die(socket, Request::DeleteProfile { target }).await;
@@ -3362,8 +3543,11 @@ async fn run_switch(
     }
     match target {
         Some(target) => send_ok_or_die(socket, Request::SwitchProfile { target }).await,
+        // Unreachable: `switch_usage_refusal` above already exited on a missing target. Kept as a
+        // total match (rather than an `expect`) so a future edit to the refusal table degrades into
+        // the same usage line instead of a panic.
         None => {
-            eprintln!("usage: tnet switch <profile> | --list | remove <profile>");
+            println!("usage: tnet switch NAME");
             std::process::exit(1);
         }
     }
@@ -4261,6 +4445,23 @@ async fn run_lock_status(socket: &std::path::Path, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// `lock log [--limit N]` (Go `tailscale lock log`): fetch + render the TKA update-chain history.
+async fn run_lock_log(socket: &std::path::Path, limit: usize, json: bool) -> Result<()> {
+    let report = match round_trip(socket, &Request::LockLog { limit }).await {
+        Ok(Response::LockLog(r)) => r,
+        Ok(Response::Error { message }) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        Ok(other) => anyhow::bail!("unexpected response to lock log: {other:?}"),
+        Err(e) => {
+            return Err(e).with_context(|| format!("querying lock log at {}", socket.display()));
+        }
+    };
+    print!("{}", format_lock_log(&report, json));
+    Ok(())
+}
+
 /// `lock init <disablement-secret>` (Go `tailscale lock init`): initialize Tailnet Lock with this
 /// node as the sole trusted key, gated by the hex-encoded disablement secret. Prints the daemon's
 /// `ok` message or surfaces the error and exits non-zero. The secret is passed straight through on the
@@ -5011,6 +5212,85 @@ fn format_lock_status(r: &tailscaled_rs::localapi::LockReport, json: bool) -> St
     }
     if r.disabled {
         out.push_str("  status: a disablement is pending (control signalled disable).\n");
+    }
+    out
+}
+
+/// Render `tnet lock log` from a [`LockLogReport`](tailscaled_rs::localapi::LockLogReport), mirroring
+/// Go `tailscale lock log` (`runNetworkLockLog` over `LocalClient.NetworkLockLog`): one stanza per
+/// update, **newest first**, each headed by the update's AUM hash and change kind.
+///
+/// Two deliberate fork deviations, both stated rather than faked:
+///
+/// - **No per-kind key detail.** Go decodes each update's raw AUM CBOR and prints what the change
+///   did (the added key's kind/id/metadata, the removed key id). This build carries the raw CBOR on
+///   the wire but does not decode it — the daemon has no AUM decoder — so a stanza reports the hash,
+///   the change kind and the ids of the keys that signed it. `--json` emits the raw CBOR (hex) so the
+///   full AUM can still be decoded out-of-band.
+/// - **The empty history says why.** Go's `NetworkLockLog` errors out when lock is not enabled; here
+///   the engine simply returns no entries, so the report carries the lock-enabled flag and this
+///   renderer prints "not enabled" or "enabled, nothing synced yet" rather than an empty table.
+///
+/// `json` emits a fork-specific object (`enabled` + `entries`), NOT Go's `[]ipnstate.NetworkLockUpdate`
+/// array. Pure (returns the string incl. its trailing newline) → unit-testable.
+fn format_lock_log(r: &tailscaled_rs::localapi::LockLogReport, json: bool) -> String {
+    if json {
+        use serde_json::{Map, Value, json};
+        let entries: Vec<Value> = r
+            .entries
+            .iter()
+            .map(|e| {
+                let mut m = Map::new();
+                m.insert("hash".into(), json!(e.hash));
+                m.insert("change".into(), json!(e.change));
+                m.insert("signer_key_ids".into(), json!(e.signer_key_ids));
+                m.insert("raw".into(), json!(e.raw));
+                Value::Object(m)
+            })
+            .collect();
+        let mut root = Map::new();
+        root.insert("enabled".into(), json!(r.enabled));
+        root.insert("entries".into(), Value::Array(entries));
+        return format!(
+            "{}\n",
+            serde_json::to_string_pretty(&root).unwrap_or_else(|_| "{}".to_string())
+        );
+    }
+    // Nothing to list: say which of the two empty cases this is (Go never reaches here — it errors
+    // instead — but an empty table would leave an operator guessing).
+    if r.entries.is_empty() {
+        if !r.enabled {
+            // Same wording as `lock status`'s not-enabled line, so the two verbs agree.
+            return "Tailnet Lock is NOT enabled.\n\n".to_string();
+        }
+        return "Tailnet Lock is ENABLED, but no update-chain history has synced to this node \
+                yet.\n\n"
+            .to_string();
+    }
+    let mut out = String::new();
+    for e in &r.entries {
+        // The change kind and hash are engine-produced (a fixed AUM-kind string; our own base32 of a
+        // 32-byte hash), but they are rendered verbatim into a structured line — sanitize anyway, as
+        // the status/dns/file formatters do.
+        out.push_str(&format!(
+            "update {} ({})\n",
+            sanitize_for_terminal(&e.hash),
+            sanitize_for_terminal(&e.change)
+        ));
+        if e.signer_key_ids.is_empty() {
+            // The genesis checkpoint carries no signatures; anything else unsigned would not have
+            // verified into the chain in the first place.
+            out.push_str("  signed by: (unsigned)\n");
+        } else {
+            let ids: Vec<String> = e
+                .signer_key_ids
+                .iter()
+                .map(|id| sanitize_for_terminal(id))
+                .collect();
+            out.push_str(&format!("  signed by: {}\n", ids.join(", ")));
+        }
+        // Blank line between stanzas, like Go's `fmt.Fprintln` after each description.
+        out.push('\n');
     }
     out
 }
@@ -7933,26 +8213,363 @@ async fn serve_host(socket: &std::path::Path) -> Result<String> {
     }
 }
 
-async fn run_serve(socket: &std::path::Path, cmd: ServeCmd) -> Result<()> {
-    use tailscaled_rs::localapi::ServeConfig;
-    // Fetch the current config (GetServeConfig is read-only; always replies ServeConfig).
-    let get_cfg = || async {
-        match round_trip(socket, &Request::GetServeConfig).await {
-            Ok(Response::ServeConfig(c)) => Ok(c),
-            Ok(other) => anyhow::bail!("unexpected response to get serve config: {other:?}"),
-            Err(e) => Err(e).context("getting serve config"),
+/// Fetch the daemon's current [`ServeConfig`](tailscaled_rs::localapi::ServeConfig). `GetServeConfig`
+/// is read-only and always replies `ServeConfig`, so anything else is a protocol error. Every
+/// mutating serve/funnel path starts here: `SetServeConfig` replaces the config wholesale (matching
+/// Go's `SetServeConfig`), so each set is a read-modify-write of the whole document.
+async fn get_serve_config(
+    socket: &std::path::Path,
+) -> Result<tailscaled_rs::localapi::ServeConfig> {
+    match round_trip(socket, &Request::GetServeConfig).await {
+        Ok(Response::ServeConfig(c)) => Ok(c),
+        Ok(other) => anyhow::bail!("unexpected response to get serve config: {other:?}"),
+        Err(e) => Err(e).context("getting serve config"),
+    }
+}
+
+/// Render `serve status` / `funnel status` (Go aliases each other — one ServeConfig backs both).
+async fn run_serve_status(socket: &std::path::Path, json: bool) -> Result<()> {
+    let cfg = get_serve_config(socket).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&cfg)?);
+    } else {
+        print!("{}", format_serve_status(&cfg, false));
+    }
+    Ok(())
+}
+
+/// Clear the whole serve config (`serve reset` / `funnel reset` — Go aliases, same single document).
+async fn run_serve_reset(socket: &std::path::Path) -> Result<()> {
+    send_ok_or_die(
+        socket,
+        Request::SetServeConfig {
+            config: tailscaled_rs::localapi::ServeConfig::default(),
+        },
+    )
+    .await?;
+    println!("serve config cleared");
+    Ok(())
+}
+
+/// Which listener a flag-grammar `serve`/`funnel` names, i.e. which of Go's four mutually exclusive
+/// port flags was given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServeKind {
+    /// `--https=PORT`: TLS terminated for the node's MagicDNS name, then reverse-proxied.
+    Https,
+    /// `--http=PORT`: plaintext HTTP, reverse-proxied.
+    Http,
+    /// `--tcp=PORT`: raw TCP splice, no TLS (the daemon's own accept loop).
+    Tcp,
+    /// `--tls-terminated-tcp=PORT`: TLS terminated, then the plaintext spliced as raw TCP.
+    TlsTerminatedTcp,
+}
+
+impl ServeKind {
+    /// Whether this listener is an HTTP(S) web serve — the two kinds that take `--set-path`, a
+    /// `text:` target and the `Web[host:port]` handler map.
+    fn is_web(self) -> bool {
+        matches!(self, ServeKind::Https | ServeKind::Http)
+    }
+}
+
+/// Resolve the four mutually exclusive port flags into `(kind, port)`, applying Go's default: with
+/// none of them given, `serve`/`funnel` mean `--https=443` (`serve_v2.go`'s `srvTypeHTTPS` / port
+/// 443 fallback). Clap already rejects two of them together; the `_` arm keeps that a hard error
+/// rather than an arbitrary winner if those `conflicts_with_all` lists ever drift.
+fn serve_kind_and_port(flags: &ServeFlags) -> Result<(ServeKind, u16)> {
+    let given: Vec<(ServeKind, u16)> = [
+        (ServeKind::Https, flags.https),
+        (ServeKind::Http, flags.http),
+        (ServeKind::Tcp, flags.tcp),
+        (ServeKind::TlsTerminatedTcp, flags.tls_terminated_tcp),
+    ]
+    .into_iter()
+    .filter_map(|(kind, port)| port.map(|p| (kind, p)))
+    .collect();
+    match given.as_slice() {
+        [] => Ok((ServeKind::Https, 443)),
+        [(_, 0)] => anyhow::bail!("port 0 is not a valid serve port"),
+        [(kind, port)] => Ok((*kind, *port)),
+        _ => anyhow::bail!(
+            "give exactly one of --https / --http / --tcp / --tls-terminated-tcp (they name the \
+             same listener)"
+        ),
+    }
+}
+
+/// Refuse the Go v1.100.0 `serve`/`funnel` flags this build parses for grammar parity but cannot
+/// honor. Each message names the specific missing capability, so a script ported from Go learns what
+/// is absent instead of hitting clap's "unexpected argument" — and none of them silently degrades to
+/// a serve that quietly lacks the requested property.
+fn reject_unsupported_serve_flags(flags: &ServeFlags) -> Result<()> {
+    if let Some(service) = &flags.service {
+        anyhow::bail!(
+            "--service={} is not supported by this build: Tailscale Services (VIP) are a control \
+             plane + netmap feature the pinned engine does not surface, and this LocalAPI \
+             ServeConfig carries no `Services` map to write. Serve on the node itself instead \
+             (drop --service)",
+            sanitize_for_terminal(service)
+        );
+    }
+    if flags.tun {
+        anyhow::bail!(
+            "--tun is not supported by this build: the daemon's serve lanes listen on the userspace \
+             netstack, not on a kernel TUN interface. Drop --tun to serve on the netstack"
+        );
+    }
+    if let Some(version) = flags.proxy_protocol {
+        anyhow::bail!(
+            "--proxy-protocol={version} is not supported by this build: the engine's TCP serve \
+             target cannot emit a PROXY-protocol header, and the daemon fails such a config closed \
+             rather than handing the backend an unmarked stream it would attribute to the wrong \
+             client. Drop --proxy-protocol"
+        );
+    }
+    if flags.accept_app_caps {
+        anyhow::bail!(
+            "--accept-app-caps is not supported by this build: the serve lanes forward no \
+             capability headers to the backend, so the flag would promise an authorization signal \
+             that never arrives. Drop --accept-app-caps"
+        );
+    }
+    Ok(())
+}
+
+/// Strip a `tcp://` scheme from a raw-TCP serve target, then normalize it the usual way (bare port →
+/// `127.0.0.1:<port>`). Go's `ExpandProxyTargetValue` accepts `tcp://host:port` for `--tcp` /
+/// `--tls-terminated-tcp`; the stored `TCPForward` is always the bare `host:port`.
+fn normalize_tcp_serve_target(target: &str) -> String {
+    normalize_serve_target(target.strip_prefix("tcp://").unwrap_or(target))
+}
+
+/// Drop every trace of a tailnet port from the serve config: its `TCP[port]` handler, any
+/// `Web[host:port]` body, and any `AllowFunnel[host:port]` key. Used by `serve … off`.
+///
+/// The `Web`/`AllowFunnel` keys are matched by `:port` suffix across any host, the same rule
+/// `port_is_web_serve`/`web_proxy_backend` use (one node has one MagicDNS name, and the stored key
+/// may predate a rename). Returns whether anything was actually removed, so the caller can tell the
+/// operator that the port was already clear rather than printing a misleading "removed".
+fn remove_serve_port(cfg: &mut tailscaled_rs::localapi::ServeConfig, port: u16) -> bool {
+    let suffix = format!(":{port}");
+    let had_tcp = cfg.tcp.remove(&port.to_string()).is_some();
+    let web_before = cfg.web.len();
+    cfg.web.retain(|k, _| !k.ends_with(&suffix));
+    let funnel_before = cfg.allow_funnel.len();
+    cfg.allow_funnel.retain(|k, _| !k.ends_with(&suffix));
+    had_tcp || cfg.web.len() != web_before || cfg.allow_funnel.len() != funnel_before
+}
+
+/// Hold a FOREGROUND `serve`/`funnel` open until the operator interrupts it, then put `previous`
+/// back — the CLI half of Go's default (non-`--bg`) serve.
+///
+/// DEVIATION from Go, and the reason this build's foreground mode is the weaker of the two: Go ties
+/// a foreground serve to the CLI's IPN-bus watch session, so the *daemon* drops the config the
+/// instant the CLI's connection goes away — even on `SIGKILL` or a lost SSH session. This build has
+/// no such session, so the restore runs from the CLI's own signal handler: `SIGINT`/`SIGTERM` are
+/// honored, but a `SIGKILL`ed (or crashed) `tnet` leaves the serve installed. `tnet serve reset`
+/// clears it.
+async fn hold_foreground_serve(
+    socket: &std::path::Path,
+    previous: tailscaled_rs::localapi::ServeConfig,
+) -> Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigint = signal(SignalKind::interrupt()).context("installing the SIGINT handler")?;
+    let mut sigterm = signal(SignalKind::terminate()).context("installing the SIGTERM handler")?;
+    println!("Press Ctrl-C to stop serving and restore the previous serve config.");
+    tokio::select! {
+        _ = sigint.recv() => {}
+        _ = sigterm.recv() => {}
+    }
+    // The shell echoes `^C` without a newline; start the teardown report on its own line.
+    eprintln!();
+    send_ok_or_die(socket, Request::SetServeConfig { config: previous }).await?;
+    println!("serve stopped; previous serve config restored");
+    Ok(())
+}
+
+/// Drive the Go v1.100.0 flag grammar for `serve` and `funnel`: `tnet <serve|funnel> [flags]
+/// <target> [off]`. `funnel` is the same code path plus the `AllowFunnel` toggle, exactly as Go
+/// shares `serve_v2.go` between the two commands.
+///
+/// The literal `off` in either positional removes the entry for the named port. For `serve` that
+/// clears the port outright (handler, web body and any funnel key — a funnel with no serve behind it
+/// exposes nothing); for `funnel` it only switches the public ingress off and LEAVES the serve, so
+/// `funnel --https=443 off` is the exact inverse of turning it on and the tailnet-internal serve
+/// survives.
+async fn run_serve_v2(socket: &std::path::Path, flags: ServeFlags, funnel: bool) -> Result<()> {
+    reject_unsupported_serve_flags(&flags)?;
+    let (kind, port) = serve_kind_and_port(&flags)?;
+    let verb = if funnel { "funnel" } else { "serve" };
+
+    // `off` is accepted in the target position (Go `serve --https=PORT off`) and after a target (Go
+    // `serve <target> off`). Anything else in the trailing slot is a typo, not a target.
+    let trailing_off = match flags.off.as_deref() {
+        None | Some("off") => flags.off.is_some(),
+        Some(other) => anyhow::bail!(
+            "unexpected argument {:?} after the target: the only value allowed there is `off`",
+            sanitize_for_terminal(other)
+        ),
+    };
+    let off = trailing_off || flags.target.as_deref() == Some("off");
+
+    if off {
+        if flags.set_path.is_some() {
+            anyhow::bail!(
+                "--set-path cannot be combined with `off` (which removes the whole port)"
+            );
+        }
+        let mut cfg = get_serve_config(socket).await?;
+        if funnel {
+            // Funnel-off leaves the serve alone; it only withdraws the public ingress.
+            let host = serve_host(socket).await?;
+            tailscaled_rs::ipn::serve::set_funnel(&mut cfg, &host, port, false);
+            send_ok_or_die(socket, Request::SetServeConfig { config: cfg }).await?;
+            println!("funnel disabled for {host}:{port} (the serve on :{port} is untouched)");
+        } else if remove_serve_port(&mut cfg, port) {
+            send_ok_or_die(socket, Request::SetServeConfig { config: cfg }).await?;
+            println!("serve removed for :{port}");
+        } else {
+            println!("no serve configured on :{port}; nothing to remove");
+        }
+        return Ok(());
+    }
+
+    let Some(target) = flags.target.as_deref() else {
+        anyhow::bail!(
+            "{verb} needs a target: `tnet {verb} [--https=PORT|--http=PORT|--tcp=PORT|\
+             --tls-terminated-tcp=PORT] <target>` (or `tnet {verb} status` / `tnet {verb} reset`)"
+        );
+    };
+    if flags.set_path.is_some() && !kind.is_web() {
+        anyhow::bail!(
+            "--set-path applies to --https / --http only: a raw-TCP serve has no URL paths to mount"
+        );
+    }
+
+    // Every kind needs the node's MagicDNS name: it is the `Web`/`AllowFunnel` key's host half and
+    // the SNI a TLS-terminated forward is issued for. Resolving it first also fails fast, before any
+    // config is written, when the node isn't up yet.
+    let host = if kind.is_web() || kind == ServeKind::TlsTerminatedTcp || funnel {
+        Some(serve_host(socket).await?)
+    } else {
+        None
+    };
+    let previous = get_serve_config(socket).await?;
+    let mut cfg = previous.clone();
+    // What the confirmation line says we did — built per kind, printed only once the SET succeeds.
+    let what = match kind {
+        ServeKind::Https | ServeKind::Http => {
+            let host = host.as_deref().expect("web serve resolved a host above");
+            let scheme = if kind == ServeKind::Https {
+                "https"
+            } else {
+                "http"
+            };
+            cfg = build_web_serve(
+                cfg,
+                host,
+                port,
+                target,
+                flags.set_path.as_deref(),
+                kind == ServeKind::Https,
+            )?;
+            format!(
+                "{scheme}://{host}:{port}{} -> {target}",
+                mount_suffix(&flags.set_path)
+            )
+        }
+        ServeKind::Tcp => {
+            let fwd = normalize_tcp_serve_target(target);
+            cfg.tcp.insert(
+                port.to_string(),
+                tailscaled_rs::localapi::TcpPortHandler {
+                    tcp_forward: fwd.clone(),
+                    ..Default::default()
+                },
+            );
+            // Repurposing a port from a web serve to a plain TCP forward must drop the stale
+            // `Web[host:port]` body a prior `--https` left behind: Go keeps `TCP[port]` and
+            // `Web[hostport]` consistent, and an orphan would leave a phantom proxy in the persisted
+            // config that a Go tool (or a future Web-consulting path) could act on.
+            let suffix = format!(":{port}");
+            cfg.web.retain(|k, _| !k.ends_with(&suffix));
+            format!("tcp :{port} -> {fwd}")
+        }
+        ServeKind::TlsTerminatedTcp => {
+            let host = host
+                .as_deref()
+                .expect("tls-terminated serve resolved a host above");
+            let fwd = normalize_tcp_serve_target(target);
+            cfg.tcp.insert(
+                port.to_string(),
+                tailscaled_rs::localapi::TcpPortHandler {
+                    // Go stores the node's DNS name as the SNI to terminate for; the daemon's
+                    // `is_terminate_tls_serve` lane then splices the plaintext to `TCPForward`.
+                    terminate_tls: host.to_string(),
+                    tcp_forward: fwd.clone(),
+                    ..Default::default()
+                },
+            );
+            let suffix = format!(":{port}");
+            cfg.web.retain(|k, _| !k.ends_with(&suffix));
+            format!("tls+tcp {host}:{port} -> {fwd} (TLS-terminated)")
         }
     };
-    match cmd {
-        ServeCmd::Status { json } => {
-            let cfg = get_cfg().await?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&cfg)?);
-            } else {
-                print!("{}", format_serve_status(&cfg, false));
-            }
-            Ok(())
+    if funnel {
+        let host = host.as_deref().expect("funnel resolved a host above");
+        tailscaled_rs::ipn::serve::set_funnel(&mut cfg, host, port, true);
+    }
+    // The funnel lane splices the public TLS-terminated stream to the port's PROXY backend, so it
+    // arms only for a web serve WITH one. Check the exact condition `arm_funnel_lane` uses, before
+    // the config leaves this process, so a funnel over `--tcp` / `--tls-terminated-tcp` / a
+    // `text:`-only serve says so here instead of only in the daemon log.
+    let funnel_has_backend =
+        funnel && tailscaled_rs::ipn::serve::web_proxy_backend(&cfg, port).is_some();
+
+    send_ok_or_die(socket, Request::SetServeConfig { config: cfg }).await?;
+    println!("serving {what}");
+    if funnel {
+        let host = host.as_deref().expect("funnel resolved a host above");
+        if funnel_has_backend {
+            println!("funnel enabled: https://{host}:{port} is reachable from the PUBLIC internet");
+        } else {
+            // Don't claim public reachability the daemon is about to decline to provide.
+            println!("funnel enabled for {host}:{port}");
+            eprintln!(
+                "warning: {host}:{port} has no web proxy backend, so this build will NOT arm the \
+                 public ingress — funnel splices to a `--https`/`--http` serve's proxy target, not \
+                 to a raw-TCP or `text:` serve"
+            );
         }
+    }
+
+    if flags.bg {
+        Ok(())
+    } else {
+        hold_foreground_serve(socket, previous).await
+    }
+}
+
+/// Drive `tnet serve`: the Go v1.100.0 flag grammar when no sub-verb is given, or one of this
+/// fork's positional sub-verbs (`tcp`/`https`/`http`/`redirect`) plus `status`/`reset`.
+///
+/// The sub-verbs predate the flag grammar here and are kept as a documented superset — `redirect` in
+/// particular has no Go counterpart at v1.100.0 (the engine serves one, Go's CLI just cannot ask for
+/// it). Both grammars write the same `ServeConfig`, and every set is a read-modify-write: the daemon
+/// replaces the config wholesale on SET (matching Go's `SetServeConfig`), so each one first fetches
+/// the current config and adds its entry.
+async fn run_serve(
+    socket: &std::path::Path,
+    cmd: Option<ServeCmd>,
+    flags: ServeFlags,
+) -> Result<()> {
+    let Some(cmd) = cmd else {
+        return run_serve_v2(socket, flags, false).await;
+    };
+    let get_cfg = || get_serve_config(socket);
+    match cmd {
+        ServeCmd::Status { json } => run_serve_status(socket, json).await,
         ServeCmd::Tcp { port, target } => {
             let mut cfg = get_cfg().await?;
             let fwd = normalize_serve_target(&target);
@@ -8043,26 +8660,70 @@ async fn run_serve(socket: &std::path::Path, cmd: ServeCmd) -> Result<()> {
             println!("serving https://{host}:{port} -> redirect {status} -> {to}");
             Ok(())
         }
-        ServeCmd::Reset => {
-            send_ok_or_die(
-                socket,
-                Request::SetServeConfig {
-                    config: ServeConfig::default(),
-                },
-            )
-            .await?;
-            println!("serve config cleared");
-            Ok(())
-        }
+        ServeCmd::Reset => run_serve_reset(socket).await,
     }
 }
 
-/// Drive `tnet funnel <port> {on|off}` (Go `tailscale funnel`): resolve this node's MagicDNS name
-/// (the Funnel `HostPort` key), then read-modify-write the ServeConfig's `AllowFunnel` via
+/// Drive `tnet funnel`: `status`/`reset` (Go aliases for the `serve` ones), the legacy
+/// `funnel <port> on|off` toggle, or the Go v1.100.0 flag grammar.
+///
+/// The legacy form is detected exactly the way Go detects its own v1 funnel grammar: a bare port in
+/// the target slot followed by the literal `on` or `off`, with none of the port flags given. It only
+/// flips `AllowFunnel`; the flag grammar (`tnet funnel --https=443 <target>`) configures the serve
+/// AND the funnel in one call, like Go.
+async fn run_funnel(
+    socket: &std::path::Path,
+    cmd: Option<FunnelCmd>,
+    flags: ServeFlags,
+) -> Result<()> {
+    match cmd {
+        Some(FunnelCmd::Status { json }) => return run_serve_status(socket, json).await,
+        Some(FunnelCmd::Reset) => return run_serve_reset(socket).await,
+        None => {}
+    }
+    if let Some((port, on)) = legacy_funnel_toggle(&flags) {
+        reject_unsupported_serve_flags(&flags)?;
+        return run_funnel_toggle(socket, port, on).await;
+    }
+    run_serve_v2(socket, flags, true).await
+}
+
+/// Recognize the fork's legacy `tnet funnel <port> on|off` toggle inside the shared flag grammar,
+/// returning `(port, on)` when it matches. Pure → unit-testable.
+///
+/// The shape is a bare port in the target slot followed by the literal `on` or `off`, with none of
+/// the four port flags given — the same discrimination Go uses to keep its own v1 funnel grammar
+/// alive alongside `serve_v2.go`'s. `on` is not a word the flag grammar has, so `funnel <port> on`
+/// can only be the legacy form.
+///
+/// `funnel <bare-port> off` IS ambiguous, and this build resolves it the legacy way: it turns the
+/// funnel off on `<bare-port>`, whereas Go would read `<bare-port>` as a target and turn the funnel
+/// off on the default port 443. Deliberate — silently retargeting an existing `tnet funnel 8443 off`
+/// at port 443 would report success while leaving 8443 exposed to the public internet, which is a
+/// far worse failure than the divergence. Spell the port flag (`funnel --https=443 off`) to get
+/// Go's reading.
+fn legacy_funnel_toggle(flags: &ServeFlags) -> Option<(u16, bool)> {
+    let no_port_flag = flags.https.is_none()
+        && flags.http.is_none()
+        && flags.tcp.is_none()
+        && flags.tls_terminated_tcp.is_none();
+    if !no_port_flag {
+        return None;
+    }
+    let on_off = flags.off.as_deref()?;
+    if !matches!(on_off, "on" | "off") {
+        return None;
+    }
+    let port = flags.target.as_deref()?.parse::<u16>().ok()?;
+    Some((port, on_off == "on"))
+}
+
+/// Drive the legacy `tnet funnel <port> {on|off}` toggle: resolve this node's MagicDNS name (the
+/// Funnel `HostPort` key), then read-modify-write the ServeConfig's `AllowFunnel` via
 /// [`serve::set_funnel`]. On `on` for a port with no serve handler, prints a Go-faithful warning
-/// (Funnel exposes a serve, so a bare funnel-on does nothing until `serve https <port> …` is set).
-async fn run_funnel(socket: &std::path::Path, port: u16, on_off: &str) -> Result<()> {
-    let on = on_off == "on";
+/// (Funnel exposes a serve, so a bare funnel-on does nothing until a serve is configured on the
+/// port). Unlike the flag grammar this touches ONLY `AllowFunnel` — it configures no serve.
+async fn run_funnel_toggle(socket: &std::path::Path, port: u16, on: bool) -> Result<()> {
     // The node's MagicDNS name (from Status.self_name) is the Funnel HostPort key. Without it we
     // can't build the `host:port` key Go uses, so require the node to be up + named.
     let status = match round_trip(socket, &Request::Status).await {
@@ -8099,8 +8760,8 @@ async fn run_funnel(socket: &std::path::Path, port: u16, on_off: &str) -> Result
         if !has_proxy_backend {
             eprintln!(
                 "warning: funnel=on for {host}:{port}, but no proxy backend on that port — run \
-                 `tnet serve https {port} <target>` so there is something to expose (funnel splices to \
-                 the serve's proxy backend)"
+                 `tnet funnel --https={port} <target>` (or `tnet serve https {port} <target>`) so \
+                 there is something to expose (funnel splices to the serve's proxy backend)"
             );
         }
     } else {
@@ -10475,6 +11136,83 @@ mod tests {
         assert_eq!(v["disabled"], serde_json::json!(true));
     }
 
+    /// `lock log` (Go `tailscale lock log`) over a synthesised daemon report: the stanza shape,
+    /// newest-first order, the unsigned (genesis) row, and the JSON object.
+    #[test]
+    fn format_lock_log_human_and_json() {
+        use tailscaled_rs::localapi::{LockLogEntry, LockLogReport};
+        let report = LockLogReport {
+            enabled: true,
+            entries: vec![
+                LockLogEntry {
+                    hash: "AAAAQ".into(),
+                    change: "add-key".into(),
+                    signer_key_ids: vec!["tlpub:aabb".into(), "tlpub:ccdd".into()],
+                    raw: "a1626b76".into(),
+                },
+                LockLogEntry {
+                    hash: "BBBBQ".into(),
+                    change: "checkpoint".into(),
+                    signer_key_ids: vec![],
+                    raw: "a1626370".into(),
+                },
+            ],
+        };
+        let h = format_lock_log(&report, false);
+        assert_eq!(
+            h,
+            "update AAAAQ (add-key)\n  signed by: tlpub:aabb, tlpub:ccdd\n\n\
+             update BBBBQ (checkpoint)\n  signed by: (unsigned)\n\n",
+            "one stanza per update, head-first, blank line between them"
+        );
+        // Head-first: the engine returns newest → oldest and the renderer must not re-order.
+        assert!(
+            h.find("AAAAQ") < h.find("BBBBQ"),
+            "newest update must print first: {h}"
+        );
+        // The raw CBOR is deliberately NOT in the human output (Go prints decoded detail, which this
+        // build cannot produce; the bytes are `--json`-only).
+        assert!(!h.contains("a1626b76"), "{h}");
+
+        let j = format_lock_log(&report, true);
+        let v: serde_json::Value = serde_json::from_str(&j).unwrap();
+        assert_eq!(v["enabled"], serde_json::json!(true));
+        assert_eq!(v["entries"].as_array().unwrap().len(), 2);
+        assert_eq!(v["entries"][0]["hash"], serde_json::json!("AAAAQ"));
+        assert_eq!(v["entries"][0]["change"], serde_json::json!("add-key"));
+        assert_eq!(
+            v["entries"][0]["signer_key_ids"],
+            serde_json::json!(["tlpub:aabb", "tlpub:ccdd"])
+        );
+        // Raw CBOR IS carried in JSON, so the full AUM can be decoded out-of-band.
+        assert_eq!(v["entries"][0]["raw"], serde_json::json!("a1626b76"));
+    }
+
+    /// The two empty histories must be distinguishable in words, not an empty table: lock off vs.
+    /// lock on with nothing synced to this node yet.
+    #[test]
+    fn format_lock_log_empty_says_which_empty_it_is() {
+        use tailscaled_rs::localapi::LockLogReport;
+        // Lock not in use: the same sentence `lock status` prints, so the two verbs agree.
+        let off = LockLogReport::default();
+        assert_eq!(
+            format_lock_log(&off, false),
+            "Tailnet Lock is NOT enabled.\n\n"
+        );
+        // Lock in use, but this node has synced no chain yet.
+        let on_but_empty = LockLogReport {
+            enabled: true,
+            entries: vec![],
+        };
+        let h = format_lock_log(&on_but_empty, false);
+        assert!(h.starts_with("Tailnet Lock is ENABLED,"), "{h}");
+        assert!(h.contains("no update-chain history has synced"), "{h}");
+        // JSON stays a well-formed object with an empty list in both cases (no null, no bare array).
+        let v: serde_json::Value = serde_json::from_str(&format_lock_log(&off, true)).unwrap();
+        assert_eq!(v["enabled"], serde_json::json!(false));
+        assert_eq!(v["entries"], serde_json::json!([]));
+    }
+
     #[test]
     fn format_dns_status_populated_human_and_json() {
         use tailscaled_rs::localapi::DnsStatusReport;
@@ -11042,6 +11780,47 @@ mod tests {
     }
 
     #[test]
+    fn switch_usage_refusal_matches_gos_order_and_messages() {
+        // Ported from Go's `switchProfile` (`cmd/tailscale/cli/switch.go`), whose three checks run in
+        // this order. Each case below is one of Go's branches.
+
+        // `--list` is handled first, so every flag/arg combination under it is usable: plain list,
+        // JSON list, and a stray target next to `--list` (Go ignores the args entirely once listing).
+        assert_eq!(switch_usage_refusal(true, false, None, false), None);
+        assert_eq!(switch_usage_refusal(true, true, None, false), None);
+        assert_eq!(switch_usage_refusal(true, true, Some("work"), false), None);
+
+        // `--json` WITHOUT `--list` is refused — with or without a target, because `--json` only ever
+        // formats the listing. Go: `--json argument cannot be used with tailscale switch NAME`.
+        assert_eq!(
+            switch_usage_refusal(false, true, Some("work"), false),
+            Some("--json argument cannot be used with tnet switch NAME")
+        );
+        assert_eq!(
+            switch_usage_refusal(false, true, None, false),
+            Some("--json argument cannot be used with tnet switch NAME"),
+            "the --json refusal precedes the usage line, as in Go"
+        );
+
+        // No target, no `--list`, no `--json` → the usage line.
+        assert_eq!(
+            switch_usage_refusal(false, false, None, false),
+            Some("usage: tnet switch NAME")
+        );
+
+        // A plain target is usable.
+        assert_eq!(
+            switch_usage_refusal(false, false, Some("work"), false),
+            None
+        );
+
+        // The `remove` subcommand is exempt from all of it: Go's ffcli dispatches the subcommand
+        // before `switch`'s own Exec runs, so `switch`'s flag rules never apply to it.
+        assert_eq!(switch_usage_refusal(false, false, None, true), None);
+        assert_eq!(switch_usage_refusal(false, true, None, true), None);
+    }
+
+    #[test]
     fn format_profiles_marks_current() {
         use tailscaled_rs::localapi::ProfileEntry;
         let out = format_profiles(&[
@@ -11436,6 +12215,224 @@ mod tests {
         let out = format_serve_status(&cfg, false);
         assert!(out.contains("Funnel (on the public internet):"), "{out}");
         assert!(out.contains("https://<node>:443"), "{out}");
+    }
+
+    /// Parse helper for the flag-grammar tests: run the real clap parser over a `tnet serve …`
+    /// command line and hand back the `Serve` variant's parts.
+    fn parse_serve(argv: &[&str]) -> (Option<ServeCmd>, ServeFlags) {
+        let mut args = vec!["tnet", "serve"];
+        args.extend_from_slice(argv);
+        match Cli::try_parse_from(args).expect("serve command line must parse") {
+            Cli {
+                command: Command::Serve { cmd, flags },
+                ..
+            } => (cmd, flags),
+            _ => panic!("expected a serve command for {argv:?}"),
+        }
+    }
+
+    /// Same, for `tnet funnel …`.
+    fn parse_funnel(argv: &[&str]) -> (Option<FunnelCmd>, ServeFlags) {
+        let mut args = vec!["tnet", "funnel"];
+        args.extend_from_slice(argv);
+        match Cli::try_parse_from(args).expect("funnel command line must parse") {
+            Cli {
+                command: Command::Funnel { cmd, flags },
+                ..
+            } => (cmd, flags),
+            _ => panic!("expected a funnel command for {argv:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_accepts_the_go_flag_grammar_and_the_fork_sub_verbs() {
+        // Go v1.100.0: `tailscale serve --https=443 localhost:3000`.
+        let (cmd, flags) = parse_serve(&["--https=443", "localhost:3000"]);
+        assert!(
+            cmd.is_none(),
+            "the flag grammar must not consume a sub-verb"
+        );
+        assert_eq!(flags.https, Some(443));
+        assert_eq!(flags.target.as_deref(), Some("localhost:3000"));
+        assert!(!flags.bg, "Go's default is the foreground");
+
+        // Go's every-flag form, including the ones this build refuses at runtime.
+        let (_, flags) = parse_serve(&[
+            "--bg",
+            "--tls-terminated-tcp=8443",
+            "--proxy-protocol=2",
+            "--service=svc:web",
+            "--tun",
+            "--accept-app-caps",
+            "--yes",
+            "tcp://127.0.0.1:5432",
+        ]);
+        assert!(flags.bg);
+        assert_eq!(flags.tls_terminated_tcp, Some(8443));
+        assert_eq!(flags.proxy_protocol, Some(2));
+        assert_eq!(flags.service.as_deref(), Some("svc:web"));
+        assert!(flags.tun && flags.accept_app_caps && flags.yes);
+
+        // The subcommands still win over the positional target when the word matches one.
+        assert!(matches!(
+            parse_serve(&["status", "--json"]).0,
+            Some(ServeCmd::Status { json: true })
+        ));
+        assert!(matches!(parse_serve(&["reset"]).0, Some(ServeCmd::Reset)));
+        assert!(matches!(
+            parse_serve(&["https", "8443", "localhost:3000"]).0,
+            Some(ServeCmd::Https { port: 8443, .. })
+        ));
+        // …and the fork-only `redirect` verb is untouched by the new grammar.
+        assert!(matches!(
+            parse_serve(&["redirect", "443", "https://example.com"]).0,
+            Some(ServeCmd::Redirect { port: 443, .. })
+        ));
+
+        // Two port flags name one listener: clap rejects the pair outright.
+        assert!(
+            Cli::try_parse_from(["tnet", "serve", "--https=443", "--tcp=22", "x"]).is_err(),
+            "--https and --tcp must conflict"
+        );
+    }
+
+    #[test]
+    fn serve_defaults_to_https_443_like_go() {
+        // serve_v2.go: with no port flag the listener is HTTPS on 443.
+        let (_, flags) = parse_serve(&["localhost:3000"]);
+        assert_eq!(
+            serve_kind_and_port(&flags).unwrap(),
+            (ServeKind::Https, 443)
+        );
+
+        for (argv, want) in [
+            (vec!["--http=80", "x"], (ServeKind::Http, 80u16)),
+            (vec!["--tcp=2222", "x"], (ServeKind::Tcp, 2222)),
+            (
+                vec!["--tls-terminated-tcp=8443", "x"],
+                (ServeKind::TlsTerminatedTcp, 8443),
+            ),
+        ] {
+            let (_, flags) = parse_serve(&argv);
+            assert_eq!(serve_kind_and_port(&flags).unwrap(), want, "{argv:?}");
+        }
+
+        // Port 0 is a parse-able u16 but not a listener.
+        let (_, flags) = parse_serve(&["--https=0", "x"]);
+        assert!(serve_kind_and_port(&flags).is_err());
+    }
+
+    #[test]
+    fn unsupported_serve_flags_are_refused_by_name() {
+        for (argv, needle) in [
+            (vec!["--service=svc:web", "x"], "--service=svc:web"),
+            (vec!["--tun", "x"], "--tun"),
+            (vec!["--proxy-protocol=1", "x"], "--proxy-protocol=1"),
+            (vec!["--accept-app-caps", "x"], "--accept-app-caps"),
+        ] {
+            let (_, flags) = parse_serve(&argv);
+            let err = reject_unsupported_serve_flags(&flags)
+                .expect_err("this build cannot honor this flag")
+                .to_string();
+            assert!(err.contains(needle), "{err}");
+            assert!(
+                err.contains("not supported by this build"),
+                "the message must say it is a build gap, not a syntax error: {err}"
+            );
+        }
+        // Everything this build DOES honor passes, `--yes` (an accepted no-op) included.
+        let (_, flags) = parse_serve(&["--bg", "--yes", "--set-path=/api", "3000"]);
+        assert!(reject_unsupported_serve_flags(&flags).is_ok());
+    }
+
+    #[test]
+    fn tcp_serve_target_accepts_gos_tcp_scheme() {
+        // Go's ExpandProxyTargetValue takes `tcp://host:port` for --tcp/--tls-terminated-tcp; the
+        // stored TCPForward is always the bare host:port.
+        assert_eq!(
+            normalize_tcp_serve_target("tcp://192.0.2.10:5432"),
+            "192.0.2.10:5432"
+        );
+        assert_eq!(normalize_tcp_serve_target("5432"), "127.0.0.1:5432");
+        assert_eq!(
+            normalize_tcp_serve_target("192.0.2.10:5432"),
+            "192.0.2.10:5432"
+        );
+    }
+
+    #[test]
+    fn serve_off_clears_the_handler_the_web_body_and_the_funnel_key() {
+        use tailscaled_rs::ipn::serve;
+        use tailscaled_rs::localapi::{HttpHandler, ServeConfig, TcpPortHandler, WebServerConfig};
+        let mut cfg = ServeConfig::default();
+        cfg.tcp.insert(
+            "443".into(),
+            TcpPortHandler {
+                https: true,
+                ..Default::default()
+            },
+        );
+        cfg.web.insert(
+            "host.example.ts.net:443".into(),
+            WebServerConfig {
+                handlers: [(
+                    "/".to_string(),
+                    HttpHandler {
+                        proxy: "127.0.0.1:3000".into(),
+                        ..Default::default()
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            },
+        );
+        serve::set_funnel(&mut cfg, "host.example.ts.net", 443, true);
+        // An untouched port on the side must survive the removal.
+        cfg.tcp.insert(
+            "8443".into(),
+            TcpPortHandler {
+                tcp_forward: "127.0.0.1:9000".into(),
+                ..Default::default()
+            },
+        );
+
+        assert!(remove_serve_port(&mut cfg, 443));
+        assert!(!cfg.tcp.contains_key("443"));
+        assert!(cfg.web.is_empty(), "the Web body must go with the handler");
+        assert!(
+            cfg.allow_funnel.is_empty(),
+            "a funnel with no serve behind it exposes nothing"
+        );
+        assert!(cfg.tcp.contains_key("8443"), "other ports are untouched");
+
+        // Removing a port that was never served changes nothing and says so.
+        assert!(!remove_serve_port(&mut cfg, 443));
+    }
+
+    #[test]
+    fn funnel_keeps_the_legacy_toggle_and_adds_the_flag_grammar() {
+        // Legacy: `tnet funnel <port> on|off`.
+        let (cmd, flags) = parse_funnel(&["8443", "on"]);
+        assert!(cmd.is_none());
+        assert_eq!(legacy_funnel_toggle(&flags), Some((8443, true)));
+        let (_, flags) = parse_funnel(&["8443", "off"]);
+        assert_eq!(legacy_funnel_toggle(&flags), Some((8443, false)));
+
+        // Go grammar: a target that is not a bare port, or any explicit port flag, is NOT the
+        // legacy toggle.
+        let (_, flags) = parse_funnel(&["--https=443", "localhost:3000"]);
+        assert_eq!(legacy_funnel_toggle(&flags), None);
+        let (_, flags) = parse_funnel(&["--https=443", "off"]);
+        assert_eq!(legacy_funnel_toggle(&flags), None);
+        let (_, flags) = parse_funnel(&["localhost:3000"]);
+        assert_eq!(legacy_funnel_toggle(&flags), None);
+
+        // Go's `funnel status` / `funnel reset` aliases.
+        assert!(matches!(
+            parse_funnel(&["status", "--json"]).0,
+            Some(FunnelCmd::Status { json: true })
+        ));
+        assert!(matches!(parse_funnel(&["reset"]).0, Some(FunnelCmd::Reset)));
     }
 
     #[test]
