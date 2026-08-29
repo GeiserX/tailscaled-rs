@@ -1031,12 +1031,17 @@ async fn dispatch(
         // the backend lock across the multi-second `Device::new` handshake. The daemon re-reads + merges
         // + persists under a brief lock, then rebuilds off-lock if a device is up; a node-down reload
         // just persists (applies on the next `up`). `reload_config` fails clearly when there is no
-        // `--config` in use or the file is now malformed (running node untouched).
+        // `--config` in use or the file is now malformed (running node untouched). The reconciled
+        // `ReloadAction` comes back so the success message can say which of those happened.
         Request::ReloadConfig => match ipn::drive_reload_config(backend).await {
-            Ok(()) => {
-                tracing::info!("reload-config reconciled");
+            // The reconcile that actually ran decides the confirmation: a generic "reloaded" cannot
+            // tell the operator whether their edit is RUNNING (the engine was rebuilt), whether it
+            // STOPPED the node (a reloaded `Enabled:false`), or whether it is only on disk awaiting
+            // the next `up` (node down). `ReloadAction::outcome_message` owns those strings.
+            Ok(action) => {
+                tracing::info!(?action, "reload-config reconciled");
                 Response::Ok {
-                    message: "configuration reloaded".to_string(),
+                    message: action.outcome_message().to_string(),
                 }
             }
             Err(e) => Response::Error {
