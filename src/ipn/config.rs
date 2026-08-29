@@ -106,6 +106,27 @@ pub(super) async fn build_config(
     // in prefs (validated at the `up`/`set` boundary), mapped verbatim to the engine's
     // `requested_tags`. Empty = a user-owned node.
     config.requested_tags = prefs.advertise_tags.clone();
+    // The Go `up`/`set` pref flags that map 1:1 onto engine `Config` fields. Two groups, and the
+    // difference decides how `set` reconciles a RUNNING node (see `SetOptions::needs_rebuild`):
+    //
+    // (a) ADVERTISED — these cross the control wire. The engine folds `advertise_app_connector` into
+    //     `Hostinfo.AppConnector` and `auto_update_apply == Some(true)` into `Hostinfo.AllowsUpdate`,
+    //     at registration AND on every map request. They are construction-time `Config` fields with
+    //     no runtime setter, so changing one on a live node requires rebuilding the device.
+    // (b) CARRIED — the engine stores them (threading each to `ts_control::Config`) but never acts on
+    //     them and never sends them; its own field docs say so. The daemon is the layer that would
+    //     act on them, and today it doesn't either (see each `Prefs` field's doc for exactly what is
+    //     and isn't implemented). They are set here anyway so the engine's pref state is the faithful
+    //     mirror of Go's and a future consumer — in either layer — reads the operator's real intent
+    //     instead of a default.
+    config.advertise_app_connector = prefs.advertise_app_connector;
+    config.auto_update_apply = prefs.auto_update_apply;
+    config.auto_update_check = prefs.auto_update_check;
+    config.operator_user = prefs.operator_user.clone();
+    config.node_nickname = prefs.node_nickname.clone();
+    config.posture_checking = prefs.posture_checking;
+    config.run_web_client = prefs.run_web_client;
+    config.exit_node_allow_lan_access = prefs.exit_node_allow_lan_access;
     // Apply a custom control server when prefs carry one; this wins over `TS_CONTROL_URL` and
     // the engine default. A malformed URL fails loudly rather than silently falling back —
     // pointing at the wrong control plane must never be silent. Only `http`/`https` are accepted
@@ -272,6 +293,220 @@ mod tests {
             .expect("build_config should succeed");
         let _ = std::fs::remove_file(&key_path);
         cfg
+    }
+
+    /// `build_config` over the given prefs with a throwaway key path. Parallel-safe (unique path per
+    /// call, like the helpers above).
+    async fn config_for_prefs(prefs: &Prefs) -> tailscale::Config {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let key_path = std::env::temp_dir().join(format!(
+            "tailnetd-prefcfgtest-{}-{}.key",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cfg = build_config(prefs, &key_path, None)
+            .await
+            .expect("build_config should succeed");
+        let _ = std::fs::remove_file(&key_path);
+        cfg
+    }
+
+    #[tokio::test]
+    async fn advertise_connector_reaches_the_engine_config() {
+        // Go `tailscale up/set --advertise-connector` → `ipn.Prefs.AppConnector.Advertise`. WIRE
+        // pref: the engine folds it into `Hostinfo.AppConnector` at register + every map request.
+        let off = config_for_prefs(&Prefs::default()).await;
+        assert!(!off.advertise_app_connector, "default is not advertising");
+        let on = config_for_prefs(&Prefs {
+            advertise_app_connector: true,
+            ..Prefs::default()
+        })
+        .await;
+        assert!(
+            on.advertise_app_connector,
+            "the app-connector pref must reach Config.advertise_app_connector"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_update_apply_reaches_the_engine_config_as_a_tristate() {
+        // Go `tailscale set --auto-update` → `ipn.Prefs.AutoUpdate.Apply` (an `opt.Bool`). WIRE pref:
+        // `Some(true)` sets `Hostinfo.AllowsUpdate`. All THREE states must survive the seam — an
+        // explicit `Some(false)` must not collapse into the unstated `None`.
+        let unset = config_for_prefs(&Prefs::default()).await;
+        assert_eq!(unset.auto_update_apply, None, "default is unstated");
+        let on = config_for_prefs(&Prefs {
+            auto_update_apply: Some(true),
+            ..Prefs::default()
+        })
+        .await;
+        assert_eq!(on.auto_update_apply, Some(true));
+        let off = config_for_prefs(&Prefs {
+            auto_update_apply: Some(false),
+            ..Prefs::default()
+        })
+        .await;
+        assert_eq!(
+            off.auto_update_apply,
+            Some(false),
+            "an explicit --no-auto-update must stay distinct from never-stated"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_check_reaches_the_engine_config_and_defaults_on() {
+        // Go `tailscale set --update-check` → `ipn.Prefs.AutoUpdate.Check`, default TRUE
+        // (`ipn.NewPrefs`). Carried pref: stored, never advertised.
+        let dflt = config_for_prefs(&Prefs::default()).await;
+        assert!(
+            dflt.auto_update_check,
+            "the Go default (Check: true) must reach the engine Config"
+        );
+        let off = config_for_prefs(&Prefs {
+            auto_update_check: false,
+            ..Prefs::default()
+        })
+        .await;
+        assert!(!off.auto_update_check);
+    }
+
+    #[tokio::test]
+    async fn operator_reaches_the_engine_config() {
+        // Go `tailscale up/set --operator` → `ipn.Prefs.OperatorUser`. Carried pref.
+        let none = config_for_prefs(&Prefs::default()).await;
+        assert_eq!(none.operator_user, None);
+        let set = config_for_prefs(&Prefs {
+            operator_user: Some("alice".into()),
+            ..Prefs::default()
+        })
+        .await;
+        assert_eq!(set.operator_user.as_deref(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn nickname_reaches_the_engine_config() {
+        // Go `tailscale set --nickname` → `ipn.Prefs.ProfileName`. Carried pref.
+        let none = config_for_prefs(&Prefs::default()).await;
+        assert_eq!(none.node_nickname, None);
+        let set = config_for_prefs(&Prefs {
+            node_nickname: Some("laptop".into()),
+            ..Prefs::default()
+        })
+        .await;
+        assert_eq!(set.node_nickname.as_deref(), Some("laptop"));
+    }
+
+    #[tokio::test]
+    async fn report_posture_reaches_the_engine_config() {
+        // Go `tailscale up/set --report-posture` → `ipn.Prefs.PostureChecking`. Carried pref: there
+        // is deliberately no Hostinfo field, because posture is a c2n PULL this fork does not serve.
+        let off = config_for_prefs(&Prefs::default()).await;
+        assert!(!off.posture_checking);
+        let on = config_for_prefs(&Prefs {
+            posture_checking: true,
+            ..Prefs::default()
+        })
+        .await;
+        assert!(on.posture_checking);
+    }
+
+    #[tokio::test]
+    async fn webclient_reaches_the_engine_config() {
+        // Go `tailscale set --webclient` → `ipn.Prefs.RunWebClient`. Carried pref: no web server is
+        // started by either layer.
+        let off = config_for_prefs(&Prefs::default()).await;
+        assert!(!off.run_web_client);
+        let on = config_for_prefs(&Prefs {
+            run_web_client: true,
+            ..Prefs::default()
+        })
+        .await;
+        assert!(on.run_web_client);
+    }
+
+    #[tokio::test]
+    async fn exit_node_allow_lan_access_reaches_the_engine_config() {
+        // Go `tailscale up/set --exit-node-allow-lan-access` → `ipn.Prefs.ExitNodeAllowLANAccess`.
+        // Carried pref: an OS-router route-shaping flag with no host-route layer to shape here.
+        let off = config_for_prefs(&Prefs::default()).await;
+        assert!(!off.exit_node_allow_lan_access);
+        let on = config_for_prefs(&Prefs {
+            exit_node_allow_lan_access: true,
+            ..Prefs::default()
+        })
+        .await;
+        assert!(on.exit_node_allow_lan_access);
+    }
+
+    #[tokio::test]
+    async fn wire_advertised_prefs_reach_the_control_config_register_and_map_requests_read() {
+        // The two prefs that genuinely cross the control wire must survive the LAST seam the daemon
+        // can observe: `tailscale::Config` → `ts_control::Config`. That struct is exactly what the
+        // engine's registration (`ts_control/src/tokio/register.rs`, `app_connector:
+        // Some(config.advertise_app_connector)` / `allows_update: config.auto_update_apply ==
+        // Some(true)`) and every streaming map request (`ts_control/src/tokio/client.rs`,
+        // `.app_connector(...)` / `.allows_update(...)`) read when they build `HostInfo`. The
+        // MapRequest builder itself is private to the engine, so this is the furthest the daemon can
+        // assert — and it is the point where a dropped daemon→engine mapping would actually show up.
+        let advertising = config_for_prefs(&Prefs {
+            advertise_app_connector: true,
+            auto_update_apply: Some(true),
+            ..Prefs::default()
+        })
+        .await;
+        let control: ts_control::Config = (&advertising).into();
+        assert!(
+            control.advertise_app_connector,
+            "--advertise-connector must reach the control config that fills HostInfo.AppConnector"
+        );
+        assert_eq!(
+            control.auto_update_apply,
+            Some(true),
+            "--auto-update must reach the control config that fills HostInfo.AllowsUpdate"
+        );
+
+        // A default node advertises neither (`AppConnector:false`, `AllowsUpdate` omitted), so the
+        // daemon must not silently opt a node into either.
+        let plain: ts_control::Config = (&config_for_prefs(&Prefs::default()).await).into();
+        assert!(!plain.advertise_app_connector);
+        assert_eq!(plain.auto_update_apply, None);
+
+        // `--no-auto-update` is an explicit decline, NOT "never stated": the engine gates
+        // `AllowsUpdate` on `== Some(true)`, so both are off the wire, but the pref must stay
+        // distinguishable end-to-end (Go's `opt.Bool`).
+        let declined: ts_control::Config = (&config_for_prefs(&Prefs {
+            auto_update_apply: Some(false),
+            ..Prefs::default()
+        })
+        .await)
+            .into();
+        assert_eq!(declined.auto_update_apply, Some(false));
+    }
+
+    #[tokio::test]
+    async fn carried_prefs_reach_the_control_config_but_are_never_advertised() {
+        // The six CARRIED prefs are threaded on to `ts_control::Config` too (that is where the engine
+        // parks them), so a downstream consumer sees the operator's real intent. Nothing in
+        // register.rs / client.rs reads them, which is why `tnet set` does not rebuild for them —
+        // pin the threading so a future engine that DOES advertise one is a visible change here.
+        let control: ts_control::Config = (&config_for_prefs(&Prefs {
+            auto_update_check: false,
+            operator_user: Some("alice".into()),
+            node_nickname: Some("laptop".into()),
+            posture_checking: true,
+            run_web_client: true,
+            exit_node_allow_lan_access: true,
+            ..Prefs::default()
+        })
+        .await)
+            .into();
+        assert!(!control.auto_update_check);
+        assert_eq!(control.operator_user.as_deref(), Some("alice"));
+        assert_eq!(control.node_nickname.as_deref(), Some("laptop"));
+        assert!(control.posture_checking);
+        assert!(control.run_web_client);
+        assert!(control.exit_node_allow_lan_access);
     }
 
     #[tokio::test]

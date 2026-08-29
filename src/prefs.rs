@@ -83,6 +83,91 @@ pub struct Prefs {
     /// policy-mapped local user); the daemon fails loudly otherwise. Default `false` — SSH is a
     /// remote-shell surface, opt-in at both build and runtime.
     pub ssh_enabled: bool,
+    /// Advertise this node as an **app connector** (Go `tailscale up/set --advertise-connector` /
+    /// `ipn.Prefs.AppConnector.Advertise`). Maps to the engine `Config.advertise_app_connector`.
+    ///
+    /// **This one crosses the control wire.** The engine sets `Hostinfo.AppConnector` from it at
+    /// registration *and* on every map request, so control persistently sees the advertised role.
+    /// It advertises the *capability* only — the app-connector data path (control-pushed connector
+    /// domains, the 4via6 domain→route mapping, the per-domain DNS observation that learns target
+    /// IPs) is a separate subsystem neither this daemon nor the engine implements, so an advertising
+    /// node serves no connector traffic. That is identical in effect to Go advertising the bool
+    /// before control has assigned any domains. Default `false`.
+    pub advertise_app_connector: bool,
+    /// Opt in to admin-console-triggered auto-updates (Go `tailscale set --auto-update` /
+    /// `ipn.Prefs.AutoUpdate.Apply`). Tri-state, mirroring Go's `opt.Bool`: `None` = never stated
+    /// (Go's `"unset"`, the default), `Some(false)` = explicitly off, `Some(true)` = on. Maps to the
+    /// engine `Config.auto_update_apply`.
+    ///
+    /// **This one crosses the control wire.** The engine sets `Hostinfo.AllowsUpdate = true` at
+    /// registration and on every map request when this is `Some(true)`, so the admin console knows
+    /// the node accepts remote update triggers. It advertises the bool ONLY: this daemon runs no
+    /// background updater — `tnet update` is a manual, operator-invoked command — so nothing here
+    /// acts on a trigger. Setting it is therefore an explicit operator statement of intent, not a
+    /// capability claim the daemon fulfils on its own.
+    pub auto_update_apply: Option<bool>,
+    /// Whether a background updater should *check* for available updates (Go `tailscale set
+    /// --update-check` / `ipn.Prefs.AutoUpdate.Check`). **Default `true`**, matching Go's
+    /// `ipn.NewPrefs()` (`AutoUpdate: {Check: true, Apply: unset}`). Maps to the engine
+    /// `Config.auto_update_check`.
+    ///
+    /// **Carried pref.** Neither the engine nor this daemon runs a background update-check loop (the
+    /// engine's own doc says so; `tnet update` is the manual command), and it is not part of
+    /// `Hostinfo` — it never crosses the control wire in Go either. It is persisted and threaded to
+    /// the engine so the node's pref state is the faithful mirror of Go's, and so `tnet get` reports
+    /// what Go's `tailscale get` would. Default `true` is honored on upgrade by the container-level
+    /// `#[serde(default)]` above, exactly like [`accept_dns`](Prefs::accept_dns).
+    pub auto_update_check: bool,
+    /// The OS username allowed to operate this node over the LocalAPI without root (Go `tailscale
+    /// up/set --operator` / `ipn.Prefs.OperatorUser`). `None` (the default) = no operator. Maps to
+    /// the engine `Config.operator_user`.
+    ///
+    /// **Carried pref.** In Go this is purely a daemon-side LocalAPI authorization input; it never
+    /// touches the control protocol, and the engine (a library with no local API) never acts on it.
+    /// This daemon persists it and reports it, but its LocalAPI write policy is still the
+    /// root-or-owner-UID peer-credential check in [`crate::auth`] (THREAT_MODEL §4.1); consuming the
+    /// operator user there is a separate, still-unbuilt phase. So setting this today RECORDS the
+    /// intent — it neither widens nor narrows who may drive the daemon.
+    pub operator_user: Option<String>,
+    /// A local display label for this node's login profile (Go `tailscale set --nickname` /
+    /// `ipn.Prefs.ProfileName`). `None` (the default) = no nickname. Maps to the engine
+    /// `Config.node_nickname`.
+    ///
+    /// **Carried pref.** Client-local and cosmetic: Go never advertises it in `Hostinfo` (it is
+    /// distinct from the [`hostname`](Prefs::hostname) the node *requests*), and the engine never
+    /// acts on it. Note this daemon also keeps a per-profile display name in `profiles.json`
+    /// (`tnet switch --list`); the two are not yet unified.
+    pub node_nickname: Option<String>,
+    /// Allow the management plane to gather device-posture information (Go `tailscale up/set
+    /// --report-posture` / `ipn.Prefs.PostureChecking`). Default `false`. Maps to the engine
+    /// `Config.posture_checking`.
+    ///
+    /// **Carried pref.** Posture is a control-to-node (c2n) *pull*: control asks the node for
+    /// posture attributes on demand. Neither the engine nor this daemon implements a c2n posture
+    /// responder, so control never pulls and the on-the-wire behavior is byte-for-byte the
+    /// posture-disabled case. There is deliberately no `Hostinfo` field to advertise it. Persisted
+    /// and threaded through so the pref state is faithful and a future c2n responder has its input.
+    pub posture_checking: bool,
+    /// Run a local web client for managing this node (Go `tailscale set --webclient` /
+    /// `ipn.Prefs.RunWebClient`). Default `false`. Maps to the engine `Config.run_web_client`.
+    ///
+    /// **Carried pref.** Go serves a device-management web UI on `100.x:5252`; that server is a
+    /// separate subsystem neither the engine nor this daemon implements (see ENGINE_ASKS §21 — it
+    /// needs a control-backed browser-session mint the engine does not expose), and it is never
+    /// advertised in `Hostinfo`. Persisted and threaded through so the pref state is faithful; no
+    /// web server is started.
+    pub run_web_client: bool,
+    /// Whether a peer using this node as an exit node may also reach this node's local LAN (Go
+    /// `tailscale up/set --exit-node-allow-lan-access` / `ipn.Prefs.ExitNodeAllowLANAccess`).
+    /// Default `false`. Maps to the engine `Config.exit_node_allow_lan_access`.
+    ///
+    /// **Carried pref.** In Go this is an OS-router route-shaping flag: it controls whether the host
+    /// router excludes local LAN ranges from the routes pulled through the tunnel. Go itself
+    /// documents it as having no effect on a platform with no host router — and this fork's default
+    /// data path is the userspace netstack, which has no host-route layer to shape. Persisted and
+    /// threaded through so a future host-route layer (or a downstream consumer) has its input; it is
+    /// never advertised to control.
+    pub exit_node_allow_lan_access: bool,
     /// Directory where inbound Taildrop files are received (Go `tailscale file`). `None` = Taildrop
     /// receiving is off (the engine refuses inbound transfers, fail-closed). When set, it maps to the
     /// engine's `Config.taildrop_dir`; peers can then send files to this node and `tnet file
@@ -134,6 +219,15 @@ impl Default for Prefs {
             advertise_routes: Vec::new(),
             advertise_tags: Vec::new(),
             ssh_enabled: false,
+            advertise_app_connector: false,
+            // Go `ipn.NewPrefs()`: `AutoUpdate{Check: true, Apply: unset}` — check on, apply unstated.
+            auto_update_apply: None,
+            auto_update_check: true,
+            operator_user: None,
+            node_nickname: None,
+            posture_checking: false,
+            run_web_client: false,
+            exit_node_allow_lan_access: false,
             taildrop_dir: None,
             tun_enabled: false,
             tun_name: None,
@@ -171,7 +265,10 @@ impl Prefs {
     /// applying the command's overrides, so e.g. `up --reset --ssh` ends with only `ssh_enabled` set
     /// and every other up-managed pref back at its default.
     ///
-    /// Deliberately NOT reset: `want_running` / `logged_out` (lifecycle — `up` sets `want_running`
+    /// Deliberately NOT reset: the four `set`-only Go pref flags (`node_nickname`, `run_web_client`,
+    /// `auto_update_apply`, `auto_update_check` — Go registers `--nickname`/`--webclient`/
+    /// `--auto-update`/`--update-check` on `set` but NOT on `up`, so `up --reset` has no business
+    /// clearing them), `want_running` / `logged_out` (lifecycle — `up` sets `want_running`
     /// itself just after), `ephemeral` (settable via `up --ephemeral` but a REGISTRATION-TIME intent
     /// the engine only honors on a fresh register — a no-op on a registered node — and with our PATCH
     /// merge it is never reverted, so resetting it on a live node is meaningless), and `taildrop_dir`
@@ -189,6 +286,15 @@ impl Prefs {
         self.advertise_routes = d.advertise_routes;
         self.advertise_tags = d.advertise_tags;
         self.ssh_enabled = d.ssh_enabled;
+        // The four Go pref flags that `tailscale up` ALSO registers (up.go's `newUpFlagSet`:
+        // `--operator`, `--exit-node-allow-lan-access`, `--advertise-connector`, `--report-posture`).
+        // `--nickname`/`--webclient`/`--auto-update`/`--update-check` are deliberately absent: Go
+        // registers those on `set` only, so an `up` never replaces them and `up --reset` must not
+        // clear them (see the exemption list in `revert_guard`'s lockstep test).
+        self.operator_user = d.operator_user;
+        self.exit_node_allow_lan_access = d.exit_node_allow_lan_access;
+        self.advertise_app_connector = d.advertise_app_connector;
+        self.posture_checking = d.posture_checking;
         self.tun_enabled = d.tun_enabled;
         self.tun_name = d.tun_name;
         self.tun_mtu = d.tun_mtu;
@@ -255,6 +361,71 @@ mod tests {
             "a fresh node defaults to PERSISTENT (Go-faithful) so it survives reboots; \
              ephemeral is opt-in via `up --ephemeral`"
         );
+    }
+
+    #[test]
+    fn auto_update_defaults_mirror_go_new_prefs() {
+        // Go `ipn.NewPrefs()` seeds `AutoUpdate{Check: true, Apply: opt.Bool("unset")}`. Mirror both:
+        // check ON, apply UNSTATED (tri-state `None`, distinct from an explicit `Some(false)`).
+        let p = Prefs::default();
+        assert!(
+            p.auto_update_check,
+            "auto_update_check must default to true (Go NewPrefs AutoUpdate.Check)"
+        );
+        assert_eq!(
+            p.auto_update_apply, None,
+            "auto_update_apply must default to UNSTATED (Go opt.Bool \"unset\"), not Some(false)"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_update_check_migrates_to_true_for_prefs_without_the_field() {
+        // Same migration contract as `accept_dns`: a prefs.json written before this field existed has
+        // no `auto_update_check` key and MUST load as Go's default `true`, not `false`.
+        let dir = std::env::temp_dir().join(format!("tailnetd-prefs-auc-{}", std::process::id()));
+        let path = dir.join("prefs.json");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(&path, br#"{"want_running":true}"#)
+            .await
+            .unwrap();
+
+        let loaded = Prefs::load(&path).await.expect("load old prefs");
+        assert!(
+            loaded.auto_update_check,
+            "an upgraded prefs file with no auto_update_check key must load as true"
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn reset_clears_up_flags_but_keeps_set_only_flags() {
+        // `up --reset` replaces the prefs Go's `up` flag set owns. The four flags Go registers on
+        // BOTH `up` and `set` are reset; the four it registers on `set` ONLY are preserved — an `up`
+        // cannot revert a pref it has no flag for.
+        let mut p = Prefs {
+            operator_user: Some("alice".into()),
+            exit_node_allow_lan_access: true,
+            advertise_app_connector: true,
+            posture_checking: true,
+            node_nickname: Some("laptop".into()),
+            run_web_client: true,
+            auto_update_apply: Some(true),
+            auto_update_check: false,
+            ..Prefs::default()
+        };
+        p.reset_up_managed_to_default();
+
+        // up-managed → back to default.
+        assert_eq!(p.operator_user, None);
+        assert!(!p.exit_node_allow_lan_access);
+        assert!(!p.advertise_app_connector);
+        assert!(!p.posture_checking);
+        // set-only → untouched by `up --reset`.
+        assert_eq!(p.node_nickname.as_deref(), Some("laptop"));
+        assert!(p.run_web_client);
+        assert_eq!(p.auto_update_apply, Some(true));
+        assert!(!p.auto_update_check);
     }
 
     #[test]

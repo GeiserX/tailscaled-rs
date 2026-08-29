@@ -635,7 +635,32 @@ it lands, the daemon adds `--wait` (await the first non-empty signal, then drain
 (drain on every signal) to `tnet file get`, consumed via a pin bump. No rush — recorded so the gap is
 not forgotten; the drain itself is already faithful without it. — daemon lane
 
-## 21. Engine `Config` fields for the ~12 missing Go `up`/`set` pref flags
+## 21. ✅ MOSTLY SHIPPED — Engine `Config` fields for the missing Go `up`/`set` pref flags
+
+> ✅ **SHIPPED at the current pin (`9d847a6`, engine v0.43.0)** for eight of the flags below, and the
+> daemon wired them in `tsd-1m9`: `--operator` (`Config.operator_user`), `--nickname`
+> (`node_nickname`), `--report-posture` (`posture_checking`), `--advertise-connector`
+> (`advertise_app_connector`), `--webclient` (`run_web_client`), `--exit-node-allow-lan-access`
+> (`exit_node_allow_lan_access`), `--auto-update` (`auto_update_apply`, an `Option<bool>` mirroring
+> Go's `opt.Bool`) and `--update-check` (`auto_update_check`). Each is threaded on to
+> `ts_control::Config`. Two of them genuinely reach control — the engine folds
+> `advertise_app_connector` into `Hostinfo.AppConnector` and `auto_update_apply == Some(true)` into
+> `Hostinfo.AllowsUpdate`, at registration and on every map request — so `tnet set` rebuilds the
+> device for those two (they are construction-time fields with no runtime setter). The other six are
+> CARRIED prefs: the engine stores them and never acts on or sends them, and the daemon does not act
+> on them either yet, so `tnet set` only persists them (no reconnect). Each flag's `tnet` help and
+> `Prefs` doc says exactly what is and is not implemented.
+>
+> **Still open:** the Linux subnet-router knobs at the end of the ask list (`--snat-subnet-routes`,
+> `--stateful-filtering`, `--netfilter-mode`, `--unattended`), which need the engine's router/netfilter
+> layer and ride the Linux OS-router work (`tsd-m8s`). The original ask is kept below for that
+> residue and as the record of what was requested.
+>
+> **Follow-ups the daemon still owes (each its own bead, none required for the flags to be faithful):**
+> consuming `operator_user` in the LocalAPI authorization matrix (today it is recorded, and the write
+> policy is still root/same-euid — THREAT_MODEL already scopes this as a later phase); and unifying
+> `node_nickname` with the per-profile display name in `profiles.json` that `tnet switch --list`
+> shows, which Go drives from the same `Prefs.ProfileName`.
 
 **Why:** Go's `tailscale up`/`set` (v1.100.0 `up.go:99-148`, `set.go:76-122`) expose ~15 pref flags;
 this fork's `up`/`set` faithfully cover the ten that map to existing engine `Config` fields
@@ -893,3 +918,67 @@ prefers the most-specific / trailing-slash mount). A regression test: mounts `{"
 handler map (`src/ipn/serve.rs` `handler_to_target`/`http_handler_to_target`); the request-time mux is
 entirely engine-owned, so this fix is transparent to the daemon (no wiring change). Tracked in daemon bead
 tsd-k4q. — daemon lane
+
+## 31. Taildrop **send-path** parity — unknown-length bodies, a byte-progress signal, and a target-eligibility reason (for a Go-faithful `tnet file cp`)
+
+**Why:** Go's `tailscale file cp` (v1.100.0 `cmd/tailscale/cli/file.go`) does three things on the send
+path that this fork cannot express against the pinned engine (`9d847a6e` / v0.43.0). The daemon-side
+wiring for each is small and ready; the primitive is missing. Read while triaging daemon bead
+**tsd-52k** — the full drift map is in [`FILE_CP_PARITY.md`](FILE_CP_PARITY.md). — daemon lane
+
+**(a) An unknown-length (chunked) send, for `file cp -` (stdin).** Go pushes stdin with
+`contentLength = -1`, so `PushFile` omits `Content-Length` and the peerAPI `PUT` body is
+chunked-encoded; the size of a pipe is not knowable up front. The engine's
+`Device::send_file(peer, name, content_length: u64, reader)` (`src/lib.rs:1116`) takes a **required**
+`u64`, and `ts_runtime::taildrop_send::send_file` unconditionally writes
+`Content-Length: {content_length}` into the request head (`ts_runtime/src/taildrop_send.rs:188`). The
+only daemon-side workaround is to spool all of stdin to disk or memory to learn its length first —
+not streaming, and an unbounded local-resource surface on a root-run daemon, so `tnet file cp` rejects
+`-` outright today rather than fake it.
+
+*Ask:* let the declared length be optional — e.g. `content_length: Option<u64>` (or a sibling
+`send_file_streaming`), where `None` emits `Transfer-Encoding: chunked` and chunk-frames the body
+instead of `Content-Length`. The receiving half already tolerates it in Go's peerAPI; keep the
+existing `u64` behavior byte-identical when `Some`.
+
+**(b) A send-progress signal (bytes pulled toward the peerAPI).** Go arms a 3-second timer on the
+first file and disarms it on the first `OutgoingFile.Sent > 0` seen on the IPN bus
+(`file.go:230`/`file.go:289`); if it fires it warns `# warning: %s is reportedly offline; trying
+anyway` or `# warning: %s is not replying; trying anyway`. Go is explicit that the trigger is bytes
+actually moving, **not** the netmap `Online` bit (which lags) and **not** the client's own write count
+(which completes as soon as the body is buffered locally). The engine streams the body inside
+`taildrop_send::send_file` with no callback and publishes no outgoing-file event, so "not replying" is
+unobservable here; a CLI-local timer with nothing to disarm it would fire on every healthy transfer
+longer than three seconds, so the warning is honestly omitted instead. The same signal is what Go's
+`--verbose` and `--update-interval` progress line are built on.
+
+*Ask:* surface bytes-written progress for an in-flight send — either (a) an optional
+`on_progress: impl Fn(u64)` / `mpsc::Sender<u64>` argument on `Device::send_file`, or (b) an
+`outgoing_files: Option<Vec<OutgoingFile>>` field on the `watch_ipn_bus` `Notify` (the Go shape, and
+the natural sibling of ask **#20**'s incoming-file signal). Option (a) is the smaller change: because
+`send_file` already takes the body as an `AsyncRead` and pulls from it only as it writes to the
+overlay, a counter at that read point already has Go's semantics.
+
+**(c) A Taildrop target-eligibility classification, with a reason.** Go's `getTargetStableID`
+(`file.go:440`) refuses **before** opening any file and says why, switching on the daemon-computed
+`ipnstate.PeerStatus.TaildropTarget` enum (ten values). Five of those reasons are visible to this
+daemon today (available / no peerAPI / offline / IPN state not running / no netmap), but three are
+not: `OwnedByOtherUser` — the engine applies `peer.user_id == self_user_id` *inside*
+`build_file_targets` (`ts_runtime/src/status.rs`) and exposes neither the self user id nor the
+per-peer verdict; `MissingCap` — the node-level file-sharing gate makes `file_targets` return an
+**empty list**, indistinguishable from "no eligible peers"; and `UnsupportedOS` — `ts_control::Node`
+carries no `Hostinfo.OS` field at all. So the daemon can only report "not a Taildrop target", never
+Go's specific sentence.
+
+*Ask:* either (a) a `Device::taildrop_target(&NodeInfo) -> TaildropTarget` returning a reason enum
+mirroring Go's, or (b) the ingredients, which are individually useful elsewhere: the self node's
+`user_id`, a `Node::os` from `Hostinfo`, and a way to distinguish "this node lacks the file-sharing
+capability" from "no peer qualifies" (e.g. `file_targets` returning that as a typed error rather than
+an empty vec — note the current empty-vec-not-error behavior is deliberate and documented, so this
+would want a separate accessor rather than a semantic change).
+
+**Daemon impact once landed:** (a) unblocks `tnet file cp -` (plus the `stdin<ext>` naming, which is
+pure daemon-side work); (b) unblocks the not-replying warning and a `--verbose`/progress line;
+(c) upgrades the pre-send refusal from a post-hoc `taildrop send failed: BadRequest` to Go's specific
+message. None of the three is a blocker for the daemon-buildable half of tsd-52k, which lands without
+a pin bump.
