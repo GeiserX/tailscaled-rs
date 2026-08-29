@@ -94,7 +94,9 @@ Closed this migration so far (51 beads). The consumed engine capabilities and sh
   IPN-bus notify stream), `metrics`, `bugreport`, `netcheck` (DERP-latency scope), `dns status`/`query`,
   `syspolicy`, `ip`/`whois`/`ping`, `licenses`.
 - **Connectivity:** exit-node use/advertise + **suggest**, advertise-routes, accept-routes/dns,
-  shields-up, TUN data path (feature `tun`), `--port`/`PORT` listen-port pinning.
+  shields-up, TUN data path (feature `tun`), `--port`/`PORT` listen-port pinning; the carried Go pref
+  flags (`--operator`, `--nickname`, `--report-posture`, `--webclient`, `--auto-update`/
+  `--update-check`, `--advertise-connector`, `--exit-node-allow-lan-access`).
 - **Services:** serve + funnel in Go v1.100.0's flag grammar (`--https`/`--http`/`--tcp`/
   `--tls-terminated-tcp`/`--set-path`/`--bg`/`--yes`, a foreground default, `<target> off`,
   `status`/`reset`) alongside this fork's positional sub-verbs (incl. the Go-less `serve redirect`)
@@ -110,7 +112,7 @@ Closed this migration so far (51 beads). The consumed engine capabilities and sh
   hardening, IP-forwarding readiness check, link-change auto-rebind, `is_ssh_over_tailscale` `/proc`
   sudo-fallback.
 - **`debug`:** capture, prefs, env, metrics, via, rebind, restun, check-ip-forwarding, check-prefs,
-  watch-ipn, local-creds, stat.
+  watch-ipn, local-creds, stat, statedir, build-info (Go `go-buildinfo`, kept as an alias).
 
 ---
 
@@ -123,7 +125,7 @@ would violate the honest-omission rule). Each rides the next pin bump once its a
 
 | Gap | Bead | Engine ask | Note |
 | --- | --- | --- | --- |
-| ~12 missing `up`/`set` pref flags (`--operator`, `--auto-update`/`--update-check`, `--report-posture`, `--advertise-connector`, `--webclient`, `--exit-node-allow-lan-access`, `--nickname`, Linux subnet-router knobs) | `tsd-1m9` | **#21** | Each needs a `Config`/pref field the engine doesn't carry. The workload-identity slice already shipped. |
+| Linux subnet-router pref flags (`--snat-subnet-routes`, `--stateful-filtering`, `--netfilter-mode`, `--unattended`) | `tsd-1m9` (residual) | **#21** | These four ride the Linux OS-router layer (`tsd-m8s`); the engine has no netfilter/router knob to carry them. The other eight `up`/`set` pref flags (`--operator`, `--auto-update`/`--update-check`, `--report-posture`, `--advertise-connector`, `--webclient`, `--exit-node-allow-lan-access`, `--nickname`) **shipped** — the engine grew every `Config` field they need. |
 | `lock add`/`remove`/`log` (tailnet-lock key-set mutation + AUM log) | `tsd-nee` | **#25** | Engine exposes `tka_{init,sign,disable}` but not `add`/`remove`/`log`. |
 | `lock local-disable` (disable lock for THIS node only) | — | **#27** | `disablement-kdf` already ships daemon-side; `local-disable` needs `Device::tka_local_disable()`. |
 | LocalAPI peer-by-id | `tsd-iqq.15` | — | Needs a numeric NodeID on `StatusNode` (engine surfaces only the stable id). |
@@ -132,7 +134,8 @@ would violate the honest-omission rule). Each rides the next pin bump once its a
 | Mutating web UI (Go `ManageServerMode`) | `tsd-bvc` (closed-partial) | **#29** | Needs a control-backed web-client session-auth flow + owner identity on whois. The read-only loopback UI ships; mutation would *exceed* Go without this. |
 | `file get --wait` / `--loop` | `tsd-1hr` | **#20** | Needs a Taildrop file-arrival bus signal; the engine exposes only a `waiting_files()` poll. Busy-polling would be a CPU-spin facsimile. |
 | `tnet drive` (Taildrive) | `tsd-eka` | — | Needs a whole engine WebDAV / virtual-disk subsystem; none exists. |
-| `debug` rich reads (`netmap`/`hostinfo`/`derp-map`/`control-knobs`) + magicsock knobs (`rotate-disco-key`, `derp-set-on-demand`, `break-*-conns`, `force-netmap-update`, `peer-endpoint-changes`, `set-expire`, `ts2021`, `dial-types`, `peer-relay-servers`) | `tsd-b15` | — | Each needs a netmap field or magicsock knob the engine doesn't expose. The clean pure-local cherry-picks (`prefs`/`env`/`via`/`local-creds`/`stat`/`restun`) are already shipped. |
+| `debug hostinfo` (the local `Hostinfo` this node advertises to control) | `tsd-b15` | **#32** | NOT a netmap gap: the engine already computes the whole thing (`ts_control::hostinfo::HostInfoData::detect()`, the mirror of Go `hostinfo.New()`). Its module is private and nothing re-exports it, so the daemon cannot read the values it is itself sending. One `pub use` unblocks it. |
+| `debug` rich reads (`netmap`/`derp-map`/`control-knobs`) + magicsock knobs (`rotate-disco-key`, `derp-set-on-demand`, `break-*-conns`, `force-netmap-update`, `peer-endpoint-changes`, `set-expire`, `ts2021`, `dial-types`, `peer-relay-servers`) + `portmap` | `tsd-b15` | — | Each needs a netmap field, a magicsock knob, or a port-mapping client (there is no NAT-PMP/PCP/UPnP code in the engine at all) that the engine doesn't expose. Re-confirmed against pin `9d847a6e`/v0.43.0. The pure-local cherry-picks (`prefs`/`env`/`via`/`local-creds`/`stat`/`restun`/`statedir`/`build-info`) are all shipped — `tsd-b15` has no daemon-buildable work left. |
 | `serve_path` segment-boundary match (`/apifoo` must not match a `/api` mount) | `tsd-k4q` | **#30** | Engine bug (the request-time mux is engine-owned); the fix is transparent to the daemon. |
 
 ### 4.2 Large multi-day subsystems (daemon-buildable, but each is a significant project)
@@ -152,7 +155,7 @@ would violate the honest-omission rule). Each rides the next pin bump once its a
 
 | Item | Bead | Note |
 | --- | --- | --- |
-| Publish `tailscaled-rs` to crates.io | `tsd-6y1` | Blocked only by the daemon's own `git`+`rev` engine pin now that `tsd-d6n` is cleared: `cargo publish` rejects a git dependency. |
+| Publish `tailscaled-rs` to crates.io | `tsd-6y1` | Registry metadata and the packaged file set are in place; `cargo package` succeeds once a `version` is present, so the daemon's own `git`+`rev` engine pin is the only remaining objection now that `tsd-d6n` is cleared. Adding a `version` beside the pin would satisfy `cargo publish` but currently misrepresents what we build — no published engine release was cut from the pinned commit (`scripts/check-engine-rev-released.sh`), so the honest unblock is an engine-version change under [`docs/ENGINE.md` §3](ENGINE.md#3-the-engine-on-cratesio). |
 | Get the `tailscale-rs` engine onto crates.io | `tsd-d6n` | **Done upstream** — every `geiserx_*` engine crate in the daemon's resolved graph is published and unyanked at the locked version (`scripts/check-engine-on-crates-io.sh` re-checks it for whatever the pin resolves to). What is left is daemon-side and belongs to `tsd-6y1`: trading the `git`+`rev` pin for a registry `version`, which is an engine-version change rather than a source swap — see [`docs/ENGINE.md` §3](ENGINE.md#3-the-engine-on-cratesio). |
 | `.deb` / `.rpm` packaging (nfpm) + ship the `acme` feature in distributed builds | `tsd-k4a` | On a stock (feature-less) build, `cert`/`serve-https`/`funnel` are inert — distributed builds must enable `acme`. |
 | Homebrew tap | `tsd-0s6` | |
