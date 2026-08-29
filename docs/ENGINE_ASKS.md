@@ -770,12 +770,30 @@ Consumed via a pin bump. Tracked in daemon bead tsd-jz2. — daemon lane
 
 ## 25. TKA key-set mutation + AUM log — `Device::tka_{add,remove,log}` (for `tnet lock add/remove/log`)
 
+> ✅ **PART (b) SHIPPED — `Device::tka_log(limit) -> Result<Vec<TkaLogEntry>, Error>` is on the facade
+> at the current pin** (documented there as the Rust analog of Go `LocalClient.NetworkLockLog`;
+> `TkaLogEntry` re-exported at the engine root, defined in `ts_runtime/src/tka_sync.rs`). It reads the
+> node's already-synced + verified AUM chain **locally** — head-first, carrying the AUM hash, the
+> change kind (`add-key`/`remove-key`/`checkpoint`/…), the signer key ids and the raw CBOR — with no
+> control round-trip. **CONSUMED**: `tnet lock log [--limit N]` ships (bead `tsd-qeu`), so `log` is no
+> longer part of this ask. One residual daemon-side gap, deliberate and documented at the renderer: Go
+> decodes each update's raw AUM to print the per-kind key detail; the daemon has no AUM decoder, so a
+> stanza prints hash + change kind + signer key ids and `--json` carries the raw CBOR for out-of-band
+> decoding.
+>
+> **Part (a) — `tka_add`/`tka_remove` — remains outstanding**, and is the whole of what is left here:
+> the engine has no key-set mutation entry point (no `tka_add`/`tka_remove`/`tka_modify`, no AddKey /
+> RemoveKey AUM builder in `ts_tka`, and no public accessor for the live verified `Authority`), so the
+> daemon cannot assemble and sign the AUM itself. `tnet lock add`/`remove` stay blocked (bead
+> `tsd-nee`).
+
 **Why:** `tnet lock` already ships `init`/`status`/`sign`/`disable` over the engine's
 `tka_{init,status,sign,disable}`. Go additionally has `lock add <key…>` / `lock remove <key…>` (add or
 remove trusted signing keys from the tailnet-lock key authority) and `lock log` (print the AUM
-update-chain history). The engine exposes **no** `tka_add`/`tka_remove` (key-set mutation) and **no**
-AUM-log reader, so these three verbs can't be built faithfully — and a tailnet-lock key-set change is
-a high-stakes trust operation that must NOT be approximated.
+update-chain history). At the time of writing the engine exposed **no** `tka_add`/`tka_remove`
+(key-set mutation) and **no** AUM-log reader, so none of the three verbs could be built faithfully —
+and a tailnet-lock key-set change is a high-stakes trust operation that must NOT be approximated. (The
+AUM-log reader has since landed; see the marker above.)
 
 **Ask:** add (a) `Device::tka_add(keys)` / `Device::tka_remove(keys)` to mutate the lock's trusted-key
 set (Go `NetworkLockModify`), submitting a signed AUM through control like `tka_sign` does; and (b)
@@ -784,8 +802,8 @@ set (Go `NetworkLockModify`), submitting a signed AUM through control like `tka_
 plumbing.
 
 **Daemon impact once landed:** `tnet lock add/remove` (WRITES — gated root/owner-uid like the other
-lock mutations) + `tnet lock log` (read). Consumed via a pin bump. Tracked in daemon bead tsd-lq8. —
-daemon lane
+lock mutations). `tnet lock log` (read) already shipped off part (b). Consumed via a pin bump. Tracked
+in daemon bead tsd-lq8. — daemon lane
 
 ---
 
