@@ -94,7 +94,9 @@ Closed this migration so far (50 beads). The consumed engine capabilities and sh
   IPN-bus notify stream), `metrics`, `bugreport`, `netcheck` (DERP-latency scope), `dns status`/`query`,
   `syspolicy`, `ip`/`whois`/`ping`, `licenses`.
 - **Connectivity:** exit-node use/advertise + **suggest**, advertise-routes, accept-routes/dns,
-  shields-up, TUN data path (feature `tun`), `--port`/`PORT` listen-port pinning.
+  shields-up, TUN data path (feature `tun`), `--port`/`PORT` listen-port pinning; the carried Go pref
+  flags (`--operator`, `--nickname`, `--report-posture`, `--webclient`, `--auto-update`/
+  `--update-check`, `--advertise-connector`, `--exit-node-allow-lan-access`).
 - **Services:** serve (tcp/https/http/redirect/status/reset), funnel on/off, Taildrop `cp`/`get`/`list`,
   TLS `cert` (feature `acme`), `nc`, `configure kubeconfig` (standalone generation; no merge).
 - **SSH:** Tailscale SSH **server** (feature `ssh`, control-policy authz, privilege drop) + host-key-
@@ -120,7 +122,7 @@ would violate the honest-omission rule). Each rides the next pin bump once its a
 
 | Gap | Bead | Engine ask | Note |
 | --- | --- | --- | --- |
-| ~12 missing `up`/`set` pref flags (`--operator`, `--auto-update`/`--update-check`, `--report-posture`, `--advertise-connector`, `--webclient`, `--exit-node-allow-lan-access`, `--nickname`, Linux subnet-router knobs) | `tsd-1m9` | **#21** | Each needs a `Config`/pref field the engine doesn't carry. The workload-identity slice already shipped. |
+| Linux subnet-router pref flags (`--snat-subnet-routes`, `--stateful-filtering`, `--netfilter-mode`, `--unattended`) | `tsd-1m9` (residual) | **#21** | These four ride the Linux OS-router layer (`tsd-m8s`); the engine has no netfilter/router knob to carry them. The other eight `up`/`set` pref flags (`--operator`, `--auto-update`/`--update-check`, `--report-posture`, `--advertise-connector`, `--webclient`, `--exit-node-allow-lan-access`, `--nickname`) **shipped** — the engine grew every `Config` field they need. |
 | `lock add`/`remove`/`log` (tailnet-lock key-set mutation + AUM log) | `tsd-nee` | **#25** | Engine exposes `tka_{init,sign,disable}` but not `add`/`remove`/`log`. |
 | `lock local-disable` (disable lock for THIS node only) | — | **#27** | `disablement-kdf` already ships daemon-side; `local-disable` needs `Device::tka_local_disable()`. |
 | LocalAPI peer-by-id | `tsd-iqq.15` | — | Needs a numeric NodeID on `StatusNode` (engine surfaces only the stable id). |
@@ -171,7 +173,7 @@ would violate the honest-omission rule). Each rides the next pin bump once its a
 | --- | --- | --- |
 | `tnet configure kubeconfig` merging into an existing `~/.kube/config` | `tsd-k47` | Generation shipped (`tsd-37m`): `configure kubeconfig <peer>` resolves the auth-proxy peer against Status and emits a **standalone** kubeconfig (stdout, or `--output PATH`). Merging stays deferred: it needs a YAML parser dependency for one niche command this fork has no k8s-operator integration to use. |
 | Small flag/grammar batch (`cert --min-validity`/`--serve-demo`, `netcheck --bind-address`, `status --browser`, etc.) | `tsd-dru` | Several items already shipped (`switch --json`, `version --track`, `metrics print`, `login`). Residual `logout --reason` is engine-gated (engine `logout()` takes no reason). |
-| `file cp` residual Go-fidelity gaps (stdin streaming, rich pre-send errors, offline-warning, system-DNS fallback) | `tsd-52k` | stdin streaming needs a daemon→client stream-back protocol. |
+| `file cp` residual Go-fidelity gaps (stdin streaming, rich pre-send errors, offline-warning, system-DNS fallback) | `tsd-52k` | Mapped item-by-item in [`FILE_CP_PARITY.md`](FILE_CP_PARITY.md). The system-DNS fallback is daemon-buildable; the pre-send errors and the offline warning are half daemon-buildable; **stdin is engine-gated** — corrected from the earlier note here, which said it needed a daemon→client stream-back protocol: the body flows client→daemon, that framing already exists (`Request::Nc` hijacks the connection), and the real blocker is the engine's required `content_length: u64` on `Device::send_file`, which cannot express Go's chunked `-1` push (engine ask #31). |
 | Taildrop `file get` dest parent-dir validation (symlinked ancestor) + same-uid trust doc | `tsd-k97` | The write is `SO_PEERCRED` same-uid-gated; a symlinked ancestor is the caller's own-namespace concern (matches Go's residual). Mostly a trust-model doc. |
 | `serve redirect` `${HOST}`/`${REQUEST_URI}` expansion (doc claims it; engine doesn't do it) | `tsd-rjf` | Correct the doc, or implement with re-validation. |
 
@@ -198,14 +200,14 @@ flowchart TB
     subgraph PARTIAL["Partial (1)"]
         P["#7 SSH session-recording (enforcement shipped;<br/>HoldAndDelegate check-mode + recorder transport open)"]
     end
-    subgraph OPEN["Open (11)"]
-        O["#5 macOS utun default name (daemon works around) ·<br/>#8 exit-node DNS advertise side · #13 Funnel type re-export ·<br/>#18 Windows host route/DNS · #20 Taildrop file-arrival signal ·<br/>#21 ~12 pref-flag Config fields · #25 TKA add/remove/log ·<br/>#27 tka_local_disable · #28 incremental peer deltas ·<br/>#29 web-client session auth · #30 serve_path segment-boundary bug"]
+    subgraph OPEN["Open (12)"]
+        O["#5 macOS utun default name (daemon works around) ·<br/>#8 exit-node DNS advertise side · #13 Funnel type re-export ·<br/>#18 Windows host route/DNS · #20 Taildrop file-arrival signal ·<br/>#21 ~12 pref-flag Config fields · #25 TKA add/remove/log ·<br/>#27 tka_local_disable · #28 incremental peer deltas ·<br/>#29 web-client session auth · #30 serve_path segment-boundary bug ·<br/>#31 Taildrop send-path (chunked body, progress, target reason)"]
     end
     SHIPPED --> PARTIAL --> OPEN
 ```
 
-**18 shipped, 1 partial, 11 open.** The open asks are exactly the engine-gated features in §4.1 plus the
-platform-breadth item #18 (Windows). The engine is an actively-developed sibling lane; each release has
+**18 shipped, 1 partial, 12 open.** The open asks are exactly the engine-gated features in §4.1 plus the
+platform-breadth item #18 (Windows) and the `file cp` send-path item #31 (§4.5). The engine is an actively-developed sibling lane; each release has
 reliably unblocked daemon work (v0.40.0 unblocked #22/#23/#26; v0.41.0 unblocked #24), so the cadence
 is: engine ships an ask → bump the pin → small consuming change.
 
