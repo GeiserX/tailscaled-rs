@@ -635,7 +635,32 @@ it lands, the daemon adds `--wait` (await the first non-empty signal, then drain
 (drain on every signal) to `tnet file get`, consumed via a pin bump. No rush — recorded so the gap is
 not forgotten; the drain itself is already faithful without it. — daemon lane
 
-## 21. Engine `Config` fields for the ~12 missing Go `up`/`set` pref flags
+## 21. ✅ MOSTLY SHIPPED — Engine `Config` fields for the missing Go `up`/`set` pref flags
+
+> ✅ **SHIPPED at the current pin (`9d847a6`, engine v0.43.0)** for eight of the flags below, and the
+> daemon wired them in `tsd-1m9`: `--operator` (`Config.operator_user`), `--nickname`
+> (`node_nickname`), `--report-posture` (`posture_checking`), `--advertise-connector`
+> (`advertise_app_connector`), `--webclient` (`run_web_client`), `--exit-node-allow-lan-access`
+> (`exit_node_allow_lan_access`), `--auto-update` (`auto_update_apply`, an `Option<bool>` mirroring
+> Go's `opt.Bool`) and `--update-check` (`auto_update_check`). Each is threaded on to
+> `ts_control::Config`. Two of them genuinely reach control — the engine folds
+> `advertise_app_connector` into `Hostinfo.AppConnector` and `auto_update_apply == Some(true)` into
+> `Hostinfo.AllowsUpdate`, at registration and on every map request — so `tnet set` rebuilds the
+> device for those two (they are construction-time fields with no runtime setter). The other six are
+> CARRIED prefs: the engine stores them and never acts on or sends them, and the daemon does not act
+> on them either yet, so `tnet set` only persists them (no reconnect). Each flag's `tnet` help and
+> `Prefs` doc says exactly what is and is not implemented.
+>
+> **Still open:** the Linux subnet-router knobs at the end of the ask list (`--snat-subnet-routes`,
+> `--stateful-filtering`, `--netfilter-mode`, `--unattended`), which need the engine's router/netfilter
+> layer and ride the Linux OS-router work (`tsd-m8s`). The original ask is kept below for that
+> residue and as the record of what was requested.
+>
+> **Follow-ups the daemon still owes (each its own bead, none required for the flags to be faithful):**
+> consuming `operator_user` in the LocalAPI authorization matrix (today it is recorded, and the write
+> policy is still root/same-euid — THREAT_MODEL already scopes this as a later phase); and unifying
+> `node_nickname` with the per-profile display name in `profiles.json` that `tnet switch --list`
+> shows, which Go drives from the same `Prefs.ProfileName`.
 
 **Why:** Go's `tailscale up`/`set` (v1.100.0 `up.go:99-148`, `set.go:76-122`) expose ~15 pref flags;
 this fork's `up`/`set` faithfully cover the ten that map to existing engine `Config` fields

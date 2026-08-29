@@ -154,6 +154,45 @@ enum Command {
         /// omitting both leaves the setting unchanged.
         #[arg(long)]
         no_ssh: bool,
+        /// Unix username allowed to operate this daemon without sudo (Go `tailscale up --operator`).
+        /// Pass an EMPTY value (`--operator=`) to remove the operator, exactly as Go does; omitting
+        /// the flag leaves the setting unchanged. NOTE: this daemon only RECORDS the operator today —
+        /// LocalAPI writes are still gated purely on the peer UID (root or the daemon's owner;
+        /// THREAT_MODEL §4.1), so naming an operator grants that user nothing yet.
+        #[arg(long, value_name = "USER")]
+        operator: Option<String>,
+        /// Let peers using this node as their exit node also reach this node's local LAN (Go
+        /// `tailscale up --exit-node-allow-lan-access`). Mutually exclusive with
+        /// `--no-exit-node-allow-lan-access`; omitting both leaves the setting unchanged. NOTE: this
+        /// is an OS-router route-shaping pref; it is recorded but has no effect in this build's
+        /// userspace-netstack data path (Go documents the same no-op on router-less platforms).
+        #[arg(long, conflicts_with = "no_exit_node_allow_lan_access")]
+        exit_node_allow_lan_access: bool,
+        /// Stop allowing exit-node clients to reach this node's local LAN. Mutually exclusive with
+        /// `--exit-node-allow-lan-access`; omitting both leaves the setting unchanged.
+        #[arg(long)]
+        no_exit_node_allow_lan_access: bool,
+        /// Advertise this node as an app connector (Go `tailscale up --advertise-connector`). This
+        /// reaches the control plane (`Hostinfo.AppConnector`) at registration and on every map
+        /// poll. It advertises the ROLE only — this build implements no app-connector data path, so
+        /// the node serves no connector traffic. Mutually exclusive with `--no-advertise-connector`;
+        /// omitting both leaves the setting unchanged.
+        #[arg(long, conflicts_with = "no_advertise_connector")]
+        advertise_connector: bool,
+        /// Stop advertising this node as an app connector. Mutually exclusive with
+        /// `--advertise-connector`; omitting both leaves the setting unchanged.
+        #[arg(long)]
+        no_advertise_connector: bool,
+        /// Allow the management plane to gather device-posture information (Go `tailscale up
+        /// --report-posture`). Recorded only: posture is a control-to-node pull this build does not
+        /// answer, so control never collects anything. Mutually exclusive with
+        /// `--no-report-posture`; omitting both leaves the setting unchanged.
+        #[arg(long, conflicts_with = "no_report_posture")]
+        report_posture: bool,
+        /// Stop allowing device-posture collection. Mutually exclusive with `--report-posture`;
+        /// omitting both leaves the setting unchanged.
+        #[arg(long)]
+        no_report_posture: bool,
         /// Reset every setting this command does not mention back to its default (Go `tailscale up
         /// --reset`). By default `tnet up` refuses to silently revert a non-default setting you did
         /// not re-mention (it tells you to re-state it or pass `--reset`); `--reset` is how you opt
@@ -317,6 +356,79 @@ enum Command {
         /// omitting both leaves the setting unchanged.
         #[arg(long)]
         no_ssh: bool,
+        /// Advertise this node as an app connector (Go `tailscale set --advertise-connector`). This
+        /// reaches the control plane (`Hostinfo.AppConnector`), which is a construction-time engine
+        /// setting — so on a RUNNING node this rebuilds the device (a brief reconnect). It advertises
+        /// the ROLE only; this build implements no app-connector data path. Mutually exclusive with
+        /// `--no-advertise-connector`; omitting both leaves the setting unchanged.
+        #[arg(long, conflicts_with = "no_advertise_connector")]
+        advertise_connector: bool,
+        /// Stop advertising this node as an app connector. Mutually exclusive with
+        /// `--advertise-connector`; omitting both leaves the setting unchanged.
+        #[arg(long)]
+        no_advertise_connector: bool,
+        /// Tell the admin console this node accepts remote update triggers (Go `tailscale set
+        /// --auto-update`). This reaches control (`Hostinfo.AllowsUpdate`), so on a RUNNING node it
+        /// rebuilds the device (a brief reconnect). It advertises the opt-in ONLY: this daemon runs
+        /// no background updater — `tnet update` is manual — so nothing here acts on a trigger.
+        /// Mutually exclusive with `--no-auto-update`; omitting both leaves the setting unchanged.
+        #[arg(long, conflicts_with = "no_auto_update")]
+        auto_update: bool,
+        /// Decline admin-console-triggered auto-updates. Distinct from never having stated a
+        /// preference (Go's `opt.Bool` tri-state). Mutually exclusive with `--auto-update`; omitting
+        /// both leaves the setting unchanged.
+        #[arg(long)]
+        no_auto_update: bool,
+        /// Enable background checks for available updates (Go `tailscale set --update-check`; on by
+        /// default). Recorded only: this daemon runs no background check loop — use `tnet update`.
+        /// Mutually exclusive with `--no-update-check`; omitting both leaves the setting unchanged.
+        #[arg(long, conflicts_with = "no_update_check")]
+        update_check: bool,
+        /// Disable background update checks. Mutually exclusive with `--update-check`; omitting both
+        /// leaves the setting unchanged.
+        #[arg(long)]
+        no_update_check: bool,
+        /// Unix username allowed to operate this daemon without sudo (Go `tailscale set
+        /// --operator`). Pass an EMPTY value (`--operator=`) to remove the operator, as Go does;
+        /// omitting the flag leaves the setting unchanged. NOTE: only RECORDED today — LocalAPI
+        /// writes are still gated purely on the peer UID (root or the daemon's owner; THREAT_MODEL
+        /// §4.1), so naming an operator grants that user nothing yet.
+        #[arg(long, value_name = "USER")]
+        operator: Option<String>,
+        /// Nickname for this login profile (Go `tailscale set --nickname` / `Prefs.ProfileName`).
+        /// Pass an EMPTY value (`--nickname=`) to clear it; omitting the flag leaves it unchanged.
+        /// Client-local and cosmetic — never advertised to control. (Distinct from `--hostname`,
+        /// which is the name this node REQUESTS from the tailnet.)
+        #[arg(long, value_name = "NAME")]
+        nickname: Option<String>,
+        /// Allow the management plane to gather device-posture information (Go `tailscale set
+        /// --report-posture`). Recorded only: posture is a control-to-node pull this build does not
+        /// answer. Mutually exclusive with `--no-report-posture`; omitting both leaves it unchanged.
+        #[arg(long, conflicts_with = "no_report_posture")]
+        report_posture: bool,
+        /// Stop allowing device-posture collection. Mutually exclusive with `--report-posture`;
+        /// omitting both leaves the setting unchanged.
+        #[arg(long)]
+        no_report_posture: bool,
+        /// Run the local web management client (Go `tailscale set --webclient`, served on port 5252).
+        /// Recorded only: this build ships no web client, so nothing is served. Mutually exclusive
+        /// with `--no-webclient`; omitting both leaves the setting unchanged.
+        #[arg(long, conflicts_with = "no_webclient")]
+        webclient: bool,
+        /// Do not run the local web management client. Mutually exclusive with `--webclient`;
+        /// omitting both leaves the setting unchanged.
+        #[arg(long)]
+        no_webclient: bool,
+        /// Let peers using this node as their exit node also reach this node's local LAN (Go
+        /// `tailscale set --exit-node-allow-lan-access`). Recorded only: an OS-router route-shaping
+        /// pref with no effect on this build's userspace-netstack data path. Mutually exclusive with
+        /// `--no-exit-node-allow-lan-access`; omitting both leaves the setting unchanged.
+        #[arg(long, conflicts_with = "no_exit_node_allow_lan_access")]
+        exit_node_allow_lan_access: bool,
+        /// Stop allowing exit-node clients to reach this node's local LAN. Mutually exclusive with
+        /// `--exit-node-allow-lan-access`; omitting both leaves the setting unchanged.
+        #[arg(long)]
+        no_exit_node_allow_lan_access: bool,
         /// Pre-accept a named risk and skip its safety refusal (Go `--accept-risk`), e.g. `lose-ssh`
         /// or `all`. On `set` the enforced risk is `lose-ssh`: toggling the Tailscale SSH server
         /// (`--ssh`/`--no-ssh`) over a Tailscale SSH session reroutes/drops that session, so it is
@@ -1653,6 +1765,13 @@ async fn main() -> Result<()> {
             no_shields_up,
             ssh,
             no_ssh,
+            operator,
+            exit_node_allow_lan_access,
+            no_exit_node_allow_lan_access,
+            advertise_connector,
+            no_advertise_connector,
+            report_posture,
+            no_report_posture,
             reset,
             force_reauth,
             ephemeral,
@@ -1665,6 +1784,18 @@ async fn main() -> Result<()> {
             audience,
             json,
         } => {
+            // Resolve the newer pref flags into their wire sentinels HERE and pass them as one named
+            // struct (see `UpPrefFlags`): `run_up`'s positional list is long enough that another four
+            // bare `Option<bool>`s would be a transposition waiting to happen.
+            let up_prefs = UpPrefFlags {
+                operator: resolve_clearable_string(operator),
+                exit_node_allow_lan_access: resolve_tristate(
+                    exit_node_allow_lan_access,
+                    no_exit_node_allow_lan_access,
+                ),
+                advertise_connector: resolve_tristate(advertise_connector, no_advertise_connector),
+                report_posture: resolve_tristate(report_posture, no_report_posture),
+            };
             run_up(
                 &socket,
                 authkey,
@@ -1691,6 +1822,7 @@ async fn main() -> Result<()> {
                 no_shields_up,
                 ssh,
                 no_ssh,
+                up_prefs,
                 reset,
                 force_reauth,
                 ephemeral,
@@ -1720,8 +1852,38 @@ async fn main() -> Result<()> {
             advertise_tags_clear,
             ssh,
             no_ssh,
+            advertise_connector,
+            no_advertise_connector,
+            auto_update,
+            no_auto_update,
+            update_check,
+            no_update_check,
+            operator,
+            nickname,
+            report_posture,
+            no_report_posture,
+            webclient,
+            no_webclient,
+            exit_node_allow_lan_access,
+            no_exit_node_allow_lan_access,
             accept_risk,
         } => {
+            // Same grouping as the `up` arm above (see `SetPrefFlags`): resolve the eight newer pref
+            // flags into wire sentinels by NAME here, rather than growing `run_set`'s positional list
+            // by another fourteen booleans.
+            let set_prefs = SetPrefFlags {
+                advertise_connector: resolve_tristate(advertise_connector, no_advertise_connector),
+                auto_update: resolve_tristate(auto_update, no_auto_update),
+                update_check: resolve_tristate(update_check, no_update_check),
+                operator: resolve_clearable_string(operator),
+                nickname: resolve_clearable_string(nickname),
+                report_posture: resolve_tristate(report_posture, no_report_posture),
+                webclient: resolve_tristate(webclient, no_webclient),
+                exit_node_allow_lan_access: resolve_tristate(
+                    exit_node_allow_lan_access,
+                    no_exit_node_allow_lan_access,
+                ),
+            };
             run_set(
                 &socket,
                 hostname,
@@ -1741,6 +1903,7 @@ async fn main() -> Result<()> {
                 advertise_tags_clear,
                 ssh,
                 no_ssh,
+                set_prefs,
                 accept_risk,
             )
             .await
@@ -2135,6 +2298,7 @@ async fn run_up(
     no_shields_up: bool,
     ssh: bool,
     no_ssh: bool,
+    up_prefs: UpPrefFlags,
     reset: bool,
     force_reauth: bool,
     ephemeral: bool,
@@ -2215,6 +2379,12 @@ async fn run_up(
         shields_up: resolve_shields_up(shields_up, no_shields_up),
         // `--ssh`/`--no-ssh` tri-state (mirrors `--tun`).
         ssh: resolve_ssh(ssh, no_ssh),
+        // The four Go pref flags `up` shares with `set`, already resolved into their wire sentinels
+        // in `main`'s `Command::Up` arm and carried here by name (see `UpPrefFlags`).
+        operator: up_prefs.operator,
+        exit_node_allow_lan_access: up_prefs.exit_node_allow_lan_access,
+        advertise_connector: up_prefs.advertise_connector,
+        report_posture: up_prefs.report_posture,
         // `--reset`: reset unmentioned settings to default + bypass the accidental-revert
         // guard. A plain bool flag (Go's `--reset`), passed straight through.
         reset,
@@ -2469,6 +2639,10 @@ async fn run_login(
         accept_dns: None,
         shields_up: None,
         ssh: None,
+        operator: None,
+        exit_node_allow_lan_access: None,
+        advertise_connector: None,
+        report_posture: None,
         reset: false,
         force_reauth: true,
         ephemeral: None,
@@ -2540,6 +2714,7 @@ async fn run_set(
     advertise_tags_clear: bool,
     ssh: bool,
     no_ssh: bool,
+    set_prefs: SetPrefFlags,
     accept_risk: Option<String>,
 ) -> Result<()> {
     // Risk gate (Go `presentSSHToggleRisk`, the `set` call site): toggling the Tailscale SSH
@@ -2573,6 +2748,16 @@ async fn run_set(
         advertise_tags: resolve_list_or_clear(advertise_tags, advertise_tags_clear),
         // `--ssh`/`--no-ssh` tri-state (mirrors `--tun`).
         ssh: resolve_ssh(ssh, no_ssh),
+        // The eight newer Go `set` pref flags, already resolved into their wire sentinels in `main`'s
+        // `Command::Set` arm and carried here by name (see `SetPrefFlags`).
+        advertise_connector: set_prefs.advertise_connector,
+        auto_update: set_prefs.auto_update,
+        update_check: set_prefs.update_check,
+        operator: set_prefs.operator,
+        nickname: set_prefs.nickname,
+        report_posture: set_prefs.report_posture,
+        webclient: set_prefs.webclient,
+        exit_node_allow_lan_access: set_prefs.exit_node_allow_lan_access,
     };
     let response = round_trip(socket, &request)
         .await
@@ -5352,8 +5537,9 @@ fn format_profiles_json(profiles: &[tailscaled_rs::localapi::ProfileEntry]) -> S
 /// [`get_value_display`]. One source so the table, the `--json` map, and single-setting lookup agree.
 ///
 /// This is a SUBSET of Go's `tailscale get` settings (Go derives its list from the full `set` flag
-/// set; many of those flags — `hostname`, `nickname`, `auto-update`, … — are not yet modelled by
-/// this fork's prefs/engine and so are absent here). One entry, `tun`, is a fork-specific extension
+/// set; the ones still absent here are the Linux OS-router knobs — `snat-subnet-routes`,
+/// `stateful-filtering`, `netfilter-mode` — plus `unattended`/`relay-server-*`, none of which this
+/// fork models yet). One entry, `tun`, is a fork-specific extension
 /// (selecting the kernel-TUN vs userspace datapath) that Go's `get` has no counterpart for; it is
 /// intentionally surfaced because it is a real `tnet set` flag in this build.
 fn get_settings(
@@ -5394,6 +5580,35 @@ fn get_settings(
         ("shields-up", Value::Bool(view.shields_up)),
         ("ssh", Value::Bool(view.ssh)),
         ("tun", Value::Bool(view.tun)),
+        ("advertise-connector", Value::Bool(view.advertise_connector)),
+        // `auto-update` is Go's `opt.Bool` tri-state: never-stated renders as JSON null (and as an
+        // empty cell in the table), distinct from an explicit `false`.
+        (
+            "auto-update",
+            view.auto_update.map(Value::Bool).unwrap_or(Value::Null),
+        ),
+        ("update-check", Value::Bool(view.update_check)),
+        // Unset operator/nickname are JSON null (Go's empty string); the table renders them empty.
+        (
+            "operator",
+            view.operator
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        ),
+        (
+            "nickname",
+            view.nickname
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        ),
+        ("report-posture", Value::Bool(view.report_posture)),
+        ("webclient", Value::Bool(view.webclient)),
+        (
+            "exit-node-allow-lan-access",
+            Value::Bool(view.exit_node_allow_lan_access),
+        ),
     ]
 }
 
@@ -5561,12 +5776,22 @@ fn revert_pref_to_flag(key: &str, value: &str) -> String {
         }
         "ssh" => bool_keep_flag("ssh", "no-ssh", value),
         "tun" => bool_keep_flag("tun", "no-tun", value),
+        "exit_node_allow_lan_access" => bool_keep_flag(
+            "exit-node-allow-lan-access",
+            "no-exit-node-allow-lan-access",
+            value,
+        ),
+        "advertise_connector" => {
+            bool_keep_flag("advertise-connector", "no-advertise-connector", value)
+        }
+        "report_posture" => bool_keep_flag("report-posture", "no-report-posture", value),
         // Value-bearing prefs: re-pass the current value verbatim. `advertise_routes` is already a
         // comma-joined list, which `--advertise-routes` accepts directly.
         "advertise_routes" => format!("--advertise-routes={value}"),
         "exit_node" => format!("--exit-node={value}"),
         "hostname" => format!("--hostname={value}"),
         "control_url" => format!("--control-url={value}"),
+        "operator" => format!("--operator={value}"),
         "tun_name" => format!("--tun-name={value}"),
         "tun_mtu" => format!("--tun-mtu={value}"),
         // Daemon knows a pref this CLI build doesn't: keep the message actionable.
@@ -6647,6 +6872,68 @@ async fn read_secret_arg(value: Option<String>) -> Result<Option<SecretString>> 
 /// identifiers; `client_secret`/`id_token` are secrets (held in [`SecretString`]). All four are
 /// registration-time-only and never persisted as prefs — they ride the same one-shot channel as the
 /// auth key.
+/// The Go pref flags `tailscale up` shares with `tailscale set` (`up.go` `newUpFlagSet`), already
+/// resolved from their CLI flag pairs into the wire sentinels. Grouped into one named value — the
+/// same shape as [`WifFlags`] — so [`run_up`]'s already-long positional list does not grow four more
+/// interchangeable `Option<bool>`s that a transposition could silently swap.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct UpPrefFlags {
+    /// `--operator <user>` / `--operator=` (clear). `None` = flag absent = leave unchanged.
+    operator: Option<Option<String>>,
+    /// `--exit-node-allow-lan-access` / `--no-exit-node-allow-lan-access`.
+    exit_node_allow_lan_access: Option<bool>,
+    /// `--advertise-connector` / `--no-advertise-connector`.
+    advertise_connector: Option<bool>,
+    /// `--report-posture` / `--no-report-posture`.
+    report_posture: Option<bool>,
+}
+
+/// The Go pref flags `tailscale set` carries (`set.go` `newSetFlagSet`) beyond the ones this CLI
+/// already had — a superset of [`UpPrefFlags`], because Go registers `--nickname`, `--webclient`,
+/// `--auto-update` and `--update-check` on `set` only. Resolved and grouped for the same reason.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct SetPrefFlags {
+    /// `--advertise-connector` / `--no-advertise-connector` (reaches control; rebuilds a live node).
+    advertise_connector: Option<bool>,
+    /// `--auto-update` / `--no-auto-update` (reaches control; rebuilds a live node).
+    auto_update: Option<bool>,
+    /// `--update-check` / `--no-update-check`.
+    update_check: Option<bool>,
+    /// `--operator <user>` / `--operator=` (clear).
+    operator: Option<Option<String>>,
+    /// `--nickname <name>` / `--nickname=` (clear).
+    nickname: Option<Option<String>>,
+    /// `--report-posture` / `--no-report-posture`.
+    report_posture: Option<bool>,
+    /// `--webclient` / `--no-webclient`.
+    webclient: Option<bool>,
+    /// `--exit-node-allow-lan-access` / `--no-exit-node-allow-lan-access`.
+    exit_node_allow_lan_access: Option<bool>,
+}
+
+/// Map an `--x` / `--no-x` pref flag pair to the tri-state `Option<bool>` the wire uses: enable →
+/// `Some(true)`, disable → `Some(false)`, neither → `None` (leave the persisted pref unchanged).
+///
+/// The general form of the older per-flag resolvers (`resolve_tun`, `resolve_shields_up`,
+/// `resolve_ssh`, …), which each open-code this identical match; the flags added since share this
+/// one. clap's `conflicts_with` guarantees the two are never both set (and, defensively, `on` wins).
+/// Pure → unit-testable.
+fn resolve_tristate(on: bool, off: bool) -> Option<bool> {
+    match (on, off) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        _ => None,
+    }
+}
+
+/// Map a string-valued pref flag that Go clears with an EMPTY value (`--operator=`, `--nickname=`,
+/// rendered by Go's own `fmtFlagValueArg` as exactly that) onto the daemon's double-`Option`
+/// sentinel: flag absent → `None` (leave unchanged), `--flag=` → `Some(None)` (clear the pref),
+/// `--flag=v` → `Some(Some(v))` (set it). Pure → unit-testable.
+fn resolve_clearable_string(value: Option<String>) -> Option<Option<String>> {
+    value.map(|v| if v.is_empty() { None } else { Some(v) })
+}
+
 struct WifFlags {
     client_id: Option<String>,
     client_secret: Option<SecretString>,
@@ -8571,6 +8858,14 @@ mod tests {
             advertise_routes: resolve_list_or_clear(vec![], false),
             advertise_tags: None,
             ssh: resolve_ssh(false, false),
+            advertise_connector: None,
+            auto_update: None,
+            update_check: None,
+            operator: None,
+            nickname: None,
+            report_posture: None,
+            webclient: None,
+            exit_node_allow_lan_access: None,
         };
         match req {
             Request::Set {
@@ -8583,6 +8878,14 @@ mod tests {
                 advertise_routes,
                 advertise_tags: _,
                 ssh,
+                advertise_connector: _,
+                auto_update: _,
+                update_check: _,
+                operator: _,
+                nickname: _,
+                report_posture: _,
+                webclient: _,
+                exit_node_allow_lan_access: _,
             } => {
                 assert_eq!(hostname, Some("laptop".to_string()));
                 assert_eq!(accept_routes, Some(true));
@@ -8618,6 +8921,10 @@ mod tests {
             accept_dns: None,
             shields_up: None,
             ssh: None,
+            operator: None,
+            exit_node_allow_lan_access: None,
+            advertise_connector: None,
+            report_posture: None,
             reset: false,
             force_reauth: false,
             ephemeral: None,
@@ -8648,6 +8955,10 @@ mod tests {
             accept_dns: None,
             shields_up: None,
             ssh: None,
+            operator: None,
+            exit_node_allow_lan_access: None,
+            advertise_connector: None,
+            report_posture: None,
             reset: false,
             force_reauth: false,
             ephemeral: None,
@@ -8682,6 +8993,10 @@ mod tests {
             accept_dns: None,
             shields_up: None,
             ssh: None,
+            operator: None,
+            exit_node_allow_lan_access: None,
+            advertise_connector: None,
+            report_posture: None,
             reset: false,
             force_reauth: false,
             ephemeral: None,
@@ -8720,6 +9035,10 @@ mod tests {
             accept_dns: None,
             shields_up: resolve_shields_up(true, false),
             ssh: None,
+            operator: None,
+            exit_node_allow_lan_access: None,
+            advertise_connector: None,
+            report_posture: None,
             reset: false,
             force_reauth: false,
             ephemeral: None,
@@ -8750,6 +9069,10 @@ mod tests {
             accept_dns: None,
             shields_up: resolve_shields_up(false, true),
             ssh: None,
+            operator: None,
+            exit_node_allow_lan_access: None,
+            advertise_connector: None,
+            report_posture: None,
             reset: false,
             force_reauth: false,
             ephemeral: None,
@@ -8780,6 +9103,10 @@ mod tests {
             accept_dns: None,
             shields_up: resolve_shields_up(false, false),
             ssh: None,
+            operator: None,
+            exit_node_allow_lan_access: None,
+            advertise_connector: None,
+            report_posture: None,
             reset: false,
             force_reauth: false,
             ephemeral: None,
@@ -8812,6 +9139,14 @@ mod tests {
             advertise_routes: resolve_list_or_clear(vec![], true),
             advertise_tags: None,
             ssh: resolve_ssh(true, false),
+            advertise_connector: None,
+            auto_update: None,
+            update_check: None,
+            operator: None,
+            nickname: None,
+            report_posture: None,
+            webclient: None,
+            exit_node_allow_lan_access: None,
         };
         match req {
             Request::Set {
@@ -8824,6 +9159,14 @@ mod tests {
                 advertise_routes,
                 advertise_tags: _,
                 ssh,
+                advertise_connector: _,
+                auto_update: _,
+                update_check: _,
+                operator: _,
+                nickname: _,
+                report_posture: _,
+                webclient: _,
+                exit_node_allow_lan_access: _,
             } => {
                 assert_eq!(hostname, None);
                 assert_eq!(accept_routes, Some(false));
@@ -9614,6 +9957,21 @@ mod tests {
             "--accept-routes"
         );
         assert_eq!(revert_pref_to_flag("shields_up", "true"), "--shields-up");
+        // The Go pref flags `up` shares with `set`: bools render as the bare enabling flag (the only
+        // case the guard reports), and the value-bearing `operator` as `--operator=<user>`.
+        assert_eq!(
+            revert_pref_to_flag("exit_node_allow_lan_access", "true"),
+            "--exit-node-allow-lan-access"
+        );
+        assert_eq!(
+            revert_pref_to_flag("advertise_connector", "true"),
+            "--advertise-connector"
+        );
+        assert_eq!(
+            revert_pref_to_flag("report_posture", "true"),
+            "--report-posture"
+        );
+        assert_eq!(revert_pref_to_flag("operator", "alice"), "--operator=alice");
         assert_eq!(revert_pref_to_flag("tun", "true"), "--tun");
         // Defensive: a false bool renders the disabling flag (shouldn't occur from the guard).
         assert_eq!(revert_pref_to_flag("ssh", "false"), "--no-ssh");
@@ -9705,6 +10063,14 @@ mod tests {
             ssh: false,
             ssh_running: false,
             tun: false,
+            advertise_connector: false,
+            auto_update: None,
+            update_check: true,
+            operator: None,
+            nickname: None,
+            report_posture: false,
+            webclient: false,
+            exit_node_allow_lan_access: false,
         };
         let line = format_get_set_flags(&view);
         // Every setting is `--name=value`, space-joined (Go getOutputSetFlags / fmtFlagValueArg).
@@ -9741,6 +10107,14 @@ mod tests {
             ssh: true,
             ssh_running: true,
             tun: false,
+            advertise_connector: true,
+            auto_update: Some(true),
+            update_check: true,
+            operator: Some("alice".into()),
+            nickname: Some("laptop".into()),
+            report_posture: true,
+            webclient: false,
+            exit_node_allow_lan_access: true,
         };
 
         // Default table: a `NAME  VALUE` header line (Go `getOutputTable`) then one line per setting.
@@ -9763,9 +10137,28 @@ mod tests {
             table.contains("hostname") && table.contains("node-a"),
             "hostname must be listed with its value: {table}"
         );
-        // 1 header + 10 settings (hostname, exit-node, advertise-exit-node, advertise-routes,
-        // advertise-tags, accept-routes, accept-dns, shields-up, ssh, tun) → 11 lines.
-        assert_eq!(table.lines().count(), 11, "{table}");
+        // 1 header + 18 settings (hostname, exit-node, advertise-exit-node, advertise-routes,
+        // advertise-tags, accept-routes, accept-dns, shields-up, ssh, tun, advertise-connector,
+        // auto-update, update-check, operator, nickname, report-posture, webclient,
+        // exit-node-allow-lan-access) → 19 lines.
+        assert_eq!(table.lines().count(), 19, "{table}");
+        // The Go pref flags added alongside their engine `Config` fields are listed too, keyed by the
+        // same `tnet set` flag name Go's `get` uses.
+        for name in [
+            "advertise-connector",
+            "auto-update",
+            "update-check",
+            "operator",
+            "nickname",
+            "report-posture",
+            "webclient",
+            "exit-node-allow-lan-access",
+        ] {
+            assert!(
+                table.contains(name),
+                "{name} missing from the table: {table}"
+            );
+        }
 
         // --json: flattened name→value map keyed by set-flag name, with GO-FAITHFUL TYPED values —
         // booleans are bare JSON `true`/`false` (NOT quoted strings), strings are strings. Parse it
@@ -9794,6 +10187,36 @@ mod tests {
             parsed["advertise-routes"],
             serde_json::json!("10.0.0.0/8,192.168.1.0/24"),
             "{j}"
+        );
+        assert_eq!(
+            parsed["advertise-connector"],
+            serde_json::json!(true),
+            "{j}"
+        );
+        assert_eq!(parsed["operator"], serde_json::json!("alice"), "{j}");
+        assert_eq!(parsed["nickname"], serde_json::json!("laptop"), "{j}");
+        assert_eq!(parsed["report-posture"], serde_json::json!(true), "{j}");
+        assert_eq!(parsed["webclient"], serde_json::json!(false), "{j}");
+        assert_eq!(
+            parsed["exit-node-allow-lan-access"],
+            serde_json::json!(true),
+            "{j}"
+        );
+        // `auto-update` is Go's tri-state `opt.Bool`: an explicit opt-in is a bare `true`, and a
+        // never-stated value is `null` — NOT `false` (which would claim an explicit opt-OUT).
+        assert_eq!(parsed["auto-update"], serde_json::json!(true), "{j}");
+        let unstated = format_get(
+            &PrefsView {
+                auto_update: None,
+                ..view.clone()
+            },
+            Some("auto-update"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            unstated, "null\n",
+            "an unstated auto-update must render as null, not false"
         );
 
         // Single named setting → just its value (plain).
@@ -11549,6 +11972,326 @@ mod tests {
                 assert!(json);
             }
             _ => panic!("expected Command::Whois"),
+        }
+    }
+
+    #[test]
+    fn resolve_tristate_maps_the_flag_pair() {
+        // The shared `--x`/`--no-x` → `Option<bool>` mapping every pref flag added since the
+        // per-flag resolvers uses. Neither flag must leave the persisted pref UNCHANGED, never
+        // flipped to the flag's zero value — the bug this sentinel exists to prevent.
+        assert_eq!(resolve_tristate(true, false), Some(true));
+        assert_eq!(resolve_tristate(false, true), Some(false));
+        assert_eq!(resolve_tristate(false, false), None);
+        // clap's `conflicts_with` makes both-set unreachable; enable wins defensively.
+        assert_eq!(resolve_tristate(true, true), Some(true));
+    }
+
+    #[test]
+    fn resolve_clearable_string_distinguishes_absent_from_empty() {
+        // Go clears `--operator`/`--nickname` by passing an EMPTY value (its own `fmtFlagValueArg`
+        // renders exactly `--operator=`). Absent → unchanged; empty → clear; value → set. Collapsing
+        // "empty" into "absent" would make the clear command a silent no-op.
+        assert_eq!(resolve_clearable_string(None), None);
+        assert_eq!(resolve_clearable_string(Some(String::new())), Some(None));
+        assert_eq!(
+            resolve_clearable_string(Some("alice".to_string())),
+            Some(Some("alice".to_string()))
+        );
+    }
+
+    #[test]
+    fn up_carries_the_four_go_up_pref_flags() {
+        // Go registers `--operator`, `--exit-node-allow-lan-access`, `--advertise-connector` and
+        // `--report-posture` on BOTH `up` and `set` (up.go `newUpFlagSet`). Parse them off `tnet up`
+        // and pin the resolved wire sentinels — including that omitting a flag leaves the pref
+        // unchanged (`None`) rather than defaulting it off.
+        match Cli::try_parse_from([
+            "tnet",
+            "up",
+            "--operator",
+            "alice",
+            "--exit-node-allow-lan-access",
+            "--advertise-connector",
+            "--no-report-posture",
+        ])
+        .expect("parses")
+        .command
+        {
+            Command::Up {
+                operator,
+                exit_node_allow_lan_access,
+                no_exit_node_allow_lan_access,
+                advertise_connector,
+                no_advertise_connector,
+                report_posture,
+                no_report_posture,
+                ..
+            } => {
+                assert_eq!(
+                    resolve_clearable_string(operator),
+                    Some(Some("alice".to_string()))
+                );
+                assert_eq!(
+                    resolve_tristate(exit_node_allow_lan_access, no_exit_node_allow_lan_access),
+                    Some(true)
+                );
+                assert_eq!(
+                    resolve_tristate(advertise_connector, no_advertise_connector),
+                    Some(true)
+                );
+                assert_eq!(
+                    resolve_tristate(report_posture, no_report_posture),
+                    Some(false)
+                );
+            }
+            _ => panic!("expected Command::Up"),
+        }
+        // A bare `up` mentions none of them → every sentinel is "unchanged".
+        match Cli::try_parse_from(["tnet", "up"]).expect("parses").command {
+            Command::Up {
+                operator,
+                exit_node_allow_lan_access,
+                no_exit_node_allow_lan_access,
+                advertise_connector,
+                no_advertise_connector,
+                report_posture,
+                no_report_posture,
+                ..
+            } => {
+                assert_eq!(resolve_clearable_string(operator), None);
+                assert_eq!(
+                    resolve_tristate(exit_node_allow_lan_access, no_exit_node_allow_lan_access),
+                    None
+                );
+                assert_eq!(
+                    resolve_tristate(advertise_connector, no_advertise_connector),
+                    None
+                );
+                assert_eq!(resolve_tristate(report_posture, no_report_posture), None);
+            }
+            _ => panic!("expected Command::Up"),
+        }
+        // `--operator=` (empty) is Go's "remove the operator" form → the CLEAR sentinel.
+        match Cli::try_parse_from(["tnet", "up", "--operator="])
+            .expect("parses")
+            .command
+        {
+            Command::Up { operator, .. } => {
+                assert_eq!(resolve_clearable_string(operator), Some(None))
+            }
+            _ => panic!("expected Command::Up"),
+        }
+        // Go does NOT register `--nickname`/`--webclient`/`--auto-update`/`--update-check` on `up`
+        // (only on `set`), so neither do we — an `up` that names them is a usage error, not a
+        // silently-ignored flag.
+        for flag in [
+            "--nickname=x",
+            "--webclient",
+            "--auto-update",
+            "--update-check",
+        ] {
+            assert!(
+                Cli::try_parse_from(["tnet", "up", flag]).is_err(),
+                "{flag} must not be an `up` flag (Go registers it on `set` only)"
+            );
+        }
+    }
+
+    #[test]
+    fn set_carries_all_eight_go_set_pref_flags() {
+        // Go's `set` flag set (set.go `newSetFlagSet`) carries four more than `up`: `--nickname`,
+        // `--webclient`, `--auto-update`, `--update-check`. Parse all eight off `tnet set` and pin
+        // the resolved wire sentinels.
+        match Cli::try_parse_from([
+            "tnet",
+            "set",
+            "--advertise-connector",
+            "--auto-update",
+            "--no-update-check",
+            "--operator",
+            "alice",
+            "--nickname",
+            "laptop",
+            "--report-posture",
+            "--webclient",
+            "--exit-node-allow-lan-access",
+        ])
+        .expect("parses")
+        .command
+        {
+            Command::Set {
+                advertise_connector,
+                no_advertise_connector,
+                auto_update,
+                no_auto_update,
+                update_check,
+                no_update_check,
+                operator,
+                nickname,
+                report_posture,
+                no_report_posture,
+                webclient,
+                no_webclient,
+                exit_node_allow_lan_access,
+                no_exit_node_allow_lan_access,
+                ..
+            } => {
+                assert_eq!(
+                    resolve_tristate(advertise_connector, no_advertise_connector),
+                    Some(true)
+                );
+                assert_eq!(resolve_tristate(auto_update, no_auto_update), Some(true));
+                assert_eq!(resolve_tristate(update_check, no_update_check), Some(false));
+                assert_eq!(
+                    resolve_clearable_string(operator),
+                    Some(Some("alice".to_string()))
+                );
+                assert_eq!(
+                    resolve_clearable_string(nickname),
+                    Some(Some("laptop".to_string()))
+                );
+                assert_eq!(
+                    resolve_tristate(report_posture, no_report_posture),
+                    Some(true)
+                );
+                assert_eq!(resolve_tristate(webclient, no_webclient), Some(true));
+                assert_eq!(
+                    resolve_tristate(exit_node_allow_lan_access, no_exit_node_allow_lan_access),
+                    Some(true)
+                );
+            }
+            _ => panic!("expected Command::Set"),
+        }
+        // Each `--x` is mutually exclusive with its `--no-x` (clap `conflicts_with`), so a
+        // contradictory invocation is refused rather than silently resolved.
+        for (on, off) in [
+            ("--advertise-connector", "--no-advertise-connector"),
+            ("--auto-update", "--no-auto-update"),
+            ("--update-check", "--no-update-check"),
+            ("--report-posture", "--no-report-posture"),
+            ("--webclient", "--no-webclient"),
+            (
+                "--exit-node-allow-lan-access",
+                "--no-exit-node-allow-lan-access",
+            ),
+        ] {
+            assert!(
+                Cli::try_parse_from(["tnet", "set", on, off]).is_err(),
+                "{on} and {off} must conflict"
+            );
+        }
+    }
+
+    #[test]
+    fn new_pref_flags_reach_the_wire_requests() {
+        // The wire mapping, built from the same `UpPrefFlags`/`SetPrefFlags` groups `main` hands to
+        // `run_up`/`run_set`. Proves each flag lands on its OWN wire field (a mis-wired pair would
+        // otherwise only show up against a live daemon).
+        let up_prefs = UpPrefFlags {
+            operator: Some(Some("alice".to_string())),
+            exit_node_allow_lan_access: Some(true),
+            advertise_connector: Some(false),
+            report_posture: Some(true),
+        };
+        let up = Request::Up {
+            authkey: None,
+            control_url: None,
+            hostname: None,
+            tun: None,
+            tun_name: None,
+            tun_mtu: None,
+            exit_node: None,
+            advertise_exit_node: None,
+            advertise_routes: None,
+            advertise_tags: None,
+            accept_routes: None,
+            accept_dns: None,
+            shields_up: None,
+            ssh: None,
+            operator: up_prefs.operator,
+            exit_node_allow_lan_access: up_prefs.exit_node_allow_lan_access,
+            advertise_connector: up_prefs.advertise_connector,
+            report_posture: up_prefs.report_posture,
+            reset: false,
+            force_reauth: false,
+            ephemeral: None,
+            client_id: None,
+            client_secret: None,
+            id_token: None,
+            audience: None,
+        };
+        match up {
+            Request::Up {
+                operator,
+                exit_node_allow_lan_access,
+                advertise_connector,
+                report_posture,
+                ..
+            } => {
+                assert_eq!(operator, Some(Some("alice".to_string())));
+                assert_eq!(exit_node_allow_lan_access, Some(true));
+                assert_eq!(advertise_connector, Some(false));
+                assert_eq!(report_posture, Some(true));
+            }
+            other => panic!("expected Request::Up, got {other:?}"),
+        }
+
+        let set_prefs = SetPrefFlags {
+            advertise_connector: Some(true),
+            auto_update: Some(false),
+            update_check: Some(false),
+            operator: Some(None),
+            nickname: Some(Some("laptop".to_string())),
+            report_posture: Some(true),
+            webclient: Some(true),
+            exit_node_allow_lan_access: Some(false),
+        };
+        let set = Request::Set {
+            hostname: None,
+            accept_routes: None,
+            accept_dns: None,
+            shields_up: None,
+            exit_node: None,
+            advertise_exit_node: None,
+            advertise_routes: None,
+            advertise_tags: None,
+            ssh: None,
+            advertise_connector: set_prefs.advertise_connector,
+            auto_update: set_prefs.auto_update,
+            update_check: set_prefs.update_check,
+            operator: set_prefs.operator,
+            nickname: set_prefs.nickname,
+            report_posture: set_prefs.report_posture,
+            webclient: set_prefs.webclient,
+            exit_node_allow_lan_access: set_prefs.exit_node_allow_lan_access,
+        };
+        match set {
+            Request::Set {
+                advertise_connector,
+                auto_update,
+                update_check,
+                operator,
+                nickname,
+                report_posture,
+                webclient,
+                exit_node_allow_lan_access,
+                ..
+            } => {
+                assert_eq!(advertise_connector, Some(true));
+                assert_eq!(
+                    auto_update,
+                    Some(false),
+                    "--no-auto-update is an explicit OFF"
+                );
+                assert_eq!(update_check, Some(false));
+                assert_eq!(operator, Some(None), "--operator= clears");
+                assert_eq!(nickname, Some(Some("laptop".to_string())));
+                assert_eq!(report_posture, Some(true));
+                assert_eq!(webclient, Some(true));
+                assert_eq!(exit_node_allow_lan_access, Some(false));
+            }
+            other => panic!("expected Request::Set, got {other:?}"),
         }
     }
 

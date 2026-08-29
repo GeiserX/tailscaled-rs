@@ -171,6 +171,41 @@ pub(super) fn check_accidental_reverts(
             value: prefs.ssh_enabled.to_string(),
         });
     }
+    // The four Go pref flags `up` shares with `set` (up.go `newUpFlagSet`; Go guards exactly the
+    // flags its own `up` flag set registers — see `prefsToFlags`). The other four new prefs
+    // (`nickname` / `webclient` / `auto_update_*`) are `set`-ONLY in Go, so `up` has no flag to
+    // mention them with and can never revert them; they get no arm here (and none in `--reset`).
+    if opts.operator.is_none()
+        && prefs.operator_user != d.operator_user
+        && let Some(v) = &prefs.operator_user
+    {
+        reverts.push(RevertedPref {
+            key: "operator".into(),
+            value: v.clone(),
+        });
+    }
+    if opts.exit_node_allow_lan_access.is_none()
+        && prefs.exit_node_allow_lan_access != d.exit_node_allow_lan_access
+    {
+        reverts.push(RevertedPref {
+            key: "exit_node_allow_lan_access".into(),
+            value: prefs.exit_node_allow_lan_access.to_string(),
+        });
+    }
+    if opts.advertise_connector.is_none()
+        && prefs.advertise_app_connector != d.advertise_app_connector
+    {
+        reverts.push(RevertedPref {
+            key: "advertise_connector".into(),
+            value: prefs.advertise_app_connector.to_string(),
+        });
+    }
+    if opts.report_posture.is_none() && prefs.posture_checking != d.posture_checking {
+        reverts.push(RevertedPref {
+            key: "report_posture".into(),
+            value: prefs.posture_checking.to_string(),
+        });
+    }
 
     reverts
 }
@@ -211,6 +246,14 @@ mod tests {
             ephemeral: _,
             taildrop_dir: _, // configured out-of-band (engine Config), not an `up` flag.
             has_logged_in: _, // registration signal — the guard's own fresh-node INPUT, never a guarded setting (tsd-i7c).
+            // EXEMPT: Go registers these four on `tailscale set` but NOT on `tailscale up`
+            // (`set.go` `newSetFlagSet` vs `up.go` `newUpFlagSet`). An `up` therefore has no flag
+            // that could mention them, so it can never revert them and `up --reset` must not clear
+            // them — exactly Go's rule, whose guard iterates the `up` flag set (`prefsToFlags`).
+            node_nickname: _,
+            run_web_client: _,
+            auto_update_apply: _,
+            auto_update_check: _,
             // --- UP-MANAGED (MUST be in reset + guard; asserted at runtime below) ---
             control_url: _,
             hostname: _,
@@ -225,6 +268,11 @@ mod tests {
             tun_enabled: _,
             tun_name: _,
             tun_mtu: _,
+            // UP-MANAGED: Go registers these four on BOTH `up` and `set`.
+            operator_user: _,
+            exit_node_allow_lan_access: _,
+            advertise_app_connector: _,
+            posture_checking: _,
         } = Prefs::default();
 
         // Runtime half: for EACH field classified up-managed above, build a node where ONLY that
@@ -258,6 +306,12 @@ mod tests {
             ("tun", |p| p.tun_enabled = true),
             ("tun_name", |p| p.tun_name = Some("tailscale0".into())),
             ("tun_mtu", |p| p.tun_mtu = Some(1280)),
+            ("operator", |p| p.operator_user = Some("alice".into())),
+            ("exit_node_allow_lan_access", |p| {
+                p.exit_node_allow_lan_access = true
+            }),
+            ("advertise_connector", |p| p.advertise_app_connector = true),
+            ("report_posture", |p| p.posture_checking = true),
         ];
 
         for (expected_key, set_non_default) in &cases {
@@ -312,6 +366,18 @@ mod tests {
                 "tun" => assert_eq!(reset_prefs.tun_enabled, d.tun_enabled),
                 "tun_name" => assert_eq!(reset_prefs.tun_name, d.tun_name),
                 "tun_mtu" => assert_eq!(reset_prefs.tun_mtu, d.tun_mtu),
+                "operator" => assert_eq!(reset_prefs.operator_user, d.operator_user),
+                "exit_node_allow_lan_access" => assert_eq!(
+                    reset_prefs.exit_node_allow_lan_access,
+                    d.exit_node_allow_lan_access
+                ),
+                "advertise_connector" => assert_eq!(
+                    reset_prefs.advertise_app_connector,
+                    d.advertise_app_connector
+                ),
+                "report_posture" => {
+                    assert_eq!(reset_prefs.posture_checking, d.posture_checking)
+                }
                 other => panic!("unclassified up-managed key in test table: {other}"),
             }
         }
@@ -342,6 +408,10 @@ mod tests {
             accept_dns: _,
             shields_up: _,
             ssh: _,
+            operator: _,
+            exit_node_allow_lan_access: _,
+            advertise_connector: _,
+            report_posture: _,
             // --- DIRECTIVE: not a pref; bypasses or is exempt from the guard, NOT in mentions_any_pref ---
             reset: _,        // its own guard-BYPASS path (caller skips the guard when set).
             force_reauth: _, // re-key lifecycle action; excluded from mentions_any_pref + the guard.
