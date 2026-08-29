@@ -17,6 +17,8 @@
 //! - [`server`] — the LocalAPI server, a Unix-domain-socket IPC surface the CLI talks to.
 //! - [`hardening`] — best-effort OS-level protection (no-coredump / no-ptrace / no-swap) for the
 //!   secrets the engine holds in memory, the in-RAM analogue of [`ensure_state_dir_secure`].
+//! - [`hostreap`] — startup cleanup of host routes/DNS a *hard-killed* previous run left behind
+//!   (the engine's graceful teardown never ran), so a crash cannot outlive the daemon.
 //!
 //! Two binaries consume it: `tailnetd` (the daemon) and `tnet` (the thin CLI client).
 
@@ -24,6 +26,7 @@ pub mod auth;
 pub mod conffile;
 pub mod debugserver;
 pub mod hardening;
+pub mod hostreap;
 pub mod httpproxy;
 pub mod ipforward;
 pub mod ipn;
