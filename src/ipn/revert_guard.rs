@@ -171,6 +171,72 @@ pub(super) fn check_accidental_reverts(
             value: prefs.ssh_enabled.to_string(),
         });
     }
+    // The eight later-added Go pref flags (bead tsd-1m9). All are up-managed — `up` accepts each as
+    // a flag and `--reset` returns each to its default — so each needs a guard arm, or an `up` that
+    // didn't mention it would silently revert it. The value-bearing ones (`operator`, `nickname`,
+    // and the tri-state `auto_update`) follow the `exit_node`/`tun_name` shape: only report when the
+    // current value is actually present, since the reported value is what the operator re-passes.
+    if opts.operator.is_none()
+        && prefs.operator_user != d.operator_user
+        && let Some(v) = &prefs.operator_user
+    {
+        reverts.push(RevertedPref {
+            key: "operator".into(),
+            value: v.clone(),
+        });
+    }
+    if opts.auto_update.is_none()
+        && prefs.auto_update_apply != d.auto_update_apply
+        && let Some(v) = prefs.auto_update_apply
+    {
+        reverts.push(RevertedPref {
+            key: "auto_update".into(),
+            value: v.to_string(),
+        });
+    }
+    if opts.update_check.is_none() && prefs.auto_update_check != d.auto_update_check {
+        reverts.push(RevertedPref {
+            key: "update_check".into(),
+            value: prefs.auto_update_check.to_string(),
+        });
+    }
+    if opts.report_posture.is_none() && prefs.posture_checking != d.posture_checking {
+        reverts.push(RevertedPref {
+            key: "report_posture".into(),
+            value: prefs.posture_checking.to_string(),
+        });
+    }
+    if opts.advertise_connector.is_none()
+        && prefs.advertise_app_connector != d.advertise_app_connector
+    {
+        reverts.push(RevertedPref {
+            key: "advertise_connector".into(),
+            value: prefs.advertise_app_connector.to_string(),
+        });
+    }
+    if opts.webclient.is_none() && prefs.run_web_client != d.run_web_client {
+        reverts.push(RevertedPref {
+            key: "webclient".into(),
+            value: prefs.run_web_client.to_string(),
+        });
+    }
+    if opts.exit_node_allow_lan_access.is_none()
+        && prefs.exit_node_allow_lan_access != d.exit_node_allow_lan_access
+    {
+        reverts.push(RevertedPref {
+            key: "exit_node_allow_lan_access".into(),
+            value: prefs.exit_node_allow_lan_access.to_string(),
+        });
+    }
+    if opts.nickname.is_none()
+        && prefs.node_nickname != d.node_nickname
+        && let Some(v) = &prefs.node_nickname
+    {
+        reverts.push(RevertedPref {
+            key: "nickname".into(),
+            value: v.clone(),
+        });
+    }
 
     reverts
 }
@@ -225,6 +291,14 @@ mod tests {
             tun_enabled: _,
             tun_name: _,
             tun_mtu: _,
+            operator_user: _,
+            auto_update_apply: _,
+            auto_update_check: _,
+            posture_checking: _,
+            advertise_app_connector: _,
+            run_web_client: _,
+            exit_node_allow_lan_access: _,
+            node_nickname: _,
         } = Prefs::default();
 
         // Runtime half: for EACH field classified up-managed above, build a node where ONLY that
@@ -258,6 +332,17 @@ mod tests {
             ("tun", |p| p.tun_enabled = true),
             ("tun_name", |p| p.tun_name = Some("tailscale0".into())),
             ("tun_mtu", |p| p.tun_mtu = Some(1280)),
+            // The eight later-added Go pref flags (bead tsd-1m9), all up-managed.
+            ("operator", |p| p.operator_user = Some("alice".into())),
+            ("auto_update", |p| p.auto_update_apply = Some(true)),
+            ("update_check", |p| p.auto_update_check = true),
+            ("report_posture", |p| p.posture_checking = true),
+            ("advertise_connector", |p| p.advertise_app_connector = true),
+            ("webclient", |p| p.run_web_client = true),
+            ("exit_node_allow_lan_access", |p| {
+                p.exit_node_allow_lan_access = true
+            }),
+            ("nickname", |p| p.node_nickname = Some("laptop".into())),
         ];
 
         for (expected_key, set_non_default) in &cases {
@@ -312,6 +397,26 @@ mod tests {
                 "tun" => assert_eq!(reset_prefs.tun_enabled, d.tun_enabled),
                 "tun_name" => assert_eq!(reset_prefs.tun_name, d.tun_name),
                 "tun_mtu" => assert_eq!(reset_prefs.tun_mtu, d.tun_mtu),
+                "operator" => assert_eq!(reset_prefs.operator_user, d.operator_user),
+                "auto_update" => {
+                    assert_eq!(reset_prefs.auto_update_apply, d.auto_update_apply)
+                }
+                "update_check" => {
+                    assert_eq!(reset_prefs.auto_update_check, d.auto_update_check)
+                }
+                "report_posture" => assert_eq!(reset_prefs.posture_checking, d.posture_checking),
+                "advertise_connector" => {
+                    assert_eq!(
+                        reset_prefs.advertise_app_connector,
+                        d.advertise_app_connector
+                    )
+                }
+                "webclient" => assert_eq!(reset_prefs.run_web_client, d.run_web_client),
+                "exit_node_allow_lan_access" => assert_eq!(
+                    reset_prefs.exit_node_allow_lan_access,
+                    d.exit_node_allow_lan_access
+                ),
+                "nickname" => assert_eq!(reset_prefs.node_nickname, d.node_nickname),
                 other => panic!("unclassified up-managed key in test table: {other}"),
             }
         }
@@ -342,6 +447,16 @@ mod tests {
             accept_dns: _,
             shields_up: _,
             ssh: _,
+            // The eight later-added Go pref flags (bead tsd-1m9): ordinary pref flags, so all eight
+            // are guard arms AND in `mentions_any_pref` AND reset by `--reset` (asserted above).
+            operator: _,
+            auto_update: _,
+            update_check: _,
+            report_posture: _,
+            advertise_connector: _,
+            webclient: _,
+            exit_node_allow_lan_access: _,
+            nickname: _,
             // --- DIRECTIVE: not a pref; bypasses or is exempt from the guard, NOT in mentions_any_pref ---
             reset: _,        // its own guard-BYPASS path (caller skips the guard when set).
             force_reauth: _, // re-key lifecycle action; excluded from mentions_any_pref + the guard.
@@ -350,6 +465,36 @@ mod tests {
             //     faithfully checking the OTHER prefs) but is NOT a guard arm and NOT in --reset. ---
             ephemeral: _,
         } = crate::ipn::UpOptions::default();
+
+        // The eight pref flags of bead tsd-1m9 are classified GUARD-RELEVANT above, which asserts
+        // two things the destructure alone cannot: their guard arms fire (proved by the `Prefs`
+        // lockstep test above, which lists all eight), and each is in `mentions_any_pref` — checked
+        // here. Missing the latter would be quiet but nasty: an `up` naming ONLY that flag would look
+        // "bare" and skip the guard entirely, so every OTHER non-default pref would silently revert.
+        type Mention = (&'static str, fn(&mut crate::ipn::UpOptions));
+        let mentions: Vec<Mention> = vec![
+            ("operator", |o| o.operator = Some(Some("alice".into()))),
+            ("auto_update", |o| o.auto_update = Some(true)),
+            ("update_check", |o| o.update_check = Some(true)),
+            ("report_posture", |o| o.report_posture = Some(true)),
+            ("advertise_connector", |o| {
+                o.advertise_connector = Some(true)
+            }),
+            ("webclient", |o| o.webclient = Some(true)),
+            ("exit_node_allow_lan_access", |o| {
+                o.exit_node_allow_lan_access = Some(true)
+            }),
+            ("nickname", |o| o.nickname = Some(Some("laptop".into()))),
+        ];
+        for (name, mention) in &mentions {
+            let mut opts = crate::ipn::UpOptions::default();
+            mention(&mut opts);
+            assert!(
+                opts.mentions_any_pref(),
+                "{name} must be in mentions_any_pref — otherwise an `up` naming only it counts as \
+                 BARE and skips the accidental-revert guard for every other pref"
+            );
+        }
 
         // Verify the two non-obvious classifications actually hold (so the table can't lie):
         // `force_reauth` is a directive → must NOT make a bare up look non-bare.

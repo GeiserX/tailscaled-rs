@@ -637,6 +637,19 @@ not forgotten; the drain itself is already faithful without it. — daemon lane
 
 ## 21. Engine `Config` fields for the ~12 missing Go `up`/`set` pref flags
 
+> ✅ **PARTLY SHIPPED.** The engine grew a `Config` field for eight of these — `operator_user`,
+> `auto_update_apply`, `auto_update_check`, `posture_checking`, `advertise_app_connector`,
+> `run_web_client`, `exit_node_allow_lan_access`, `node_nickname` — and threads every one on to
+> `ts_control::Config`. Two of them are genuinely advertised to control (`advertise_app_connector` →
+> `Hostinfo.AppConnector`, `auto_update_apply` → `Hostinfo.AllowsUpdate`, sent at registration and on
+> every map request); the other six are stored-and-carried, which is what a downstream daemon needs.
+> The daemon consumed all eight in bead `tsd-1m9` (`--operator`, `--auto-update`, `--update-check`,
+> `--report-posture`, `--advertise-connector`, `--webclient`, `--exit-node-allow-lan-access`,
+> `--nickname` on both `up` and `set`). **Still open:** the Linux subnet-router knobs at the bottom of
+> the ask (`--snat-subnet-routes`, `--stateful-filtering`, `--netfilter-mode`, `--unattended`), which
+> need the router/netfilter layer. The workload-identity sub-ask below also shipped (the daemon's
+> `identity-federation` cargo feature).
+
 **Why:** Go's `tailscale up`/`set` (v1.100.0 `up.go:99-148`, `set.go:76-122`) expose ~15 pref flags;
 this fork's `up`/`set` faithfully cover the ten that map to existing engine `Config` fields
 (`hostname`, `accept-routes`, `accept-dns`, `shields-up`, `exit-node`, `advertise-exit-node`,

@@ -87,7 +87,9 @@ consuming change rides the next pin bump).
 
 Closed this migration so far (50 beads). The consumed engine capabilities and shipped daemon features:
 
-- **Lifecycle / prefs:** `up` (full flag surface incl. workload-identity-federation auth keys), `down`,
+- **Lifecycle / prefs:** `up` (full flag surface incl. workload-identity-federation auth keys and the
+  eight carried/advertised pref flags `--operator`/`--auto-update`/`--update-check`/`--report-posture`/
+  `--advertise-connector`/`--webclient`/`--exit-node-allow-lan-access`/`--nickname`), `down`,
   `login` (interactive + authkey), `logout`, `set` (live pref mutation), `reload-config` (3-way
   persisted/rebuild/bring-down), `get`, `wait`, `whoami`, `version` (rich `--version` w/ commit+rustc).
 - **Status / observability:** `status` (+`--json`/`--watch`/filters/`--web`), WatchNotifications (masked
@@ -120,7 +122,7 @@ would violate the honest-omission rule). Each rides the next pin bump once its a
 
 | Gap | Bead | Engine ask | Note |
 | --- | --- | --- | --- |
-| ~12 missing `up`/`set` pref flags (`--operator`, `--auto-update`/`--update-check`, `--report-posture`, `--advertise-connector`, `--webclient`, `--exit-node-allow-lan-access`, `--nickname`, Linux subnet-router knobs) | `tsd-1m9` | **#21** | Each needs a `Config`/pref field the engine doesn't carry. The workload-identity slice already shipped. |
+| Linux subnet-router pref flags (`--snat-subnet-routes`, `--stateful-filtering`, `--netfilter-mode`, `--unattended`) | `tsd-1m9` (residual) | **#21** | Need the engine's router/netfilter layer (Go `Prefs.NoSNAT`/`NoStatefulFiltering`/`NetfilterMode`/`Unattended`); they ride on the Linux OS-router bead `tsd-m8s`. The other eight flags of ask #21 — `--operator`, `--auto-update`, `--update-check`, `--report-posture`, `--advertise-connector`, `--webclient`, `--exit-node-allow-lan-access`, `--nickname` — SHIPPED once the engine grew their `Config` fields. |
 | `lock add`/`remove`/`log` (tailnet-lock key-set mutation + AUM log) | `tsd-nee` | **#25** | Engine exposes `tka_{init,sign,disable}` but not `add`/`remove`/`log`. |
 | `lock local-disable` (disable lock for THIS node only) | — | **#27** | `disablement-kdf` already ships daemon-side; `local-disable` needs `Device::tka_local_disable()`. |
 | LocalAPI peer-by-id | `tsd-iqq.15` | — | Needs a numeric NodeID on `StatusNode` (engine surfaces only the stable id). |

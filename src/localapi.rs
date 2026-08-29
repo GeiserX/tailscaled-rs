@@ -181,6 +181,52 @@ pub enum Request {
         /// with a clear error unless built with the `identity-federation` feature (never silently
         /// ignored — honest-omission). `client_secret`/`id_token` are secrets; the CLI holds them in
         /// `SecretString` and the daemon hands them straight to the engine without logging.
+        /// The OS username allowed to drive the LocalAPI without root (Go `--operator`). Double
+        /// `Option`: absent = leave the pref unchanged, present `null` = clear, present string = set.
+        /// A CARRIED pref — persisted and threaded to the engine `Config`, but this daemon's LocalAPI
+        /// write policy is still root/same-uid and does not consult it yet (see
+        /// [`crate::prefs::Prefs::operator_user`]).
+        #[serde(
+            default,
+            with = "::serde_with::rust::double_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        operator: Option<Option<String>>,
+        /// Opt in to admin-console-triggered auto-updates (Go `--auto-update`). `None` unchanged;
+        /// `Some(b)` sets the tri-state pref to `Some(b)`. ADVERTISED to control as
+        /// `Hostinfo.AllowsUpdate`; no updater runs here.
+        #[serde(default)]
+        auto_update: Option<bool>,
+        /// Let a background updater check for available updates (Go `--update-check`). `None`
+        /// unchanged; `Some(b)` sets it. Carried pref — never sent to control.
+        #[serde(default)]
+        update_check: Option<bool>,
+        /// Enable device-posture identity collection (Go `--report-posture`). `None` unchanged;
+        /// `Some(b)` sets it. Carried pref — this fork implements no c2n posture responder.
+        #[serde(default)]
+        report_posture: Option<bool>,
+        /// Advertise this node as an app connector (Go `--advertise-connector`). `None` unchanged;
+        /// `Some(b)` sets it. ADVERTISED to control as `Hostinfo.AppConnector` (capability only — the
+        /// connector data path is not implemented).
+        #[serde(default)]
+        advertise_connector: Option<bool>,
+        /// Run the local web client (Go `--webclient`). `None` unchanged; `Some(b)` sets it. Carried
+        /// pref — no web-client server is hosted.
+        #[serde(default)]
+        webclient: Option<bool>,
+        /// Let peers using this node as an exit node also reach its local LAN (Go
+        /// `--exit-node-allow-lan-access`). `None` unchanged; `Some(b)` sets it. Carried pref — inert
+        /// without a host-route layer.
+        #[serde(default)]
+        exit_node_allow_lan_access: Option<bool>,
+        /// Local display label for this login profile (Go `--nickname`). Double `Option`: absent =
+        /// unchanged, `null` = clear, string = set. Carried pref — never advertised.
+        #[serde(
+            default,
+            with = "::serde_with::rust::double_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        nickname: Option<Option<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -236,6 +282,52 @@ pub enum Request {
         /// `set` rebuilds the running device (the SSH server task is tied to the device lifecycle).
         #[serde(default)]
         ssh: Option<bool>,
+        /// The OS username allowed to drive the LocalAPI without root (Go `--operator`). Double
+        /// `Option`: absent = leave the pref unchanged, present `null` = clear, present string = set.
+        /// A CARRIED pref — persisted and threaded to the engine `Config`, but this daemon's LocalAPI
+        /// write policy is still root/same-uid and does not consult it yet (see
+        /// [`crate::prefs::Prefs::operator_user`]).
+        #[serde(
+            default,
+            with = "::serde_with::rust::double_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        operator: Option<Option<String>>,
+        /// Opt in to admin-console-triggered auto-updates (Go `--auto-update`). `None` unchanged;
+        /// `Some(b)` sets the tri-state pref to `Some(b)`. ADVERTISED to control as
+        /// `Hostinfo.AllowsUpdate`; no updater runs here.
+        #[serde(default)]
+        auto_update: Option<bool>,
+        /// Let a background updater check for available updates (Go `--update-check`). `None`
+        /// unchanged; `Some(b)` sets it. Carried pref — never sent to control.
+        #[serde(default)]
+        update_check: Option<bool>,
+        /// Enable device-posture identity collection (Go `--report-posture`). `None` unchanged;
+        /// `Some(b)` sets it. Carried pref — this fork implements no c2n posture responder.
+        #[serde(default)]
+        report_posture: Option<bool>,
+        /// Advertise this node as an app connector (Go `--advertise-connector`). `None` unchanged;
+        /// `Some(b)` sets it. ADVERTISED to control as `Hostinfo.AppConnector` (capability only — the
+        /// connector data path is not implemented).
+        #[serde(default)]
+        advertise_connector: Option<bool>,
+        /// Run the local web client (Go `--webclient`). `None` unchanged; `Some(b)` sets it. Carried
+        /// pref — no web-client server is hosted.
+        #[serde(default)]
+        webclient: Option<bool>,
+        /// Let peers using this node as an exit node also reach its local LAN (Go
+        /// `--exit-node-allow-lan-access`). `None` unchanged; `Some(b)` sets it. Carried pref — inert
+        /// without a host-route layer.
+        #[serde(default)]
+        exit_node_allow_lan_access: Option<bool>,
+        /// Local display label for this login profile (Go `--nickname`). Double `Option`: absent =
+        /// unchanged, `null` = clear, string = set. Carried pref — never advertised.
+        #[serde(
+            default,
+            with = "::serde_with::rust::double_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        nickname: Option<Option<String>>,
     },
     /// Report the daemon's own version (Go `tailscale version --daemon` reads `Status.Version`).
     /// Read-only — gated like [`Status`](Request::Status).
@@ -332,8 +424,10 @@ pub enum Request {
     /// gates `serveCheckPrefs` on `PermitWrite`), but it MUTATES NOTHING — it only runs the same
     /// validation the bring-up path would. This fork mirrors the subset of Go's rule chain that maps
     /// to its prefs: the exit-node-vs-advertise-exit-node conflict, SSH-server capability, and
-    /// advertise-route CIDR masking (Go's operator/auto-update/profile/config-lock rules reference
-    /// prefs this fork does not model). The fields are the same "leave unchanged unless named"
+    /// advertise-route CIDR masking. Go's operator/auto-update/profile/config-lock rules are NOT
+    /// mirrored: three of those prefs are modelled now (`--operator`, `--auto-update`, `--nickname`,
+    /// bead `tsd-1m9`), but they are CARRIED prefs this daemon stores without acting on, so there is
+    /// no behavior for such a rule to protect yet. The fields are the same "leave unchanged unless named"
     /// sentinels as [`Set`](Request::Set) — a check validates the prospective combined posture.
     CheckPrefs {
         /// Prospective exit-node selector (same double-option semantics as [`Set::exit_node`]).
@@ -1009,6 +1103,31 @@ pub struct PrefsView {
     pub ssh_running: bool,
     /// Whether the node uses the kernel-TUN data path (vs the userspace netstack).
     pub tun: bool,
+    /// The OS username allowed to drive the LocalAPI without root (Go `--operator`), or `None`. A
+    /// carried pref: recorded and threaded to the engine `Config`, not yet consulted by this
+    /// daemon's write policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operator: Option<String>,
+    /// Whether the node opts in to admin-console-triggered auto-updates (Go `--auto-update`).
+    /// Tri-state, mirroring Go's `opt.Bool`: `None` = unset, `Some(false)` = explicitly off,
+    /// `Some(true)` = on. Advertised to control as `Hostinfo.AllowsUpdate`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_update: Option<bool>,
+    /// Whether a background updater should check for updates (Go `--update-check`). Carried pref.
+    pub update_check: bool,
+    /// Whether device-posture identity collection is enabled (Go `--report-posture`). Carried pref.
+    pub report_posture: bool,
+    /// Whether the node advertises itself as an app connector (Go `--advertise-connector`).
+    /// Advertised to control as `Hostinfo.AppConnector`.
+    pub advertise_connector: bool,
+    /// Whether the node runs the local web client (Go `--webclient`). Carried pref.
+    pub webclient: bool,
+    /// Whether peers using this node as an exit node may also reach its local LAN (Go
+    /// `--exit-node-allow-lan-access`). Carried pref.
+    pub exit_node_allow_lan_access: bool,
+    /// Local display label for this login profile (Go `--nickname`), or `None`. Carried pref.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nickname: Option<String>,
 }
 
 /// The node's serve configuration (the TCP-forward subset of Go `ipn.ServeConfig`), carried by
@@ -1500,6 +1619,184 @@ mod tests {
     // tagged representations are a contract: assert the exact `cmd`/`kind` discriminants.
 
     #[test]
+    fn up_and_set_carry_the_eight_pref_flags_and_stay_back_compatible() {
+        // Bead tsd-1m9. The CLI and daemon are separate processes agreeing only on this JSON, so the
+        // eight new flags need three things pinned: they round-trip on BOTH `up` and `set`; an
+        // absent key means "leave the pref unchanged" (so an OLDER CLI's payload still parses and
+        // changes nothing); and the two string flags distinguish absent (unchanged) from an explicit
+        // `null` (clear) — the `double_option` the `exit_node` field already depends on.
+
+        // --- round trip on `up` ---
+        let req = Request::Up {
+            authkey: None,
+            control_url: None,
+            hostname: None,
+            tun: None,
+            tun_name: None,
+            tun_mtu: None,
+            exit_node: None,
+            advertise_exit_node: None,
+            advertise_routes: None,
+            advertise_tags: None,
+            accept_routes: None,
+            accept_dns: None,
+            shields_up: None,
+            ssh: None,
+            reset: false,
+            force_reauth: false,
+            ephemeral: None,
+            client_id: None,
+            client_secret: None,
+            id_token: None,
+            audience: None,
+            operator: Some(Some("alice".to_string())),
+            auto_update: Some(true),
+            update_check: Some(false),
+            report_posture: Some(true),
+            advertise_connector: Some(true),
+            webclient: Some(true),
+            exit_node_allow_lan_access: Some(true),
+            nickname: Some(Some("laptop".to_string())),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        match serde_json::from_str::<Request>(&json).unwrap() {
+            Request::Up {
+                operator,
+                auto_update,
+                update_check,
+                report_posture,
+                advertise_connector,
+                webclient,
+                exit_node_allow_lan_access,
+                nickname,
+                ..
+            } => {
+                assert_eq!(operator, Some(Some("alice".to_string())));
+                assert_eq!(auto_update, Some(true));
+                assert_eq!(update_check, Some(false), "explicit false must survive");
+                assert_eq!(report_posture, Some(true));
+                assert_eq!(advertise_connector, Some(true));
+                assert_eq!(webclient, Some(true));
+                assert_eq!(exit_node_allow_lan_access, Some(true));
+                assert_eq!(nickname, Some(Some("laptop".to_string())));
+            }
+            other => panic!("expected Up, got {other:?}"),
+        }
+
+        // --- round trip on `set` (the same eight; Go exposes them on both commands) ---
+        let req = Request::Set {
+            hostname: None,
+            accept_routes: None,
+            accept_dns: None,
+            shields_up: None,
+            exit_node: None,
+            advertise_exit_node: None,
+            advertise_routes: None,
+            advertise_tags: None,
+            ssh: None,
+            operator: Some(None),
+            auto_update: Some(false),
+            update_check: Some(true),
+            report_posture: Some(true),
+            advertise_connector: Some(false),
+            webclient: Some(true),
+            exit_node_allow_lan_access: Some(true),
+            nickname: Some(None),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        match serde_json::from_str::<Request>(&json).unwrap() {
+            Request::Set {
+                operator,
+                auto_update,
+                advertise_connector,
+                nickname,
+                ..
+            } => {
+                assert_eq!(
+                    operator,
+                    Some(None),
+                    "a present null must survive as Some(None) = CLEAR, not collapse to unchanged"
+                );
+                assert_eq!(nickname, Some(None));
+                assert_eq!(auto_update, Some(false));
+                assert_eq!(advertise_connector, Some(false));
+            }
+            other => panic!("expected Set, got {other:?}"),
+        }
+
+        // --- BACK-COMPAT: a payload from a CLI that predates these flags omits every key. Each must
+        // deserialize to `None` = "leave the pref unchanged", so an older client can never silently
+        // reset a node's operator/nickname/advertise posture just by not knowing about them.
+        let old = r#"{"cmd":"up","authkey":null,"reset":false,"force_reauth":false}"#;
+        match serde_json::from_str::<Request>(old).unwrap() {
+            Request::Up {
+                operator,
+                auto_update,
+                update_check,
+                report_posture,
+                advertise_connector,
+                webclient,
+                exit_node_allow_lan_access,
+                nickname,
+                ..
+            } => {
+                assert!(operator.is_none(), "absent operator = unchanged, not clear");
+                assert!(nickname.is_none(), "absent nickname = unchanged, not clear");
+                assert_eq!(auto_update, None);
+                assert_eq!(update_check, None);
+                assert_eq!(report_posture, None);
+                assert_eq!(advertise_connector, None);
+                assert_eq!(webclient, None);
+                assert_eq!(exit_node_allow_lan_access, None);
+            }
+            other => panic!("expected Up, got {other:?}"),
+        }
+        let old = r#"{"cmd":"set","hostname":"node-a"}"#;
+        match serde_json::from_str::<Request>(old).unwrap() {
+            Request::Set {
+                operator,
+                advertise_connector,
+                nickname,
+                ..
+            } => {
+                assert!(operator.is_none());
+                assert!(nickname.is_none());
+                assert_eq!(advertise_connector, None);
+            }
+            other => panic!("expected Set, got {other:?}"),
+        }
+
+        // An UNCHANGED string flag stays OFF the wire entirely (`skip_serializing_if`), so an older
+        // daemon parsing a newer CLI's payload sees no key rather than a `null` it might read as a
+        // clear. The bool flags are plain `Option`s and serialize as `null` when unset, which every
+        // daemon reads back as `None` = unchanged.
+        let unchanged = serde_json::to_string(&Request::Set {
+            hostname: None,
+            accept_routes: None,
+            accept_dns: None,
+            shields_up: None,
+            exit_node: None,
+            advertise_exit_node: None,
+            advertise_routes: None,
+            advertise_tags: None,
+            ssh: None,
+            operator: None,
+            auto_update: None,
+            update_check: None,
+            report_posture: None,
+            advertise_connector: None,
+            webclient: None,
+            exit_node_allow_lan_access: None,
+            nickname: None,
+        })
+        .unwrap();
+        assert!(
+            !unchanged.contains("operator") && !unchanged.contains("nickname"),
+            "an unmentioned operator/nickname must not appear on the wire: {unchanged}"
+        );
+    }
+
+    #[test]
     fn request_status_wire_format() {
         let json = serde_json::to_string(&Request::Status).unwrap();
         assert_eq!(json, r#"{"cmd":"status"}"#);
@@ -1529,6 +1826,14 @@ mod tests {
             client_secret: Some("tskey-client-secret".to_string()),
             id_token: None,
             audience: None,
+            operator: None,
+            auto_update: None,
+            update_check: None,
+            report_posture: None,
+            advertise_connector: None,
+            webclient: None,
+            exit_node_allow_lan_access: None,
+            nickname: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&json).unwrap();
@@ -1555,6 +1860,14 @@ mod tests {
                 client_secret,
                 id_token,
                 audience,
+                operator: None,
+                auto_update: None,
+                update_check: None,
+                report_posture: None,
+                advertise_connector: None,
+                webclient: None,
+                exit_node_allow_lan_access: None,
+                nickname: None,
             } => {
                 assert!(reset, "reset must survive the wire round-trip when set");
                 assert_eq!(authkey.as_deref(), Some("tskey-auth-xxx"));
@@ -2447,6 +2760,14 @@ mod tests {
             client_secret: None,
             id_token: None,
             audience: None,
+            operator: None,
+            auto_update: None,
+            update_check: None,
+            report_posture: None,
+            advertise_connector: None,
+            webclient: None,
+            exit_node_allow_lan_access: None,
+            nickname: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&json).unwrap();
@@ -2473,6 +2794,14 @@ mod tests {
                 client_secret,
                 id_token,
                 audience,
+                operator: None,
+                auto_update: None,
+                update_check: None,
+                report_posture: None,
+                advertise_connector: None,
+                webclient: None,
+                exit_node_allow_lan_access: None,
+                nickname: None,
             } => {
                 assert!(!reset);
                 assert!(authkey.is_none());
@@ -2546,6 +2875,14 @@ mod tests {
             client_secret: None,
             id_token: None,
             audience: None,
+            operator: None,
+            auto_update: None,
+            update_check: None,
+            report_posture: None,
+            advertise_connector: None,
+            webclient: None,
+            exit_node_allow_lan_access: None,
+            nickname: None,
         };
         let json = serde_json::to_string(&clear).unwrap();
         match serde_json::from_str::<Request>(&json).unwrap() {
@@ -2604,6 +2941,14 @@ mod tests {
             client_secret: None,
             id_token: None,
             audience: None,
+            operator: None,
+            auto_update: None,
+            update_check: None,
+            report_posture: None,
+            advertise_connector: None,
+            webclient: None,
+            exit_node_allow_lan_access: None,
+            nickname: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         match serde_json::from_str::<Request>(&json).unwrap() {
@@ -2678,6 +3023,14 @@ mod tests {
             client_secret: None,
             id_token: None,
             audience: None,
+            operator: None,
+            auto_update: None,
+            update_check: None,
+            report_posture: None,
+            advertise_connector: None,
+            webclient: None,
+            exit_node_allow_lan_access: None,
+            nickname: None,
         })
         .unwrap();
         let unchanged_json = serde_json::to_string(&Request::Up {
@@ -2702,6 +3055,14 @@ mod tests {
             client_secret: None,
             id_token: None,
             audience: None,
+            operator: None,
+            auto_update: None,
+            update_check: None,
+            report_posture: None,
+            advertise_connector: None,
+            webclient: None,
+            exit_node_allow_lan_access: None,
+            nickname: None,
         })
         .unwrap();
         assert!(
@@ -2791,6 +3152,14 @@ mod tests {
             advertise_routes: None,
             advertise_tags: None,
             ssh: None,
+            operator: None,
+            auto_update: None,
+            update_check: None,
+            report_posture: None,
+            advertise_connector: None,
+            webclient: None,
+            exit_node_allow_lan_access: None,
+            nickname: None,
         })
         .unwrap();
         let unchanged_json = serde_json::to_string(&Request::Set {
@@ -2803,6 +3172,14 @@ mod tests {
             advertise_routes: None,
             advertise_tags: None,
             ssh: None,
+            operator: None,
+            auto_update: None,
+            update_check: None,
+            report_posture: None,
+            advertise_connector: None,
+            webclient: None,
+            exit_node_allow_lan_access: None,
+            nickname: None,
         })
         .unwrap();
         // Match the `exit_node` KEY specifically — `advertise_exit_node` also contains the substring

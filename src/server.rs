@@ -1265,6 +1265,14 @@ async fn dispatch(
             reset,
             force_reauth,
             ephemeral,
+            operator,
+            auto_update,
+            update_check,
+            report_posture,
+            advertise_connector,
+            webclient,
+            exit_node_allow_lan_access,
+            nickname,
             client_id,
             client_secret,
             id_token,
@@ -1311,6 +1319,16 @@ async fn dispatch(
                 reset,
                 force_reauth,
                 ephemeral,
+                // The eight later-added Go pref flags (bead tsd-1m9) move 1:1 into `UpOptions`;
+                // their carried-vs-advertised semantics are documented on the pref fields.
+                operator,
+                auto_update,
+                update_check,
+                report_posture,
+                advertise_connector,
+                webclient,
+                exit_node_allow_lan_access,
+                nickname,
             };
             // Accidental-revert guard (Go `checkForAccidentalSettingReverts`): unless this is a
             // `--reset` up, refuse an `up` that would silently revert a non-default pref it didn't
@@ -1363,6 +1381,14 @@ async fn dispatch(
             advertise_routes,
             advertise_tags,
             ssh,
+            operator,
+            auto_update,
+            update_check,
+            report_posture,
+            advertise_connector,
+            webclient,
+            exit_node_allow_lan_access,
+            nickname,
         } => {
             let opts = ipn::SetOptions {
                 hostname,
@@ -1374,6 +1400,17 @@ async fn dispatch(
                 advertise_routes,
                 advertise_tags,
                 ssh,
+                // Same eight flags as `up` (bead tsd-1m9). Two of them (`auto_update`,
+                // `advertise_connector`) are rebuild-only on a running node — see
+                // `SetOptions::needs_rebuild`; the other six persist with no reconnect.
+                operator,
+                auto_update,
+                update_check,
+                report_posture,
+                advertise_connector,
+                webclient,
+                exit_node_allow_lan_access,
+                nickname,
             };
             // `tailscale set` with no flags names no prefs: reject it as a usage error before touching
             // the backend, rather than driving a no-op reconcile.

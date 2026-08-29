@@ -270,6 +270,14 @@ mod tests {
             client_secret: None,
             id_token: None,
             audience: None,
+            operator: None,
+            auto_update: None,
+            update_check: None,
+            report_posture: None,
+            advertise_connector: None,
+            webclient: None,
+            exit_node_allow_lan_access: None,
+            nickname: None,
         }
     }
 
@@ -284,6 +292,14 @@ mod tests {
             advertise_routes: None,
             advertise_tags: None,
             ssh: None,
+            operator: None,
+            auto_update: None,
+            update_check: None,
+            report_posture: None,
+            advertise_connector: None,
+            webclient: None,
+            exit_node_allow_lan_access: None,
+            nickname: None,
         }
     }
 

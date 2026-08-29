@@ -102,6 +102,84 @@ pub struct Prefs {
     /// TUN interface MTU; `None` uses the transport default. Tailscale's overlay MTU is 1280.
     /// Ignored unless [`tun_enabled`](Prefs::tun_enabled) is `true`.
     pub tun_mtu: Option<u16>,
+    /// The OS username permitted to drive this node's LocalAPI without root (Go `tailscale up/set
+    /// --operator` / `ipn.Prefs.OperatorUser`). `None` (default) = no operator delegation. Maps to
+    /// the engine's `Config.operator_user`.
+    ///
+    /// **Carried pref.** The engine stores it and never acts on it (it is a daemon-side authorization
+    /// concept, never sent to control), and *this* daemon's LocalAPI write policy is still the
+    /// root/same-uid check in `crate::auth` — it does not yet consult this value. So setting it
+    /// records the intent and threads it to the engine `Config`; it does not today widen or narrow who
+    /// may drive the socket. Kept honest here rather than implied by the flag's existence.
+    #[serde(default)]
+    pub operator_user: Option<String>,
+    /// Whether this node opts in to admin-console-triggered auto-updates (Go `--auto-update` /
+    /// `ipn.Prefs.AutoUpdate.Apply`). Tri-state like Go's `opt.Bool`: `None` (default) = unset,
+    /// `Some(false)` = explicitly off, `Some(true)` = on. Maps to the engine's
+    /// `Config.auto_update_apply`, which **advertises** it to control as `Hostinfo.AllowsUpdate` at
+    /// registration and on every map request — so this one genuinely crosses the wire.
+    ///
+    /// Advertising only: neither the engine nor this daemon runs an updater (self-update is a
+    /// packaging concern — see `docs/DESIGN.md` non-goals), so `Some(true)` tells the admin console
+    /// the node accepts remote update triggers; nothing here applies an update.
+    #[serde(default)]
+    pub auto_update_apply: Option<bool>,
+    /// Whether a background updater should *check* for available updates (Go `--update-check` /
+    /// `ipn.Prefs.AutoUpdate.Check`). Default `false`. Maps to the engine's `Config.auto_update_check`.
+    ///
+    /// **Carried pref.** Never sent to control (it is not part of `Hostinfo`), and this fork ships no
+    /// updater to run the check — the value is stored and threaded to the engine `Config` so the pref
+    /// state is faithful and a future updater has it.
+    #[serde(default)]
+    pub auto_update_check: bool,
+    /// Whether device-posture identity collection is enabled (Go `--report-posture` /
+    /// `ipn.Prefs.PostureChecking`). Default `false`. Maps to the engine's `Config.posture_checking`.
+    ///
+    /// **Carried pref.** Posture is a control-to-node (c2n) *pull* — control asks the node for posture
+    /// attributes — and neither the engine nor this daemon implements a c2n posture responder, so
+    /// control never pulls and an enabled pref is byte-for-byte identical on the wire to a disabled
+    /// one. Stored + threaded through; nothing is collected or reported today.
+    #[serde(default)]
+    pub posture_checking: bool,
+    /// Whether this node advertises itself as an **app connector** (Go `--advertise-connector` /
+    /// `ipn.Prefs.AppConnector.Advertise`). Default `false`. Maps to the engine's
+    /// `Config.advertise_app_connector`, which sends `Hostinfo.AppConnector` at registration and on
+    /// every map request — so this one genuinely crosses the wire.
+    ///
+    /// Advertises the *capability* only. The app-connector data path (control-pushed connector domain
+    /// routes, the 4via6 domain→route mapping, per-domain DNS observation) is an engine subsystem this
+    /// fork does not implement, so an advertising node serves no connector traffic — the same state as
+    /// Go advertising the bool before control has assigned it any domains.
+    #[serde(default)]
+    pub advertise_app_connector: bool,
+    /// Whether this node runs the local web client (Go `--webclient` / `ipn.Prefs.RunWebClient`).
+    /// Default `false`. Maps to the engine's `Config.run_web_client`.
+    ///
+    /// **Carried pref.** Neither the engine nor this daemon hosts the device-management web UI on
+    /// `100.x:5252`; the value is stored and threaded to the engine `Config` only. Setting it starts
+    /// no server.
+    #[serde(default)]
+    pub run_web_client: bool,
+    /// Whether a peer using this node as its exit node may also reach this node's local LAN (Go
+    /// `--exit-node-allow-lan-access` / `ipn.Prefs.ExitNodeAllowLANAccess`). Default `false`. Maps to
+    /// the engine's `Config.exit_node_allow_lan_access`.
+    ///
+    /// **Carried pref.** In Go this shapes *host routes* — whether the OS router excludes local LAN
+    /// ranges from what is pulled through the tunnel — and it has "no effect" on a platform with no
+    /// host router. This fork's default data path is the userspace netstack, which has no host-route
+    /// layer to shape, so the value is stored and threaded through and is inert until such a layer
+    /// exists. Never advertised to control.
+    #[serde(default)]
+    pub exit_node_allow_lan_access: bool,
+    /// A local display label for this node's login profile (Go `--nickname` /
+    /// `ipn.Prefs.ProfileName`). `None` (default) = no nickname. Maps to the engine's
+    /// `Config.node_nickname`.
+    ///
+    /// **Carried pref.** Client-local cosmetics: never advertised in `Hostinfo` (distinct from the
+    /// [`hostname`](Prefs::hostname) the node *requests* from control) and never acted on by the
+    /// engine. Stored + threaded through for profile display.
+    #[serde(default)]
+    pub node_nickname: Option<String>,
     /// Whether this node has ever actually **logged in** (completed registration / reached `Running`).
     /// The faithful analogue of Go's `Persist.UserProfile.LoginName != ""` — distinct from "has a
     /// prefs file" (the daemon's `ever_configured`, derived from prefs.json existence + flipped by a
@@ -138,6 +216,14 @@ impl Default for Prefs {
             tun_enabled: false,
             tun_name: None,
             tun_mtu: None,
+            operator_user: None,
+            auto_update_apply: None,
+            auto_update_check: false,
+            posture_checking: false,
+            advertise_app_connector: false,
+            run_web_client: false,
+            exit_node_allow_lan_access: false,
+            node_nickname: None,
             has_logged_in: false,
         }
     }
@@ -192,6 +278,14 @@ impl Prefs {
         self.tun_enabled = d.tun_enabled;
         self.tun_name = d.tun_name;
         self.tun_mtu = d.tun_mtu;
+        self.operator_user = d.operator_user;
+        self.auto_update_apply = d.auto_update_apply;
+        self.auto_update_check = d.auto_update_check;
+        self.posture_checking = d.posture_checking;
+        self.advertise_app_connector = d.advertise_app_connector;
+        self.run_web_client = d.run_web_client;
+        self.exit_node_allow_lan_access = d.exit_node_allow_lan_access;
+        self.node_nickname = d.node_nickname;
     }
 
     /// Atomically persist prefs to `path`, creating parent directories as needed.
@@ -291,6 +385,81 @@ mod tests {
             loaded.accept_dns,
             "an upgraded prefs file with no accept_dns key must load as true, not false"
         );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn up_set_pref_flags_default_off() {
+        // Bead tsd-1m9: every one of the eight later-added Go pref flags defaults to off/unset, so a
+        // node that never passes them keeps exactly the posture it had before they existed. The two
+        // ADVERTISED ones matter most here — a default node must not start telling control it is an
+        // app connector or accepts remote updates.
+        let p = Prefs::default();
+        assert_eq!(p.operator_user, None);
+        assert_eq!(
+            p.auto_update_apply, None,
+            "auto-update is Go's tri-state opt.Bool: unset, not false"
+        );
+        assert!(!p.auto_update_check);
+        assert!(!p.posture_checking);
+        assert!(!p.advertise_app_connector);
+        assert!(!p.run_web_client);
+        assert!(!p.exit_node_allow_lan_access);
+        assert_eq!(p.node_nickname, None);
+    }
+
+    #[tokio::test]
+    async fn up_set_pref_flags_migrate_and_round_trip() {
+        // MIGRATION: a prefs.json written before these eight fields existed has none of their keys.
+        // It must load with each at its default (the container `#[serde(default)]`), NOT fail to
+        // parse — a parse failure would silently reset the whole file to defaults on upgrade, taking
+        // the node's real settings with it.
+        let dir = std::env::temp_dir().join(format!("tailnetd-prefs-1m9-{}", std::process::id()));
+        let path = dir.join("prefs.json");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(
+            &path,
+            br#"{"want_running":true,"hostname":"node-a","shields_up":true}"#,
+        )
+        .await
+        .unwrap();
+        let loaded = Prefs::load(&path).await.expect("load old prefs");
+        assert!(loaded.want_running, "the pre-existing fields still load");
+        assert!(loaded.shields_up);
+        assert_eq!(loaded.operator_user, None);
+        assert_eq!(loaded.auto_update_apply, None);
+        assert!(!loaded.advertise_app_connector);
+        assert_eq!(loaded.node_nickname, None);
+
+        // ROUND TRIP: set all eight, save, reload — every value survives, including the distinction
+        // between `auto_update_apply: Some(false)` (explicitly off) and `None` (unset).
+        let p = Prefs {
+            operator_user: Some("alice".to_string()),
+            auto_update_apply: Some(false),
+            auto_update_check: true,
+            posture_checking: true,
+            advertise_app_connector: true,
+            run_web_client: true,
+            exit_node_allow_lan_access: true,
+            node_nickname: Some("laptop".to_string()),
+            ..Prefs::default()
+        };
+        p.save(&path).await.expect("save");
+        let loaded = Prefs::load(&path).await.expect("reload");
+        assert_eq!(loaded.operator_user.as_deref(), Some("alice"));
+        assert_eq!(
+            loaded.auto_update_apply,
+            Some(false),
+            "explicitly-off must survive as Some(false), not collapse to unset"
+        );
+        assert!(loaded.auto_update_check);
+        assert!(loaded.posture_checking);
+        assert!(loaded.advertise_app_connector);
+        assert!(loaded.run_web_client);
+        assert!(loaded.exit_node_allow_lan_access);
+        assert_eq!(loaded.node_nickname.as_deref(), Some("laptop"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

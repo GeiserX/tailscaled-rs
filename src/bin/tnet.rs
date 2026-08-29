@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use secrecy::{ExposeSecret, SecretString};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -25,6 +25,132 @@ struct Cli {
     socket: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
+}
+
+/// The eight later-added Go `up`/`set` pref flags (bead tsd-1m9), grouped into one clap `Args` block
+/// because `tnet up` and `tnet set` accept exactly the same eight (Go exposes them on both too).
+/// Flattening keeps the CLI surface identical to declaring them inline — `tnet up --operator alice`
+/// parses the same — while giving `run_up`/`run_set` one parameter instead of fourteen.
+///
+/// Each maps to a field on the engine's construction `Config`. Two of them, `--advertise-connector`
+/// and `--auto-update`, genuinely cross the control wire (the engine sends them as
+/// `Hostinfo.AppConnector` / `Hostinfo.AllowsUpdate` at registration and on every map request). The
+/// other six are CARRIED prefs: the engine stores them, never acts on them and never sends them, so
+/// each flag's help text says plainly what this build does and does not do with it — an operator must
+/// not read `--webclient` as "a web server is now running".
+#[derive(Args)]
+struct PrefFlags {
+    /// Local OS username permitted to operate this node without root (Go `--operator`). Pass an
+    /// empty value (`--operator=`) to clear it. NOTE: this build RECORDS the preference and threads
+    /// it to the engine, but the daemon's LocalAPI access check is still root/same-uid — setting it
+    /// does not yet grant that user access.
+    #[arg(long, value_name = "USER")]
+    operator: Option<String>,
+    /// Accept auto-updates triggered from the admin console (Go `--auto-update`). Advertised to the
+    /// control plane; this build ships no updater, so it never installs anything. Mutually exclusive
+    /// with `--no-auto-update`; omitting both leaves the persisted setting unchanged. (There is no
+    /// flag for "back to unset" — `tnet up --reset` is that path.)
+    #[arg(long, conflicts_with = "no_auto_update")]
+    auto_update: bool,
+    /// Refuse admin-console-triggered auto-updates. Mutually exclusive with `--auto-update`;
+    /// omitting both leaves the persisted setting unchanged.
+    #[arg(long)]
+    no_auto_update: bool,
+    /// Let a background updater check for new versions (Go `--update-check`). Carried preference
+    /// only: this build runs no updater, so nothing performs the check. Mutually exclusive with
+    /// `--no-update-check`; omitting both leaves the persisted setting unchanged.
+    #[arg(long, conflicts_with = "no_update_check")]
+    update_check: bool,
+    /// Do not check for new versions. Mutually exclusive with `--update-check`; omitting both leaves
+    /// the persisted setting unchanged.
+    #[arg(long)]
+    no_update_check: bool,
+    /// Allow the control plane to gather device-posture information (Go `--report-posture`). Carried
+    /// preference only: posture is a control-to-node pull and this build implements no posture
+    /// responder, so nothing is collected or reported. Mutually exclusive with
+    /// `--no-report-posture`; omitting both leaves the persisted setting unchanged.
+    #[arg(long, conflicts_with = "no_report_posture")]
+    report_posture: bool,
+    /// Do not report device posture. Mutually exclusive with `--report-posture`; omitting both
+    /// leaves the persisted setting unchanged.
+    #[arg(long)]
+    no_report_posture: bool,
+    /// Advertise this node to the tailnet as an app connector (Go `--advertise-connector`). This is
+    /// advertised to the control plane, but the connector data path is not implemented in this
+    /// build, so an advertising node serves no connector traffic. Mutually exclusive with
+    /// `--no-advertise-connector`; omitting both leaves the persisted setting unchanged.
+    #[arg(long, conflicts_with = "no_advertise_connector")]
+    advertise_connector: bool,
+    /// Stop advertising this node as an app connector. Mutually exclusive with
+    /// `--advertise-connector`; omitting both leaves the persisted setting unchanged.
+    #[arg(long)]
+    no_advertise_connector: bool,
+    /// Run the local web client (Go `--webclient`). Carried preference only: this build hosts no
+    /// web UI, so setting it starts no server. Mutually exclusive with `--no-webclient`; omitting
+    /// both leaves the persisted setting unchanged.
+    #[arg(long, conflicts_with = "no_webclient")]
+    webclient: bool,
+    /// Do not run the local web client. Mutually exclusive with `--webclient`; omitting both leaves
+    /// the persisted setting unchanged.
+    #[arg(long)]
+    no_webclient: bool,
+    /// When this node is used as an exit node, also let those peers reach its local LAN (Go
+    /// `--exit-node-allow-lan-access`). Carried preference only: it shapes host routes, and this
+    /// build's default userspace-netstack data path has no host-route layer, so it is inert here.
+    /// Mutually exclusive with `--no-exit-node-allow-lan-access`; omitting both leaves the persisted
+    /// setting unchanged.
+    #[arg(long, conflicts_with = "no_exit_node_allow_lan_access")]
+    exit_node_allow_lan_access: bool,
+    /// Do not let exit-node peers reach this node's local LAN. Mutually exclusive with
+    /// `--exit-node-allow-lan-access`; omitting both leaves the persisted setting unchanged.
+    #[arg(long)]
+    no_exit_node_allow_lan_access: bool,
+    /// Local display label for this login profile (Go `--nickname`). Pass an empty value
+    /// (`--nickname=`) to clear it. Client-local only — never sent to the control plane.
+    #[arg(long, value_name = "NAME")]
+    nickname: Option<String>,
+}
+
+impl PrefFlags {
+    /// Resolve the flag pairs into the eight wire fields, using the same tri-state convention as the
+    /// rest of the CLI: enable → `Some(true)`, `--no-…` → `Some(false)`, neither → `None` (leave the
+    /// persisted pref unchanged). The two string flags become DOUBLE options so an empty value can
+    /// mean "clear" without colliding with "unmentioned": absent → `None`, `--operator=` → `Some(None)`,
+    /// `--operator=alice` → `Some(Some("alice"))`. clap's `conflicts_with` guarantees no pair is both
+    /// set. Pure → unit-testable.
+    fn resolve(self) -> ResolvedPrefFlags {
+        ResolvedPrefFlags {
+            operator: resolve_string_or_clear(self.operator),
+            auto_update: resolve_bool_pair(self.auto_update, self.no_auto_update),
+            update_check: resolve_bool_pair(self.update_check, self.no_update_check),
+            report_posture: resolve_bool_pair(self.report_posture, self.no_report_posture),
+            advertise_connector: resolve_bool_pair(
+                self.advertise_connector,
+                self.no_advertise_connector,
+            ),
+            webclient: resolve_bool_pair(self.webclient, self.no_webclient),
+            exit_node_allow_lan_access: resolve_bool_pair(
+                self.exit_node_allow_lan_access,
+                self.no_exit_node_allow_lan_access,
+            ),
+            nickname: resolve_string_or_clear(self.nickname),
+        }
+    }
+}
+
+/// The wire-ready form of [`PrefFlags`], one field per `Request::Up`/`Request::Set` field of the same
+/// name. Exists so `run_up`/`run_set` can spread eight resolved values into the request without
+/// re-deriving them (and so the resolution is testable independently of clap).
+#[derive(Debug, Default, PartialEq)]
+struct ResolvedPrefFlags {
+    operator: Option<Option<String>>,
+    auto_update: Option<bool>,
+    update_check: Option<bool>,
+    report_posture: Option<bool>,
+    advertise_connector: Option<bool>,
+    webclient: Option<bool>,
+    exit_node_allow_lan_access: Option<bool>,
+    nickname: Option<Option<String>>,
 }
 
 // NB: neither `Cli` nor `Command` derives `Debug`. That is deliberate — it keeps the parsed
@@ -179,6 +305,11 @@ enum Command {
         /// setting unchanged.
         #[arg(long)]
         no_ephemeral: bool,
+        /// The eight later-added Go pref flags (`--operator`, `--auto-update`, `--update-check`,
+        /// `--report-posture`, `--advertise-connector`, `--webclient`,
+        /// `--exit-node-allow-lan-access`, `--nickname`), shared verbatim with `tnet set`.
+        #[command(flatten)]
+        pref_flags: PrefFlags,
         /// Wait up to this many seconds for the node to reach the Running state after bringing it up,
         /// then exit (Go `tailscale up --timeout`). On timeout, exits non-zero. Omitted = don't wait
         /// (return as soon as the daemon accepts the up); `0` = wait forever. Handy in scripts as
@@ -317,6 +448,13 @@ enum Command {
         /// omitting both leaves the setting unchanged.
         #[arg(long)]
         no_ssh: bool,
+        /// The eight later-added Go pref flags (`--operator`, `--auto-update`, `--update-check`,
+        /// `--report-posture`, `--advertise-connector`, `--webclient`,
+        /// `--exit-node-allow-lan-access`, `--nickname`), shared verbatim with `tnet up`. Two of
+        /// them (`--advertise-connector`, `--auto-update`) reach the control plane and so rebuild a
+        /// running device (a brief reconnect); the other six persist with no reconnect.
+        #[command(flatten)]
+        pref_flags: PrefFlags,
         /// Pre-accept a named risk and skip its safety refusal (Go `--accept-risk`), e.g. `lose-ssh`
         /// or `all`. On `set` the enforced risk is `lose-ssh`: toggling the Tailscale SSH server
         /// (`--ssh`/`--no-ssh`) over a Tailscale SSH session reroutes/drops that session, so it is
@@ -1315,6 +1453,29 @@ fn resolve_shields_up(shields_up: bool, no_shields_up: bool) -> Option<bool> {
     }
 }
 
+/// Map an enable/disable flag pair to a tri-state `Option<bool>` — enable → `Some(true)`, disable →
+/// `Some(false)`, neither → `None` (leave the persisted pref unchanged). The generic form of the
+/// per-flag resolvers below (`resolve_tun`, `resolve_shields_up`, …), used by every pair in
+/// [`PrefFlags`] so eight near-identical `match`es do not accumulate. clap's `conflicts_with`
+/// guarantees the two are never both set.
+fn resolve_bool_pair(enable: bool, disable: bool) -> Option<bool> {
+    match (enable, disable) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        _ => None,
+    }
+}
+
+/// Map an optional string flag to the double-`Option` "unchanged / clear / set" wire form: the flag
+/// absent → `None` (leave the pref unchanged), passed EMPTY (`--operator=`) → `Some(None)` (clear
+/// it), passed with a value → `Some(Some(value))`. The empty-string spelling is how `--operator` /
+/// `--nickname` clear a value, mirroring Go (where the empty string IS the unset value) — the other
+/// clearable prefs use an explicit `--clear-…` flag instead because their values are lists, where an
+/// empty element is ambiguous.
+fn resolve_string_or_clear(value: Option<String>) -> Option<Option<String>> {
+    value.map(|v| if v.is_empty() { None } else { Some(v) })
+}
+
 /// Map the `--tun` / `--no-tun` flag pair to a tri-state `Option<bool>` — enable → `Some(true)`,
 /// disable → `Some(false)`, neither → `None` (leave the persisted pref unchanged). A named helper
 /// for symmetry with the other tri-state resolvers (`resolve_accept_routes` / `resolve_ssh` / …),
@@ -1634,6 +1795,7 @@ async fn main() -> Result<()> {
             force_reauth,
             ephemeral,
             no_ephemeral,
+            pref_flags,
             timeout,
             accept_risk,
             client_id,
@@ -1672,6 +1834,7 @@ async fn main() -> Result<()> {
                 force_reauth,
                 ephemeral,
                 no_ephemeral,
+                pref_flags.resolve(),
                 timeout,
                 accept_risk,
                 resolve_wif(client_id, client_secret, id_token, audience).await?,
@@ -1697,6 +1860,7 @@ async fn main() -> Result<()> {
             advertise_tags_clear,
             ssh,
             no_ssh,
+            pref_flags,
             accept_risk,
         } => {
             run_set(
@@ -1718,6 +1882,7 @@ async fn main() -> Result<()> {
                 advertise_tags_clear,
                 ssh,
                 no_ssh,
+                pref_flags.resolve(),
                 accept_risk,
             )
             .await
@@ -2106,6 +2271,7 @@ async fn run_up(
     force_reauth: bool,
     ephemeral: bool,
     no_ephemeral: bool,
+    pref_flags: ResolvedPrefFlags,
     timeout: Option<u64>,
     accept_risk: Option<String>,
     wif: WifFlags,
@@ -2190,6 +2356,18 @@ async fn run_up(
         force_reauth,
         // `--ephemeral`/`--no-ephemeral` tri-state (registration-time intent; default persistent).
         ephemeral: resolve_ephemeral(ephemeral, no_ephemeral),
+        // The eight later-added Go pref flags (bead tsd-1m9), already resolved from their
+        // enable/disable pairs by `PrefFlags::resolve`. Two of them (`advertise_connector`,
+        // `auto_update`) are advertised to control in `Hostinfo`; the other six are carried prefs
+        // the engine stores without acting on — the flag help says so per-flag.
+        operator: pref_flags.operator,
+        auto_update: pref_flags.auto_update,
+        update_check: pref_flags.update_check,
+        report_posture: pref_flags.report_posture,
+        advertise_connector: pref_flags.advertise_connector,
+        webclient: pref_flags.webclient,
+        exit_node_allow_lan_access: pref_flags.exit_node_allow_lan_access,
+        nickname: pref_flags.nickname,
         // Workload-identity-federation creds (Go `--client-id/--client-secret/--id-token/--audience`):
         // registration-time only, NOT prefs. Expose the two secrets only here, at wire-serialize time
         // (the wire field is a plain `Option<String>`, like `authkey` above); `client_id`/`audience`
@@ -2443,6 +2621,14 @@ async fn run_login(
         client_secret: None,
         id_token: None,
         audience: None,
+        operator: None,
+        auto_update: None,
+        update_check: None,
+        report_posture: None,
+        advertise_connector: None,
+        webclient: None,
+        exit_node_allow_lan_access: None,
+        nickname: None,
     };
     match round_trip(socket, &request)
         .await
@@ -2507,6 +2693,7 @@ async fn run_set(
     advertise_tags_clear: bool,
     ssh: bool,
     no_ssh: bool,
+    pref_flags: ResolvedPrefFlags,
     accept_risk: Option<String>,
 ) -> Result<()> {
     // Risk gate (Go `presentSSHToggleRisk`, the `set` call site): toggling the Tailscale SSH
@@ -2540,6 +2727,16 @@ async fn run_set(
         advertise_tags: resolve_list_or_clear(advertise_tags, advertise_tags_clear),
         // `--ssh`/`--no-ssh` tri-state (mirrors `--tun`).
         ssh: resolve_ssh(ssh, no_ssh),
+        // The eight later-added Go pref flags (bead tsd-1m9), resolved by `PrefFlags::resolve` —
+        // the SAME flags `up` accepts, since Go exposes them on both.
+        operator: pref_flags.operator,
+        auto_update: pref_flags.auto_update,
+        update_check: pref_flags.update_check,
+        report_posture: pref_flags.report_posture,
+        advertise_connector: pref_flags.advertise_connector,
+        webclient: pref_flags.webclient,
+        exit_node_allow_lan_access: pref_flags.exit_node_allow_lan_access,
+        nickname: pref_flags.nickname,
     };
     let response = round_trip(socket, &request)
         .await
@@ -5193,8 +5390,9 @@ fn format_profiles_json(profiles: &[tailscaled_rs::localapi::ProfileEntry]) -> S
 /// [`get_value_display`]. One source so the table, the `--json` map, and single-setting lookup agree.
 ///
 /// This is a SUBSET of Go's `tailscale get` settings (Go derives its list from the full `set` flag
-/// set; many of those flags — `hostname`, `nickname`, `auto-update`, … — are not yet modelled by
-/// this fork's prefs/engine and so are absent here). One entry, `tun`, is a fork-specific extension
+/// set; the flags this fork's prefs do not model — the Linux subnet-router knobs
+/// `--snat-subnet-routes` / `--stateful-filtering` / `--netfilter-mode` / `--unattended` — are
+/// absent here). One entry, `tun`, is a fork-specific extension
 /// (selecting the kernel-TUN vs userspace datapath) that Go's `get` has no counterpart for; it is
 /// intentionally surfaced because it is a real `tnet set` flag in this build.
 fn get_settings(
@@ -5235,6 +5433,36 @@ fn get_settings(
         ("shields-up", Value::Bool(view.shields_up)),
         ("ssh", Value::Bool(view.ssh)),
         ("tun", Value::Bool(view.tun)),
+        // The eight later-added Go pref flags (bead tsd-1m9), listed by their set-flag names so a
+        // `tnet get` value can be pasted straight back into `tnet set`. An unset `operator` /
+        // `nickname` is JSON null (the table renders it empty), matching `hostname`/`exit-node`
+        // above. `auto-update` is Go's tri-state `opt.Bool`: null = unset, else a bare boolean.
+        (
+            "operator",
+            view.operator
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        ),
+        (
+            "auto-update",
+            view.auto_update.map(Value::Bool).unwrap_or(Value::Null),
+        ),
+        ("update-check", Value::Bool(view.update_check)),
+        ("report-posture", Value::Bool(view.report_posture)),
+        ("advertise-connector", Value::Bool(view.advertise_connector)),
+        ("webclient", Value::Bool(view.webclient)),
+        (
+            "exit-node-allow-lan-access",
+            Value::Bool(view.exit_node_allow_lan_access),
+        ),
+        (
+            "nickname",
+            view.nickname
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        ),
     ]
 }
 
@@ -5410,6 +5638,23 @@ fn revert_pref_to_flag(key: &str, value: &str) -> String {
         "control_url" => format!("--control-url={value}"),
         "tun_name" => format!("--tun-name={value}"),
         "tun_mtu" => format!("--tun-mtu={value}"),
+        // The eight later-added Go pref flags (bead tsd-1m9). The bool ones need explicit arms (not
+        // the `other` fallback) because their guard keys use `_` where the flag uses `-`, and
+        // because a `false` value must render as the explicit `--no-…` form.
+        "auto_update" => bool_keep_flag("auto-update", "no-auto-update", value),
+        "update_check" => bool_keep_flag("update-check", "no-update-check", value),
+        "report_posture" => bool_keep_flag("report-posture", "no-report-posture", value),
+        "advertise_connector" => {
+            bool_keep_flag("advertise-connector", "no-advertise-connector", value)
+        }
+        "webclient" => bool_keep_flag("webclient", "no-webclient", value),
+        "exit_node_allow_lan_access" => bool_keep_flag(
+            "exit-node-allow-lan-access",
+            "no-exit-node-allow-lan-access",
+            value,
+        ),
+        "operator" => format!("--operator={value}"),
+        "nickname" => format!("--nickname={value}"),
         // Daemon knows a pref this CLI build doesn't: keep the message actionable.
         other => format!("--{other}={value}"),
     }
@@ -8412,6 +8657,14 @@ mod tests {
             advertise_routes: resolve_list_or_clear(vec![], false),
             advertise_tags: None,
             ssh: resolve_ssh(false, false),
+            operator: None,
+            auto_update: None,
+            update_check: None,
+            report_posture: None,
+            advertise_connector: None,
+            webclient: None,
+            exit_node_allow_lan_access: None,
+            nickname: None,
         };
         match req {
             Request::Set {
@@ -8424,6 +8677,14 @@ mod tests {
                 advertise_routes,
                 advertise_tags: _,
                 ssh,
+                operator: None,
+                auto_update: None,
+                update_check: None,
+                report_posture: None,
+                advertise_connector: None,
+                webclient: None,
+                exit_node_allow_lan_access: None,
+                nickname: None,
             } => {
                 assert_eq!(hostname, Some("laptop".to_string()));
                 assert_eq!(accept_routes, Some(true));
@@ -8466,6 +8727,14 @@ mod tests {
             client_secret: None,
             id_token: None,
             audience: None,
+            operator: None,
+            auto_update: None,
+            update_check: None,
+            report_posture: None,
+            advertise_connector: None,
+            webclient: None,
+            exit_node_allow_lan_access: None,
+            nickname: None,
         };
         match enabled {
             Request::Up { accept_routes, .. } => {
@@ -8496,6 +8765,14 @@ mod tests {
             client_secret: None,
             id_token: None,
             audience: None,
+            operator: None,
+            auto_update: None,
+            update_check: None,
+            report_posture: None,
+            advertise_connector: None,
+            webclient: None,
+            exit_node_allow_lan_access: None,
+            nickname: None,
         };
         match disabled {
             Request::Up { accept_routes, .. } => {
@@ -8530,6 +8807,14 @@ mod tests {
             client_secret: None,
             id_token: None,
             audience: None,
+            operator: None,
+            auto_update: None,
+            update_check: None,
+            report_posture: None,
+            advertise_connector: None,
+            webclient: None,
+            exit_node_allow_lan_access: None,
+            nickname: None,
         };
         match unchanged {
             Request::Up { accept_routes, .. } => assert_eq!(
@@ -8568,6 +8853,14 @@ mod tests {
             client_secret: None,
             id_token: None,
             audience: None,
+            operator: None,
+            auto_update: None,
+            update_check: None,
+            report_posture: None,
+            advertise_connector: None,
+            webclient: None,
+            exit_node_allow_lan_access: None,
+            nickname: None,
         };
         match enabled {
             Request::Up { shields_up, .. } => {
@@ -8598,6 +8891,14 @@ mod tests {
             client_secret: None,
             id_token: None,
             audience: None,
+            operator: None,
+            auto_update: None,
+            update_check: None,
+            report_posture: None,
+            advertise_connector: None,
+            webclient: None,
+            exit_node_allow_lan_access: None,
+            nickname: None,
         };
         match disabled {
             Request::Up { shields_up, .. } => {
@@ -8628,6 +8929,14 @@ mod tests {
             client_secret: None,
             id_token: None,
             audience: None,
+            operator: None,
+            auto_update: None,
+            update_check: None,
+            report_posture: None,
+            advertise_connector: None,
+            webclient: None,
+            exit_node_allow_lan_access: None,
+            nickname: None,
         };
         match unchanged {
             Request::Up { shields_up, .. } => assert_eq!(
@@ -8653,6 +8962,14 @@ mod tests {
             advertise_routes: resolve_list_or_clear(vec![], true),
             advertise_tags: None,
             ssh: resolve_ssh(true, false),
+            operator: None,
+            auto_update: None,
+            update_check: None,
+            report_posture: None,
+            advertise_connector: None,
+            webclient: None,
+            exit_node_allow_lan_access: None,
+            nickname: None,
         };
         match req {
             Request::Set {
@@ -8665,6 +8982,14 @@ mod tests {
                 advertise_routes,
                 advertise_tags: _,
                 ssh,
+                operator: None,
+                auto_update: None,
+                update_check: None,
+                report_posture: None,
+                advertise_connector: None,
+                webclient: None,
+                exit_node_allow_lan_access: None,
+                nickname: None,
             } => {
                 assert_eq!(hostname, None);
                 assert_eq!(accept_routes, Some(false));
@@ -9432,6 +9757,73 @@ mod tests {
     }
 
     #[test]
+    fn eight_pref_flags_round_trip_through_get_and_the_revert_guard() {
+        // Bead tsd-1m9, the two CLI surfaces a new pref has to reach beyond `up`/`set` itself:
+        //
+        // 1. `tnet get` must LIST it (Go keys `get` by the set-flag names), or an operator cannot
+        //    read back what they just set.
+        // 2. The accidental-revert guard must be able to render it as a flag the CLI ACCEPTS — the
+        //    guard's whole output is a copy-pasteable `tnet up …` line, so a key whose flag name is
+        //    wrong produces guidance that fails to parse. Assert that by parsing the rendered flag
+        //    back through clap rather than string-comparing it.
+        use tailscaled_rs::localapi::PrefsView;
+
+        let names: Vec<&str> = get_settings(&PrefsView::default())
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        for expected in [
+            "operator",
+            "auto-update",
+            "update-check",
+            "report-posture",
+            "advertise-connector",
+            "webclient",
+            "exit-node-allow-lan-access",
+            "nickname",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "`tnet get` must list {expected:?}; it lists {names:?}"
+            );
+        }
+
+        // (guard key, value the daemon would report) → a flag `tnet up` parses.
+        for (key, value) in [
+            ("operator", "alice"),
+            ("auto_update", "true"),
+            ("auto_update", "false"),
+            ("update_check", "true"),
+            ("report_posture", "true"),
+            ("advertise_connector", "true"),
+            ("webclient", "true"),
+            ("exit_node_allow_lan_access", "true"),
+            ("nickname", "laptop"),
+        ] {
+            let flag = revert_pref_to_flag(key, value);
+            assert!(
+                !flag.contains('_'),
+                "guard key {key:?} rendered as {flag:?}: flags use dashes, so this fell through to \
+                 the generic `--{{key}}={{value}}` fallback instead of getting a real arm"
+            );
+            Cli::try_parse_from(["tnet", "up", &flag]).unwrap_or_else(|e| {
+                panic!("guard rendered {flag:?} for {key:?}, which `tnet up` rejects: {e}")
+            });
+        }
+
+        // A `false` boolean must render as the explicit `--no-…` form (re-passing the bare enabling
+        // flag would flip the setting the operator is trying to KEEP).
+        assert_eq!(
+            revert_pref_to_flag("advertise_connector", "false"),
+            "--no-advertise-connector"
+        );
+        assert_eq!(
+            revert_pref_to_flag("auto_update", "false"),
+            "--no-auto-update"
+        );
+    }
+
+    #[test]
     fn revert_pref_to_flag_maps_keys_to_their_up_flags() {
         // Value prefs render as `--flag=value`; the daemon's `advertise_routes` value is already
         // comma-joined and re-passed verbatim.
@@ -9546,6 +9938,9 @@ mod tests {
             ssh: false,
             ssh_running: false,
             tun: false,
+            // The eight later-added pref flags (bead tsd-1m9) are not what this test is about;
+            // take their defaults so the fixture stays about the fields it asserts on.
+            ..PrefsView::default()
         };
         let line = format_get_set_flags(&view);
         // Every setting is `--name=value`, space-joined (Go getOutputSetFlags / fmtFlagValueArg).
@@ -9582,6 +9977,9 @@ mod tests {
             ssh: true,
             ssh_running: true,
             tun: false,
+            // The eight later-added pref flags (bead tsd-1m9) are not what this test is about;
+            // take their defaults so the fixture stays about the fields it asserts on.
+            ..PrefsView::default()
         };
 
         // Default table: a `NAME  VALUE` header line (Go `getOutputTable`) then one line per setting.
@@ -9604,9 +10002,14 @@ mod tests {
             table.contains("hostname") && table.contains("node-a"),
             "hostname must be listed with its value: {table}"
         );
-        // 1 header + 10 settings (hostname, exit-node, advertise-exit-node, advertise-routes,
-        // advertise-tags, accept-routes, accept-dns, shields-up, ssh, tun) → 11 lines.
-        assert_eq!(table.lines().count(), 11, "{table}");
+        // 1 header + one line per setting. Derived from `get_settings` rather than hard-coded, so
+        // adding a setting does not fail this test for the wrong reason — what it actually pins is
+        // that the table prints EVERY setting and nothing else (no dropped or duplicated row).
+        assert_eq!(
+            table.lines().count(),
+            get_settings(&view).len() + 1,
+            "{table}"
+        );
 
         // --json: flattened name→value map keyed by set-flag name, with GO-FAITHFUL TYPED values —
         // booleans are bare JSON `true`/`false` (NOT quoted strings), strings are strings. Parse it
@@ -11232,6 +11635,98 @@ mod tests {
         // `--timeout 0` is the explicit "wait forever" value (Go's 0 = wait indefinitely); it must
         // parse as Some(0), distinct from absent (None) — `wait_for_running` maps both to no deadline.
         assert_eq!(up_timeout_of(&["tnet", "up", "--timeout", "0"]), Some(0));
+    }
+
+    #[test]
+    fn pref_flags_parse_and_resolve_on_both_up_and_set() {
+        // Bead tsd-1m9. The eight later-added Go pref flags are declared once (`PrefFlags`) and
+        // flattened into BOTH `tnet up` and `tnet set`, so pin at the parse boundary that (a) every
+        // flag actually exists on both commands with its Go spelling, and (b) `resolve()` maps them
+        // to the tri-state the wire expects. A typo'd flag name or a resolver wired to the wrong
+        // field is exactly the "parses and does nothing" failure this bead exists to end.
+        let resolved = |argv: &[&str]| -> ResolvedPrefFlags {
+            match Cli::try_parse_from(argv).expect("parses").command {
+                Command::Up { pref_flags, .. } | Command::Set { pref_flags, .. } => {
+                    pref_flags.resolve()
+                }
+                _ => panic!("expected Up/Set from {argv:?}"),
+            }
+        };
+
+        // Every flag ON, via `up`. Each lands in its own field (a copy-paste error in `resolve`
+        // shows up as a wrong field here).
+        let all_on = resolved(&[
+            "tnet",
+            "up",
+            "--operator",
+            "alice",
+            "--auto-update",
+            "--update-check",
+            "--report-posture",
+            "--advertise-connector",
+            "--webclient",
+            "--exit-node-allow-lan-access",
+            "--nickname",
+            "laptop",
+        ]);
+        assert_eq!(
+            all_on,
+            ResolvedPrefFlags {
+                operator: Some(Some("alice".into())),
+                auto_update: Some(true),
+                update_check: Some(true),
+                report_posture: Some(true),
+                advertise_connector: Some(true),
+                webclient: Some(true),
+                exit_node_allow_lan_access: Some(true),
+                nickname: Some(Some("laptop".into())),
+            }
+        );
+
+        // Every `--no-…` form, via `set` — the same eight flags must exist there too, and each
+        // negative form must resolve to an explicit `Some(false)` (NOT `None`), because "explicitly
+        // off" and "unmentioned" are different requests.
+        let all_off = resolved(&[
+            "tnet",
+            "set",
+            "--no-auto-update",
+            "--no-update-check",
+            "--no-report-posture",
+            "--no-advertise-connector",
+            "--no-webclient",
+            "--no-exit-node-allow-lan-access",
+        ]);
+        assert_eq!(
+            all_off,
+            ResolvedPrefFlags {
+                operator: None,
+                auto_update: Some(false),
+                update_check: Some(false),
+                report_posture: Some(false),
+                advertise_connector: Some(false),
+                webclient: Some(false),
+                exit_node_allow_lan_access: Some(false),
+                nickname: None,
+            }
+        );
+
+        // Mentioning nothing leaves every pref unchanged — the guarantee that adding these flags
+        // cannot alter an existing node's posture.
+        assert_eq!(resolved(&["tnet", "up"]), ResolvedPrefFlags::default());
+        assert_eq!(resolved(&["tnet", "set"]), ResolvedPrefFlags::default());
+
+        // The two string flags CLEAR on an empty value (Go treats the empty string as unset), which
+        // is distinct from not passing them at all.
+        let cleared = resolved(&["tnet", "set", "--operator=", "--nickname="]);
+        assert_eq!(cleared.operator, Some(None), "--operator= clears");
+        assert_eq!(cleared.nickname, Some(None), "--nickname= clears");
+
+        // A flag and its negation are mutually exclusive (clap `conflicts_with`), so an ambiguous
+        // request is refused at parse time rather than silently resolving one way.
+        assert!(
+            Cli::try_parse_from(["tnet", "set", "--webclient", "--no-webclient"]).is_err(),
+            "--webclient and --no-webclient must conflict"
+        );
     }
 
     #[test]

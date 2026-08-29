@@ -8,14 +8,21 @@
 //!
 //! ## Honest omission
 //!
-//! Go's `ConfigVAlpha` carries fields this fork has no home for yet (operator user, SNAT/netfilter,
-//! app-connector, posture, web-client, auto-update, …). We still **parse** them — a valid Go config
-//! must not error here — but we only **honor** the subset that maps to a real [`Prefs`] field, and we
+//! Go's `ConfigVAlpha` carries fields this config loader does not honor (operator user,
+//! SNAT/netfilter, app-connector, posture, web-client, auto-update, …). We still **parse** them — a
+//! valid Go config must not error here — but we only **honor** the subset that maps to a real
+//! [`Prefs`] field, and we
 //! **warn** (never silently drop) when an unmapped field is set to a non-default value, so a headless
 //! operator sees exactly what is and isn't applied. The mapped set today: `Enabled` → `want_running`,
 //! `ServerURL` → `control_url`, `Hostname`, `AcceptDNS`, `AcceptRoutes`, `ExitNode`, `AdvertiseRoutes`,
 //! `ShieldsUp`, `RunSSHServer` → `ssh_enabled`. `AuthKey` is returned separately (it is a registration
 //! credential, not a persisted pref).
+//!
+//! NOTE: several of the unmapped names above (operator user, app-connector, posture, web-client,
+//! auto-update, nickname, exit-node LAN access) DO have a [`Prefs`] field now — bead `tsd-1m9` wired
+//! them to `tnet up`/`tnet set`. Mapping them here as well is a separate, additive change to this
+//! loader; until it happens they stay in the parse-and-warn set above, which is honest (a config that
+//! sets them is told they were not applied) rather than silently half-applied.
 //!
 //! NOTE: Go's `ConfigVAlpha` has **no** tags field — ACL tags are carried by the auth key at
 //! registration, never by the config file (verified against `ipn/conf.go` @ v1.100.0). So there is no

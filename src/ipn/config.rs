@@ -221,6 +221,30 @@ pub(super) async fn build_config(
     // refused. Sending (`file_cp`) does NOT depend on this; only receiving does. The raw pref
     // string maps straight to the engine's `Option<PathBuf>` (no parse can fail).
     config.taildrop_dir = prefs.taildrop_dir.as_ref().map(PathBuf::from);
+    // ---- The eight later-added Go `up`/`set` pref flags (bead tsd-1m9). Each maps 1:1 onto an
+    // engine `Config` field, and every one of these fields is threaded on to `ts_control::Config`
+    // by the engine (`From<&tailscale::Config> for ts_control::Config`). They split in two:
+    //
+    // (a) ADVERTISED — `advertise_app_connector` and `auto_update_apply` genuinely cross the control
+    //     wire: the engine sends them as `Hostinfo.AppConnector` / `Hostinfo.AllowsUpdate` both at
+    //     registration and on EVERY map request. Because they are construction-time `Config` fields
+    //     with no runtime setter, a `set` that changes either must REBUILD the device for the new
+    //     value to reach control (see `SetOptions::needs_rebuild`).
+    // (b) CARRIED — the other six are stored by the engine and never acted on and never sent
+    //     (the engine's own field docs say so). The DAEMON is the layer that would act on them, so
+    //     they are persisted daemon-side and threaded here for completeness; changing one needs no
+    //     device rebuild, because no live engine behavior depends on it.
+    //
+    // Both classes are set unconditionally from prefs, so a rebuild always reflects the persisted
+    // intent (no "only when non-default" branch that could go stale).
+    config.operator_user = prefs.operator_user.clone();
+    config.auto_update_apply = prefs.auto_update_apply;
+    config.auto_update_check = prefs.auto_update_check;
+    config.posture_checking = prefs.posture_checking;
+    config.advertise_app_connector = prefs.advertise_app_connector;
+    config.run_web_client = prefs.run_web_client;
+    config.exit_node_allow_lan_access = prefs.exit_node_allow_lan_access;
+    config.node_nickname = prefs.node_nickname.clone();
     // WireGuard/disco UDP listen port (Go `tailscaled --port` / `PORT`). A daemon-startup setting, not
     // a pref — it is fixed for the process lifetime, so it is threaded in here rather than stored in
     // `Prefs`. `None` (the default + Go's `0`) lets the OS pick an ephemeral port; `Some(p)` pins the
@@ -272,6 +296,171 @@ mod tests {
             .expect("build_config should succeed");
         let _ = std::fs::remove_file(&key_path);
         cfg
+    }
+
+    /// Run `build_config` over a throwaway key path with the given prefs. Returns the built engine
+    /// config. Parallel-safe (each call gets a unique key path).
+    async fn config_for_prefs(prefs: &Prefs) -> tailscale::Config {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let key_path = std::env::temp_dir().join(format!(
+            "tailnetd-prefscfgtest-{}-{}.key",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cfg = build_config(prefs, &key_path, None)
+            .await
+            .expect("build_config should succeed");
+        let _ = std::fs::remove_file(&key_path);
+        cfg
+    }
+
+    #[tokio::test]
+    async fn up_set_pref_flags_reach_the_engine_config() {
+        // Bead tsd-1m9, one case per flag: the persisted pref must land on the engine `Config` field
+        // the flag mirrors. This is the whole point of the plumbing — a flag that parses but whose
+        // value never reaches the engine is the inert-flag trap this repo has been burned by before
+        // (`accept_dns`), so pin every one of the eight individually. The Go flag each mirrors is
+        // named in the assertion message.
+        //
+        // Each case sets EXACTLY one pref to a non-default value and asserts EXACTLY that field, so a
+        // copy-paste mapping error (two flags writing the same `Config` field) fails here.
+        // (name, set-only-this-pref, assert-only-that-Config-field). Aliased to dodge
+        // clippy::type_complexity on the tuple literal, like the tables in `revert_guard`.
+        type Case = (&'static str, fn(&mut Prefs), fn(&tailscale::Config) -> bool);
+        let cases: Vec<Case> = vec![
+            (
+                "--operator (Go Prefs.OperatorUser) → Config.operator_user",
+                |p| p.operator_user = Some("alice".into()),
+                |c| c.operator_user.as_deref() == Some("alice"),
+            ),
+            (
+                "--auto-update (Go Prefs.AutoUpdate.Apply) → Config.auto_update_apply",
+                |p| p.auto_update_apply = Some(true),
+                |c| c.auto_update_apply == Some(true),
+            ),
+            (
+                "--update-check (Go Prefs.AutoUpdate.Check) → Config.auto_update_check",
+                |p| p.auto_update_check = true,
+                |c| c.auto_update_check,
+            ),
+            (
+                "--report-posture (Go Prefs.PostureChecking) → Config.posture_checking",
+                |p| p.posture_checking = true,
+                |c| c.posture_checking,
+            ),
+            (
+                "--advertise-connector (Go Prefs.AppConnector.Advertise) → Config.advertise_app_connector",
+                |p| p.advertise_app_connector = true,
+                |c| c.advertise_app_connector,
+            ),
+            (
+                "--webclient (Go Prefs.RunWebClient) → Config.run_web_client",
+                |p| p.run_web_client = true,
+                |c| c.run_web_client,
+            ),
+            (
+                "--exit-node-allow-lan-access (Go Prefs.ExitNodeAllowLANAccess) → Config.exit_node_allow_lan_access",
+                |p| p.exit_node_allow_lan_access = true,
+                |c| c.exit_node_allow_lan_access,
+            ),
+            (
+                "--nickname (Go Prefs.ProfileName) → Config.node_nickname",
+                |p| p.node_nickname = Some("laptop".into()),
+                |c| c.node_nickname.as_deref() == Some("laptop"),
+            ),
+        ];
+
+        for (what, set_pref, check) in cases {
+            let mut prefs = Prefs::default();
+            set_pref(&mut prefs);
+            let cfg = config_for_prefs(&prefs).await;
+            assert!(
+                check(&cfg),
+                "{what}: the persisted pref did not reach the engine Config — the flag would parse \
+                 and do nothing"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn up_set_pref_flags_default_off_on_the_engine_config() {
+        // The other half of the mapping: default prefs must leave all eight engine fields at their
+        // off/unset defaults, so merely ADDING these flags cannot have flipped a node's posture (a
+        // node that never passes them must advertise and carry exactly what it did before).
+        let cfg = config_for_prefs(&Prefs::default()).await;
+        assert_eq!(cfg.operator_user, None);
+        assert_eq!(cfg.auto_update_apply, None);
+        assert!(!cfg.auto_update_check);
+        assert!(!cfg.posture_checking);
+        assert!(!cfg.advertise_app_connector);
+        assert!(!cfg.run_web_client);
+        assert!(!cfg.exit_node_allow_lan_access);
+        assert_eq!(cfg.node_nickname, None);
+    }
+
+    #[tokio::test]
+    async fn advertised_pref_flags_reach_the_control_client_config() {
+        // The two flags of bead tsd-1m9 that genuinely CROSS THE WIRE: the engine sends
+        // `advertise_app_connector` as `Hostinfo.AppConnector` and `auto_update_apply` as
+        // `Hostinfo.AllowsUpdate` — at registration (engine `ts_control/src/tokio/register.rs`,
+        // `app_connector:`/`allows_update:` on the RegisterRequest's HostInfo) AND on every map
+        // request (engine `ts_control/src/tokio/client.rs`, `.app_connector(…)`/`.allows_update(…)`
+        // on the MapRequest builder). Both call sites read them off `ts_control::Config`.
+        //
+        // That struct is the last daemon-visible hop: the engine's `From<&tailscale::Config> for
+        // ts_control::Config` is what carries the value across, and the builder types beyond it are
+        // private to the engine (`ts_control::map_request_builder` is a private module), so this
+        // asserts the furthest point the daemon can observe. The remaining hop — those two
+        // `ts_control::Config` fields driving the `Hostinfo` wire keys — is pinned engine-side by
+        // `advertise_prefs_drive_host_info_wire_fields` in `ts_control/src/config.rs`.
+        let prefs = Prefs {
+            advertise_app_connector: true,
+            auto_update_apply: Some(true),
+            ..Prefs::default()
+        };
+        let cfg = config_for_prefs(&prefs).await;
+        let control: ts_control::Config = (&cfg).into();
+        assert!(
+            control.advertise_app_connector,
+            "--advertise-connector must reach the register/map-request payload \
+             (ts_control::Config.advertise_app_connector → Hostinfo.AppConnector)"
+        );
+        assert_eq!(
+            control.auto_update_apply,
+            Some(true),
+            "--auto-update must reach the register/map-request payload \
+             (ts_control::Config.auto_update_apply → Hostinfo.AllowsUpdate)"
+        );
+
+        // `--no-auto-update` (an explicit `Some(false)`) is carried distinctly from unset, and both
+        // advertise NO update — the engine sends `AllowsUpdate` only for `Some(true)`. Pinned so the
+        // tri-state is not silently collapsed to a plain bool by a future refactor.
+        let off = Prefs {
+            auto_update_apply: Some(false),
+            ..Prefs::default()
+        };
+        let control: ts_control::Config = (&config_for_prefs(&off).await).into();
+        assert_eq!(control.auto_update_apply, Some(false));
+
+        // And the six CARRIED prefs reach that same struct (the engine threads them on for a
+        // downstream daemon) even though the engine never sends or acts on them.
+        let carried = Prefs {
+            operator_user: Some("alice".into()),
+            auto_update_check: true,
+            posture_checking: true,
+            run_web_client: true,
+            exit_node_allow_lan_access: true,
+            node_nickname: Some("laptop".into()),
+            ..Prefs::default()
+        };
+        let control: ts_control::Config = (&config_for_prefs(&carried).await).into();
+        assert_eq!(control.operator_user.as_deref(), Some("alice"));
+        assert!(control.auto_update_check);
+        assert!(control.posture_checking);
+        assert!(control.run_web_client);
+        assert!(control.exit_node_allow_lan_access);
+        assert_eq!(control.node_nickname.as_deref(), Some("laptop"));
     }
 
     #[tokio::test]
