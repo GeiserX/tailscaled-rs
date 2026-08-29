@@ -85,7 +85,7 @@ consuming change rides the next pin bump).
 
 ## 3. What is DONE (for orientation)
 
-Closed this migration so far (50 beads). The consumed engine capabilities and shipped daemon features:
+Closed this migration so far (51 beads). The consumed engine capabilities and shipped daemon features:
 
 - **Lifecycle / prefs:** `up` (full flag surface incl. workload-identity-federation auth keys), `down`,
   `login` (interactive + authkey), `logout`, `set` (live pref mutation), `reload-config` (3-way
@@ -97,8 +97,11 @@ Closed this migration so far (50 beads). The consumed engine capabilities and sh
   shields-up, TUN data path (feature `tun`), `--port`/`PORT` listen-port pinning; the carried Go pref
   flags (`--operator`, `--nickname`, `--report-posture`, `--webclient`, `--auto-update`/
   `--update-check`, `--advertise-connector`, `--exit-node-allow-lan-access`).
-- **Services:** serve (tcp/https/http/redirect/status/reset), funnel on/off, Taildrop `cp`/`get`/`list`,
-  TLS `cert` (feature `acme`), `nc`, `configure kubeconfig` (standalone generation; no merge).
+- **Services:** serve + funnel in Go v1.100.0's flag grammar (`--https`/`--http`/`--tcp`/
+  `--tls-terminated-tcp`/`--set-path`/`--bg`/`--yes`, a foreground default, `<target> off`,
+  `status`/`reset`) alongside this fork's positional sub-verbs (incl. the Go-less `serve redirect`)
+  and the legacy `funnel <port> on|off`; Taildrop `cp`/`get`/`list`, TLS `cert` (feature `acme`),
+  `nc`, `configure kubeconfig` (standalone generation; no merge).
 - **SSH:** Tailscale SSH **server** (feature `ssh`, control-policy authz, privilege drop) + host-key-
   pinned SSH **client** (`tnet ssh`).
 - **Tailnet lock:** `init`/`status`/`log`/`sign`/`disable`/`disablement-kdf`.
@@ -143,7 +146,7 @@ would violate the honest-omission rule). Each rides the next pin bump once its a
 | **Linux OS-DNS configurator** (systemd-resolved / NetworkManager / resolvconf / direct `/etc/resolv.conf` matrix, with trample detection) | `tsd-m8s` | Re-scoped: the engine's `ts_host_net` already programs the resolver via `resolvectl` in TUN mode — so this is now largely a **verify-on-a-live-Linux-box** task to confirm the matrix + that Windows returns `Unsupported` cleanly. |
 | **Port mapper** (UPnP-IGD / NAT-PMP / PCP) | `tsd-vxb` | Go has `net/portmapper`; improves NAT traversal. Engine-side concern (the daemon doesn't own magicsock). |
 | **MagicDNS OS integration** (the `100.100.100.100` resolver wired into the host) | `tsd-ioh` | Depends on the OS-DNS configurator (`tsd-m8s`). |
-| **Serve / Funnel runtime** (the full Go v2 grammar: `--bg`/`--service`/`--tun`/`--tls-terminated-tcp`/`--proxy-protocol`, service `drain`/`clear`/`advertise`/`get-config`/`set-config`) | `tsd-z40`, `tsd-c3w` | The TCP + web serve lanes ship; the Tailscale **Services** (VIP) layer and the v2 flag grammar are unmodeled. Partly engine-gated (Services are a netmap+control feature). |
+| **Serve / Funnel runtime** (`--service`/`--tun`/`--proxy-protocol`; service `drain`/`clear`/`advertise`/`get-config`/`set-config`) | `tsd-z40` | The v2 flag grammar, the foreground default and `--tls-terminated-tcp` now ship (`tsd-c3w`). What is left is the Tailscale **Services** (VIP) layer — engine-gated, Services are a netmap+control feature — plus `--tun` (netstack-only serve lanes) and `--proxy-protocol` (the engine's TCP serve target cannot emit the header). All three are *parsed* and refused by name, so a ported Go command line says what is missing. |
 | **Captive-portal detection** | `tsd-iqq.5` | Go's `ipnlocal/captiveportal.go`: probe the DERP map, mark a health warning on detection. |
 | **`--state mem:` / non-file state backends** | `tsd-iqq.10` | Go's `--state` supports `mem:`/`kube:`/`arn:aws:ssm:` prefixes; this fork is file-only. |
 | **LocalAPI → HTTP/1-over-UDS** (the eventual transport, matching Go's LocalAPI exactly) | `tsd-euv` | Currently newline-delimited JSON; Go is HTTP/1 with `PermitRead`/`PermitWrite`. A faithfulness upgrade, not a feature gap. |
@@ -241,6 +244,15 @@ not silently weaker than Go. They are surfaced to the user where relevant.
 - **Outbound HTTP proxy** implements CONNECT only; absolute-form forwarding returns `501`.
 - **`update`** verifies **integrity** (SHA-256), not **authenticity** (no signature chain) — stated
   plainly.
+- **Foreground `serve`/`funnel`** is torn down by the **CLI**, not the daemon. Go ties a foreground
+  serve to the CLI's IPN-bus watch session, so the daemon drops the config the moment that connection
+  goes away (`SIGKILL`, a lost SSH session); here `tnet` restores the previous config from its own
+  `SIGINT`/`SIGTERM` handler, so a killed foreground `tnet serve` leaves its serve installed until
+  `tnet serve reset`.
+- **`funnel <bare-port> off`** keeps this fork's legacy reading (turn the funnel off on
+  `<bare-port>`), where Go reads the bare port as a *target* and turns off the funnel on the default
+  port 443. Retargeting an existing `tnet funnel 8443 off` at 443 would report success while leaving
+  8443 publicly exposed; `funnel --https=443 off` spells Go's reading explicitly.
 
 These are the subject of `tsd-efv` (document the Go-tooling-compatibility boundary cleanly).
 
@@ -248,7 +260,7 @@ These are the subject of `tsd-efv` (document the Go-tooling-compatibility bounda
 
 ## 7. Full open bead list
 
-45 open beads (`bd list --status open`), grouped by priority. Epics are umbrella trackers.
+44 open beads (`bd list --status open`), grouped by priority. Epics are umbrella trackers.
 
 ### Epics (P1–P3)
 - `tsd-iqq` (P1) — **GOAL:** full Go `tailscaled` parity (the umbrella).
@@ -265,12 +277,12 @@ These are the subject of `tsd-efv` (document the Go-tooling-compatibility bounda
 ### Features / tasks / bugs
 - **P2:** `tsd-1m9` pref flags (#21) · `tsd-6y1` crates.io (daemon) · `tsd-d6n` crates.io (engine) ·
   `tsd-k4a` .deb/.rpm + ship acme · `tsd-m8s` Linux OS-DNS configurator · `tsd-q8o` external crypto audit.
-- **P3:** `tsd-1yw` Windows support · `tsd-52k` file-cp residual gaps ·
-  `tsd-6hx` live e2e campaign · `tsd-91w` profiles/multi-account · `tsd-b15` debug subcommands ·
-  `tsd-c3w` serve/funnel v2 grammar · `tsd-efv` document reduced shapes · `tsd-euv` HTTP/1-over-UDS ·
-  `tsd-ioh` MagicDNS OS integration · `tsd-iqq.10` `--state mem:` · `tsd-iqq.12` set-expiry/reset-auth
-  (engine-gated) · `tsd-iqq.15` peer-by-id (engine-gated) · `tsd-nee` lock add/remove (#25) ·
-  `tsd-v0x` stale-route reaper (exceeds Go) · `tsd-vxb` port mapper · `tsd-z40` serve/funnel runtime.
+- **P3:** `tsd-1yw` Windows support · `tsd-52k` file-cp residual gaps · `tsd-6hx` live e2e campaign ·
+  `tsd-91w` profiles/multi-account · `tsd-b15` debug subcommands · `tsd-efv` document reduced shapes ·
+  `tsd-euv` HTTP/1-over-UDS · `tsd-ioh` MagicDNS OS integration · `tsd-iqq.10` `--state mem:` ·
+  `tsd-iqq.12` set-expiry/reset-auth (engine-gated) · `tsd-iqq.15` peer-by-id (engine-gated) ·
+  `tsd-nee` lock add/remove (#25) · `tsd-v0x` stale-route reaper (exceeds Go) · `tsd-vxb` port
+  mapper · `tsd-z40` serve/funnel runtime.
 - **P4:** `tsd-0s6` Homebrew tap · `tsd-1hr` file get --wait/--loop (#20) · `tsd-49c` live proxy-splice
   proof · `tsd-9et` live interactive-login vs Headscale · `tsd-dru` small flag batch · `tsd-eka`
   Taildrive (engine-gated) · `tsd-iqq.5` captive-portal detection · `tsd-iqq.16` reload-config refactor ·
