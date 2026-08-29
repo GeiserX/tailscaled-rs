@@ -1010,6 +1010,29 @@ enum DebugCmd {
         #[arg(value_name = "FILE", required = true)]
         files: Vec<String>,
     },
+    /// Print the state directory this CLI resolved, WHY it resolved there, and the socket derived
+    /// from it (Go `tailscale debug statedir`). Purely local — it reports the paths the CLI would
+    /// use; nothing is read from the daemon, created, or mutated.
+    ///
+    /// The state dir is chosen by a cascade (`$TAILNETD_STATE_DIR`, else the packaged system dir
+    /// when running as root, else `$XDG_STATE_HOME`/`$HOME`), and the winning rule is invisible in
+    /// the resulting path. That is exactly the shape of this fork's most common confusion: a root
+    /// `tailnetd` and an unprivileged `tnet` resolve *different* dirs, hence different sockets, and
+    /// the CLI just reports a missing socket. This prints the rule that won, so the split is one
+    /// line to spot instead of a guess.
+    Statedir,
+    /// Print this binary's build metadata as JSON (Go `tailscale debug go-buildinfo`, which dumps
+    /// Go's `runtime/debug.BuildInfo`). Purely local — no daemon round-trip. Rust has no runtime
+    /// build-info reflection, so the same facts are stamped in at compile time by `build.rs`: the
+    /// package + version, the target triple and cargo profile, the `rustc` that built it, the git
+    /// revision (and whether the tree was dirty), and the cargo features this build was compiled
+    /// with. The intended use is Go's: paste it into a bug report so the exact binary is identified.
+    ///
+    /// Fields that could not be determined at build time (e.g. building from a release tarball with
+    /// no `.git`, or with no `rustc` on PATH) are emitted as JSON `null` rather than a placeholder
+    /// string — an honest "unknown", never a fabricated value.
+    #[command(alias = "go-buildinfo")]
+    BuildInfo,
 }
 
 /// `tnet serve` subcommands. Mirrors the TCP-forward subset of Go `tailscale serve`.
@@ -1962,6 +1985,16 @@ async fn main() -> Result<()> {
             // `debug stat` lstats each path locally — no socket round-trip.
             DebugCmd::Stat { files } => {
                 run_debug_stat(&files);
+                Ok(())
+            }
+            // `debug statedir` reports the CLI's own path resolution — purely local, no round-trip.
+            DebugCmd::Statedir => {
+                run_debug_statedir(&socket);
+                Ok(())
+            }
+            // `debug build-info` prints compile-time build facts — purely local, no round-trip.
+            DebugCmd::BuildInfo => {
+                run_debug_build_info();
                 Ok(())
             }
         },
@@ -3159,6 +3192,132 @@ fn stat_report(path: &std::path::Path) -> String {
         }
     }
     out
+}
+
+/// `debug statedir` (Go `tailscale debug statedir`): print the resolved state dir, the cascade rule
+/// that chose it, and the LocalAPI socket the CLI resolved. Purely local — it only reports paths, and
+/// deliberately does NOT create the state dir (a diagnostic that creates the thing it is diagnosing
+/// would mask the very "wrong dir" it exists to reveal). `socket` is the socket the CLI actually
+/// resolved (so an explicit `--socket`/`$TAILNETD_SOCKET` is reflected, not re-derived).
+fn run_debug_statedir(socket: &std::path::Path) {
+    let (dir, source) = tailscaled_rs::state_dir_with_source();
+    print!("{}", statedir_report(&dir, source, socket));
+}
+
+/// Build the `debug statedir` output (pure → unit-testable; no stdout, no filesystem writes).
+/// Three lines: the state dir with its on-disk status, the rule that selected it, and the socket with
+/// its on-disk status. The string always ends in a newline.
+fn statedir_report(
+    dir: &std::path::Path,
+    source: tailscaled_rs::StateDirSource,
+    socket: &std::path::Path,
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "state dir: {} ({})", dir.display(), path_status(dir));
+    let _ = writeln!(out, "resolved:  {}", source.describe());
+    let _ = writeln!(
+        out,
+        "socket:    {} ({})",
+        socket.display(),
+        path_status(socket)
+    );
+    out
+}
+
+/// One-word on-disk status of `path` for [`statedir_report`]: `present` (plus the unix permission
+/// bits for a directory, since a state dir that is not `0700` is itself a finding), `absent`, or the
+/// stat error when the path exists but cannot be inspected (e.g. a parent the caller cannot traverse).
+///
+/// Symlinks are FOLLOWED (`stat`, not `lstat` — the opposite of `debug stat`, which mirrors Go's
+/// `os.Lstat`): the question here is whether there is a usable state dir / a live socket at the end
+/// of the path, so a dangling symlink is correctly `absent` rather than a "present" that would read
+/// as "the daemon is up".
+fn path_status(path: &std::path::Path) -> String {
+    use std::os::unix::fs::PermissionsExt as _;
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_dir() => {
+            format!("present, mode {:o}", meta.permissions().mode() & 0o777)
+        }
+        Ok(_) => "present".to_string(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => "absent".to_string(),
+        Err(e) => format!("cannot stat: {e}"),
+    }
+}
+
+/// `debug build-info` (Go `tailscale debug go-buildinfo`): print this binary's build metadata as
+/// pretty JSON. Purely local — every value is a compile-time constant stamped in by `build.rs` or by
+/// cargo, so there is no daemon round-trip and nothing to fail at runtime.
+fn run_debug_build_info() {
+    // The cargo features this binary was actually compiled with. Read via `cfg!` (not a manifest
+    // parse) so the answer is what the compiler saw, which is the only answer worth reporting.
+    let features: Vec<&str> = [
+        ("tun", cfg!(feature = "tun")),
+        ("ssh", cfg!(feature = "ssh")),
+        ("acme", cfg!(feature = "acme")),
+        ("identity-federation", cfg!(feature = "identity-federation")),
+    ]
+    .into_iter()
+    .filter_map(|(name, on)| on.then_some(name))
+    .collect();
+
+    let info = build_info_json(
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+        env!("TAILNETD_TARGET"),
+        env!("TAILNETD_PROFILE"),
+        env!("TAILNETD_RUSTC_VERSION"),
+        env!("TAILNETD_GIT_COMMIT"),
+        &features,
+    );
+    println!("{info:#}");
+}
+
+/// Build the `debug build-info` JSON (pure → unit-testable; no stdout, no env reads).
+///
+/// `git_commit` arrives in `build.rs`'s stamp form — a short SHA, optionally suffixed `-dirty`, or the
+/// literal `unknown` — and is split into the Go-`BuildInfo` setting pair `vcs.revision` / `vcs.modified`.
+/// Any field `build.rs` could not determine (the literal `unknown`) becomes JSON `null`: an honest gap
+/// is more useful in a bug report than a placeholder that reads like a real value.
+fn build_info_json(
+    package: &str,
+    version: &str,
+    target: &str,
+    profile: &str,
+    rustc: &str,
+    git_commit: &str,
+    features: &[&str],
+) -> serde_json::Value {
+    /// `unknown` (build.rs's "could not determine") → JSON `null`; anything else → a JSON string.
+    fn or_null(v: &str) -> serde_json::Value {
+        if v == "unknown" {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String(v.to_string())
+        }
+    }
+
+    // `-dirty` is appended by build.rs when the tracked tree had uncommitted changes at build time —
+    // Go's `vcs.modified` setting. With no revision at all there is nothing honest to say about
+    // modification either, so the whole `vcs` object is null rather than half-invented.
+    let vcs = match git_commit {
+        "unknown" => serde_json::Value::Null,
+        stamp => serde_json::json!({
+            "revision": stamp.strip_suffix("-dirty").unwrap_or(stamp),
+            "modified": stamp.ends_with("-dirty"),
+        }),
+    };
+
+    serde_json::json!({
+        "binary": "tnet",
+        "package": package,
+        "version": version,
+        "target": or_null(target),
+        "profile": or_null(profile),
+        "rustcVersion": or_null(rustc),
+        "vcs": vcs,
+        "features": features,
+    })
 }
 
 /// `switch` (Go `tailscale switch`): `--list` renders a table; `remove <id>` deletes; a bare
@@ -12485,6 +12644,140 @@ mod tests {
             "must print a trailing `  ...` when entries exceed the cap: {report:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- `debug statedir` / `debug build-info` --------------------------------------------------
+
+    #[test]
+    fn statedir_report_names_the_rule_that_won() {
+        // The whole point of the command: the path alone cannot tell you WHY it was chosen, so the
+        // rule has to be on the page next to it.
+        let dir = std::env::temp_dir().join(format!("tnet-statedir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("tailnetd.sock");
+
+        let report = super::statedir_report(&dir, tailscaled_rs::StateDirSource::SystemRoot, &sock);
+        assert!(
+            report.contains(&dir.display().to_string())
+                && report.contains(&sock.display().to_string()),
+            "must print both resolved paths: {report:?}"
+        );
+        assert!(
+            report.contains(tailscaled_rs::StateDirSource::SystemRoot.describe()),
+            "must name the winning cascade rule: {report:?}"
+        );
+        assert_eq!(report.lines().count(), 3, "expected 3 lines: {report:?}");
+        assert!(report.ends_with('\n'));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn statedir_report_distinguishes_present_from_absent() {
+        // A present dir reports its permission bits (a non-0700 state dir is itself a finding); a
+        // missing socket reports `absent` rather than erroring out — this command must stay useful
+        // precisely when the daemon is NOT running.
+        let dir = std::env::temp_dir().join(format!("tnet-statedir-abs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let sock = dir.join("not-there.sock");
+
+        let report = super::statedir_report(&dir, tailscaled_rs::StateDirSource::Env, &sock);
+        assert!(
+            report.contains("present, mode 700"),
+            "an existing state dir must report its mode: {report:?}"
+        );
+        assert!(
+            report.contains("(absent)"),
+            "a missing socket must report `absent`: {report:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_info_json_splits_the_dirty_suffix_into_vcs_fields() {
+        // build.rs stamps `<sha>-dirty` for an uncommitted tree; the JSON must split that back into
+        // Go's `vcs.revision` / `vcs.modified` pair rather than leaking the suffix into the sha.
+        let v = super::build_info_json(
+            "tailscaled-rs",
+            "0.52.2",
+            "x86_64-unknown-linux-gnu",
+            "release",
+            "rustc 1.95.0",
+            "abc123def-dirty",
+            &["ssh"],
+        );
+        assert_eq!(v["vcs"]["revision"], "abc123def");
+        assert_eq!(v["vcs"]["modified"], true);
+        assert_eq!(v["package"], "tailscaled-rs");
+        assert_eq!(v["version"], "0.52.2");
+        assert_eq!(v["target"], "x86_64-unknown-linux-gnu");
+        assert_eq!(v["features"][0], "ssh");
+
+        // A clean tree: same sha, `modified` false.
+        let clean = super::build_info_json(
+            "tailscaled-rs",
+            "0.52.2",
+            "x86_64-unknown-linux-gnu",
+            "release",
+            "rustc 1.95.0",
+            "abc123def",
+            &[],
+        );
+        assert_eq!(clean["vcs"]["revision"], "abc123def");
+        assert_eq!(clean["vcs"]["modified"], false);
+        assert!(
+            clean["features"].as_array().is_some_and(|a| a.is_empty()),
+            "a default build reports an empty feature list, not null"
+        );
+    }
+
+    #[test]
+    fn build_info_json_reports_undetermined_fields_as_null() {
+        // Built from a tarball with no `.git` and no rustc on PATH: build.rs stamps the literal
+        // `unknown`. That must surface as JSON `null` — a bug report is better served by an honest
+        // gap than by the string "unknown" masquerading as a value.
+        let v = super::build_info_json(
+            "tailscaled-rs",
+            "0.52.2",
+            "unknown",
+            "unknown",
+            "unknown",
+            "unknown",
+            &[],
+        );
+        assert!(v["vcs"].is_null(), "no revision → no vcs object: {v}");
+        assert!(v["target"].is_null());
+        assert!(v["profile"].is_null());
+        assert!(v["rustcVersion"].is_null());
+        // The facts cargo always knows are still present.
+        assert_eq!(v["binary"], "tnet");
+        assert_eq!(v["version"], "0.52.2");
+    }
+
+    /// The real, compiled-in stamps must produce a well-formed object — this is what catches a
+    /// `build.rs` that stopped emitting one of the `env!` values.
+    #[test]
+    fn build_info_json_from_the_real_build_stamps_is_well_formed() {
+        let v = super::build_info_json(
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+            env!("TAILNETD_TARGET"),
+            env!("TAILNETD_PROFILE"),
+            env!("TAILNETD_RUSTC_VERSION"),
+            env!("TAILNETD_GIT_COMMIT"),
+            &[],
+        );
+        assert_eq!(v["package"], env!("CARGO_PKG_NAME"));
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        // Under cargo test the triple + profile are always known, so they must not be null.
+        assert!(v["target"].is_string(), "target must be stamped: {v}");
+        assert!(v["profile"].is_string(), "profile must be stamped: {v}");
     }
 
     // --- `configure kubeconfig` (Go `tailscale configure kubeconfig`) ---------------------------
