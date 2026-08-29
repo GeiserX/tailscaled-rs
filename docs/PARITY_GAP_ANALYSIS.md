@@ -180,7 +180,7 @@ would violate the honest-omission rule). Each rides the next pin bump once its a
 | Item | Bead | Note |
 | --- | --- | --- |
 | Document the reduced fork shapes (`status --json` / `whois` / `netcheck` / `dns-status`) as the Go-tooling-compat boundary; fix RFC3339 timestamps + `nodekey:` peer-key keying | `tsd-efv` | The deviations are listed in §6; this bead is about documenting the boundary cleanly. |
-| `tnet` startup stale-route/scutil reaper (exceeds Go macOS crash-safety) | `tsd-v0x` | An enhancement *beyond* Go, not a gap. |
+| `tailnetd` startup stale-route/scutil reaper (exceeds Go macOS crash-safety) | `tsd-v0x` | **Shipped** (`src/hostreap.rs`, called from `tailnetd` startup before the engine comes up). An enhancement *beyond* Go, not a gap: Go's darwin `Close()` is a no-op and there is no darwin `HookCleanUp`, so a hard-killed Go node re-converges only on the next `Set`. The reaper removes the engine's leftover `scutil` resolver key and its `utun`-scoped static routes — matched by their externally observable markers, with no coupling to the engine's private macOS module, and only where the `utun` they point at is gone. Skippable with `TAILNETD_NO_REAP=1`. The parse + match contract is unit-tested (and asserted against live `netstat`/`scutil` output on macOS); the root-only delete leg still wants the Mac gate (root + a live FIB) to be exercised end to end. |
 | Extract a shared `rebuild_running_device` helper for `reload-config`/`drive_set` + richer reload success message | `tsd-iqq.16` | Internal tidy. |
 
 ---
@@ -267,7 +267,7 @@ These are the subject of `tsd-efv` (document the Go-tooling-compatibility bounda
   `tsd-c3w` serve/funnel v2 grammar · `tsd-efv` document reduced shapes · `tsd-euv` HTTP/1-over-UDS ·
   `tsd-ioh` MagicDNS OS integration · `tsd-iqq.10` `--state mem:` · `tsd-iqq.12` set-expiry/reset-auth
   (engine-gated) · `tsd-iqq.15` peer-by-id (engine-gated) · `tsd-nee` lock add/remove/log (#25) ·
-  `tsd-v0x` stale-route reaper (exceeds Go) · `tsd-vxb` port mapper · `tsd-z40` serve/funnel runtime.
+  `tsd-vxb` port mapper · `tsd-z40` serve/funnel runtime.
 - **P4:** `tsd-0s6` Homebrew tap · `tsd-1hr` file get --wait/--loop (#20) · `tsd-49c` live proxy-splice
   proof · `tsd-9et` live interactive-login vs Headscale · `tsd-dru` small flag batch · `tsd-eka`
   Taildrive (engine-gated) · `tsd-iqq.5` captive-portal detection · `tsd-iqq.16` reload-config refactor ·

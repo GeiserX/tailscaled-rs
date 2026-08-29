@@ -117,6 +117,14 @@ never re-authenticates and never changes whether the node is up or down.
 State (node keys + prefs) lives in `$XDG_STATE_HOME/tailnetd` (override with `TAILNETD_STATE_DIR`);
 the control socket is `<state-dir>/tailnetd.sock` (override with `TAILNETD_SOCKET`).
 
+**Crash cleanup (macOS).** In kernel-TUN mode the daemon programs host routes and a scoped MagicDNS
+resolver; both are reversed on a clean shutdown. A `SIGKILL`/panic skips that teardown, so on macOS
+they can outlive the daemon — a `scutil` resolver dictionary pointing at a MagicDNS server that is no
+longer listening, and routes blackholing into a `utun` that no longer exists. `tailnetd` therefore
+reaps that leftover state at startup, before it brings the node up: it removes its own `scutil` key
+and any of its static routes whose `utun` device is gone, and touches nothing else. Set
+`TAILNETD_NO_REAP=1` to skip the pass.
+
 ## Install as a system service
 
 To run `tailnetd` as an always-on boot service instead of a foreground process, install it as a
