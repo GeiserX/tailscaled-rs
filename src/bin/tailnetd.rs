@@ -341,6 +341,15 @@ async fn main() -> Result<()> {
         "tailnetd posture"
     );
 
+    // Reap host network state a previous, HARD-KILLED run left behind (macOS): a SIGKILL/abort skips
+    // the engine's graceful route/DNS teardown, so stale `utun` routes and a stale `scutil` resolver
+    // dictionary can outlive the daemon and keep blackholing traffic and DNS. Done here — after the
+    // posture log, and crucially BEFORE `auto_start` brings the engine up — so the cleanup can never
+    // race the fresh TUN device or its routes. Best-effort and non-fatal (a failure is logged; it is
+    // never a reason to refuse to bring the node up), a no-op off macOS / when not root, and
+    // skippable with `TAILNETD_NO_REAP=1`.
+    tailscaled_rs::hostreap::reap_stale_host_state();
+
     // Auto-start if the persisted intent was "up". A `--config` auth key (if supplied, already a
     // `SecretString`) is threaded in as the registration credential, taking precedence over
     // `TS_AUTH_KEY`.
