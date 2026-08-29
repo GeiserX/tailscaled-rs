@@ -1335,6 +1335,69 @@ pub struct Backend {
     has_node_key: bool,
 }
 
+/// What a [`Backend::switch_profile`] call actually did — the daemon-side half of the reporting Go's
+/// `switch` does around its `SwitchProfile` LocalAPI call (`cmd/tailscale/cli/switch.go`).
+///
+/// Go's CLI distinguishes three outcomes and says so in words: the target *was already* the current
+/// profile (`Already on account %q`, exit 0, nothing torn down), or the switch happened and the new
+/// profile then settles into a state it reports (`Success.` when it reaches `Running`, or
+/// `Logged out.` plus `To log in, run: tailscale up` when it reaches `NeedsLogin`). Reducing all
+/// three to one "switched" string — as this daemon did — makes the no-op case *claim a switch that
+/// never happened*, which is the one report a caller cannot afford to have wrong.
+///
+/// Go reaches its terminal report by polling `StatusWithoutPeers` until the backend leaves
+/// `NoState`/`Starting`. This daemon does not need the poll: `switch_profile` tears the device down
+/// and deliberately does not auto-`up` the target (see its docs), so the target's post-switch state
+/// is already final and is computed once, here, from the same [`Backend::derive_state`] the wire
+/// `status` uses — no second source of truth, no waiting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwitchOutcome {
+    /// `target` resolved to the profile that was **already** active: no teardown, no writes, no
+    /// change. Go's `Already on account %q` (which exits 0 — this is a success, not an error).
+    AlreadyCurrent {
+        /// The canonical id `target` resolved to.
+        id: String,
+    },
+    /// The active profile changed to `id`, whose settled state is `state`. The device is always down
+    /// immediately after a switch (this daemon never auto-`up`s the target), so `state` is one of
+    /// `NeedsLogin` (logged out / wants running with no engine), `NoState` (never registered — no
+    /// node key yet) or `Stopped` (registered, explicitly down).
+    Switched {
+        /// The canonical id `target` resolved to, now the active profile.
+        id: String,
+        /// The target profile's state after the switch, from [`Backend::derive_state`].
+        state: State,
+    },
+}
+
+impl SwitchOutcome {
+    /// The one-line human report for this outcome, as the LocalAPI `Ok` message.
+    ///
+    /// Mirrors the three things Go's `switch` tells the user, adapted to this daemon's nouns
+    /// (`profile`, not `account`) and to the fact that a switch here never connects:
+    /// - already-current → it says so, and does not claim a switch;
+    /// - switched to a profile with no usable login (`NeedsLogin`/`NoState`) → Go's "Logged out. To
+    ///   log in, run: `tailscale up`" collapsed onto one line;
+    /// - switched to a registered-but-down profile (`Stopped`) → run `up` to connect.
+    ///
+    /// Names the resolved **id** rather than echoing the caller's argument (Go prints `args[0]`):
+    /// the argument may have been a display name, and the id is what every follow-up command —
+    /// `switch`, `switch remove`, the `--list` output — is keyed by.
+    pub fn report(&self) -> String {
+        match self {
+            SwitchOutcome::AlreadyCurrent { id } => format!("already on profile {id:?}"),
+            SwitchOutcome::Switched { id, state } => match state {
+                // No usable login on the target: Go's `NeedsLogin` arm tells the user how to fix it.
+                State::NeedsLogin | State::NoState => {
+                    format!("switched to profile {id:?} (logged out — run `tnet up` to log in)")
+                }
+                // Registered, just not connected — a switch always leaves the device down.
+                _ => format!("switched to profile {id:?} (run `tnet up` to connect)"),
+            },
+        }
+    }
+}
+
 /// Whether the key file at `key_path` holds a usable persisted node key — a **pure, side-effect-free**
 /// read (the on-disk source of truth behind both [`Backend::has_persisted_node_key`] and the
 /// [`has_node_key`](Backend::has_node_key) cache). One source of truth so the cache's startup seed
@@ -1485,8 +1548,10 @@ impl Backend {
     /// switch changes the profile and the engine reconciles to the new prefs' `WantRunning`).
     ///
     /// `target` is validated as a profile id ([`profile::is_valid_profile_id`]) so it is always a safe
-    /// single path component. Switching to the already-current profile is a no-op success.
-    pub async fn switch_profile(&mut self, target: &str) -> Result<()> {
+    /// single path component. Switching to the already-current profile is a no-op success, reported
+    /// as [`SwitchOutcome::AlreadyCurrent`] rather than as a switch that did not happen (Go's
+    /// `Already on account %q`); see [`SwitchOutcome`] for why the outcome is typed.
+    pub async fn switch_profile(&mut self, target: &str) -> Result<SwitchOutcome> {
         // Resolve `target` (a profile id OR a display name — Go's `switch` accepts either) to a
         // canonical id BEFORE any teardown, so a no-match is rejected with the device untouched. An
         // existing profile is matched by id or unique name; a syntactically-valid id that is NOT yet
@@ -1505,7 +1570,11 @@ impl Backend {
             }
         };
         if target == self.current_profile {
-            return Ok(()); // already on it
+            // Already on it: nothing is torn down and nothing is written. Say so — reporting this as
+            // a switch would claim a teardown that never happened (Go: `Already on account %q`).
+            return Ok(SwitchOutcome::AlreadyCurrent {
+                id: target.to_string(),
+            });
         }
         // Tear down the live device + supersede any in-flight up before swapping the active files.
         // (The device is down either way after this — a switch always disconnects; the engine is
@@ -1555,18 +1624,36 @@ impl Backend {
         self.boot_attempted_up = false;
         // Adopt the target profile's node-key fact (computed above against the new `key_path`).
         self.has_node_key = has_node_key;
-        Ok(())
+        // The device is down (we tore it down above and never auto-`up` the target), so the target's
+        // state is already final — derive it from the same source `status` uses. `have_self_node` is
+        // false for the same reason: no device, hence no netmap.
+        Ok(SwitchOutcome::Switched {
+            id: self.current_profile.clone(),
+            state: self.derive_state(false),
+        })
     }
 
-    /// Delete profile `target` (the analogue of Go `tailscale switch remove`). Refuses to delete the
-    /// **current** profile (Go switches away first; we require the operator to switch away, which is
-    /// the safer, more explicit contract) and refuses to delete the reserved `default` profile.
-    /// Removes the profile's prefs+key files and its `profiles.json` entry. Idempotent for an
-    /// already-absent named profile.
-    pub async fn delete_profile(&mut self, target: &str) -> Result<()> {
-        if !profile::is_valid_profile_id(target) {
-            return Err(anyhow!("invalid profile id {target:?}"));
-        }
+    /// Delete profile `target` (the analogue of Go `tailscale switch remove`), returning the
+    /// canonical id that was removed.
+    ///
+    /// `target` is resolved by id **or display name**, exactly like [`switch_profile`](Backend::switch_profile)
+    /// — Go shares one `matchProfile` between `switch` and `switch remove`, so a name that can be
+    /// switched to can also be removed. A `target` that matches no known profile is **refused**
+    /// (Go: `No profile named %q`, exit 1): `remove` has no create-on-use semantics, so a typo that
+    /// reported success would tell the operator a profile is gone while it is still on disk. That
+    /// makes `remove` non-idempotent, like Go's.
+    ///
+    /// Refuses to delete the **current** profile (Go switches away first; we require the operator to
+    /// switch away, which is the safer, more explicit contract) and refuses to delete the reserved
+    /// `default` profile. Removes the profile's prefs+key files and its `profiles.json` entry.
+    pub async fn delete_profile(&mut self, target: &str) -> Result<String> {
+        // Resolve by id or name before anything else — an unknown target must not read as a
+        // successful no-op removal. The resolver only ever returns ids that are safe as a single
+        // path component, which is what the file removals below rely on.
+        let meta = profile::load_profiles_file(&self.state_dir).await;
+        let resolved = profile::resolve_target_to_id(target, &meta)
+            .ok_or_else(|| anyhow!("no profile named {target:?}"))?;
+        let target: &str = &resolved;
         if target == profile::DEFAULT_PROFILE_ID {
             return Err(anyhow!("the default profile cannot be removed"));
         }
@@ -1588,14 +1675,15 @@ impl Backend {
         if let Some(dir) = prefs_path.parent() {
             let _ = tokio::fs::remove_dir(dir).await;
         }
-        // Drop it from profiles.json.
+        // Drop it from profiles.json. Re-read rather than reusing the map loaded for resolution: the
+        // file removals above are `await` points, so the map may be stale by now.
         let mut meta = profile::load_profiles_file(&self.state_dir).await;
         if meta.profiles.remove(target).is_some() {
             profile::save_profiles_file(&self.state_dir, &meta)
                 .await
                 .with_context(|| "persisting profiles.json after delete")?;
         }
-        Ok(())
+        Ok(target.to_string())
     }
 
     /// Bump the monotonic [`generation`](Backend::generation) **and** notify lifecycle watchers. The
@@ -3048,6 +3136,13 @@ impl Backend {
         diag::lock_status(dev).await
     }
 
+    /// Read the Tailnet Lock update-chain history (the `tnet lock log` path). Thin `pub` shim over
+    /// [`diag::lock_log`]. See it for the `tka_log` → [`LockLogReport`](crate::localapi::LockLogReport)
+    /// mapping (and why `tka_status` is queried alongside).
+    pub async fn lock_log(dev: &tailscale::Device, limit: usize) -> crate::localapi::Response {
+        diag::lock_log(dev, limit).await
+    }
+
     /// Initialize Tailnet Lock (the `tnet lock init` path). Thin `pub` shim over [`diag::lock_init`]
     /// (hex-decodes the disablement secret and calls `Device::tka_init`).
     pub async fn lock_init(dev: &tailscale::Device, secret_hex: &str) -> crate::localapi::Response {
@@ -4313,16 +4408,131 @@ mod tests {
                 .is_err()
         );
 
-        // Removes a non-current named profile + its files.
+        // Removes a non-current named profile + its files, and reports the id it removed.
         let (work_prefs, _) = profile::profile_paths(&dir, "work");
         assert!(tokio::fs::try_exists(&work_prefs).await.unwrap());
-        be.delete_profile("work").await.unwrap();
+        assert_eq!(be.delete_profile("work").await.unwrap(), "work");
         assert!(!tokio::fs::try_exists(&work_prefs).await.unwrap());
         // It's gone from the list (only default remains).
         let list = be.list_profiles().await;
         assert!(!list.iter().any(|e| e.id == "work"));
-        // Idempotent: deleting an absent profile is fine.
-        be.delete_profile("work").await.unwrap();
+        // Removing it AGAIN is refused, not silently reported as success (Go: `No profile named
+        // %q`). `remove` never creates, so an unmatched target is always an operator error — most
+        // often a typo — and answering "removed" would say a profile is gone while it is still there.
+        let err = be
+            .delete_profile("work")
+            .await
+            .expect_err("removing an unknown profile must be refused, not a silent no-op");
+        assert!(
+            format!("{err:#}").contains("no profile named"),
+            "unexpected error: {err:#}"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn profile_delete_resolves_display_names_like_switch_does() {
+        // Go shares one `matchProfile` between `switch` and `switch remove`, so anything you can
+        // switch to by display name you can also remove by display name. This daemon resolves the
+        // target through the same `resolve_target_to_id`, so the two agree by construction — pinned
+        // here because `delete_profile` used to require a literal id and would have refused a name.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-prof-delname-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = Backend::load(&dir).await.unwrap();
+
+        // Create "work" and give it a display name, then switch away so it is removable.
+        be.switch_profile("work").await.unwrap();
+        be.persist_prefs().await.unwrap();
+        let mut meta = profile::load_profiles_file(&dir).await;
+        meta.profiles.insert(
+            "work".to_string(),
+            profile::ProfileMeta {
+                name: "Work tailnet".to_string(),
+            },
+        );
+        profile::save_profiles_file(&dir, &meta).await.unwrap();
+        be.switch_profile(profile::DEFAULT_PROFILE_ID)
+            .await
+            .unwrap();
+
+        // Remove by DISPLAY NAME: resolves to the id, and the id is what comes back.
+        assert_eq!(be.delete_profile("Work tailnet").await.unwrap(), "work");
+        assert!(!be.list_profiles().await.iter().any(|e| e.id == "work"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn switch_reports_already_current_separately_from_a_real_switch() {
+        // The no-op switch must not claim a switch: Go answers `Already on account %q` and exits 0.
+        // Also pins the settled state each outcome carries — the daemon never auto-`up`s the target,
+        // so a fresh (never-registered) profile lands in `NoState` and a registered-but-down one in
+        // `Stopped`, which is what the report's "log in" vs "connect" wording keys off.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-prof-outcome-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = Backend::load(&dir).await.unwrap();
+
+        // Switching to the profile that is already current changes nothing.
+        let outcome = be
+            .switch_profile(profile::DEFAULT_PROFILE_ID)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            SwitchOutcome::AlreadyCurrent {
+                id: profile::DEFAULT_PROFILE_ID.to_string()
+            }
+        );
+        assert_eq!(outcome.report(), "already on profile \"default\"");
+        assert_eq!(be.current_profile, profile::DEFAULT_PROFILE_ID);
+
+        // A real switch to a brand-new profile: never registered → NoState → "log in" wording.
+        let outcome = be.switch_profile("work").await.unwrap();
+        assert_eq!(
+            outcome,
+            SwitchOutcome::Switched {
+                id: "work".to_string(),
+                state: State::NoState,
+            }
+        );
+        assert!(
+            outcome.report().contains("log in"),
+            "a profile with no node key must be reported as needing a login: {}",
+            outcome.report()
+        );
+
+        // A profile that HAS a persisted node key and is explicitly down settles in `Stopped`, and
+        // is reported as connectable rather than as logged out. Fake the key file the same way the
+        // `has_node_key` cache reads it (a real key, minted by the engine's own keypair type).
+        let (_, key_path) = profile::profile_paths(&dir, "keyed");
+        tokio::fs::create_dir_all(key_path.parent().unwrap())
+            .await
+            .unwrap();
+        // Mint a realistic key file with the engine's own loader (it create-on-missing-writes one),
+        // the same way `has_persisted_node_key_true_after_key_file_written` does — so the on-disk
+        // shape cannot drift from what the switch's node-key re-derivation parses.
+        tailscale::config::load_key_file(&key_path, Default::default())
+            .await
+            .expect("mint a key file for the target profile");
+
+        let outcome = be.switch_profile("keyed").await.unwrap();
+        assert_eq!(
+            outcome,
+            SwitchOutcome::Switched {
+                id: "keyed".to_string(),
+                state: State::Stopped,
+            }
+        );
+        assert!(
+            outcome.report().contains("connect") && !outcome.report().contains("log in"),
+            "a registered, downed profile must be reported as connectable: {}",
+            outcome.report()
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

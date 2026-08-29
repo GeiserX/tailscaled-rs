@@ -747,3 +747,136 @@ async fn lifecycle_subscriber_observes_generation_advance_on_up_path() {
 
     harness.shutdown_and_verify().await;
 }
+
+/// Profiles over the wire (Go `tailscale switch` / `switch --list` / `switch remove`, ported in
+/// `cmd/tailscale/cli/switch.go`): the three LocalAPI verbs a multi-account CLI drives, exercised
+/// end-to-end through the real server so the reply *messages* — the only thing the user sees — are
+/// pinned alongside the state changes.
+///
+/// The interesting cases are the refusals and the no-op, because those are the ones a caller cannot
+/// verify for itself: a `switch` to the profile you are already on must not claim it switched, and a
+/// `switch remove` of a profile that does not exist must not claim it removed one.
+#[tokio::test]
+async fn profile_switch_list_and_remove_round_trip_over_the_wire() {
+    let harness = Harness::start().await;
+
+    // A fresh daemon is on the implicit default profile, which is the only one listed.
+    match harness.round_trip(r#"{"cmd":"profile_list"}"#).await {
+        Response::Profiles { profiles } => {
+            assert_eq!(
+                profiles.len(),
+                1,
+                "fresh daemon has only the default profile"
+            );
+            assert_eq!(profiles[0].id, "default");
+            assert!(profiles[0].current, "the default profile must be current");
+        }
+        other => panic!("expected Response::Profiles, got {other:?}"),
+    }
+
+    // Switching to a brand-new id creates and activates it. The profile has never registered, so the
+    // reply says so (Go's post-switch `NeedsLogin` arm) rather than claiming a connection.
+    match harness
+        .round_trip(r#"{"cmd":"switch_profile","target":"work"}"#)
+        .await
+    {
+        Response::Ok { message } => {
+            assert!(
+                message.contains("switched to profile \"work\"") && message.contains("log in"),
+                "unexpected switch message: {message:?}"
+            );
+        }
+        other => panic!("expected Response::Ok from switch, got {other:?}"),
+    }
+
+    // Both profiles are now listed, with the marker moved to "work".
+    match harness.round_trip(r#"{"cmd":"profile_list"}"#).await {
+        Response::Profiles { profiles } => {
+            let work = profiles
+                .iter()
+                .find(|p| p.id == "work")
+                .expect("work must be listed after the switch");
+            assert!(work.current, "work must be the current profile");
+            assert!(
+                profiles.iter().any(|p| p.id == "default" && !p.current),
+                "default must still be listed, no longer current"
+            );
+        }
+        other => panic!("expected Response::Profiles, got {other:?}"),
+    }
+
+    // Switching to the profile we are ALREADY on changes nothing and says exactly that (Go:
+    // `Already on account %q`, exit 0) — it must not report a switch that did not happen.
+    match harness
+        .round_trip(r#"{"cmd":"switch_profile","target":"work"}"#)
+        .await
+    {
+        Response::Ok { message } => {
+            assert_eq!(message, "already on profile \"work\"");
+        }
+        other => panic!("expected Response::Ok from the no-op switch, got {other:?}"),
+    }
+
+    // Removing the CURRENT profile is refused (this daemon requires an explicit switch away first).
+    match harness
+        .round_trip(r#"{"cmd":"delete_profile","target":"work"}"#)
+        .await
+    {
+        Response::Error { message } => assert!(
+            message.contains("current profile"),
+            "unexpected refusal: {message:?}"
+        ),
+        other => panic!("expected Response::Error removing the current profile, got {other:?}"),
+    }
+
+    // Removing a profile that does not exist is refused too (Go: `No profile named %q`), rather than
+    // silently reported as a successful removal.
+    match harness
+        .round_trip(r#"{"cmd":"delete_profile","target":"nonesuch"}"#)
+        .await
+    {
+        Response::Error { message } => assert!(
+            message.contains("no profile named"),
+            "unexpected refusal: {message:?}"
+        ),
+        other => panic!("expected Response::Error removing an unknown profile, got {other:?}"),
+    }
+
+    // Switch back to the default profile, then the removal of "work" is accepted.
+    match harness
+        .round_trip(r#"{"cmd":"switch_profile","target":"default"}"#)
+        .await
+    {
+        Response::Ok { message } => assert!(
+            message.contains("switched to profile \"default\""),
+            "unexpected switch-back message: {message:?}"
+        ),
+        other => panic!("expected Response::Ok switching back, got {other:?}"),
+    }
+    match harness
+        .round_trip(r#"{"cmd":"delete_profile","target":"work"}"#)
+        .await
+    {
+        Response::Ok { message } => assert_eq!(message, "removed profile \"work\""),
+        other => panic!("expected Response::Ok removing work, got {other:?}"),
+    }
+
+    // Gone from the listing, and the state dir no longer holds its per-profile directory.
+    match harness.round_trip(r#"{"cmd":"profile_list"}"#).await {
+        Response::Profiles { profiles } => {
+            assert!(
+                !profiles.iter().any(|p| p.id == "work"),
+                "the removed profile must not still be listed"
+            );
+        }
+        other => panic!("expected Response::Profiles, got {other:?}"),
+    }
+    assert!(
+        !tokio::fs::try_exists(harness.state_dir.join("profiles").join("work"))
+            .await
+            .unwrap(),
+        "removing a profile must remove its on-disk prefs/key directory"
+    );
+
+    harness.shutdown_and_verify().await;
+}
