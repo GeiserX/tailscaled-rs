@@ -94,7 +94,9 @@ Closed this migration so far (50 beads). The consumed engine capabilities and sh
   IPN-bus notify stream), `metrics`, `bugreport`, `netcheck` (DERP-latency scope), `dns status`/`query`,
   `syspolicy`, `ip`/`whois`/`ping`, `licenses`.
 - **Connectivity:** exit-node use/advertise + **suggest**, advertise-routes, accept-routes/dns,
-  shields-up, TUN data path (feature `tun`), `--port`/`PORT` listen-port pinning.
+  shields-up, TUN data path (feature `tun`), `--port`/`PORT` listen-port pinning; the carried Go pref
+  flags (`--operator`, `--nickname`, `--report-posture`, `--webclient`, `--auto-update`/
+  `--update-check`, `--advertise-connector`, `--exit-node-allow-lan-access`).
 - **Services:** serve (tcp/https/http/redirect/status/reset), funnel on/off, Taildrop `cp`/`get`/`list`,
   TLS `cert` (feature `acme`), `nc`, `configure kubeconfig` (standalone generation; no merge).
 - **SSH:** Tailscale SSH **server** (feature `ssh`, control-policy authz, privilege drop) + host-key-
@@ -120,7 +122,7 @@ would violate the honest-omission rule). Each rides the next pin bump once its a
 
 | Gap | Bead | Engine ask | Note |
 | --- | --- | --- | --- |
-| ~12 missing `up`/`set` pref flags (`--operator`, `--auto-update`/`--update-check`, `--report-posture`, `--advertise-connector`, `--webclient`, `--exit-node-allow-lan-access`, `--nickname`, Linux subnet-router knobs) | `tsd-1m9` | **#21** | Each needs a `Config`/pref field the engine doesn't carry. The workload-identity slice already shipped. |
+| Linux subnet-router pref flags (`--snat-subnet-routes`, `--stateful-filtering`, `--netfilter-mode`, `--unattended`) | `tsd-1m9` (residual) | **#21** | These four ride the Linux OS-router layer (`tsd-m8s`); the engine has no netfilter/router knob to carry them. The other eight `up`/`set` pref flags (`--operator`, `--auto-update`/`--update-check`, `--report-posture`, `--advertise-connector`, `--webclient`, `--exit-node-allow-lan-access`, `--nickname`) **shipped** — the engine grew every `Config` field they need. |
 | `lock add`/`remove`/`log` (tailnet-lock key-set mutation + AUM log) | `tsd-nee` | **#25** | Engine exposes `tka_{init,sign,disable}` but not `add`/`remove`/`log`. |
 | `lock local-disable` (disable lock for THIS node only) | — | **#27** | `disablement-kdf` already ships daemon-side; `local-disable` needs `Device::tka_local_disable()`. |
 | LocalAPI peer-by-id | `tsd-iqq.15` | — | Needs a numeric NodeID on `StatusNode` (engine surfaces only the stable id). |
@@ -149,7 +151,7 @@ would violate the honest-omission rule). Each rides the next pin bump once its a
 
 | Item | Bead | Note |
 | --- | --- | --- |
-| Publish `tailscaled-rs` to crates.io | `tsd-6y1` | Blocked only by the daemon's own `git`+`rev` engine pin now that `tsd-d6n` is cleared: `cargo publish` rejects a git dependency. |
+| Publish `tailscaled-rs` to crates.io | `tsd-6y1` | Registry metadata and the packaged file set are in place; `cargo package` succeeds once a `version` is present, so the daemon's own `git`+`rev` engine pin is the only remaining objection now that `tsd-d6n` is cleared. Adding a `version` beside the pin would satisfy `cargo publish` but currently misrepresents what we build — no published engine release was cut from the pinned commit (`scripts/check-engine-rev-released.sh`), so the honest unblock is an engine-version change under [`docs/ENGINE.md` §3](ENGINE.md#3-the-engine-on-cratesio). |
 | Get the `tailscale-rs` engine onto crates.io | `tsd-d6n` | **Done upstream** — every `geiserx_*` engine crate in the daemon's resolved graph is published and unyanked at the locked version (`scripts/check-engine-on-crates-io.sh` re-checks it for whatever the pin resolves to). What is left is daemon-side and belongs to `tsd-6y1`: trading the `git`+`rev` pin for a registry `version`, which is an engine-version change rather than a source swap — see [`docs/ENGINE.md` §3](ENGINE.md#3-the-engine-on-cratesio). |
 | `.deb` / `.rpm` packaging (nfpm) + ship the `acme` feature in distributed builds | `tsd-k4a` | On a stock (feature-less) build, `cert`/`serve-https`/`funnel` are inert — distributed builds must enable `acme`. |
 | Homebrew tap | `tsd-0s6` | |

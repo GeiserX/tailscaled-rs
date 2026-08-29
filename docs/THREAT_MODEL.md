@@ -119,6 +119,13 @@ Every LocalAPI connection is authorized by its peer process credentials (`SO_PEE
 A different unprivileged user therefore cannot bring the node up/down or repoint its control plane,
 even if they reach the socket.
 
+**`--operator` does NOT widen this.** `tnet up/set --operator <user>` (Go
+`ipn.Prefs.OperatorUser`) is persisted and reported, and threaded to the engine `Config`, but the
+authorization policy above does not consult it: access is still decided purely from the peer UID.
+Naming an operator therefore grants that user **nothing** today — it records the intent. Consuming it
+(Go's "the operator may drive tailscaled without sudo") widens the write surface to a second UID and
+is deliberately a separate change with its own review, not a side effect of the flag existing.
+
 ### 4.2 The `0700` state/socket directory gates socket reach — adversary (a)
 
 Peer-cred is the *second* layer; the directory is the *first*. A different user typically cannot
