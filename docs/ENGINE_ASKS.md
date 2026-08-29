@@ -982,3 +982,37 @@ pure daemon-side work); (b) unblocks the not-replying warning and a `--verbose`/
 (c) upgrades the pre-send refusal from a post-hoc `taildrop send failed: BadRequest` to Go's specific
 message. None of the three is a blocker for the daemon-buildable half of tsd-52k, which lands without
 a pin bump.
+
+---
+
+## 32. Expose the detected `Hostinfo` — `Device::host_info()` (for `tnet debug hostinfo`)
+
+**Why:** Go's `tailscale debug hostinfo` prints the `Hostinfo` the client advertises to control
+(`hostinfo.New()`, marshalled to JSON). It is one of the first things asked for in a support thread,
+because it is exactly the block control sees: OS + OS version, arch/machine, the advertised client
+version, distro, container/managed-environment detection.
+
+This one is worth stating precisely, because the daemon-side bead (`tsd-b15`) previously recorded it
+as blocked on "netmap fields the engine doesn't surface" — that diagnosis was wrong. The engine
+**already computes the entire struct**: `ts_control::hostinfo::HostInfoData::detect()` is a
+field-by-field mirror of Go's `hostinfo.New()` (`ipn_version`, `os`, `os_version`, `go_arch`,
+`go_version`, `machine`, `distro`/`distro_version`/`distro_code_name`, `container`, `env`), and it is
+what the register + map-poll paths send. The only thing missing is reachability: `ts_control/src/lib.rs`
+declares `mod hostinfo;` (private) and neither `ts_control` nor the `tailscale` facade re-exports
+`HostInfoData`, so a downstream crate cannot name the type — verified against pin `9d847a6e`/v0.43.0.
+
+The daemon deliberately does **not** work around this by re-detecting the host itself. A second,
+independent detector would drift from the engine's, and `debug hostinfo` would then print something
+subtly different from what the node actually sends to control — which is precisely the failure the
+command exists to rule out. A wrong answer here is worse than no answer.
+
+**Ask:** either (a) `pub use hostinfo::HostInfoData;` from `ts_control` (plus `pub mod hostinfo` or a
+facade re-export) so the daemon can call `HostInfoData::detect()`, or — better, because it reports the
+*live* node rather than a fresh detection — (b) `Device::host_info(&self) -> HostInfoData` returning the
+instance the running node is actually advertising. (b) also covers the fields Go fills that are not
+part of `detect()` today (`Hostname`, `Package`/`PACKAGE_TSNET`, `RoutableIPs`, `Services`,
+`SSHHostKeys`), which only the live node knows.
+
+**Daemon impact once landed:** `tnet debug hostinfo` (READ) — with (a) a pure-local print like the
+existing `debug env`/`debug build-info`; with (b) a thin read-only LocalAPI verb. Consumed via a pin
+bump. Tracked in daemon bead tsd-b15. — daemon lane
