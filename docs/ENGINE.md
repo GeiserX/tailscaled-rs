@@ -300,6 +300,20 @@ daemon is built and tested against. Read the flag next to it too: a `"dirty": tr
 tarball was cut from a modified working tree at that commit, so the sha1 is a starting point for
 the comparison rather than proof the contents are identical.
 
+Only one version can possibly match, so that comparison is a script rather than a hunt:
+
+```bash
+scripts/check-engine-rev-released.sh
+```
+
+It reads the pinned `rev` from `Cargo.toml` and the version that pin resolves to from `Cargo.lock`,
+then fetches exactly that release and compares its stamped `sha1`. Checking the single version is
+complete, not a shortcut: a release carries whatever version the manifests held at the commit it
+was cut from, so a release cut from the pinned commit necessarily carries the pinned tree’s own
+version. If that one was cut elsewhere, no other release matches the pin either. Like the
+publication check, the answer decays on every engine bump, which is why it is a command and not a
+sentence here.
+
 ### Trading the `rev` for a version
 
 Because of the above, replacing `git` + `rev` with `version = "…"` is **an engine-version change,
@@ -320,5 +334,15 @@ the `git` specification will be removed from the dependency declaration.
 That unblocks `cargo publish` without changing what this repo builds, because the `git` source
 still wins locally and in CI. It is a real option, but it is not free: everyone who consumes the
 *published* daemon then builds against the crates.io release while our own gate ran against the
-pinned commit. Only take it with a release whose `.cargo_vcs_info.json` sha1 matches the pin, and
-keep the two in lockstep from then on.
+pinned commit. Only take it with a release whose `.cargo_vcs_info.json` sha1 matches the pin — that
+is precisely the `MATCH` verdict from `scripts/check-engine-rev-released.sh` — and keep the two in
+lockstep from then on. While that check reports `MISMATCH`, the shortcut is not available and the
+pin is what blocks publishing the daemon.
+
+### Everything else about publishing is ready
+
+The rest of the crate is publishable today: `cargo package` succeeds with a `version` added, so the
+engine pin is the *only* thing `cargo publish` objects to. `Cargo.toml` carries the registry
+metadata (`readme`, `keywords`, `categories`) and an `exclude` list that keeps repository machinery
+— CI config, release tooling, the local issue tracker under `.beads/` — out of the tarball. When
+the pin question above is resolved, publishing should need no other manifest work.
