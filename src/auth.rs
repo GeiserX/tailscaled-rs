@@ -263,6 +263,10 @@ mod tests {
             accept_dns: None,
             shields_up: None,
             ssh: None,
+            operator: None,
+            exit_node_allow_lan_access: None,
+            advertise_connector: None,
+            report_posture: None,
             reset: false,
             force_reauth: false,
             ephemeral: None,
@@ -284,6 +288,14 @@ mod tests {
             advertise_routes: None,
             advertise_tags: None,
             ssh: None,
+            advertise_connector: None,
+            auto_update: None,
+            update_check: None,
+            operator: None,
+            nickname: None,
+            report_posture: None,
+            webclient: None,
+            exit_node_allow_lan_access: None,
         }
     }
 

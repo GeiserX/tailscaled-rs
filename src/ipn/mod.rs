@@ -700,11 +700,12 @@ pub async fn drive_up(
 ///    live-set atomic under one lock. Only NEW flows use the new values; in-flight connections are
 ///    untouched (no teardown, no reconnect).
 /// 3. **A rebuild-only pref changed, node up** ([`SetAction::Rebuild`]) — `shields_up` (the immutable
-///    `Config.block_incoming`), `ssh` (a device-lifecycle task), or `advertise_tags` (registration-time
-///    `Config.requested_tags`) have no live setter, so the only way to apply them to a running node
-///    is to **rebuild the device** from the now-updated prefs. This reuses the exact
-///    [`begin_up`](Backend::begin_up) → [`build_device`] → [`finish_up`](Backend::finish_up) machinery
-///    as `drive_up` (same off-lock handshake, same generation-supersede guard, same off-lock orphan
+///    `Config.block_incoming`), `ssh` (a device-lifecycle task), `advertise_tags` (registration-time
+///    `Config.requested_tags`), or the wire-advertised `advertise_connector` / `auto_update`
+///    (`Hostinfo` fields re-sent on every map request) have no live setter, so the only way to apply
+///    them to a running node is to **rebuild the device** from the now-updated prefs. This reuses the
+///    exact [`begin_up`](Backend::begin_up) → [`build_device`] → [`finish_up`](Backend::finish_up)
+///    machinery as `drive_up` (same off-lock handshake, same generation-supersede guard, same off-lock orphan
 ///    settle), so it inherits the same lock discipline verbatim. **CAVEAT — this is a brief
 ///    reconnect:** rebuilding tears down the live engine and stands a fresh one up, so the overlay
 ///    drops and re-registers (a short interruption + a new netmap convergence). `set` is honest about
@@ -943,10 +944,18 @@ pub enum SetAction {
     /// order) — a `set --exit-node X` is the common single-op case, but a multi-pref all-live `set`
     /// (e.g. `--hostname h --accept-routes`) issues several. Mirrors Go's `set` = one live
     /// `EditPrefs` (no reconnect).
+    ///
+    /// The `Vec` is EMPTY when the `set` named only CARRIED prefs (`--operator`, `--nickname`,
+    /// `--report-posture`, `--webclient`, `--update-check`, `--exit-node-allow-lan-access`): the
+    /// pinned engine stores those but never acts on or advertises them, so the persist in `begin_set`
+    /// is the whole job even on a running node — there is no setter to issue and no reason to force a
+    /// reconnect. See [`SetOptions::needs_rebuild`] for the full three-way classification.
     Live(Vec<LiveSetOp>),
-    /// At least one changed pref has NO live setter — `shields_up` (maps to the immutable
-    /// `Config.block_incoming`), `ssh` (a device-lifecycle task, not a `Config` knob), or
-    /// `advertise_tags` (registration-time `requested_tags`) — so the engine `Config` must be rebuilt
+    /// At least one changed pref is one the live engine acts on with NO live setter — `shields_up`
+    /// (maps to the immutable `Config.block_incoming`), `ssh` (a device-lifecycle task, not a
+    /// `Config` knob), `advertise_tags` (registration-time `requested_tags`), or the wire-advertised
+    /// `advertise_connector` / `auto_update` (`Hostinfo.AppConnector` / `Hostinfo.AllowsUpdate`, sent
+    /// on every map request from a construction-time field) — so the engine `Config` must be rebuilt
     /// from the updated prefs. The caller ([`drive_set`]) runs the off-lock
     /// `begin_up`/`build_device`/`finish_up` handshake. This is a brief reconnect. (When a `set` mixes
     /// live-applicable and rebuild-only prefs, the whole `set` rebuilds — a rebuild re-applies every
@@ -997,6 +1006,20 @@ pub struct UpOptions {
     pub shields_up: Option<bool>,
     /// Run-SSH-server override (`None` leaves the pref unchanged; `Some(b)` sets it).
     pub ssh: Option<bool>,
+    /// Operator override (Go `tailscale up --operator <user>`; `ipn.Prefs.OperatorUser`). Double
+    /// `Option` on the same pattern as [`exit_node`](Self::exit_node): OUTER `None` = leave the pref
+    /// unchanged, `Some(None)` = clear the operator, `Some(Some(u))` = set it. The CLI maps Go's
+    /// clear-by-empty-string form (`--operator=`) onto `Some(None)`.
+    pub operator: Option<Option<String>>,
+    /// Exit-node-LAN-access override (Go `tailscale up --exit-node-allow-lan-access`). `None`
+    /// unchanged; `Some(b)` sets it.
+    pub exit_node_allow_lan_access: Option<bool>,
+    /// App-connector advertise override (Go `tailscale up --advertise-connector`). `None` unchanged;
+    /// `Some(b)` sets it. Crosses the control wire (`Hostinfo.AppConnector`).
+    pub advertise_connector: Option<bool>,
+    /// Device-posture reporting override (Go `tailscale up --report-posture`). `None` unchanged;
+    /// `Some(b)` sets it.
+    pub report_posture: Option<bool>,
     /// Reset every up-managed pref this command does not mention back to its default before applying
     /// the named overrides (Go `tailscale up --reset`). The one path where `up` is a true wholesale
     /// REPLACE rather than a PATCH; also bypasses the accidental-revert guard (the operator is
@@ -1045,6 +1068,10 @@ impl UpOptions {
             || self.ephemeral.is_some()
             || self.shields_up.is_some()
             || self.ssh.is_some()
+            || self.operator.is_some()
+            || self.exit_node_allow_lan_access.is_some()
+            || self.advertise_connector.is_some()
+            || self.report_posture.is_some()
     }
 }
 
@@ -1056,10 +1083,11 @@ impl UpOptions {
 ///
 /// On a running node, most of these apply **live** (no reconnect, matching Go's `set` = one
 /// `EditPrefs`) via the engine's runtime setters: `exit_node`, `hostname`, `accept_routes`,
-/// `advertise_routes`, `advertise_exit_node`. Only `shields_up` (the immutable
-/// `Config.block_incoming`), `ssh` (a device-lifecycle task), and `advertise_tags` (registration-time
-/// `requested_tags`) have no live setter and take the device-rebuild path (a brief reconnect). See
-/// [`SetOptions::needs_rebuild`] and [`SetAction`].
+/// `advertise_routes`, `advertise_exit_node`. `shields_up` (the immutable `Config.block_incoming`),
+/// `ssh` (a device-lifecycle task), `advertise_tags` (registration-time `requested_tags`) and the two
+/// wire-advertised prefs `advertise_connector` / `auto_update` have no live setter and take the
+/// device-rebuild path (a brief reconnect). The remaining six are CARRIED prefs the engine never acts
+/// on, so they only persist. See [`SetOptions::needs_rebuild`] and [`SetAction`].
 #[derive(Debug, Default, Clone)]
 pub struct SetOptions {
     /// Requested hostname (`None` unchanged). Applied LIVE on a running node via
@@ -1095,6 +1123,33 @@ pub struct SetOptions {
     /// device-rebuild change (the SSH server task is tied to the device lifecycle), so it takes the
     /// [`SetAction::Rebuild`] path on a running node — not the live fast path.
     pub ssh: Option<bool>,
+    /// App-connector advertise (Go `tailscale set --advertise-connector`; `None` unchanged). The
+    /// engine folds this into `Hostinfo.AppConnector` at registration and on every map request, and
+    /// it is a construction-time `Config` field with no runtime setter — so applying it to a running
+    /// node takes the [`SetAction::Rebuild`] path (a brief reconnect), like `shields_up`.
+    pub advertise_connector: Option<bool>,
+    /// Admin-console auto-update opt-in (Go `tailscale set --auto-update`; `None` unchanged). Like
+    /// `advertise_connector` it reaches control (`Hostinfo.AllowsUpdate`) from a construction-time
+    /// `Config` field, so it is a [`SetAction::Rebuild`] pref on a running node.
+    pub auto_update: Option<bool>,
+    /// Background update-check opt-in (Go `tailscale set --update-check`; `None` unchanged). A
+    /// CARRIED pref — nothing reads it at runtime — so it needs no engine reconcile.
+    pub update_check: Option<bool>,
+    /// Operator user (Go `tailscale set --operator`). Double `Option`: `None` unchanged,
+    /// `Some(None)` clears, `Some(Some(u))` sets. A CARRIED pref — no engine reconcile.
+    pub operator: Option<Option<String>>,
+    /// Login-profile nickname (Go `tailscale set --nickname`). Double `Option`: `None` unchanged,
+    /// `Some(None)` clears, `Some(Some(n))` sets. A CARRIED pref — no engine reconcile.
+    pub nickname: Option<Option<String>>,
+    /// Device-posture reporting (Go `tailscale set --report-posture`; `None` unchanged). A CARRIED
+    /// pref — no engine reconcile.
+    pub report_posture: Option<bool>,
+    /// Local web client (Go `tailscale set --webclient`; `None` unchanged). A CARRIED pref — no
+    /// engine reconcile (this daemon starts no web server).
+    pub webclient: Option<bool>,
+    /// LAN access for peers using this node as an exit node (Go `tailscale set
+    /// --exit-node-allow-lan-access`; `None` unchanged). A CARRIED pref — no engine reconcile.
+    pub exit_node_allow_lan_access: Option<bool>,
 }
 
 impl SetOptions {
@@ -1109,14 +1164,38 @@ impl SetOptions {
             && self.advertise_routes.is_none()
             && self.advertise_tags.is_none()
             && self.ssh.is_none()
+            && self.advertise_connector.is_none()
+            && self.auto_update.is_none()
+            && self.update_check.is_none()
+            && self.operator.is_none()
+            && self.nickname.is_none()
+            && self.report_posture.is_none()
+            && self.webclient.is_none()
+            && self.exit_node_allow_lan_access.is_none()
     }
 
     /// Whether applying this `set` on a **running** node requires a device REBUILD (a brief
-    /// reconnect) — true IFF it names any pref with no live engine setter: `shields_up` (the
-    /// immutable `Config.block_incoming`), `ssh` (a device-lifecycle task, not a `Config` knob), or
-    /// `advertise_tags` (registration-time `Config.requested_tags`). The other five fields — `exit_node`,
-    /// `hostname`, `accept_routes`, `advertise_routes`, `advertise_exit_node` — each have an in-place
-    /// engine setter (v0.28.2), so a `set` naming ONLY those applies live with no reconnect.
+    /// reconnect) — true IFF it names a pref that the live engine ACTS on but offers no setter for:
+    /// `shields_up` (the immutable `Config.block_incoming`), `ssh` (a device-lifecycle task, not a
+    /// `Config` knob), `advertise_tags` (registration-time `Config.requested_tags`), and the two
+    /// wire-advertised prefs `advertise_connector` / `auto_update` (construction-time `Config` fields
+    /// the engine folds into `Hostinfo.AppConnector` / `Hostinfo.AllowsUpdate` on every map request —
+    /// so a running node keeps advertising the OLD value until the device is rebuilt).
+    ///
+    /// Three groups, and every `SetOptions` field is in exactly one:
+    ///
+    /// - **LIVE** — `exit_node`, `hostname`, `accept_routes`, `accept_dns`, `advertise_routes`,
+    ///   `advertise_exit_node`: each has an in-place engine setter, so naming only these applies with
+    ///   no reconnect.
+    /// - **REBUILD** — the five listed above.
+    /// - **CARRIED** — `update_check`, `operator`, `nickname`, `report_posture`, `webclient`,
+    ///   `exit_node_allow_lan_access`: the pinned engine stores these and never acts on or sends them
+    ///   (its own `Config` field docs say so), so a live device holding the old copy behaves
+    ///   identically to one holding the new one. There is nothing to reconcile — forcing a reconnect
+    ///   for them would be a user-visible outage in exchange for no behavior change — so they neither
+    ///   rebuild nor issue a live setter. The persisted pref is the source of truth and the next
+    ///   device built (any `up`/rebuild/restart) picks it up. A `set` naming ONLY carried prefs on a
+    ///   running node therefore yields `SetAction::Live` with an EMPTY op list.
     ///
     /// The mixed-change rule: if a single `set` touches BOTH a live-applicable pref and a
     /// rebuild-only one, the whole `set` rebuilds (this returns `true`). A rebuild re-applies every
@@ -1127,7 +1206,11 @@ impl SetOptions {
     ///
     /// (`accept_dns` is a live field too — `Device::set_accept_dns` — so it is NOT listed here.)
     pub fn needs_rebuild(&self) -> bool {
-        self.shields_up.is_some() || self.ssh.is_some() || self.advertise_tags.is_some()
+        self.shields_up.is_some()
+            || self.ssh.is_some()
+            || self.advertise_tags.is_some()
+            || self.advertise_connector.is_some()
+            || self.auto_update.is_some()
     }
 }
 
@@ -1724,8 +1807,9 @@ impl Backend {
     ///   messages are awaited under the lock; the device's `Arc` could in principle be cloned to hoist
     ///   them off-lock, but they are quick mailbox round-trips (not the multi-second registration
     ///   handshake), so we keep them atomic with the prefs-apply under the one brief lock.
-    /// - **Device up AND a rebuild-only pref changed** (`shields_up` / `ssh` / `advertise_tags`, which
-    ///   have no live setter) → [`SetAction::Rebuild`]: the caller must rebuild the device from the
+    /// - **Device up AND a rebuild-only pref changed** (`shields_up` / `ssh` / `advertise_tags` /
+    ///   `advertise_connector` / `auto_update`, which have no live setter) → [`SetAction::Rebuild`]:
+    ///   the caller must rebuild the device from the
     ///   updated prefs (the engine `Config` is immutable). A brief reconnect. A `set` mixing live and
     ///   rebuild-only prefs rebuilds wholesale (the rebuild re-applies the live ones too).
     ///
@@ -1750,6 +1834,11 @@ impl Backend {
         let opts_shields_up_named = opts.shields_up.is_some();
         let opts_ssh_named = opts.ssh.is_some();
         let opts_advertise_tags_named = opts.advertise_tags.is_some();
+        // The two WIRE-advertised prefs: also rebuild-forcing (the engine sends them from a
+        // construction-time Config field on every map request, so a running node would keep
+        // advertising the old value otherwise).
+        let opts_advertise_connector_named = opts.advertise_connector.is_some();
+        let opts_auto_update_named = opts.auto_update.is_some();
 
         // PRE-VALIDATE the advertised CIDRs BEFORE mutating/persisting prefs. `build_config` is the
         // final authority (it re-parses the same way; see its `advertise_routes` block), but it only
@@ -1814,6 +1903,35 @@ impl Backend {
         if let Some(ssh) = opts.ssh {
             self.prefs.ssh_enabled = ssh;
         }
+        // The eight Go `set` pref flags this fork gained with the engine fields that carry them
+        // (`tsd-1m9`). Same "unchanged unless named" sentinel throughout; `operator`/`nickname` are
+        // double `Option`s (`Some(None)` clears, mirroring Go's `--operator=` / `--nickname=`).
+        // WIRE-advertised (rebuild-forcing, see `needs_rebuild`):
+        if let Some(v) = opts.advertise_connector {
+            self.prefs.advertise_app_connector = v;
+        }
+        if let Some(v) = opts.auto_update {
+            self.prefs.auto_update_apply = Some(v);
+        }
+        // CARRIED (persist-only — the engine stores but never acts on or sends these):
+        if let Some(v) = opts.update_check {
+            self.prefs.auto_update_check = v;
+        }
+        if let Some(op) = opts.operator {
+            self.prefs.operator_user = op;
+        }
+        if let Some(nick) = opts.nickname {
+            self.prefs.node_nickname = nick;
+        }
+        if let Some(v) = opts.report_posture {
+            self.prefs.posture_checking = v;
+        }
+        if let Some(v) = opts.webclient {
+            self.prefs.run_web_client = v;
+        }
+        if let Some(v) = opts.exit_node_allow_lan_access {
+            self.prefs.exit_node_allow_lan_access = v;
+        }
         // `set` is a policy-pref mutation, not a lifecycle change: deliberately do NOT touch
         // `want_running` / `logged_out` (that is `up`/`down`'s job). It still marks the node as
         // configured-at-least-once (a `set` on a never-touched node has now written prefs), matching
@@ -1831,8 +1949,9 @@ impl Backend {
                 );
                 Ok(SetAction::PersistedOnly)
             }
-            // A rebuild-only pref (shields_up / ssh / advertise_tags — no live setter) changed on a
-            // running node: the engine Config is immutable, so the caller must rebuild the device
+            // A rebuild-only pref (shields_up / ssh / advertise_tags / advertise_connector /
+            // auto_update — no live setter) changed on a running node: the engine Config is
+            // immutable, so the caller must rebuild the device
             // from the updated prefs (a brief reconnect). A `set` that ALSO named live-applicable
             // prefs still rebuilds wholesale — the rebuild re-applies them from the persisted prefs.
             Some(_) if needs_rebuild => {
@@ -1843,6 +1962,8 @@ impl Backend {
                     shields_up = opts_shields_up_named,
                     ssh = opts_ssh_named,
                     advertise_tags = opts_advertise_tags_named,
+                    advertise_connector = opts_advertise_connector_named,
+                    auto_update = opts_auto_update_named,
                     "set: reconcile decided (rebuild-only pref changed on a running node → brief reconnect)"
                 );
                 Ok(SetAction::Rebuild)
@@ -2113,6 +2234,30 @@ impl Backend {
         // preflights the feature/root requirements so an impossible `--ssh` fails the bring-up loudly.
         if let Some(ssh) = opts.ssh {
             self.prefs.ssh_enabled = ssh;
+        }
+        // The four Go pref flags `up` shares with `set` (up.go `newUpFlagSet`). Same
+        // "unchanged unless named" sentinel; `operator` is the double `Option` (`Some(None)` clears,
+        // mirroring Go's `--operator=`).
+        //
+        // OPERATOR, vs Go's `applyImplicitPrefs`: Go re-carries an `OperatorUser` that equals the
+        // invoking `$USER` across an `up` that did not mention `--operator`, so its REPLACE semantics
+        // cannot lock you out of your own daemon. This PATCH merge needs no such carve-out on the
+        // ordinary path — an unmentioned pref is simply never touched — and on `--reset` (the one
+        // genuine replace) we deliberately DO clear it, because the daemon has no notion of the
+        // invoking user at this layer and, today, `operator_user` gates nothing: the LocalAPI write
+        // policy is still root/same-euid. Whoever wires the operator authorization matrix must
+        // revisit this together with Go's carve-out.
+        if let Some(op) = opts.operator {
+            self.prefs.operator_user = op;
+        }
+        if let Some(v) = opts.exit_node_allow_lan_access {
+            self.prefs.exit_node_allow_lan_access = v;
+        }
+        if let Some(v) = opts.advertise_connector {
+            self.prefs.advertise_app_connector = v;
+        }
+        if let Some(v) = opts.report_posture {
+            self.prefs.posture_checking = v;
         }
         self.prefs.want_running = true;
         self.prefs.logged_out = false;
@@ -2825,6 +2970,14 @@ impl Backend {
             accept_dns: self.prefs.accept_dns,
             shields_up: self.prefs.shields_up,
             ssh: self.prefs.ssh_enabled,
+            advertise_connector: self.prefs.advertise_app_connector,
+            auto_update: self.prefs.auto_update_apply,
+            update_check: self.prefs.auto_update_check,
+            operator: self.prefs.operator_user.clone(),
+            nickname: self.prefs.node_nickname.clone(),
+            report_posture: self.prefs.posture_checking,
+            webclient: self.prefs.run_web_client,
+            exit_node_allow_lan_access: self.prefs.exit_node_allow_lan_access,
             // SSH *liveness*, distinct from the `ssh_enabled` pref above: the server task is spawned
             // in `finish_up` and can die at bind time (no tailnet IPv4, `listen_ssh` error). Report
             // it as running only when we hold a task handle that has not finished —
@@ -5254,6 +5407,55 @@ mod tests {
             "accept_routes + advertise_tags → rebuild (tags force it)"
         );
 
+        // The two WIRE-advertised prefs alone → rebuild: the engine sends them from a
+        // construction-time Config field on every map request, so a live node would otherwise keep
+        // advertising the old value until the next restart (the silent persists-without-effect trap).
+        assert!(
+            SetOptions {
+                advertise_connector: Some(true),
+                ..SetOptions::default()
+            }
+            .needs_rebuild(),
+            "advertise_connector reaches Hostinfo.AppConnector from an immutable Config → rebuild"
+        );
+        assert!(
+            SetOptions {
+                auto_update: Some(true),
+                ..SetOptions::default()
+            }
+            .needs_rebuild(),
+            "auto_update reaches Hostinfo.AllowsUpdate from an immutable Config → rebuild"
+        );
+
+        // The six CARRIED prefs alone → NO rebuild: the pinned engine stores each and never acts on
+        // or advertises it, so the persisted pref is the whole change and a reconnect would buy
+        // nothing. Naming one must still make the request non-empty (the server would otherwise
+        // reject it as "no preferences specified").
+        type CarriedCase = (&'static str, fn(&mut SetOptions));
+        let carried: Vec<CarriedCase> = vec![
+            ("update_check", |o| o.update_check = Some(false)),
+            ("operator", |o| o.operator = Some(Some("alice".into()))),
+            ("nickname", |o| o.nickname = Some(Some("laptop".into()))),
+            ("report_posture", |o| o.report_posture = Some(true)),
+            ("webclient", |o| o.webclient = Some(true)),
+            ("exit_node_allow_lan_access", |o| {
+                o.exit_node_allow_lan_access = Some(true)
+            }),
+        ];
+        for (name, apply) in &carried {
+            let mut opts = SetOptions::default();
+            apply(&mut opts);
+            assert!(
+                !opts.is_empty(),
+                "{name}: a named set must not be is_empty()"
+            );
+            assert!(
+                !opts.needs_rebuild(),
+                "{name} is a CARRIED pref (the engine never acts on or sends it) — it must NOT force \
+                 a reconnect"
+            );
+        }
+
         // An empty set names no rebuild-only pref → needs_rebuild is false (the server rejects an
         // empty set earlier via is_empty; needs_rebuild is only consulted for a non-empty, device-up
         // set).
@@ -5268,8 +5470,10 @@ mod tests {
         // Structural drift tripwire — the `SetOptions` analogue of the `Prefs`/`UpOptions` lockstep
         // tests in `revert_guard`. EXHAUSTIVELY destructure `SetOptions` with NO `..`, so adding a
         // field is a COMPILE error until it is consciously classified LIVE (an in-place engine setter
-        // is called in `begin_set`, so a `set` naming only it applies with no reconnect) or REBUILD
-        // (no live setter → `needs_rebuild()` must return true so the device is rebuilt). Without this,
+        // is called in `begin_set`, so a `set` naming only it applies with no reconnect), REBUILD
+        // (the engine acts on it but has no live setter → `needs_rebuild()` must return true so the
+        // device is rebuilt), or CARRIED (the engine stores it and never acts on or sends it, so
+        // there is nothing to reconcile — neither a setter nor a rebuild). Without this,
         // a new field defaults to the Live path and SILENTLY persists-without-effect on a running node
         // until the next restart — the exact exit_node/has_logged_in/funnel bug-class this repo has
         // been burned by. The runtime half below proves each field's classification actually holds.
@@ -5281,10 +5485,25 @@ mod tests {
             exit_node: _,
             advertise_exit_node: _,
             advertise_routes: _,
-            // --- REBUILD (no live setter → MUST be in needs_rebuild()) ---
+            // --- REBUILD (the engine ACTS on it with no live setter → MUST be in needs_rebuild()) ---
             shields_up: _,
             advertise_tags: _,
             ssh: _,
+            // `advertise_connector`/`auto_update` reach control from a construction-time `Config`
+            // field (`Hostinfo.AppConnector` / `Hostinfo.AllowsUpdate`, re-sent on every map
+            // request), so a running node keeps advertising the OLD value until it is rebuilt.
+            advertise_connector: _,
+            auto_update: _,
+            // --- CARRIED (the pinned engine stores it but never acts on or sends it, so a live
+            //     device holding the stale copy is indistinguishable from one holding the new value:
+            //     nothing to reconcile, and forcing a reconnect would be an outage for no behavior
+            //     change. needs_rebuild() must stay FALSE and no live setter is issued.) ---
+            update_check: _,
+            operator: _,
+            nickname: _,
+            report_posture: _,
+            webclient: _,
+            exit_node_allow_lan_access: _,
         } = SetOptions::default();
 
         // Runtime half: a `set` naming ONLY a LIVE field must NOT need a rebuild; naming ONLY a
@@ -5309,6 +5528,23 @@ mod tests {
                 o.advertise_tags = Some(vec!["tag:server".into()])
             }),
             ("ssh", true, |o| o.ssh = Some(true)),
+            ("advertise_connector", true, |o| {
+                o.advertise_connector = Some(true)
+            }),
+            ("auto_update", true, |o| o.auto_update = Some(true)),
+            // CARRIED: naming one makes the request non-empty, but there is nothing to reconcile.
+            ("update_check", false, |o| o.update_check = Some(false)),
+            ("operator", false, |o| {
+                o.operator = Some(Some("alice".into()))
+            }),
+            ("nickname", false, |o| {
+                o.nickname = Some(Some("laptop".into()))
+            }),
+            ("report_posture", false, |o| o.report_posture = Some(true)),
+            ("webclient", false, |o| o.webclient = Some(true)),
+            ("exit_node_allow_lan_access", false, |o| {
+                o.exit_node_allow_lan_access = Some(true)
+            }),
         ];
         for (name, expect_rebuild, set_only) in &cases {
             let mut opts = SetOptions::default();
@@ -5389,6 +5625,171 @@ mod tests {
         assert!(be.prefs.advertise_exit_node);
         assert_eq!(be.prefs.advertise_routes, vec!["10.0.0.0/8".to_string()]);
         assert_eq!(be.prefs.hostname.as_deref(), Some("baseline-host"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn begin_up_applies_the_four_shared_go_pref_flags() {
+        // Go registers `--operator`, `--exit-node-allow-lan-access`, `--advertise-connector` and
+        // `--report-posture` on `up` as well as `set` (`up.go` `newUpFlagSet`). Drive them through
+        // `begin_up` (offline — no engine handshake happens until `build_device`) and pin: each named
+        // flag lands on its own pref, a following BARE `up` leaves them alone (the PATCH merge), and
+        // `--operator=` clears.
+        let dir = std::env::temp_dir().join(format!("tailnetd-up-goflags-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+
+        be.begin_up(
+            UpOptions {
+                operator: Some(Some("alice".to_string())),
+                exit_node_allow_lan_access: Some(true),
+                advertise_connector: Some(true),
+                report_posture: Some(true),
+                ..UpOptions::default()
+            },
+            None,
+        )
+        .await
+        .expect("begin_up");
+        assert_eq!(be.prefs.operator_user.as_deref(), Some("alice"));
+        assert!(be.prefs.exit_node_allow_lan_access);
+        assert!(be.prefs.advertise_app_connector);
+        assert!(be.prefs.posture_checking);
+
+        // A bare `up` must not revert any of them (this daemon's `up` is a PATCH merge; the
+        // accidental-revert guard, not a silent default, is what enforces Go's REPLACE contract).
+        be.begin_up(UpOptions::default(), None)
+            .await
+            .expect("bare begin_up");
+        assert_eq!(be.prefs.operator_user.as_deref(), Some("alice"));
+        assert!(be.prefs.exit_node_allow_lan_access);
+        assert!(be.prefs.advertise_app_connector);
+        assert!(be.prefs.posture_checking);
+
+        // `--operator=` (the empty-value form Go clears with) removes the operator.
+        be.begin_up(
+            UpOptions {
+                operator: Some(None),
+                ..UpOptions::default()
+            },
+            None,
+        )
+        .await
+        .expect("begin_up clear");
+        assert_eq!(be.prefs.operator_user, None);
+
+        // `up --reset` resets the four `up`-managed flags but must NOT touch the four Go registers on
+        // `set` only — an `up` has no flag that could mention them.
+        be.prefs.advertise_app_connector = true;
+        be.prefs.posture_checking = true;
+        be.prefs.node_nickname = Some("laptop".to_string());
+        be.prefs.run_web_client = true;
+        be.prefs.auto_update_apply = Some(true);
+        be.begin_up(
+            UpOptions {
+                reset: true,
+                ..UpOptions::default()
+            },
+            None,
+        )
+        .await
+        .expect("begin_up --reset");
+        assert!(!be.prefs.advertise_app_connector, "--reset clears up flags");
+        assert!(!be.prefs.posture_checking);
+        assert_eq!(
+            be.prefs.node_nickname.as_deref(),
+            Some("laptop"),
+            "--reset must not clear a `set`-only pref"
+        );
+        assert!(be.prefs.run_web_client);
+        assert_eq!(be.prefs.auto_update_apply, Some(true));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn begin_set_applies_the_go_parity_pref_flags() {
+        // The eight Go `set` pref flags added alongside their engine `Config` fields, end to end
+        // through `begin_set`: each named flag lands on its OWN pref, an unnamed one is untouched,
+        // and the two string prefs CLEAR (`Some(None)`) distinctly from unchanged (`None`).
+        let dir = std::env::temp_dir().join(format!("tailnetd-set-goflags-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+        // A baseline unnamed pref that must survive untouched.
+        be.prefs.hostname = Some("baseline-host".to_string());
+
+        be.begin_set(SetOptions {
+            advertise_connector: Some(true),
+            auto_update: Some(true),
+            update_check: Some(false),
+            operator: Some(Some("alice".to_string())),
+            nickname: Some(Some("laptop".to_string())),
+            report_posture: Some(true),
+            webclient: Some(true),
+            exit_node_allow_lan_access: Some(true),
+            ..SetOptions::default()
+        })
+        .await
+        .expect("begin_set");
+
+        assert!(be.prefs.advertise_app_connector);
+        assert_eq!(be.prefs.auto_update_apply, Some(true));
+        assert!(!be.prefs.auto_update_check);
+        assert_eq!(be.prefs.operator_user.as_deref(), Some("alice"));
+        assert_eq!(be.prefs.node_nickname.as_deref(), Some("laptop"));
+        assert!(be.prefs.posture_checking);
+        assert!(be.prefs.run_web_client);
+        assert!(be.prefs.exit_node_allow_lan_access);
+        assert_eq!(
+            be.prefs.hostname.as_deref(),
+            Some("baseline-host"),
+            "an unnamed pref must be left untouched"
+        );
+
+        // `--no-auto-update` is an explicit DECLINE, distinct from never having stated one.
+        be.begin_set(SetOptions {
+            auto_update: Some(false),
+            ..SetOptions::default()
+        })
+        .await
+        .expect("begin_set");
+        assert_eq!(be.prefs.auto_update_apply, Some(false));
+
+        // A no-op `set` leaves every one of them alone (the "unchanged" sentinel).
+        be.begin_set(SetOptions {
+            hostname: Some("other-host".to_string()),
+            ..SetOptions::default()
+        })
+        .await
+        .expect("begin_set");
+        assert_eq!(be.prefs.operator_user.as_deref(), Some("alice"));
+        assert_eq!(be.prefs.node_nickname.as_deref(), Some("laptop"));
+        assert!(be.prefs.advertise_app_connector);
+        assert_eq!(be.prefs.auto_update_apply, Some(false));
+
+        // CLEAR: `--operator=` / `--nickname=` remove the value (Go's empty-value form).
+        be.begin_set(SetOptions {
+            operator: Some(None),
+            nickname: Some(None),
+            ..SetOptions::default()
+        })
+        .await
+        .expect("begin_set");
+        assert_eq!(be.prefs.operator_user, None);
+        assert_eq!(be.prefs.node_nickname, None);
+
+        // The persist actually reached disk (a `set` is durable, not in-memory only).
+        let persisted = Prefs::load(&be.prefs_path).await.expect("load prefs");
+        assert!(persisted.advertise_app_connector);
+        assert_eq!(persisted.auto_update_apply, Some(false));
+        assert!(!persisted.auto_update_check);
+        assert_eq!(persisted.operator_user, None);
+        assert!(persisted.posture_checking);
+        assert!(persisted.run_web_client);
+        assert!(persisted.exit_node_allow_lan_access);
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
