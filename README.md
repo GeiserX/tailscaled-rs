@@ -110,9 +110,13 @@ session you could lock yourself out of.
 
 `tnet set` (Go `tailscale set`) adjusts policy prefs on an already-running node. Changing
 `--exit-node`, `--hostname`, `--accept-routes`, `--advertise-routes`, or `--advertise-exit-node`
-applies **live** — in place, with no reconnect (matching Go's `set`). Only `--shields-up`, `--ssh`,
-and `--advertise-tags` briefly rebuild the connection (they have no in-place engine setter). `set`
-never re-authenticates and never changes whether the node is up or down.
+applies **live** — in place, with no reconnect (matching Go's `set`). `--shields-up`, `--ssh`,
+`--advertise-tags`, `--advertise-connector` and `--auto-update` briefly rebuild the connection (they
+have no in-place engine setter, and the last two are re-advertised to control on every map request).
+`--operator`, `--nickname`, `--report-posture`, `--webclient`, `--update-check` and
+`--exit-node-allow-lan-access` are **carried prefs**: they are persisted and reported (`tnet get`),
+but nothing in this build acts on them yet — each flag's `--help` says exactly what it does and does
+not do. `set` never re-authenticates and never changes whether the node is up or down.
 
 State (node keys + prefs) lives in `$XDG_STATE_HOME/tailnetd` (override with `TAILNETD_STATE_DIR`);
 the control socket is `<state-dir>/tailnetd.sock` (override with `TAILNETD_SOCKET`).

@@ -635,7 +635,32 @@ it lands, the daemon adds `--wait` (await the first non-empty signal, then drain
 (drain on every signal) to `tnet file get`, consumed via a pin bump. No rush — recorded so the gap is
 not forgotten; the drain itself is already faithful without it. — daemon lane
 
-## 21. Engine `Config` fields for the ~12 missing Go `up`/`set` pref flags
+## 21. ✅ MOSTLY SHIPPED — Engine `Config` fields for the missing Go `up`/`set` pref flags
+
+> ✅ **SHIPPED at the current pin (`9d847a6`, engine v0.43.0)** for eight of the flags below, and the
+> daemon wired them in `tsd-1m9`: `--operator` (`Config.operator_user`), `--nickname`
+> (`node_nickname`), `--report-posture` (`posture_checking`), `--advertise-connector`
+> (`advertise_app_connector`), `--webclient` (`run_web_client`), `--exit-node-allow-lan-access`
+> (`exit_node_allow_lan_access`), `--auto-update` (`auto_update_apply`, an `Option<bool>` mirroring
+> Go's `opt.Bool`) and `--update-check` (`auto_update_check`). Each is threaded on to
+> `ts_control::Config`. Two of them genuinely reach control — the engine folds
+> `advertise_app_connector` into `Hostinfo.AppConnector` and `auto_update_apply == Some(true)` into
+> `Hostinfo.AllowsUpdate`, at registration and on every map request — so `tnet set` rebuilds the
+> device for those two (they are construction-time fields with no runtime setter). The other six are
+> CARRIED prefs: the engine stores them and never acts on or sends them, and the daemon does not act
+> on them either yet, so `tnet set` only persists them (no reconnect). Each flag's `tnet` help and
+> `Prefs` doc says exactly what is and is not implemented.
+>
+> **Still open:** the Linux subnet-router knobs at the end of the ask list (`--snat-subnet-routes`,
+> `--stateful-filtering`, `--netfilter-mode`, `--unattended`), which need the engine's router/netfilter
+> layer and ride the Linux OS-router work (`tsd-m8s`). The original ask is kept below for that
+> residue and as the record of what was requested.
+>
+> **Follow-ups the daemon still owes (each its own bead, none required for the flags to be faithful):**
+> consuming `operator_user` in the LocalAPI authorization matrix (today it is recorded, and the write
+> policy is still root/same-euid — THREAT_MODEL already scopes this as a later phase); and unifying
+> `node_nickname` with the per-profile display name in `profiles.json` that `tnet switch --list`
+> shows, which Go drives from the same `Prefs.ProfileName`.
 
 **Why:** Go's `tailscale up`/`set` (v1.100.0 `up.go:99-148`, `set.go:76-122`) expose ~15 pref flags;
 this fork's `up`/`set` faithfully cover the ten that map to existing engine `Config` fields
@@ -957,3 +982,37 @@ pure daemon-side work); (b) unblocks the not-replying warning and a `--verbose`/
 (c) upgrades the pre-send refusal from a post-hoc `taildrop send failed: BadRequest` to Go's specific
 message. None of the three is a blocker for the daemon-buildable half of tsd-52k, which lands without
 a pin bump.
+
+---
+
+## 32. Expose the detected `Hostinfo` — `Device::host_info()` (for `tnet debug hostinfo`)
+
+**Why:** Go's `tailscale debug hostinfo` prints the `Hostinfo` the client advertises to control
+(`hostinfo.New()`, marshalled to JSON). It is one of the first things asked for in a support thread,
+because it is exactly the block control sees: OS + OS version, arch/machine, the advertised client
+version, distro, container/managed-environment detection.
+
+This one is worth stating precisely, because the daemon-side bead (`tsd-b15`) previously recorded it
+as blocked on "netmap fields the engine doesn't surface" — that diagnosis was wrong. The engine
+**already computes the entire struct**: `ts_control::hostinfo::HostInfoData::detect()` is a
+field-by-field mirror of Go's `hostinfo.New()` (`ipn_version`, `os`, `os_version`, `go_arch`,
+`go_version`, `machine`, `distro`/`distro_version`/`distro_code_name`, `container`, `env`), and it is
+what the register + map-poll paths send. The only thing missing is reachability: `ts_control/src/lib.rs`
+declares `mod hostinfo;` (private) and neither `ts_control` nor the `tailscale` facade re-exports
+`HostInfoData`, so a downstream crate cannot name the type — verified against pin `9d847a6e`/v0.43.0.
+
+The daemon deliberately does **not** work around this by re-detecting the host itself. A second,
+independent detector would drift from the engine's, and `debug hostinfo` would then print something
+subtly different from what the node actually sends to control — which is precisely the failure the
+command exists to rule out. A wrong answer here is worse than no answer.
+
+**Ask:** either (a) `pub use hostinfo::HostInfoData;` from `ts_control` (plus `pub mod hostinfo` or a
+facade re-export) so the daemon can call `HostInfoData::detect()`, or — better, because it reports the
+*live* node rather than a fresh detection — (b) `Device::host_info(&self) -> HostInfoData` returning the
+instance the running node is actually advertising. (b) also covers the fields Go fills that are not
+part of `detect()` today (`Hostname`, `Package`/`PACKAGE_TSNET`, `RoutableIPs`, `Services`,
+`SSHHostKeys`), which only the live node knows.
+
+**Daemon impact once landed:** `tnet debug hostinfo` (READ) — with (a) a pure-local print like the
+existing `debug env`/`debug build-info`; with (b) a thin read-only LocalAPI verb. Consumed via a pin
+bump. Tracked in daemon bead tsd-b15. — daemon lane

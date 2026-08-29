@@ -57,19 +57,77 @@ const SYSTEM_STATE_DIR: &str = "/var/lib/tailnetd";
 /// The root branch is the fix for the otherwise-silent split where `tailnetd` (env-configured to
 /// `/var/lib/tailnetd`) and a bare `sudo tnet status` (which has no env) looked in different places.
 pub fn state_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("TAILNETD_STATE_DIR") {
-        return PathBuf::from(dir);
+    state_dir_with_source().0
+}
+
+/// Which rule in [`state_dir`]'s cascade produced the path.
+///
+/// The cascade itself is invisible in the resulting path, which makes the classic failure — the root
+/// daemon and an unprivileged `tnet` silently resolving *different* state dirs, and so different
+/// sockets — hard to see. Reporting the winning rule alongside the path turns that into one readable
+/// line (`tnet debug statedir`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateDirSource {
+    /// `TAILNETD_STATE_DIR` was set: the explicit override, which beats every other rule.
+    Env,
+    /// No override and the process is root, so the fixed system path the packaged systemd/launchd
+    /// service uses ([`SYSTEM_STATE_DIR`]) — this is what makes `sudo tnet …` agree with the daemon.
+    SystemRoot,
+    /// `$XDG_STATE_HOME/tailnetd`.
+    XdgStateHome,
+    /// `$HOME/.local/state/tailnetd` (no `XDG_STATE_HOME`).
+    Home,
+    /// Neither `XDG_STATE_HOME` nor `HOME` is set — the last-resort `/tmp/tailnetd`.
+    Tmp,
+}
+
+impl StateDirSource {
+    /// A one-line human explanation of the winning rule, for `tnet debug statedir`.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Env => "$TAILNETD_STATE_DIR (explicit override)",
+            Self::SystemRoot => "running as root, so the packaged system state dir",
+            Self::XdgStateHome => "$XDG_STATE_HOME/tailnetd",
+            Self::Home => "$HOME/.local/state/tailnetd",
+            Self::Tmp => "no $XDG_STATE_HOME and no $HOME, so the /tmp fallback",
+        }
     }
-    // Root → the fixed system path the packaged service uses. SAFETY: geteuid() is infallible.
+}
+
+/// [`state_dir`], plus which rule produced it. `state_dir()` is the path-only shim over this, so
+/// there is exactly one copy of the cascade.
+pub fn state_dir_with_source() -> (PathBuf, StateDirSource) {
+    // SAFETY: geteuid() is infallible. Off unix there is no root branch (as before).
     #[cfg(unix)]
-    if unsafe { libc::geteuid() } == 0 {
-        return PathBuf::from(SYSTEM_STATE_DIR);
+    let is_root = unsafe { libc::geteuid() } == 0;
+    #[cfg(not(unix))]
+    let is_root = false;
+    state_dir_from(|name| std::env::var_os(name), is_root)
+}
+
+/// The pure core of [`state_dir_with_source`]: the cascade against an arbitrary environment lookup
+/// `get` (`name -> Option<value>`) and an explicit `is_root`, so it is unit-testable without mutating
+/// the process-global environment (`std::env::set_var` is `unsafe` and races the parallel test
+/// harness — the same reason `socket_path_in`'s test avoids it).
+fn state_dir_from(
+    get: impl Fn(&str) -> Option<std::ffi::OsString>,
+    is_root: bool,
+) -> (PathBuf, StateDirSource) {
+    if let Some(dir) = get("TAILNETD_STATE_DIR") {
+        return (PathBuf::from(dir), StateDirSource::Env);
     }
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    base.join("tailnetd")
+    // Root → the fixed system path the packaged service uses.
+    if is_root {
+        return (PathBuf::from(SYSTEM_STATE_DIR), StateDirSource::SystemRoot);
+    }
+    let (base, source) = match get("XDG_STATE_HOME") {
+        Some(x) => (PathBuf::from(x), StateDirSource::XdgStateHome),
+        None => match get("HOME") {
+            Some(h) => (PathBuf::from(h).join(".local/state"), StateDirSource::Home),
+            None => (PathBuf::from("/tmp"), StateDirSource::Tmp),
+        },
+    };
+    (base.join("tailnetd"), source)
 }
 
 /// Path to the LocalAPI Unix domain socket.
@@ -200,5 +258,78 @@ mod tests {
             let dir = std::path::Path::new("/var/lib/tailnetd-explicit");
             assert_eq!(socket_path_in(dir), dir.join("tailnetd.sock"));
         }
+    }
+
+    /// Build an env lookup over a fixed table, so the cascade is exercised without touching (and
+    /// racing on) the real process environment.
+    fn fake_env(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> + use<> {
+        let table: Vec<(String, String)> = vars
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        move |name: &str| {
+            table
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| std::ffi::OsString::from(v))
+        }
+    }
+
+    #[test]
+    fn state_dir_env_override_wins_over_root_and_home() {
+        // `TAILNETD_STATE_DIR` is the explicit override: it beats BOTH the root system path and the
+        // per-user cascade, so an operator can always point a daemon+CLI pair at one dir.
+        let env = fake_env(&[
+            ("TAILNETD_STATE_DIR", "/srv/tailnetd"),
+            ("XDG_STATE_HOME", "/home/u/.state"),
+            ("HOME", "/home/u"),
+        ]);
+        assert_eq!(
+            state_dir_from(&env, true),
+            (PathBuf::from("/srv/tailnetd"), StateDirSource::Env)
+        );
+        assert_eq!(
+            state_dir_from(&env, false),
+            (PathBuf::from("/srv/tailnetd"), StateDirSource::Env)
+        );
+    }
+
+    #[test]
+    fn state_dir_root_takes_the_packaged_system_path() {
+        // Root with no override → the packaged system dir, IGNORING $HOME/$XDG_STATE_HOME. This is
+        // the branch that makes `sudo tnet status` find the systemd daemon's socket; a regression
+        // here reintroduces the silent root-vs-user split.
+        let env = fake_env(&[("XDG_STATE_HOME", "/root/.state"), ("HOME", "/root")]);
+        assert_eq!(
+            state_dir_from(&env, true),
+            (PathBuf::from(SYSTEM_STATE_DIR), StateDirSource::SystemRoot)
+        );
+    }
+
+    #[test]
+    fn state_dir_non_root_cascade_prefers_xdg_then_home_then_tmp() {
+        // Non-root, no override: XDG_STATE_HOME, else $HOME/.local/state, else /tmp — each reported
+        // with the rule that produced it.
+        assert_eq!(
+            state_dir_from(
+                fake_env(&[("XDG_STATE_HOME", "/home/u/.state"), ("HOME", "/home/u")]),
+                false
+            ),
+            (
+                PathBuf::from("/home/u/.state/tailnetd"),
+                StateDirSource::XdgStateHome
+            )
+        );
+        assert_eq!(
+            state_dir_from(fake_env(&[("HOME", "/home/u")]), false),
+            (
+                PathBuf::from("/home/u/.local/state/tailnetd"),
+                StateDirSource::Home
+            )
+        );
+        assert_eq!(
+            state_dir_from(fake_env(&[]), false),
+            (PathBuf::from("/tmp/tailnetd"), StateDirSource::Tmp)
+        );
     }
 }
