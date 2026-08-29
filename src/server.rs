@@ -1125,10 +1125,20 @@ async fn dispatch(
         Request::SwitchProfile { target } => {
             let mut be = backend.lock().await;
             match be.switch_profile(&target).await {
-                Ok(()) => {
-                    tracing::info!(profile = %target, "switched profile (device torn down; run `up` to connect)");
+                // The reply distinguishes "already on it" from a real switch, and names the target's
+                // settled state — see `SwitchOutcome`. The daemon log carries the resolved id, which
+                // `target` need not be (it may have been a display name).
+                Ok(outcome) => {
+                    match &outcome {
+                        crate::ipn::SwitchOutcome::AlreadyCurrent { id } => {
+                            tracing::info!(profile = %id, "switch: already on this profile; nothing changed");
+                        }
+                        crate::ipn::SwitchOutcome::Switched { id, state } => {
+                            tracing::info!(profile = %id, state = state.as_str(), "switched profile (device torn down; run `up` to connect)");
+                        }
+                    }
                     Response::Ok {
-                        message: format!("switched to profile {target}"),
+                        message: outcome.report(),
                     }
                 }
                 Err(e) => Response::Error {
@@ -1136,12 +1146,14 @@ async fn dispatch(
                 },
             }
         }
-        // `switch remove <id>` (Go `tailscale switch remove`). Refuses the current/default profile.
+        // `switch remove <id>` (Go `tailscale switch remove`). Refuses an unknown profile, and the
+        // current/default profile.
         Request::DeleteProfile { target } => {
             let mut be = backend.lock().await;
             match be.delete_profile(&target).await {
-                Ok(()) => Response::Ok {
-                    message: format!("removed profile {target}"),
+                // Report the resolved id, not the caller's argument (which may have been a name).
+                Ok(id) => Response::Ok {
+                    message: format!("removed profile {id:?}"),
                 },
                 Err(e) => Response::Error {
                     message: format!("{e:#}"),

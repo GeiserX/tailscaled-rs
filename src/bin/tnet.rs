@@ -484,9 +484,12 @@ enum Command {
         /// With `--list`, emit the profiles as a JSON array (Go `tailscale switch --list --json`):
         /// one object per profile with `id`, `nickname`, and `selected`. (Go also carries `tailnet`
         /// and `account` per profile; this fork's engine does not surface those per-profile, so they
-        /// are emitted as `null` — an honest reduction, not a fake value. See bead tsd-91w.) Ignored
-        /// without `--list`.
-        #[arg(long, requires = "list")]
+        /// are emitted as `null` — an honest reduction, not a fake value. See bead tsd-91w.)
+        ///
+        /// Only valid with `--list`: without it, this refuses like Go does — see
+        /// [`switch_usage_refusal`]. The check is deliberately NOT a clap `requires = "list"`, so the
+        /// message and the exit code are Go's rather than clap's.
+        #[arg(long)]
         json: bool,
         /// The profile id to switch to (omit with `--list`). Ignored when `--list` is given.
         #[arg(value_name = "PROFILE")]
@@ -1364,9 +1367,14 @@ enum SyspolicyCmd {
 /// The `tnet switch` subcommands. Mirrors Go's `tailscale switch remove`.
 #[derive(Subcommand)]
 enum SwitchCmd {
-    /// Remove a profile (delete its prefs + node key). Cannot remove the current or default profile.
+    /// Remove a profile (delete its prefs + node key). The profile may be named by id or by display
+    /// name, like `switch` itself; a name that matches no profile is refused (Go: `No profile named
+    /// %q`) rather than reported as a removal. Cannot remove the current or default profile.
     Remove {
-        /// The profile id to remove.
+        /// The profile id (or display name) to remove.
+        ///
+        /// Required, so clap supplies the arity refusal Go hand-rolls as
+        /// `usage: tailscale switch remove NAME`.
         #[arg(value_name = "PROFILE")]
         target: String,
     },
@@ -3461,6 +3469,42 @@ fn build_info_json(
 /// `switch` (Go `tailscale switch`): `--list` renders a table; `remove <id>` deletes; a bare
 /// `<target>` switches. `--list` renders the Profiles reply, and the three modes map to different
 /// requests.
+/// The refusal `tnet switch` owes its own flags *before* it contacts the daemon, or `None` when the
+/// invocation is usable. Ported from Go's `switchProfile` (`cmd/tailscale/cli/switch.go`), which
+/// checks in exactly this order:
+///
+/// 1. `--list` wins outright — Go dispatches to `listProfiles`/`listProfilesJSON` first, so
+///    `--list --json` is the JSON listing and a stray `<target>` alongside `--list` is ignored
+///    (never a refusal).
+/// 2. `--json` without `--list` is refused: `--json` only ever selects the *listing's* format, so
+///    pairing it with a switch target asks for JSON output that does not exist. Go prints
+///    `--json argument cannot be used with tailscale switch NAME` and exits 1.
+/// 3. no target left → the usage line, exit 1.
+///
+/// The `remove` subcommand is exempt: Go's ffcli dispatches the subcommand before `switch`'s own
+/// `Exec` ever runs, so `switch`'s flag rules do not apply to it (clap parses the same shape here).
+///
+/// Both messages go to **stdout** and exit **1**, matching Go's `outln` + `os.Exit(1)` — not clap's
+/// stderr + exit 2, which is why this is a hand-rolled check and not an `#[arg(requires = ...)]`.
+/// Pure (no I/O, no process exit) so the whole refusal table is unit-testable.
+fn switch_usage_refusal(
+    list: bool,
+    json: bool,
+    target: Option<&str>,
+    has_subcommand: bool,
+) -> Option<&'static str> {
+    if has_subcommand || list {
+        return None;
+    }
+    if json {
+        return Some("--json argument cannot be used with tnet switch NAME");
+    }
+    if target.is_none() {
+        return Some("usage: tnet switch NAME");
+    }
+    None
+}
+
 async fn run_switch(
     socket: &std::path::Path,
     list: bool,
@@ -3468,6 +3512,11 @@ async fn run_switch(
     target: Option<String>,
     cmd: Option<SwitchCmd>,
 ) -> Result<()> {
+    // Go's own flag refusals first (stdout + exit 1), before any daemon round-trip.
+    if let Some(message) = switch_usage_refusal(list, json, target.as_deref(), cmd.is_some()) {
+        println!("{message}");
+        std::process::exit(1);
+    }
     // `switch remove <id>` (subcommand) takes precedence.
     if let Some(SwitchCmd::Remove { target }) = cmd {
         return send_ok_or_die(socket, Request::DeleteProfile { target }).await;
@@ -3494,8 +3543,11 @@ async fn run_switch(
     }
     match target {
         Some(target) => send_ok_or_die(socket, Request::SwitchProfile { target }).await,
+        // Unreachable: `switch_usage_refusal` above already exited on a missing target. Kept as a
+        // total match (rather than an `expect`) so a future edit to the refusal table degrades into
+        // the same usage line instead of a panic.
         None => {
-            eprintln!("usage: tnet switch <profile> | --list | remove <profile>");
+            println!("usage: tnet switch NAME");
             std::process::exit(1);
         }
     }
@@ -11725,6 +11777,47 @@ mod tests {
             out.contains('\u{FFFD}'),
             "delimiters not neutralized: {out:?}"
         );
+    }
+
+    #[test]
+    fn switch_usage_refusal_matches_gos_order_and_messages() {
+        // Ported from Go's `switchProfile` (`cmd/tailscale/cli/switch.go`), whose three checks run in
+        // this order. Each case below is one of Go's branches.
+
+        // `--list` is handled first, so every flag/arg combination under it is usable: plain list,
+        // JSON list, and a stray target next to `--list` (Go ignores the args entirely once listing).
+        assert_eq!(switch_usage_refusal(true, false, None, false), None);
+        assert_eq!(switch_usage_refusal(true, true, None, false), None);
+        assert_eq!(switch_usage_refusal(true, true, Some("work"), false), None);
+
+        // `--json` WITHOUT `--list` is refused — with or without a target, because `--json` only ever
+        // formats the listing. Go: `--json argument cannot be used with tailscale switch NAME`.
+        assert_eq!(
+            switch_usage_refusal(false, true, Some("work"), false),
+            Some("--json argument cannot be used with tnet switch NAME")
+        );
+        assert_eq!(
+            switch_usage_refusal(false, true, None, false),
+            Some("--json argument cannot be used with tnet switch NAME"),
+            "the --json refusal precedes the usage line, as in Go"
+        );
+
+        // No target, no `--list`, no `--json` → the usage line.
+        assert_eq!(
+            switch_usage_refusal(false, false, None, false),
+            Some("usage: tnet switch NAME")
+        );
+
+        // A plain target is usable.
+        assert_eq!(
+            switch_usage_refusal(false, false, Some("work"), false),
+            None
+        );
+
+        // The `remove` subcommand is exempt from all of it: Go's ffcli dispatches the subcommand
+        // before `switch`'s own Exec runs, so `switch`'s flag rules never apply to it.
+        assert_eq!(switch_usage_refusal(false, false, None, true), None);
+        assert_eq!(switch_usage_refusal(false, true, None, true), None);
     }
 
     #[test]

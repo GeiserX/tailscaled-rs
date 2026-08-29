@@ -460,12 +460,18 @@ pub enum Request {
     /// Switch the active profile (Go `tailscale switch <id>`). The daemon tears down the current
     /// device, swaps to the target profile's prefs/key, and persists the pointer. A WRITE (it changes
     /// node lifecycle + persisted state) — gated like `up`/`down`.
+    ///
+    /// The `Ok` message distinguishes the three outcomes Go's CLI reports in words: already on this
+    /// profile (nothing changed), switched to a profile that still needs a login, and switched to a
+    /// registered profile that is merely down.
     SwitchProfile {
         /// The target profile id (or name; the daemon resolves either).
         target: String,
     },
-    /// Delete a profile (Go `tailscale switch remove`). Refuses the current/default profile. A WRITE
-    /// — gated like `up`/`down`.
+    /// Delete a profile (Go `tailscale switch remove`). The target may be an id or a display name,
+    /// like [`SwitchProfile`](Request::SwitchProfile). Refuses a target that matches no known profile
+    /// (Go: `No profile named %q`), and refuses the current/default profile. A WRITE — gated like
+    /// `up`/`down`.
     DeleteProfile {
         /// The profile id to remove.
         target: String,
