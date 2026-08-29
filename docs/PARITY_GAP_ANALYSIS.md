@@ -47,8 +47,9 @@ verbs over a `SO_PEERCRED`-authorized Unix socket.
 
 **What's left, in one breath.** The biggest remaining buckets are: **per-OS platform breadth** (the
 Linux OS-DNS configurator matrix, the port mapper, MagicDNS OS integration, and full **Windows**
-support); **engine-gated features** (the ~12 missing `up`/`set` pref flags, tailnet-lock key-set
-mutation, the incremental peer-delta bus, the mutating web UI, and a Taildrop file-arrival signal);
+support); **engine-gated features** (the four residual Linux subnet-router `up`/`set` pref flags —
+the other eight shipped once the engine grew their `Config` fields — tailnet-lock key-set mutation,
+the incremental peer-delta bus, the mutating web UI, and a Taildrop file-arrival signal);
 **distribution** (crates.io, `.deb`/`.rpm`, Homebrew); **live-tailnet verification** of paths CI can't
 reach; and a basket of **small CLI/cosmetic flag gaps**. Each is enumerated below with its bead and
 gating factor.
@@ -201,7 +202,7 @@ flowchart TB
         P["#7 SSH session-recording (enforcement shipped;<br/>HoldAndDelegate check-mode + recorder transport open)"]
     end
     subgraph OPEN["Open (12)"]
-        O["#5 macOS utun default name (daemon works around) ·<br/>#8 exit-node DNS advertise side · #13 Funnel type re-export ·<br/>#18 Windows host route/DNS · #20 Taildrop file-arrival signal ·<br/>#21 ~12 pref-flag Config fields · #25 TKA add/remove/log ·<br/>#27 tka_local_disable · #28 incremental peer deltas ·<br/>#29 web-client session auth · #30 serve_path segment-boundary bug ·<br/>#31 Taildrop send-path (chunked body, progress, target reason)"]
+        O["#5 macOS utun default name (daemon works around) ·<br/>#8 exit-node DNS advertise side · #13 Funnel type re-export ·<br/>#18 Windows host route/DNS · #20 Taildrop file-arrival signal ·<br/>#21 the 4 residual Linux router pref-flag Config fields (8 of 12 shipped) · #25 TKA add/remove/log ·<br/>#27 tka_local_disable · #28 incremental peer deltas ·<br/>#29 web-client session auth · #30 serve_path segment-boundary bug ·<br/>#31 Taildrop send-path (chunked body, progress, target reason)"]
     end
     SHIPPED --> PARTIAL --> OPEN
 ```
@@ -262,8 +263,9 @@ These are the subject of `tsd-efv` (document the Go-tooling-compatibility bounda
 - `tsd-49u` (P3) — Phase 4: feature parity.
 
 ### Features / tasks / bugs
-- **P2:** `tsd-1m9` pref flags (#21) · `tsd-6y1` crates.io (daemon) · `tsd-d6n` crates.io (engine) ·
-  `tsd-k4a` .deb/.rpm + ship acme · `tsd-m8s` Linux OS-DNS configurator · `tsd-q8o` external crypto audit.
+- **P2:** `tsd-1m9` residual Linux router pref flags (#21) · `tsd-6y1` crates.io (daemon) ·
+  `tsd-d6n` crates.io (engine) · `tsd-k4a` .deb/.rpm + ship acme · `tsd-m8s` Linux OS-DNS
+  configurator · `tsd-q8o` external crypto audit.
 - **P3:** `tsd-1yw` Windows support · `tsd-52k` file-cp residual gaps ·
   `tsd-6hx` live e2e campaign · `tsd-91w` profiles/multi-account · `tsd-b15` debug subcommands ·
   `tsd-c3w` serve/funnel v2 grammar · `tsd-efv` document reduced shapes · `tsd-euv` HTTP/1-over-UDS ·

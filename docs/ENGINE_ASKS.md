@@ -662,45 +662,61 @@ not forgotten; the drain itself is already faithful without it. — daemon lane
 > `node_nickname` with the per-profile display name in `profiles.json` that `tnet switch --list`
 > shows, which Go drives from the same `Prefs.ProfileName`.
 
-**Why:** Go's `tailscale up`/`set` (v1.100.0 `up.go:99-148`, `set.go:76-122`) expose ~15 pref flags;
-this fork's `up`/`set` faithfully cover the ten that map to existing engine `Config` fields
-(`hostname`, `accept-routes`, `accept-dns`, `shields-up`, `exit-node`, `advertise-exit-node`,
-`advertise-routes`, `advertise-tags`, `ssh`, `tun`). The remainder are **not daemon-fixable today**
-because the pinned engine `Config` (rev `6035651`, `src/config.rs`) has **no field** to carry them, and
-the honest-omission rule forbids shipping a flag that parses but silently does nothing (the historical
-`accept_dns` inert-flag trap). Confirmed by reading the authoritative `Config` struct: its fields end
-at `audience`, with nothing for any of the flags below.
+**Why — as filed, at engine rev `6035651`.** Kept as the record of what was requested, in the past
+tense it now deserves: for the eight flags marked ✅ below this is HISTORY, superseded by the update
+above. Go's `tailscale up`/`set` (v1.100.0 `up.go:99-148`, `set.go:76-122`) expose ~15 pref flags;
+this fork's `up`/`set` faithfully covered the ten that mapped to engine `Config` fields existing at
+that rev (`hostname`, `accept-routes`, `accept-dns`, `shields-up`, `exit-node`,
+`advertise-exit-node`, `advertise-routes`, `advertise-tags`, `ssh`, `tun`). The remainder were **not
+daemon-fixable at that rev** because its `Config` (`src/config.rs`) had **no field** to carry them,
+and the honest-omission rule forbids shipping a flag that parses but silently does nothing (the
+historical `accept_dns` inert-flag trap). Confirmed by reading the authoritative `Config` struct as
+it stood then: its fields ended at `audience`, with nothing for any of the flags below. **At the current pin (`9d847a6`) that is
+no longer true for eight of them** — the fields exist, the daemon wired them, and only the four Linux
+router knobs still have nowhere to live.
 
 **Ask — add the engine `Config` fields (Go pref name → suggested field), so the daemon can wire each
 faithfully (a wire `Up`/`Set` field + pref mapping + the revert-guard/`--reset` lockstep + a
-`get_settings` row):**
+`get_settings` row). Each entry carries its status: ✅ SHIPPED = the engine grew the field and the
+daemon wired the flag; ⬜ STILL OPEN = no field yet, nothing wired.**
 
-- `--operator <user>` → `operator_user: Option<String>` (also the substrate for the operator-GID
-  LocalAPI authz matrix the daemon's THREAT_MODEL notes as a later phase).
-- `--exit-node-allow-lan-access <bool>` → `exit_node_allow_lan_access: bool` (Go
-  `Prefs.ExitNodeAllowLANAccess`; only meaningful with an exit node selected).
-- `--nickname <name>` → `nickname: Option<String>` (Go `Prefs.ProfileName`-adjacent / node nickname).
-- `--report-posture <bool>` → `posture_checking: bool` (Go `Prefs.PostureChecking`).
-- `--auto-update <bool>` / `--update-check <bool>` → `auto_update: { apply: Option<bool>, check:
-  Option<bool> }` (Go `Prefs.AutoUpdate`). *(Caveat: the daemon also lists self-update as a NON-GOAL —
-  see DESIGN §"Non-goals". If the engine carries the pref purely as state to report to control, the
-  daemon can wire the flag as a pref without implementing an updater; flagging the tension.)*
-- `--advertise-connector <bool>` → an app-connector pref/field (Go `Prefs.AppConnector`). Distinct from
-  the existing `advertise_services` (that is service-advertise, not the app-connector role).
-- `--webclient <bool>` → `run_web_client: bool` (Go `Prefs.RunWebClient`). *(Also a daemon NON-GOAL as
-  a UI; same caveat as auto-update — pref-state only, no embedded server.)*
-- Linux subnet-router knobs: `--snat-subnet-routes`, `--stateful-filtering`, `--netfilter-mode`,
-  `--unattended` → the engine's router/netfilter layer (Go `Prefs.NoSNAT` / `NoStatefulFiltering` /
-  `NetfilterMode` / `Unattended`). These ride on the Linux OS-router (daemon bead tsd-m8s) and are
-  lower priority.
+- ✅ SHIPPED (`Config.operator_user`) — `--operator <user>` → `operator_user: Option<String>` (also
+  the substrate for the operator-GID LocalAPI authz matrix the daemon's THREAT_MODEL notes as a later
+  phase; still unconsumed — the pref is recorded and grants nobody anything).
+- ✅ SHIPPED (`Config.exit_node_allow_lan_access`) — `--exit-node-allow-lan-access <bool>` →
+  `exit_node_allow_lan_access: bool` (Go `Prefs.ExitNodeAllowLANAccess`; only meaningful with an exit
+  node selected).
+- ✅ SHIPPED (`Config.node_nickname`) — `--nickname <name>` → `nickname: Option<String>` (Go
+  `Prefs.ProfileName`-adjacent / node nickname). The engine named the field `node_nickname`.
+- ✅ SHIPPED (`Config.posture_checking`) — `--report-posture <bool>` → `posture_checking: bool` (Go
+  `Prefs.PostureChecking`).
+- ✅ SHIPPED (`Config.auto_update_apply` / `Config.auto_update_check`) — `--auto-update <bool>` /
+  `--update-check <bool>` → `auto_update: { apply: Option<bool>, check: Option<bool> }` (Go
+  `Prefs.AutoUpdate`). The engine landed them as two flat fields rather than a nested struct.
+  *(Caveat, resolved as written: the daemon lists self-update as a NON-GOAL — see DESIGN
+  §"Non-goals" — so the flags are wired as pref state only; `auto_update_apply` does reach control as
+  `Hostinfo.AllowsUpdate`, and no updater was implemented.)*
+- ✅ SHIPPED (`Config.advertise_app_connector`) — `--advertise-connector <bool>` → an app-connector
+  pref/field (Go `Prefs.AppConnector`). Distinct from the existing `advertise_services` (that is
+  service-advertise, not the app-connector role).
+- ✅ SHIPPED (`Config.run_web_client`) — `--webclient <bool>` → `run_web_client: bool` (Go
+  `Prefs.RunWebClient`). *(Also a daemon NON-GOAL as a UI; same resolution as auto-update — pref-state
+  only, no embedded server.)*
+- ⬜ STILL OPEN — Linux subnet-router knobs: `--snat-subnet-routes`, `--stateful-filtering`,
+  `--netfilter-mode`, `--unattended` → the engine's router/netfilter layer (Go `Prefs.NoSNAT` /
+  `NoStatefulFiltering` / `NetfilterMode` / `Unattended`). These ride on the Linux OS-router (daemon
+  bead tsd-m8s) and are lower priority. **This bullet is the whole of what ask #21 still wants.**
 
-**Workload-identity flags** (`--client-id`/`--client-secret`/`--id-token`/`--audience`) are a SEPARATE
-case: the engine `Config` **already has** `client_id`/`client_secret`/`id_token`/`audience`, but they
-are behind the engine's **`identity-federation` cargo feature**, which this fork's engine dep does NOT
-enable — so wiring them today would also be inert. **Sub-ask:** confirm whether enabling
-`identity-federation` on the engine dep is supported/compiles; if so the daemon can wire those four
-flags immediately (they need no new engine field, only the feature on). Tracked in daemon bead
-tsd-1m9, which is BLOCKED on this ask. — daemon lane
+**Workload-identity flags** (`--client-id`/`--client-secret`/`--id-token`/`--audience`) were a SEPARATE
+case: the engine `Config` **already had** `client_id`/`client_secret`/`id_token`/`audience`, but behind
+the engine's **`identity-federation` cargo feature**, which this fork's engine dep did not enable — so
+wiring them then would also have been inert. **Sub-ask (✅ RESOLVED):** enabling `identity-federation`
+on the engine dep is supported and compiles, so the daemon forwards it as its own off-by-default
+`identity-federation` feature (`Cargo.toml`) and `tnet up` carries all four flags.
+
+**Ask #21 status:** the workload-identity slice and the eight `Config`-field flags above have shipped;
+the four Linux router knobs have not. Daemon bead tsd-1m9 stays open for exactly that residue, blocked
+on the router/netfilter layer rather than on this ask as originally filed. — daemon lane
 
 ## 22. A configurable WireGuard/disco listen port on `Config` (for `tailnetd --port` / `PORT`)
 
