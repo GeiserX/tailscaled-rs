@@ -6,6 +6,33 @@ rust-version = "1.95"
 license = "BSD-3-Clause"
 repository = "https://github.com/GeiserX/tailscaled-rs"
 description = "An independent, from-scratch Rust system daemon that joins a WireGuard-based mesh overlay, speaking the Tailscale control protocol. Wraps the tailscale-rs engine in a long-running, IPC-controlled daemon (the layer the embeddable library omits). Not affiliated with, endorsed by, or sponsored by Tailscale Inc.; 'Tailscale' is a trademark of Tailscale Inc."
+readme = "README.md"
+# crates.io discovery. The registry indexes both lists for search, and keywords are capped at five,
+# so they name the protocols and the shape of the artifact rather than restating the description.
+# "wireguard" here is nominative use, as everywhere else in this project (see NOTICE): it describes
+# the protocol the data plane speaks, not an affiliation.
+keywords = ["vpn", "wireguard", "mesh", "overlay-network", "daemon"]
+categories = ["network-programming", "command-line-utilities"]
+# What NOT to ship in the published tarball. `cargo package` otherwise uploads every git-tracked
+# file, and repository machinery is noise to someone who downloads the crate: it acts on this
+# checkout and cannot do anything from inside a registry tarball. The local issue-tracker state
+# under `.beads/` — which carries git hooks — has no business on a public registry at all. Source,
+# tests, `docs/`, LICENSE, NOTICE and `packaging/` (the systemd units and launchd plist a consumer
+# actually installs) all stay. `exclude` is preferred over `include` so a newly added source file
+# can never be silently dropped from a release.
+exclude = [
+    "/.beads/",
+    "/.github/",
+    "/.coderabbit.yaml",
+    "/codecov.yml",
+    "/release-please-config.json",
+    "/.release-please-manifest.json",
+    "/Cross.toml",
+    "/AGENTS.md",
+    "/CLAUDE.md",
+    # Referenced only by the GitHub repository's social-preview setting, never by the docs.
+    "/docs/images/social-preview.png",
+]
 
 # Lint policy. `unreachable_pub` keeps the API surface honest: an item declared `pub` that is not
 # actually reachable outside its module should be `pub(super)`/`pub(crate)` instead. Kept at `warn`
