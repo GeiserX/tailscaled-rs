@@ -1306,6 +1306,12 @@ enum FileCmd {
         /// directory-drain mode always removes received files from the inbox, like Go.)
         #[arg(long)]
         delete_after: bool,
+        /// Directory-drain mode only: print per-file progress in Go's `tailscale file get
+        /// --verbose` shape — a `wrote <name> as <path> (<n> bytes)` line per received file,
+        /// followed by the `moved <received>/<waiting> files` tally. Without it the drain prints
+        /// the fork's compact result lines. Ignored in single-file (`get <name> <dest>`) mode.
+        #[arg(long)]
+        verbose: bool,
     },
 }
 
@@ -4774,7 +4780,14 @@ async fn run_whois(socket: &std::path::Path, ip: String, json: bool) -> Result<(
 /// (the daemon reads/consumes a file) and reply `Ok`; `list` is read-only and replies `Files`. The
 /// file name in a `list` reply is engine/peer-supplied, so it is run through `sanitize_for_terminal`
 /// inside `format_files` before printing (a sender could craft a hostile name).
+///
+/// `get <dir> --verbose` sends the same request and only swaps the renderer for the drain's reply:
+/// [`format_files_got_verbose`] (Go's `tailscale file get --verbose` progress lines) in place of the
+/// compact [`format_files_got`].
 async fn run_file(socket: &std::path::Path, cmd: FileCmd) -> Result<()> {
+    // `--verbose` changes nothing about the request — it only picks a different renderer for the
+    // drain's `FilesGot` reply — so read it off the subcommand here, before `cmd` is consumed below.
+    let verbose = matches!(cmd, FileCmd::Get { verbose: true, .. });
     // `cp` has its own handler: it may `--targets`-list, or send 1..N files (a round-trip each), so
     // it does not fit the single-request-then-match shape the other verbs share.
     let request = match cmd {
@@ -4789,6 +4802,7 @@ async fn run_file(socket: &std::path::Path, cmd: FileCmd) -> Result<()> {
             dest,
             conflict,
             delete_after,
+            verbose: _,
         } => match dest {
             // A literal `-` dest means "stream to stdout" in the CLI convention (Go's `file get` uses
             // it; `tnet cert -` does too). The single-file fetch is a daemon-writes-the-path operation
@@ -4829,7 +4843,11 @@ async fn run_file(socket: &std::path::Path, cmd: FileCmd) -> Result<()> {
         // Inbox-drain outcomes (`tnet file get <dir>`). Print one line per file; exit non-zero if any
         // file failed (Go returns the last error), so scripts can detect a partial drain.
         Response::FilesGot { results } => {
-            print!("{}", format_files_got(&results));
+            if verbose {
+                print!("{}", format_files_got_verbose(&results));
+            } else {
+                print!("{}", format_files_got(&results));
+            }
             if results.iter().any(|r| r.error.is_some()) {
                 std::process::exit(1);
             }
@@ -6060,6 +6078,67 @@ fn format_files_got(results: &[tailscaled_rs::localapi::FileGotReport]) -> Strin
             }
         }
     }
+    out
+}
+
+/// Render `tnet file get <dir> --verbose` — the per-file progress Go's `tailscale file get
+/// --verbose` prints (`runFileGetOneBatch` in `cmd/tailscale/cli/file.go`).
+///
+/// Go's two verbose lines, reproduced verbatim in shape:
+/// * per received file: `wrote <inbox name> as <path it landed at> (<n> bytes)` — the path differs
+///   from `<dir>/<name>` under the `rename` policy, which is exactly why Go prints both.
+/// * once at the end: `moved <received>/<waiting> files`, where `received` counts only the files
+///   that were both written AND cleared from the inbox (Go's `deleted`), so a file that landed on
+///   disk but could not be removed is *not* counted — a re-drain would fetch it again.
+///
+/// Failures keep the compact `error: <name>: <reason>` line [`format_files_got`] uses: Go prints
+/// those through a different path (its accumulated `errs`, printed by `runFileGet`, not gated on
+/// `--verbose`), so they belong in both modes and there is no second Go shape to mirror. An empty
+/// inbox keeps the fork's `(no files waiting)` placeholder ahead of Go's `moved 0/0 files` tally, so
+/// the zero-file case says so in words instead of rendering as an empty list.
+///
+/// NOTE: a `/dev/null` (wipe) drain renders through this same shape. Go's `wipeInbox` has its own
+/// verbose lines (`deleting <name> ...` / `deleted <n> files`); mirroring those is separate work and
+/// deliberately not done here.
+///
+/// Every name/path is engine- or peer-supplied, so each goes through [`sanitize_for_terminal`].
+/// Pure (returns the string, trailing newline included) → unit-testable; the caller `print!`s it.
+fn format_files_got_verbose(results: &[tailscaled_rs::localapi::FileGotReport]) -> String {
+    let mut out = String::new();
+    if results.is_empty() {
+        out.push_str("(no files waiting)\n");
+    }
+    let mut moved = 0usize;
+    for r in results {
+        let name = sanitize_for_terminal(&r.name);
+        match (&r.written, &r.error) {
+            // Landed on disk. Go's verbose line names both the inbox name and the real path.
+            (Some(path), err) => {
+                out.push_str(&format!(
+                    "wrote {name} as {} ({} bytes)\n",
+                    sanitize_for_terminal(path),
+                    r.size
+                ));
+                match err {
+                    // Written but not consumed: Go counts this as an error, not a move, and reports
+                    // the delete failure separately — so print the reason and leave `moved` alone.
+                    Some(e) => {
+                        out.push_str(&format!("error: {name}: {}\n", sanitize_for_terminal(e)))
+                    }
+                    None => moved += 1,
+                }
+            }
+            // Never written: the file stays in the inbox. Same failure line as the compact renderer.
+            (None, Some(e)) => {
+                out.push_str(&format!("error: {name}: {}\n", sanitize_for_terminal(e)));
+            }
+            // Neither (should not happen — the daemon always sets one) — surface defensively.
+            (None, None) => {
+                out.push_str(&format!("error: {name}: unknown outcome\n"));
+            }
+        }
+    }
+    out.push_str(&format!("moved {moved}/{} files\n", results.len()));
     out
 }
 
@@ -9322,12 +9401,14 @@ mod tests {
                 dest,
                 conflict,
                 delete_after: da,
+                verbose: false,
             }) {
                 FileCmd::Get {
                     target,
                     dest,
                     conflict,
                     delete_after,
+                    verbose: _,
                 } => match dest {
                     Some(dest) => Request::FileGet {
                         name: target,
@@ -9640,6 +9721,128 @@ mod tests {
         assert!(
             out.contains("could not be removed from the inbox"),
             "must name the reason: {out}"
+        );
+    }
+
+    #[test]
+    fn format_files_got_verbose_renders_go_progress_lines() {
+        use tailscaled_rs::localapi::FileGotReport;
+        // Two received files, one of them landed under a numbered name (`rename`) — Go's verbose line
+        // names both the inbox name and the path it actually landed at, plus the size, then closes
+        // the batch with the `moved <n>/<total> files` tally.
+        let results = vec![
+            FileGotReport {
+                name: "a.txt".to_string(),
+                size: 12,
+                written: Some("/tmp/dl/a.txt".to_string()),
+                error: None,
+            },
+            FileGotReport {
+                name: "b.bin".to_string(),
+                size: 4096,
+                written: Some("/tmp/dl/b (1).bin".to_string()),
+                error: None,
+            },
+        ];
+        assert_eq!(
+            format_files_got_verbose(&results),
+            "wrote a.txt as /tmp/dl/a.txt (12 bytes)\n\
+             wrote b.bin as /tmp/dl/b (1).bin (4096 bytes)\n\
+             moved 2/2 files\n"
+        );
+    }
+
+    #[test]
+    fn format_files_got_verbose_empty_inbox_says_so() {
+        // Zero waiting files must say so rather than render as an empty list; the Go tally follows.
+        assert_eq!(
+            format_files_got_verbose(&[]),
+            "(no files waiting)\nmoved 0/0 files\n"
+        );
+    }
+
+    #[test]
+    fn format_files_got_verbose_tally_counts_only_cleared_files() {
+        use tailscaled_rs::localapi::FileGotReport;
+        // Three attempted files, one of each end-state. Only the clean success counts toward `moved`
+        // (Go's `deleted`): a file written but not cleared from the inbox would be re-fetched on the
+        // next drain, and a file that never landed is still waiting — neither one moved.
+        let results = vec![
+            FileGotReport {
+                name: "ok.txt".to_string(),
+                size: 3,
+                written: Some("/tmp/dl/ok.txt".to_string()),
+                error: None,
+            },
+            FileGotReport {
+                name: "stuck.txt".to_string(),
+                size: 7,
+                written: Some("/tmp/dl/stuck.txt".to_string()),
+                error: Some("saved but could not be removed from the inbox".to_string()),
+            },
+            FileGotReport {
+                name: "clash.txt".to_string(),
+                size: 0,
+                written: None,
+                error: Some("refusing to overwrite /tmp/dl/clash.txt".to_string()),
+            },
+        ];
+        let out = format_files_got_verbose(&results);
+        assert!(
+            out.contains("wrote ok.txt as /tmp/dl/ok.txt (3 bytes)\n"),
+            "{out}"
+        );
+        // Written-but-stuck: the progress line still shows where it landed, followed by the reason.
+        assert!(
+            out.contains("wrote stuck.txt as /tmp/dl/stuck.txt (7 bytes)\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("error: stuck.txt: saved but could not be removed from the inbox\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("error: clash.txt: refusing to overwrite /tmp/dl/clash.txt\n"),
+            "{out}"
+        );
+        assert!(
+            out.ends_with("moved 1/3 files\n"),
+            "only the cleared file counts as moved: {out}"
+        );
+    }
+
+    #[test]
+    fn format_files_got_verbose_sanitizes_peer_supplied_name() {
+        use tailscaled_rs::localapi::FileGotReport;
+        // Same rule as the compact renderer: the inbox name comes from the sending peer (untrusted),
+        // so terminal escapes must never reach the verbose progress line either.
+        let results = vec![FileGotReport {
+            name: "evil\x1b[2J\x07.txt".to_string(),
+            size: 1,
+            written: Some("/tmp/evil\x1b[2J.txt".to_string()),
+            error: None,
+        }];
+        let out = format_files_got_verbose(&results);
+        assert!(!out.contains('\x1b'), "ESC stripped from verbose line");
+        assert!(!out.contains('\x07'), "BEL stripped from verbose line");
+    }
+
+    #[test]
+    fn file_get_verbose_flag_parses_into_file_get() {
+        // `tnet file get <dir> --verbose` parses to `FileCmd::Get { verbose: true, .. }`; omitting it
+        // leaves the compact default. `run_file` reads exactly this field to pick the renderer.
+        let verbose_of = |argv: &[&str]| -> bool {
+            match Cli::try_parse_from(argv).expect("parses").command {
+                Command::File {
+                    cmd: FileCmd::Get { verbose, .. },
+                } => verbose,
+                _ => panic!("expected `file get` from {argv:?}"),
+            }
+        };
+        assert!(verbose_of(&["tnet", "file", "get", "/tmp/dl", "--verbose"]));
+        assert!(
+            !verbose_of(&["tnet", "file", "get", "/tmp/dl"]),
+            "no --verbose → compact drain output"
         );
     }
 
