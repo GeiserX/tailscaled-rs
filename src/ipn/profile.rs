@@ -66,6 +66,9 @@ pub(super) fn is_valid_profile_id(id: &str) -> bool {
 /// 3. otherwise `None` — the caller reports an error. A name matching MULTIPLE ids is ambiguous and
 ///    also yields `None` (the caller must be told to use the id), never an arbitrary pick.
 ///
+/// Every id this returns is guaranteed to satisfy [`is_valid_profile_id`] — including the ones read
+/// out of `profiles.json` by the name arm — so a caller may join it as a single path component.
+///
 /// Pure over the parsed `profiles.json` (no I/O) so it is unit-testable; the caller loads the file.
 /// Note a *syntactically* valid id that is NOT yet a known profile is intentionally left to the
 /// caller (switching to a brand-new id is how a new profile is created), so this returns `None` for
@@ -79,10 +82,17 @@ pub(super) fn resolve_target_to_id(target: &str, meta: &ProfilesFile) -> Option<
     }
     // 2. Unique display-name match. Collect all ids whose name equals `target`; resolve only if
     //    exactly one (an ambiguous name must not silently pick one).
+    //
+    //    The `is_valid_profile_id` filter on the *key* is load-bearing, not decoration: unlike the
+    //    id arm above (which validates `target` itself), this arm returns an id read straight out of
+    //    `profiles.json`, and every caller then joins that id as a path component
+    //    ([`profile_paths`]). A hand-edited or corrupted map with a key like `"../../etc"` would
+    //    otherwise let a name lookup escape the state dir. Ids the daemon writes always pass, so
+    //    this only ever rejects a map this daemon did not produce.
     let mut by_name = meta
         .profiles
         .iter()
-        .filter(|(_, m)| m.name == target)
+        .filter(|(id, m)| m.name == target && is_valid_profile_id(id))
         .map(|(id, _)| id.clone());
     let first = by_name.next()?;
     if by_name.next().is_some() {
@@ -328,5 +338,39 @@ mod tests {
         );
         // "home" is a known id → resolves to id "home", NOT to "work" (whose name is "home").
         assert_eq!(resolve_target_to_id("home", &prec).as_deref(), Some("home"));
+    }
+
+    #[test]
+    fn resolve_never_returns_an_id_that_is_unsafe_as_a_path_component() {
+        // `profiles.json` is a file on disk: a hand-edited or corrupted map can carry a key that is
+        // not a legal profile id. The id arm rejects such a target because it validates the target
+        // itself; the NAME arm returns the map's key, so it must validate the key. Both callers
+        // (`switch_profile`, `delete_profile`) join the resolved id as a path component, so a
+        // traversal key must never come back out.
+        let mut meta = ProfilesFile::default();
+        meta.profiles.insert(
+            "../../etc".into(),
+            ProfileMeta {
+                name: "escape".into(),
+            },
+        );
+        assert_eq!(
+            resolve_target_to_id("escape", &meta),
+            None,
+            "a name whose id is not a safe path component must not resolve"
+        );
+        // Same key, looked up directly: the id arm already refused it.
+        assert_eq!(resolve_target_to_id("../../etc", &meta), None);
+
+        // A traversal key alongside a legitimate one sharing the same name resolves to the safe id
+        // rather than being treated as ambiguous — the bad key is filtered out before the count.
+        let mut mixed = ProfilesFile::default();
+        mixed
+            .profiles
+            .insert("../../etc".into(), ProfileMeta { name: "dup".into() });
+        mixed
+            .profiles
+            .insert("work".into(), ProfileMeta { name: "dup".into() });
+        assert_eq!(resolve_target_to_id("dup", &mixed).as_deref(), Some("work"));
     }
 }
