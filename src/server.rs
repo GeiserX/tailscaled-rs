@@ -912,6 +912,17 @@ async fn dispatch(
                 },
             }
         }
+        // `lock log` (Go `tailscale lock log`, read-only). Off-lock device call; needs the node up
+        // (the AUM chain is read from the live engine's synced TKA state).
+        Request::LockLog { limit } => {
+            let dev = { backend.lock().await.device_handle() };
+            match dev {
+                Some(dev) => Backend::lock_log(&dev, limit).await,
+                None => Response::Error {
+                    message: "node is not up".into(),
+                },
+            }
+        }
         // `lock init` (Go `tailscale lock init`): initialize the lock with this node as sole trusted
         // key. A write (authz'd above) — a control init RPC, off-lock, needs the node up.
         Request::LockInit { secret_hex } => {

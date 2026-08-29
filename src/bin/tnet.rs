@@ -612,8 +612,10 @@ enum Command {
         #[arg(long, value_name = "TRACK")]
         track: Option<String>,
     },
-    /// Tailnet Lock (TKA) commands. Currently `status` (read-only): whether lock is in use, the
-    /// authority head, and any pending disablement. Mirrors Go `tailscale lock status`.
+    /// Tailnet Lock (TKA) commands. The read-only pair mirrors Go `tailscale lock status` (whether
+    /// lock is in use, the authority head, any pending disablement) and Go `tailscale lock log` (the
+    /// update-chain history, newest first); `init`/`sign`/`disable` mutate the lock and
+    /// `disablement-kdf` is a pure-local derivation.
     Lock {
         #[command(subcommand)]
         cmd: LockCmd,
@@ -1002,6 +1004,19 @@ enum LockCmd {
     },
     /// Show Tailnet Lock status (read-only).
     Status {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the changes applied to Tailnet Lock — the update (AUM) chain, newest first (Go
+    /// `tailscale lock log`). Read-only, and read *locally*: the entries come from the AUM chain this
+    /// node has already synced and verified, so there is no control round-trip and the history stops
+    /// at whatever this node has seen.
+    Log {
+        /// Maximum number of updates to list, counted back from the chain head (Go `--limit`, same
+        /// default of 50).
+        #[arg(long, value_name = "N", default_value_t = 50)]
+        limit: usize,
         /// Output as JSON.
         #[arg(long)]
         json: bool,
@@ -1955,6 +1970,10 @@ async fn main() -> Result<()> {
         Command::Lock {
             cmd: LockCmd::Status { json },
         } => run_lock_status(&socket, json).await,
+        // `lock log` (Go `tailscale lock log`): fetch + render the TKA update-chain history.
+        Command::Lock {
+            cmd: LockCmd::Log { limit, json },
+        } => run_lock_log(&socket, limit, json).await,
         // `lock sign` (Go `tailscale lock sign`): co-sign a node key into the lock.
         Command::Lock {
             cmd: LockCmd::Sign { node_key },
@@ -3911,6 +3930,23 @@ async fn run_lock_status(socket: &std::path::Path, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// `lock log [--limit N]` (Go `tailscale lock log`): fetch + render the TKA update-chain history.
+async fn run_lock_log(socket: &std::path::Path, limit: usize, json: bool) -> Result<()> {
+    let report = match round_trip(socket, &Request::LockLog { limit }).await {
+        Ok(Response::LockLog(r)) => r,
+        Ok(Response::Error { message }) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        Ok(other) => anyhow::bail!("unexpected response to lock log: {other:?}"),
+        Err(e) => {
+            return Err(e).with_context(|| format!("querying lock log at {}", socket.display()));
+        }
+    };
+    print!("{}", format_lock_log(&report, json));
+    Ok(())
+}
+
 /// `lock init <disablement-secret>` (Go `tailscale lock init`): initialize Tailnet Lock with this
 /// node as the sole trusted key, gated by the hex-encoded disablement secret. Prints the daemon's
 /// `ok` message or surfaces the error and exits non-zero. The secret is passed straight through on the
@@ -4649,6 +4685,85 @@ fn format_lock_status(r: &tailscaled_rs::localapi::LockReport, json: bool) -> St
     }
     if r.disabled {
         out.push_str("  status: a disablement is pending (control signalled disable).\n");
+    }
+    out
+}
+
+/// Render `tnet lock log` from a [`LockLogReport`](tailscaled_rs::localapi::LockLogReport), mirroring
+/// Go `tailscale lock log` (`runNetworkLockLog` over `LocalClient.NetworkLockLog`): one stanza per
+/// update, **newest first**, each headed by the update's AUM hash and change kind.
+///
+/// Two deliberate fork deviations, both stated rather than faked:
+///
+/// - **No per-kind key detail.** Go decodes each update's raw AUM CBOR and prints what the change
+///   did (the added key's kind/id/metadata, the removed key id). This build carries the raw CBOR on
+///   the wire but does not decode it — the daemon has no AUM decoder — so a stanza reports the hash,
+///   the change kind and the ids of the keys that signed it. `--json` emits the raw CBOR (hex) so the
+///   full AUM can still be decoded out-of-band.
+/// - **The empty history says why.** Go's `NetworkLockLog` errors out when lock is not enabled; here
+///   the engine simply returns no entries, so the report carries the lock-enabled flag and this
+///   renderer prints "not enabled" or "enabled, nothing synced yet" rather than an empty table.
+///
+/// `json` emits a fork-specific object (`enabled` + `entries`), NOT Go's `[]ipnstate.NetworkLockUpdate`
+/// array. Pure (returns the string incl. its trailing newline) → unit-testable.
+fn format_lock_log(r: &tailscaled_rs::localapi::LockLogReport, json: bool) -> String {
+    if json {
+        use serde_json::{Map, Value, json};
+        let entries: Vec<Value> = r
+            .entries
+            .iter()
+            .map(|e| {
+                let mut m = Map::new();
+                m.insert("hash".into(), json!(e.hash));
+                m.insert("change".into(), json!(e.change));
+                m.insert("signer_key_ids".into(), json!(e.signer_key_ids));
+                m.insert("raw".into(), json!(e.raw));
+                Value::Object(m)
+            })
+            .collect();
+        let mut root = Map::new();
+        root.insert("enabled".into(), json!(r.enabled));
+        root.insert("entries".into(), Value::Array(entries));
+        return format!(
+            "{}\n",
+            serde_json::to_string_pretty(&root).unwrap_or_else(|_| "{}".to_string())
+        );
+    }
+    // Nothing to list: say which of the two empty cases this is (Go never reaches here — it errors
+    // instead — but an empty table would leave an operator guessing).
+    if r.entries.is_empty() {
+        if !r.enabled {
+            // Same wording as `lock status`'s not-enabled line, so the two verbs agree.
+            return "Tailnet Lock is NOT enabled.\n\n".to_string();
+        }
+        return "Tailnet Lock is ENABLED, but no update-chain history has synced to this node \
+                yet.\n\n"
+            .to_string();
+    }
+    let mut out = String::new();
+    for e in &r.entries {
+        // The change kind and hash are engine-produced (a fixed AUM-kind string; our own base32 of a
+        // 32-byte hash), but they are rendered verbatim into a structured line — sanitize anyway, as
+        // the status/dns/file formatters do.
+        out.push_str(&format!(
+            "update {} ({})\n",
+            sanitize_for_terminal(&e.hash),
+            sanitize_for_terminal(&e.change)
+        ));
+        if e.signer_key_ids.is_empty() {
+            // The genesis checkpoint carries no signatures; anything else unsigned would not have
+            // verified into the chain in the first place.
+            out.push_str("  signed by: (unsigned)\n");
+        } else {
+            let ids: Vec<String> = e
+                .signer_key_ids
+                .iter()
+                .map(|id| sanitize_for_terminal(id))
+                .collect();
+            out.push_str(&format!("  signed by: {}\n", ids.join(", ")));
+        }
+        // Blank line between stanzas, like Go's `fmt.Fprintln` after each description.
+        out.push('\n');
     }
     out
 }
@@ -9688,6 +9803,83 @@ mod tests {
         assert_eq!(v["enabled"], serde_json::json!(true));
         assert_eq!(v["head"], serde_json::json!("tka-aumhash-abc"));
         assert_eq!(v["disabled"], serde_json::json!(true));
+    }
+
+    /// `lock log` (Go `tailscale lock log`) over a synthesised daemon report: the stanza shape,
+    /// newest-first order, the unsigned (genesis) row, and the JSON object.
+    #[test]
+    fn format_lock_log_human_and_json() {
+        use tailscaled_rs::localapi::{LockLogEntry, LockLogReport};
+        let report = LockLogReport {
+            enabled: true,
+            entries: vec![
+                LockLogEntry {
+                    hash: "AAAAQ".into(),
+                    change: "add-key".into(),
+                    signer_key_ids: vec!["tlpub:aabb".into(), "tlpub:ccdd".into()],
+                    raw: "a1626b76".into(),
+                },
+                LockLogEntry {
+                    hash: "BBBBQ".into(),
+                    change: "checkpoint".into(),
+                    signer_key_ids: vec![],
+                    raw: "a1626370".into(),
+                },
+            ],
+        };
+        let h = format_lock_log(&report, false);
+        assert_eq!(
+            h,
+            "update AAAAQ (add-key)\n  signed by: tlpub:aabb, tlpub:ccdd\n\n\
+             update BBBBQ (checkpoint)\n  signed by: (unsigned)\n\n",
+            "one stanza per update, head-first, blank line between them"
+        );
+        // Head-first: the engine returns newest → oldest and the renderer must not re-order.
+        assert!(
+            h.find("AAAAQ") < h.find("BBBBQ"),
+            "newest update must print first: {h}"
+        );
+        // The raw CBOR is deliberately NOT in the human output (Go prints decoded detail, which this
+        // build cannot produce; the bytes are `--json`-only).
+        assert!(!h.contains("a1626b76"), "{h}");
+
+        let j = format_lock_log(&report, true);
+        let v: serde_json::Value = serde_json::from_str(&j).unwrap();
+        assert_eq!(v["enabled"], serde_json::json!(true));
+        assert_eq!(v["entries"].as_array().unwrap().len(), 2);
+        assert_eq!(v["entries"][0]["hash"], serde_json::json!("AAAAQ"));
+        assert_eq!(v["entries"][0]["change"], serde_json::json!("add-key"));
+        assert_eq!(
+            v["entries"][0]["signer_key_ids"],
+            serde_json::json!(["tlpub:aabb", "tlpub:ccdd"])
+        );
+        // Raw CBOR IS carried in JSON, so the full AUM can be decoded out-of-band.
+        assert_eq!(v["entries"][0]["raw"], serde_json::json!("a1626b76"));
+    }
+
+    /// The two empty histories must be distinguishable in words, not an empty table: lock off vs.
+    /// lock on with nothing synced to this node yet.
+    #[test]
+    fn format_lock_log_empty_says_which_empty_it_is() {
+        use tailscaled_rs::localapi::LockLogReport;
+        // Lock not in use: the same sentence `lock status` prints, so the two verbs agree.
+        let off = LockLogReport::default();
+        assert_eq!(
+            format_lock_log(&off, false),
+            "Tailnet Lock is NOT enabled.\n\n"
+        );
+        // Lock in use, but this node has synced no chain yet.
+        let on_but_empty = LockLogReport {
+            enabled: true,
+            entries: vec![],
+        };
+        let h = format_lock_log(&on_but_empty, false);
+        assert!(h.starts_with("Tailnet Lock is ENABLED,"), "{h}");
+        assert!(h.contains("no update-chain history has synced"), "{h}");
+        // JSON stays a well-formed object with an empty list in both cases (no null, no bare array).
+        let v: serde_json::Value = serde_json::from_str(&format_lock_log(&off, true)).unwrap();
+        assert_eq!(v["enabled"], serde_json::json!(false));
+        assert_eq!(v["entries"], serde_json::json!([]));
     }
 
     #[test]

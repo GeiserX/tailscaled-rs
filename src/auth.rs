@@ -141,6 +141,9 @@ pub(crate) fn requires_write(request: &crate::localapi::Request) -> bool {
         | Request::GetPrefs
         | Request::ProfileList
         | Request::LockStatus
+        // `lock log` reads the node's already-synced AUM chain locally (no control round-trip, no
+        // mutation) — a read, classified exactly like `lock status`.
+        | Request::LockLog { .. }
         | Request::DnsStatus
         | Request::DnsQuery { .. }
         | Request::Netcheck
@@ -433,6 +436,10 @@ mod tests {
         assert!(
             !requires_write(&Request::LockStatus),
             "lock status only reads TKA status — a read"
+        );
+        assert!(
+            !requires_write(&Request::LockLog { limit: 50 }),
+            "lock log only reads the locally-synced AUM chain — a read"
         );
         assert!(
             !requires_write(&Request::BugReport { note: None }),

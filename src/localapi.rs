@@ -257,6 +257,13 @@ pub enum Request {
     /// Report Tailnet Lock (TKA) status (Go `tailscale lock status`, read-only subset). Replies with
     /// [`Response::Lock`]. Read-only — gated like [`Status`](Request::Status).
     LockStatus,
+    /// Read the Tailnet Lock update-chain history (Go `tailscale lock log`, i.e. Go
+    /// `LocalClient.NetworkLockLog`). Replies with [`Response::LockLog`]. Read-only — gated like
+    /// [`Status`](Request::Status): the engine reads the node's already-synced + verified AUM chain
+    /// locally, with no control round-trip and no mutation. `limit` caps how many entries come back,
+    /// counted from the chain head (newest) backwards; the CLI defaults it to Go's `--limit` default
+    /// of 50.
+    LockLog { limit: usize },
     /// Initialize Tailnet Lock with this node as the sole initial trusted key (Go `tailscale lock
     /// init`, single-node case). Submits the signed genesis to control; replies with
     /// [`Response::Ok`]/[`Response::Error`]. A **write** — gated like `up`/`down` (root/same-uid): it
@@ -638,6 +645,9 @@ pub enum Response {
     },
     /// Tailnet Lock (TKA) status (reply to [`Request::LockStatus`]), rendered by `tnet lock status`.
     Lock(LockReport),
+    /// Tailnet Lock (TKA) update-chain history (reply to [`Request::LockLog`]), rendered by
+    /// `tnet lock log`.
+    LockLog(LockLogReport),
     /// The control-pushed MagicDNS configuration (reply to [`Request::DnsStatus`]), rendered by
     /// `tnet dns status`.
     DnsStatus(DnsStatusReport),
@@ -1227,6 +1237,53 @@ pub struct LockReport {
     pub disabled: bool,
 }
 
+/// Tailnet Lock (TKA) update-chain history in a [`Response::LockLog`] reply (Go `tailscale lock
+/// log`). Mirrors the engine's `Vec<TkaLogEntry>`, plus the lock-enabled flag from `tka_status` so
+/// the CLI can tell "lock is off" apart from "lock is on but no chain has synced here yet" — an
+/// empty entry list alone cannot distinguish the two.
+///
+/// Container-level `#[serde(default)]`: every field is omittable on the wire and falls back to
+/// [`LockLogReport::default`], so a JSON document missing any field deserializes instead of
+/// hard-erroring. `entries` keeps its `skip_serializing_if` so an empty history is dropped on the wire.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LockLogReport {
+    /// Whether Tailnet Lock is in use (control sent TKA info for this node) — the same signal
+    /// [`LockReport::enabled`] carries.
+    pub enabled: bool,
+    /// The update-chain entries, **head-first** (newest → oldest), already truncated to the
+    /// requested limit by the engine.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<LockLogEntry>,
+}
+
+/// One update-chain entry in a [`LockLogReport`] — the daemon's wire form of the engine's
+/// `TkaLogEntry` (Go `ipnstate.NetworkLockUpdate`). The engine's byte fields are pre-rendered to
+/// their text forms *daemon-side* so the wire DTO stays plain strings (the same pattern
+/// [`DnsStatusReport`] uses for resolver addresses) and the CLI never has to name an engine type.
+///
+/// Container-level `#[serde(default)]` for the same forward-compat reason as [`LockLogReport`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LockLogEntry {
+    /// The AUM's chain-link hash (Go `NetworkLockUpdate.Hash`) in Go's text form: RFC 4648 standard
+    /// base32, no padding — the same encoding [`LockReport::head`] carries, so the newest entry's
+    /// hash is directly comparable with the head `tnet lock status` prints.
+    pub hash: String,
+    /// The change kind (Go `NetworkLockUpdate.Change`), e.g. `add-key` / `remove-key` / `checkpoint`.
+    pub change: String,
+    /// The id of each trusted key that signed this AUM, hex-encoded and `tlpub:`-prefixed — the form
+    /// Go prints tailnet-lock key ids in. Empty for an unsigned AUM (the genesis checkpoint).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub signer_key_ids: Vec<String>,
+    /// The AUM's canonical CBOR serialization (Go `NetworkLockUpdate.Raw`), hex-encoded. Carried so
+    /// an operator can decode the full AUM out-of-band; the daemon itself never decodes it (it has no
+    /// AUM decoder), which is why `tnet lock log`'s human output cannot print Go's per-kind key
+    /// detail. Emitted only by `tnet lock log --json`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub raw: String,
+}
+
 /// The control-pushed MagicDNS configuration in a [`Response::DnsStatus`] reply (Go `tailscale dns
 /// status`, the MagicDNS-configuration sections). Mirrors the engine's `tailscale::DnsConfig`, but
 /// stored as this crate's own wire types (resolver addresses pre-rendered to strings via
@@ -1603,6 +1660,50 @@ mod tests {
             serde_json::from_str::<Request>(r#"{"cmd":"reload_config"}"#).unwrap(),
             Request::ReloadConfig
         ));
+    }
+
+    #[test]
+    fn lock_log_wire_format_round_trips() {
+        // `lock log` (Go `tailscale lock log`): the CLI and daemon are separate processes agreeing
+        // only on this JSON, so pin both discriminants and the field names.
+        assert_eq!(
+            serde_json::to_string(&Request::LockLog { limit: 50 }).unwrap(),
+            r#"{"cmd":"lock_log","limit":50}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<Request>(r#"{"cmd":"lock_log","limit":7}"#).unwrap(),
+            Request::LockLog { limit: 7 }
+        ));
+
+        let report = LockLogReport {
+            enabled: true,
+            entries: vec![LockLogEntry {
+                hash: "MZXW6YTBOI".to_string(),
+                change: "add-key".to_string(),
+                signer_key_ids: vec!["tlpub:aabb".to_string()],
+                raw: "a1626b76".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&Response::LockLog(report.clone())).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"lock_log","enabled":true,"entries":[{"hash":"MZXW6YTBOI","change":"add-key","signer_key_ids":["tlpub:aabb"],"raw":"a1626b76"}]}"#
+        );
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::LockLog(back) => assert_eq!(back, report),
+            other => panic!("expected a lock_log reply, got {other:?}"),
+        }
+
+        // Empty history: the entries list is dropped on the wire, and a document missing it (or
+        // missing `enabled`) still deserializes to the default rather than hard-erroring.
+        assert_eq!(
+            serde_json::to_string(&Response::LockLog(LockLogReport::default())).unwrap(),
+            r#"{"kind":"lock_log","enabled":false}"#
+        );
+        match serde_json::from_str::<Response>(r#"{"kind":"lock_log"}"#).unwrap() {
+            Response::LockLog(back) => assert_eq!(back, LockLogReport::default()),
+            other => panic!("expected a lock_log reply, got {other:?}"),
+        }
     }
 
     #[test]

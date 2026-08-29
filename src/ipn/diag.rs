@@ -67,6 +67,98 @@ pub(super) async fn lock_status(dev: &tailscale::Device) -> Response {
     }
 }
 
+/// Read the Tailnet Lock update-chain history (the `tnet lock log` / Go `tailscale lock log`
+/// read-only path). Calls [`Device::tka_log`](tailscale::Device::tka_log) — the Rust analog of Go
+/// `LocalClient.NetworkLockLog` — for up to `limit` entries of this node's already-synced + verified
+/// AUM chain, **head-first** (newest → oldest). A pure local read: no control round-trip, no
+/// mutation.
+///
+/// The engine's `TkaLogEntry` carries raw bytes; they are rendered to their text forms HERE so the
+/// wire [`LockLogEntry`](crate::localapi::LockLogEntry) stays plain strings: the AUM hash as RFC 4648
+/// base32 (no padding) — Go `AUMHash`'s text form, and the same encoding `lock status` reports the
+/// head in — and the signer key ids as `tlpub:<hex>` (Go's tailnet-lock key-id rendering). The raw
+/// CBOR is hex-encoded and carried verbatim for out-of-band decoding.
+///
+/// [`tka_status`](tailscale::Device::tka_status) is queried alongside purely to set
+/// [`LockLogReport::enabled`](crate::localapi::LockLogReport::enabled): an empty entry list on its own
+/// cannot tell "lock is not in use" apart from "lock is on but no chain has synced to this node yet",
+/// and the CLI must say which. Either engine call failing surfaces as a clear [`Response::Error`].
+pub(super) async fn lock_log(dev: &tailscale::Device, limit: usize) -> Response {
+    let enabled = match dev.tka_status().await {
+        Ok(status) => status.is_some(),
+        Err(e) => {
+            return Response::Error {
+                message: format!("tailnet lock status query failed: {e}"),
+            };
+        }
+    };
+    let entries = match dev.tka_log(limit).await {
+        Ok(entries) => entries,
+        Err(e) => {
+            return Response::Error {
+                message: format!("tailnet lock log query failed: {e}"),
+            };
+        }
+    };
+    Response::LockLog(crate::localapi::LockLogReport {
+        enabled,
+        entries: entries
+            .into_iter()
+            .map(|e| crate::localapi::LockLogEntry {
+                hash: base32_nopad(&e.aum_hash),
+                change: e.change,
+                signer_key_ids: e
+                    .signer_key_ids
+                    .iter()
+                    .map(|id| format!("tlpub:{}", encode_hex(id)))
+                    .collect(),
+                raw: encode_hex(&e.raw),
+            })
+            .collect(),
+    })
+}
+
+/// Encode bytes as RFC 4648 **standard** base32 with **no** padding — the text form Go's
+/// `tka.AUMHash` marshals to (`base32.StdEncoding.WithPadding(base32.NoPadding)`), and therefore the
+/// form control's authority head arrives in on `TkaStatus::head`. Rendering `tka_log`'s raw
+/// `[u8; 32]` hashes the same way is what makes a `lock log` row comparable with the head that
+/// `lock status` prints.
+///
+/// Written out here (rather than taking a base32 dependency, or depending on the engine's `ts_tka`
+/// crate just to reach `AumHash::to_base32`) for the same reason [`decode_hex`] is: one small,
+/// self-contained, test-pinned helper beats a dependency for a single use.
+fn base32_nopad(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut out = String::with_capacity(data.len().div_ceil(5) * 8);
+    // Standard big-endian bit packing: fill a buffer 8 bits at a time, emitting a symbol per whole
+    // 5 bits; any trailing 1-4 bits are left-aligned into a final symbol (no padding is appended).
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    for &byte in data {
+        acc = (acc << 8) | u32::from(byte);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            out.push(ALPHABET[((acc >> bits) & 0x1f) as usize] as char);
+        }
+    }
+    if bits > 0 {
+        out.push(ALPHABET[((acc << (5 - bits)) & 0x1f) as usize] as char);
+    }
+    out
+}
+
+/// Encode bytes as lowercase hex. The inverse of [`decode_hex`]; used to render the TKA log's signer
+/// key ids and raw AUM CBOR onto the (string-only) wire DTO.
+fn encode_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut s, b| {
+        // Writing into a String is infallible.
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
 /// Initialize Tailnet Lock with this node as the sole initial trusted key (the `tnet lock init` / Go
 /// `tailscale lock init` single-node path). Hex-decodes the operator-supplied disablement secret and
 /// calls [`Device::tka_init`](tailscale::Device::tka_init), which builds + signs the genesis
@@ -1692,6 +1784,39 @@ mod tests {
             t.to_string(),
             "to_rfc3339 must differ from the Display form"
         );
+    }
+
+    /// `base32_nopad` must match Go's `base32.StdEncoding.WithPadding(base32.NoPadding)` — the
+    /// encoding `tka.AUMHash` marshals with — including the partial-final-group case, since a 32-byte
+    /// AUM hash is 51.2 symbols and so always ends on a partial group.
+    #[test]
+    fn base32_nopad_matches_go_std_encoding_no_padding() {
+        use super::base32_nopad;
+        // RFC 4648 §10 test vectors, with the padding dropped (Go's NoPadding).
+        assert_eq!(base32_nopad(b""), "");
+        assert_eq!(base32_nopad(b"f"), "MY");
+        assert_eq!(base32_nopad(b"fo"), "MZXQ");
+        assert_eq!(base32_nopad(b"foo"), "MZXW6");
+        assert_eq!(base32_nopad(b"foob"), "MZXW6YQ");
+        assert_eq!(base32_nopad(b"fooba"), "MZXW6YTB");
+        assert_eq!(base32_nopad(b"foobar"), "MZXW6YTBOI");
+        // A 32-byte hash → 52 symbols (256 bits = 51 whole 5-bit groups + a 1-bit remainder that is
+        // left-aligned into a final symbol), no '=' anywhere.
+        let hash = [0xffu8; 32];
+        let text = base32_nopad(&hash);
+        assert_eq!(text.len(), 52, "{text}");
+        assert!(!text.contains('='), "{text}");
+        // All-ones: 51 full 'seven' symbols then the 1 remaining bit left-aligned → 'Q' (0b10000).
+        assert_eq!(text, format!("{}Q", "7".repeat(51)));
+    }
+
+    #[test]
+    fn encode_hex_round_trips_through_decode_hex() {
+        use super::{decode_hex, encode_hex};
+        assert_eq!(encode_hex(&[]), "");
+        assert_eq!(encode_hex(&[0x00, 0x0f, 0xa5, 0xff]), "000fa5ff");
+        let bytes = vec![0xde, 0xad, 0xbe, 0xef, 0x00, 0x7f];
+        assert_eq!(decode_hex(&encode_hex(&bytes)).unwrap(), bytes);
     }
 
     #[test]

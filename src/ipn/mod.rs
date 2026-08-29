@@ -2895,6 +2895,13 @@ impl Backend {
         diag::lock_status(dev).await
     }
 
+    /// Read the Tailnet Lock update-chain history (the `tnet lock log` path). Thin `pub` shim over
+    /// [`diag::lock_log`]. See it for the `tka_log` → [`LockLogReport`](crate::localapi::LockLogReport)
+    /// mapping (and why `tka_status` is queried alongside).
+    pub async fn lock_log(dev: &tailscale::Device, limit: usize) -> crate::localapi::Response {
+        diag::lock_log(dev, limit).await
+    }
+
     /// Initialize Tailnet Lock (the `tnet lock init` path). Thin `pub` shim over [`diag::lock_init`]
     /// (hex-decodes the disablement secret and calls `Device::tka_init`).
     pub async fn lock_init(dev: &tailscale::Device, secret_hex: &str) -> crate::localapi::Response {
