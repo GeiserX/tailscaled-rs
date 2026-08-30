@@ -485,8 +485,9 @@ pub enum Request {
     },
     /// Delete a profile (Go `tailscale switch remove`). The target may be an id or a display name,
     /// like [`SwitchProfile`](Request::SwitchProfile). Refuses a target that matches no known profile
-    /// (Go: `No profile named %q`), and refuses the current/default profile. A WRITE — gated like
-    /// `up`/`down`.
+    /// (Go: `No profile named %q`) and the reserved `default` profile. Naming the profile that is
+    /// currently active is a **success** that removes nothing, as in Go (`Already on account %q`,
+    /// exit 0); the `Ok` message says so. A WRITE — gated like `up`/`down`.
     DeleteProfile {
         /// The profile id to remove.
         target: String,

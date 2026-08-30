@@ -1564,6 +1564,51 @@ impl SwitchOutcome {
     }
 }
 
+/// What a `switch remove` actually did — the analogue of the two exits Go's `removeProfile` takes
+/// once it has matched a profile (`cmd/tailscale/cli/switch.go`).
+///
+/// Go removes the matched profile *unless it is the current one*, and the current-profile case is a
+/// plain **success**: `if profID == cp.ID { printf("Already on account %q\n", args[0]); os.Exit(0) }`
+/// — nothing is deleted and the command exits 0. (The wording is `switchProfile`'s, reused verbatim
+/// there; the behaviour is what matters.) Collapsing that into an error, as this daemon did, breaks
+/// every ported caller that walks a list of profiles and removes each: under Go the active one is
+/// skipped and the loop finishes, here it exited non-zero. So the "not removed" case is typed and
+/// reported rather than raised, exactly like [`SwitchOutcome::AlreadyCurrent`] — the protection Go
+/// has (the active profile is never deleted out from under the running device) is kept; only the
+/// exit status changes, to Go's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    /// The profile was removed: its prefs+key files are gone and its `profiles.json` entry with them.
+    Removed {
+        /// The canonical id `target` resolved to.
+        id: String,
+    },
+    /// `target` resolved to the profile that is **currently active**, so nothing was removed. Go's
+    /// `Already on account %q` + `os.Exit(0)` — a success, not a refusal.
+    AlreadyCurrent {
+        /// The canonical id `target` resolved to, still the active profile and still on disk.
+        id: String,
+    },
+}
+
+impl DeleteOutcome {
+    /// The one-line human report for this outcome, as the LocalAPI `Ok` message.
+    ///
+    /// Names the resolved **id** rather than echoing the caller's argument (Go prints `args[0]`):
+    /// the argument may have been a display name, and the id is what `--list` and every follow-up
+    /// command are keyed by. The already-current line keeps Go's leading clause but says outright
+    /// that nothing was removed — Go's bare `Already on account %q` is `switchProfile`'s message
+    /// reused, and after `switch remove` it reads as if the removal had happened.
+    pub fn report(&self) -> String {
+        match self {
+            DeleteOutcome::Removed { id } => format!("removed profile {id:?}"),
+            DeleteOutcome::AlreadyCurrent { id } => {
+                format!("already on profile {id:?}; not removed — switch away first to remove it")
+            }
+        }
+    }
+}
+
 /// Whether the key file at `key_path` holds a usable persisted node key — a **pure, side-effect-free**
 /// read (the on-disk source of truth behind both [`Backend::has_persisted_node_key`] and the
 /// [`has_node_key`](Backend::has_node_key) cache). One source of truth so the cache's startup seed
@@ -1842,8 +1887,8 @@ impl Backend {
         })
     }
 
-    /// Delete profile `target` (the analogue of Go `tailscale switch remove`), returning the
-    /// canonical id that was removed.
+    /// Delete profile `target` (the analogue of Go `tailscale switch remove`), reporting what it did
+    /// as a [`DeleteOutcome`].
     ///
     /// `target` is resolved by id **or display name**, exactly like [`switch_profile`](Backend::switch_profile)
     /// — Go shares one `matchProfile` between `switch` and `switch remove`, so a name that can be
@@ -1852,10 +1897,20 @@ impl Backend {
     /// reported success would tell the operator a profile is gone while it is still on disk. That
     /// makes `remove` non-idempotent, like Go's.
     ///
-    /// Refuses to delete the **current** profile (Go switches away first; we require the operator to
-    /// switch away, which is the safer, more explicit contract) and refuses to delete the reserved
-    /// `default` profile. Removes the profile's prefs+key files and its `profiles.json` entry.
-    pub async fn delete_profile(&mut self, target: &str) -> Result<String> {
+    /// The **current** profile is never deleted, and — as in Go — that is a success, not an error:
+    /// `removeProfile` answers `Already on account %q` and exits 0 without touching it, so a caller
+    /// looping over profiles simply skips the active one. This returns
+    /// [`DeleteOutcome::AlreadyCurrent`] for that case; see [`DeleteOutcome`] for why it is typed
+    /// rather than raised. Checked BEFORE the `default` arm below, so `switch remove default` while
+    /// on the default profile takes Go's already-current path rather than a refusal Go never makes.
+    ///
+    /// The reserved `default` profile is refused when it is *not* current — an extra refusal with no
+    /// upstream counterpart, because unlike Go's profiles it is not removable state: it lives at the
+    /// legacy top-level `prefs.json`/`node.key.json` paths and always exists (see this module's
+    /// layout docs), so there is no "removed" state for it to reach.
+    ///
+    /// A removal takes the profile's prefs+key files and its `profiles.json` entry.
+    pub async fn delete_profile(&mut self, target: &str) -> Result<DeleteOutcome> {
         // Resolve by id or name before anything else — an unknown target must not read as a
         // successful no-op removal. The resolver only ever returns ids that are safe as a single
         // path component, which is what the file removals below rely on.
@@ -1863,13 +1918,14 @@ impl Backend {
         let resolved = profile::resolve_target_to_id(target, &meta)
             .ok_or_else(|| anyhow!("no profile named {target:?}"))?;
         let target: &str = &resolved;
+        if target == self.current_profile {
+            // Go's `if profID == cp.ID`: nothing is removed and the command succeeds.
+            return Ok(DeleteOutcome::AlreadyCurrent {
+                id: target.to_string(),
+            });
+        }
         if target == profile::DEFAULT_PROFILE_ID {
             return Err(anyhow!("the default profile cannot be removed"));
-        }
-        if target == self.current_profile {
-            return Err(anyhow!(
-                "cannot remove the current profile {target:?}; switch to another profile first"
-            ));
         }
         // Remove the profile's files (tolerate already-absent — idempotent).
         let (prefs_path, key_path) = profile::profile_paths(&self.state_dir, target);
@@ -1892,7 +1948,9 @@ impl Backend {
                 .await
                 .with_context(|| "persisting profiles.json after delete")?;
         }
-        Ok(target.to_string())
+        Ok(DeleteOutcome::Removed {
+            id: target.to_string(),
+        })
     }
 
     /// Bump the monotonic [`generation`](Backend::generation) **and** notify lifecycle watchers. The
@@ -4843,37 +4901,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn profile_delete_refuses_current_and_default_but_removes_others() {
+    async fn profile_delete_skips_the_current_profile_as_a_success_and_removes_others() {
+        // Go's `removeProfile` never deletes the profile that is current, and says so as a SUCCESS:
+        // `if profID == cp.ID { printf("Already on account %q\n", args[0]); os.Exit(0) }`. This
+        // daemon used to raise an error there, so a ported script that walks a profile list and
+        // removes each one finished under Go and exited non-zero here. The profile is still not
+        // deleted — only the report and the exit status change.
         let dir = std::env::temp_dir().join(format!("tailnetd-prof-del-{}", std::process::id()));
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let mut be = Backend::load(&dir).await.unwrap();
 
-        // Create + populate "work", then switch back to default so "work" is deletable.
+        // Create + populate "work" (switching to an unused id creates it) and stay on it.
         be.switch_profile("work").await.unwrap();
         be.prefs.hostname = Some("work-host".into());
         be.persist_prefs().await.unwrap();
-        be.switch_profile(profile::DEFAULT_PROFILE_ID)
-            .await
-            .unwrap();
 
-        // Refuses the default profile and the current profile.
+        // While on "work": the reserved `default` profile is refused. That refusal has no upstream
+        // counterpart — Go has no such profile — and stands because `default` is not removable
+        // state: it lives at the legacy top-level paths and always exists.
         assert!(
             be.delete_profile(profile::DEFAULT_PROFILE_ID)
                 .await
                 .is_err()
         );
-        // (current is now default) — deleting current also refused:
-        assert!(
-            be.delete_profile(&be.current_profile.clone())
-                .await
-                .is_err()
-        );
 
-        // Removes a non-current named profile + its files, and reports the id it removed.
+        // Naming the CURRENT profile removes nothing and SUCCEEDS (Go's already-current exit).
         let (work_prefs, _) = profile::profile_paths(&dir, "work");
         assert!(tokio::fs::try_exists(&work_prefs).await.unwrap());
-        assert_eq!(be.delete_profile("work").await.unwrap(), "work");
+        assert_eq!(
+            be.delete_profile("work").await.unwrap(),
+            DeleteOutcome::AlreadyCurrent { id: "work".into() },
+            "removing the current profile must be a no-op success, as in Go"
+        );
+        assert!(
+            tokio::fs::try_exists(&work_prefs).await.unwrap(),
+            "the current profile's prefs must survive the no-op removal"
+        );
+        assert!(
+            be.list_profiles().await.iter().any(|e| e.id == "work"),
+            "the current profile must still be listed after the no-op removal"
+        );
+
+        // Switch away, then the same target is really removed — files and listing entry both.
+        be.switch_profile(profile::DEFAULT_PROFILE_ID)
+            .await
+            .unwrap();
+        // The current-profile check runs BEFORE the `default` one, so naming the current profile
+        // takes Go's already-current path even when it is `default` (which is otherwise refused).
+        assert_eq!(
+            be.delete_profile(profile::DEFAULT_PROFILE_ID)
+                .await
+                .unwrap(),
+            DeleteOutcome::AlreadyCurrent {
+                id: profile::DEFAULT_PROFILE_ID.into()
+            }
+        );
+        assert_eq!(
+            be.delete_profile("work").await.unwrap(),
+            DeleteOutcome::Removed { id: "work".into() }
+        );
         assert!(!tokio::fs::try_exists(&work_prefs).await.unwrap());
         // It's gone from the list (only default remains).
         let list = be.list_profiles().await;
@@ -4921,8 +5008,66 @@ mod tests {
             .unwrap();
 
         // Remove by DISPLAY NAME: resolves to the id, and the id is what comes back.
-        assert_eq!(be.delete_profile("Work tailnet").await.unwrap(), "work");
+        assert_eq!(
+            be.delete_profile("Work tailnet").await.unwrap(),
+            DeleteOutcome::Removed { id: "work".into() }
+        );
         assert!(!be.list_profiles().await.iter().any(|e| e.id == "work"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn switch_resolves_a_display_name_two_profiles_share_instead_of_conjuring_a_third() {
+        // Go's `matchProfile` name pass returns the FIRST profile whose `Name` matches, so a
+        // nickname two profiles share is a usable target. This daemon's resolver answered `None` for
+        // it, and `switch_profile`'s no-match arm treats a syntactically valid target as a NEW
+        // profile id — so `tnet switch shared` did not even refuse: it created a third profile
+        // literally called "shared" and switched to that. Now the name resolves, like Go's.
+        let dir = std::env::temp_dir().join(format!("tailnetd-prof-dup-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = Backend::load(&dir).await.unwrap();
+
+        // Two profiles that both carry the nickname "shared" (Go's `LoginProfile.Name`, what
+        // `set --nickname` writes here). `alpha` sorts first in `profiles.json`'s map.
+        for id in ["alpha", "beta"] {
+            be.switch_profile(id).await.unwrap();
+            be.persist_prefs().await.unwrap();
+        }
+        let mut meta = profile::load_profiles_file(&dir).await;
+        for id in ["alpha", "beta"] {
+            meta.profiles.insert(
+                id.to_string(),
+                profile::ProfileMeta {
+                    name: "shared".to_string(),
+                },
+            );
+        }
+        profile::save_profiles_file(&dir, &meta).await.unwrap();
+        be.switch_profile(profile::DEFAULT_PROFILE_ID)
+            .await
+            .unwrap();
+
+        // The shared name switches to the first match rather than being refused or creating anew.
+        match be.switch_profile("shared").await.unwrap() {
+            SwitchOutcome::Switched { id, .. } => assert_eq!(
+                id, "alpha",
+                "a shared nickname must resolve to the first matching profile, as Go's pass does"
+            ),
+            other => panic!("expected a real switch, got {other:?}"),
+        }
+        assert!(
+            !be.list_profiles().await.iter().any(|e| e.id == "shared"),
+            "the shared name must not be taken for a new profile id"
+        );
+
+        // `switch remove` shares the resolver, so it agrees: the name names `alpha`, which is now
+        // current — Go's already-current success, not a removal and not a refusal.
+        assert_eq!(
+            be.delete_profile("shared").await.unwrap(),
+            DeleteOutcome::AlreadyCurrent { id: "alpha".into() }
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
