@@ -1490,7 +1490,9 @@ enum SyspolicyCmd {
 enum SwitchCmd {
     /// Remove a profile (delete its prefs + node key). The profile may be named by id or by display
     /// name, like `switch` itself; a name that matches no profile is refused (Go: `No profile named
-    /// %q`) rather than reported as a removal. Cannot remove the current or default profile.
+    /// %q`) rather than reported as a removal. Naming the profile you are currently on removes
+    /// nothing and succeeds, as in Go (`Already on account %q`, exit 0) — switch away first to
+    /// remove it. The reserved `default` profile cannot be removed at all.
     Remove {
         /// The profile id (or display name) to remove.
         ///

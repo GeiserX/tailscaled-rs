@@ -1158,14 +1158,25 @@ async fn dispatch(
             }
         }
         // `switch remove <id>` (Go `tailscale switch remove`). Refuses an unknown profile, and the
-        // current/default profile.
+        // reserved `default` one; the CURRENT profile is left alone and reported as a success, which
+        // is what Go's `removeProfile` does (`Already on account %q`, exit 0) — see `DeleteOutcome`.
         Request::DeleteProfile { target } => {
             let mut be = backend.lock().await;
             match be.delete_profile(&target).await {
                 // Report the resolved id, not the caller's argument (which may have been a name).
-                Ok(id) => Response::Ok {
-                    message: format!("removed profile {id:?}"),
-                },
+                Ok(outcome) => {
+                    match &outcome {
+                        crate::ipn::DeleteOutcome::Removed { id } => {
+                            tracing::info!(profile = %id, "switch remove: profile deleted");
+                        }
+                        crate::ipn::DeleteOutcome::AlreadyCurrent { id } => {
+                            tracing::info!(profile = %id, "switch remove: target is the current profile; nothing removed");
+                        }
+                    }
+                    Response::Ok {
+                        message: outcome.report(),
+                    }
+                }
                 Err(e) => Response::Error {
                     message: format!("{e:#}"),
                 },
