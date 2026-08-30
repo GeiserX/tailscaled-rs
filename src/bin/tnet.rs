@@ -908,10 +908,11 @@ enum ConfigureCmd {
     /// [ALPHA] Generate a kubeconfig that reaches a Kubernetes cluster through a Tailscale auth-proxy
     /// peer (Go `tailscale configure kubeconfig <hostname-or-fqdn>`). The argument names the tailnet
     /// peer running the auth proxy in front of the cluster's API server — a bare hostname, its full
-    /// MagicDNS name, or one of its tailnet IPs; it is resolved against the current netmap, and the
-    /// resolved MagicDNS name becomes the cluster `server` URL, the context, and the user entry.
-    /// Authentication is the proxy's job (it maps the calling tailnet identity to a Kubernetes user),
-    /// so the generated user entry deliberately carries no credential.
+    /// MagicDNS name, or one of its tailnet IPs, optionally prefixed with `http://`/`https://`; it is
+    /// resolved against the current netmap, and the resolved MagicDNS name becomes the cluster
+    /// `server` URL and the context. The user entry is the shared `tailscale-auth` one Go writes,
+    /// carrying the placeholder token Go uses: the proxy authenticates the caller by its tailnet
+    /// identity, and the token only stops kubectl prompting for a username and password.
     ///
     /// DEVIATION from Go: Go merges the new cluster/context/user into your existing kubeconfig via
     /// the Kubernetes client libraries. This fork EMITS a standalone kubeconfig instead (stdout by
@@ -923,6 +924,10 @@ enum ConfigureCmd {
         /// The auth-proxy peer: a bare hostname, a full MagicDNS name, or a tailnet IP.
         #[arg(value_name = "HOSTNAME_OR_FQDN")]
         host: String,
+        /// Use HTTP instead of HTTPS to connect to the auth proxy. Ignored if you include a scheme
+        /// in the hostname argument (Go `tailscale configure kubeconfig --http`).
+        #[arg(long)]
+        http: bool,
         /// Write the kubeconfig to PATH (mode `0600`) instead of stdout. `-` also means stdout.
         /// Refuses to overwrite an existing file unless `--force` is given — this build cannot merge,
         /// so a blind overwrite would silently drop every other cluster in that file.
@@ -2349,10 +2354,11 @@ async fn main() -> Result<()> {
             cmd:
                 ConfigureCmd::Kubeconfig {
                     host,
+                    http,
                     output,
                     force,
                 },
-        } => run_configure_kubeconfig(&socket, &host, output.as_deref(), force).await,
+        } => run_configure_kubeconfig(&socket, &host, http, output.as_deref(), force).await,
     }
 }
 
@@ -8961,9 +8967,15 @@ fn format_serve_status(cfg: &tailscaled_rs::localapi::ServeConfig, _json: bool) 
 async fn run_configure_kubeconfig(
     socket: &std::path::Path,
     host: &str,
+    http: bool,
     output: Option<&str>,
     force: bool,
 ) -> Result<()> {
+    // Go parses the argument BEFORE it talks to the daemon, so a usage mistake is refused without a
+    // round trip: an empty argument is `flag.ErrHelp`, and a scheme in the argument decides http-vs-
+    // https regardless of `--http`.
+    let (host, scheme) = kubeconfig_inputs(host, http)?;
+    let host = host.as_str();
     let status = match round_trip(socket, &Request::Status).await {
         Ok(Response::Status(s)) => s,
         Ok(Response::Error { message }) => {
@@ -8994,19 +9006,22 @@ async fn run_configure_kubeconfig(
     // built by string interpolation. Both are only safe because the name is constrained to a DNS
     // charset here; keep this check in front of `render_kubeconfig`, which relies on it.
     validate_kube_fqdn(&fqdn)?;
-    let kubeconfig = render_kubeconfig(&fqdn);
+    let kubeconfig = render_kubeconfig(scheme, &fqdn);
+    let url = format!("{scheme}{fqdn}");
 
+    // Go's closing line is `kubeconfig configured for %q at URL %q`; this fork appends where the
+    // document went, since it wrote a new file rather than editing the one kubectl already reads.
     match output {
         None | Some("-") => {
             use std::io::Write as _;
             std::io::stdout()
                 .write_all(kubeconfig.as_bytes())
                 .context("writing the kubeconfig to stdout")?;
-            eprintln!("kubeconfig for {fqdn} written to stdout");
+            eprintln!("kubeconfig configured for {fqdn:?} at URL {url:?} — written to stdout");
         }
         Some(path) => {
             write_kubeconfig_file(path, &kubeconfig, force)?;
-            println!("kubeconfig for {fqdn} written to {path}");
+            println!("kubeconfig configured for {fqdn:?} at URL {url:?} — written to {path}");
         }
     }
     // Say plainly what this build did NOT do, so nobody assumes `~/.kube/config` was updated.
@@ -9017,6 +9032,48 @@ async fn run_configure_kubeconfig(
     Ok(())
 }
 
+/// Split the `<hostname-or-fqdn>` argument into the name to resolve and the scheme the cluster URL
+/// gets, porting Go's `getInputs` (plus the empty-argument arm of `runConfigureKubeconfig`).
+///
+/// Go runs the argument through `url.Parse`: an `http`/`https` scheme in the argument wins over
+/// `--http` in BOTH directions (`https://host` stays HTTPS even with `--http`, `http://host` is
+/// plaintext without it) and the host is what gets resolved; anything else is a bare name and the
+/// flag decides. Go's `len(args) != 1 || args[0] == ""` arm returns `flag.ErrHelp`, so an empty
+/// argument is a usage refusal, not a peer lookup for the empty name. clap already refuses a missing
+/// argument; the empty-string one has to be refused here.
+///
+/// The authority is taken the way `url.Parse` fills `u.Host`: everything after the scheme, up to the
+/// first `/`, `?` or `#`, with any `userinfo@` prefix dropped. Whatever survives still has to match a
+/// peer and pass [`validate_kube_fqdn`], so a port or a path in the argument fails loudly rather than
+/// being spliced into the server URL.
+fn kubeconfig_inputs(arg: &str, http_flag: bool) -> Result<(String, &'static str)> {
+    if arg.is_empty() {
+        anyhow::bail!(
+            "configure kubeconfig: needs a <hostname-or-fqdn> argument — the tailnet peer running \
+             the auth proxy in front of the cluster's API server"
+        );
+    }
+    for scheme in ["https://", "http://"] {
+        // `get`, not a bare slice: the argument is arbitrary argv, so indexing by a byte length can
+        // land inside a multi-byte character and panic.
+        if arg
+            .get(..scheme.len())
+            .is_some_and(|p| p.eq_ignore_ascii_case(scheme))
+        {
+            let authority = &arg[scheme.len()..];
+            let authority = authority.split(['/', '?', '#']).next().unwrap_or(authority);
+            let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+            return Ok((host.to_string(), scheme));
+        }
+    }
+    Ok((arg.to_string(), kube_scheme(http_flag)))
+}
+
+/// The URL scheme `--http` selects, in Go's `scheme := "https://"` / `"http://"` spelling.
+fn kube_scheme(http: bool) -> &'static str {
+    if http { "http://" } else { "https://" }
+}
+
 /// Resolve a `<hostname-or-fqdn>` argument to a peer's MagicDNS name, mirroring Go's
 /// `nodeDNSNameFromArg`: a full DNS name, the leading label of one, or a tailnet IP all match, and
 /// name comparison is case-insensitive with a trailing root dot ignored on both sides. Returns the
@@ -9025,6 +9082,9 @@ fn peer_dns_name_from_arg(
     status: &tailscaled_rs::localapi::StatusReport,
     arg: &str,
 ) -> Option<String> {
+    // Go parses the argument with `netip.ParseAddr` first: an argument that IS an address matches
+    // only against the peer's tailnet IPs and never falls through to a name comparison.
+    let arg_ip: Option<std::net::IpAddr> = arg.parse().ok();
     let arg = arg.trim_end_matches('.');
     if arg.is_empty() {
         return None;
@@ -9036,15 +9096,25 @@ fn peer_dns_name_from_arg(
             // kubeconfig from, so it can never be the answer — skip it entirely.
             continue;
         }
+        if let Some(want) = arg_ip {
+            // Compare PARSED addresses, as Go's `slices.Contains(ps.TailscaleIPs, argIP)` does, so an
+            // abbreviated IPv6 literal still matches however the netmap spelled the same address.
+            let hit = [Some(peer.ipv4.as_str()), peer.ipv6.as_deref()]
+                .into_iter()
+                .flatten()
+                .filter_map(|ip| ip.parse::<std::net::IpAddr>().ok())
+                .any(|ip| ip == want);
+            if hit {
+                return Some(name.to_string());
+            }
+            continue;
+        }
         if name.eq_ignore_ascii_case(arg) {
             return Some(name.to_string());
         }
         if let Some((base, _)) = name.split_once('.')
             && base.eq_ignore_ascii_case(arg)
         {
-            return Some(name.to_string());
-        }
-        if peer.ipv4 == arg || peer.ipv6.as_deref() == Some(arg) {
             return Some(name.to_string());
         }
     }
@@ -9091,34 +9161,40 @@ fn validate_kube_fqdn(fqdn: &str) -> Result<()> {
     Ok(())
 }
 
-/// Render the kubeconfig for an auth-proxy peer.
+/// Render the kubeconfig for an auth-proxy peer, in the document Go's `updateKubeconfig` produces
+/// for a previously empty config.
 ///
-/// The shape is what Go produces: the client-go `clientcmd` writer emits the top-level keys in
-/// alphabetical order with `kind: Config` and an empty `preferences`, and Go names the cluster, the
-/// context and the user all after the peer's FQDN. The user entry is empty on purpose — the proxy
-/// authenticates the caller by its tailnet identity, so kubectl must send no credential of its own.
+/// Go builds a `map[string]any` and hands it to `sigs.k8s.io/yaml`, which emits the top-level keys
+/// in alphabetical order: `apiVersion`, `clusters`, `contexts`, `current-context`, `kind`, `users`,
+/// and nothing else (no `preferences` key — Go never sets one). The cluster and the context are
+/// named after the peer's FQDN, but the user is NOT: Go writes one shared `tailscale-auth` entry and
+/// points every Tailscale context at it. That entry carries a placeholder token, quoting Go's
+/// reason — the proxy authorizes by tailnet identity and ignores the token, but with no credential
+/// at all in the user entry kubectl prompts for a username and password.
+///
+/// `scheme` is Go's `"https://"` / `"http://"` (see [`kube_scheme`] and [`kubeconfig_inputs`]).
 ///
 /// Pure + total: the caller has already run [`validate_kube_fqdn`], which is what lets the name be
-/// written as a bare YAML scalar (exactly as client-go writes it) rather than quoted.
-fn render_kubeconfig(fqdn: &str) -> String {
+/// written as a bare YAML scalar (exactly as Go's marshaller writes it) rather than quoted.
+fn render_kubeconfig(scheme: &str, fqdn: &str) -> String {
     // Left-flushed on purpose: the literal IS the emitted file, so it reads as the YAML it produces.
     format!(
         r#"apiVersion: v1
 clusters:
 - cluster:
-    server: https://{fqdn}
+    server: {scheme}{fqdn}
   name: {fqdn}
 contexts:
 - context:
     cluster: {fqdn}
-    user: {fqdn}
+    user: tailscale-auth
   name: {fqdn}
 current-context: {fqdn}
 kind: Config
-preferences: {{}}
 users:
-- name: {fqdn}
-  user: {{}}
+- name: tailscale-auth
+  user:
+    token: unused
 "#
     )
 }
@@ -14116,32 +14192,113 @@ mod tests {
         assert_eq!(peer_dns_name_from_arg(&st, "100.64.0.9"), None);
         // A non-leading label must not match — Go cuts at the FIRST dot only.
         assert_eq!(peer_dns_name_from_arg(&st, "tail0123"), None);
+        // Go parses the argument as an address FIRST: an IP that matches no peer is a miss, never a
+        // name comparison that could match a peer literally named after an address.
+        assert_eq!(peer_dns_name_from_arg(&st, "100.64.0.99"), None);
     }
 
     #[test]
-    fn kubeconfig_render_matches_the_go_client_go_shape() {
-        // Byte-for-byte the document Go's client-go `clientcmd` writer produces for this command:
-        // alphabetical top-level keys, `kind: Config`, an empty `preferences`, and the cluster,
-        // context and user all named after the peer FQDN. The user entry is EMPTY on purpose — the
-        // auth proxy authenticates by tailnet identity, so kubectl must send no credential.
-        let got = render_kubeconfig("k8s-proxy.tail0123.ts.net");
-        let want = "apiVersion: v1\n\
-                    clusters:\n\
-                    - cluster:\n    \
-                        server: https://k8s-proxy.tail0123.ts.net\n  \
-                      name: k8s-proxy.tail0123.ts.net\n\
-                    contexts:\n\
-                    - context:\n    \
-                        cluster: k8s-proxy.tail0123.ts.net\n    \
-                        user: k8s-proxy.tail0123.ts.net\n  \
-                      name: k8s-proxy.tail0123.ts.net\n\
-                    current-context: k8s-proxy.tail0123.ts.net\n\
-                    kind: Config\n\
-                    preferences: {}\n\
-                    users:\n\
-                    - name: k8s-proxy.tail0123.ts.net\n  \
-                      user: {}\n";
-        assert_eq!(got, want, "rendered kubeconfig drifted from the Go shape");
+    fn kubeconfig_peer_ip_match_is_by_address_not_by_spelling() {
+        // Go compares parsed `netip.Addr`s, so an argument that spells the same IPv6 address
+        // differently than the netmap did still resolves.
+        let st = kube_status();
+        let want = Some("k8s-proxy.tail0123.ts.net".to_string());
+        assert_eq!(
+            peer_dns_name_from_arg(&st, "fd7a:115c:a1e0:0:0:0:0:7"),
+            want,
+            "an unabbreviated IPv6 literal is the same address"
+        );
+        assert_eq!(
+            peer_dns_name_from_arg(&st, "FD7A:115C:A1E0::7"),
+            want,
+            "IPv6 literals are hex, so case must not matter"
+        );
+    }
+
+    #[test]
+    fn kubeconfig_render_matches_the_go_golden() {
+        // Byte-for-byte the `empty` case of Go's own `TestKubeconfig`
+        // (cmd/tailscale/cli/configure-kube_test.go, v1.100.0), same peer FQDN: alphabetical
+        // top-level keys and NO `preferences` key, the cluster and context named after the peer, and
+        // the user a single shared `tailscale-auth` entry holding Go's placeholder token — the proxy
+        // ignores the token, but without one kubectl prompts for a username and password.
+        let want = "apiVersion: v1
+clusters:
+- cluster:
+    server: https://foo.tail-scale.ts.net
+  name: foo.tail-scale.ts.net
+contexts:
+- context:
+    cluster: foo.tail-scale.ts.net
+    user: tailscale-auth
+  name: foo.tail-scale.ts.net
+current-context: foo.tail-scale.ts.net
+kind: Config
+users:
+- name: tailscale-auth
+  user:
+    token: unused
+";
+        let got = render_kubeconfig("https://", "foo.tail-scale.ts.net");
+        assert_eq!(got, want, "rendered kubeconfig drifted from the Go golden");
+
+        // Go's `empty_http` case: only the cluster `server` scheme changes.
+        let got_http = render_kubeconfig("http://", "foo.tail-scale.ts.net");
+        assert_eq!(
+            got_http,
+            want.replace(
+                "server: https://foo.tail-scale.ts.net",
+                "server: http://foo.tail-scale.ts.net"
+            ),
+            "--http must change the server URL scheme and nothing else"
+        );
+    }
+
+    #[test]
+    fn kubeconfig_inputs_port_go_getinputs() {
+        // Go's `TestGetInputs` matrix: for every argument shape × every scheme prefix × `--http`,
+        // the host to resolve is the argument with the scheme stripped, and a scheme in the argument
+        // decides http-vs-https in BOTH directions, overriding the flag.
+        for arg in ["foo.tail-scale.ts.net", "foo", "127.0.0.1"] {
+            for prefix in ["", "https://", "http://"] {
+                for http_flag in [false, true] {
+                    let want_http = (http_flag && prefix != "https://") || prefix == "http://";
+                    let want_scheme = if want_http { "http://" } else { "https://" };
+                    let (host, scheme) =
+                        kubeconfig_inputs(&format!("{prefix}{arg}"), http_flag).unwrap();
+                    assert_eq!(host, arg, "host for {prefix}{arg} (--http={http_flag})");
+                    assert_eq!(
+                        scheme, want_scheme,
+                        "scheme for {prefix}{arg} (--http={http_flag})"
+                    );
+                }
+            }
+        }
+        // `url.Parse` lowercases the scheme, and fills `u.Host` from the authority only — a path,
+        // query or fragment is not part of the name to resolve, and neither is any `userinfo@`.
+        assert_eq!(
+            kubeconfig_inputs("HTTPS://foo.tail-scale.ts.net/api?x=1#f", true).unwrap(),
+            ("foo.tail-scale.ts.net".to_string(), "https://")
+        );
+        assert_eq!(
+            kubeconfig_inputs("http://someone@foo.tail-scale.ts.net", false).unwrap(),
+            ("foo.tail-scale.ts.net".to_string(), "http://")
+        );
+        // A non-ASCII argument is still just argv: it must be handled as a bare name, never sliced
+        // through a multi-byte character.
+        assert_eq!(
+            kubeconfig_inputs("https:/\u{e9}", false).unwrap(),
+            ("https:/\u{e9}".to_string(), "https://"),
+            "a near-miss on the scheme prefix is a bare name"
+        );
+        // Go's `args[0] == ""` arm is `flag.ErrHelp` — a usage refusal, not a lookup of the empty
+        // name against the netmap (which would report "no peer" and hide the real mistake).
+        let err = kubeconfig_inputs("", false).expect_err("an empty argument is a usage error");
+        assert!(
+            err.to_string()
+                .contains("needs a <hostname-or-fqdn> argument"),
+            "the refusal should name the missing argument: {err}"
+        );
     }
 
     #[test]
@@ -14189,7 +14346,7 @@ mod tests {
         let path = dir.join("config");
         let path_str = path.to_str().unwrap();
 
-        let rendered = render_kubeconfig("k8s-proxy.tail0123.ts.net");
+        let rendered = render_kubeconfig("https://", "k8s-proxy.tail0123.ts.net");
         write_kubeconfig_file(path_str, &rendered, false).expect("first write creates the file");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), rendered);
         // Mode 0600: a kubeconfig names the clusters you can reach; don't publish that.
@@ -14219,13 +14376,14 @@ mod tests {
 
     #[test]
     fn configure_kubeconfig_flags_parse() {
-        // `tnet configure kubeconfig <host> -o <path> --force` reaches the ConfigureCmd arm with all
-        // three fields; `--output` defaults to None (stdout) and `--force` to false.
+        // `tnet configure kubeconfig <host> --http -o <path> --force` reaches the ConfigureCmd arm
+        // with all four fields; `--output` defaults to None (stdout), `--http`/`--force` to false.
         let parsed = Cli::try_parse_from([
             "tnet",
             "configure",
             "kubeconfig",
             "k8s-proxy",
+            "--http",
             "-o",
             "/tmp/kc.yaml",
             "--force",
@@ -14236,11 +14394,13 @@ mod tests {
                 cmd:
                     ConfigureCmd::Kubeconfig {
                         host,
+                        http,
                         output,
                         force,
                     },
             } => {
                 assert_eq!(host, "k8s-proxy");
+                assert!(http);
                 assert_eq!(output.as_deref(), Some("/tmp/kc.yaml"));
                 assert!(force);
             }
@@ -14251,8 +14411,15 @@ mod tests {
             .expect("the host argument alone should parse");
         match bare.command {
             Command::Configure {
-                cmd: ConfigureCmd::Kubeconfig { output, force, .. },
+                cmd:
+                    ConfigureCmd::Kubeconfig {
+                        http,
+                        output,
+                        force,
+                        ..
+                    },
             } => {
+                assert!(!http, "HTTPS is the default, as in Go");
                 assert_eq!(output, None, "no --output means stdout");
                 assert!(!force);
             }
