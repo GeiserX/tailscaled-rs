@@ -967,9 +967,18 @@ enum Command {
         #[command(subcommand)]
         cmd: DebugCmd,
     },
-    /// Host-specific setup glue (Go `tailscale configure`). Currently one sub-target:
-    /// `kubeconfig`, which writes a kubectl config pointed at a Kubernetes API server fronted by a
-    /// Tailscale auth-proxy peer.
+    /// Host-specific setup glue (Go `tailscale configure`). Three sub-targets: `kubeconfig`, which
+    /// writes a kubectl config pointed at a Kubernetes API server fronted by a Tailscale auth-proxy
+    /// peer, plus the two macOS ones — `sysext` and `mac-vpn` — which refuse, exactly as Go's
+    /// open-source CLI does, because the system extension and the VPN profile belong to the GUI
+    /// client this fork does not ship.
+    ///
+    /// Go's other `configure` sub-targets are host-integration commands for products this fork does
+    /// not build, and are OUT OF SCOPE rather than unfinished: `synology`, `synology-cert` and the
+    /// hidden `configure-host` alias (DSM package plumbing — Go registers all three only on a
+    /// Synology), `jetkvm` (a JetKVM boot script that starts Go's `tailscaled`), and
+    /// `flash-appliance` / `pve-appliance` (they download and flash Tailscale's signed appliance
+    /// image). The ruling, command by command, is in `docs/CONFIGURE_SCOPE.md`.
     Configure {
         #[command(subcommand)]
         cmd: ConfigureCmd,
@@ -980,8 +989,12 @@ enum Command {
     Uninstall,
 }
 
-/// `tnet configure` subcommands (Go `tailscale configure`). Go also carries `synology`/`sysext`/
-/// `jetkvm` sub-targets; those are per-platform host glue and are not ported here yet.
+/// `tnet configure` subcommands (Go `tailscale configure`). `kubeconfig` is ported; `sysext` and
+/// `mac-vpn` are Go's macOS-only pair, ported as the refusals Go's own CLI-only build serves. Go's
+/// remaining sub-targets (`synology`, `synology-cert`, `configure-host`, `jetkvm`,
+/// `flash-appliance`, `pve-appliance`) are ruled out of scope in `docs/CONFIGURE_SCOPE.md` — they
+/// configure hosts around software this fork does not ship, so they are absent by decision, not by
+/// omission.
 #[derive(Subcommand)]
 enum ConfigureCmd {
     /// [ALPHA] Generate a kubeconfig that reaches a Kubernetes cluster through a Tailscale auth-proxy
@@ -1021,6 +1034,53 @@ enum ConfigureCmd {
         #[arg(long)]
         force: bool,
     },
+    /// Manage the macOS system extension (Go `tailscale configure sysext`, with the verbs
+    /// `activate`/`deactivate`/`status`). Present so a command line copied from a macOS Tailscale
+    /// install is answered rather than rejected at argument parsing — but every verb REFUSES, as a
+    /// system extension is something only the signed GUI client can register. Go's open-source CLI
+    /// refuses these the same way (`requiresStandalone`); only the Swift GUI build handles them.
+    /// This fork ships no macOS app, no system extension, and runs its data plane in userspace
+    /// networking, so there is nothing to activate, deactivate or report on — `tnet install` is the
+    /// analogue.
+    Sysext {
+        /// `activate`, `deactivate` or `status`. Optional: the bare `configure sysext` refuses with
+        /// the same message, as it does in Go.
+        #[command(subcommand)]
+        cmd: Option<SysextCmd>,
+    },
+    /// Manage the macOS VPN configuration — the entry in System Settings > VPN (Go `tailscale
+    /// configure mac-vpn [install|uninstall]`). Refuses for the same reason as `sysext`: the profile
+    /// is written by the macOS GUI client, which this fork is not, and Go's open-source CLI refuses
+    /// it identically (`requiresGUI`). This fork installs no VPN profile on any platform; use
+    /// `tnet install` to register the daemon as a system service.
+    MacVpn {
+        /// `install` or `uninstall`. Optional: the bare `configure mac-vpn` refuses with the same
+        /// message, as it does in Go.
+        #[command(subcommand)]
+        cmd: Option<MacVpnCmd>,
+    },
+}
+
+/// `tnet configure sysext` verbs (Go `tailscale configure sysext`). All three refuse; the verb is
+/// carried only so the refusal can name the command the user actually typed.
+#[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
+enum SysextCmd {
+    /// Register the system extension with macOS (Go `configure sysext activate`).
+    Activate,
+    /// Deactivate the system extension (Go `configure sysext deactivate`).
+    Deactivate,
+    /// Print the extension's enablement status (Go `configure sysext status`).
+    Status,
+}
+
+/// `tnet configure mac-vpn` verbs (Go `tailscale configure mac-vpn`). Both refuse; the verb is
+/// carried only so the refusal can name the command the user actually typed.
+#[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
+enum MacVpnCmd {
+    /// Write the VPN configuration to the macOS settings (Go `configure mac-vpn install`).
+    Install,
+    /// Delete the VPN configuration from the macOS settings (Go `configure mac-vpn uninstall`).
+    Uninstall,
 }
 
 /// `tnet debug` subcommands (Go `tailscale debug`).
@@ -2511,6 +2571,17 @@ async fn main() -> Result<()> {
                     force,
                 },
         } => run_configure_kubeconfig(&socket, &host, http, output.as_deref(), force).await,
+        // `configure sysext` / `configure mac-vpn` (Go `tailscale configure sysext|mac-vpn`): the
+        // macOS system extension and the VPN profile belong to the GUI client, so Go's open-source
+        // CLI answers with an explanatory error and this fork does the same. Purely local — the
+        // refusal is decided in the CLI process, with no daemon round trip (matching Go, whose
+        // `Exec` returns the error without touching the LocalAPI).
+        Command::Configure {
+            cmd: ConfigureCmd::Sysext { cmd },
+        } => run_configure_sysext(cmd),
+        Command::Configure {
+            cmd: ConfigureCmd::MacVpn { cmd },
+        } => run_configure_mac_vpn(cmd),
     }
 }
 
@@ -9778,6 +9849,89 @@ fn format_serve_status(cfg: &tailscaled_rs::localapi::ServeConfig, _json: bool) 
     out
 }
 
+/// The command path a `configure sysext` refusal names — `configure sysext`, or the verb the user
+/// typed. Go gives each verb its own `ShortUsage`, and refuses the bare command too, so the message
+/// can always say which one was refused.
+fn sysext_verb_path(cmd: Option<SysextCmd>) -> &'static str {
+    match cmd {
+        None => "configure sysext",
+        Some(SysextCmd::Activate) => "configure sysext activate",
+        Some(SysextCmd::Deactivate) => "configure sysext deactivate",
+        Some(SysextCmd::Status) => "configure sysext status",
+    }
+}
+
+/// The command path a `configure mac-vpn` refusal names. As with [`sysext_verb_path`], Go refuses
+/// the bare command and each verb alike.
+fn mac_vpn_verb_path(cmd: Option<MacVpnCmd>) -> &'static str {
+    match cmd {
+        None => "configure mac-vpn",
+        Some(MacVpnCmd::Install) => "configure mac-vpn install",
+        Some(MacVpnCmd::Uninstall) => "configure mac-vpn uninstall",
+    }
+}
+
+/// Why `configure sysext` refuses. Go's `requiresStandalone` (`cmd/tailscale/cli/configure_apple.go`)
+/// is the same shape: in a CLI-only build every `sysext` verb returns "unsupported command: requires
+/// the Standalone (.pkg installer) GUI build of the client", because registering a macOS system
+/// extension is the signed app's job, not the CLI's. This fork has no GUI build to defer to at all,
+/// so the second sentence says what it does instead of implying one exists.
+///
+/// `on_macos` is the caller's platform (`cfg!(target_os = "macos")` in production). Off macOS Go
+/// does not register the command at all — it is `nil` outside darwin — so there the message is about
+/// the platform rather than the build.
+fn sysext_refusal(cmd: Option<SysextCmd>, on_macos: bool) -> String {
+    let path = sysext_verb_path(cmd);
+    if on_macos {
+        format!(
+            "{path}: unsupported command: requires the Standalone (.pkg installer) GUI build of the \
+             macOS client — this fork ships no macOS system extension, so there is none to activate, \
+             deactivate or report on. `tailnetd` runs the data plane in userspace networking; \
+             register it as a launchd service with `tnet install`."
+        )
+    } else {
+        format!(
+            "{path}: unsupported command: a system extension is a macOS concept, and Go registers \
+             `configure sysext` on darwin only. This fork ships no system extension on any platform \
+             — register the daemon as this host's system service with `tnet install`."
+        )
+    }
+}
+
+/// Why `configure mac-vpn` refuses. Go's `requiresGUI` (`cmd/tailscale/cli/configure_apple.go`)
+/// returns "unsupported command: requires a GUI build of the macOS client" for `install`,
+/// `uninstall` and the bare command: the VPN profile in System Settings > VPN is written by the app,
+/// not the CLI. This fork writes no such profile, on macOS or anywhere else.
+fn mac_vpn_refusal(cmd: Option<MacVpnCmd>, on_macos: bool) -> String {
+    let path = mac_vpn_verb_path(cmd);
+    if on_macos {
+        format!(
+            "{path}: unsupported command: requires a GUI build of the macOS client — this fork \
+             writes no macOS VPN configuration, so no Tailscale entry appears in System Settings > \
+             VPN. `tnet install` registers `tailnetd` as a launchd service instead."
+        )
+    } else {
+        format!(
+            "{path}: unsupported command: the macOS VPN configuration is a macOS concept, and Go \
+             registers `configure mac-vpn` on darwin only. Use `tnet install` to register `tailnetd` \
+             as this host's system service."
+        )
+    }
+}
+
+/// `configure sysext` (Go `tailscale configure sysext [activate|deactivate|status]`): always an
+/// error, exactly as in Go's non-GUI build. Exits 1 with the reason, where an unregistered
+/// subcommand would exit 2 with clap's parse error and explain nothing.
+fn run_configure_sysext(cmd: Option<SysextCmd>) -> Result<()> {
+    Err(anyhow!(sysext_refusal(cmd, cfg!(target_os = "macos"))))
+}
+
+/// `configure mac-vpn` (Go `tailscale configure mac-vpn [install|uninstall]`): always an error, as
+/// in Go's non-GUI build. See [`mac_vpn_refusal`].
+fn run_configure_mac_vpn(cmd: Option<MacVpnCmd>) -> Result<()> {
+    Err(anyhow!(mac_vpn_refusal(cmd, cfg!(target_os = "macos"))))
+}
+
 /// `configure kubeconfig` (Go `tailscale configure kubeconfig <hostname-or-fqdn>`).
 ///
 /// Go's flow, which this ports step for step: read Status, require the backend to be `Running`,
@@ -16356,6 +16510,183 @@ users:
         }
         // The host argument is required.
         assert!(Cli::try_parse_from(["tnet", "configure", "kubeconfig"]).is_err());
+    }
+
+    #[test]
+    fn configure_sysext_and_mac_vpn_grammar_parse() {
+        // Go's macOS `configure` pair: `sysext [activate|deactivate|status]` and
+        // `mac-vpn [install|uninstall]`, both of which Go also accepts BARE (the parent command has
+        // its own Exec, which refuses identically). Reaching a `ConfigureCmd` arm rather than a
+        // parse error is the point: it is what lets the CLI answer with a reason instead of clap's
+        // "unrecognized subcommand".
+        let cases: &[(&[&str], Option<SysextCmd>)] = &[
+            (&["tnet", "configure", "sysext"], None),
+            (
+                &["tnet", "configure", "sysext", "activate"],
+                Some(SysextCmd::Activate),
+            ),
+            (
+                &["tnet", "configure", "sysext", "deactivate"],
+                Some(SysextCmd::Deactivate),
+            ),
+            (
+                &["tnet", "configure", "sysext", "status"],
+                Some(SysextCmd::Status),
+            ),
+        ];
+        for (argv, want) in cases {
+            let parsed = Cli::try_parse_from(argv.iter().copied())
+                .unwrap_or_else(|e| panic!("{argv:?} should parse: {e}"));
+            match parsed.command {
+                Command::Configure {
+                    cmd: ConfigureCmd::Sysext { cmd },
+                } => assert_eq!(cmd, *want, "{argv:?}"),
+                // `Command` derives no Debug (it can hold an auth key), so name the miss directly.
+                _ => panic!("expected a ConfigureCmd::Sysext arm for {argv:?}"),
+            }
+        }
+
+        let vpn: &[(&[&str], Option<MacVpnCmd>)] = &[
+            (&["tnet", "configure", "mac-vpn"], None),
+            (
+                &["tnet", "configure", "mac-vpn", "install"],
+                Some(MacVpnCmd::Install),
+            ),
+            (
+                &["tnet", "configure", "mac-vpn", "uninstall"],
+                Some(MacVpnCmd::Uninstall),
+            ),
+        ];
+        for (argv, want) in vpn {
+            let parsed = Cli::try_parse_from(argv.iter().copied())
+                .unwrap_or_else(|e| panic!("{argv:?} should parse: {e}"));
+            match parsed.command {
+                Command::Configure {
+                    cmd: ConfigureCmd::MacVpn { cmd },
+                } => assert_eq!(cmd, *want, "{argv:?}"),
+                _ => panic!("expected a ConfigureCmd::MacVpn arm for {argv:?}"),
+            }
+        }
+
+        // Only Go's verbs exist under each: a typo is still a parse error, not a refusal that
+        // pretends the verb was understood.
+        assert!(Cli::try_parse_from(["tnet", "configure", "sysext", "enable"]).is_err());
+        assert!(Cli::try_parse_from(["tnet", "configure", "mac-vpn", "reinstall"]).is_err());
+        // And the out-of-scope host-integration commands stay absent, as ruled in
+        // docs/CONFIGURE_SCOPE.md — recognising them would claim work this fork does not do.
+        for name in [
+            "synology",
+            "synology-cert",
+            "jetkvm",
+            "flash-appliance",
+            "pve-appliance",
+        ] {
+            assert!(
+                Cli::try_parse_from(["tnet", "configure", name]).is_err(),
+                "`configure {name}` is out of scope and must not be registered"
+            );
+        }
+    }
+
+    #[test]
+    fn configure_sysext_refuses_like_go() {
+        // Go's `requiresStandalone` refuses every `sysext` verb, and the bare command too, with one
+        // message. Ours names the verb that was refused, keeps Go's "unsupported command:" opening
+        // and its Standalone-GUI reason, and then says what this fork offers instead.
+        for cmd in [
+            None,
+            Some(SysextCmd::Activate),
+            Some(SysextCmd::Deactivate),
+            Some(SysextCmd::Status),
+        ] {
+            let mac = sysext_refusal(cmd, true);
+            assert!(
+                mac.starts_with(sysext_verb_path(cmd)),
+                "the refusal must name the verb: {mac}"
+            );
+            assert!(mac.contains("unsupported command:"), "{mac}");
+            assert!(
+                mac.contains("Standalone (.pkg installer) GUI build"),
+                "Go's reason must survive the port: {mac}"
+            );
+            assert!(mac.contains("tnet install"), "{mac}");
+
+            // Off darwin Go does not register the command at all, so the reason is the platform.
+            let other = sysext_refusal(cmd, false);
+            assert!(other.contains("darwin only"), "{other}");
+            assert!(
+                !other.contains("Standalone"),
+                "off macOS the GUI build is not the reason: {other}"
+            );
+        }
+
+        // The production path is an error (exit 1), carrying exactly that message for this host.
+        let err = run_configure_sysext(Some(SysextCmd::Status))
+            .expect_err("every sysext verb refuses, on every platform");
+        assert_eq!(
+            err.to_string(),
+            sysext_refusal(Some(SysextCmd::Status), cfg!(target_os = "macos"))
+        );
+    }
+
+    #[test]
+    fn configure_mac_vpn_refuses_like_go() {
+        // Go's `requiresGUI`, same shape as `requiresStandalone` above.
+        for cmd in [None, Some(MacVpnCmd::Install), Some(MacVpnCmd::Uninstall)] {
+            let mac = mac_vpn_refusal(cmd, true);
+            assert!(
+                mac.starts_with(mac_vpn_verb_path(cmd)),
+                "the refusal must name the verb: {mac}"
+            );
+            assert!(mac.contains("unsupported command:"), "{mac}");
+            assert!(
+                mac.contains("requires a GUI build of the macOS client"),
+                "Go's reason must survive the port: {mac}"
+            );
+            assert!(mac.contains("tnet install"), "{mac}");
+
+            let other = mac_vpn_refusal(cmd, false);
+            assert!(other.contains("darwin only"), "{other}");
+            assert!(
+                !other.contains("GUI build"),
+                "off macOS the GUI build is not the reason: {other}"
+            );
+        }
+
+        let err = run_configure_mac_vpn(None)
+            .expect_err("mac-vpn refuses on every platform, bare or with a verb");
+        assert_eq!(
+            err.to_string(),
+            mac_vpn_refusal(None, cfg!(target_os = "macos"))
+        );
+    }
+
+    #[test]
+    fn configure_help_records_the_out_of_scope_commands() {
+        // The ruling has to reach the user who goes looking for `tailscale configure synology`, or
+        // the absence just reads as unfinished work. `tnet configure --help` names each out-of-scope
+        // command and points at the document that explains why.
+        let mut cli = <Cli as clap::CommandFactory>::command();
+        let help = cli
+            .find_subcommand_mut("configure")
+            .expect("configure is a subcommand")
+            .render_long_help()
+            .to_string();
+        for name in [
+            "synology",
+            "synology-cert",
+            "configure-host",
+            "jetkvm",
+            "flash-appliance",
+            "pve-appliance",
+        ] {
+            assert!(
+                help.contains(name),
+                "`configure --help` must account for {name}"
+            );
+        }
+        assert!(help.contains("OUT OF SCOPE"), "{help}");
+        assert!(help.contains("docs/CONFIGURE_SCOPE.md"), "{help}");
     }
     #[test]
     fn go_duration_grammar_is_ported() {
