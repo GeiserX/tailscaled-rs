@@ -25,6 +25,34 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.53.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.52.2...v0.53.0) (2026-08-30)
+
+
+### Features
+
+* **cli:** accept the six Go flags a ported command line still died on ([#289](https://github.com/GeiserX/tailscaled-rs/issues/289)) ([a92d513](https://github.com/GeiserX/tailscaled-rs/commit/a92d5139113ae59037f3c3065aa332b3e3efa4e4))
+* **configure:** emit the kubeconfig kubectl accepts, over http or https ([#288](https://github.com/GeiserX/tailscaled-rs/issues/288)) ([32719b6](https://github.com/GeiserX/tailscaled-rs/commit/32719b60f5e8baa549fc60a7fdcc7e6876571053))
+* **health:** say when a captive portal is what's blocking the node ([#290](https://github.com/GeiserX/tailscaled-rs/issues/290)) ([ea567a3](https://github.com/GeiserX/tailscaled-rs/commit/ea567a3b6e9746ee5888b04650884332c50714f7))
+* **packaging:** install tailnetd + tnet with Homebrew, and keep the formula honest ([#292](https://github.com/GeiserX/tailscaled-rs/issues/292)) ([12c941c](https://github.com/GeiserX/tailscaled-rs/commit/12c941cfd45ad4e40c88ff3a6d211dcf048ac7dd))
+* **reload-config:** report whether the reload is live or waits for the next up ([#285](https://github.com/GeiserX/tailscaled-rs/issues/285)) ([d5eee15](https://github.com/GeiserX/tailscaled-rs/commit/d5eee155ffc64724c300dadcbada7a6fa890c56b))
+* **serve:** take Go's serve/funnel flag grammar so ported commands run unedited ([#274](https://github.com/GeiserX/tailscaled-rs/issues/274)) ([358ab21](https://github.com/GeiserX/tailscaled-rs/commit/358ab219bd84ba1f583d6a54d765a5d9239cbe29))
+* **tailnetd:** clean up macOS routes and DNS a hard-killed daemon left behind ([#278](https://github.com/GeiserX/tailscaled-rs/issues/278)) ([3d393c8](https://github.com/GeiserX/tailscaled-rs/commit/3d393c83dcc9c3fb5dfc131236023562cd20d65f))
+* **tnet:** accept the Go up/set pref flags the engine can now carry ([#269](https://github.com/GeiserX/tailscaled-rs/issues/269)) ([9a49710](https://github.com/GeiserX/tailscaled-rs/commit/9a49710c1cec23b1d730631c2461b0c57153dc3f))
+* **tnet:** add file get --verbose for Go-style Taildrop drain progress ([#276](https://github.com/GeiserX/tailscaled-rs/issues/276)) ([67456e5](https://github.com/GeiserX/tailscaled-rs/commit/67456e58d71efd7b5630ef925d500261317c3bad))
+* **tnet:** make tnet report which state dir it picked, and which build it is ([#273](https://github.com/GeiserX/tailscaled-rs/issues/273)) ([1b8c977](https://github.com/GeiserX/tailscaled-rs/commit/1b8c9771bfde7a79dba500afd915452e85c35b84))
+* **tnet:** point kubectl at a cluster fronted by a Tailscale auth proxy ([#262](https://github.com/GeiserX/tailscaled-rs/issues/262)) ([578d652](https://github.com/GeiserX/tailscaled-rs/commit/578d6522c649b1fa693b7ad9edc8f0c1f7c7c673))
+* **tnet:** read the tailnet-lock update chain with `tnet lock log` ([#275](https://github.com/GeiserX/tailscaled-rs/issues/275)) ([ab19f18](https://github.com/GeiserX/tailscaled-rs/commit/ab19f183457354bf7aa11e2bf055317120d418cb))
+
+
+### Bug Fixes
+
+* **cli:** refuse `up --exit-node-allow-lan-access` with no exit node, and let `--nickname` rename the profile ([#294](https://github.com/GeiserX/tailscaled-rs/issues/294)) ([ca7c528](https://github.com/GeiserX/tailscaled-rs/commit/ca7c52836c4051f88df07ea607cf9fac6cec38d0))
+* **configure:** merge into the user's kubeconfig instead of emitting one ([#296](https://github.com/GeiserX/tailscaled-rs/issues/296)) ([14a2b26](https://github.com/GeiserX/tailscaled-rs/commit/14a2b26f1df322e1d4cc37fb8118d94936e1930e))
+* **serve:** give a ported serve command line Go's refusal, not "unsupported" ([#293](https://github.com/GeiserX/tailscaled-rs/issues/293)) ([a1ad4f5](https://github.com/GeiserX/tailscaled-rs/commit/a1ad4f54eb2e15cea5afa5dd7baa024924be0da3))
+* **serve:** redirect targets are sent verbatim, not variable-expanded ([#287](https://github.com/GeiserX/tailscaled-rs/issues/287)) ([6d3d7a3](https://github.com/GeiserX/tailscaled-rs/commit/6d3d7a3060a55fcba25cb98450eaaff55745c6bc))
+* **switch:** don't report a switch or a removal that never happened ([#279](https://github.com/GeiserX/tailscaled-rs/issues/279)) ([fa38b33](https://github.com/GeiserX/tailscaled-rs/commit/fa38b33e4a2b0ed745b80a792d94ebdc8f6d65d5))
+* **taildrop:** resolve and vet the directory `file get` writes into, not just the leaf ([#286](https://github.com/GeiserX/tailscaled-rs/issues/286)) ([17f326e](https://github.com/GeiserX/tailscaled-rs/commit/17f326e6a443a87ca518b5f98bb07fa10fa24886))
+
 ## [0.52.2](https://github.com/GeiserX/tailscaled-rs/compare/v0.52.1...v0.52.2) (2026-08-12)
 
 

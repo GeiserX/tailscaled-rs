@@ -1,0 +1,78 @@
+{
+  "schema": "restock-beads/v1",
+  "pin": "53a0d659afa51835dd7a9283873cca44261454f8",
+  "beads": [
+    {
+      "title": "tnet up rejects four Go up flags a ported command line still carries",
+      "description": "Go's `tailscale up` takes `--auth-key` (its canonical spelling, and it accepts a `file:<path>` value), `--login-server`, `--nickname` and the hidden `--host-routes`. `tnet up` has none of them: it spells the key `--authkey`/`--authkey-file`, the control URL `--control-url`, and carries `--nickname` only on `set`. A command line copied from Go therefore exits 2 at argument parsing with clap's \"unexpected argument\", which is the exact failure the six-flag batch in #289 set out to end. Decide for each whether it becomes an alias of the flag this fork already has (`--auth-key`, `--login-server`, `--nickname`) or an honest refusal, and port the error paths with it: `--host-routes` is a Go `notFalseVar`, so `--host-routes=false` must fail with \"unsupported value; only 'true' is allowed\" while `--host-routes`/`--host-routes=true` is accepted and does nothing, and `--auth-key file:/path` must read the key from the file the way `--authkey-file` already does.",
+      "upstream": "cmd/tailscale/cli/up.go @ 53a0d659afa51835dd7a9283873cca44261454f8",
+      "priority": 2
+    },
+    {
+      "title": "Four Go set pref flags this fork does not model at all",
+      "description": "Go's `tailscale set` carries `--relay-server-port`, `--relay-server-static-endpoints`, `--remote-config` and `--sync`; `tnet set` has none, and `tnet get` cannot report them either. `--remote-config` is new since v1.100.0 and is not a cosmetic flag: it delegates full remote control of the node's prefs and LocalAPI to the tailnet admin, bypassing the per-feature double opt-in, so adopting it is a security decision as much as a port. The engine's `Config` has no field for a peer-relay listen port, static relay endpoints, control-delegated configuration, or the config-sync kill switch, so all four are engine-gated: the work is to file the engine ask(s), then decide per flag whether this fork wants the behaviour at all or should refuse it by name so a ported command line says what is missing instead of dying at the parser.",
+      "upstream": "cmd/tailscale/cli/set.go @ 53a0d659afa51835dd7a9283873cca44261454f8",
+      "priority": 2
+    },
+    {
+      "title": "No routecheck: upstream's multi-path route reachability report and the probe it feeds",
+      "description": "Upstream ships `tailscale routecheck`, which prints which routers are actually reachable for each prefix advertised by more than one node, over the LocalAPI `RouteCheck`/`RouteCheckProbe` calls backed by `net/routecheck` peer probing; `--probe` forces a fresh probe and `--format=json|json-line` selects the machine shape. The same subsystem now backs `exit-node suggest --force-probe`, which re-ranks the suggestion off a fresh reachability report rather than the cached one. This fork has neither: there is no routecheck code in the daemon and no routecheck subsystem in the engine, and `Device::suggest_exit_node()` takes no probe hint. Decide whether to file the engine ask for peer reachability probing (the honest path) or to record routecheck as out of scope; a CLI-side facsimile that pings peers itself would report something Go's report does not mean.",
+      "upstream": "cmd/tailscale/cli/routecheck.go @ 53a0d659afa51835dd7a9283873cca44261454f8",
+      "priority": 2
+    },
+    {
+      "title": "No appc-routes: the app connector advertises but cannot report what it learned",
+      "description": "Go's `tailscale appc-routes` prints the app connector's configured domains and the routes learned for each, with `--all`, `--map` and `-n` shapes, reading the LocalAPI `appc-route-info` verb (`b.ReadRouteInfo()`, an `appctype.RouteInfo` of domains, control-configured routes and wildcards). This fork ships the advertise half — `up`/`set --advertise-connector` reaches control through `Hostinfo.AppConnector` — but has no readback at all, because the engine learns and stores no app-connector routes: there is no route-info store to expose. The decision is whether app-connector route learning belongs in the engine (an ask) or whether this fork advertises the capability without implementing the connector's data path, in which case that limit should be stated where `--advertise-connector` is documented.",
+      "upstream": "cmd/tailscale/cli/appcroutes.go @ 53a0d659afa51835dd7a9283873cca44261454f8",
+      "priority": 2
+    },
+    {
+      "title": "Tailscale Services (VIPs) are invisible to every read path this fork has",
+      "description": "Upstream v1.102.3 added `tailscale service list`, which lists the Services this node can reach from the LocalAPI `services` verb (`map[tailcfg.ServiceName]tailcfg.ServiceDetails`), and wired the same data into two existing commands: `tailscale ip <addr>` now falls back to matching a Service VIP and prints that Service's addresses instead of failing with \"no peer found\", and `configure kubeconfig` resolves a Service name as well as a peer name. This fork models Services nowhere — `tnet ip` fails on anything that is not a peer, and `configure kubeconfig` resolves peers only — because the engine surfaces no Service list from the netmap. This is the read half of Services and is distinct from tsd-z40, which owns the serving half (`serve --service`). Needs an engine ask for the Service set before any of the three CLI changes can be honest.",
+      "upstream": "cmd/tailscale/cli/service.go @ 53a0d659afa51835dd7a9283873cca44261454f8",
+      "priority": 2
+    },
+    {
+      "title": "tailnetd has no --syspolicy-file, so an admin cannot supply a policy source",
+      "description": "New at v1.102.3: `tailscaled --syspolicy-file` registers a JSON file as a device-scope syspolicy source, defaulting to `/etc/tailscale/syspolicy.json` (`%ProgramData%\\Tailscale\\syspolicy.json` on Windows), with an empty value disabling it; a load failure is logged and the daemon continues rather than dying, and on Windows the file's keys take precedence over the registry store per key. This fork already has the consuming side — `src/ipn/syspolicy.rs` plus `tnet syspolicy list`/`reload` — but nothing an operator can actually write policy into, so the whole surface reports an empty policy set on every platform. Port the flag, its platform-specific default, the empty-disables case and the log-and-continue error path, and decide what precedence a file source has against anything else this daemon consults.",
+      "upstream": "cmd/tailscaled/syspolicy.go @ 53a0d659afa51835dd7a9283873cca44261454f8",
+      "priority": 2
+    },
+    {
+      "title": "tailnetd --config takes only a path: no vm:user-data source, no optional: prefix",
+      "description": "Go's `tailscaled --config` takes a config *source*, not just a path: `vm:user-data` reads the VM's user-data (EC2), and — new at v1.102.3 — an `optional:` prefix means an absent source is not fatal, so the node boots unconfigured and can be enrolled interactively instead of failing to start, while a source that is present but invalid still fails. This fork types the flag as a `PathBuf` and fails on anything that is not a readable file, so `--config optional:vm:user-data` copied from a cloud-init template dies at startup. The interesting half is the error path: `optional:` must distinguish \"no config present\" from \"config present and malformed\", which needs a distinguishable not-found error out of the loader (Go's `conffile.ErrNoConfig`) rather than one opaque failure.",
+      "upstream": "cmd/tailscaled/tailscaled.go @ 53a0d659afa51835dd7a9283873cca44261454f8",
+      "priority": 2
+    },
+    {
+      "title": "--json is a bare bool here, where Go now takes a schema version",
+      "description": "Upstream's `cmd/tailscale/cli/jsonoutput` makes `--json` accept either a boolean or an integer schema version: `--json` and `--json=true` mean version 1, `--json=false` clears it, and an unknown version is refused with `unrecognised version: %d`. Output is wrapped in a `ResponseEnvelope` carrying the schema version alongside errors and warnings, so scripts can pin a shape and upstream can still make breaking changes. `lock status`, `lock log` and `dns status` all take it, and `netcheck`/`routecheck` combine it with `--format=json|json-line`. Every `--json` in `tnet` is a plain clap bool with a bare payload, so `--json=1` from a Go script is rejected as an invalid boolean and nothing in the output says which shape a consumer got. Decide whether to adopt the envelope for the commands Go versions, and port the refusal, not only the happy path.",
+      "upstream": "cmd/tailscale/cli/jsonoutput/jsonoutput.go @ 53a0d659afa51835dd7a9283873cca44261454f8",
+      "priority": 2
+    },
+    {
+      "title": "tnet ssh overrides the user's ssh_config by always injecting a username",
+      "description": "Upstream changed at v1.102.3: when the target has no `user@`, `tailscale ssh` leaves the username empty and passes the bare host to `ssh`, so the user's own `ssh_config` `User` directive decides. It used to read the local account and splice it in, which is what `tnet ssh` still does — `current_login_user()` from `$USER`/`$LOGNAME`, then always `user@host` in the argv handed to `ssh`. The result is that a `Host` block setting `User` is silently overridden for tailnet hosts and only for tailnet hosts. Drop the injection for the no-`user@` case while keeping the existing guard on an explicitly supplied username (a `-`-leading or whitespace-bearing user is still refused, since that half is argv the caller controls), and test both shapes: `tnet ssh host` must produce a bare destination, `tnet ssh user@host` must still produce `user@host`.",
+      "upstream": "cmd/tailscale/cli/ssh.go @ 53a0d659afa51835dd7a9283873cca44261454f8",
+      "priority": 2
+    },
+    {
+      "title": "tnet debug resolve — the one Go debug verb that needs nothing from the engine",
+      "description": "`tailscale debug resolve <hostname>` does a host-resolver lookup with a 5-second timeout and prints one address per line, taking `--net ip|ip4|ip6` to choose the family and refusing the wrong argument count with `usage: tailscale debug resolve <hostname>`. It runs entirely in the CLI process — no LocalAPI call, no daemon state — which makes it the only remaining `debug` verb under tsd-b15 that is daemon-buildable today; everything else there needs a netmap field, a magicsock knob or an event bus the engine does not expose. Port the verb, the family selector and both error paths (bad argument count, and the resolver error surfaced verbatim rather than swallowed).",
+      "upstream": "cmd/tailscale/cli/debug.go @ 53a0d659afa51835dd7a9283873cca44261454f8",
+      "priority": 2
+    },
+    {
+      "title": "Decide the fork's answer on the appliance and host configure subcommands",
+      "description": "Upstream's `configure` tree is mostly platform integration: `synology`, `synology-cert`, the hidden `configure-host` alias for Synology, `flash-appliance`, `pve-appliance`, `jetkvm`, `sysext` (`activate`/`deactivate`/`status`) and `mac-vpn` (`install`/`uninstall`). Each is host-specific plumbing — DSM package permissions, VM-appliance images, a macOS system extension — and this fork has only `configure kubeconfig`. Several are almost certainly out of scope for a daemon that ships no platform packages, but that is a decision nobody has recorded, so every parity sweep re-finds them as absences. Rule on the set: adopt the ones a Linux/macOS daemon can honestly do, and write the rest into the intentional-deviation list so they stop reading as unfinished work.",
+      "upstream": "cmd/tailscale/cli/configure.go @ 53a0d659afa51835dd7a9283873cca44261454f8",
+      "priority": 2
+    },
+    {
+      "title": "tailscaled --bird-socket has no counterpart, and no recorded decision",
+      "description": "Go still ships `tailscaled --bird-socket <path>` for subnet routers that hand their advertised routes to a BIRD BGP daemon; at v1.102.3 the implementation moved behind `wgengine.HookNewBird`, and a build that cannot honour the flag refuses it loudly at startup (`--bird-socket is not supported on %s`) rather than ignoring it. This fork has no BIRD story at all: the flag is not a no-op, it is an unknown argument that stops `tailnetd` before it starts, which is the worst of the three possible answers. Decide between implementing the BIRD client, accepting the flag with an honest refusal that names why, or declaring BGP integration out of scope in the deviation list — and whichever it is, make the daemon say it.",
+      "upstream": "cmd/tailscaled/tailscaled.go @ 53a0d659afa51835dd7a9283873cca44261454f8",
+      "priority": 2
+    }
+  ]
+}
