@@ -1241,27 +1241,39 @@ enum FunnelCmd {
 /// by both commands exactly as Go shares it: `tnet <serve|funnel> [flags] <target> [off]`.
 ///
 /// Four of these flags are accepted by the parser but REFUSED at runtime
-/// ([`reject_unsupported_serve_flags`]). That is deliberate: a script written against Go gets an
-/// error naming the missing capability instead of clap's opaque "unexpected argument", and the
-/// grammar stays a superset so the same command line keeps working the day the gap closes.
+/// ([`check_serve_flags`]). That is deliberate: a script written against Go gets an error naming
+/// the missing capability instead of clap's opaque "unexpected argument", and the grammar stays a
+/// superset so the same command line keeps working the day the gap closes. Go's OWN refusals for
+/// those flags come first, though, so a command line Go would have rejected is rejected here for
+/// Go's reason and in Go's words — see [`check_serve_flags`].
 #[derive(clap::Args, Debug, Default, Clone)]
 struct ServeFlags {
     /// Persist the serve and exit, instead of holding it for the lifetime of this command. Go's
     /// `--bg`; like Go, the default is the FOREGROUND — the serve is installed, this process blocks,
     /// and the previous serve config is restored when you interrupt it (Ctrl-C / `SIGTERM`).
-    #[arg(long)]
-    bg: bool,
+    ///
+    /// Go's `bgBoolFlag` takes an optional value, so `--bg=false` is how a Go command line asks for
+    /// the foreground explicitly; `require_equals` reproduces that, and leaves a following bare
+    /// `false` in the target position exactly as Go's flag package does. `None` means "not given",
+    /// which [`serve_background`] resolves Go's way.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    bg: Option<bool>,
     /// Terminate TLS on this tailnet port and reverse-proxy to `<TARGET>` (Go `--https=PORT`). This
     /// is the default listener: with none of the four port flags given, `serve`/`funnel` act as
     /// `--https=443`, matching Go.
-    #[arg(long, value_name = "PORT", conflicts_with_all = ["http", "tcp", "tls_terminated_tcp"])]
+    ///
+    /// Go counts a port flag as given only when it is NON-ZERO, so the exclusivity of the four is
+    /// decided at runtime by [`serve_kind_and_port`], not by clap: `--https=0 --tcp=22` names one
+    /// listener under Go, and a genuine pair still gets Go's `cannot serve multiple types for a
+    /// single mount point`.
+    #[arg(long, value_name = "PORT")]
     https: Option<u16>,
     /// Serve plain HTTP on this tailnet port, reverse-proxying to `<TARGET>` (Go `--http=PORT`).
-    #[arg(long, value_name = "PORT", conflicts_with_all = ["tcp", "tls_terminated_tcp"])]
+    #[arg(long, value_name = "PORT")]
     http: Option<u16>,
     /// Forward raw TCP on this tailnet port to `<TARGET>` with no TLS (Go `--tcp=PORT`). Served by
     /// the daemon's own accept loop.
-    #[arg(long, value_name = "PORT", conflicts_with_all = ["tls_terminated_tcp"])]
+    #[arg(long, value_name = "PORT")]
     tcp: Option<u16>,
     /// Terminate TLS on this tailnet port with the node's cert, then splice the plaintext stream to
     /// `<TARGET>` as raw TCP (Go `--tls-terminated-tcp=PORT`) — no HTTP parsing or reverse-proxying.
@@ -1275,24 +1287,41 @@ struct ServeFlags {
     /// NOT SUPPORTED by this build (Go `--service=svc:<name>`): attach the serve to a Tailscale
     /// Service (VIP) rather than to this node. Refused rather than ignored — the LocalAPI
     /// `ServeConfig` here carries no `Services` map, and Services are a control-plane + netmap
-    /// feature the pinned engine does not surface.
+    /// feature the pinned engine does not surface. Go's own two refusals for the flag (with
+    /// `funnel`, and with a foreground serve) still come first, in Go's words.
     #[arg(long, value_name = "SERVICE")]
     service: Option<String>,
     /// NOT SUPPORTED by this build (Go `--tun`): serve on the kernel TUN interface instead of the
     /// userspace netstack. Refused rather than ignored — this daemon's serve lanes are netstack-only.
+    ///
+    /// Go models `--tun` as a fifth serve type ([`ServeKind::Tun`]), mutually exclusive with the
+    /// four port flags and legal only alongside `--service`; since `--service` is refused here, the
+    /// refusal a `tnet` command line actually reaches is Go's own `tun mode is only supported for
+    /// services`.
     #[arg(long)]
     tun: bool,
     /// NOT SUPPORTED by this build (Go `--proxy-protocol=1|2`): prepend a PROXY-protocol header to
     /// each `--tls-terminated-tcp` connection. Refused rather than ignored — the engine's TCP serve
     /// target cannot emit the header, and the daemon already fails such a config closed rather than
     /// silently dropping it (which would hand the backend an unmarked, wrongly-attributed stream).
+    ///
+    /// Go's two conditional refusals run first (see [`check_serve_flags`]), so an HTTP(S) serve and
+    /// a version that is neither 1 nor 2 are rejected for Go's reason. Typed wide like Go's `uint`
+    /// so an out-of-range version reaches Go's message instead of clap's integer-range error; `0`
+    /// means unset there, and here.
     #[arg(long = "proxy-protocol", value_name = "VERSION")]
-    proxy_protocol: Option<u8>,
-    /// NOT SUPPORTED by this build (Go `--accept-app-caps`): forward the caller's app capabilities
-    /// to the backend. Refused rather than ignored — the daemon's serve lanes add no such headers,
-    /// so accepting the flag would promise an authorization signal that never arrives.
-    #[arg(long = "accept-app-caps")]
-    accept_app_caps: bool,
+    proxy_protocol: Option<u64>,
+    /// NOT SUPPORTED by this build (Go `--accept-app-caps=<domain>/<name>,…`): forward the caller's
+    /// app capabilities to the backend. Refused rather than ignored — the daemon's serve lanes add
+    /// no such headers, so accepting the flag would promise an authorization signal that never
+    /// arrives.
+    ///
+    /// It still takes Go's VALUE, a comma-separated capability list, and repeats accumulate the way
+    /// Go's `acceptAppCapsFlag.Set` appends: a Go command line has to parse before it can be told
+    /// what is missing, and a malformed list is refused with Go's own message
+    /// ([`parse_accept_app_caps`]).
+    #[arg(long = "accept-app-caps", value_name = "CAPS")]
+    accept_app_caps: Vec<String>,
     /// Accepted and ignored (Go `--yes`): pre-approve Go's interactive funnel confirmation. This
     /// CLI never prompts, so the flag is a no-op kept so Go-shaped scripts run unedited.
     #[arg(long)]
@@ -8923,6 +8952,11 @@ enum ServeKind {
     Tcp,
     /// `--tls-terminated-tcp=PORT`: TLS terminated, then the plaintext spliced as raw TCP.
     TlsTerminatedTcp,
+    /// `--tun`: Go's `serveTypeTUN`, a port-less fifth serve type that forwards ALL traffic for a
+    /// Service to the local machine. Modelled here for the same reason Go models it — it is one of
+    /// the mutually exclusive listener choices — but never written: Go itself refuses it without
+    /// `--service` (`tun mode is only supported for services`), and this build has no Services.
+    Tun,
 }
 
 impl ServeKind {
@@ -8933,37 +8967,112 @@ impl ServeKind {
     }
 }
 
-/// Resolve the four mutually exclusive port flags into `(kind, port)`, applying Go's default: with
-/// none of them given, `serve`/`funnel` mean `--https=443` (`serve_v2.go`'s `srvTypeHTTPS` / port
-/// 443 fallback). Clap already rejects two of them together; the `_` arm keeps that a hard error
-/// rather than an arbitrary winner if those `conflicts_with_all` lists ever drift.
+/// Resolve the mutually exclusive listener flags into `(kind, port)` exactly as `serve_v2.go`'s
+/// `srvTypeAndPortFromFlags` does, applying Go's default: with none of them given, `serve`/`funnel`
+/// mean `--https=443`.
+///
+/// Go counts a port flag as given only when its value is NON-ZERO (`for k, v := range sourceMap { if
+/// v != 0 { … } }`), because its flags are plain `uint`s whose zero value IS "unset". So
+/// `serve --https=0 3000` contributes nothing, leaves the count at zero, and serves HTTPS on 443 —
+/// it is not an error. `--tun` is Go's fifth, port-less type and counts in the same exclusivity
+/// check, which is why the pair `--tun --https=443` is refused here rather than by clap.
 fn serve_kind_and_port(flags: &ServeFlags) -> Result<(ServeKind, u16)> {
-    let given: Vec<(ServeKind, u16)> = [
+    let mut given: Vec<(ServeKind, u16)> = [
         (ServeKind::Https, flags.https),
         (ServeKind::Http, flags.http),
         (ServeKind::Tcp, flags.tcp),
         (ServeKind::TlsTerminatedTcp, flags.tls_terminated_tcp),
     ]
     .into_iter()
-    .filter_map(|(kind, port)| port.map(|p| (kind, p)))
+    .filter_map(|(kind, port)| port.filter(|p| *p != 0).map(|p| (kind, p)))
     .collect();
+    if flags.tun {
+        given.push((ServeKind::Tun, 0));
+    }
     match given.as_slice() {
         [] => Ok((ServeKind::Https, 443)),
-        [(_, 0)] => anyhow::bail!("port 0 is not a valid serve port"),
         [(kind, port)] => Ok((*kind, *port)),
         _ => anyhow::bail!(
-            "give exactly one of --https / --http / --tcp / --tls-terminated-tcp (they name the \
-             same listener)"
+            "cannot serve multiple types for a single mount point: give exactly one of --https / \
+             --http / --tcp / --tls-terminated-tcp / --tun (they name the same listener)"
         ),
     }
 }
 
-/// Refuse the Go v1.100.0 `serve`/`funnel` flags this build parses for grammar parity but cannot
-/// honor. Each message names the specific missing capability, so a script ported from Go learns what
-/// is absent instead of hitting clap's "unexpected argument" — and none of them silently degrades to
-/// a serve that quietly lacks the requested property.
-fn reject_unsupported_serve_flags(flags: &ServeFlags) -> Result<()> {
+/// Go's `--bg` default: unset means the FOREGROUND, except with `--service`, where Go flips the
+/// default to the background (`if !e.bg.IsSet { e.bg.Value = forService }`). An explicit `--bg=false`
+/// stays false either way, which is the only way to reach Go's background-mode refusal below.
+fn serve_background(flags: &ServeFlags) -> bool {
+    flags.bg.unwrap_or(flags.service.is_some())
+}
+
+/// Whether `cap` matches Go's `validAppCap` regexp `^([\pL\pN-]+\.)+[\pL\pN-]+\/[\pL\pN-/]+$`:
+/// a `{domain}/{name}` app capability whose domain is a fully qualified name of two or more labels
+/// drawn from letters, numbers and hyphens, and whose name may also contain forward slashes.
+fn is_valid_app_cap(cap: &str) -> bool {
+    let label_char = |c: char| c.is_alphabetic() || c.is_numeric() || c == '-';
+    // The domain half has no slash, so the FIRST slash is the separator and everything after it is
+    // the (slash-bearing) name.
+    let Some((domain, name)) = cap.split_once('/') else {
+        return false;
+    };
+    let labels: Vec<&str> = domain.split('.').collect();
+    if labels.len() < 2
+        || labels
+            .iter()
+            .any(|l| !l.chars().all(label_char) || l.is_empty())
+    {
+        return false;
+    }
+    !name.is_empty() && name.chars().all(|c| label_char(c) || c == '/')
+}
+
+/// Parse `--accept-app-caps` the way Go's `acceptAppCapsFlag.Set` does: every occurrence is a
+/// comma-separated list, each element is trimmed and validated against the `{domain}/{name}` form,
+/// and repeats append to one list. An empty value contributes nothing (Go returns early on `""`),
+/// so `--accept-app-caps=` asks for no capabilities rather than for an unsupported feature.
+fn parse_accept_app_caps(values: &[String]) -> Result<Vec<String>> {
+    let mut caps = Vec::new();
+    for value in values {
+        if value.is_empty() {
+            continue;
+        }
+        for cap in value.split(',') {
+            let cap = cap.trim();
+            if !is_valid_app_cap(cap) {
+                anyhow::bail!(
+                    "{:?} does not match the form {{domain}}/{{name}}, where domain must be a \
+                     fully qualified domain name",
+                    sanitize_for_terminal(cap)
+                );
+            }
+            caps.push(cap.to_string());
+        }
+    }
+    Ok(caps)
+}
+
+/// Validate a `serve`/`funnel` flag set and resolve its listener, running `serve_v2.go`'s own checks
+/// in `serve_v2.go`'s order before any of this build's "not supported" refusals.
+///
+/// The ordering is the point. Go rejects plenty of these command lines itself — a `--service` funnel,
+/// a `--proxy-protocol` on HTTP(S), a version that is neither 1 nor 2, a `--tun` without a service —
+/// and a port of the flag has to bring those refusals with it, in Go's words, or a script that Go
+/// told exactly what was wrong gets told instead that the whole feature is missing here. Only a
+/// command line Go would have ACCEPTED reaches a "not supported by this build" message, which then
+/// names the specific missing capability rather than degrading to a serve that silently lacks the
+/// requested property.
+fn check_serve_flags(flags: &ServeFlags, funnel: bool) -> Result<(ServeKind, u16)> {
+    // Go validates --accept-app-caps inside the flag's `Set`, i.e. before every other check.
+    let app_caps = parse_accept_app_caps(&flags.accept_app_caps)?;
+
     if let Some(service) = &flags.service {
+        if funnel {
+            anyhow::bail!("--service flag is not supported with funnel");
+        }
+        if !serve_background(flags) {
+            anyhow::bail!("--service flag is only compatible with background mode");
+        }
         anyhow::bail!(
             "--service={} is not supported by this build: Tailscale Services (VIP) are a control \
              plane + netmap feature the pinned engine does not surface, and this LocalAPI \
@@ -8972,13 +9081,27 @@ fn reject_unsupported_serve_flags(flags: &ServeFlags) -> Result<()> {
             sanitize_for_terminal(service)
         );
     }
-    if flags.tun {
-        anyhow::bail!(
-            "--tun is not supported by this build: the daemon's serve lanes listen on the userspace \
-             netstack, not on a kernel TUN interface. Drop --tun to serve on the netstack"
-        );
+
+    let (kind, port) = serve_kind_and_port(flags)?;
+
+    // Go's `uint` zero is "unset", so --proxy-protocol=0 asks for nothing and is not refused.
+    let proxy_protocol = flags.proxy_protocol.filter(|v| *v != 0);
+    if let Some(version) = proxy_protocol {
+        if kind.is_web() {
+            anyhow::bail!("PROXY protocol is only supported for TCP forwarding, not HTTP/HTTPS");
+        }
+        if version != 1 && version != 2 {
+            anyhow::bail!("invalid PROXY protocol version {version}; must be 1 or 2");
+        }
     }
-    if let Some(version) = flags.proxy_protocol {
+
+    if kind == ServeKind::Tun {
+        // Go: `!forService && srvType == serveTypeTUN`. --service is refused above, so this is the
+        // only --tun outcome a tnet command line can reach, and it is Go's own.
+        anyhow::bail!("tun mode is only supported for services");
+    }
+
+    if let Some(version) = proxy_protocol {
         anyhow::bail!(
             "--proxy-protocol={version} is not supported by this build: the engine's TCP serve \
              target cannot emit a PROXY-protocol header, and the daemon fails such a config closed \
@@ -8986,14 +9109,15 @@ fn reject_unsupported_serve_flags(flags: &ServeFlags) -> Result<()> {
              client. Drop --proxy-protocol"
         );
     }
-    if flags.accept_app_caps {
+    if !app_caps.is_empty() {
         anyhow::bail!(
-            "--accept-app-caps is not supported by this build: the serve lanes forward no \
+            "--accept-app-caps={} is not supported by this build: the serve lanes forward no \
              capability headers to the backend, so the flag would promise an authorization signal \
-             that never arrives. Drop --accept-app-caps"
+             that never arrives. Drop --accept-app-caps",
+            app_caps.join(",")
         );
     }
-    Ok(())
+    Ok((kind, port))
 }
 
 /// Strip a `tcp://` scheme from a raw-TCP serve target, then normalize it the usual way (bare port →
@@ -9058,8 +9182,7 @@ async fn hold_foreground_serve(
 /// `funnel --https=443 off` is the exact inverse of turning it on and the tailnet-internal serve
 /// survives.
 async fn run_serve_v2(socket: &std::path::Path, flags: ServeFlags, funnel: bool) -> Result<()> {
-    reject_unsupported_serve_flags(&flags)?;
-    let (kind, port) = serve_kind_and_port(&flags)?;
+    let (kind, port) = check_serve_flags(&flags, funnel)?;
     let verb = if funnel { "funnel" } else { "serve" };
 
     // `off` is accepted in the target position (Go `serve --https=PORT off`) and after a target (Go
@@ -9175,6 +9298,8 @@ async fn run_serve_v2(socket: &std::path::Path, flags: ServeFlags, funnel: bool)
             cfg.web.retain(|k, _| !k.ends_with(&suffix));
             format!("tls+tcp {host}:{port} -> {fwd} (TLS-terminated)")
         }
+        // `check_serve_flags` refuses --tun above, for Go's reason, before anything is written.
+        ServeKind::Tun => unreachable!("a TUN serve never reaches the config writer"),
     };
     if funnel {
         let host = host.as_deref().expect("funnel resolved a host above");
@@ -9204,7 +9329,7 @@ async fn run_serve_v2(socket: &std::path::Path, flags: ServeFlags, funnel: bool)
         }
     }
 
-    if flags.bg {
+    if serve_background(&flags) {
         Ok(())
     } else {
         hold_foreground_serve(socket, previous).await
@@ -9348,7 +9473,7 @@ async fn run_funnel(
         None => {}
     }
     if let Some((port, on)) = legacy_funnel_toggle(&flags) {
-        reject_unsupported_serve_flags(&flags)?;
+        check_serve_flags(&flags, true)?;
         return run_funnel_toggle(socket, port, on).await;
     }
     run_serve_v2(socket, flags, true).await
@@ -13019,7 +13144,8 @@ mod tests {
         );
         assert_eq!(flags.https, Some(443));
         assert_eq!(flags.target.as_deref(), Some("localhost:3000"));
-        assert!(!flags.bg, "Go's default is the foreground");
+        assert_eq!(flags.bg, None, "unset; Go's default is the foreground");
+        assert!(!serve_background(&flags), "Go's default is the foreground");
 
         // Go's every-flag form, including the ones this build refuses at runtime.
         let (_, flags) = parse_serve(&[
@@ -13028,15 +13154,29 @@ mod tests {
             "--proxy-protocol=2",
             "--service=svc:web",
             "--tun",
-            "--accept-app-caps",
+            "--accept-app-caps=example.com/cap-a,example.com/cap-b",
             "--yes",
             "tcp://127.0.0.1:5432",
         ]);
-        assert!(flags.bg);
+        assert_eq!(flags.bg, Some(true));
         assert_eq!(flags.tls_terminated_tcp, Some(8443));
         assert_eq!(flags.proxy_protocol, Some(2));
         assert_eq!(flags.service.as_deref(), Some("svc:web"));
-        assert!(flags.tun && flags.accept_app_caps && flags.yes);
+        assert_eq!(
+            flags.accept_app_caps,
+            vec!["example.com/cap-a,example.com/cap-b".to_string()],
+            "--accept-app-caps takes Go's comma-separated VALUE, not a bare bool"
+        );
+        assert!(flags.tun && flags.yes);
+
+        // Go's `bgBoolFlag` accepts an explicit `--bg=false`; a bare `--bg` still means true, and a
+        // following bare `false` stays a target, exactly as Go's flag package leaves it.
+        let (_, flags) = parse_serve(&["--bg=false", "localhost:3000"]);
+        assert_eq!(flags.bg, Some(false));
+        assert!(!serve_background(&flags));
+        let (_, flags) = parse_serve(&["--bg", "false"]);
+        assert_eq!(flags.bg, Some(true));
+        assert_eq!(flags.target.as_deref(), Some("false"));
 
         // The subcommands still win over the positional target when the word matches one.
         assert!(matches!(
@@ -13054,11 +13194,13 @@ mod tests {
             Some(ServeCmd::Redirect { port: 443, .. })
         ));
 
-        // Two port flags name one listener: clap rejects the pair outright.
-        assert!(
-            Cli::try_parse_from(["tnet", "serve", "--https=443", "--tcp=22", "x"]).is_err(),
-            "--https and --tcp must conflict"
-        );
+        // Two port flags name one listener. Go decides that at runtime rather than at parse time
+        // (its zero value is "unset", so it cannot), and so does this.
+        let (_, flags) = parse_serve(&["--https=443", "--tcp=22", "x"]);
+        let err = serve_kind_and_port(&flags)
+            .expect_err("--https and --tcp name one listener")
+            .to_string();
+        assert!(err.contains("cannot serve multiple types"), "{err}");
     }
 
     #[test]
@@ -13081,22 +13223,203 @@ mod tests {
             let (_, flags) = parse_serve(&argv);
             assert_eq!(serve_kind_and_port(&flags).unwrap(), want, "{argv:?}");
         }
+    }
 
-        // Port 0 is a parse-able u16 but not a listener.
-        let (_, flags) = parse_serve(&["--https=0", "x"]);
-        assert!(serve_kind_and_port(&flags).is_err());
+    #[test]
+    fn a_zero_port_flag_is_unset_like_go() {
+        // srvTypeAndPortFromFlags counts a port flag only `if v != 0`, because Go's flags are plain
+        // uints whose zero value IS "unset". So `serve --https=0 3000` names no listener, the count
+        // stays at zero, and the default HTTPS/443 listener wins — it is not an error.
+        for flag in ["--https=0", "--http=0", "--tcp=0", "--tls-terminated-tcp=0"] {
+            let (_, flags) = parse_serve(&[flag, "3000"]);
+            assert_eq!(
+                serve_kind_and_port(&flags).unwrap(),
+                (ServeKind::Https, 443),
+                "{flag} is unset, so the default listener stands"
+            );
+            assert_eq!(
+                check_serve_flags(&flags, false).unwrap(),
+                (ServeKind::Https, 443),
+                "{flag}"
+            );
+        }
+
+        // A zero flag alongside a real one leaves exactly one listener named, so it is not the
+        // multiple-types error either.
+        let (_, flags) = parse_serve(&["--https=0", "--tcp=22", "3000"]);
+        assert_eq!(serve_kind_and_port(&flags).unwrap(), (ServeKind::Tcp, 22));
+    }
+
+    #[test]
+    fn tun_is_gos_fifth_serve_type() {
+        // serve_v2.go: --tun sets serveTypeTUN and counts toward the exclusivity check…
+        let (_, flags) = parse_serve(&["--tun", "3000"]);
+        assert_eq!(serve_kind_and_port(&flags).unwrap(), (ServeKind::Tun, 0));
+        let (_, flags) = parse_serve(&["--tun", "--https=443", "3000"]);
+        let err = serve_kind_and_port(&flags)
+            .expect_err("--tun and --https name one listener")
+            .to_string();
+        assert!(err.contains("cannot serve multiple types"), "{err}");
+
+        // …and Go refuses it outright without a service, which is the only shape this build can
+        // express: `--service` is refused before `--tun` is ever looked at.
+        let (_, flags) = parse_serve(&["--tun", "3000"]);
+        let err = check_serve_flags(&flags, false)
+            .expect_err("--tun without a service is refused by Go too")
+            .to_string();
+        assert_eq!(err, "tun mode is only supported for services");
+    }
+
+    #[test]
+    fn gos_own_proxy_protocol_refusals_come_first() {
+        // serve_v2.go refuses --proxy-protocol on a web serve, whether the HTTP(S) listener was
+        // named or defaulted to HTTPS/443.
+        for argv in [
+            vec!["--proxy-protocol=1", "3000"],
+            vec!["--https=8443", "--proxy-protocol=1", "3000"],
+            vec!["--http=80", "--proxy-protocol=2", "3000"],
+        ] {
+            let (_, flags) = parse_serve(&argv);
+            let err = check_serve_flags(&flags, false)
+                .expect_err("PROXY protocol is a TCP-only option")
+                .to_string();
+            assert_eq!(
+                err, "PROXY protocol is only supported for TCP forwarding, not HTTP/HTTPS",
+                "{argv:?}"
+            );
+        }
+
+        // Then Go's version validation, for a TCP forward. Typed as Go types it, so a version well
+        // past a u8 still gets Go's message rather than clap's integer-range one.
+        for (argv, want) in [
+            (
+                vec!["--tcp=2222", "--proxy-protocol=3", "3000"],
+                "invalid PROXY protocol version 3; must be 1 or 2",
+            ),
+            (
+                vec!["--tls-terminated-tcp=8443", "--proxy-protocol=300", "3000"],
+                "invalid PROXY protocol version 300; must be 1 or 2",
+            ),
+        ] {
+            let (_, flags) = parse_serve(&argv);
+            let err = check_serve_flags(&flags, false)
+                .expect_err("only versions 1 and 2 exist")
+                .to_string();
+            assert_eq!(err, want, "{argv:?}");
+        }
+
+        // Go's zero value means unset: --proxy-protocol=0 asks for nothing and refuses nothing.
+        let (_, flags) = parse_serve(&["--proxy-protocol=0", "3000"]);
+        assert_eq!(
+            check_serve_flags(&flags, false).unwrap(),
+            (ServeKind::Https, 443)
+        );
+
+        // A version Go would have ACCEPTED is where this build's own refusal lands.
+        let (_, flags) = parse_serve(&["--tcp=2222", "--proxy-protocol=2", "3000"]);
+        let err = check_serve_flags(&flags, false)
+            .expect_err("this build cannot emit a PROXY header")
+            .to_string();
+        assert!(err.contains("--proxy-protocol=2"), "{err}");
+        assert!(err.contains("not supported by this build"), "{err}");
+    }
+
+    #[test]
+    fn gos_own_service_refusals_come_first() {
+        // `--service` with funnel, and `--service` with an explicit foreground: both are Go's.
+        let (_, flags) = parse_funnel(&["--service=svc:web", "3000"]);
+        let err = check_serve_flags(&flags, true)
+            .expect_err("Go does not serve a service over funnel")
+            .to_string();
+        assert_eq!(err, "--service flag is not supported with funnel");
+
+        let (_, flags) = parse_serve(&["--service=svc:web", "--bg=false", "3000"]);
+        let err = check_serve_flags(&flags, false)
+            .expect_err("a service serve must be a background one")
+            .to_string();
+        assert_eq!(
+            err,
+            "--service flag is only compatible with background mode"
+        );
+
+        // Without --bg, Go flips the default to the background for a service serve, so that refusal
+        // does NOT fire and the build gap is what is reported.
+        let (_, flags) = parse_serve(&["--service=svc:web", "3000"]);
+        assert!(serve_background(&flags), "--service defaults to --bg in Go");
+        let err = check_serve_flags(&flags, false)
+            .expect_err("this build has no Services")
+            .to_string();
+        assert!(err.contains("--service=svc:web"), "{err}");
+        assert!(err.contains("not supported by this build"), "{err}");
+    }
+
+    #[test]
+    fn accept_app_caps_takes_gos_value_and_gos_validation() {
+        // acceptAppCapsFlag.Set: comma-separated, trimmed, {domain}/{name}, repeats append.
+        assert_eq!(
+            parse_accept_app_caps(&[
+                "example.com/cap-a, example.com/deep/cap".to_string(),
+                "sub.example.com/cap-b".to_string(),
+            ])
+            .unwrap(),
+            vec![
+                "example.com/cap-a".to_string(),
+                "example.com/deep/cap".to_string(),
+                "sub.example.com/cap-b".to_string(),
+            ]
+        );
+        // Go returns early on an empty value, so it asks for no capabilities at all.
+        assert!(parse_accept_app_caps(&[String::new()]).unwrap().is_empty());
+
+        for bad in [
+            "nodomain/cap",
+            "example.com",
+            "example.com/",
+            "/cap",
+            "exa mple.com/cap",
+        ] {
+            let err = parse_accept_app_caps(&[bad.to_string()])
+                .expect_err("not a {domain}/{name} capability")
+                .to_string();
+            assert!(
+                err.contains("does not match the form {domain}/{name}"),
+                "{bad}: {err}"
+            );
+        }
+
+        // A Go command line has to PARSE before it can be told what is missing here.
+        let (_, flags) = parse_serve(&["--accept-app-caps=example.com/cap-a", "3000"]);
+        let err = check_serve_flags(&flags, false)
+            .expect_err("this build forwards no capability headers")
+            .to_string();
+        assert!(err.contains("--accept-app-caps=example.com/cap-a"), "{err}");
+        assert!(err.contains("not supported by this build"), "{err}");
+
+        // An empty list asks for nothing, so it is not refused.
+        let (_, flags) = parse_serve(&["--accept-app-caps=", "3000"]);
+        assert_eq!(
+            check_serve_flags(&flags, false).unwrap(),
+            (ServeKind::Https, 443)
+        );
     }
 
     #[test]
     fn unsupported_serve_flags_are_refused_by_name() {
+        // Each flag, in the shape Go itself would have accepted, so the refusal that lands is this
+        // build's own and names the missing capability rather than a syntax error.
         for (argv, needle) in [
             (vec!["--service=svc:web", "x"], "--service=svc:web"),
-            (vec!["--tun", "x"], "--tun"),
-            (vec!["--proxy-protocol=1", "x"], "--proxy-protocol=1"),
-            (vec!["--accept-app-caps", "x"], "--accept-app-caps"),
+            (
+                vec!["--tcp=2222", "--proxy-protocol=1", "x"],
+                "--proxy-protocol=1",
+            ),
+            (
+                vec!["--accept-app-caps=example.com/cap", "x"],
+                "--accept-app-caps=example.com/cap",
+            ),
         ] {
             let (_, flags) = parse_serve(&argv);
-            let err = reject_unsupported_serve_flags(&flags)
+            let err = check_serve_flags(&flags, false)
                 .expect_err("this build cannot honor this flag")
                 .to_string();
             assert!(err.contains(needle), "{err}");
@@ -13107,7 +13430,10 @@ mod tests {
         }
         // Everything this build DOES honor passes, `--yes` (an accepted no-op) included.
         let (_, flags) = parse_serve(&["--bg", "--yes", "--set-path=/api", "3000"]);
-        assert!(reject_unsupported_serve_flags(&flags).is_ok());
+        assert_eq!(
+            check_serve_flags(&flags, false).unwrap(),
+            (ServeKind::Https, 443)
+        );
     }
 
     #[test]
