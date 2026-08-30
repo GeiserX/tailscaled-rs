@@ -740,6 +740,10 @@ enum Command {
     /// NOT an authenticity check — this fork publishes no cryptographic signatures yet, so a
     /// `--yes` self-install trusts GitHub Releases as the source of truth. `update` says so before
     /// installing.
+    ///
+    /// A binary a package manager owns is never replaced in place: on a Homebrew install (the
+    /// `packaging/homebrew` formula), `--yes` refuses and names `brew upgrade` instead, the way Go
+    /// refuses a binary update for a `pkg`-installed client.
     Update {
         /// Only report whether a newer version is available (current vs latest); never install.
         /// Equivalent to Go `tailscale update --dry-run`. This is also the default when neither
@@ -3781,6 +3785,56 @@ fn host_release_triple() -> Option<&'static str> {
     }
 }
 
+/// The Homebrew formula that owns the file at `exe`, if any — the `<formula>` of a
+/// `<prefix>/Cellar/<formula>/<version>/bin/<binary>` path. Pure → unit-testable.
+///
+/// Homebrew installs every file of a package under `<prefix>/Cellar/<formula>/<version>/` and links
+/// the binaries into `<prefix>/bin` as symlinks, so a *resolved* executable path is always the Cellar
+/// one. Matching on the `Cellar` component rather than a hard-coded prefix covers every prefix
+/// Homebrew uses — `/usr/local` (Intel macOS), `/opt/homebrew` (Apple Silicon),
+/// `/home/linuxbrew/.linuxbrew` (Linux), and an operator's custom one.
+fn homebrew_formula_owning(exe: &std::path::Path) -> Option<String> {
+    let mut comps = exe.components();
+    while let Some(c) = comps.next() {
+        if c.as_os_str() != "Cellar" {
+            continue;
+        }
+        let formula = comps.next()?.as_os_str().to_str()?.to_string();
+        // `Cellar/<formula>/<version>/…`: a path that stops at the formula directory names no
+        // installed file, so it is not evidence that this binary came from Homebrew.
+        comps.next()?;
+        return Some(formula);
+    }
+    None
+}
+
+/// The Homebrew formula that owns the *running* `tnet`, if any. Resolves symlinks first, since the
+/// binary on `PATH` is `<prefix>/bin/tnet`, a symlink into the Cellar.
+fn running_binary_homebrew_formula() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    homebrew_formula_owning(&exe)
+}
+
+/// Why `update --yes` refuses on a Homebrew-installed binary, and what to run instead.
+///
+/// The same refusal Go makes when its binary came from a package manager rather than from a release
+/// tarball (`clientupdate/clientupdate.go`, `updateFreeBSD`: "Tailscale was not installed via pkg,
+/// binary updates on FreeBSD are not supported; please reinstall Tailscale using pkg or update
+/// manually", plus the `pkg upgrade tailscale` hint). Swapping the binary in place would overwrite a
+/// file Homebrew owns: the Cellar keeps one directory per installed version, so the next `brew`
+/// command would report a version that is no longer on disk, and the following `brew upgrade` would
+/// silently discard the update. Pure → unit-testable.
+fn homebrew_update_refusal(formula: &str) -> String {
+    format!(
+        "this `tnet` was installed by Homebrew (it is a file of the `{formula}` formula, under \
+         Homebrew's Cellar), and binary updates are not supported for a Homebrew install: replacing \
+         it in place would overwrite a file Homebrew owns and leave `brew` reporting a version that \
+         is no longer installed. Update it with `brew update && brew upgrade {formula}` instead \
+         (or install a release tarball outside the Homebrew prefix and update that)"
+    )
+}
+
 /// One GitHub release, as much of the Releases-API JSON as `update` needs.
 #[derive(Debug, serde::Deserialize)]
 struct GithubRelease {
@@ -3897,6 +3951,10 @@ async fn run_update(
     // an explicit `--yes`). Capture that up front so the messaging is honest.
     let will_install = yes && !report_only;
 
+    // Is this binary a file of a Homebrew formula? If so, `--yes` refuses below — so the report must
+    // not send the reader to a `--yes` that cannot work; it names `brew upgrade` instead.
+    let homebrew_formula = running_binary_homebrew_formula();
+
     // Resolve the target release off the async runtime (ureq is blocking).
     let ver_owned = version.clone();
     let release =
@@ -3933,6 +3991,22 @@ async fn run_update(
 
     // Report-only (default / --check / --dry-run, or no --yes): stop here, having reported.
     if !will_install {
+        if let Some(formula) = homebrew_formula.as_deref() {
+            // Homebrew owns this binary: `--yes` would refuse, so point at the command that works.
+            println!();
+            if latest > current {
+                println!(
+                    "a newer version is available; this `tnet` is Homebrew-managed, so install it \
+                     with `brew update && brew upgrade {formula}`."
+                );
+            } else {
+                println!(
+                    "this `tnet` is Homebrew-managed, so `--yes` cannot change its version — \
+                     `brew` decides which one is installed (`brew upgrade {formula}`)."
+                );
+            }
+            return Ok(());
+        }
         if latest > current {
             println!();
             if version.is_some() {
@@ -3951,6 +4025,15 @@ async fn run_update(
     }
 
     // --- install path (--yes) ---
+
+    // A package manager owns this binary: refuse before downloading anything, and name the command
+    // that does the update properly. Checked ahead of the platform-artifact question below because
+    // it is the more useful answer wherever both apply — a Homebrew install needs `brew upgrade`,
+    // not a release tarball.
+    if let Some(formula) = homebrew_formula.as_deref() {
+        anyhow::bail!("{}", homebrew_update_refusal(formula));
+    }
+
     let Some(triple) = host_release_triple() else {
         anyhow::bail!(
             "this build's platform ({}/{}) has no published release artifact (the project ships \
@@ -14802,6 +14885,67 @@ mod tests {
             }
             _ => assert_eq!(host_release_triple(), None),
         }
+    }
+
+    #[test]
+    fn homebrew_formula_owning_recognises_every_cellar_prefix() {
+        // The three prefixes Homebrew ships with, plus a custom one: the formula is the component
+        // after `Cellar`, whatever the prefix is.
+        for prefix in [
+            "/usr/local",
+            "/opt/homebrew",
+            "/home/linuxbrew/.linuxbrew",
+            "/srv/brew",
+        ] {
+            let exe =
+                std::path::PathBuf::from(format!("{prefix}/Cellar/tailscaled-rs/0.52.2/bin/tnet"));
+            assert_eq!(
+                homebrew_formula_owning(&exe).as_deref(),
+                Some("tailscaled-rs"),
+                "{} should be recognised as a Homebrew-owned file",
+                exe.display()
+            );
+        }
+    }
+
+    #[test]
+    fn homebrew_formula_owning_ignores_non_homebrew_paths() {
+        // The paths a release tarball / `cargo install` / a distro package put the binary at — none
+        // of them are Homebrew's, so `update --yes` must NOT refuse for them.
+        for path in [
+            "/usr/local/bin/tnet",
+            "/usr/bin/tnet",
+            "/home/alice/.cargo/bin/tnet",
+            "/opt/tailscaled-rs/bin/tnet",
+            // A directory literally named Cellar but with nothing installed under it: `Cellar/x`
+            // alone names no file, so it is not evidence of a Homebrew install.
+            "/usr/local/Cellar/tailscaled-rs",
+        ] {
+            assert_eq!(
+                homebrew_formula_owning(std::path::Path::new(path)),
+                None,
+                "{path} is not a Homebrew-owned file"
+            );
+        }
+    }
+
+    #[test]
+    fn homebrew_update_refusal_names_the_formula_and_the_brew_command() {
+        // The refusal has to be actionable: it must say Homebrew owns the binary and give the exact
+        // command that updates it (Go's package-manager refusals do the same — see
+        // `clientupdate.updateFreeBSD`'s `pkg upgrade tailscale` hint).
+        let msg = homebrew_update_refusal("tailscaled-rs");
+        assert!(msg.contains("Homebrew"), "{msg}");
+        assert!(
+            msg.contains("brew update && brew upgrade tailscaled-rs"),
+            "the refusal must name the command that does work: {msg}"
+        );
+        // The formula name is carried through rather than hard-coded, so a renamed/forked formula
+        // still gets a command that works.
+        assert!(
+            homebrew_update_refusal("tailscaled-rs-git").contains("brew upgrade tailscaled-rs-git"),
+            "the formula name must be interpolated, not assumed"
+        );
     }
 
     #[test]
