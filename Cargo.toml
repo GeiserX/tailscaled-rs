@@ -100,6 +100,15 @@ ts_capabilityversion = { package = "geiserx_ts_capabilityversion", git = "https:
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# `tnet configure kubeconfig`: parse the user's existing kubeconfig and re-emit it after merging the
+# new cluster/context/user in (Go `updateKubeconfig`). Go reaches for `sigs.k8s.io/yaml`, which is a
+# YAML front-end over `encoding/json`: it converts the document to the JSON data model, mutates a
+# `map[string]any`, and marshals back through JSON — so the port is `serde_json::Value` as the
+# document model with this crate doing only the YAML parse + emit, which reproduces Go's output
+# byte-for-byte (top-level keys alphabetical, because `serde_json::Map` is a `BTreeMap` exactly as
+# Go's `encoding/json` sorts map keys). `serde_norway` is the maintained fork of the archived
+# `serde_yaml`, same libyaml-derived emitter, no C dependency.
+serde_norway = "0.9"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 # chrono is already in the tree (the engine re-exports `DateTime<Utc>` on Node/StatusNode), but the
