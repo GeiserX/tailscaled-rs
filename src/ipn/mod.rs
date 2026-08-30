@@ -1056,7 +1056,9 @@ pub enum SetAction {
     /// `--report-posture`, `--webclient`, `--update-check`, `--exit-node-allow-lan-access`): the
     /// pinned engine stores those but never acts on or advertises them, so the persist in `begin_set`
     /// is the whole job even on a running node — there is no setter to issue and no reason to force a
-    /// reconnect. See [`SetOptions::needs_rebuild`] for the full three-way classification.
+    /// reconnect. (`--nickname` also renames the login profile on disk, as Go's `profiles.go` does,
+    /// but that is a local file write, not an engine op — so it too leaves the `Vec` empty.) See
+    /// [`SetOptions::needs_rebuild`] for the full three-way classification.
     Live(Vec<LiveSetOp>),
     /// At least one changed pref is one the live engine acts on with NO live setter — `shields_up`
     /// (maps to the immutable `Config.block_incoming`), `ssh` (a device-lifecycle task, not a
@@ -1194,7 +1196,8 @@ impl UpOptions {
 /// `ssh` (a device-lifecycle task), `advertise_tags` (registration-time `requested_tags`) and the two
 /// wire-advertised prefs `advertise_connector` / `auto_update` have no live setter and take the
 /// device-rebuild path (a brief reconnect). The remaining six are CARRIED prefs the engine never acts
-/// on, so they only persist. See [`SetOptions::needs_rebuild`] and [`SetAction`].
+/// on, so they only persist — `nickname` additionally renaming the current login profile, the one
+/// local effect among them. See [`SetOptions::needs_rebuild`] and [`SetAction`].
 #[derive(Debug, Default, Clone)]
 pub struct SetOptions {
     /// Requested hostname (`None` unchanged). Applied LIVE on a running node via
@@ -1246,7 +1249,11 @@ pub struct SetOptions {
     /// `Some(None)` clears, `Some(Some(u))` sets. A CARRIED pref — no engine reconcile.
     pub operator: Option<Option<String>>,
     /// Login-profile nickname (Go `tailscale set --nickname`). Double `Option`: `None` unchanged,
-    /// `Some(None)` clears, `Some(Some(n))` sets. A CARRIED pref — no engine reconcile.
+    /// `Some(None)` clears, `Some(Some(n))` sets. Carried by the ENGINE (no reconcile — see
+    /// [`SetOptions::needs_rebuild`]), but not inert locally: like Go's `profiles.go`, applying it
+    /// also renames the current login profile
+    /// ([`rename_current_profile`](Backend::rename_current_profile)), which is what `switch --list`
+    /// shows and what a `switch <name>` target resolves against.
     pub nickname: Option<Option<String>>,
     /// Device-posture reporting (Go `tailscale set --report-posture`; `None` unchanged). A CARRIED
     /// pref — no engine reconcile.
@@ -1302,7 +1309,9 @@ impl SetOptions {
     ///   for them would be a user-visible outage in exchange for no behavior change — so they neither
     ///   rebuild nor issue a live setter. The persisted pref is the source of truth and the next
     ///   device built (any `up`/rebuild/restart) picks it up. A `set` naming ONLY carried prefs on a
-    ///   running node therefore yields `SetAction::Live` with an EMPTY op list.
+    ///   running node therefore yields `SetAction::Live` with an EMPTY op list. CARRIED is a
+    ///   statement about the ENGINE only: `nickname` additionally renames the current login profile
+    ///   on disk (Go's `profiles.go` does the same), a purely local effect that needs no reconnect.
     ///
     /// The mixed-change rule: if a single `set` touches BOTH a live-applicable pref and a
     /// rebuild-only one, the whole `set` rebuilds (this returns `true`). A rebuild re-applies every
@@ -1661,6 +1670,47 @@ impl Backend {
             });
         }
         entries
+    }
+
+    /// Set the display NAME of the current profile in `profiles.json` — the local half of Go's
+    /// `--nickname` (`ipn/ipnlocal/profiles.go`, where `profileManager.SetPrefs` copies
+    /// `ipn.Prefs.ProfileName` onto the current `LoginProfile`: `if prefsIn.ProfileName() != "" {
+    /// lp.Name = prefsIn.ProfileName() }`). That name is the one user-visible handle a profile has:
+    /// [`list_profiles`](Backend::list_profiles) prints it and
+    /// [`profile::resolve_target_to_id`] resolves a `switch` target against it, so writing it here is
+    /// what makes `tnet set --nickname work-laptop` take effect across the whole `switch` surface
+    /// rather than only inside `prefs.json`.
+    ///
+    /// An EMPTY `name` (Go's `--nickname=` clear) removes the display name rather than storing a
+    /// blank one; both readers already fall back to the profile id, which is the closest local
+    /// analogue of Go's own fallback (Go substitutes the account's login name — a value this daemon
+    /// does not track).
+    ///
+    /// Registers the current profile in the map if it is not there yet, including the implicit
+    /// `default` — [`list_profiles`](Backend::list_profiles) already reads a `default` entry's name
+    /// if one exists, so the default profile is renameable like any other. Writes are atomic
+    /// (see [`profile::save_profiles_file`]); an unreadable/malformed map is treated as empty by the
+    /// loader, so the rename re-establishes it rather than failing.
+    async fn rename_current_profile(&self, name: &str) -> Result<()> {
+        let mut meta = profile::load_profiles_file(&self.state_dir).await;
+        meta.profiles
+            .entry(self.current_profile.clone())
+            .or_default()
+            .name = name.to_string();
+        profile::save_profiles_file(&self.state_dir, &meta)
+            .await
+            .with_context(|| {
+                format!(
+                    "persisting profiles.json while renaming profile {:?}",
+                    self.current_profile
+                )
+            })?;
+        tracing::info!(
+            profile = %self.current_profile,
+            name = %name,
+            "profile: display name updated from --nickname"
+        );
+        Ok(())
     }
 
     /// Switch the active profile to `target` (the analogue of Go `tailscale switch <id>`). Tears the
@@ -2075,6 +2125,10 @@ impl Backend {
             validate_exit_node_selector(Some(sel))?;
         }
 
+        // The login-profile rename `--nickname` owes beyond the pref (see the `opts.nickname` arm
+        // below): captured here as `Some(name)` / `Some(cleared)` and applied after the prefs persist.
+        let mut rename_profile_to: Option<Option<String>> = None;
+
         // Apply the overrides. Same sentinel semantics as `begin_up`'s override block, restricted to
         // the fields `set` accepts. `exit_node` is the double `Option`: binding `en` (an
         // `Option<String>`) and assigning it through both SETS (`Some(Some(sel))`) and CLEARS
@@ -2132,7 +2186,16 @@ impl Backend {
             self.prefs.operator_user = op;
         }
         if let Some(nick) = opts.nickname {
-            self.prefs.node_nickname = nick;
+            self.prefs.node_nickname = nick.clone();
+            // `--nickname` is NOT a carried pref in Go: `profileManager.SetPrefs`
+            // (`ipn/ipnlocal/profiles.go`) applies `ipn.Prefs.ProfileName` to the LOGIN PROFILE
+            // itself — `if prefsIn.ProfileName() != "" { cp.Name = prefsIn.ProfileName() }` — and
+            // that name is what `switch --list` prints and what a `switch <target>` resolves
+            // against. Renaming only the pref would leave `tnet switch <the name you just chose>`
+            // resolving to nothing (worse: to a brand-new empty profile of that id), so the rename
+            // lands on `profiles.json` too. Deferred to just after the prefs persist below, so a
+            // failed rename cannot leave a renamed profile pointing at unpersisted prefs.
+            rename_profile_to = Some(nick);
         }
         if let Some(v) = opts.report_posture {
             self.prefs.posture_checking = v;
@@ -2149,6 +2212,15 @@ impl Backend {
         // `up`/`down`, so a `set`-then-restart reads `Stopped`, not `NoState`.
         self.ever_configured = true;
         self.persist_prefs().await?;
+        // The other half of `--nickname` (Go's `profiles.go` rename, see the apply arm above): make
+        // the display name of the CURRENT profile follow the nickname, so `switch --list` shows it
+        // and `switch <nickname>` resolves to this profile immediately. Ordered AFTER the prefs
+        // persist so the two agree on disk: a rename that fails returns `Err` with the pref already
+        // durable (the operator retries `set --nickname`), never the reverse.
+        if let Some(name) = rename_profile_to {
+            self.rename_current_profile(name.as_deref().unwrap_or(""))
+                .await?;
+        }
 
         // Reconcile against the live engine. This is the only step that needs the device.
         match self.device.as_ref() {
@@ -6224,6 +6296,146 @@ mod tests {
         );
         assert!(be.prefs.run_web_client);
         assert_eq!(be.prefs.auto_update_apply, Some(true));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn set_nickname_renames_the_login_profile_switch_resolves_against() {
+        // Go's `--nickname` is not a carried pref: `profileManager.SetPrefs` copies
+        // `ipn.Prefs.ProfileName` onto the current login profile, so the new name is immediately what
+        // `switch --list` prints and what a `switch <target>` resolves against. Drive the real
+        // `begin_set` and read the rename back through the two production surfaces that consume it.
+        let dir = std::env::temp_dir().join(format!("tailnetd-nick-rename-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = Backend::load(&dir).await.unwrap();
+
+        // Before: the default profile is listed under its id, because nothing has named it.
+        let before = be.list_profiles().await;
+        let def = before
+            .iter()
+            .find(|e| e.id == profile::DEFAULT_PROFILE_ID)
+            .expect("default profile is always listed");
+        assert_eq!(def.name, profile::DEFAULT_PROFILE_ID);
+
+        be.begin_set(SetOptions {
+            nickname: Some(Some("work-laptop".to_string())),
+            ..SetOptions::default()
+        })
+        .await
+        .expect("begin_set --nickname");
+
+        // The pref still holds it (Go writes `Prefs.ProfileName` too)...
+        assert_eq!(be.prefs.node_nickname.as_deref(), Some("work-laptop"));
+        // ...and the LISTING now shows the chosen name against the current profile.
+        let listed = be.list_profiles().await;
+        let def = listed
+            .iter()
+            .find(|e| e.id == profile::DEFAULT_PROFILE_ID)
+            .expect("default profile is always listed");
+        assert_eq!(
+            def.name, "work-laptop",
+            "`switch --list` must show the nickname just set"
+        );
+        assert!(def.current);
+        // The rename is DURABLE (it is the on-disk profiles.json a restart reads), not in-memory.
+        let meta = profile::load_profiles_file(&dir).await;
+        assert_eq!(
+            meta.profiles
+                .get(profile::DEFAULT_PROFILE_ID)
+                .map(|m| m.name.as_str()),
+            Some("work-laptop")
+        );
+
+        // And `switch work-laptop` now resolves to THIS profile. Without the rename the name is not
+        // a known profile, and — being a syntactically valid id — it would be taken as a request to
+        // create a brand-new empty profile called `work-laptop` and switch to it.
+        match be.switch_profile("work-laptop").await.expect("switch") {
+            SwitchOutcome::AlreadyCurrent { id } => {
+                assert_eq!(id, profile::DEFAULT_PROFILE_ID);
+            }
+            other => panic!("nickname must resolve to the current profile, got {other:?}"),
+        }
+        assert_eq!(be.current_profile, profile::DEFAULT_PROFILE_ID);
+
+        // Clearing (Go's `--nickname=`) drops the display name; the listing falls back to the id.
+        be.begin_set(SetOptions {
+            nickname: Some(None),
+            ..SetOptions::default()
+        })
+        .await
+        .expect("begin_set --nickname=");
+        assert_eq!(be.prefs.node_nickname, None);
+        let cleared = be.list_profiles().await;
+        let def = cleared
+            .iter()
+            .find(|e| e.id == profile::DEFAULT_PROFILE_ID)
+            .expect("default profile is always listed");
+        assert_eq!(def.name, profile::DEFAULT_PROFILE_ID);
+
+        // A `set` that does NOT name a nickname leaves the profile name alone.
+        be.begin_set(SetOptions {
+            nickname: Some(Some("renamed".to_string())),
+            ..SetOptions::default()
+        })
+        .await
+        .expect("begin_set --nickname");
+        be.begin_set(SetOptions {
+            hostname: Some("some-host".to_string()),
+            ..SetOptions::default()
+        })
+        .await
+        .expect("begin_set --hostname");
+        let after = be.list_profiles().await;
+        let def = after
+            .iter()
+            .find(|e| e.id == profile::DEFAULT_PROFILE_ID)
+            .expect("default profile is always listed");
+        assert_eq!(def.name, "renamed", "an unnamed nickname must not rename");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn set_nickname_renames_the_profile_it_is_issued_on_not_the_default() {
+        // The rename follows the CURRENT profile — Go renames the current login profile, not a fixed
+        // one — so a nickname set after `switch work` names `work` and leaves `default` untouched.
+        let dir = std::env::temp_dir().join(format!("tailnetd-nick-cur-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = Backend::load(&dir).await.unwrap();
+        be.switch_profile("work").await.expect("switch work");
+
+        be.begin_set(SetOptions {
+            nickname: Some(Some("Work tailnet".to_string())),
+            ..SetOptions::default()
+        })
+        .await
+        .expect("begin_set --nickname");
+
+        let listed = be.list_profiles().await;
+        let work = listed.iter().find(|e| e.id == "work").expect("work listed");
+        let def = listed
+            .iter()
+            .find(|e| e.id == profile::DEFAULT_PROFILE_ID)
+            .expect("default listed");
+        assert_eq!(work.name, "Work tailnet");
+        assert_eq!(
+            def.name,
+            profile::DEFAULT_PROFILE_ID,
+            "another profile must not be renamed"
+        );
+
+        // A display name with a space is unreachable as an id, so the name arm of the resolver is the
+        // only thing that can find it — exactly Go's `switch "Work tailnet"`.
+        be.switch_profile(profile::DEFAULT_PROFILE_ID)
+            .await
+            .expect("switch default");
+        match be.switch_profile("Work tailnet").await.expect("switch") {
+            SwitchOutcome::Switched { id, .. } => assert_eq!(id, "work"),
+            other => panic!("expected a switch to `work`, got {other:?}"),
+        }
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

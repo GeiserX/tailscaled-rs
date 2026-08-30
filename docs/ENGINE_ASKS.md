@@ -658,9 +658,10 @@ not forgotten; the drain itself is already faithful without it. — daemon lane
 >
 > **Follow-ups the daemon still owes (each its own bead, none required for the flags to be faithful):**
 > consuming `operator_user` in the LocalAPI authorization matrix (today it is recorded, and the write
-> policy is still root/same-euid — THREAT_MODEL already scopes this as a later phase); and unifying
+> policy is still root/same-euid — THREAT_MODEL already scopes this as a later phase). Unifying
 > `node_nickname` with the per-profile display name in `profiles.json` that `tnet switch --list`
-> shows, which Go drives from the same `Prefs.ProfileName`.
+> shows — which Go drives from the same `Prefs.ProfileName` — is **done**: `set --nickname` now also
+> renames the current profile, so `nickname` is carried by the ENGINE but not inert locally.
 
 **Why:** Go's `tailscale up`/`set` (v1.100.0 `up.go:99-148`, `set.go:76-122`) expose ~15 pref flags;
 this fork's `up`/`set` faithfully cover the ten that map to existing engine `Config` fields
