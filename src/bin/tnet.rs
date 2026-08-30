@@ -442,7 +442,20 @@ enum Command {
     /// `up` registers as a fresh login (requires a new auth key / interactive login). Unlike `down`,
     /// which keeps the registration for a seamless reconnect, `logout` ends it. Mirrors Go
     /// `tailscale logout`.
-    Logout,
+    Logout {
+        /// Why this node is being logged out (Go `tailscale logout --reason`), for a fleet where a
+        /// policy asks the operator to justify a disconnect. The text is sent to the daemon, which
+        /// records it in its log alongside the logout.
+        ///
+        /// HONEST SCOPE: in Go the reason is what unlocks a logout on a node whose MDM policy
+        /// requires a justification, and it lands in the node's audit log. This fork registers no
+        /// policy store on Unix (`tnet syspolicy list` shows why) and the engine has no audit-log
+        /// transport to control, so nothing *requires* a reason here and the reason is not forwarded
+        /// to the control plane — it is recorded locally. The flag exists so the operator's habit and
+        /// the tooling that types it keep working against this daemon.
+        #[arg(long, value_name = "TEXT")]
+        reason: Option<String>,
+    },
     /// Re-read the daemon's `--config` file and adopt the changed settings into the running node. The
     /// operator-facing form of Go `tailscaled`'s internal `reload-config` (which Go also triggers on
     /// SIGHUP): edit the declarative config the daemon was started with, then run this to apply the
@@ -515,6 +528,16 @@ enum Command {
         /// exits non-zero — faithful to Go's behavior when upstream-checking is unavailable.
         #[arg(long)]
         upstream: bool,
+        /// Which release track `--upstream` should check: `stable`, `release-candidate` or
+        /// `unstable` (Go `version --track`; empty means "same as the running version").
+        ///
+        /// Consulted ONLY by `--upstream`. Go reads it inside its upstream branch, after the
+        /// "not supported in this build" check — so in a build without an upstream fetcher (Go's
+        /// and this one alike) the flag is accepted and changes nothing. It is here so a script
+        /// written against Go's `version` flags parses. For this fork's own working release check,
+        /// which really does select a track, use `tnet update --check --track <stable|unstable>`.
+        #[arg(long, value_name = "TRACK")]
+        track: Option<String>,
     },
     /// Show current preference values (Go `tailscale get`). With no setting name, shows all prefs;
     /// with a name (e.g. `accept-routes`), shows just that one. Setting names match the `tnet set`
@@ -567,6 +590,18 @@ enum Command {
         /// browser opens by default). Ignored without `--web`.
         #[arg(long)]
         no_browser: bool,
+        /// Go's spelling of the same switch: `--browser=false` suppresses the browser, `--browser`
+        /// (or `--browser=true`) is the default. Accepted so a command line written for Go's
+        /// `status` works here unchanged; mutually exclusive with `--no-browser`, which is this
+        /// fork's spelling of `--browser=false`. Ignored without `--web`, like Go's.
+        #[arg(
+            long,
+            value_name = "BOOL",
+            num_args = 0..=1,
+            default_missing_value = "true",
+            conflicts_with = "no_browser"
+        )]
+        browser: Option<bool>,
     },
     /// Block until the node is connected (state `Running` with a tailnet IP), then exit 0. Mirrors
     /// Go `tailscale wait` — handy in scripts as `tnet wait && start-my-service`.
@@ -762,6 +797,15 @@ enum Command {
         /// Runs until interrupted (Ctrl-C). Omit for a single report.
         #[arg(long, value_name = "SECONDS")]
         every: Option<u64>,
+        /// Log how long each report took, to stderr (Go `tailscale netcheck --verbose`).
+        ///
+        /// PARTIAL: Go's `--verbose` turns on logging in TWO places — the CLI's own
+        /// `GetReport took <d>; err=<e>` line, and the probe-by-probe chatter of the netcheck client
+        /// it runs in-process. Here the measurement happens in the daemon's engine, not in this
+        /// process, so only the timing line is available; the probe log is engine-side (it would need
+        /// the engine to stream its net-report log over the LocalAPI).
+        #[arg(long)]
+        verbose: bool,
     },
     /// Exit-node commands. `list` shows tailnet peers offering to be exit nodes. Mirrors Go
     /// `tailscale exit-node`.
@@ -805,6 +849,35 @@ enum Command {
         /// neither `--cert-file` nor `--key-file` is given. Written with `0600` permissions.
         #[arg(long, value_name = "PATH")]
         key_file: Option<String>,
+        /// The least remaining lifetime the returned certificate must have, as a Go duration
+        /// (`720h`, `30m`, `1h30m`) — Go `tailscale cert --min-validity`. Unset (or `0`) means no
+        /// minimum, Go's default.
+        ///
+        /// HONEST SCOPE: in Go this renews a *cached* certificate that has less than this much life
+        /// left. This fork's engine keeps no cert cache — every `cert` issues fresh — so a
+        /// full-lifetime certificate always satisfies the minimum and the flag changes nothing
+        /// today. It is carried all the way to the engine (not swallowed by the CLI) so an
+        /// engine-side cache would honor it without a CLI change. Go additionally accepts a NEGATIVE
+        /// duration, where it has no effect; this refuses one rather than pretending to carry it.
+        #[arg(long, value_name = "DURATION", value_parser = parse_min_validity)]
+        min_validity: Option<std::time::Duration>,
+        /// Instead of writing the cert to disk, serve HTTPS with it until interrupted (Ctrl-C), as a
+        /// demo that the certificate works (Go `tailscale cert --serve-demo`). Every request gets a
+        /// short "it works" page. `--cert-file`/`--key-file` are ignored in this mode — nothing is
+        /// written — exactly as in Go.
+        ///
+        /// GRAMMAR NOTE: Go's `--serve-demo` needs no domain (its daemon hands it a certificate per
+        /// SNI name as connections arrive) and takes the listen address as the positional argument.
+        /// This fork's LocalAPI has no per-SNI certificate hook, so the domain positional is still
+        /// required — it names the one certificate this server presents — and the listen address is
+        /// `--listen`.
+        #[arg(long)]
+        serve_demo: bool,
+        /// Address for `--serve-demo` to listen on (Go's positional argument, same default `:443`,
+        /// which needs root). A bare `:PORT` binds every IPv4 interface; write `[::]:PORT` for IPv6
+        /// or `127.0.0.1:PORT` to keep the demo on this host. Only valid with `--serve-demo`.
+        #[arg(long, value_name = "ADDR")]
+        listen: Option<String>,
     },
     /// Connect to a TCP port on a tailnet host and pipe stdin/stdout over the overlay (Go `tailscale
     /// nc`). Like netcat: bytes from stdin go to the peer, the peer's bytes go to stdout, until EOF.
@@ -1638,6 +1711,16 @@ fn resolve_ssh(ssh: bool, no_ssh: bool) -> Option<bool> {
     }
 }
 
+/// Whether `status --web` should open a browser, from the two spellings of the same switch: this
+/// fork's `--no-browser` and Go's `--browser[=BOOL]` (default true). clap already refuses the pair
+/// together, so at most one is set; with neither, the browser opens — Go's default.
+fn resolve_browser(browser: Option<bool>, no_browser: bool) -> bool {
+    if no_browser {
+        return false;
+    }
+    browser.unwrap_or(true)
+}
+
 /// Whether `ip` is a Tailscale-assigned address — the Rust analogue of Go `tsaddr.IsTailscaleIP`.
 /// CGNAT `100.64.0.0/10` **minus** the ChromeOS-VM subrange `100.115.92.0/23` (Go excludes it —
 /// `IsTailscaleIPv4 = CGNATRange.Contains && !ChromeOSVMRange.Contains`), plus the Tailscale ULA
@@ -2064,7 +2147,21 @@ async fn main() -> Result<()> {
             domain,
             cert_file,
             key_file,
-        } => run_cert(&socket, domain, cert_file, key_file).await,
+            min_validity,
+            serve_demo,
+            listen,
+        } => {
+            run_cert(
+                &socket,
+                domain,
+                cert_file,
+                key_file,
+                min_validity,
+                serve_demo,
+                listen,
+            )
+            .await
+        }
         // `nc` hijacks its connection (the daemon splices to the overlay after a one-line ack), so it
         // is handled by a dedicated piping path, not the generic round-trip.
         Command::Nc { host, port } => run_nc(&socket, &host, port)
@@ -2157,7 +2254,7 @@ async fn main() -> Result<()> {
         Command::Uninstall => tailscaled_rs::ipn::install::run_uninstall()
             .context("removing the tailnetd system service"),
         Command::Down => dispatch_simple(&socket, Request::Down).await,
-        Command::Logout => dispatch_simple(&socket, Request::Logout).await,
+        Command::Logout { reason } => dispatch_simple(&socket, Request::Logout { reason }).await,
         // `reload-config` (Go `tailscaled`'s `reload-config`): re-read the daemon's `--config` and adopt
         // it into the running node. A dedicated renderer (not `dispatch_simple`) so it prints a clean
         // success line and exits 1 on the daemon's error (no `--config` in use / malformed file), like
@@ -2184,10 +2281,14 @@ async fn main() -> Result<()> {
         // return. WITH `--daemon` it round-trips `Request::Version` to learn the daemon's version,
         // then renders both; we do that inline here (rather than falling through to the generic
         // response printer) so the client/daemon pairing + `--json` shape stay in one place.
+        // `--track` selects the release track `--upstream` would query. This build has no upstream
+        // fetcher (`--upstream` refuses, as Go's does without its clientupdate hook), so the track
+        // never reaches a fetch — accepted and ignored, exactly like Go's.
         Command::Version {
             daemon,
             json,
             upstream,
+            track: _,
         } => run_version(&socket, daemon, json, upstream).await,
         // `get` (Go `tailscale get`): round-trip GetPrefs, then render. Handled inline (early return)
         // because its `setting`/`json` args shape the output and are not part of the wire request —
@@ -2218,9 +2319,18 @@ async fn main() -> Result<()> {
             web,
             listen,
             no_browser,
+            browser,
         } => {
             run_status(
-                &socket, watch, json, active, no_peers, no_self, web, listen, no_browser,
+                &socket,
+                watch,
+                json,
+                active,
+                no_peers,
+                no_self,
+                web,
+                listen,
+                resolve_browser(browser, no_browser),
             )
             .await
         }
@@ -2331,7 +2441,8 @@ async fn main() -> Result<()> {
             json,
             format,
             every,
-        } => run_netcheck(&socket, json, format, every).await,
+            verbose,
+        } => run_netcheck(&socket, json, format, every, verbose).await,
         // `exit-node list` (Go `tailscale exit-node list`): reuse Status, filter to exit-node peers.
         Command::ExitNode {
             cmd: ExitNodeCmd::List,
@@ -2952,14 +3063,15 @@ async fn run_status(
     no_self: bool,
     web: bool,
     listen: Option<String>,
-    no_browser: bool,
+    browser: bool,
 ) -> Result<()> {
     // `status --web` is a long-lived embedded HTTP server, not a one-shot — handle it here and
-    // return (like --watch). Default listen 127.0.0.1:8384; browser opens unless --no-browser.
+    // return (like --watch). Default listen 127.0.0.1:8384; the browser opens unless it was turned
+    // off (`--no-browser`, or Go's `--browser=false`).
     if web {
         let listen = listen.unwrap_or_else(|| "127.0.0.1:8384".to_string());
         // `status --web` serves at `/` (no path prefix).
-        return run_status_web(socket, &listen, !no_browser, "/")
+        return run_status_web(socket, &listen, browser, "/")
             .await
             .with_context(|| format!("serving status --web on {listen}"));
     }
@@ -4706,6 +4818,7 @@ async fn run_netcheck(
     json: bool,
     format: Option<String>,
     every: Option<u64>,
+    verbose: bool,
 ) -> Result<()> {
     // Resolve the output mode: an explicit `--format` wins; the legacy `--json` bool maps to pretty
     // JSON; otherwise human-readable. (clap already rejects `--json` + `--format` together.)
@@ -4716,10 +4829,16 @@ async fn run_netcheck(
         _ => NetcheckFormat::Human,
     };
 
+    // Go prints this to stderr before any JSON report: the report shape is not a stable interface.
+    // It applies to the `--json` alias too — that is just another spelling of `--format json`.
+    if matches!(mode, NetcheckFormat::Json | NetcheckFormat::JsonLine) {
+        eprintln!("# Warning: this JSON format is not yet considered a stable interface");
+    }
+
     match every {
         // Single report (the default).
         None => {
-            let report = fetch_netcheck(socket).await?;
+            let report = fetch_netcheck_timed(socket, verbose).await?;
             print!("{}", format_netcheck(&report, mode));
             Ok(())
         }
@@ -4729,7 +4848,7 @@ async fn run_netcheck(
             let interval = std::time::Duration::from_secs(secs.max(1));
             let mut first = true;
             loop {
-                let report = fetch_netcheck(socket).await?;
+                let report = fetch_netcheck_timed(socket, verbose).await?;
                 if !first && matches!(mode, NetcheckFormat::Human | NetcheckFormat::Json) {
                     println!();
                 }
@@ -4741,6 +4860,36 @@ async fn run_netcheck(
             }
         }
     }
+}
+
+/// Fetch one report, and with `--verbose` log how long it took to stderr — Go's
+/// `c.Logf("GetReport took %v; err=%v", ...)`, which its netcheck client prints after every report.
+/// The timing is measured around the daemon round-trip because that is where the measurement happens
+/// here (Go measures its in-process `GetReport` call). A failed fetch never reaches this line: like
+/// Go, an error ends the command — [`fetch_netcheck`] prints the daemon's error and exits.
+async fn fetch_netcheck_timed(
+    socket: &std::path::Path,
+    verbose: bool,
+) -> Result<tailscaled_rs::localapi::NetcheckReport> {
+    if !verbose {
+        return fetch_netcheck(socket).await;
+    }
+    let started = std::time::Instant::now();
+    let report = fetch_netcheck(socket).await?;
+    eprintln!("{}", netcheck_verbose_line(started.elapsed()));
+    Ok(report)
+}
+
+/// Render Go's verbose netcheck timing line. Go logs `netcheck: GetReport took 57ms; err=<nil>`
+/// (a `time.Duration` rounded to milliseconds, and `%v` of a nil error). This prints whole
+/// milliseconds rather than reimplementing Go's mixed-unit duration formatting, and always reports
+/// `err=<nil>`: an errored report exits before this line, so the only report that gets timed here is
+/// one that succeeded. Pure → unit-testable.
+fn netcheck_verbose_line(elapsed: std::time::Duration) -> String {
+    format!(
+        "netcheck: GetReport took {}ms; err=<nil>",
+        elapsed.as_millis()
+    )
 }
 
 /// Fetch one netcheck report from the daemon (a single `Request::Netcheck` round-trip). A plain
@@ -4790,6 +4939,372 @@ async fn run_syspolicy(socket: &std::path::Path, request: Request, json: bool) -
     Ok(())
 }
 
+/// clap value parser for `cert --min-validity`: Go's duration grammar, then the one restriction this
+/// fork adds. Go's flag package accepts a negative duration here (where it simply has no effect, since
+/// nothing is ever less valid than "already expired"); the wire field is an unsigned second count, so
+/// rather than silently carrying a lie this refuses it. Everything else is Go's parser verbatim —
+/// including its error text, so `--min-validity 1d` explains itself the way `tailscale` does.
+fn parse_min_validity(value: &str) -> Result<std::time::Duration, String> {
+    let nanos = parse_go_duration(value)?;
+    if nanos < 0 {
+        return Err(format!(
+            "a negative minimum validity ({value:?}) asks for a certificate that is already expired"
+        ));
+    }
+    Ok(std::time::Duration::from_nanos(nanos as u64))
+}
+
+/// Parse a Go duration string — `300ms`, `-1.5h`, `2h45m`, `0` — into nanoseconds, the way Go's
+/// `time.ParseDuration` does (`src/time/format.go` in the Go standard library, reached from
+/// `cmd/tailscale/cli/cert.go`'s `fs.DurationVar`). A duration is a possibly signed sequence of
+/// decimal numbers each with a unit suffix; valid units are `ns`, `us` (or `µs`/`μs`), `ms`, `s`,
+/// `m` and `h`.
+///
+/// The error strings are Go's, so a mistyped flag reads the same as it would from `tailscale`:
+/// `time: missing unit in duration "1"`, `time: unknown unit "d" in duration "1d"`, and
+/// `time: invalid duration "abc"` for everything else (including overflow past Go's i64-nanosecond
+/// range). Pure → unit-testable.
+fn parse_go_duration(input: &str) -> Result<i64, String> {
+    // Go quotes the offending text with %q; the values here are flag arguments (no exotic escapes to
+    // reproduce), so a plain double-quoting matches what Go prints.
+    fn quoted(s: &str) -> String {
+        format!("{s:?}")
+    }
+    let invalid = |s: &str| format!("time: invalid duration {}", quoted(s));
+
+    let orig = input;
+    let mut s = input;
+    let mut neg = false;
+    if let Some(first) = s.as_bytes().first()
+        && (*first == b'-' || *first == b'+')
+    {
+        neg = *first == b'-';
+        s = &s[1..];
+    }
+    // Special case: a bare "0" is zero with no unit.
+    if s == "0" {
+        return Ok(0);
+    }
+    if s.is_empty() {
+        return Err(invalid(orig));
+    }
+
+    // Nanoseconds accumulated so far. Go accumulates in a u64 and range-checks against 1<<63 as it
+    // goes, so the same arithmetic is done here.
+    let mut total: u64 = 0;
+    while !s.is_empty() {
+        // The next character must start a number: [0-9.].
+        let first = s.as_bytes()[0];
+        if !(first == b'.' || first.is_ascii_digit()) {
+            return Err(invalid(orig));
+        }
+        // Integer part.
+        let before = s.len();
+        let (mut v, rest) = leading_int(s).ok_or_else(|| invalid(orig))?;
+        s = rest;
+        let had_int = before != s.len();
+        // Optional fraction.
+        let mut frac: u64 = 0;
+        let mut scale: f64 = 1.0;
+        let mut had_frac = false;
+        if s.as_bytes().first() == Some(&b'.') {
+            s = &s[1..];
+            let before = s.len();
+            let (f, sc, rest) = leading_fraction(s);
+            frac = f;
+            scale = sc;
+            s = rest;
+            had_frac = before != s.len();
+        }
+        if !had_int && !had_frac {
+            return Err(invalid(orig));
+        }
+        // The unit runs until the next digit or '.'. Those are ASCII, and a multi-byte unit (`µs`)
+        // has no ASCII bytes, so this byte scan always lands on a char boundary.
+        let end = s
+            .as_bytes()
+            .iter()
+            .position(|c| *c == b'.' || c.is_ascii_digit())
+            .unwrap_or(s.len());
+        if end == 0 {
+            return Err(format!("time: missing unit in duration {}", quoted(orig)));
+        }
+        let unit_name = &s[..end];
+        s = &s[end..];
+        let unit: u64 = match unit_name {
+            "ns" => 1,
+            "us" | "µs" | "\u{03bc}s" => 1_000,
+            "ms" => 1_000_000,
+            "s" => 1_000_000_000,
+            "m" => 60 * 1_000_000_000,
+            "h" => 3_600 * 1_000_000_000,
+            other => {
+                return Err(format!(
+                    "time: unknown unit {} in duration {}",
+                    quoted(other),
+                    quoted(orig)
+                ));
+            }
+        };
+        if v > (1u64 << 63) / unit {
+            return Err(invalid(orig)); // Overflow.
+        }
+        v *= unit;
+        if frac > 0 {
+            // Go's float round-trip for the fractional part; the scale is a power of ten.
+            v += (frac as f64 * (unit as f64 / scale)) as u64;
+            if v > 1u64 << 63 {
+                return Err(invalid(orig));
+            }
+        }
+        total = total.checked_add(v).ok_or_else(|| invalid(orig))?;
+        if total > 1u64 << 63 {
+            return Err(invalid(orig));
+        }
+    }
+    if neg {
+        // Go negates after building the magnitude; the extreme case (exactly 1<<63) is i64::MIN,
+        // which wraps in exactly the same way there.
+        return Ok((total as i64).wrapping_neg());
+    }
+    if total > (1u64 << 63) - 1 {
+        return Err(invalid(orig));
+    }
+    Ok(total as i64)
+}
+
+/// Consume the leading run of decimal digits, returning its value and the rest of the string — Go's
+/// `leadingInt`. `None` on overflow past `i64::MAX` nanoseconds, which the caller reports as an
+/// invalid duration (Go's own behavior).
+fn leading_int(s: &str) -> Option<(u64, &str)> {
+    let mut value: u64 = 0;
+    let mut idx = 0;
+    for (i, c) in s.bytes().enumerate() {
+        if !c.is_ascii_digit() {
+            idx = i;
+            break;
+        }
+        // Go's two overflow guards, in Go's order and with Go's thresholds.
+        if value > (1u64 << 63) / 10 {
+            return None;
+        }
+        value = value * 10 + u64::from(c - b'0');
+        if value > 1u64 << 63 {
+            return None;
+        }
+        idx = i + 1;
+    }
+    Some((value, &s[idx..]))
+}
+
+/// Consume the leading run of decimal digits as a fraction, returning the digits' value, the power of
+/// ten to divide it by, and the rest of the string — Go's `leadingFraction`. Digits past the point
+/// where the value would overflow are consumed but ignored (again Go's behavior: they cannot change
+/// the result at nanosecond resolution).
+fn leading_fraction(s: &str) -> (u64, f64, &str) {
+    let mut value: u64 = 0;
+    let mut scale: f64 = 1.0;
+    let mut overflow = false;
+    let mut idx = 0;
+    for (i, c) in s.bytes().enumerate() {
+        if !c.is_ascii_digit() {
+            idx = i;
+            break;
+        }
+        idx = i + 1;
+        if overflow {
+            continue;
+        }
+        if value > ((1u64 << 63) - 1) / 10 {
+            // Keep consuming digits, but stop accumulating.
+            overflow = true;
+            continue;
+        }
+        let next = value * 10 + u64::from(c - b'0');
+        if next > 1u64 << 63 {
+            overflow = true;
+            continue;
+        }
+        value = next;
+        scale *= 10.0;
+    }
+    (value, scale, &s[idx..])
+}
+
+/// The refusal `tnet cert` owes its own flags before it contacts the daemon, or `None` when the
+/// invocation is usable. `--listen` names the address `--serve-demo` binds, so on its own it asks for
+/// a listener that will never exist — Go refuses the same shape from the other direction, rejecting
+/// the listen argument it only accepts alongside `--serve-demo` ("too many arguments; max 1 allowed
+/// with --serve-demo (the listen address)"). The extra-positional half of Go's check is clap's job
+/// here: this fork's `cert` takes exactly one positional (the domain), so a second one is already
+/// refused.
+///
+/// The message goes to **stdout** and the caller exits **1**, matching Go's `outln` + `os.Exit(1)`
+/// (and this CLI's [`switch_usage_refusal`]) rather than clap's stderr + exit 2 — which is why this
+/// is a hand-rolled check and not an `#[arg(requires = ...)]`. Pure → unit-testable.
+fn cert_usage_refusal(serve_demo: bool, has_listen: bool) -> Option<&'static str> {
+    if has_listen && !serve_demo {
+        return Some("--listen can only be used with --serve-demo");
+    }
+    None
+}
+
+/// Where `cert --serve-demo` listens when `--listen` is not given: Go's `:443`, the port a browser
+/// reaches without a port in the URL. Binding it needs root.
+const DEFAULT_CERT_DEMO_LISTEN: &str = ":443";
+
+/// Turn a Go-style listen address into one Rust's resolver accepts. Go's `net.Listen` reads a bare
+/// `:443` as "every interface"; Rust's `ToSocketAddrs` rejects it outright, so a leading colon
+/// becomes an explicit `0.0.0.0`. Everything else is passed through untouched — `[::]:443`,
+/// `127.0.0.1:8443` and a hostname all mean here exactly what they mean to Go.
+///
+/// DIVERGENCE, deliberate: Go's bare `:443` listens on IPv4 *and* IPv6; `0.0.0.0:443` is IPv4 only.
+/// Binding both families needs two listeners, which a demo server does not warrant — pass
+/// `[::]:443` for the IPv6 side. Pure → unit-testable.
+fn normalize_demo_listen(listen: &str) -> String {
+    match listen.strip_prefix(':') {
+        Some(port) => format!("0.0.0.0:{port}"),
+        None => listen.to_string(),
+    }
+}
+
+/// Max concurrent in-flight `cert --serve-demo` connection handlers — the same count bound, for the
+/// same reason, as [`MAX_WEB_CONNECTIONS`] on the status page. This listener can be reachable from
+/// the tailnet (or, on `:443`, the internet), so shedding beyond the cap matters more here: a TLS
+/// handshake is not free.
+const MAX_CERT_DEMO_CONNECTIONS: usize = 64;
+
+/// `cert --serve-demo` (Go `tailscale cert --serve-demo`): serve HTTPS with the certificate just
+/// issued, so the operator can point a browser at the domain and see that it works, instead of
+/// writing the PEMs to disk. Runs until interrupted (Ctrl-C).
+///
+/// Terminates TLS with the issued leaf+chain and its key, and answers every request with the same
+/// short page Go serves. Each connection is handled on its own task under a
+/// [`MAX_CERT_DEMO_CONNECTIONS`] semaphore, with a deadline on the handshake and on the request read,
+/// so neither a flood nor a client that connects and says nothing can pile up handlers.
+///
+/// REDUCED SCOPE vs Go: Go's demo handler also redirects a bare-hostname request to the expanded
+/// MagicDNS name (its `ExpandSNIName` LocalAPI call), and it serves whatever certificate matches the
+/// SNI of each connection. This fork's LocalAPI offers neither, so the server presents the one
+/// certificate `cert` was asked for and serves the page to every request.
+async fn run_cert_serve_demo(
+    domain: &str,
+    cert_pem: &str,
+    key_pem: &str,
+    listen: &str,
+) -> Result<()> {
+    use std::sync::Arc;
+
+    let certs = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .context("parsing the issued certificate PEM")?;
+    if certs.is_empty() {
+        anyhow::bail!("the daemon returned no certificate for {domain:?}");
+    }
+    let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+        .context("parsing the issued private-key PEM")?
+        .ok_or_else(|| anyhow!("the daemon returned no private key for {domain:?}"))?;
+    // Name the crypto provider explicitly rather than relying on a process default: this binary also
+    // links other TLS users, and an ambiguous default is a runtime panic, not a build error.
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .context("selecting TLS protocol versions")?
+    .with_no_client_auth()
+    .with_single_cert(certs, key)
+    .context("loading the issued certificate into the TLS server")?;
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+
+    let bind = normalize_demo_listen(listen);
+    let listener = tokio::net::TcpListener::bind(&bind)
+        .await
+        .with_context(|| format!("binding the cert demo server to {bind} (:443 needs root)"))?;
+    let addr = listener
+        .local_addr()
+        .context("resolving the listen address")?;
+    println!("running TLS server on {addr} for {domain} ... (Ctrl-C to stop)");
+
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CERT_DEMO_CONNECTIONS));
+    loop {
+        let (conn, _peer) = match listener.accept().await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("cert --serve-demo: accept failed: {e}");
+                continue;
+            }
+        };
+        let Ok(permit) = Arc::clone(&conn_limit).try_acquire_owned() else {
+            eprintln!("cert --serve-demo: connection cap reached; dropping connection");
+            continue;
+        };
+        let acceptor = acceptor.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            serve_cert_demo_connection(conn, acceptor).await;
+        });
+    }
+}
+
+/// Serve one `cert --serve-demo` connection: complete the TLS handshake, read the request line, and
+/// write the demo page. Best-effort throughout — a handshake failure (a plain-HTTP client, a scanner)
+/// or any read/write error just drops the connection; this is a demonstration server, not a hardened
+/// endpoint. Both the handshake and the request-line read are bounded in time (and the read in bytes)
+/// so a client that connects and then says nothing cannot hold a handler forever.
+async fn serve_cert_demo_connection(
+    conn: tokio::net::TcpStream,
+    acceptor: tokio_rustls::TlsAcceptor,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let Ok(Ok(mut tls)) = tokio::time::timeout(CERT_DEMO_DEADLINE, acceptor.accept(conn)).await
+    else {
+        return; // Handshake timed out or failed (e.g. a plain-HTTP request to an HTTPS port).
+    };
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+    let read_line = async {
+        loop {
+            let n = tls.read(&mut chunk).await?;
+            if n == 0 {
+                break; // EOF before a full line — no request to answer.
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.contains(&b'\n') || buf.len() >= 8192 {
+                break;
+            }
+        }
+        Ok::<(), std::io::Error>(())
+    };
+    if !matches!(
+        tokio::time::timeout(CERT_DEMO_DEADLINE, read_line).await,
+        Ok(Ok(()))
+    ) || buf.is_empty()
+    {
+        return;
+    }
+    let _ = tls.write_all(cert_demo_response().as_bytes()).await;
+    let _ = tls.shutdown().await;
+}
+
+/// The whole HTTP response `cert --serve-demo` writes: Go's demo handler answers **every** request
+/// the same way (no routing, no 404 path), so this takes no request and returns one `200` with the
+/// page. Pure → unit-testable.
+fn cert_demo_response() -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{CERT_DEMO_BODY}",
+        CERT_DEMO_BODY.len()
+    )
+}
+
+/// How long a `cert --serve-demo` connection gets for its TLS handshake, and then for its request
+/// line. Matches the `status --web` handler's 5s read deadline.
+const CERT_DEMO_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The page `cert --serve-demo` answers with — Go serves `<h1>Hello from Tailscale</h1>It works.`;
+/// this names the daemon that actually served it.
+const CERT_DEMO_BODY: &str = "<h1>Hello from tailscaled-rs</h1>It works.";
+
 /// `cert <domain>` (Go `tailscale cert`): round-trip a [`Request::Cert`], then write the issued
 /// cert+key PEMs. File handling mirrors Go's `runCert`: when neither `--cert-file` nor `--key-file`
 /// is given, default to `DOMAIN.crt` + `DOMAIN.key` in the cwd (with `*.` → `wildcard_.` so a wildcard
@@ -4802,11 +5317,22 @@ async fn run_cert(
     domain: String,
     cert_file: Option<String>,
     key_file: Option<String>,
+    min_validity: Option<std::time::Duration>,
+    serve_demo: bool,
+    listen: Option<String>,
 ) -> Result<()> {
+    // This command's own flag refusal, before any daemon round-trip (Go checks its own flag/argument
+    // grammar first too).
+    if let Some(message) = cert_usage_refusal(serve_demo, listen.is_some()) {
+        println!("{message}");
+        std::process::exit(1);
+    }
     let (cert_pem, key_pem) = match round_trip(
         socket,
         &Request::Cert {
             domain: domain.clone(),
+            // Whole seconds on the wire (an ACME lifetime is measured in days).
+            min_validity_secs: min_validity.map(|d| d.as_secs()),
         },
     )
     .await
@@ -4821,6 +5347,14 @@ async fn run_cert(
             return Err(e).with_context(|| format!("requesting cert at {}", socket.display()));
         }
     };
+
+    // `--serve-demo`: serve the certificate instead of writing it out, and never return (Ctrl-C
+    // stops it). Like Go, `--cert-file`/`--key-file` are not consulted on this path — nothing is
+    // written to disk.
+    if serve_demo {
+        let listen = listen.unwrap_or_else(|| DEFAULT_CERT_DEMO_LISTEN.to_string());
+        return run_cert_serve_demo(&domain, &cert_pem, &key_pem, &listen).await;
+    }
 
     // Go's default-filename rule: only when BOTH flags are unset. `*.` → `wildcard_.` keeps a wildcard
     // domain a legal path. GUARD (L1): the domain is interpolated into the default filename, so refuse
@@ -14509,5 +15043,329 @@ users:
         }
         // The host argument is required.
         assert!(Cli::try_parse_from(["tnet", "configure", "kubeconfig"]).is_err());
+    }
+    #[test]
+    fn go_duration_grammar_is_ported() {
+        // `cert --min-validity` takes a Go duration, so the parser has to be Go's — a script that
+        // says `720h` must mean 30 days here too. Cases from the Go standard library's
+        // `TestParseDuration` (`src/time/format_test.go`).
+        let ns = 1i64;
+        let us = 1_000 * ns;
+        let ms = 1_000 * us;
+        let sec = 1_000 * ms;
+        let min = 60 * sec;
+        let hour = 60 * min;
+
+        assert_eq!(parse_go_duration("0"), Ok(0));
+        assert_eq!(parse_go_duration("5s"), Ok(5 * sec));
+        assert_eq!(parse_go_duration("30s"), Ok(30 * sec));
+        assert_eq!(parse_go_duration("1478s"), Ok(1478 * sec));
+        // Signs.
+        assert_eq!(parse_go_duration("-5s"), Ok(-5 * sec));
+        assert_eq!(parse_go_duration("+5s"), Ok(5 * sec));
+        assert_eq!(parse_go_duration("-0"), Ok(0));
+        assert_eq!(parse_go_duration("+0"), Ok(0));
+        // Decimal points.
+        assert_eq!(parse_go_duration("5.0s"), Ok(5 * sec));
+        assert_eq!(parse_go_duration("5.6s"), Ok(5 * sec + 600 * ms));
+        assert_eq!(parse_go_duration("5.s"), Ok(5 * sec));
+        assert_eq!(parse_go_duration(".5s"), Ok(500 * ms));
+        assert_eq!(parse_go_duration("1.0s"), Ok(sec));
+        assert_eq!(parse_go_duration("1.00s"), Ok(sec));
+        assert_eq!(parse_go_duration("1.004s"), Ok(sec + 4 * ms));
+        assert_eq!(parse_go_duration("1.0040s"), Ok(sec + 4 * ms));
+        assert_eq!(parse_go_duration("100.00100s"), Ok(100 * sec + ms));
+        // Every unit, including the two spellings of micro.
+        assert_eq!(parse_go_duration("10ns"), Ok(10 * ns));
+        assert_eq!(parse_go_duration("11us"), Ok(11 * us));
+        assert_eq!(parse_go_duration("12\u{b5}s"), Ok(12 * us));
+        assert_eq!(parse_go_duration("12\u{3bc}s"), Ok(12 * us));
+        assert_eq!(parse_go_duration("13ms"), Ok(13 * ms));
+        assert_eq!(parse_go_duration("14s"), Ok(14 * sec));
+        assert_eq!(parse_go_duration("15m"), Ok(15 * min));
+        assert_eq!(parse_go_duration("16h"), Ok(16 * hour));
+        // Composite durations — the shape `--min-validity 720h`/`1h30m` actually gets typed as.
+        assert_eq!(parse_go_duration("3h30m"), Ok(3 * hour + 30 * min));
+        assert_eq!(parse_go_duration("720h"), Ok(720 * hour));
+        assert_eq!(
+            parse_go_duration("10.5s4m"),
+            Ok(4 * min + 10 * sec + 500 * ms)
+        );
+        assert_eq!(
+            parse_go_duration("-2m3.4s"),
+            Ok(-(2 * min + 3 * sec + 400 * ms))
+        );
+        assert_eq!(
+            parse_go_duration("1h2m3s4ms5us6ns"),
+            Ok(hour + 2 * min + 3 * sec + 4 * ms + 5 * us + 6 * ns)
+        );
+        // Largest and smallest representable durations (Go's boundary cases).
+        assert_eq!(parse_go_duration("9223372036854775807ns"), Ok(i64::MAX));
+        assert_eq!(parse_go_duration("-9223372036854775808ns"), Ok(i64::MIN));
+
+        // Go's error paths, with Go's error text.
+        assert_eq!(
+            parse_go_duration(""),
+            Err(r#"time: invalid duration """#.to_string())
+        );
+        assert_eq!(
+            parse_go_duration("3"),
+            Err(r#"time: missing unit in duration "3""#.to_string())
+        );
+        assert_eq!(
+            parse_go_duration("1d"),
+            Err(r#"time: unknown unit "d" in duration "1d""#.to_string()),
+            "days are not a Go duration unit — the message has to say which unit was rejected"
+        );
+        for bad in ["-", "s", ".", "-.", ".s", "+.s", "\u{b5}s", "3000000h"] {
+            assert!(
+                parse_go_duration(bad).is_err(),
+                "{bad:?} must be refused, as Go refuses it"
+            );
+        }
+    }
+
+    #[test]
+    fn min_validity_flag_refuses_a_negative_duration() {
+        // The wire field is an unsigned second count, so a negative minimum cannot be carried
+        // honestly. Go accepts one (where it has no effect); this says so instead of dropping it.
+        assert_eq!(
+            parse_min_validity("720h"),
+            Ok(std::time::Duration::from_secs(720 * 3600))
+        );
+        assert_eq!(parse_min_validity("0"), Ok(std::time::Duration::ZERO));
+        let err = parse_min_validity("-1h").expect_err("a negative minimum must be refused");
+        assert!(err.contains("already expired"), "{err}");
+        // A grammar error still comes back in Go's words, not ours.
+        assert_eq!(
+            parse_min_validity("1d"),
+            Err(r#"time: unknown unit "d" in duration "1d""#.to_string())
+        );
+    }
+
+    #[test]
+    fn cert_refuses_listen_without_serve_demo() {
+        // `--listen` only names the address `--serve-demo` binds; on its own it asks for a listener
+        // that is never created, so it is refused before the daemon round-trip rather than silently
+        // ignored.
+        assert_eq!(
+            cert_usage_refusal(false, true),
+            Some("--listen can only be used with --serve-demo")
+        );
+        // Every usable combination stays usable.
+        assert_eq!(cert_usage_refusal(true, true), None);
+        assert_eq!(cert_usage_refusal(true, false), None);
+        assert_eq!(cert_usage_refusal(false, false), None);
+    }
+
+    #[test]
+    fn demo_listen_address_accepts_gos_bare_port() {
+        // Go's `net.Listen` takes `:443`; Rust's resolver does not, so the bare form is expanded.
+        assert_eq!(normalize_demo_listen(":443"), "0.0.0.0:443");
+        assert_eq!(
+            normalize_demo_listen(DEFAULT_CERT_DEMO_LISTEN),
+            "0.0.0.0:443"
+        );
+        assert_eq!(normalize_demo_listen(":0"), "0.0.0.0:0");
+        // Anything already explicit is passed through untouched.
+        assert_eq!(normalize_demo_listen("127.0.0.1:8443"), "127.0.0.1:8443");
+        assert_eq!(normalize_demo_listen("[::]:443"), "[::]:443");
+        assert_eq!(normalize_demo_listen("192.0.2.10:443"), "192.0.2.10:443");
+    }
+
+    #[test]
+    fn cert_demo_serves_one_page_to_every_request() {
+        // Go's demo handler answers every request with the same short page; the only thing that has
+        // to be right is that the response is well-formed HTTP whose length header matches the body,
+        // or a browser hangs waiting for bytes that never come.
+        let resp = cert_demo_response();
+        let (head, body) = resp
+            .split_once("\r\n\r\n")
+            .expect("response must separate headers from body with a blank line");
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head:?}");
+        assert!(
+            head.contains(&format!("Content-Length: {}", body.len())),
+            "the declared length must match the body ({} bytes): {head:?}",
+            body.len()
+        );
+        assert!(head.contains("Content-Type: text/html; charset=utf-8"));
+        assert!(head.contains("Connection: close"));
+        assert!(body.contains("It works."), "{body:?}");
+    }
+
+    #[test]
+    fn cert_command_parses_the_demo_and_validity_flags() {
+        match Cli::try_parse_from([
+            "tnet",
+            "cert",
+            "--serve-demo",
+            "--listen",
+            "127.0.0.1:8443",
+            "--min-validity",
+            "720h",
+            "host.user.ts.net",
+        ])
+        .expect("parses")
+        .command
+        {
+            Command::Cert {
+                domain,
+                min_validity,
+                serve_demo,
+                listen,
+                ..
+            } => {
+                assert_eq!(domain, "host.user.ts.net");
+                assert!(serve_demo);
+                assert_eq!(listen.as_deref(), Some("127.0.0.1:8443"));
+                assert_eq!(
+                    min_validity,
+                    Some(std::time::Duration::from_secs(720 * 3600))
+                );
+            }
+            _ => panic!("expected Command::Cert"),
+        }
+        // The defaults: no demo server, no minimum validity.
+        match Cli::try_parse_from(["tnet", "cert", "host.user.ts.net"])
+            .expect("parses")
+            .command
+        {
+            Command::Cert {
+                min_validity,
+                serve_demo,
+                listen,
+                ..
+            } => {
+                assert!(!serve_demo);
+                assert_eq!(listen, None);
+                assert_eq!(min_validity, None);
+            }
+            _ => panic!("expected Command::Cert"),
+        }
+        // A duration Go's parser rejects is rejected at parse time, before anything is issued.
+        assert!(
+            Cli::try_parse_from(["tnet", "cert", "--min-validity", "1d", "host.user.ts.net"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn logout_parses_an_optional_reason() {
+        // Go `tailscale logout --reason "<text>"`. Bare `logout` keeps working (no reason).
+        match Cli::try_parse_from(["tnet", "logout", "--reason", "laptop returned to IT"])
+            .expect("parses")
+            .command
+        {
+            Command::Logout { reason } => {
+                assert_eq!(reason.as_deref(), Some("laptop returned to IT"));
+            }
+            _ => panic!("expected Command::Logout"),
+        }
+        match Cli::try_parse_from(["tnet", "logout"])
+            .expect("parses")
+            .command
+        {
+            Command::Logout { reason } => assert_eq!(reason, None),
+            _ => panic!("expected Command::Logout"),
+        }
+    }
+
+    #[test]
+    fn version_accepts_gos_track_flag() {
+        // `--track` selects the release track `--upstream` would query. This build has no upstream
+        // fetcher, so the flag parses and changes nothing — which is exactly what Go's does in a
+        // build without its clientupdate hook.
+        match Cli::try_parse_from(["tnet", "version", "--track", "unstable"])
+            .expect("parses")
+            .command
+        {
+            Command::Version {
+                track,
+                upstream,
+                daemon,
+                json,
+            } => {
+                assert_eq!(track.as_deref(), Some("unstable"));
+                assert!(!upstream && !daemon && !json);
+            }
+            _ => panic!("expected Command::Version"),
+        }
+    }
+
+    #[test]
+    fn netcheck_verbose_reports_how_long_the_report_took() {
+        // Go's netcheck client logs `GetReport took <d>; err=<nil>` after each report; this is the
+        // same line, timed around the daemon round-trip that does the measuring here.
+        assert_eq!(
+            netcheck_verbose_line(std::time::Duration::from_millis(57)),
+            "netcheck: GetReport took 57ms; err=<nil>"
+        );
+        assert_eq!(
+            netcheck_verbose_line(std::time::Duration::from_millis(1_234)),
+            "netcheck: GetReport took 1234ms; err=<nil>"
+        );
+        // `--verbose` is off by default, and pairs with the other netcheck flags.
+        match Cli::try_parse_from(["tnet", "netcheck", "--verbose", "--every", "5"])
+            .expect("parses")
+            .command
+        {
+            Command::Netcheck {
+                verbose,
+                every,
+                json,
+                format,
+            } => {
+                assert!(verbose);
+                assert_eq!(every, Some(5));
+                assert!(!json && format.is_none());
+            }
+            _ => panic!("expected Command::Netcheck"),
+        }
+        match Cli::try_parse_from(["tnet", "netcheck"])
+            .expect("parses")
+            .command
+        {
+            Command::Netcheck { verbose, .. } => assert!(!verbose),
+            _ => panic!("expected Command::Netcheck"),
+        }
+    }
+
+    #[test]
+    fn status_browser_flag_matches_gos_spelling() {
+        // Go writes `--browser=false` to keep the browser closed; this fork's own spelling is
+        // `--no-browser`. Both must reach the same decision, and the default must stay "open it".
+        assert!(resolve_browser(None, false), "Go's default is to open one");
+        assert!(!resolve_browser(Some(false), false), "--browser=false");
+        assert!(resolve_browser(Some(true), false), "--browser=true");
+        assert!(!resolve_browser(None, true), "--no-browser");
+
+        match Cli::try_parse_from(["tnet", "status", "--web", "--browser=false"])
+            .expect("parses")
+            .command
+        {
+            Command::Status {
+                browser,
+                no_browser,
+                ..
+            } => {
+                assert_eq!(browser, Some(false));
+                assert!(!no_browser);
+                assert!(!resolve_browser(browser, no_browser));
+            }
+            _ => panic!("expected Command::Status"),
+        }
+        // A bare `--browser` is Go's `--browser=true`.
+        match Cli::try_parse_from(["tnet", "status", "--web", "--browser"])
+            .expect("parses")
+            .command
+        {
+            Command::Status { browser, .. } => assert_eq!(browser, Some(true)),
+            _ => panic!("expected Command::Status"),
+        }
+        // The two spellings of the same switch cannot be combined.
+        assert!(
+            Cli::try_parse_from(["tnet", "status", "--web", "--browser", "--no-browser"]).is_err(),
+            "--browser and --no-browser are the same knob; asking for both is a usage error"
+        );
     }
 }
