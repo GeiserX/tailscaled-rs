@@ -363,6 +363,18 @@ async fn main() -> Result<()> {
 
     let backend = Arc::new(Mutex::new(backend));
 
+    // Captive-portal detection (Go `ipn/ipnlocal/captiveportal.go`): a daemon-lifetime task that
+    // notices when this node is stuck behind an airport/hotel Wi-Fi login page and raises the
+    // `captive-portal-detected` health warning `tnet status` prints. Deliberately NOT tied to a
+    // device (unlike the link monitor): the case worth reporting is precisely the one where the
+    // engine never came up. It probes only while the node wants to be up and is not — a connected or
+    // deliberately-down node makes zero requests — so it costs nothing on a healthy headless node.
+    //
+    // Detached rather than a `select!` arm: it must never be able to end `serve`, and it owns no
+    // resource needing orderly teardown beyond its `Arc`. Its handle is aborted after `serve` returns
+    // so the loop cannot outlive the backend it reports on.
+    let captive_portal_task = tokio::spawn(ipn::captive_portal_loop(Arc::clone(&backend)));
+
     // Serve the LocalAPI socket until SIGINT/SIGTERM, with SIGHUP handled *concurrently* as a reload
     // (never a shutdown). `serve`'s shutdown future is still SIGINT/SIGTERM only — the SIGHUP loop is
     // a SEPARATE `select!` branch that holds its own `Arc` clone and runs forever, so a SIGHUP can
@@ -406,6 +418,10 @@ async fn main() -> Result<()> {
             }
         }
     };
+    // The daemon is exiting: stop reporting on a backend that is about to be torn down. Aborting
+    // before `shutdown` also guarantees the loop is not holding the backend lock we need next.
+    captive_portal_task.abort();
+
     serve_result?;
 
     backend.lock().await.shutdown().await;

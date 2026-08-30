@@ -1064,6 +1064,16 @@ pub struct StatusReport {
     /// disk, so it must report `true` even while the state is `NeedsLogin`; only `logout`/`force-reauth`
     /// discard the key.) The container-level `#[serde(default)]` keeps the wire backward-compatible.
     pub have_node_key: bool,
+    /// Health-check problems currently raised on this node (Go `ipnstate.Status.Health`), as the
+    /// human-readable texts Go's `health.Tracker.Strings()` emits. Empty means "nothing known to be
+    /// wrong" — the same meaning as Go's empty slice.
+    ///
+    /// This fork registers exactly one warnable, Go's `captive-portal-detected`, so this list is
+    /// either empty or holds that one message; it is not the full Go health-tracker surface. The
+    /// container-level `#[serde(default)]` plus `skip_serializing_if` keep the wire backward-compatible
+    /// with clients that predate this field, and keep a healthy node's status line unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub health: Vec<String>,
 }
 
 /// A read-only projection of the node's persisted [`Prefs`](crate::prefs::Prefs) for `status`
@@ -2545,6 +2555,7 @@ mod tests {
             }],
             version: None,
             have_node_key: false,
+            health: Vec::new(),
         });
         let json = serde_json::to_string(&report).unwrap();
         let back: Response = serde_json::from_str(&json).unwrap();
@@ -2588,6 +2599,7 @@ mod tests {
             peers: vec![],
             version: None,
             have_node_key: false,
+            health: Vec::new(),
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("auth_url"));
@@ -2626,6 +2638,7 @@ mod tests {
             peers: vec![],
             version: None,
             have_node_key: false,
+            health: Vec::new(),
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"error\""));
@@ -2658,6 +2671,7 @@ mod tests {
             peers: vec![],
             version: None,
             have_node_key: false,
+            health: Vec::new(),
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(
@@ -2687,6 +2701,7 @@ mod tests {
             peers: vec![],
             version: None,
             have_node_key: false,
+            health: Vec::new(),
         };
         let pending_json = serde_json::to_string(&pending).unwrap();
         assert!(pending_json.contains("auth_url"));
@@ -2714,6 +2729,7 @@ mod tests {
             peers: vec![],
             version: None,
             have_node_key: false,
+            health: Vec::new(),
         };
         let failed_json = serde_json::to_string(&failed).unwrap();
         assert!(failed_json.contains("\"error\""));

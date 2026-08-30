@@ -7195,6 +7195,22 @@ fn format_status(s: &tailscaled_rs::localapi::StatusReport) -> String {
             peer_status_cell(p),
         );
     }
+    // Health warnings last, in Go's `printHealth` shape (`cmd/tailscale/cli/status.go`):
+    //
+    //     # Health check:
+    //     #     - <text>
+    //
+    // Printed only when something is actually wrong, exactly like Go (which guards on
+    // `len(st.Health) > 0`), so a healthy node's status block is unchanged. The texts are
+    // daemon-generated constants, not control-supplied, but they go through the same single-line
+    // sanitizer as every other cell so the block cannot be broken by a future free-form message.
+    if !s.health.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "# Health check:");
+        for m in &s.health {
+            let _ = writeln!(out, "#     - {}", sanitize_for_terminal(m));
+        }
+    }
     out
 }
 
@@ -7374,6 +7390,10 @@ fn format_status_json(s: &tailscaled_rs::localapi::StatusReport) -> Result<Strin
         }
         root.insert("ExitNodeStatus".into(), Value::Object(ens));
     }
+    // Health (Go `Status.Health`, a `[]string` of health-check problems; empty means nothing known
+    // to be wrong). DEVIATION: Go emits `null` for its nil slice, we always emit an array, so
+    // `jq '.Health | length'` works without a null guard.
+    root.insert("Health".into(), json!(s.health));
     root.insert("Peer".into(), Value::Object(peers));
 
     Ok(format!("{}\n", serde_json::to_string_pretty(&root)?))
@@ -13298,6 +13318,7 @@ mod tests {
             ],
             version: None,
             have_node_key: true,
+            health: Vec::new(),
         };
 
         // No filter → everything.
@@ -13384,6 +13405,7 @@ mod tests {
             ],
             version: Some("0.36.0".to_string()),
             have_node_key: true,
+            health: Vec::new(),
         };
         let out = format_status_json(&report).unwrap();
         let v: serde_json::Value =
@@ -13447,6 +13469,66 @@ mod tests {
             v["Peer"]["peer-c"]["LastSeen"],
             serde_json::json!("2026-06-11T05:19:14+00:00")
         );
+    }
+
+    #[test]
+    fn format_status_prints_the_health_block_only_when_something_is_wrong() {
+        use tailscaled_rs::localapi::StatusReport;
+        // Go `cmd/tailscale/cli/status.go`'s `printHealth`: a `# Health check:` header followed by
+        // one `#     - <text>` line per problem, and nothing at all on a healthy node.
+        let healthy = StatusReport {
+            state: "Running".to_string(),
+            want_running: true,
+            ..Default::default()
+        };
+        let out = format_status(&healthy);
+        assert!(
+            !out.contains("# Health check:"),
+            "a healthy node's status block must be unchanged: {out}"
+        );
+
+        let warned = StatusReport {
+            state: "Starting".to_string(),
+            want_running: true,
+            health: vec!["This network requires you to log in using your web browser.".to_string()],
+            ..Default::default()
+        };
+        let out = format_status(&warned);
+        assert!(
+            out.contains(
+                "# Health check:\n#     - This network requires you to log in using your web \
+                 browser.\n"
+            ),
+            "the health block must match Go's printHealth shape: {out}"
+        );
+    }
+
+    #[test]
+    fn format_status_json_carries_health() {
+        use tailscaled_rs::localapi::StatusReport;
+        // Go `ipnstate.Status.Health` is a `[]string`; `status --json` must expose it under that key
+        // so a script can act on it.
+        let report = StatusReport {
+            state: "Starting".to_string(),
+            health: vec!["This network requires you to log in using your web browser.".to_string()],
+            ..Default::default()
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&format_status_json(&report).unwrap()).unwrap();
+        assert_eq!(
+            v["Health"],
+            serde_json::json!(["This network requires you to log in using your web browser."])
+        );
+
+        // Healthy: an empty ARRAY, never a missing key or a null (the documented deviation from Go,
+        // which emits null for its nil slice) — so `jq '.Health | length'` needs no null guard.
+        let healthy = StatusReport {
+            state: "Running".to_string(),
+            ..Default::default()
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&format_status_json(&healthy).unwrap()).unwrap();
+        assert_eq!(v["Health"], serde_json::json!([]));
     }
 
     #[test]
