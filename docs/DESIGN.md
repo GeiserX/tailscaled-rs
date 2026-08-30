@@ -132,11 +132,12 @@ of it off.)
 - **`systray`** — Go's desktop system-tray GUI. To match: a tray app driving the LocalAPI. A real
   target when a desktop UX is wanted; *not-yet-built* (a separate UI surface, not daemon-internal).
 - **`configure` (synology / sysext / jetkvm / kubeconfig)** — host-specific setup glue. Each is a
-  concrete file/host-config generator we can match per platform. **`configure kubeconfig`** (pure
-  file generation) is *shipped*, with one deliberate deviation: it emits a standalone kubeconfig
-  instead of merging into an existing `~/.kube/config`, because merging means parsing arbitrary user
-  YAML — a parser dependency this daemon has no other use for. The remaining sub-targets are
-  *not-yet-built* — file beads per sub-target.
+  concrete file/host-config generator we can match per platform. **`configure kubeconfig`** is
+  *shipped* and now at parity: it merges the cluster/context/user triple into the kubeconfig kubectl
+  already reads (`$KUBECONFIG`, else `~/.kube/config`), replacing a same-named entry and leaving
+  every other cluster intact, and it resolves a Tailscale Service DNS record when the argument names
+  no peer. `--output PATH` (a fork addition, not a Go flag) still writes a standalone document
+  instead. The remaining sub-targets are *not-yet-built* — file beads per sub-target.
 - **Exotic OS targets** — Plan9 / AIX / Solaris / illumos. *Blocked* on engine support for those
   targets (the engine builds Linux + macOS today; Windows is the next port). Match them as the engine
   grows targets.
