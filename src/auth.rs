@@ -170,7 +170,7 @@ pub(crate) fn requires_write(request: &crate::localapi::Request) -> bool {
         Request::Up { .. }
         | Request::Set { .. }
         | Request::Down
-        | Request::Logout
+        | Request::Logout { .. }
         | Request::SwitchProfile { .. }
         | Request::DeleteProfile { .. }
         | Request::Nc { .. }
@@ -342,7 +342,7 @@ mod tests {
         assert!(!requires_write(&Request::Status));
         assert!(requires_write(&Request::Down));
         assert!(
-            requires_write(&Request::Logout),
+            requires_write(&Request::Logout { reason: None }),
             "logout deregisters + wipes the key — a write, gated like down"
         );
         assert!(requires_write(&up()));

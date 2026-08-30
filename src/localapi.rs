@@ -435,6 +435,21 @@ pub enum Request {
         /// The DNS name to certify — must be one of the tailnet's `CertDomains` (Go validates the
         /// same; an arbitrary domain is refused by control/ACME).
         domain: String,
+        /// The caller's minimum acceptable remaining validity, in whole seconds (Go `tailscale cert
+        /// --min-validity`, which reaches Go's daemon as the `min_validity` query parameter of
+        /// `LocalClient.CertPairWithValidity`). `None` = no minimum (Go's zero duration), which is
+        /// what an older client that omits the field sends.
+        ///
+        /// HONEST SCOPE: Go renews a *cached* cert when less than this much of its lifetime remains.
+        /// This fork's engine keeps no cert cache — every call issues fresh — so the engine accepts
+        /// the value for signature compatibility and a freshly issued (full-lifetime) cert satisfies
+        /// any minimum. The field is wired end to end rather than dropped at the CLI so the day the
+        /// engine grows a cache, the operator's request is already arriving here.
+        ///
+        /// Whole seconds: an ACME certificate's lifetime is measured in days, so sub-second
+        /// precision would be noise on the wire (the CLI parses Go's duration grammar and floors).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min_validity_secs: Option<u64>,
     },
     /// Produce a shareable diagnostic marker (Go `tailscale bugreport`). Replies with
     /// [`Response::BugReport`]. Read-only. NOTE: Go uploads logs to logtail and returns the log id;
@@ -494,7 +509,20 @@ pub enum Request {
     /// `up` re-registers fresh (a new login) rather than resuming the old registration. This is
     /// distinct from [`Down`](Request::Down), which keeps the node key for a seamless resume. A WRITE
     /// — gated like `up`/`down`.
-    Logout,
+    Logout {
+        /// The operator's justification for the logout (Go `tailscale logout --reason`, which travels
+        /// as the base64 `X-Tailscale-Reason` LocalAPI header). `None` when the flag was omitted —
+        /// which is also what an older client sending the bare `{"cmd":"logout"}` deserializes to.
+        ///
+        /// HONEST SCOPE: in Go the reason is what lets a user disconnect a node whose MDM policy
+        /// requires a justification, and it is recorded in the node's audit log. This fork registers
+        /// no policy store on Unix (see [`SyspolicyList`](Request::SyspolicyList)) and the engine has
+        /// no audit-log transport to control, so the daemon *records the reason in its own log*
+        /// alongside the logout and nothing else consumes it. It is not forwarded to the control
+        /// plane.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     /// Report this node's own tailnet addresses (Go `tailscale ip`). Read-only — gated like
     /// [`Status`](Request::Status).
     Ip,
@@ -2136,14 +2164,49 @@ mod tests {
         // mangled or truncated. Pin the request discriminant + field and the reply's two PEM bodies.
         let req = Request::Cert {
             domain: "host.user.ts.net".into(),
+            min_validity_secs: Some(2_592_000),
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(
             json.contains(r#""cmd":"cert""#) && json.contains(r#""domain":"host.user.ts.net""#),
             "{json}"
         );
+        assert!(
+            json.contains(r#""min_validity_secs":2592000"#),
+            "the requested minimum validity must reach the daemon: {json}"
+        );
         match serde_json::from_str::<Request>(&json).unwrap() {
-            Request::Cert { domain } => assert_eq!(domain, "host.user.ts.net"),
+            Request::Cert {
+                domain,
+                min_validity_secs,
+            } => {
+                assert_eq!(domain, "host.user.ts.net");
+                assert_eq!(min_validity_secs, Some(2_592_000));
+            }
+            other => panic!("expected Cert, got {other:?}"),
+        }
+        // No `--min-validity`: the field is omitted from the wire entirely, and an older client's
+        // bare `{"cmd":"cert","domain":...}` still deserializes (to "no minimum" — Go's zero
+        // duration).
+        let bare = serde_json::to_string(&Request::Cert {
+            domain: "host.user.ts.net".into(),
+            min_validity_secs: None,
+        })
+        .unwrap();
+        assert!(
+            !bare.contains("min_validity_secs"),
+            "an unset minimum must not appear on the wire: {bare}"
+        );
+        match serde_json::from_str::<Request>(r#"{"cmd":"cert","domain":"host.user.ts.net"}"#)
+            .unwrap()
+        {
+            Request::Cert {
+                domain,
+                min_validity_secs,
+            } => {
+                assert_eq!(domain, "host.user.ts.net");
+                assert_eq!(min_validity_secs, None, "an absent field means no minimum");
+            }
             other => panic!("expected Cert, got {other:?}"),
         }
         let resp = Response::Cert {
@@ -2157,6 +2220,38 @@ mod tests {
                 assert!(key_pem.contains("BEGIN PRIVATE KEY"), "{key_pem}");
             }
             other => panic!("expected Cert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn logout_reason_round_trips_and_stays_backward_compatible() {
+        // `tnet logout --reason "<text>"` (Go `tailscale logout --reason`, which sends the base64
+        // `X-Tailscale-Reason` header): the justification must reach the daemon verbatim, and the
+        // bare `{"cmd":"logout"}` an older client sends must still parse — the field is the only
+        // thing that changed about the variant.
+        let json = serde_json::to_string(&Request::Logout {
+            reason: Some("laptop returned to IT".into()),
+        })
+        .unwrap();
+        assert!(
+            json.contains(r#""cmd":"logout""#)
+                && json.contains(r#""reason":"laptop returned to IT""#),
+            "{json}"
+        );
+        match serde_json::from_str::<Request>(&json).unwrap() {
+            Request::Logout { reason } => {
+                assert_eq!(reason.as_deref(), Some("laptop returned to IT"))
+            }
+            other => panic!("expected Logout, got {other:?}"),
+        }
+        let bare = serde_json::to_string(&Request::Logout { reason: None }).unwrap();
+        assert_eq!(
+            bare, r#"{"cmd":"logout"}"#,
+            "no reason must serialize to the historical bare form"
+        );
+        match serde_json::from_str::<Request>(r#"{"cmd":"logout"}"#).unwrap() {
+            Request::Logout { reason } => assert_eq!(reason, None),
+            other => panic!("expected Logout, got {other:?}"),
         }
     }
 

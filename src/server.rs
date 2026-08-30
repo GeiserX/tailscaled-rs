@@ -1089,10 +1089,16 @@ async fn dispatch(
         // `cert <domain>` (Go `tailscale cert`): issue a TLS cert+key via the tailnet ACME flow.
         // Off-lock device call (issuance is a control round-trip, potentially slow). Needs the node up
         // (issuance goes through the live engine's control connection); fail-closed without `acme`.
-        Request::Cert { domain } => {
+        Request::Cert {
+            domain,
+            min_validity_secs,
+        } => {
             let dev = { backend.lock().await.device_handle() };
+            // The wire carries whole seconds (an ACME lifetime is measured in days); `None` is Go's
+            // zero duration, i.e. no minimum.
+            let min_validity = min_validity_secs.map(std::time::Duration::from_secs);
             match dev {
-                Some(dev) => Backend::cert_pair(&dev, &domain).await,
+                Some(dev) => Backend::cert_pair(&dev, &domain, min_validity).await,
                 None => Response::Error {
                     message: "node is not up".into(),
                 },
@@ -1171,8 +1177,20 @@ async fn dispatch(
         // deregister is a quick mailbox round-trip (like `set`'s live exit-node, not the multi-second
         // `Device::new` handshake the begin/finish split exists for), so keeping it atomic under the
         // one lock is correct and simplest — no concurrent `up` should interleave a half-logout.
-        Request::Logout => {
+        //
+        // `--reason` (Go's, which travels as the base64 `X-Tailscale-Reason` header) is the
+        // operator's justification. This daemon registers no policy store that could *require* one
+        // and the engine has no audit-log transport to control, so what the reason buys here is a
+        // record in the daemon's own log, written before the attempt — a logout that then FAILS is
+        // exactly the record an operator reading the log later wants the justification attached to.
+        Request::Logout { reason } => {
             let mut be = backend.lock().await;
+            if let Some(reason) = reason.as_deref() {
+                tracing::info!(
+                    reason = %sanitize_logout_reason(reason),
+                    "logout requested with an operator-supplied reason"
+                );
+            }
             match be.logout().await {
                 Ok(()) => {
                     tracing::info!("logout: node deregistered + key wiped");
@@ -1519,6 +1537,29 @@ async fn dispatch(
     }
 }
 
+/// Harden the operator-supplied `logout --reason` text for the daemon log. The reason is free text
+/// typed by whoever ran `tnet logout`, and it lands in a log a human (or a log shipper) reads later,
+/// so it is untrusted for formatting: every control character — newline, CR, tab, ANSI escape —
+/// becomes `_` so one reason can never forge a second log line or steer a terminal, and the value is
+/// capped at [`MAX_LOGGED_REASON`] characters so a megabyte of "justification" cannot flood the log.
+/// Truncation is marked with a trailing `…` so a reader can tell the record is not the whole text.
+/// Same treatment (and same rationale) as the `bugreport` note's `sanitize_marker_note`.
+fn sanitize_logout_reason(reason: &str) -> String {
+    let mut out: String = reason
+        .chars()
+        .take(MAX_LOGGED_REASON)
+        .map(|c| if c.is_control() { '_' } else { c })
+        .collect();
+    if reason.chars().nth(MAX_LOGGED_REASON).is_some() {
+        out.push('…');
+    }
+    out
+}
+
+/// Character cap applied to a logged `logout --reason` (see [`sanitize_logout_reason`]). Generous
+/// for a real justification, far below anything that would bloat the daemon log.
+const MAX_LOGGED_REASON: usize = 256;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1630,5 +1671,41 @@ mod tests {
         // Best-effort cleanup before the assertion so a failure still removes the dir.
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(mode, 0o700, "loose socket dir must be tightened to 0700");
+    }
+
+    #[test]
+    fn logout_reason_is_sanitized_before_it_reaches_the_log() {
+        // The reason is operator free text that ends up in the daemon log, so a newline must not be
+        // able to forge a second log record and an escape must not be able to steer a terminal that
+        // later renders the log.
+        let forged = "returned to IT\nINFO forged: node re-registered";
+        let clean = sanitize_logout_reason(forged);
+        assert!(
+            !clean.contains('\n'),
+            "a newline must not survive into the log line: {clean:?}"
+        );
+        assert_eq!(clean, "returned to IT_INFO forged: node re-registered");
+        assert_eq!(
+            sanitize_logout_reason("laptop returned to IT"),
+            "laptop returned to IT",
+            "ordinary text must pass through untouched"
+        );
+        assert!(
+            !sanitize_logout_reason("\u{1b}[2Jwiped").contains('\u{1b}'),
+            "ANSI escapes must be neutralized"
+        );
+
+        // Over-long input is capped and marked as truncated.
+        let long = "j".repeat(MAX_LOGGED_REASON + 50);
+        let capped = sanitize_logout_reason(&long);
+        assert_eq!(capped.chars().count(), MAX_LOGGED_REASON + 1);
+        assert!(
+            capped.ends_with('…'),
+            "truncation must be visible: {capped:?}"
+        );
+        // Exactly at the cap: no truncation marker.
+        let exact = sanitize_logout_reason(&"j".repeat(MAX_LOGGED_REASON));
+        assert_eq!(exact.chars().count(), MAX_LOGGED_REASON);
+        assert!(!exact.ends_with('…'));
     }
 }
