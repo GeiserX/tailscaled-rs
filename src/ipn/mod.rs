@@ -899,6 +899,10 @@ async fn rebuild_running_device(
 /// settle any superseded orphan off-lock. A concurrent `status`/`down`/`up` is never blocked behind
 /// the handshake, and a `down`/`up` that lands mid-rebuild correctly supersedes it (the rebuilt
 /// device is discarded).
+///
+/// A `--nickname` whose login-profile rename failed ([`SetOutcome::rename_error`]) is returned as this
+/// function's error — but only AFTER the reconcile above has run, so a `profiles.json` write failure
+/// never leaves an already-persisted, live-applicable pref unapplied on the running device.
 pub async fn drive_set(
     backend: &std::sync::Arc<tokio::sync::Mutex<Backend>>,
     opts: SetOptions,
@@ -907,25 +911,33 @@ pub async fn drive_set(
     // the live path we ALSO issue the live engine setters here, under the same brief lock: each is a
     // quick actor message (not the off-lock-worthy registration handshake), so we keep them atomic
     // with the prefs-apply rather than hoisting them off-lock via the device's `Arc`.
-    let action = {
+    let outcome = {
         let mut be = backend.lock().await;
         be.begin_set(opts).await
     }?;
 
-    match action {
+    match outcome.action {
         // Node down: persisting was the whole job; nothing live to reconcile.
-        SetAction::PersistedOnly => Ok(()),
+        SetAction::PersistedOnly => {}
         // Every changed pref was live-applicable and applied in place, under the brief lock, inside
         // `begin_set` (`ops` records what was issued). No reconnect. Done.
-        SetAction::Live(_) => Ok(()),
+        SetAction::Live(_) => {}
         // A rebuild-only pref changed on a running node → rebuild from the updated prefs via the
         // preflight → begin_up → (off-lock) build_device → finish_up → off-lock orphan settle
         // sequence, the same off-lock handshake as `drive_up`. That sequence is shared verbatim with
         // `drive_reload_config`'s `ReloadAction::Rebuild`, so it lives in ONE place:
         // `rebuild_running_device` carries the per-phase rationale, and a fix there cannot miss
         // either verb. The brief reconnect is documented on this function and `SetAction::Rebuild`.
-        SetAction::Rebuild => rebuild_running_device(backend, "set").await,
+        SetAction::Rebuild => rebuild_running_device(backend, "set").await?,
     }
+
+    // The `--nickname` half failed after the prefs were already persisted (see [`SetOutcome`]). The
+    // engine is reconciled by now, so report the rename failure as the `set`'s error here rather than
+    // letting it skip the reconcile.
+    if let Some(e) = outcome.rename_error {
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Drive a `reload-config` against a shared [`Backend`]: re-read the `--config` file and adopt the
@@ -1070,6 +1082,30 @@ pub enum SetAction {
     /// live-applicable and rebuild-only prefs, the whole `set` rebuilds — a rebuild re-applies every
     /// pref from the persisted state anyway, so applying the live ones first would be wasted work.)
     Rebuild,
+}
+
+/// What [`Backend::begin_set`] produced: the [`SetAction`] the caller must still carry out, plus a
+/// `--nickname` profile rename that FAILED *after* the prefs were already persisted.
+///
+/// The two ride back together rather than the rename error short-circuiting the return, because by
+/// the time the rename runs everything the `set` asked for is already durable in `prefs.json`.
+/// Returning early on it would skip the engine reconcile entirely, so a
+/// `set --nickname X --exit-node Y` on a running node would leave `Y` in `prefs.json` (and in what
+/// `tnet get` reports) while the live device kept the OLD exit node — a mismatch that survives until
+/// the next successful `set`/`up`. Instead the reconcile always runs (the live setters inside
+/// `begin_set`; [`SetAction::Rebuild`] in [`drive_set`] / [`Backend::set`]) and the caller returns
+/// `rename_error` as the command's error afterwards: the operator still learns the rename failed, but
+/// no already-durable, live-applicable pref is skipped because a `profiles.json` write failed.
+#[derive(Debug)]
+pub struct SetOutcome {
+    /// How to reconcile the live engine (see [`SetAction`]). Always decided — including when
+    /// `rename_error` is set.
+    pub action: SetAction,
+    /// `Some` when `--nickname` was named and the login-profile rename (`profiles.json`) failed. The
+    /// prefs, the `node_nickname` pref included, are already persisted; only the profile's display
+    /// name is stale, so `switch --list` keeps showing the old one until a `set --nickname` succeeds.
+    /// Callers must surface this as the `set`'s error, but only AFTER performing `action`.
+    pub rename_error: Option<anyhow::Error>,
 }
 
 /// Optional overrides applied to the persisted [`Prefs`] when bringing the node up.
@@ -2008,9 +2044,10 @@ impl Backend {
     /// `set` never (re)authenticates (no `authkey`), never touches the control URL / TUN transport
     /// (those are connection-defining and belong to `up`), and never flips `want_running`.
     pub async fn set(&mut self, opts: SetOptions) -> Result<()> {
-        match self.begin_set(opts).await? {
+        let outcome = self.begin_set(opts).await?;
+        match outcome.action {
             // Node down, or every changed pref applied live under begin_set — nothing further to do.
-            SetAction::PersistedOnly | SetAction::Live(_) => Ok(()),
+            SetAction::PersistedOnly | SetAction::Live(_) => {}
             // A rebuild-only pref changed on a running node: rebuild from the updated prefs to apply
             // it (the engine Config is immutable). Brief reconnect; no authkey (resume from the
             // persisted node key); `want_running` unchanged. Inline three-phase like `up`.
@@ -2037,15 +2074,21 @@ impl Backend {
                     tracing::warn!(error = %e, "failed to persist has_logged_in after set-rebuild");
                 }
                 shutdown_orphan(orphan).await;
-                Ok(())
             }
         }
+        // The `--nickname` half failed after the prefs were already persisted (see [`SetOutcome`]).
+        // The engine is reconciled by now, so failing the command here reports the rename without
+        // having skipped an already-durable, live-applicable pref.
+        if let Some(e) = outcome.rename_error {
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Phase 1 of a `set` (shared by [`Backend::set`] and [`drive_set`]): apply the [`SetOptions`]
     /// overrides to `self.prefs`, **persist** them, and decide how to reconcile the live engine —
-    /// returning a [`SetAction`] for the caller to carry out (or, for the live exit-node case,
-    /// already carried out here).
+    /// returning a [`SetOutcome`] whose [`SetAction`] the caller carries out (or, for the live
+    /// exit-node case, is already carried out here).
     ///
     /// The override block mirrors [`begin_up`](Backend::begin_up) **exactly** for the fields `set`
     /// accepts — same "leave unchanged unless named" sentinel, including the `exit_node` *double*
@@ -2074,10 +2117,17 @@ impl Backend {
     ///   updated prefs (the engine `Config` is immutable). A brief reconnect. A `set` mixing live and
     ///   rebuild-only prefs rebuilds wholesale (the rebuild re-applies the live ones too).
     ///
+    /// `--nickname` additionally renames the current login profile on disk (Go's `profiles.go`), the
+    /// one step here that is neither a pref write nor an engine call. It is attempted after the prefs
+    /// persist and its failure is **held**, not returned: by then the whole `set` is durable, so
+    /// aborting on it would skip the reconcile and leave a live-applicable pref (say `--exit-node`)
+    /// persisted-but-not-applied on a running node. The failure comes back in
+    /// [`SetOutcome::rename_error`] for the caller to return once the action is done.
+    ///
     /// Does **no** network I/O for the `Rebuild` case (the slow `Device::new` is the caller's
     /// off-lock job); the only blocking steps here are the quick live setter mailbox round-trips on
     /// the `Live` path.
-    pub async fn begin_set(&mut self, opts: SetOptions) -> Result<SetAction> {
+    pub async fn begin_set(&mut self, opts: SetOptions) -> Result<SetOutcome> {
         // Decide the path BEFORE mutating prefs — `needs_rebuild()` inspects which fields the
         // request named, which the apply below would not change, but reading it first keeps the
         // decision crisply about the *request* rather than post-apply state. Also snapshot which
@@ -2215,15 +2265,37 @@ impl Backend {
         // The other half of `--nickname` (Go's `profiles.go` rename, see the apply arm above): make
         // the display name of the CURRENT profile follow the nickname, so `switch --list` shows it
         // and `switch <nickname>` resolves to this profile immediately. Ordered AFTER the prefs
-        // persist so the two agree on disk: a rename that fails returns `Err` with the pref already
-        // durable (the operator retries `set --nickname`), never the reverse.
-        if let Some(name) = rename_profile_to {
-            self.rename_current_profile(name.as_deref().unwrap_or(""))
-                .await?;
-        }
+        // persist so the two agree on disk: a rename that fails leaves the pref already durable (the
+        // operator retries `set --nickname`), never the reverse.
+        //
+        // Its failure is HELD, not propagated with `?`. Everything this `set` asked for is already in
+        // `prefs.json` by the time we get here, so returning now would skip the reconcile below and
+        // leave a `set --nickname X --exit-node Y` on a running node with `Y` durable (and reported by
+        // `tnet get`) but NEVER pushed to the engine — the device keeps the old exit node until the
+        // next successful `set`/`up`. So: attempt the rename, keep the error, reconcile the engine,
+        // and hand the error back in [`SetOutcome::rename_error`] for the caller to return once the
+        // action is carried out. The converse ordering — reconcile first, `?` on the rename — only
+        // mirrors the bug (a failing live setter would then skip an otherwise-fine rename): neither
+        // half of a `set` whose prefs are already durable may abort the other.
+        let rename_error = match rename_profile_to {
+            Some(name) => {
+                let renamed = self
+                    .rename_current_profile(name.as_deref().unwrap_or(""))
+                    .await;
+                if let Err(e) = &renamed {
+                    tracing::warn!(
+                        error = %e,
+                        "set: profile rename failed; reconciling the already-persisted prefs anyway"
+                    );
+                }
+                renamed.err()
+            }
+            None => None,
+        };
 
-        // Reconcile against the live engine. This is the only step that needs the device.
-        match self.device.as_ref() {
+        // Reconcile against the live engine. This is the only step that needs the device, and it runs
+        // whether or not the rename above succeeded (see `rename_error`).
+        let reconciled: Result<SetAction> = match self.device.as_ref() {
             // No engine to reconcile — persisting above is the whole job; prefs apply on next `up`.
             None => {
                 tracing::info!(
@@ -2325,7 +2397,16 @@ impl Backend {
                 tracing::info!(action = "live", ops = ?ops, "set: reconcile decided (applied live, no reconnect)");
                 Ok(SetAction::Live(ops))
             }
-        }
+        };
+
+        // Both halves attempted. A live-setter failure wins the return (engine state is the more
+        // consequential of the two, and it means the engine is in trouble); a rename failure rides
+        // back with the action so the caller can carry the action out and only *then* fail the
+        // command.
+        Ok(SetOutcome {
+            action: reconciled?,
+            rename_error,
+        })
     }
 
     /// Pure, read-only accidental-revert pre-check for an `up` (the Rust analogue of Go's
@@ -6168,7 +6249,7 @@ mod tests {
         be.prefs.hostname = Some("baseline-host".to_string());
 
         // SET accept_routes + exit_node + advertise_* (but NOT hostname) → only those move.
-        let action = be
+        let outcome = be
             .begin_set(SetOptions {
                 accept_routes: Some(true),
                 exit_node: Some(Some("100.64.0.9".to_string())),
@@ -6179,7 +6260,7 @@ mod tests {
             .await
             .expect("begin_set");
         assert_eq!(
-            action,
+            outcome.action,
             SetAction::PersistedOnly,
             "no device up → set just persists; prefs apply on next up"
         );
@@ -6202,11 +6283,11 @@ mod tests {
         );
 
         // A no-op `set` (all None) must leave EVERY pref exactly as-is.
-        let action = be
+        let outcome = be
             .begin_set(SetOptions::default())
             .await
             .expect("begin_set");
-        assert_eq!(action, SetAction::PersistedOnly);
+        assert_eq!(outcome.action, SetAction::PersistedOnly);
         assert!(be.prefs.accept_routes, "no-op set preserves accept_routes");
         assert_eq!(
             be.prefs.exit_node.as_deref(),
@@ -6441,6 +6522,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_nickname_rename_failure_still_reconciles_the_persisted_prefs() {
+        // A `--nickname` whose login-profile rename FAILS must not swallow the rest of the `set`. By
+        // the time the rename runs, every pref the request named is already durable in `prefs.json`,
+        // so returning early on it would skip the engine reconcile — and a
+        // `set --nickname X --exit-node Y` on a running node would end with `Y` on disk (and in what
+        // `tnet get` reports) while the live device kept the OLD exit node, until the next successful
+        // `set`/`up`. `begin_set` must therefore still decide + carry out the reconcile and hand the
+        // rename failure back in `SetOutcome::rename_error`.
+        //
+        // The rename is forced to fail by making `profiles.json` a DIRECTORY: `save_profiles_file`
+        // writes atomically (temp file in the same dir, then rename over the target), and renaming a
+        // file over a directory fails on every platform this daemon builds for. Offline: no device,
+        // so the reconcile decision is `PersistedOnly` — the observable is that a decision was
+        // reached at all.
+        let dir = std::env::temp_dir().join(format!("tailnetd-nick-fail-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::create_dir_all(profile::profiles_file_path(&dir))
+            .await
+            .unwrap();
+        let mut be = backend_for(&dir);
+
+        let outcome = be
+            .begin_set(SetOptions {
+                nickname: Some(Some("work-laptop".to_string())),
+                exit_node: Some(Some("100.64.0.9".to_string())),
+                ..SetOptions::default()
+            })
+            .await
+            .expect("a failed profile rename must not abort begin_set before the reconcile");
+
+        // The reconcile decision was still REACHED. Without the fix `begin_set` returned the rename
+        // error here and never looked at the device at all.
+        assert_eq!(
+            outcome.action,
+            SetAction::PersistedOnly,
+            "the reconcile must run even when the profile rename failed"
+        );
+        // ...and the failure is reported, not swallowed.
+        let err = outcome
+            .rename_error
+            .expect("the failed rename must be reported, not dropped");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("renaming profile"),
+            "the rename failure must name what failed, got {msg:?}"
+        );
+
+        // The live-applicable pref the reconcile exists to apply is durable — in memory and on disk.
+        assert_eq!(be.prefs.exit_node.as_deref(), Some("100.64.0.9"));
+        let persisted = crate::prefs::Prefs::load(&be.prefs_path)
+            .await
+            .expect("prefs.json");
+        assert_eq!(
+            persisted.exit_node.as_deref(),
+            Some("100.64.0.9"),
+            "the exit node was already persisted before the rename was attempted"
+        );
+        assert_eq!(persisted.node_nickname.as_deref(), Some("work-laptop"));
+        // Only the profile DISPLAY name is stale: the unwritable map reads as empty, so the listing
+        // falls back to the profile id.
+        let listed = be.list_profiles().await;
+        let def = listed
+            .iter()
+            .find(|e| e.id == profile::DEFAULT_PROFILE_ID)
+            .expect("default profile is always listed");
+        assert_eq!(def.name, profile::DEFAULT_PROFILE_ID);
+
+        // The owned `set` path reports the same failure — but only AFTER carrying the action out, so
+        // the rest of the request still lands.
+        let err = be
+            .set(SetOptions {
+                nickname: Some(Some("work-laptop".to_string())),
+                hostname: Some("renamed-host".to_string()),
+                ..SetOptions::default()
+            })
+            .await
+            .expect_err("a failed profile rename must still fail the command");
+        assert!(format!("{err:#}").contains("renaming profile"));
+        let persisted = crate::prefs::Prefs::load(&be.prefs_path)
+            .await
+            .expect("prefs.json");
+        assert_eq!(
+            persisted.hostname.as_deref(),
+            Some("renamed-host"),
+            "the rest of the set must be applied even though the rename failed"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
     async fn begin_set_applies_the_go_parity_pref_flags() {
         // The eight Go `set` pref flags added alongside their engine `Config` fields, end to end
         // through `begin_set`: each named flag lands on its OWN pref, an unnamed one is untouched,
@@ -6548,9 +6721,9 @@ mod tests {
             "hostname + shields_up classifies as rebuild (precondition)"
         );
         // ...but device-less it just persists, returning PersistedOnly and applying BOTH prefs.
-        let action = be.begin_set(opts).await.expect("begin_set");
+        let outcome = be.begin_set(opts).await.expect("begin_set");
         assert_eq!(
-            action,
+            outcome.action,
             SetAction::PersistedOnly,
             "device-less set persists regardless of live/rebuild classification"
         );
@@ -6759,7 +6932,7 @@ mod tests {
         assert!(!be.prefs.ssh_enabled);
 
         // ENABLE.
-        let action = be
+        let outcome = be
             .begin_set(SetOptions {
                 ssh: Some(true),
                 ..SetOptions::default()
@@ -6767,7 +6940,7 @@ mod tests {
             .await
             .expect("begin_set enable ssh");
         assert_eq!(
-            action,
+            outcome.action,
             SetAction::PersistedOnly,
             "no device up → an ssh toggle just persists; it applies on next up"
         );
