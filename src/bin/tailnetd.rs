@@ -67,6 +67,20 @@ struct Args {
     /// `TAILNETD_SOCKET` else `<statedir>/tailnetd.sock`. Go `tailscaled --socket`.
     #[arg(long, value_name = "PATH")]
     socket: Option<PathBuf>,
+    /// Path of the BIRD control socket, for a subnet router that hands its advertised routes to a
+    /// BIRD BGP daemon (Go `tailscaled --bird-socket`). **Accepted by the parser, then refused at
+    /// startup** — see `bird_socket_refusal`. Go passes the path to its engine
+    /// (`wgengine.Config.BIRDSocket`, constructed via `wgengine.HookNewBird`), which enables BIRD's
+    /// `tailscale` protocol while this node is a *primary* subnet router and disables it otherwise.
+    /// That toggle lives inside the engine's reconfigure cycle, which this daemon does not own, and
+    /// the `tailscale-rs` engine exposes no BIRD hook — so there is nothing here to hand the socket
+    /// to. Declaring the flag anyway is the whole point: a Go-shaped command line gets a startup
+    /// error that NAMES the missing integration instead of clap's generic "unexpected argument",
+    /// and — unlike silently ignoring it — a subnet router is never left believing its BGP
+    /// announcements are being driven when nothing is connected to BIRD. Go refuses the same way
+    /// (`--bird-socket is not supported on %s`) on a build whose BIRD hook is not linked in.
+    #[arg(long, value_name = "PATH")]
+    bird_socket: Option<String>,
     /// Log verbosity: `0` (default, info), `1` (debug), `2+` (trace). Overrides the `TAILNETD_LOG`
     /// env filter when given. Go `tailscaled --verbose`.
     #[arg(long, short = 'v', value_name = "LEVEL")]
@@ -155,6 +169,17 @@ async fn main() -> Result<()> {
     // flags before we touch the experiment gate or any state, matching how Go `tailscaled` parses its
     // flag set up front. The parsed values then override the env-derived defaults below.
     let args = Args::parse();
+
+    // `--bird-socket <path>` (Go `tailscaled --bird-socket`): parsed so a Go-shaped command line
+    // reaches a refusal that names the missing integration, then refused HERE — before the
+    // `--cleanup` handling below, which is where Go puts the same check (top of `main`, above its
+    // own cleanup exit), so `--cleanup --bird-socket <path>` refuses instead of quietly cleaning up.
+    // Bare message + exit 1 mirrors Go's `log.SetFlags(0)` + `log.Fatalf`. See `bird_socket_refusal`
+    // for the reasoning and for the empty-path carve-out.
+    if let Some(message) = bird_socket_refusal(args.bird_socket.as_deref()) {
+        eprintln!("{message}");
+        std::process::exit(1);
+    }
 
     // `--cleanup` (Go `tailscaled --cleanup`): reclaim OS-level network state from a previous run,
     // then exit — WITHOUT running the engine, so it deliberately runs BEFORE the experiment gate
@@ -951,6 +976,48 @@ fn log_resume_decision(resuming: bool, have_authkey: bool, ephemeral: bool) {
     }
 }
 
+/// The `--bird-socket` refusal decision and its message, pure so it can be unit-tested.
+///
+/// Ported from Go `cmd/tailscaled/tailscaled.go` @ `53a0d659afa51835dd7a9283873cca44261454f8`,
+/// which registers the flag and then fatals early when the build carries no BIRD hook:
+///
+/// ```text
+/// if buildfeatures.HasBird && args.birdSocketPath != "" && !wgengine.HookNewBird.IsSet() {
+///     log.SetFlags(0)
+///     log.Fatalf("--bird-socket is not supported on %s", runtime.GOOS)
+/// }
+/// ```
+///
+/// This fork is permanently in that "no hook linked in" case, so the refusal is unconditional —
+/// but it names the real reason (no BIRD integration in the engine) rather than blaming the OS,
+/// because unlike Go's the gap here is not platform-specific.
+///
+/// One Go edge case ports with it: the empty path is **not** a refusal. Go's guard is
+/// `birdSocketPath != ""`, so `--bird-socket=""` means "no BIRD socket" exactly like omitting the
+/// flag — hence `Some("")` maps to `None` here, and the daemon starts normally.
+///
+/// Returns `None` when there is nothing to refuse, else the operator-facing message.
+fn bird_socket_refusal(path: Option<&str>) -> Option<String> {
+    // Go: `args.birdSocketPath != ""` — an unset *or* explicitly empty path is "no BIRD socket".
+    let path = path.filter(|p| !p.is_empty())?;
+    Some(format!(
+        "error: --bird-socket is not supported by tailnetd (given {path:?}).\n\
+         Go accepts this flag for a subnet router that hands its advertised routes to a BIRD BGP \
+         daemon: it passes the socket path to its engine (`wgengine.Config.BIRDSocket`, built via \
+         `wgengine.HookNewBird`), which enables BIRD's `tailscale` protocol while this node is a \
+         primary subnet router and disables it otherwise.\n\
+         That toggle belongs to the engine's reconfigure cycle, which this daemon does not own, and \
+         the tailscale-rs engine exposes no BIRD hook — so there is nothing here to hand the socket \
+         to. tailnetd therefore refuses at startup, the way Go refuses on a build with no BIRD hook, \
+         instead of accepting the flag as a no-op: a silently ignored --bird-socket would leave a \
+         subnet router believing its BGP announcements track its primary-route status when nothing \
+         was ever connected to BIRD.\n\
+         Drop the flag to start tailnetd. Routes are still advertised to the tailnet with `tnet up \
+         --advertise-routes=<prefix,...>`; driving BIRD from that state needs a BIRD hook in the \
+         engine, and is out of scope here until it has one."
+    ))
+}
+
 /// The experimental-gate decision, pure so it can be unit-tested: the gate passes only when the
 /// env var holds exactly the required opt-in value. `None` (unset) and any other value fail.
 fn experiment_gate_ok(value: Option<&str>) -> bool {
@@ -1137,6 +1204,78 @@ mod tests {
                 .debug
                 .as_deref(),
             Some("9090")
+        );
+    }
+
+    // --- `--bird-socket` (Go `tailscaled --bird-socket`) ---------------------------------------
+    //
+    // Go registers the flag and then fatals when the build has no BIRD hook linked in. This fork is
+    // permanently in that case, so the three things worth pinning are: the flag PARSES (a Go-shaped
+    // command line must reach the refusal, not clap's "unexpected argument"), an omitted or empty
+    // path is NOT a refusal (Go's guard is `birdSocketPath != ""`), and a real path IS refused with
+    // a message that says why.
+
+    #[test]
+    fn bird_socket_flag_parses_rather_than_being_an_unknown_argument() {
+        use clap::Parser;
+        // Absent → None (nothing to refuse).
+        assert!(Args::parse_from(["tailnetd"]).bird_socket.is_none());
+        // Present → the path, in both `--flag value` and `--flag=value` spellings.
+        assert_eq!(
+            Args::parse_from(["tailnetd", "--bird-socket", "/run/bird.ctl"])
+                .bird_socket
+                .as_deref(),
+            Some("/run/bird.ctl")
+        );
+        assert_eq!(
+            Args::parse_from(["tailnetd", "--bird-socket=/run/bird.ctl"])
+                .bird_socket
+                .as_deref(),
+            Some("/run/bird.ctl")
+        );
+        // The empty path parses too (Go's flag is a plain string) — `bird_socket_refusal` is what
+        // decides that it means "no BIRD socket".
+        assert_eq!(
+            Args::parse_from(["tailnetd", "--bird-socket="])
+                .bird_socket
+                .as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn bird_socket_absent_or_empty_is_not_a_refusal() {
+        // Omitted: nothing to refuse.
+        assert_eq!(bird_socket_refusal(None), None);
+        // Explicitly empty: Go tests `args.birdSocketPath != ""`, so `--bird-socket=""` is "no BIRD
+        // socket" and the daemon starts normally. Ported deliberately — do not "tidy" this into a
+        // refusal.
+        assert_eq!(bird_socket_refusal(Some("")), None);
+    }
+
+    #[test]
+    fn bird_socket_path_is_refused_and_the_message_says_why() {
+        let message =
+            bird_socket_refusal(Some("/run/bird.ctl")).expect("a non-empty path must be refused");
+        // Names the flag, so the operator can tell which argument stopped the daemon.
+        assert!(
+            message.contains("--bird-socket is not supported"),
+            "keeps Go's refusal wording; got {message:?}"
+        );
+        // Echoes the rejected path.
+        assert!(
+            message.contains("/run/bird.ctl"),
+            "names the path it was given; got {message:?}"
+        );
+        // Names the actual reason (no BIRD hook in the engine) rather than just "unsupported".
+        assert!(
+            message.contains("BIRD") && message.contains("engine exposes no BIRD hook"),
+            "says WHY it is unsupported; got {message:?}"
+        );
+        // Tells the operator what to do instead.
+        assert!(
+            message.contains("--advertise-routes"),
+            "points at the route-advertising path that does work; got {message:?}"
         );
     }
 
