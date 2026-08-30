@@ -677,6 +677,93 @@ pub async fn drive_up(
     Ok(())
 }
 
+/// Rebuild the live engine from the caller's ALREADY-updated-and-persisted prefs, without ever
+/// holding the backend lock across the multi-second `Device::new` handshake — the one body shared by
+/// every "adopt a rebuild-only change into a running node" path.
+///
+/// [`drive_set`]'s [`SetAction::Rebuild`] and [`drive_reload_config`]'s [`ReloadAction::Rebuild`] need
+/// exactly this sequence, and its lock discipline is load-bearing (a rebuild that holds the lock
+/// across the handshake head-of-line blocks every concurrent `status`/`down`; a rebuild that skips the
+/// preflight can leave a healthy node offline), so it lives here ONCE — a fix to the sequence cannot
+/// land on one caller and miss the other.
+///
+/// The phases, in order — [`drive_up`]'s phasing plus the preflight:
+///
+/// 1. **PREFLIGHT under a brief lock** ([`build_config`](Backend::build_config)) — validate the
+///    rebuilt config BEFORE tearing the live device down. `begin_up` → `stop_device` drops the running
+///    engine, but the SSH root/feature checks (and the control-URL/route parse) live in `build_config`,
+///    which `begin_up` only reaches AFTER teardown. If that check fails (e.g. `set --ssh`, or a
+///    reloaded config enabling SSH, on a daemon without the `ssh` feature or without root), a naive
+///    rebuild would leave a healthy node OFFLINE — a `set`/reload that fails must never drop the
+///    tunnel. So validate FIRST; on error, return it with the live device untouched. (The caller
+///    already persisted the prefs, so they apply on the next successful `up`/`set` — but the running
+///    node stays up now.)
+/// 2. **Brief lock** — [`begin_up`](Backend::begin_up) from the (already-updated) prefs. **No authkey
+///    and no WIF creds:** a rebuild resumes from the persisted node key; neither `set` nor
+///    `reload-config` (re)authenticates. NB `begin_up` sets `want_running = true`, which is a no-op on
+///    both callers' rebuild arms — each only reaches one when a device is already up and stays up (the
+///    node-down and stop-me-now cases are decided before we get here), so a rebuild can neither flip a
+///    down node up nor resurrect one the caller asked to stop.
+/// 3. **NO lock held** — the slow, network-bound re-registration handshake ([`build_device`]). This is
+///    the whole point of the split: concurrent `status`/`down`/`up` proceed freely here.
+/// 4. **Brief lock** — [`finish_up`](Backend::finish_up) installs iff still current (the
+///    generation-supersede guard), handing back any superseded device as an orphan. On a successful
+///    install (no orphan) `finish_up` flips `has_logged_in` in memory, so we persist it here too (the
+///    same contract as `drive_up`/[`Backend::up`]) — otherwise a rebuild after a prior transient
+///    persist failure would leave the flag true-in-memory but false-on-disk and lose the
+///    accidental-revert guard's fresh-node exemption across a restart. Persist failure is non-fatal:
+///    the node is up; a lost flag just means the next `up` is unguarded once.
+/// 5. **Lock released** — settle the (rare) superseded orphan off-lock, so a supersede never blocks
+///    the lock for up to `SHUTDOWN_TIMEOUT`.
+///
+/// A `down`/`up` that lands mid-rebuild correctly supersedes it (the rebuilt device is discarded).
+///
+/// **CAVEAT — this is a brief reconnect:** the live engine is torn down and a fresh one stood up, so
+/// the overlay drops and re-registers (a short interruption + a new netmap convergence). Both callers
+/// document that on their rebuild arms.
+///
+/// `cause` names the driving verb (`"set"` / `"reload-config"`) for the non-fatal persist-failure
+/// warning, so the log still says which verb's rebuild could not persist the flag.
+async fn rebuild_running_device(
+    backend: &std::sync::Arc<tokio::sync::Mutex<Backend>>,
+    cause: &'static str,
+) -> Result<()> {
+    // Phase 1: PREFLIGHT the rebuilt config under a brief lock, before anything is torn down (see the
+    // doc comment: a bad value must never drop a healthy tunnel).
+    {
+        let be = backend.lock().await;
+        be.build_config().await?;
+    }
+    // Phase 2: brief lock — begin a bring-up from the (already-updated) prefs. No authkey and no WIF
+    // creds: a rebuild resumes from the persisted node key, it never (re)authenticates.
+    let pending = {
+        let mut be = backend.lock().await;
+        be.begin_up(UpOptions::default(), None).await
+    }?;
+    // Phase 3: NO lock held — the slow, network-bound re-registration handshake.
+    let built = build_device(&pending, None).await;
+    // Phase 4: brief lock — install iff still current, returning any orphan to settle off-lock.
+    let orphan = {
+        let mut be = backend.lock().await;
+        let orphan = be.finish_up(pending, built)?;
+        // Persist the `has_logged_in` flip `finish_up` made on a successful install (see the doc
+        // comment). Non-fatal on failure: the node is up.
+        if orphan.is_none()
+            && let Err(e) = be.persist_prefs().await
+        {
+            tracing::warn!(
+                error = %e,
+                cause,
+                "failed to persist has_logged_in after a rebuild (node is up; next up may be unguarded once)"
+            );
+        }
+        orphan
+    };
+    // Phase 5: lock released — settle the (rare) superseded device off-lock.
+    shutdown_orphan(orphan).await;
+    Ok(())
+}
+
 /// Drive a live pref mutation (`tnet set`) against a shared [`Backend`], reconciling the engine
 /// without ever holding the backend lock across the multi-second `Device::new` handshake — the
 /// concurrency-safe `set` for any caller that holds the `Arc<Mutex<Backend>>`.
@@ -740,54 +827,13 @@ pub async fn drive_set(
         // Every changed pref was live-applicable and applied in place, under the brief lock, inside
         // `begin_set` (`ops` records what was issued). No reconnect. Done.
         SetAction::Live(_) => Ok(()),
-        // A rebuild-only pref changed on a running node → rebuild from the updated prefs, reusing the
-        // begin_up/build_device/finish_up off-lock handshake exactly like `drive_up`. The brief
-        // reconnect is documented on this function and `SetAction::Rebuild`.
-        SetAction::Rebuild => {
-            // Phase 2-pre: PREFLIGHT the rebuilt config before tearing the live device down.
-            // `begin_up` → `stop_device` drops the running engine, but the SSH root/feature checks
-            // (and control-URL/route parse) live in `build_config`, which `begin_up` only reaches
-            // AFTER teardown. If that check fails (e.g. `set --ssh` without the `ssh` feature or
-            // without root), a naive rebuild would leave a healthy node OFFLINE — a `set` that fails
-            // must never drop the tunnel. So validate FIRST under a brief lock; on error, return it
-            // with the live device untouched. (The pref is already persisted by `begin_set`; it
-            // applies on the next successful `up`/`set` — but the running node stays up now.)
-            {
-                let be = backend.lock().await;
-                be.build_config().await?;
-            }
-            // Phase 2a: brief lock — begin a bring-up from the (already-updated) prefs. No authkey:
-            // a rebuild resumes from the persisted node key; `set` never (re)authenticates. NB:
-            // `begin_up` sets `want_running = true`, which for a Rebuild action is a no-op (we only
-            // rebuild when a device is already up, i.e. the node was already running) — so `set`
-            // does not silently flip `want_running` on a down node (that path is PersistedOnly).
-            let pending = {
-                let mut be = backend.lock().await;
-                // A `set`-driven rebuild never (re)authenticates, so it carries no WIF creds (`None`).
-                be.begin_up(UpOptions::default(), None).await
-            }?;
-            // Phase 2b: NO lock held — the slow, network-bound re-registration handshake.
-            let built = build_device(&pending, None).await;
-            // Phase 2c: brief lock — install iff still current, returning any orphan to settle off-lock.
-            let orphan = {
-                let mut be = backend.lock().await;
-                let orphan = be.finish_up(pending, built)?;
-                // A `set`-driven rebuild re-registers the engine just like `up`, so on a successful
-                // install `finish_up` flips `has_logged_in` in memory — persist it here too (same
-                // contract as `drive_up`/`Backend::up`), or a rebuild-`set` after a prior transient
-                // persist failure would leave the flag true-in-memory but false-on-disk and lose the
-                // guard's fresh-node exemption across a restart. Non-fatal on failure (node is up).
-                if orphan.is_none()
-                    && let Err(e) = be.persist_prefs().await
-                {
-                    tracing::warn!(error = %e, "failed to persist has_logged_in after set-rebuild");
-                }
-                orphan
-            };
-            // Lock released — settle the (rare) superseded device off-lock.
-            shutdown_orphan(orphan).await;
-            Ok(())
-        }
+        // A rebuild-only pref changed on a running node → rebuild from the updated prefs via the
+        // preflight → begin_up → (off-lock) build_device → finish_up → off-lock orphan settle
+        // sequence, the same off-lock handshake as `drive_up`. That sequence is shared verbatim with
+        // `drive_reload_config`'s `ReloadAction::Rebuild`, so it lives in ONE place:
+        // `rebuild_running_device` carries the per-phase rationale, and a fix there cannot miss
+        // either verb. The brief reconnect is documented on this function and `SetAction::Rebuild`.
+        SetAction::Rebuild => rebuild_running_device(backend, "set").await,
     }
 }
 
@@ -826,15 +872,25 @@ pub async fn drive_set(
 /// (it persists up-intent that the next auto-start/`up` acts on) — so a reload never *surprise-starts*
 /// a stopped node from the reload call itself, but it can *stop* a running one.
 ///
-/// Mirrors `drive_set`'s rebuild phasing precisely: brief lock for `reload_config` (apply + persist +
-/// decide); on a rebuild, a brief lock to PREFLIGHT the rebuilt config (so a bad value never drops a
-/// healthy tunnel); a brief lock for `begin_up`; the lock is **dropped** for the slow `build_device`;
-/// taken briefly again for `finish_up`; then dropped to settle any superseded orphan off-lock. A
-/// concurrent `status`/`down`/`up` is never blocked behind the handshake, and a `down`/`up` that lands
-/// mid-rebuild correctly supersedes it (the rebuilt device is discarded).
+/// Mirrors `drive_set`'s rebuild phasing precisely — in fact it *is* that phasing: the rebuild arm
+/// calls the shared [`rebuild_running_device`], so the lock-discipline-critical sequence (brief lock to
+/// PREFLIGHT the rebuilt config so a bad value never drops a healthy tunnel; brief lock for `begin_up`;
+/// lock **dropped** for the slow `build_device`; brief lock again for `finish_up`; dropped to settle
+/// any superseded orphan off-lock) has one source of truth for both verbs. A concurrent
+/// `status`/`down`/`up` is never blocked behind the handshake, and a `down`/`up` that lands mid-rebuild
+/// correctly supersedes it (the rebuilt device is discarded).
+///
+/// ## Returns
+///
+/// The [`ReloadAction`] that was actually reconciled — the reload's *outcome*, not just its success:
+/// `Rebuild` (the config is live on a rebuilt engine), `BringDown` (the reloaded `Enabled:false`
+/// stopped the node), or `PersistedOnly` (node down; the merged prefs apply on the next `up`). The
+/// LocalAPI server turns it into the operator-facing confirmation via
+/// [`ReloadAction::outcome_message`], because "reloaded" alone cannot tell an operator whether their
+/// edit is running yet.
 pub async fn drive_reload_config(
     backend: &std::sync::Arc<tokio::sync::Mutex<Backend>>,
-) -> Result<()> {
+) -> Result<ReloadAction> {
     // Phase 1: brief lock — re-read the config, merge + persist, and decide the reconcile action.
     let action = {
         let mut be = backend.lock().await;
@@ -843,67 +899,27 @@ pub async fn drive_reload_config(
 
     match action {
         // Node down: persisting the merged prefs was the whole job; they apply on the next `up`.
-        ReloadAction::PersistedOnly => return Ok(()),
+        ReloadAction::PersistedOnly => {}
         // Node up, reloaded `Enabled:false` → tear the engine down to match the already-persisted
         // `want_running=false` (Go applies a reloaded `Enabled:false`). `down` does `stop_device` +
         // bump_generation (so an in-flight bring-up is superseded) + re-persists `want_running=false`
         // (idempotent — `apply_config` already set it). No off-lock build needed for a teardown.
         ReloadAction::BringDown => {
             let mut be = backend.lock().await;
-            return be.down().await;
+            be.down().await?;
         }
-        // Node up, reloaded config keeps it up → fall through to the rebuild handshake below.
-        ReloadAction::Rebuild => {}
+        // Node up, reloaded config keeps it up → rebuild from the now-updated prefs. The
+        // preflight → begin_up → (off-lock) build_device → finish_up → off-lock orphan settle
+        // sequence is shared verbatim with `drive_set`'s `SetAction::Rebuild`, so it lives in ONE
+        // place — see `rebuild_running_device` for the per-phase rationale (and the brief-reconnect
+        // caveat, also documented above).
+        ReloadAction::Rebuild => rebuild_running_device(backend, "reload-config").await?,
     }
 
-    // Node up → rebuild from the now-updated prefs, reusing the begin_up/build_device/finish_up
-    // off-lock handshake exactly like `drive_set`'s `SetAction::Rebuild`. The brief reconnect is
-    // documented on this function.
-    //
-    // Phase 2-pre: PREFLIGHT the rebuilt config before tearing the live device down. `begin_up` →
-    // `stop_device` drops the running engine, but the SSH root/feature checks (and control-URL/route
-    // parse) live in `build_config`, which `begin_up` only reaches AFTER teardown. If that check fails
-    // (e.g. a reloaded config enables SSH on a daemon without the `ssh` feature or without root), a
-    // naive rebuild would leave a healthy node OFFLINE — a reload that fails must never drop the
-    // tunnel. So validate FIRST under a brief lock; on error, return it with the live device untouched.
-    // (The prefs are already persisted by `reload_config`; they apply on the next successful `up`/`set`
-    // — but the running node stays up now.)
-    {
-        let be = backend.lock().await;
-        be.build_config().await?;
-    }
-    // Phase 2a: brief lock — begin a bring-up from the (already-updated) prefs. No authkey: a reload
-    // resumes from the persisted node key; it never (re)authenticates. NB: `begin_up` sets
-    // `want_running = true`, which on this arm is a no-op — we only reach `Rebuild` when the node was
-    // already up AND the reloaded config kept it up (`want_running` already true). The down node
-    // (`PersistedOnly`) and the stop-me-now (`BringDown`) cases were handled above, so `begin_up` here
-    // cannot resurrect a node the reloaded config asked to stop.
-    let pending = {
-        let mut be = backend.lock().await;
-        // A reload-driven rebuild never (re)authenticates, so it carries no WIF creds (`None`).
-        be.begin_up(UpOptions::default(), None).await
-    }?;
-    // Phase 2b: NO lock held — the slow, network-bound re-registration handshake.
-    let built = build_device(&pending, None).await;
-    // Phase 2c: brief lock — install iff still current, returning any orphan to settle off-lock.
-    let orphan = {
-        let mut be = backend.lock().await;
-        let orphan = be.finish_up(pending, built)?;
-        // A reload-driven rebuild re-registers the engine just like `up`, so on a successful install
-        // `finish_up` flips `has_logged_in` in memory — persist it here too (same contract as
-        // `drive_up`/`drive_set`'s rebuild), or a reload after a prior transient persist failure would
-        // leave the flag true-in-memory but false-on-disk and lose the guard's fresh-node exemption
-        // across a restart. Non-fatal on failure (node is up).
-        if orphan.is_none()
-            && let Err(e) = be.persist_prefs().await
-        {
-            tracing::warn!(error = %e, "failed to persist has_logged_in after reload-config rebuild");
-        }
-        orphan
-    };
-    // Lock released — settle the (rare) superseded device off-lock.
-    shutdown_orphan(orphan).await;
-    Ok(())
+    // Report WHICH reconcile actually ran, so the caller (the LocalAPI server) can tell the operator
+    // whether the reloaded config is already live (`Rebuild`/`BringDown`) or only persisted for the
+    // next `up` (`PersistedOnly`) — see [`ReloadAction::outcome_message`].
+    Ok(action)
 }
 
 /// A single live engine pref-setter that [`Backend::begin_set`] issued (under its brief lock) to
@@ -3712,6 +3728,37 @@ pub enum ReloadAction {
     /// Node up but the reloaded config set `Enabled:false` (`want_running=false`) → tear the engine
     /// down to match the already-persisted intent (Go applies a reloaded `Enabled:false`).
     BringDown,
+}
+
+impl ReloadAction {
+    /// The operator-facing confirmation for a `reload-config` that reconciled via this action — what
+    /// the LocalAPI server returns (and `tnet reload-config` prints) on success.
+    ///
+    /// A bare "configuration reloaded" is ambiguous in the one way that matters: it cannot tell an
+    /// operator whether the edit they just made is RUNNING or merely on disk awaiting the next `up`.
+    /// The three outcomes are materially different, so each says which happened:
+    ///
+    /// * [`Rebuild`](ReloadAction::Rebuild) — the engine was rebuilt, so the config is live now (and
+    ///   the node briefly reconnected to get there — worth saying, since the operator may have seen
+    ///   the blip).
+    /// * [`BringDown`](ReloadAction::BringDown) — the reloaded `Enabled:false` STOPPED the node. A
+    ///   generic success line here would read as "all good" to an operator who just lost their tunnel.
+    /// * [`PersistedOnly`](ReloadAction::PersistedOnly) — the node was down, so nothing was applied
+    ///   live; the merged prefs take effect on the next `up`.
+    ///
+    /// The strings deliberately share the `configuration reloaded` prefix so the success shape stays
+    /// recognizable (and greppable) across all three.
+    pub fn outcome_message(self) -> &'static str {
+        match self {
+            ReloadAction::Rebuild => "configuration reloaded; engine rebuilt (brief reconnect)",
+            ReloadAction::BringDown => {
+                "configuration reloaded; node brought down (config set Enabled:false)"
+            }
+            ReloadAction::PersistedOnly => {
+                "configuration reloaded; node is down, so it applies on the next up"
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -6639,6 +6686,60 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn reload_action_outcome_message_distinguishes_the_three_reconciles() {
+        // The `reload-config` success line is all the operator gets back, and a bare "configuration
+        // reloaded" cannot answer the question they actually have: is my edit RUNNING? The three
+        // reconciles are materially different (live on a rebuilt engine / the node was just stopped /
+        // nothing applied yet), so each must say which one happened. Drive the production
+        // `outcome_message` for every variant — never a copy of its strings reassembled here.
+        let rebuild = ReloadAction::Rebuild.outcome_message();
+        let bring_down = ReloadAction::BringDown.outcome_message();
+        let persisted = ReloadAction::PersistedOnly.outcome_message();
+
+        // (1) All three differ — the whole point of splitting the message.
+        assert_ne!(
+            rebuild, bring_down,
+            "a rebuild and a bring-down must not read the same"
+        );
+        assert_ne!(
+            rebuild, persisted,
+            "a live rebuild must not read like a persisted-only reload"
+        );
+        assert_ne!(
+            bring_down, persisted,
+            "a bring-down must not read like a persisted-only reload"
+        );
+
+        // (2) All three keep the shared, greppable success prefix (the success shape is stable).
+        for msg in [rebuild, bring_down, persisted] {
+            assert!(
+                msg.starts_with("configuration reloaded"),
+                "every outcome keeps the `configuration reloaded` prefix: {msg}"
+            );
+        }
+
+        // (3) Each names what happened to the live node.
+        assert!(
+            rebuild.contains("rebuilt"),
+            "the rebuild outcome must say the engine was rebuilt: {rebuild}"
+        );
+        assert!(
+            bring_down.contains("brought down"),
+            "a reloaded Enabled:false stopped the node — the message must say so, not just \
+             report success: {bring_down}"
+        );
+        assert!(
+            persisted.contains("next up"),
+            "the persisted-only outcome must point at the next `up`: {persisted}"
+        );
+        // ...and the persisted-only line must NOT claim anything was applied to a live engine.
+        assert!(
+            !persisted.contains("rebuilt"),
+            "a node-down reload rebuilt nothing: {persisted}"
+        );
     }
 
     #[tokio::test]
