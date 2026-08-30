@@ -869,17 +869,31 @@ pub(super) async fn file_targets(dev: &tailscale::Device) -> Response {
 /// [`spawn_blocking`](tokio::task::spawn_blocking) so the synchronous [`std::io::copy`] never
 /// stalls the async runtime's worker threads (even though a local file copy is fast).
 ///
-/// ## Dest hardening (no clobber of / no follow into a non-regular file)
+/// ## Dest hardening (resolve the parent; no clobber of / no follow into a non-regular file)
 ///
-/// Because the daemon writes `dest` as root, we first `symlink_metadata` it (which does NOT follow
-/// a final-component symlink) and, **if it already exists and is not a regular file** — a symlink,
-/// device, FIFO, socket, or directory — **refuse** rather than write. This is fail-closed
-/// defense-in-depth: it stops a fetch from following a symlink planted at `dest` to overwrite a
-/// file the operator did not name, and from writing through a device/dir. A non-existent `dest`
-/// (the normal case) passes the check and is created by the copy. The create also uses `O_NOFOLLOW`,
-/// closing the stat→create TOCTOU window (a symlink swapped in after the stat fails the open with
-/// `ELOOP` rather than being followed) — the same hardening [`debug_capture`] applies. Minimal by
-/// design — not a full sandbox.
+/// Because the daemon writes `dest` as root, [`taildrop_dest_resolved`] vets it in two steps before
+/// a byte is written, and the copy opens the path IT returns rather than the raw argument:
+///
+/// - **The parent directory is resolved and validated.** `dest` splits into `<parent>/<name>`; the
+///   parent is `canonicalize`d (resolving every symlink in the ancestor chain) and must exist and be
+///   a directory. A missing or non-directory parent is refused here, naming it, instead of leaking
+///   out later as a bare `ENOENT`/`ENOTDIR` from the create — and because the resolved path holds no
+///   symlink, the stat below and the create afterwards are talking about the same concrete file.
+///   An ancestor symlink is deliberately **followed**, not refused: the caller is `SO_PEERCRED`-gated
+///   to root or the daemon's own uid, so it is its own namespace it is redirecting, and Go's
+///   `os.Stat` gate follows symlinks too. See [`taildrop_dest_resolved`] and
+///   `docs/THREAT_MODEL.md` §5.7.
+/// - **The final component must be absent or a regular file.** The resolved path is
+///   `symlink_metadata`'d (which does NOT follow a final-component symlink) and, **if it already
+///   exists and is not a regular file** — a symlink, device, FIFO, socket, or directory — the fetch
+///   is **refused** rather than written. This is fail-closed defense-in-depth: it stops a fetch from
+///   following a symlink planted at `dest` to overwrite a file the operator did not name, and from
+///   writing through a device/dir. A non-existent `dest` (the normal case) passes and is created by
+///   the copy.
+///
+/// The create also uses `O_NOFOLLOW`, closing the stat→create TOCTOU window on the leaf (a symlink
+/// swapped in after the stat fails the open with `ELOOP` rather than being followed) — the same
+/// hardening [`debug_capture`] applies. Minimal by design — not a full sandbox.
 ///
 /// With `delete_after` set (the Go default), the received file is removed from the receive
 /// directory after a successful copy. A delete failure is logged as a warning but does **not**
@@ -902,21 +916,25 @@ pub(super) async fn file_get(
             };
         }
     };
-    // Dest hardening (see method doc): `taildrop_dest_ok` `symlink_metadata`s `dest` WITHOUT
-    // following a final-component symlink, so an existing symlink/device/FIFO/socket/dir is refused
+    // Dest hardening (see method doc): `taildrop_dest_resolved` canonicalizes the PARENT directory
+    // (refusing a missing/non-directory parent by name, and resolving any symlinked ancestor — see
+    // its doc for why that is followed rather than refused), then `symlink_metadata`s the final
+    // component WITHOUT following it, so an existing symlink/device/FIFO/socket/dir is refused
     // rather than followed or clobbered; a `NotFound` is the normal case (we are about to create the
-    // file). This predicate is the stat half; the `O_NOFOLLOW` create below is the TOCTOU-closing
-    // second half. The same check is unit-tested directly on the predicate.
-    if let Err(message) = taildrop_dest_ok(dest).await {
-        return Response::Error { message };
-    }
+    // file). It hands back the fully resolved path, which is what we open below: the stat and the
+    // create then name the SAME symlink-free path. This is the stat half; the `O_NOFOLLOW` create
+    // below is the TOCTOU-closing second half. The same predicate is unit-tested directly.
+    let resolved_dest = match taildrop_dest_resolved(dest).await {
+        Ok(p) => p,
+        Err(message) => return Response::Error { message },
+    };
     // Copy off the async runtime: `std::io::copy` over `std::fs` handles is blocking, so do it on
-    // a blocking thread rather than stall an async worker. The `dest` string is moved in. The create
+    // a blocking thread rather than stall an async worker. The resolved path is moved in. The create
     // uses `O_NOFOLLOW` to close the stat→create TOCTOU window: the `symlink_metadata` check above
     // already refused an existing symlink, but one swapped in AFTER the stat (the daemon may run as
     // root) would otherwise be followed and the received file written through it to an arbitrary
     // target — with O_NOFOLLOW the open fails (ELOOP) instead. Matches `debug_capture`'s open.
-    let dest_owned = dest.to_string();
+    let dest_owned = resolved_dest.clone();
     let copy_result = tokio::task::spawn_blocking(move || {
         let mut out = std::fs::OpenOptions::new()
             .write(true)
@@ -954,7 +972,11 @@ pub(super) async fn file_get(
         );
     }
     Response::Ok {
-        message: format!("saved {name} to {dest}"),
+        // Report where the bytes actually landed — the RESOLVED path, not the argument. When the
+        // caller reached the directory through a symlink the two differ, and the resolved one is the
+        // truthful answer to "where is my file?" (`file get <dir>` reports its written paths the
+        // same way).
+        message: format!("saved {name} to {}", resolved_dest.display()),
     }
 }
 
@@ -964,8 +986,11 @@ pub(super) async fn file_get(
 /// attempted file (in inbox order) so the CLI can render Go-style lines and decide its exit code.
 ///
 /// The special `dir == "/dev/null"` **wipes** the inbox (delete every waiting file, write nothing) —
-/// Go's `wipeInbox`. Otherwise `dir` must already exist and be a directory (validated here, matching
-/// Go's `os.Stat`+`IsDir`); a missing/!dir target is a single fail-closed [`Response::Error`].
+/// Go's `wipeInbox`. Otherwise `dir` must already exist and be a directory, resolved and validated by
+/// [`taildrop_dir_resolved`] (`canonicalize` + is-a-directory, matching Go's symlink-FOLLOWING
+/// `os.Stat`+`IsDir`); a missing/!dir target is a single fail-closed [`Response::Error`] carrying
+/// Go's `"%q is not a directory"` wording. The per-file writes then happen under the RESOLVED
+/// directory, so those opens face no symlink above the leaf.
 ///
 /// Per file (Go's loop): receive `<dir>/<name>` under the conflict policy → set the quarantine
 /// attribute → on success remove it from the inbox (so a re-drain does not re-fetch it). A file that
@@ -988,20 +1013,18 @@ pub(super) async fn file_get_dir(
     }
 
     // The target must already exist and be a directory (Go `os.Stat`+`IsDir`). Fail closed otherwise —
-    // a typo'd or not-yet-created dir must not silently no-op.
-    match tokio::fs::symlink_metadata(dir).await {
-        Ok(meta) if meta.is_dir() => {}
-        Ok(_) => {
-            return Response::Error {
-                message: format!("{dir:?} is not a directory"),
-            };
-        }
-        Err(e) => {
-            return Response::Error {
-                message: format!("{dir:?} is not a directory: {e}"),
-            };
-        }
-    }
+    // a typo'd or not-yet-created dir must not silently no-op. Resolved (symlinks in the chain
+    // followed, as Go's `os.Stat` does) so every per-file create below runs under one concrete
+    // symlink-free directory; see `taildrop_dir_resolved` for why a symlinked target is followed
+    // rather than refused.
+    let resolved_dir = match taildrop_dir_resolved(dir).await {
+        Ok(p) => p,
+        Err(message) => return Response::Error { message },
+    };
+    // Everything below joins onto this as a `Path`, never a `String`: a `to_string_lossy` round-trip
+    // would silently rewrite a non-UTF-8 directory name into U+FFFD and create the files somewhere
+    // else. Only the reported `written` string is lossy, and that is display-only.
+    let dir: &std::path::Path = &resolved_dir;
 
     let waiting = match dev.taildrop_waiting_files() {
         Ok(w) => w,
@@ -1132,7 +1155,7 @@ enum ReceiveOutcome {
 /// mode maps to a [`ReceiveOutcome`] variant the loop turns into a [`FileGotReport`].
 async fn receive_one(
     dev: &tailscale::Device,
-    dir: &str,
+    dir: &std::path::Path,
     name: &str,
     conflict: ConflictPolicy,
 ) -> ReceiveOutcome {
@@ -1155,7 +1178,7 @@ async fn receive_one(
     // leave un-quarantined bytes. The quarantine is best-effort (a failure is non-fatal — the marker
     // is defense-in-depth, not a correctness gate), so we capture whether it succeeded and warn after
     // the copy rather than aborting the receive.
-    let dir_owned = dir.to_string();
+    let dir_owned = dir.to_path_buf();
     let name_owned = name.to_string();
     let copy_result =
         tokio::task::spawn_blocking(move || -> std::io::Result<(String, u64, Option<String>)> {
@@ -1214,12 +1237,12 @@ async fn receive_one(
 /// (the `O_EXCL` create hitting an existing file) becomes Go's "refusing to overwrite" wording; other
 /// errors are reported with the target for context.
 fn humanize_write_err(
-    dir: &str,
+    dir: &std::path::Path,
     name: &str,
     conflict: ConflictPolicy,
     e: &std::io::Error,
 ) -> String {
-    let target = std::path::Path::new(dir).join(name);
+    let target = dir.join(name);
     let target = target.display();
     if conflict == ConflictPolicy::Skip && e.kind() == std::io::ErrorKind::AlreadyExists {
         format!("refusing to overwrite {target}: file already exists (left in inbox)")
@@ -1245,7 +1268,7 @@ fn humanize_write_err(
 /// than being followed — the root daemon never writes through a planted link. Synchronous (called
 /// from inside `spawn_blocking`).
 fn open_target_under_policy(
-    dir: &str,
+    dir: &std::path::Path,
     base: &str,
     conflict: ConflictPolicy,
 ) -> std::io::Result<(std::fs::File, String)> {
@@ -1278,7 +1301,7 @@ fn open_target_under_policy(
             .open(path)
     };
 
-    let target = std::path::Path::new(dir).join(base);
+    let target = dir.join(base);
     match conflict {
         ConflictPolicy::Skip => {
             let f = excl_create(&target)?;
@@ -1303,7 +1326,7 @@ fn open_target_under_policy(
                 Err(e) => return Err(e),
             }
             for i in 1..MAX_RENAME_ATTEMPTS {
-                let candidate = std::path::Path::new(dir).join(numbered_file_name(base, i));
+                let candidate = dir.join(numbered_file_name(base, i));
                 match excl_create(&candidate) {
                     Ok(f) => return Ok((f, candidate.to_string_lossy().into_owned())),
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -1405,8 +1428,8 @@ async fn capture_dest_ok(path: &str) -> Result<(), String> {
 /// `Ok(())` only if the path EXISTS and is a **regular file**; `Err(reason)` otherwise — a symlink
 /// (refused as the link itself, never followed, since `symlink_metadata` does not traverse the final
 /// component), device (e.g. `/dev/zero`, an infinite stream), FIFO, socket, directory, or a
-/// missing/unreadable path. Unlike [`capture_dest_ok`]/[`taildrop_dest_ok`] a *missing* path is an
-/// ERROR here (there is nothing to send), so the absent case is folded into the same fail-closed
+/// missing/unreadable path. Unlike [`capture_dest_ok`]/[`taildrop_dest_resolved`] a *missing* path
+/// is an ERROR here (there is nothing to send), so the absent case is folded into the same fail-closed
 /// message the open would produce. This is the stat half of `file_cp`'s hardening; the open it gates
 /// also uses `O_NOFOLLOW` to close the stat→open TOCTOU window. Pure (just a stat) → unit-testable
 /// without a device.
@@ -1419,22 +1442,117 @@ async fn taildrop_source_ok(path: &str) -> Result<(), String> {
     }
 }
 
-/// Validate a `file get` **dest** path before the daemon (running as root) creates/overwrites it:
-/// `Ok(())` if the path is missing (the normal fresh-fetch case) or an existing **regular file**
-/// (overwritten); `Err(reason)` if it EXISTS as anything else — a symlink (refused as the link
-/// itself, never followed, since `symlink_metadata` does not traverse the final component), device,
-/// FIFO, socket, or directory. Same shape as [`capture_dest_ok`] (a missing dest is allowed and the
-/// copy creates it), only the message differs. This is the stat half of `file_get`'s hardening; the
-/// create it gates also uses `O_NOFOLLOW` to close the stat→create TOCTOU window. Pure (just a stat)
-/// → unit-testable without a device.
-async fn taildrop_dest_ok(dest: &str) -> Result<(), String> {
-    match tokio::fs::symlink_metadata(dest).await {
-        Ok(meta) if meta.file_type().is_file() => Ok(()), // existing regular file → overwrite is fine
+/// Resolve and validate a `file get` **dest** path before the daemon (running as root)
+/// creates/overwrites it, returning the exact path the copy will open.
+///
+/// Two halves, because a `dest` is a *parent directory* plus a *final component* and the daemon must
+/// be deliberate about both:
+///
+/// 1. **The parent is resolved, then validated.** `dest` is split into `<parent>/<name>` (a bare
+///    relative `out.bin` parents to `.`), the parent is [`canonicalize`](tokio::fs::canonicalize)d —
+///    which walks and resolves EVERY symlink in the ancestor chain — and the result must exist and
+///    be a directory. A missing or non-directory parent is refused **here**, naming the parent,
+///    instead of surfacing later as a bare `ENOENT`/`ENOTDIR` from the create. Resolving also pins
+///    the write to one concrete directory: the path handed to the `O_NOFOLLOW` create contains no
+///    symlink at all, so the only component the open still has to defend is the leaf.
+/// 2. **The final component keeps the regular-file-or-absent rule.** The resolved
+///    `<real-parent>/<name>` is [`symlink_metadata`](tokio::fs::symlink_metadata)'d (which does NOT
+///    traverse the final component): missing → `Ok` (the normal fresh-fetch case, created by the
+///    copy), an existing **regular file** → `Ok` (overwritten), anything else — a symlink (refused
+///    as the link itself, never followed), device, FIFO, socket, or directory → `Err`. Same shape as
+///    [`capture_dest_ok`], only the message differs.
+///
+/// ## Why a symlinked ancestor is resolved and NOT refused
+///
+/// This deliberately **follows** an ancestor symlink rather than rejecting it. `file get` is
+/// `SO_PEERCRED`-gated to root or the daemon's own uid ([`crate::auth`]), so the caller choosing the
+/// path is already a party that may write wherever the daemon can; a symlink it planted in its own
+/// namespace redirects only its own fetch. Refusing would break the ordinary case (a home directory
+/// reached through a symlinked mount point) to defend a boundary the peer-credential gate already
+/// holds. Go is in the same place: `runFileGet` validates its target with `os.Stat` + `IsDir`
+/// (`cmd/tailscale/cli/file.go`, v1.100.0), and `os.Stat` follows symlinks — there is no
+/// `EvalSymlinks` and no ancestor check upstream either. Documented as a residual, not a hole, in
+/// `docs/THREAT_MODEL.md` §5.7.
+///
+/// This is the stat half of `file_get`'s hardening; the create it gates also uses `O_NOFOLLOW` to
+/// close the stat→create TOCTOU window on the leaf. Pure (stat + canonicalize, no device) →
+/// unit-testable.
+async fn taildrop_dest_resolved(dest: &str) -> Result<std::path::PathBuf, String> {
+    let raw = std::path::Path::new(dest);
+    // A dest must name a file, not a directory position. `file_name()` is `None` exactly for the
+    // paths that name no leaf — empty, `/`, `.`, `..`, or anything ending in `..` — and joining
+    // `<parent>/<name>` below is only meaningful when there IS a name. Refuse them by name rather
+    // than let `canonicalize` turn `..` into a directory the copy would then fail to open.
+    let Some(name) = raw.file_name() else {
+        return Err(format!(
+            "refusing to write {dest}: does not name a file to write"
+        ));
+    };
+    // The parent of a bare relative name (`out.bin`) is the empty path, which means the working
+    // directory — spell it `.` so `canonicalize` has something to resolve.
+    let parent = match raw.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    // Resolve the ancestor chain (see the doc above: followed on purpose, same-uid-gated).
+    let real_parent = tokio::fs::canonicalize(&parent).await.map_err(|e| {
+        format!(
+            "cannot write {dest}: parent directory {} is unusable: {e}",
+            parent.display()
+        )
+    })?;
+    // `canonicalize` succeeds on a regular file too, so the "is it a directory" question is still
+    // open. The resolved path has no symlinks left, so a plain `metadata` is exact here.
+    match tokio::fs::metadata(&real_parent).await {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            return Err(format!(
+                "cannot write {dest}: parent {} is not a directory",
+                real_parent.display()
+            ));
+        }
+        Err(e) => {
+            return Err(format!(
+                "cannot write {dest}: cannot stat parent {}: {e}",
+                real_parent.display()
+            ));
+        }
+    }
+    let resolved = real_parent.join(name);
+    match tokio::fs::symlink_metadata(&resolved).await {
+        Ok(meta) if meta.file_type().is_file() => Ok(resolved), // existing regular file → overwrite
         Ok(_) => Err(format!(
             "refusing to write {dest}: exists and is not a regular file"
         )),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()), // does not exist → create below
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(resolved), // absent → create below
         Err(e) => Err(format!("cannot write {dest}: {e}")),
+    }
+}
+
+/// Resolve and validate the **target directory** of an inbox drain (`file get <dir>`), returning the
+/// concrete directory each `<dir>/<name>` will be written under.
+///
+/// The analogue of Go's `runFileGet` gate — `if fi, err := os.Stat(dir); err != nil || !fi.IsDir()`
+/// → `"%q is not a directory"` (`cmd/tailscale/cli/file.go`, v1.100.0) — and the same two-step as
+/// [`taildrop_dest_resolved`]'s first half: [`canonicalize`](tokio::fs::canonicalize) the argument
+/// (resolving every symlink in the chain, exactly as Go's symlink-following `os.Stat` does), then
+/// require the resolved path to be a directory. Handing the resolved directory to the per-file
+/// `O_NOFOLLOW`/`O_EXCL` creates means the only component those opens still have to defend is the
+/// leaf file name.
+///
+/// Note this **fixes a Go deviation** as well as adding the resolution: the previous
+/// `symlink_metadata` gate refused `file get <symlinked-dir>` outright, where Go accepts it. A
+/// symlinked target is the same-uid caller's own-namespace choice — see
+/// [`taildrop_dest_resolved`]'s rationale and `docs/THREAT_MODEL.md` §5.7. Go's message is kept
+/// verbatim for both the missing and the not-a-directory case, since Go collapses them too.
+async fn taildrop_dir_resolved(dir: &str) -> Result<std::path::PathBuf, String> {
+    let resolved = tokio::fs::canonicalize(dir)
+        .await
+        .map_err(|e| format!("{dir:?} is not a directory: {e}"))?;
+    match tokio::fs::metadata(&resolved).await {
+        Ok(meta) if meta.is_dir() => Ok(resolved),
+        Ok(_) => Err(format!("{dir:?} is not a directory")),
+        Err(e) => Err(format!("{dir:?} is not a directory: {e}")),
     }
 }
 
@@ -1586,8 +1704,9 @@ mod tests {
     // refuse anything that is not a regular file (a symlink — never followed — device, FIFO, socket,
     // or directory). That stat-check half is now an extracted pure predicate that the production
     // methods CALL — `taildrop_source_ok` (file_cp: source must EXIST as a regular file) and
-    // `taildrop_dest_ok` (file_get: dest must be a regular file OR absent) — mirroring how
-    // `debug_capture` calls `capture_dest_ok`. These tests therefore exercise the SAME code the
+    // `taildrop_dest_resolved` (file_get: dest must be a regular file OR absent, under a resolved
+    // real directory) — mirroring how `debug_capture` calls `capture_dest_ok`. These tests
+    // therefore exercise the SAME code the
     // methods run (no re-implementation), over real temp paths: a regular file is accepted, a symlink
     // is rejected as the link itself (never traversed), a directory is refused, and the absent case
     // differs by predicate (source → error, dest → ok). The `O_NOFOLLOW` open that closes the
@@ -1651,11 +1770,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn taildrop_dest_ok_accepts_regular_and_missing_rejects_dir() {
+    async fn taildrop_dest_resolved_accepts_regular_and_missing_rejects_dir() {
         // `file_get` dest rule, via the production predicate: a missing dest → Ok (the copy creates
         // it — the normal case), an existing regular file → Ok (overwritten), a directory → Err.
         // This is the exact check `file_get` now calls (same shape as `capture_dest_ok`).
-        use super::taildrop_dest_ok;
+        use super::taildrop_dest_resolved;
         let base = std::env::temp_dir().join(format!("tailnetd-dest-ok-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
@@ -1663,7 +1782,9 @@ mod tests {
         // The normal fresh-fetch case: a non-existent dest passes (created by the copy).
         let missing = base.join("does-not-exist.bin");
         assert!(
-            taildrop_dest_ok(missing.to_str().unwrap()).await.is_ok(),
+            taildrop_dest_resolved(missing.to_str().unwrap())
+                .await
+                .is_ok(),
             "a non-existent dest must be allowed (file_get creates it)"
         );
 
@@ -1671,13 +1792,15 @@ mod tests {
         let reg = base.join("old.bin");
         std::fs::write(&reg, b"x").unwrap();
         assert!(
-            taildrop_dest_ok(reg.to_str().unwrap()).await.is_ok(),
+            taildrop_dest_resolved(reg.to_str().unwrap()).await.is_ok(),
             "an existing regular-file dest must be allowed (overwrite)"
         );
 
         // A directory is refused (can't clobber / write through a non-file).
         assert!(
-            taildrop_dest_ok(base.to_str().unwrap()).await.is_err(),
+            taildrop_dest_resolved(base.to_str().unwrap())
+                .await
+                .is_err(),
             "a directory dest must be refused"
         );
 
@@ -1686,10 +1809,10 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn taildrop_dest_ok_rejects_existing_symlink_without_following() {
+    async fn taildrop_dest_resolved_rejects_existing_symlink_without_following() {
         // An EXISTING symlink at the dest must be refused as the link itself (not followed/clobbered),
         // even when it points at a regular file. Pinned through the production predicate `file_get` calls.
-        use super::taildrop_dest_ok;
+        use super::taildrop_dest_resolved;
         let base = std::env::temp_dir().join(format!("tailnetd-dest-sym-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
@@ -1699,11 +1822,182 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
         assert!(
-            taildrop_dest_ok(link.to_str().unwrap()).await.is_err(),
+            taildrop_dest_resolved(link.to_str().unwrap())
+                .await
+                .is_err(),
             "an existing symlink dest must be refused as the link itself, never followed/clobbered"
         );
         // The target must be untouched — the predicate only stats, never writes through the link.
         assert_eq!(std::fs::read(&target).unwrap(), b"data");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // --- `file get` dest: the PARENT directory is resolved and validated (bead tsd-k97) -----------
+    //
+    // A `dest` is a parent directory plus a leaf, and before this the daemon only vetted the leaf:
+    // a missing parent surfaced as a bare `ENOENT` out of the create, a parent that was a regular
+    // file as a bare `ENOTDIR`, and the path the create opened was the raw argument rather than one
+    // the daemon had resolved. `taildrop_dest_resolved` now canonicalizes the parent, refuses it by
+    // name when it is missing or not a directory, and RETURNS the symlink-free path `file_get`
+    // opens. A symlinked ancestor is followed on purpose (same-uid-gated; Go's `os.Stat` follows
+    // too) — pinned below so the deliberate choice cannot silently flip to a refusal.
+
+    #[tokio::test]
+    async fn taildrop_dest_resolved_refuses_a_missing_or_non_directory_parent() {
+        // The parent half of the dest rule, via the production predicate `file_get` calls: a dest
+        // under a directory that does not exist, and one under a REGULAR FILE, are both refused
+        // here — before any create — while the same leaf under the real directory is accepted.
+        use super::taildrop_dest_resolved;
+        let base =
+            std::env::temp_dir().join(format!("tailnetd-dest-parent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let missing_parent = base.join("no-such-dir").join("out.bin");
+        assert!(
+            taildrop_dest_resolved(missing_parent.to_str().unwrap())
+                .await
+                .is_err(),
+            "a dest whose parent directory does not exist must be refused"
+        );
+
+        // Parent is a regular file → `<file>/out.bin` can never be created; refuse it by name.
+        let not_a_dir = base.join("regular.bin");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+        let under_file = not_a_dir.join("out.bin");
+        assert!(
+            taildrop_dest_resolved(under_file.to_str().unwrap())
+                .await
+                .is_err(),
+            "a dest whose parent is a regular file must be refused"
+        );
+
+        // Control: the same leaf under the real directory is fine (created by the copy).
+        let ok = base.join("out.bin");
+        assert!(
+            taildrop_dest_resolved(ok.to_str().unwrap()).await.is_ok(),
+            "a fresh dest under a real directory must still be accepted"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn taildrop_dest_resolved_follows_a_symlinked_ancestor_and_returns_the_real_path() {
+        // DELIBERATE: an ancestor symlink is RESOLVED, not refused — `file get` is SO_PEERCRED-gated
+        // to root or the daemon's own uid, so the caller is redirecting its own namespace, and Go's
+        // `os.Stat` gate follows symlinks as well (docs/THREAT_MODEL.md §5.7). What the predicate
+        // must NOT do is hand the create a path that still contains the link: the returned path is
+        // the canonical one under the REAL directory, so the `O_NOFOLLOW` open only has the leaf
+        // left to defend.
+        use super::taildrop_dest_resolved;
+        let base = std::env::temp_dir().join(format!("tailnetd-dest-anc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let real_dir = base.join("real");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let link_dir = base.join("link");
+        std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
+
+        let via_link = link_dir.join("out.bin");
+        let resolved = taildrop_dest_resolved(via_link.to_str().unwrap())
+            .await
+            .expect("a dest reached through a symlinked ancestor must be accepted, not refused");
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(&real_dir).unwrap().join("out.bin"),
+            "the returned path must be the resolved one under the REAL directory"
+        );
+        assert_ne!(
+            resolved, via_link,
+            "the returned path must not be the un-resolved argument"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn taildrop_dest_resolved_refuses_a_path_that_names_no_file() {
+        // `/`, `.` and `..` name a directory position, not a file to write. They have no final
+        // component to stat and nothing sensible to create, so they are refused by name rather than
+        // canonicalized into a directory the create would then fail on.
+        use super::taildrop_dest_resolved;
+        for bad in ["/", ".", "..", "/tmp/.."] {
+            assert!(
+                taildrop_dest_resolved(bad).await.is_err(),
+                "{bad:?} names no file to write and must be refused"
+            );
+        }
+    }
+
+    // --- `file get <dir>`: the drain target is resolved the way Go's `os.Stat` resolves it --------
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn taildrop_dir_resolved_follows_a_symlinked_target_dir_like_go() {
+        // Go's gate is `os.Stat(dir)` + `IsDir` (cmd/tailscale/cli/file.go, v1.100.0), and `os.Stat`
+        // FOLLOWS symlinks — so `tailscale file get <symlinked-dir>` works upstream. The previous
+        // `symlink_metadata` gate here refused it; the resolver accepts it and hands back the real
+        // directory the per-file creates run under.
+        use super::taildrop_dir_resolved;
+        let base = std::env::temp_dir().join(format!("tailnetd-dir-res-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let real_dir = base.join("inbox");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let link_dir = base.join("inbox-link");
+        std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
+
+        let resolved = taildrop_dir_resolved(link_dir.to_str().unwrap())
+            .await
+            .expect(
+                "a symlinked target directory must be accepted, as Go's os.Stat gate accepts it",
+            );
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(&real_dir).unwrap(),
+            "the drain must run under the resolved real directory"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn taildrop_dir_resolved_refuses_a_file_or_missing_target_with_gos_wording() {
+        // Both of Go's failing branches collapse to one message — `fmt.Errorf("%q is not a
+        // directory", dir)` — because Go's `if fi, err := os.Stat(dir); err != nil || !fi.IsDir()`
+        // collapses them too. Pin the wording, not just the refusal.
+        use super::taildrop_dir_resolved;
+        let base = std::env::temp_dir().join(format!("tailnetd-dir-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let file = base.join("not-a-dir.bin");
+        std::fs::write(&file, b"x").unwrap();
+        let err = taildrop_dir_resolved(file.to_str().unwrap())
+            .await
+            .expect_err("a regular-file target must be refused");
+        assert!(
+            err.contains("is not a directory"),
+            "must keep Go's wording, got {err:?}"
+        );
+
+        let missing = base.join("no-such-dir");
+        let err = taildrop_dir_resolved(missing.to_str().unwrap())
+            .await
+            .expect_err("a missing target must be refused");
+        assert!(
+            err.contains("is not a directory"),
+            "must keep Go's wording for the missing case too, got {err:?}"
+        );
+
+        // Control: the real directory resolves.
+        assert!(
+            taildrop_dir_resolved(base.to_str().unwrap()).await.is_ok(),
+            "an existing directory must be accepted"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -1860,7 +2154,7 @@ mod tests {
         let base = std::env::temp_dir().join(format!("tailnetd-skip-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
-        let dir = base.to_str().unwrap();
+        let dir = base.as_path();
 
         // Pre-existing file with known contents.
         let existing = base.join("f.bin");
@@ -1889,7 +2183,7 @@ mod tests {
         let base = std::env::temp_dir().join(format!("tailnetd-ow-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
-        let dir = base.to_str().unwrap();
+        let dir = base.as_path();
 
         // (a) Plain overwrite of an existing regular file: we get a fresh, empty, writable handle.
         let existing = base.join("f.bin");
@@ -1938,7 +2232,7 @@ mod tests {
         let base = std::env::temp_dir().join(format!("tailnetd-rn-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
-        let dir = base.to_str().unwrap();
+        let dir = base.as_path();
 
         // First rename call with no conflict → the plain name.
         let (_f0, p0) = open_target_under_policy(dir, "doc.txt", ConflictPolicy::Rename).unwrap();
