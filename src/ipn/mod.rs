@@ -3332,9 +3332,14 @@ impl Backend {
     /// Provision a TLS cert+key for `domain` via the tailnet ACME flow (the `tnet cert` path). Thin
     /// `pub` shim over [`diag::cert_pair`], kept on `Backend` so the `server.rs` dispatch call site is
     /// uniform with the other off-lock device operations. Fail-closed: a non-`acme` build, or any ACME
-    /// failure, returns a clear [`Response::Error`] — never a self-signed cert. See [`diag::cert_pair`].
-    pub async fn cert_pair(dev: &tailscale::Device, domain: &str) -> crate::localapi::Response {
-        diag::cert_pair(dev, domain).await
+    /// failure, returns a clear [`Response::Error`] — never a self-signed cert. `min_validity` is the
+    /// caller's `--min-validity` (Go's flag), passed through to the engine. See [`diag::cert_pair`].
+    pub async fn cert_pair(
+        dev: &tailscale::Device,
+        domain: &str,
+        min_validity: Option<std::time::Duration>,
+    ) -> crate::localapi::Response {
+        diag::cert_pair(dev, domain, min_validity).await
     }
 
     /// Load the current profile's serve config (the `tnet serve status` / GetServeConfig path).

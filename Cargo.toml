@@ -150,6 +150,17 @@ sha2 = "0.10"
 # pin it directly (with the rust backend) so the updater can name it and it can't be dropped.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 tar = "0.4"
+# `tnet cert --serve-demo`: terminate TLS with the certificate the daemon just issued, so the
+# operator can see it work in a browser instead of reading PEM off disk (Go serves the same demo page
+# on :443). All three crates are already in this build's graph — rustls via ureq (the update client)
+# and via the engine's TLS stack, tokio-rustls and rustls-pemfile via the engine's `ts_control` — so
+# naming them here adds a dependency EDGE, not a crate. `default-features = false` + `ring` keeps the crypto
+# provider the one the rest of the tree already uses: rustls' default features would pull in a SECOND
+# provider (aws-lc-rs, with its C build), and with two compiled in, picking one becomes a runtime
+# decision that panics when it is not made.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pemfile = "2"
 # RNG for generating the Tailscale SSH server's host key (`russh::keys::PrivateKey::random`). Must
 # be `rand 0.10` — russh 0.61's `ssh-key` bounds `random` on `rand_core 0.10`'s `CryptoRng`, which
 # `rand 0.9`'s `ThreadRng` does NOT implement (verified: build fails with a CryptoRng trait-bound

@@ -368,13 +368,24 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// 2. WITH `acme`: any ACME/HTTP/validation failure surfaces as a clear error (the engine's
 ///    `cert_pair` is itself fail-closed — never a partial or self-signed pair).
 ///
-/// `min_validity` is passed as `None` (Go's default: a freshly issued, full-lifetime cert). The key
-/// PEM is sensitive: it is carried in [`Response::Cert`] and written `0600` by the CLI; it is never
-/// logged here.
-pub(super) async fn cert_pair(dev: &tailscale::Device, domain: &str) -> Response {
+/// `min_validity` carries the caller's `tnet cert --min-validity` (Go's `--min-validity`, which
+/// reaches Go's daemon as the `min_validity` query parameter): the least remaining lifetime the
+/// operator will accept. `None` is Go's default (zero duration — no minimum). HONEST SCOPE: the
+/// engine keeps no cert cache, so every call issues a fresh, full-lifetime cert that satisfies any
+/// minimum; the engine accepts the value for signature compatibility and it changes nothing today.
+/// It is passed through rather than dropped so a future engine-side cache honors what the operator
+/// already asked for.
+///
+/// The key PEM is sensitive: it is carried in [`Response::Cert`] and written `0600` by the CLI; it is
+/// never logged here.
+pub(super) async fn cert_pair(
+    dev: &tailscale::Device,
+    domain: &str,
+    min_validity: Option<std::time::Duration>,
+) -> Response {
     #[cfg(feature = "acme")]
     {
-        match dev.cert_pair(domain, None).await {
+        match dev.cert_pair(domain, min_validity).await {
             Ok((cert_pem, key_pem)) => Response::Cert { cert_pem, key_pem },
             Err(e) => Response::Error {
                 message: format!("cert issuance for {domain:?} failed: {e}"),
@@ -383,8 +394,9 @@ pub(super) async fn cert_pair(dev: &tailscale::Device, domain: &str) -> Response
     }
     #[cfg(not(feature = "acme"))]
     {
-        // Reference `dev`/`domain` so the non-acme build has no unused-variable warnings.
-        let _ = (dev, domain);
+        // Reference `dev`/`domain`/`min_validity` so the non-acme build has no unused-variable
+        // warnings.
+        let _ = (dev, domain, min_validity);
         Response::Error {
             message: "this daemon was built without the `acme` feature; rebuild with \
                       `--features acme` to issue TLS certificates"
