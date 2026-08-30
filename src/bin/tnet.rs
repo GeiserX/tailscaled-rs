@@ -397,8 +397,10 @@ enum Command {
         operator: Option<String>,
         /// Nickname for this login profile (Go `tailscale set --nickname` / `Prefs.ProfileName`).
         /// Pass an EMPTY value (`--nickname=`) to clear it; omitting the flag leaves it unchanged.
-        /// Client-local and cosmetic — never advertised to control. (Distinct from `--hostname`,
-        /// which is the name this node REQUESTS from the tailnet.)
+        /// Client-local — never advertised to control — but not cosmetic: as in Go it RENAMES the
+        /// current login profile, so this is the name `tnet switch --list` shows and the one
+        /// `tnet switch <name>` resolves against. (Distinct from `--hostname`, which is the name
+        /// this node REQUESTS from the tailnet.)
         #[arg(long, value_name = "NAME")]
         nickname: Option<String>,
         /// Allow the management plane to gather device-posture information (Go `tailscale set
@@ -2564,13 +2566,54 @@ async fn dispatch_simple(socket: &std::path::Path, request: Request) -> Result<(
     Ok(())
 }
 
+/// The refusal `tnet up` owes its own flags *before* it contacts the daemon, or `None` when the
+/// invocation is usable. Ported from Go's `prefsFromUpArgs` (`cmd/tailscale/cli/up.go` @ v1.100.0),
+/// which refuses the one flag combination that cannot mean anything — `if upArgs.exitNodeIP == "" &&
+/// upArgs.exitNodeAllowLANAccess { return nil, fmt.Errorf("--exit-node-allow-lan-access can only be
+/// used with --exit-node") }`.
+///
+/// `--exit-node-allow-lan-access` only shapes traffic that is *already* leaving through an exit
+/// node, so on its own it asks for an exemption from routing that is not happening. Go decides this
+/// from the FLAGS, not from the resulting state — `prefsFromUpArgs` runs before any LocalAPI call —
+/// so the refusal here is likewise on the invocation: an `up` that does not itself name an exit node
+/// is refused even when one is already persisted (Go's `up` would have cleared it anyway; re-passing
+/// `--exit-node` is the answer in both). The negative form (`--no-exit-node-allow-lan-access`, Go's
+/// `--exit-node-allow-lan-access=false`) turns the setting OFF and needs no exit node, so it passes.
+///
+/// `--clear-exit-node` is this fork's spelling of Go's `--exit-node=""`, which lands on the same
+/// empty `exitNodeIP` — so it is refused alongside it rather than treated as naming an exit node.
+///
+/// The refusal is `up`-only, exactly as in Go: `prefsFromUpArgs` is not on the `set` path, so
+/// `tnet set --exit-node-allow-lan-access` stays accepted (it edits one pref on an existing node).
+///
+/// The message goes to **stderr** and the caller exits **1**, matching Go's error return from
+/// `prefsFromUpArgs` (printed by the CLI's top-level error handler) rather than clap's stderr +
+/// exit 2 — which is why this is a hand-rolled check and not an `#[arg(requires = ...)]`. Pure →
+/// unit-testable.
+fn up_usage_refusal(
+    exit_node: Option<&str>,
+    clear_exit_node: bool,
+    exit_node_allow_lan_access: Option<bool>,
+) -> Option<&'static str> {
+    // Go's `exitNodeIP != ""`: an exit node is named only by a non-empty selector. `--clear-exit-node`
+    // is the empty selector, so it names none.
+    let names_exit_node = !clear_exit_node && exit_node.is_some_and(|sel| !sel.trim().is_empty());
+    if exit_node_allow_lan_access == Some(true) && !names_exit_node {
+        return Some("--exit-node-allow-lan-access can only be used with --exit-node");
+    }
+    None
+}
+
 /// `up` (Go `tailscale up`): bring the node up / re-apply prefs. Runs the two SSH-risk pre-flight
 /// gates, resolves the auth key, builds the wire `Request::Up`, round-trips it, then renders the
 /// reply. On a successful `Ok`, a keyless (interactive) up polls `status` to surface the login URL,
 /// and `--timeout` bounds a client-side wait for Running. The accidental-revert guard
 /// (`RevertGuard`) and `Error` both exit non-zero without changing the node. The pre-flight ORDER is
-/// load-bearing: force-reauth refusal → SSH-toggle gate → `--timeout` capture → authkey resolution →
-/// interactive flag → build request.
+/// load-bearing: usage refusal → force-reauth refusal → SSH-toggle gate → `--timeout` capture →
+/// authkey resolution → interactive flag → build request. The usage refusal comes first because it
+/// is the only one that judges the command line alone (Go decides it in `prefsFromUpArgs`, before it
+/// asks the daemon anything), so a malformed invocation never reaches a risk prompt about a node it
+/// was never going to touch.
 #[allow(clippy::too_many_arguments)]
 async fn run_up(
     socket: &std::path::Path,
@@ -2608,6 +2651,16 @@ async fn run_up(
     wif: WifFlags,
     json: bool,
 ) -> Result<()> {
+    // Go's own flag refusal first (stderr + exit 1), before any risk gate or daemon round-trip —
+    // see `up_usage_refusal` for the ported check and why it is `up`-only.
+    if let Some(message) = up_usage_refusal(
+        exit_node.as_deref(),
+        clear_exit_node,
+        up_prefs.exit_node_allow_lan_access,
+    ) {
+        eprintln!("{message}");
+        std::process::exit(1);
+    }
     // Risk gate (Go `--accept-risk`/`riskLoseSSH`): `--force-reauth` re-registers the node,
     // which can drop the very Tailscale-SSH session you're typing from. Refuse it over such a
     // session unless the operator pre-accepted `lose-ssh` (or `all`). Detected entirely
@@ -15611,6 +15664,47 @@ users:
             parse_min_validity("1d"),
             Err(r#"time: unknown unit "d" in duration "1d""#.to_string())
         );
+    }
+
+    #[test]
+    fn up_refuses_exit_node_allow_lan_access_without_an_exit_node() {
+        // Go's `prefsFromUpArgs` refuses this pair outright, before any LocalAPI call:
+        // `--exit-node-allow-lan-access` exempts LAN traffic from exit-node routing, so with no exit
+        // node it asks for an exemption from routing that is not happening. The message is Go's,
+        // verbatim.
+        assert_eq!(
+            up_usage_refusal(None, false, Some(true)),
+            Some("--exit-node-allow-lan-access can only be used with --exit-node")
+        );
+        // `--clear-exit-node` is this fork's `--exit-node=""`: it names no exit node either.
+        assert_eq!(
+            up_usage_refusal(None, true, Some(true)),
+            Some("--exit-node-allow-lan-access can only be used with --exit-node")
+        );
+        // An explicitly EMPTY selector is Go's empty `exitNodeIP` — refused for the same reason, and
+        // whitespace is not a selector.
+        assert_eq!(
+            up_usage_refusal(Some(""), false, Some(true)),
+            Some("--exit-node-allow-lan-access can only be used with --exit-node")
+        );
+        assert_eq!(
+            up_usage_refusal(Some("  "), false, Some(true)),
+            Some("--exit-node-allow-lan-access can only be used with --exit-node")
+        );
+        // A named selector — IP or MagicDNS name — is exactly Go's non-empty `exitNodeIP`: usable.
+        assert_eq!(
+            up_usage_refusal(Some("100.64.0.9"), false, Some(true)),
+            None
+        );
+        assert_eq!(up_usage_refusal(Some("exit-1"), false, Some(true)), None);
+        // The negative form turns the setting OFF (Go's `--exit-node-allow-lan-access=false`), which
+        // is meaningful with no exit node — Go only refuses the true case.
+        assert_eq!(up_usage_refusal(None, false, Some(false)), None);
+        assert_eq!(up_usage_refusal(None, true, Some(false)), None);
+        // Not mentioning the flag at all is always usable, exit node or not.
+        assert_eq!(up_usage_refusal(None, false, None), None);
+        assert_eq!(up_usage_refusal(Some("100.64.0.9"), false, None), None);
+        assert_eq!(up_usage_refusal(None, true, None), None);
     }
 
     #[test]
