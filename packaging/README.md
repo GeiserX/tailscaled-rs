@@ -5,6 +5,10 @@ background service:
 
 - **Linux** — systemd unit: [`systemd/tailnetd.service`](systemd/tailnetd.service)
 - **macOS** — launchd `LaunchDaemon`: [`launchd/cloud.tailscaled-rs.tailnetd.plist`](launchd/cloud.tailscaled-rs.tailnetd.plist)
+- **Homebrew (macOS/Linux)** — formula + tap: [`homebrew/tailscaled-rs.rb`](homebrew/tailscaled-rs.rb),
+  documented in [`homebrew/README.md`](homebrew/README.md). It builds the binaries from a released
+  source tag and registers the same daemon with `brew services`, so `sudo brew services start
+  tailscaled-rs` replaces steps 1 and 2 below.
 
 Both run `tailnetd` from `/usr/local/bin/tailnetd`, set the required experiment opt-in
 (`TS_RS_EXPERIMENT=this_is_unstable_software`), point the daemon at a private state directory,
