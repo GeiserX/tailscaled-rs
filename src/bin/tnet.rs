@@ -993,12 +993,14 @@ enum ConfigureCmd {
     /// carrying the placeholder token Go uses: the proxy authenticates the caller by its tailnet
     /// identity, and the token only stops kubectl prompting for a username and password.
     ///
-    /// DEVIATION from Go: Go merges the new cluster/context/user into your existing kubeconfig via
-    /// the Kubernetes client libraries. This fork EMITS a standalone kubeconfig instead (stdout by
-    /// default, or `--output PATH`) and never rewrites an existing one — merging would mean parsing
-    /// arbitrary user YAML, i.e. a YAML-parser dependency this daemon otherwise has no use for. Point
-    /// kubectl at the result directly (`--kubeconfig`), or stack it on your existing config with
-    /// `KUBECONFIG=~/.kube/config:<path>`.
+    /// Like Go, this MERGES into the kubeconfig kubectl already reads — `$KUBECONFIG` (first entry
+    /// that exists), else `~/.kube/config` — adding or replacing just this peer's triple and leaving
+    /// every other cluster, context and user in the file untouched, then making the new context
+    /// current. The file is created (`0600`) if it does not exist, and a document that is not an
+    /// `apiVersion: v1` / `kind: Config` kubeconfig is refused rather than overwritten.
+    ///
+    /// `--output` opts out of that: it writes a standalone kubeconfig and reads nothing. Point
+    /// kubectl at the result (`--kubeconfig`), or stack it: `KUBECONFIG=~/.kube/config:<path>`.
     Kubeconfig {
         /// The auth-proxy peer: a bare hostname, a full MagicDNS name, or a tailnet IP.
         #[arg(value_name = "HOSTNAME_OR_FQDN")]
@@ -1007,13 +1009,15 @@ enum ConfigureCmd {
         /// in the hostname argument (Go `tailscale configure kubeconfig --http`).
         #[arg(long)]
         http: bool,
-        /// Write the kubeconfig to PATH (mode `0600`) instead of stdout. `-` also means stdout.
-        /// Refuses to overwrite an existing file unless `--force` is given — this build cannot merge,
-        /// so a blind overwrite would silently drop every other cluster in that file.
+        /// Write a STANDALONE kubeconfig to PATH (mode `0600`) instead of merging into the
+        /// kubeconfig kubectl reads. `-` means stdout. Refuses to overwrite an existing file unless
+        /// `--force` is given — nothing is merged on this path, so a blind overwrite would silently
+        /// drop every other cluster in that file.
         #[arg(long, short = 'o', value_name = "PATH")]
         output: Option<String>,
         /// Overwrite `--output PATH` if it already exists. DESTRUCTIVE: the file is replaced, not
-        /// merged, so any other clusters/contexts it held are lost.
+        /// merged, so any other clusters/contexts it held are lost. Ignored without `--output`, where
+        /// the existing kubeconfig is merged into and never replaced.
         #[arg(long)]
         force: bool,
     },
@@ -9774,11 +9778,13 @@ fn format_serve_status(cfg: &tailscaled_rs::localapi::ServeConfig, _json: bool) 
 
 /// `configure kubeconfig` (Go `tailscale configure kubeconfig <hostname-or-fqdn>`).
 ///
-/// Go's flow is: read Status, require the backend to be `Running`, resolve the argument to a peer's
-/// MagicDNS name, then add a `cluster`/`context`/`user` triple named after that FQDN to the user's
-/// kubeconfig and make it the current context. This fork does the first three steps identically and
-/// then *emits* that kubeconfig rather than merging it (see [`ConfigureCmd::Kubeconfig`] for why),
-/// so the whole render is pure and offline once Status has answered.
+/// Go's flow, which this ports step for step: read Status, require the backend to be `Running`,
+/// resolve the argument to a peer's MagicDNS name (falling back to a Tailscale Service record), then
+/// merge a `cluster`/`context`/`user` triple named after that FQDN into the user's kubeconfig and
+/// make it the current context.
+///
+/// The one addition is `--output`, which writes the triple as a standalone document instead of
+/// merging — see [`ConfigureCmd::Kubeconfig`].
 async fn run_configure_kubeconfig(
     socket: &std::path::Path,
     host: &str,
@@ -9810,40 +9816,74 @@ async fn run_configure_kubeconfig(
             sanitize_for_terminal(&status.state)
         );
     }
-    let fqdn = peer_dns_name_from_arg(&status, host).ok_or_else(|| {
-        anyhow!(
-            "configure kubeconfig: no peer matching {:?} in the current netmap (run `tnet status` \
-             to list peers)",
-            sanitize_for_terminal(host)
-        )
-    })?;
+    // Go's `nodeOrServiceDNSNameFromArg`: try the peers first, and only on a miss look the argument
+    // up as a Tailscale Service record in the tailnet's MagicDNS configuration.
+    //
+    // Go fetches the DNS config unconditionally, before resolving; this fetches it only on the peer
+    // miss. Same answers and same errors — one fewer LocalAPI round trip on the common path, and a
+    // daemon that cannot answer `dns status` no longer breaks a lookup that the netmap alone
+    // already settled.
+    let fqdn = match peer_dns_name_from_arg(&status, host) {
+        Some(name) => name,
+        None => {
+            let dns = match round_trip(socket, &Request::DnsStatus).await {
+                Ok(Response::DnsStatus(r)) => r,
+                Ok(Response::Error { message }) => {
+                    eprintln!("error: {message}");
+                    std::process::exit(1);
+                }
+                Ok(other) => {
+                    anyhow::bail!("unexpected response to dns status request: {other:?}")
+                }
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("querying dns status at {}", socket.display()));
+                }
+            };
+            service_dns_name_from_arg(&dns, &status, host)?
+        }
+    };
+    // Go: `targetFQDN = strings.TrimSuffix(targetFQDN, ".")`. The peer arm already trims; a Service
+    // record's name is whatever control pushed, so it can still carry the root dot.
+    let fqdn = fqdn.trim_end_matches('.').to_string();
     // The FQDN lands unquoted in the YAML *and* inside the cluster's `https://…` server URL, both
     // built by string interpolation. Both are only safe because the name is constrained to a DNS
-    // charset here; keep this check in front of `render_kubeconfig`, which relies on it.
+    // charset here; keep this check in front of `update_kubeconfig`, which relies on it.
     validate_kube_fqdn(&fqdn)?;
-    let kubeconfig = render_kubeconfig(scheme, &fqdn);
     let url = format!("{scheme}{fqdn}");
 
-    // Go's closing line is `kubeconfig configured for %q at URL %q`; this fork appends where the
-    // document went, since it wrote a new file rather than editing the one kubectl already reads.
     match output {
-        None | Some("-") => {
-            use std::io::Write as _;
-            std::io::stdout()
-                .write_all(kubeconfig.as_bytes())
-                .context("writing the kubeconfig to stdout")?;
-            eprintln!("kubeconfig configured for {fqdn:?} at URL {url:?} — written to stdout");
+        // Go's behaviour, and the default: merge the cluster/context/user triple into the kubeconfig
+        // kubectl already reads, leaving every other cluster in it intact.
+        None => {
+            let path = kubeconfig_path()?;
+            set_kubeconfig_for_peer(scheme, &fqdn, &path)?;
+            // Go's closing line, verbatim (`kubeconfig configured for %q at URL %q`), plus the file
+            // it edited — Go leaves that implicit, but `$KUBECONFIG` can point anywhere.
+            println!("kubeconfig configured for {fqdn:?} at URL {url:?} — merged into {path}");
         }
-        Some(path) => {
-            write_kubeconfig_file(path, &kubeconfig, force)?;
-            println!("kubeconfig configured for {fqdn:?} at URL {url:?} — written to {path}");
+        // `--output` is this fork's own escape hatch, not a Go flag: emit the triple as a fresh
+        // standalone document and touch nothing else. Nothing is read, so nothing can be merged.
+        Some(dest) => {
+            let kubeconfig = update_kubeconfig("", scheme, &fqdn)?;
+            if dest == "-" {
+                use std::io::Write as _;
+                std::io::stdout()
+                    .write_all(kubeconfig.as_bytes())
+                    .context("writing the kubeconfig to stdout")?;
+                eprintln!("kubeconfig configured for {fqdn:?} at URL {url:?} — written to stdout");
+            } else {
+                write_kubeconfig_file(dest, &kubeconfig, force)?;
+                println!("kubeconfig configured for {fqdn:?} at URL {url:?} — written to {dest}");
+            }
+            // Say plainly what `--output` did NOT do, so nobody assumes `~/.kube/config` was updated.
+            eprintln!(
+                "note: --output writes a standalone kubeconfig — no existing kubeconfig was read or \
+                 modified. Use it with `kubectl --kubeconfig <path>`, or stack it: \
+                 `KUBECONFIG=~/.kube/config:<path>`. Drop --output to merge into your kubeconfig."
+            );
         }
     }
-    // Say plainly what this build did NOT do, so nobody assumes `~/.kube/config` was updated.
-    eprintln!(
-        "note: this is a standalone kubeconfig — no existing kubeconfig was read or modified. Use \
-         it with `kubectl --kubeconfig <path>`, or stack it: `KUBECONFIG=~/.kube/config:<path>`."
-    );
     Ok(())
 }
 
@@ -9976,51 +10016,355 @@ fn validate_kube_fqdn(fqdn: &str) -> Result<()> {
     Ok(())
 }
 
-/// Render the kubeconfig for an auth-proxy peer, in the document Go's `updateKubeconfig` produces
-/// for a previously empty config.
+/// Merge the auth-proxy cluster/context/user triple into an existing kubeconfig, porting Go's
+/// `updateKubeconfig` (and the `appendOrSetNamed` it leans on).
 ///
-/// Go builds a `map[string]any` and hands it to `sigs.k8s.io/yaml`, which emits the top-level keys
-/// in alphabetical order: `apiVersion`, `clusters`, `contexts`, `current-context`, `kind`, `users`,
-/// and nothing else (no `preferences` key — Go never sets one). The cluster and the context are
-/// named after the peer's FQDN, but the user is NOT: Go writes one shared `tailscale-auth` entry and
-/// points every Tailscale context at it. That entry carries a placeholder token, quoting Go's
-/// reason — the proxy authorizes by tailnet identity and ignores the token, but with no credential
-/// at all in the user entry kubectl prompts for a username and password.
+/// `cfg_yaml` is the current contents of the target file, or `""` when there is none — which is the
+/// "render a fresh document" case, and the only one `--output` uses.
 ///
-/// `scheme` is Go's `"https://"` / `"http://"` (see [`kube_scheme`] and [`kubeconfig_inputs`]).
+/// Go's model is `sigs.k8s.io/yaml`, i.e. YAML over `encoding/json`: the document is decoded into a
+/// `map[string]any`, mutated, and marshalled back through JSON. The port keeps that model exactly —
+/// [`serde_json::Value`] is the document, [`serde_norway`] only parses and emits — so the output
+/// matches Go byte for byte, including the alphabetical top-level key order (Go's `encoding/json`
+/// sorts map keys; `serde_json::Map` is a `BTreeMap`).
 ///
-/// Pure + total: the caller has already run [`validate_kube_fqdn`], which is what lets the name be
-/// written as a bare YAML scalar (exactly as Go's marshaller writes it) rather than quoted.
-fn render_kubeconfig(scheme: &str, fqdn: &str) -> String {
-    // Left-flushed on purpose: the literal IS the emitted file, so it reads as the YAML it produces.
-    format!(
-        r#"apiVersion: v1
-clusters:
-- cluster:
-    server: {scheme}{fqdn}
-  name: {fqdn}
-contexts:
-- context:
-    cluster: {fqdn}
-    user: tailscale-auth
-  name: {fqdn}
-current-context: {fqdn}
-kind: Config
-users:
-- name: tailscale-auth
-  user:
-    token: unused
-"#
-    )
+/// What the merge preserves, per Go: every cluster, context and user the file already held, in
+/// order; a triple already named after this FQDN is REPLACED in place rather than duplicated (that
+/// is `appendOrSetNamed`); and the `tailscale-auth` user is one shared entry every Tailscale context
+/// points at, carrying Go's placeholder token — the proxy authorizes by tailnet identity and ignores
+/// the token, but with no credential at all in the user entry kubectl prompts for a username and
+/// password.
+///
+/// Refuses (Go's `errInvalidKubeconfig`) a document that does not parse, or that is not an
+/// `apiVersion: v1` / `kind: Config` mapping. That refusal is what keeps a merge from turning into a
+/// silent overwrite of a file this build did not understand.
+///
+/// `scheme` is Go's `"https://"` / `"http://"` (see [`kube_scheme`] and [`kubeconfig_inputs`]). The
+/// caller has already run [`validate_kube_fqdn`], so the name is a plain DNS name.
+fn update_kubeconfig(cfg_yaml: &str, scheme: &str, fqdn: &str) -> Result<String> {
+    use serde_json::{Map, Value, json};
+
+    let invalid = || {
+        anyhow!(
+            "configure kubeconfig: invalid kubeconfig — it is not an `apiVersion: v1` / `kind: \
+             Config` YAML document. Refusing to touch it (Go refuses the same way): merging into a \
+             file this build cannot read would mean overwriting it."
+        )
+    };
+    // Go unmarshals into a `map[string]any` and treats a nil map (empty input, or a document that is
+    // only comments / an explicit `null`) as "start a fresh config"; anything that is not a mapping
+    // fails to unmarshal at all.
+    let parsed: Option<Map<String, Value>> = if cfg_yaml.is_empty() {
+        None
+    } else {
+        match serde_norway::from_str::<Value>(cfg_yaml) {
+            Ok(Value::Null) => None,
+            Ok(Value::Object(m)) => Some(m),
+            Ok(_) | Err(_) => return Err(invalid()),
+        }
+    };
+    let mut cfg = match parsed {
+        None => {
+            let mut m = Map::new();
+            m.insert("apiVersion".to_string(), json!("v1"));
+            m.insert("kind".to_string(), json!("Config"));
+            m
+        }
+        Some(m) => {
+            // Go: `cfg["apiVersion"] != "v1" || cfg["kind"] != "Config"`. A missing key compares
+            // unequal too, so `{}` is invalid — it is a mapping, just not a kubeconfig.
+            if m.get("apiVersion") != Some(&json!("v1")) || m.get("kind") != Some(&json!("Config"))
+            {
+                return Err(invalid());
+            }
+            m
+        }
+    };
+
+    // Go: `clusters, _ := cfg["clusters"].([]any)` — a missing key AND a key holding something that
+    // is not a list both yield nil, and the key is then overwritten with the rebuilt list.
+    let seq = |cfg: &Map<String, Value>, key: &str| match cfg.get(key) {
+        Some(Value::Array(a)) => a.clone(),
+        _ => Vec::new(),
+    };
+
+    let mut clusters = seq(&cfg, "clusters");
+    append_or_set_named(
+        &mut clusters,
+        fqdn,
+        json!({"name": fqdn, "cluster": {"server": format!("{scheme}{fqdn}")}}),
+    );
+    cfg.insert("clusters".to_string(), Value::Array(clusters));
+
+    let mut users = seq(&cfg, "users");
+    append_or_set_named(
+        &mut users,
+        "tailscale-auth",
+        json!({"name": "tailscale-auth", "user": {"token": "unused"}}),
+    );
+    cfg.insert("users".to_string(), Value::Array(users));
+
+    let mut contexts = seq(&cfg, "contexts");
+    append_or_set_named(
+        &mut contexts,
+        fqdn,
+        json!({"name": fqdn, "context": {"cluster": fqdn, "user": "tailscale-auth"}}),
+    );
+    cfg.insert("contexts".to_string(), Value::Array(contexts));
+
+    cfg.insert("current-context".to_string(), json!(fqdn));
+    serde_norway::to_string(&Value::Object(cfg)).context("rendering the merged kubeconfig as YAML")
 }
 
-/// Write the rendered kubeconfig to `path` with mode `0600`.
+/// Go's `appendOrSetNamed`: replace the entry whose `name` key equals `name`, or append if there is
+/// none. Anything in the list that is not a mapping with a matching string `name` is left alone,
+/// exactly as Go's type assertion skips it.
+fn append_or_set_named(dst: &mut Vec<serde_json::Value>, name: &str, val: serde_json::Value) {
+    let want = serde_json::Value::String(name.to_string());
+    match dst.iter().position(|m| m.get("name") == Some(&want)) {
+        Some(i) => dst[i] = val,
+        None => dst.push(val),
+    }
+}
+
+/// The kubeconfig file to merge into, porting Go's `kubeconfigPath()`.
+///
+/// `$KUBECONFIG` wins when set: it is a `:`-separated list, and the target is the first entry that
+/// exists and is not a directory — falling back to the LAST entry when none of them exists, which is
+/// how a first run creates the file the list names. Otherwise it is `$HOME/.kube/config`.
+///
+/// Split out from [`kubeconfig_path`] so the resolution is testable without mutating the process
+/// environment. Go's sandboxed-macOS-GUI arms have no analogue here (this daemon has no sandboxed
+/// GUI build), and its Windows `;` list separator is out of scope — this CLI is unix-only.
+fn kubeconfig_path_from(kubeconfig_env: Option<&str>, home: Option<&str>) -> Result<String> {
+    if let Some(list) = kubeconfig_env.filter(|s| !s.is_empty()) {
+        let mut out = "";
+        for entry in list.split(':') {
+            out = entry;
+            match std::fs::metadata(entry) {
+                // Exists and is a file: this is the one kubectl would read first.
+                Ok(md) if !md.is_dir() => break,
+                Ok(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                // Exists but cannot be stat'd (a permission error on the parent, say). Go's
+                // `!os.IsNotExist(err)` arm takes it too — and then nil-derefs; we just take it and
+                // let the open() below produce the real error.
+                Err(_) => break,
+            }
+        }
+        if out.is_empty() {
+            anyhow::bail!(
+                "configure kubeconfig: $KUBECONFIG names no usable file ({:?}) — set it to a path, \
+                 or unset it to use ~/.kube/config",
+                sanitize_for_terminal(list)
+            );
+        }
+        return Ok(out.to_string());
+    }
+    let home = home.filter(|h| !h.is_empty()).ok_or_else(|| {
+        anyhow!(
+            "configure kubeconfig: $HOME is not set, so ~/.kube/config cannot be located — set \
+             $KUBECONFIG to the kubeconfig to merge into"
+        )
+    })?;
+    Ok(format!("{home}/.kube/config"))
+}
+
+/// [`kubeconfig_path_from`] against the real environment (Go's `os.Getenv("KUBECONFIG")` +
+/// `homedir.HomeDir()`).
+fn kubeconfig_path() -> Result<String> {
+    let kubeconfig = std::env::var("KUBECONFIG").ok();
+    let home = std::env::var("HOME").ok();
+    kubeconfig_path_from(kubeconfig.as_deref(), home.as_deref())
+}
+
+/// Merge the triple into the kubeconfig at `path`, porting Go's `setKubeconfigForPeer`: create the
+/// parent directory if it is missing, read whatever is there (a missing file is an empty document),
+/// merge, and write the result back at mode `0600`.
+///
+/// Symlinks are followed, as Go's `os.ReadFile`/`os.WriteFile` do — a `~/.kube/config` symlinked into
+/// a dotfiles checkout is a normal setup, and refusing it would break the common case this command
+/// exists for. (`--output`, which creates a *new* file, still refuses to follow one; see
+/// [`write_kubeconfig_file`].)
+fn set_kubeconfig_for_peer(scheme: &str, fqdn: &str, path: &str) -> Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+
+    let p = std::path::Path::new(path);
+    // Go: `os.Mkdir(dir, 0755)` — one level, not MkdirAll, so a path several directories deep still
+    // reports the missing parent rather than conjuring the tree.
+    if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty())
+        && !dir.exists()
+    {
+        std::fs::DirBuilder::new()
+            .mode(0o755)
+            .create(dir)
+            .with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let existing = match std::fs::read(p) {
+        Ok(b) => String::from_utf8(b).map_err(|_| {
+            anyhow!(
+                "configure kubeconfig: {path} is not valid UTF-8, so it is not a kubeconfig this \
+                 build can merge into. Refusing to overwrite it."
+            )
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading kubeconfig {path}")),
+    };
+    let merged = update_kubeconfig(&existing, scheme, fqdn)
+        .with_context(|| format!("merging the auth-proxy cluster into {path}"))?;
+    // Go: `os.WriteFile(filePath, b, 0600)`. The mode applies on creation; an existing file keeps
+    // whatever mode it had, so this never loosens a kubeconfig the user tightened.
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(p)
+        .with_context(|| format!("opening kubeconfig {path} for writing"))?;
+    f.write_all(merged.as_bytes())
+        .with_context(|| format!("writing kubeconfig {path}"))?;
+    f.sync_all()
+        .with_context(|| format!("fsync kubeconfig {path}"))?;
+    Ok(())
+}
+
+/// Go's `dnsname.ToFQDN`, returning the `WithTrailingDot()` form — the shape Go compares Service
+/// record names in — or `None` for a name that is not a valid DNS name.
+///
+/// Faithful to Go including its edges: an empty string and `"."` are both the root, a leading dot is
+/// dropped, the length limit is 254 counting the trailing dot, and only labels *before* the last dot
+/// are length-checked (Go's loop fires on `.`, so a trailing label is never measured).
+fn to_fqdn(s: &str) -> Option<String> {
+    if s.is_empty() || s == "." {
+        return Some(".".to_string());
+    }
+    let s = s.strip_prefix('.').unwrap_or(s);
+    let raw = s;
+    let mut total = s.len();
+    let body = match s.strip_suffix('.') {
+        Some(b) => b,
+        None => {
+            total += 1; // account for the missing dot
+            s
+        }
+    };
+    if total > 254 {
+        return None;
+    }
+    let mut st = 0;
+    for (i, c) in body.char_indices() {
+        if c != '.' {
+            continue;
+        }
+        let label = &body[st..i];
+        if label.is_empty() || label.len() > 63 {
+            return None;
+        }
+        st = i + 1;
+    }
+    Some(if raw.ends_with('.') {
+        raw.to_string()
+    } else {
+        format!("{raw}.")
+    })
+}
+
+/// Go's `serviceDNSRecordFromDNSConfig`: find the control-pushed DNS record (a Tailscale Service's
+/// MagicDNS entry) that the argument names.
+///
+/// An argument that parses as an IP matches a record by its *value*; otherwise it matches a record's
+/// leading label or its full name, case-insensitively and with the trailing root dot normalised on
+/// both sides. Returns the `(name, addr)` pair as [`DnsStatusReport::extra_records`] carries it.
+fn service_dns_record_from_dns_config<'a>(
+    dns: &'a tailscaled_rs::localapi::DnsStatusReport,
+    arg: &str,
+) -> Option<&'a (String, String)> {
+    let arg_ip: Option<std::net::IpAddr> = arg.parse().ok();
+    let arg_fqdn = to_fqdn(arg);
+    if arg_ip.is_none() && arg_fqdn.is_none() {
+        return None;
+    }
+    for rec in &dns.extra_records {
+        if let Some(want) = arg_ip {
+            // Compare PARSED addresses, as Go does, so a differently-spelled IPv6 literal still hits.
+            if rec.1.parse::<std::net::IpAddr>().ok() == Some(want) {
+                return Some(rec);
+            }
+            continue;
+        }
+        let Some(argf) = arg_fqdn.as_deref() else {
+            continue;
+        };
+        if arg.eq_ignore_ascii_case(rec.0.split('.').next().unwrap_or("")) {
+            return Some(rec);
+        }
+        let Some(recf) = to_fqdn(&rec.0) else {
+            continue;
+        };
+        if argf.eq_ignore_ascii_case(&recf) {
+            return Some(rec);
+        }
+    }
+    None
+}
+
+/// The Tailscale Service arm of Go's `nodeOrServiceDNSNameFromArg`, reached only when no peer
+/// matched the argument.
+///
+/// A Service is not a peer: it is a MagicDNS record whose address some peer advertises in its
+/// `AllowedIPs`. So finding the record is not enough — Go then requires a peer to actually be
+/// advertising that exact host route, and reports the two failures distinctly: an argument that
+/// names nothing at all is "no peer found", while a name control publishes that no peer currently
+/// carries is "in MagicDNS, but not reachable". Collapsing them would tell an operator to go look at
+/// their spelling when the real answer is that the Service's backend is down.
+fn service_dns_name_from_arg(
+    dns: &tailscaled_rs::localapi::DnsStatusReport,
+    status: &tailscaled_rs::localapi::StatusReport,
+    arg: &str,
+) -> Result<String> {
+    let rec = service_dns_record_from_dns_config(dns, arg).ok_or_else(|| {
+        anyhow!(
+            "configure kubeconfig: no peer found for {:?} (run `tnet status` to list peers, or \
+             `tnet dns status` to list the tailnet's Tailscale Service records)",
+            sanitize_for_terminal(arg)
+        )
+    })?;
+    let ip: std::net::IpAddr = rec.1.parse().map_err(|e| {
+        anyhow!(
+            "configure kubeconfig: error parsing ExtraRecord IP address {:?}: {e}",
+            sanitize_for_terminal(&rec.1)
+        )
+    })?;
+    // Go builds `netip.PrefixFrom(ip, ip.BitLen())` and looks for that exact prefix in some peer's
+    // AllowedIPs: a Service's address is advertised as a single-host route, so a covering subnet
+    // route does NOT count as reachability.
+    for peer in &status.peers {
+        for route in &peer.allowed_routes {
+            if let Ok(net) = route.parse::<ipnet::IpNet>()
+                && net.addr() == ip
+                && net.prefix_len() == net.max_prefix_len()
+            {
+                return Ok(rec.0.clone());
+            }
+        }
+    }
+    Err(anyhow!(
+        "configure kubeconfig: {:?} is in MagicDNS, but is not currently reachable on any known \
+         peer (no peer advertises {})",
+        sanitize_for_terminal(arg),
+        sanitize_for_terminal(&rec.1)
+    ))
+}
+
+/// Write a standalone kubeconfig to `--output PATH` with mode `0600`.
 ///
 /// Without `--force` the file is created `O_EXCL` (`create_new`), so an existing kubeconfig is never
-/// touched: this build cannot merge, and overwriting `~/.kube/config` would silently delete every
-/// other cluster in it. `O_NOFOLLOW` on the final component keeps a pre-planted symlink from
-/// redirecting the write (the same residual as elsewhere in this CLI: an attacker-controlled
-/// *parent* directory is still traversed).
+/// touched: `--output` renders a fresh document rather than merging, and overwriting a kubeconfig
+/// with it would silently delete every other cluster in that file. (Merging is what the default,
+/// `--output`-less path does — see [`set_kubeconfig_for_peer`].) `O_NOFOLLOW` on the final component
+/// keeps a pre-planted symlink from redirecting the write (the same residual as elsewhere in this
+/// CLI: an attacker-controlled *parent* directory is still traversed).
 fn write_kubeconfig_file(path: &str, kubeconfig: &str, force: bool) -> Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -10036,10 +10380,9 @@ fn write_kubeconfig_file(path: &str, kubeconfig: &str, force: bool) -> Result<()
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             anyhow::bail!(
-                "configure kubeconfig: {path} already exists and this build cannot merge into an \
-                 existing kubeconfig. Write it elsewhere and stack it \
-                 (`KUBECONFIG=~/.kube/config:<path>`), or pass --force to REPLACE {path} (losing \
-                 every other cluster it holds)."
+                "configure kubeconfig: {path} already exists and --output writes a standalone \
+                 kubeconfig, never a merge. Drop --output to MERGE into your kubeconfig, write it \
+                 elsewhere, or pass --force to REPLACE {path} (losing every other cluster it holds)."
             );
         }
         Err(e) => return Err(e).with_context(|| format!("creating kubeconfig file {path}")),
@@ -15336,6 +15679,143 @@ mod tests {
         assert_eq!(peer_dns_name_from_arg(&st, "100.64.0.99"), None);
     }
 
+    /// A tailnet whose MagicDNS carries one Tailscale Service record, advertised by a peer that is
+    /// NOT the one the record is named after — which is the point: a Service is a DNS record plus a
+    /// host route in some peer's AllowedIPs, not a peer of its own.
+    fn kube_dns() -> tailscaled_rs::localapi::DnsStatusReport {
+        tailscaled_rs::localapi::DnsStatusReport {
+            magic_dns: true,
+            extra_records: vec![
+                (
+                    "k8s-svc.tail0123.ts.net".to_string(),
+                    "100.80.0.5".to_string(),
+                ),
+                (
+                    "offline-svc.tail0123.ts.net".to_string(),
+                    "100.80.0.6".to_string(),
+                ),
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// `kube_status()` plus the AllowedIPs that make the first Service reachable.
+    fn kube_status_with_service_route() -> StatusReport {
+        let mut st = kube_status();
+        st.peers[0].allowed_routes = vec![
+            "100.64.0.7/32".to_string(),
+            "100.80.0.5/32".to_string(),
+            // A covering subnet route must NOT count as reachability for the second Service: Go
+            // looks for the single-host prefix and nothing else.
+            "100.80.0.0/24".to_string(),
+        ];
+        st
+    }
+
+    #[test]
+    fn kubeconfig_falls_back_to_a_tailscale_service() {
+        // Go's `nodeOrServiceDNSNameFromArg` second arm: an argument matching no peer is looked up
+        // as a Tailscale Service DNS record, and resolves to the record's name once a peer is seen
+        // advertising the record's address as a host route.
+        let st = kube_status_with_service_route();
+        let dns = kube_dns();
+        let want = "k8s-svc.tail0123.ts.net".to_string();
+        assert_eq!(peer_dns_name_from_arg(&st, "k8s-svc"), None, "not a peer");
+        assert_eq!(
+            service_dns_name_from_arg(&dns, &st, "k8s-svc").unwrap(),
+            want,
+            "the record's leading label"
+        );
+        assert_eq!(
+            service_dns_name_from_arg(&dns, &st, "K8S-SVC.tail0123.ts.net.").unwrap(),
+            want,
+            "the full name, case-folded, trailing root dot ignored"
+        );
+        assert_eq!(
+            service_dns_name_from_arg(&dns, &st, "100.80.0.5").unwrap(),
+            want,
+            "an argument that is the record's address"
+        );
+    }
+
+    #[test]
+    fn kubeconfig_service_misses_keep_gos_two_distinct_errors() {
+        // Go reports these differently on purpose, and the distinction is the whole diagnostic: a
+        // name nothing publishes is the operator's spelling, while a published name no peer carries
+        // is the Service's backend being down.
+        let st = kube_status_with_service_route();
+        let dns = kube_dns();
+
+        let err = service_dns_name_from_arg(&dns, &st, "nope").expect_err("names nothing");
+        assert!(
+            err.to_string().contains("no peer found for"),
+            "an unknown name is Go's `no peer found for %q`: {err}"
+        );
+
+        let err = service_dns_name_from_arg(&dns, &st, "offline-svc")
+            .expect_err("published, but no peer advertises its /32");
+        assert!(
+            err.to_string()
+                .contains("is in MagicDNS, but is not currently reachable"),
+            "a MagicDNS-known but unreachable Service has its own error: {err}"
+        );
+        assert!(
+            !err.to_string().contains("no peer found for"),
+            "the two failures must not collapse into one message: {err}"
+        );
+
+        // A record whose value control did not spell as an IP is its own failure, not a silent miss.
+        let broken = tailscaled_rs::localapi::DnsStatusReport {
+            extra_records: vec![("weird.tail0123.ts.net".to_string(), "not-an-ip".to_string())],
+            ..Default::default()
+        };
+        let err = service_dns_name_from_arg(&broken, &st, "weird").expect_err("unparseable value");
+        assert!(
+            err.to_string()
+                .contains("error parsing ExtraRecord IP address"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn kubeconfig_service_record_lookup_ports_go() {
+        // `serviceDNSRecordFromDNSConfig` in isolation: what matches a record and what does not.
+        let dns = kube_dns();
+        assert_eq!(
+            service_dns_record_from_dns_config(&dns, "k8s-svc").map(|r| r.0.as_str()),
+            Some("k8s-svc.tail0123.ts.net")
+        );
+        // An IP argument matches by VALUE only — never by name, and never a different record.
+        assert_eq!(
+            service_dns_record_from_dns_config(&dns, "100.80.0.6").map(|r| r.0.as_str()),
+            Some("offline-svc.tail0123.ts.net")
+        );
+        assert!(service_dns_record_from_dns_config(&dns, "100.80.0.9").is_none());
+        // A non-leading label must not match; Go cuts at the first dot.
+        assert!(service_dns_record_from_dns_config(&dns, "tail0123").is_none());
+        assert!(service_dns_record_from_dns_config(&dns, "").is_none());
+
+        // Go's `dnsname.ToFQDN` gate: a name with an over-long or empty label is not a DNS name, so
+        // it can never name a Service.
+        assert_eq!(
+            to_fqdn("foo.example.com"),
+            Some("foo.example.com.".to_string())
+        );
+        assert_eq!(
+            to_fqdn("foo.example.com."),
+            Some("foo.example.com.".to_string())
+        );
+        assert_eq!(
+            to_fqdn(".foo.example.com"),
+            Some("foo.example.com.".to_string())
+        );
+        assert_eq!(to_fqdn(""), Some(".".to_string()));
+        assert_eq!(to_fqdn("."), Some(".".to_string()));
+        assert_eq!(to_fqdn("a..b.example.com"), None, "empty label");
+        assert_eq!(to_fqdn(&format!("{}.example.com", "a".repeat(64))), None);
+        assert_eq!(to_fqdn(&"a.".repeat(200)), None, "longer than 254");
+    }
+
     #[test]
     fn kubeconfig_peer_ip_match_is_by_address_not_by_spelling() {
         // Go compares parsed `netip.Addr`s, so an argument that spells the same IPv6 address
@@ -15354,14 +15834,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn kubeconfig_render_matches_the_go_golden() {
-        // Byte-for-byte the `empty` case of Go's own `TestKubeconfig`
-        // (cmd/tailscale/cli/configure-kube_test.go, v1.100.0), same peer FQDN: alphabetical
-        // top-level keys and NO `preferences` key, the cluster and context named after the peer, and
-        // the user a single shared `tailscale-auth` entry holding Go's placeholder token — the proxy
-        // ignores the token, but without one kubectl prompts for a username and password.
-        let want = "apiVersion: v1
+    /// Go's `TestKubeconfig` table (cmd/tailscale/cli/configure-kube_test.go, v1.100.0), verbatim:
+    /// input document, scheme, and expected output, for the same `foo.tail-scale.ts.net` peer.
+    ///
+    /// Go trims surrounding whitespace before comparing, so the goldens carry no trailing newline;
+    /// the comparison below trims the same way and nothing else, so the bytes in between are Go's.
+    const GO_KUBECONFIG_CASES: &[(&str, bool, &str)] = &[
+        (
+            "empty",
+            false,
+            "apiVersion: v1
 clusters:
 - cluster:
     server: https://foo.tail-scale.ts.net
@@ -15376,21 +15858,325 @@ kind: Config
 users:
 - name: tailscale-auth
   user:
-    token: unused
-";
-        let got = render_kubeconfig("https://", "foo.tail-scale.ts.net");
-        assert_eq!(got, want, "rendered kubeconfig drifted from the Go golden");
+    token: unused",
+        ),
+        (
+            "empty_http",
+            true,
+            "apiVersion: v1
+clusters:
+- cluster:
+    server: http://foo.tail-scale.ts.net
+  name: foo.tail-scale.ts.net
+contexts:
+- context:
+    cluster: foo.tail-scale.ts.net
+    user: tailscale-auth
+  name: foo.tail-scale.ts.net
+current-context: foo.tail-scale.ts.net
+kind: Config
+users:
+- name: tailscale-auth
+  user:
+    token: unused",
+        ),
+    ];
 
-        // Go's `empty_http` case: only the cluster `server` scheme changes.
-        let got_http = render_kubeconfig("http://", "foo.tail-scale.ts.net");
+    #[test]
+    fn kubeconfig_merge_matches_the_go_goldens() {
+        // The whole of Go's `TestKubeconfig`: a fresh document, `--http`, a config whose lists were
+        // emptied to `null`, an already-configured one (must not duplicate), an unrelated cluster
+        // (must survive), and a second Tailscale cluster (shares the `tailscale-auth` user).
+        const FQDN: &str = "foo.tail-scale.ts.net";
+        for (name, http, want) in GO_KUBECONFIG_CASES {
+            let scheme = kube_scheme(*http);
+            let got = update_kubeconfig("", scheme, FQDN)
+                .unwrap_or_else(|e| panic!("{name}: update_kubeconfig failed: {e}"));
+            assert_eq!(got.trim_end(), *want, "{name}: drifted from the Go golden");
+        }
+
+        // "all-configs-clusters-users-deleted": explicit `null` lists rebuild cleanly, and the stale
+        // `current-context` is replaced.
+        let got = update_kubeconfig(
+            "apiVersion: v1
+clusters: null
+contexts: null
+kind: Config
+current-context: some-non-existent-cluster
+users: null
+",
+            "https://",
+            FQDN,
+        )
+        .expect("null lists are a valid kubeconfig");
         assert_eq!(
-            got_http,
-            want.replace(
-                "server: https://foo.tail-scale.ts.net",
-                "server: http://foo.tail-scale.ts.net"
-            ),
-            "--http must change the server URL scheme and nothing else"
+            got.trim_end(),
+            GO_KUBECONFIG_CASES[0].2,
+            "all-configs-clusters-users-deleted"
         );
+
+        // "already-configured": re-running must REPLACE the existing triple, not append a second one.
+        let already = format!("{}\n", GO_KUBECONFIG_CASES[0].2);
+        let got = update_kubeconfig(&already, "https://", FQDN).expect("re-running is idempotent");
+        assert_eq!(
+            got.trim_end(),
+            GO_KUBECONFIG_CASES[0].2,
+            "already-configured must be idempotent, not duplicated"
+        );
+
+        // "other-cluster": an unrelated cluster/context/user must all survive, in place, with the
+        // Tailscale triple appended after them and the context switched.
+        let got = update_kubeconfig(
+            "apiVersion: v1
+clusters:
+- cluster:
+    server: https://192.168.1.1:8443
+  name: some-cluster
+contexts:
+- context:
+    cluster: some-cluster
+    user: some-auth
+  name: some-cluster
+kind: Config
+current-context: some-cluster
+users:
+- name: some-auth
+  user:
+    token: asdfasdf
+",
+            "https://",
+            FQDN,
+        )
+        .expect("an unrelated cluster is a valid kubeconfig");
+        assert_eq!(
+            got.trim_end(),
+            "apiVersion: v1
+clusters:
+- cluster:
+    server: https://192.168.1.1:8443
+  name: some-cluster
+- cluster:
+    server: https://foo.tail-scale.ts.net
+  name: foo.tail-scale.ts.net
+contexts:
+- context:
+    cluster: some-cluster
+    user: some-auth
+  name: some-cluster
+- context:
+    cluster: foo.tail-scale.ts.net
+    user: tailscale-auth
+  name: foo.tail-scale.ts.net
+current-context: foo.tail-scale.ts.net
+kind: Config
+users:
+- name: some-auth
+  user:
+    token: asdfasdf
+- name: tailscale-auth
+  user:
+    token: unused",
+            "other-cluster: the pre-existing cluster/context/user must survive untouched"
+        );
+
+        // "already-using-tailscale": a second Tailscale cluster is appended and reuses the single
+        // shared `tailscale-auth` user rather than adding a second copy of it.
+        let got = update_kubeconfig(
+            "apiVersion: v1
+clusters:
+- cluster:
+    server: https://bar.tail-scale.ts.net
+  name: bar.tail-scale.ts.net
+contexts:
+- context:
+    cluster: bar.tail-scale.ts.net
+    user: tailscale-auth
+  name: bar.tail-scale.ts.net
+kind: Config
+current-context: bar.tail-scale.ts.net
+users:
+- name: tailscale-auth
+  user:
+    token: unused
+",
+            "https://",
+            FQDN,
+        )
+        .expect("a config that already uses tailscale is valid");
+        assert_eq!(
+            got.trim_end(),
+            "apiVersion: v1
+clusters:
+- cluster:
+    server: https://bar.tail-scale.ts.net
+  name: bar.tail-scale.ts.net
+- cluster:
+    server: https://foo.tail-scale.ts.net
+  name: foo.tail-scale.ts.net
+contexts:
+- context:
+    cluster: bar.tail-scale.ts.net
+    user: tailscale-auth
+  name: bar.tail-scale.ts.net
+- context:
+    cluster: foo.tail-scale.ts.net
+    user: tailscale-auth
+  name: foo.tail-scale.ts.net
+current-context: foo.tail-scale.ts.net
+kind: Config
+users:
+- name: tailscale-auth
+  user:
+    token: unused",
+            "already-using-tailscale: one shared tailscale-auth user, both clusters"
+        );
+    }
+
+    #[test]
+    fn kubeconfig_merge_refuses_a_document_it_cannot_read() {
+        // Go's `errInvalidKubeconfig` cases. Both matter because the alternative to refusing is
+        // overwriting: a merge that cannot read the file would replace it and lose every cluster.
+        let err = update_kubeconfig("apiVersion: v1\nkind: ,asdf", "https://", "foo.example.com")
+            .expect_err("invalid YAML must not be merged into");
+        assert!(
+            err.to_string().contains("invalid kubeconfig"),
+            "unhelpful refusal: {err}"
+        );
+        let err = update_kubeconfig("apiVersion: v1\nkind: Pod", "https://", "foo.example.com")
+            .expect_err("a non-kubeconfig document must not be merged into");
+        assert!(
+            err.to_string().contains("invalid kubeconfig"),
+            "unhelpful refusal: {err}"
+        );
+        // A YAML mapping that is not a kubeconfig at all (no apiVersion/kind) is refused too — Go
+        // compares the missing keys against "v1"/"Config" and they are unequal.
+        assert!(
+            update_kubeconfig("{}", "https://", "foo.example.com").is_err(),
+            "an empty mapping is a document we did not write; refuse it"
+        );
+        // …but a file holding nothing (or only comments) IS the "no kubeconfig yet" case.
+        assert!(update_kubeconfig("# nothing here\n", "https://", "foo.example.com").is_ok());
+    }
+
+    #[test]
+    fn kubeconfig_merge_writes_the_file_preserving_other_clusters() {
+        // The end-to-end of the default path: `set_kubeconfig_for_peer` creates the ~/.kube dir,
+        // merges into whatever is there, and writes 0600 — the state Go leaves the machine in.
+        let dir = std::env::temp_dir().join(format!("tnet-kubemerge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let kube = dir.join(".kube");
+        let path = kube.join("config");
+        let path_str = path.to_str().unwrap().to_string();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // No ~/.kube yet: Go creates it, so a first run on a fresh machine works.
+        set_kubeconfig_for_peer("https://", "foo.tail-scale.ts.net", &path_str)
+            .expect("a missing parent directory is created");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim_end(),
+            GO_KUBECONFIG_CASES[0].2
+        );
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "kubeconfig must be written 0600, got {mode:o}");
+        }
+
+        // Now the case the whole finding is about: a second peer must not erase the first.
+        set_kubeconfig_for_peer("http://", "bar.tail-scale.ts.net", &path_str)
+            .expect("merging a second cluster");
+        let merged = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            merged.contains("server: https://foo.tail-scale.ts.net"),
+            "the first cluster was dropped by the second run:\n{merged}"
+        );
+        assert!(
+            merged.contains("server: http://bar.tail-scale.ts.net"),
+            "the second cluster was not added:\n{merged}"
+        );
+        assert_eq!(
+            merged.matches("- name: tailscale-auth").count(),
+            1,
+            "the tailscale-auth user is ONE shared entry, not one per cluster:\n{merged}"
+        );
+        assert_eq!(
+            merged.matches("user: tailscale-auth").count(),
+            2,
+            "both contexts must point at that one shared user:\n{merged}"
+        );
+        assert!(
+            merged.contains("current-context: bar.tail-scale.ts.net"),
+            "the newest cluster must become current:\n{merged}"
+        );
+
+        // A file that is not a kubeconfig is refused, and left byte-identical.
+        std::fs::write(&path, "not: a kubeconfig\n").unwrap();
+        let err = set_kubeconfig_for_peer("https://", "foo.tail-scale.ts.net", &path_str)
+            .expect_err("an unreadable kubeconfig must not be overwritten");
+        assert!(
+            format!("{err:#}").contains("invalid kubeconfig"),
+            "unhelpful refusal: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "not: a kubeconfig\n",
+            "a refused merge must not have touched the file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kubeconfig_path_ports_go_kubeconfigpath() {
+        // Go's `kubeconfigPath()`: $KUBECONFIG is a `:`-separated list and the target is the first
+        // entry that exists and is not a directory; with no $KUBECONFIG it is $HOME/.kube/config.
+        let dir = std::env::temp_dir().join(format!("tnet-kubepath-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real");
+        std::fs::write(&real, "apiVersion: v1\nkind: Config\n").unwrap();
+        let real = real.to_str().unwrap();
+        let subdir = dir.join("subdir");
+        std::fs::create_dir(&subdir).unwrap();
+        let subdir = subdir.to_str().unwrap();
+        let missing = dir.join("missing").to_str().unwrap().to_string();
+
+        assert_eq!(
+            kubeconfig_path_from(None, Some("/home/someone")).unwrap(),
+            "/home/someone/.kube/config",
+            "no $KUBECONFIG => ~/.kube/config"
+        );
+        assert_eq!(
+            kubeconfig_path_from(Some(""), Some("/home/someone")).unwrap(),
+            "/home/someone/.kube/config",
+            "an empty $KUBECONFIG is unset"
+        );
+        assert_eq!(
+            kubeconfig_path_from(Some(real), None).unwrap(),
+            real,
+            "$KUBECONFIG wins over ~/.kube/config, and $HOME is not needed"
+        );
+        assert_eq!(
+            kubeconfig_path_from(Some(&format!("{missing}:{real}")), None).unwrap(),
+            real,
+            "the first entry that exists is the one kubectl reads"
+        );
+        assert_eq!(
+            kubeconfig_path_from(Some(&format!("{subdir}:{real}")), None).unwrap(),
+            real,
+            "a directory is never the kubeconfig"
+        );
+        assert_eq!(
+            kubeconfig_path_from(Some(&format!("{missing}:{missing}2")), None).unwrap(),
+            format!("{missing}2"),
+            "when nothing exists yet, the LAST entry is what gets created"
+        );
+        assert!(
+            kubeconfig_path_from(None, None).is_err(),
+            "no $KUBECONFIG and no $HOME has no answer; say so instead of writing to /.kube/config"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -15478,14 +16264,16 @@ users:
 
     #[test]
     fn kubeconfig_file_write_refuses_to_clobber_without_force() {
-        // This build cannot merge, so writing over an existing kubeconfig would silently drop every
-        // other cluster in it. Default: refuse (and leave the file byte-identical). `--force`: replace.
+        // `--output` writes a standalone document, so writing over an existing kubeconfig would
+        // silently drop every other cluster in it. Default: refuse (and leave the file
+        // byte-identical). `--force`: replace. (Merging is the `--output`-less path.)
         let dir = std::env::temp_dir().join(format!("tnet-kubeconfig-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config");
         let path_str = path.to_str().unwrap();
 
-        let rendered = render_kubeconfig("https://", "k8s-proxy.tail0123.ts.net");
+        let rendered = update_kubeconfig("", "https://", "k8s-proxy.tail0123.ts.net")
+            .expect("rendering a standalone kubeconfig");
         write_kubeconfig_file(path_str, &rendered, false).expect("first write creates the file");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), rendered);
         // Mode 0600: a kubeconfig names the clusters you can reach; don't publish that.
