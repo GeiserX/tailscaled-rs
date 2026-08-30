@@ -261,6 +261,33 @@ text from corrupting the operator's terminal or spoofing a structured listing. N
 where the fork is **deliberately stricter than Go**: upstream `tailscale` prints `ComputedName` and
 the DNS fields raw and *is* susceptible to escape/column injection in these listings.
 
+### 4.9 Daemon-written paths are resolved and refuse a non-regular target — adversary (a)
+
+Three LocalAPI verbs make the daemon — often root — **create or overwrite a file at a path the
+caller names**: `file get <name> <dest>` (Taildrop fetch), `file get <dir>` (inbox drain) and
+`debug capture <path>` (pcap). All three are write-gated by §4.1, so the caller is already root or
+the daemon's own UID; the hardening below is defense-in-depth on top of that, aimed at the case where
+something *else* on the host has planted a link or a special file in the way.
+
+- **The directory is resolved before anything is opened.** `file get`'s `dest` is split into
+  `<parent>/<name>` and the parent is `canonicalize`d; the drain's `<dir>` is `canonicalize`d whole
+  (`taildrop_dest_resolved` / `taildrop_dir_resolved`, `src/ipn/diag.rs`). A parent that is missing
+  or is not a directory is refused **there**, naming it, rather than surfacing as a bare `ENOENT` /
+  `ENOTDIR` out of the create. The resolved path is what the open then uses, so the stat and the
+  create are provably talking about the same file and every component *above* the leaf is already
+  symlink-free at open time.
+- **An existing non-regular target is refused, never followed.** The final component is
+  `symlink_metadata`'d — which does not traverse it — and anything that exists but is not a regular
+  file (a symlink, device, FIFO, socket, or directory) fails the call. Absent is the normal case and
+  is allowed; an existing regular file is overwritten.
+- **The open itself is `O_NOFOLLOW`.** That closes the stat→create TOCTOU window on the leaf: a
+  symlink swapped in after the check fails the open with `ELOOP` instead of being followed. The
+  drain additionally creates `O_EXCL` (and, under `overwrite`, unlinks first rather than
+  open-truncating), so it never writes *through* a name it did not create.
+
+What this does **not** claim: it is not a sandbox, and it does not restrict *which* directory a
+write-authed caller may target. See §5.7.
+
 ---
 
 ## 5. What is NOT mitigated (blunt)
@@ -357,6 +384,36 @@ already-running node additionally requires `--force-reauth` (`change_blocked`,
 validation is that the scheme is `http`/`https`; a malformed URL fails loudly rather than silently
 falling back (`src/ipn/config.rs:110-117`).
 
+### 5.7 A write-authed caller chooses where the daemon writes — same-UID-trusted, authz-gated
+
+`file get` writes to a path the **caller** supplies, and the daemon (commonly root) performs that
+write. §4.9 hardens *how* the write happens; it deliberately does not constrain *where*. Two residual
+consequences, both bounded by the §4.1 peer-credential gate:
+
+- **A symlinked ancestor is followed, not refused.** `~/dl/out.bin` where `dl` is a symlink resolves
+  through the link and the file lands at its real target. This is a deliberate choice, not an
+  oversight: the caller is root or the daemon's own UID, so the link it is traversing is one it could
+  have written through anyway, and refusing would break the ordinary case — a home directory or a
+  download folder reached through a symlinked mount point. Only the *leaf* is refused-if-symlinked
+  (§4.9), because that is the component an inbound file name could collide with.
+- **The target directory is otherwise unrestricted.** A write-authed caller can drop a received file
+  anywhere the daemon's UID can write. That is the same authority §5.6 describes for `--control-url`:
+  granting LocalAPI write is granting the daemon's file-writing authority, and the boundary that
+  holds is the UID gate, not a path allowlist.
+
+**This is Go's position too, not a fork weakness.** Upstream `tailscale file get` validates its
+target with `os.Stat(dir)` + `IsDir()` (`cmd/tailscale/cli/file.go`, v1.100.0) — `os.Stat` *follows*
+symlinks, and there is no `filepath.EvalSymlinks` and no ancestor check anywhere in that path. The
+fork is in fact stricter: upstream does this validation **client-side, as the invoking user**, while
+this fork does the write in the daemon and therefore adds the leaf `symlink_metadata` refusal,
+`O_NOFOLLOW`/`O_EXCL` and the parent resolution that upstream has no need for.
+
+The practical guidance is the same as for §5.6: **grant LocalAPI write only to principals you would
+grant the daemon's own file-writing authority.** If that is ever too broad, the fix is a path policy
+on the daemon side (an allowlist rooted at the configured Taildrop directory), not a symlink
+refusal — a symlink refusal would cost the ordinary case and buy nothing the UID gate does not
+already hold.
+
 ---
 
 ## 6. The Rust memory-safety thesis — honest version
@@ -408,6 +465,7 @@ the language; and the privileged-attacker and cold-boot leaks remain unaddressed
 | Broken handshake / traffic disclosure | (c) | **No** — engine is unaudited | Confidentiality unproven until audited | Engine; `SECURITY.md` |
 | Rogue peer-key injection | (d) | **No** — Tailnet Lock inert | Compromised control plane can add trusted peers | Engine; §5.4, `SECURITY.md` |
 | Operator repoints control plane | (b)/operator | **N/A** — by design | A write-authed caller can move the root of trust (authz-gated) | §5.6; `src/ipn/config.rs:118` |
+| Root daemon writes to a caller-named path (`file get`, `debug capture`) | (a)/operator | **Partial** — parent directory resolved + validated, leaf must be absent-or-regular, `O_NOFOLLOW`/`O_EXCL` opens | A write-authed caller still picks the directory, and a symlinked ancestor is followed (its own namespace) — Go's residual too; bounded by the peercred write gate | §4.9, §5.7; `src/ipn/diag.rs` `taildrop_dest_resolved`/`taildrop_dir_resolved` |
 | Auth-key in argv / shell history | (a)/(b) | **Partial** — `--authkey-file` / `$TS_AUTH_KEY` offered | `--authkey` flag still exposes the key in argv if used | `src/bin/tnet.rs:37-42` |
 | Terminal escape / column-row injection via off-box text | (d)/peer | **Yes** — all control/peer-supplied text sanitized at every print site (columnar cells strip `\t`/`\n`/`\r` too) | Display hardening only; the underlying control-plane trust gap is unchanged (§5.4); does not cover output piped through a *different* tool that re-interprets `U+FFFD` | §4.8; `src/bin/tnet.rs` `sanitize_for_terminal`/`sanitize_multiline` |
 
