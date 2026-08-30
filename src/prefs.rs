@@ -133,10 +133,12 @@ pub struct Prefs {
     /// `ipn.Prefs.ProfileName`). `None` (the default) = no nickname. Maps to the engine
     /// `Config.node_nickname`.
     ///
-    /// **Carried pref.** Client-local and cosmetic: Go never advertises it in `Hostinfo` (it is
-    /// distinct from the [`hostname`](Prefs::hostname) the node *requests*), and the engine never
-    /// acts on it. Note this daemon also keeps a per-profile display name in `profiles.json`
-    /// (`tnet switch --list`); the two are not yet unified.
+    /// **Carried by the engine, but not inert.** Client-local: Go never advertises it in `Hostinfo`
+    /// (it is distinct from the [`hostname`](Prefs::hostname) the node *requests*), and the engine
+    /// never acts on it. It nonetheless has a local, immediately visible effect, exactly as in Go's
+    /// `ipn/ipnlocal/profiles.go`: setting it also renames the current profile in `profiles.json`,
+    /// the display name `tnet switch --list` prints and a `tnet switch <name>` target resolves
+    /// against (`Backend::rename_current_profile`).
     pub node_nickname: Option<String>,
     /// Allow the management plane to gather device-posture information (Go `tailscale up/set
     /// --report-posture` / `ipn.Prefs.PostureChecking`). Default `false`. Maps to the engine
