@@ -334,10 +334,13 @@ the `git` specification will be removed from the dependency declaration.
 That unblocks `cargo publish` without changing what this repo builds, because the `git` source
 still wins locally and in CI. It is a real option, but it is not free: everyone who consumes the
 *published* daemon then builds against the crates.io release while our own gate ran against the
-pinned commit. Only take it with a release whose `.cargo_vcs_info.json` sha1 matches the pin — that
-is precisely the `MATCH` verdict from `scripts/check-engine-rev-released.sh` — and keep the two in
-lockstep from then on. While that check reports `MISMATCH`, the shortcut is not available and the
-pin is what blocks publishing the daemon.
+pinned commit. Only take it when `scripts/check-engine-rev-released.sh` reports `MATCH`, which
+means both halves of that release's `.cargo_vcs_info.json`: the sha1 equals the pin *and* `dirty`
+is false. A matching sha1 on its own is not enough — a release packaged from a modified working
+tree records the pinned commit without carrying the pinned contents, and the script calls that
+`INCONCLUSIVE`, not `MATCH`. Every other outcome — `MISMATCH`, `INCONCLUSIVE`, or a version that
+was never published at all — leaves the shortcut unavailable and the pin is what blocks publishing
+the daemon. On `MATCH`, take it and keep the pin and the version in lockstep from then on.
 
 ### Everything else about publishing is ready
 
