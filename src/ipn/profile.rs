@@ -57,14 +57,25 @@ pub(super) fn is_valid_profile_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-/// Resolve a user-supplied `tnet switch <target>` to a canonical profile **id**, matching by id OR by
-/// display name (Go's `tailscale switch` accepts either). Precedence, mirroring Go (id wins over name
-/// so an exact-id target is never shadowed by a coincidental name):
-/// 1. `target` is a valid id that names a known profile (the reserved [`DEFAULT_PROFILE_ID`], or a key
-///    present in `profiles.json`) → that id.
-/// 2. exactly ONE profile's [`ProfileMeta::name`] equals `target` → that profile's id.
-/// 3. otherwise `None` — the caller reports an error. A name matching MULTIPLE ids is ambiguous and
-///    also yields `None` (the caller must be told to use the id), never an arbitrary pick.
+/// Resolve a user-supplied `tnet switch <target>` / `tnet switch remove <target>` to a canonical
+/// profile **id** — the analogue of Go's `matchProfile` (`cmd/tailscale/cli/switch.go`), which
+/// `switch` and `switch remove` share there exactly as `switch_profile`/`delete_profile` share this.
+///
+/// Go runs FOUR ordered passes over every profile — `ID`, `NetworkProfile.DomainName` (the tailnet),
+/// `Name` (the nickname, printed in `--list`'s Account column), then `NetworkProfile.DisplayName` —
+/// and each pass returns its FIRST hit, so a value two profiles happen to share resolves rather than
+/// erroring. Two of the four are portable here; the two `NetworkProfile` passes are not, because the
+/// engine surfaces no per-profile tailnet — it carries no netmap `Domain` at all — which is the same
+/// gap that leaves Go's `Tailnet`/`Account` `--list` columns with nothing to print
+/// (`docs/PARITY_GAP_ANALYSIS.md` §4.5). So the passes here are Go's first and third:
+/// 1. `target` is a valid id that names a known profile (the reserved [`DEFAULT_PROFILE_ID`], or a
+///    key present in `profiles.json`) → that id. First, so an exact-id target is never shadowed by a
+///    coincidental name — Go's ordering.
+/// 2. `target` equals some profile's [`ProfileMeta::name`] → that profile's id. That name is Go's
+///    `LoginProfile.Name`, what `tnet set --nickname` writes. Like Go's pass this takes the FIRST
+///    match rather than refusing a name two profiles share: `profiles.json` is a sorted map, so
+///    "first" is the lowest id — deterministic, where Go's is its profile-list order.
+/// 3. otherwise `None`.
 ///
 /// Every id this returns is guaranteed to satisfy [`is_valid_profile_id`] — including the ones read
 /// out of `profiles.json` by the name arm — so a caller may join it as a single path component.
@@ -80,8 +91,8 @@ pub(super) fn resolve_target_to_id(target: &str, meta: &ProfilesFile) -> Option<
     {
         return Some(target.to_string());
     }
-    // 2. Unique display-name match. Collect all ids whose name equals `target`; resolve only if
-    //    exactly one (an ambiguous name must not silently pick one).
+    // 2. Display-name match, first hit wins (Go's pass returns `p.ID` on the first `p.Name == arg`
+    //    and has no ambiguity case).
     //
     //    The `is_valid_profile_id` filter on the *key* is load-bearing, not decoration: unlike the
     //    id arm above (which validates `target` itself), this arm returns an id read straight out of
@@ -89,16 +100,10 @@ pub(super) fn resolve_target_to_id(target: &str, meta: &ProfilesFile) -> Option<
     //    ([`profile_paths`]). A hand-edited or corrupted map with a key like `"../../etc"` would
     //    otherwise let a name lookup escape the state dir. Ids the daemon writes always pass, so
     //    this only ever rejects a map this daemon did not produce.
-    let mut by_name = meta
-        .profiles
+    meta.profiles
         .iter()
-        .filter(|(id, m)| m.name == target && is_valid_profile_id(id))
-        .map(|(id, _)| id.clone());
-    let first = by_name.next()?;
-    if by_name.next().is_some() {
-        return None; // ambiguous: >1 profile shares this name → caller errors, user must use the id.
-    }
-    Some(first)
+        .find(|(id, m)| m.name == target && is_valid_profile_id(id))
+        .map(|(id, _)| id.clone())
 }
 
 /// The `(prefs.json, node.key.json)` paths for profile `id` under `state_dir`. The default profile
@@ -281,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_target_matches_id_name_and_handles_ambiguity() {
+    fn resolve_target_matches_id_then_name_and_takes_the_first_hit_like_go() {
         let mut meta = ProfilesFile::default();
         meta.profiles.insert(
             "work".into(),
@@ -313,13 +318,20 @@ mod tests {
         // Neither a known id/name nor (here) relevant → None.
         assert_eq!(resolve_target_to_id("nope", &meta), None);
 
-        // Ambiguous name (two ids share it) → None: never silently pick one.
+        // A name two profiles SHARE resolves to the first match rather than being refused: Go's
+        // `matchProfile` pass is `for _, p := range all { if p.Name == arg { return p.ID, true } }`,
+        // which returns the first hit and has no ambiguity case at all. "First" here is the lowest
+        // id, because `profiles.json` is a sorted map — deterministic, where Go's is list order.
         let mut amb = ProfilesFile::default();
         amb.profiles
-            .insert("a".into(), ProfileMeta { name: "dup".into() });
-        amb.profiles
             .insert("b".into(), ProfileMeta { name: "dup".into() });
-        assert_eq!(resolve_target_to_id("dup", &amb), None);
+        amb.profiles
+            .insert("a".into(), ProfileMeta { name: "dup".into() });
+        assert_eq!(
+            resolve_target_to_id("dup", &amb).as_deref(),
+            Some("a"),
+            "a shared display name must resolve (Go takes the first hit), not be refused"
+        );
 
         // id precedence over name: a target that is BOTH a known id AND some other profile's name
         // resolves to the id. (Set up "home" id whose name coincides with a target that is also an id.)
@@ -362,8 +374,8 @@ mod tests {
         // Same key, looked up directly: the id arm already refused it.
         assert_eq!(resolve_target_to_id("../../etc", &meta), None);
 
-        // A traversal key alongside a legitimate one sharing the same name resolves to the safe id
-        // rather than being treated as ambiguous — the bad key is filtered out before the count.
+        // A traversal key alongside a legitimate one sharing the same name resolves to the safe id:
+        // the bad key is filtered out of the pass entirely, so it can never be the "first hit".
         let mut mixed = ProfilesFile::default();
         mixed
             .profiles

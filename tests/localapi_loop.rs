@@ -888,16 +888,26 @@ async fn profile_switch_list_and_remove_round_trip_over_the_wire() {
         other => panic!("expected Response::Ok from the no-op switch, got {other:?}"),
     }
 
-    // Removing the CURRENT profile is refused (this daemon requires an explicit switch away first).
+    // Removing the CURRENT profile removes nothing and SUCCEEDS, exactly as Go's `removeProfile`
+    // does (`Already on account %q`, `os.Exit(0)`) — a script that walks the profile list and
+    // removes each one must not die on the active one. The reply says nothing was removed.
     match harness
         .round_trip(r#"{"cmd":"delete_profile","target":"work"}"#)
         .await
     {
-        Response::Error { message } => assert!(
-            message.contains("current profile"),
-            "unexpected refusal: {message:?}"
+        Response::Ok { message } => assert_eq!(
+            message,
+            "already on profile \"work\"; not removed — switch away first to remove it"
         ),
-        other => panic!("expected Response::Error removing the current profile, got {other:?}"),
+        other => panic!("expected Response::Ok removing the current profile, got {other:?}"),
+    }
+    // ...and it really is still there, node key and all.
+    match harness.round_trip(r#"{"cmd":"profile_list"}"#).await {
+        Response::Profiles { profiles } => assert!(
+            profiles.iter().any(|p| p.id == "work"),
+            "the current profile must survive its own `switch remove`"
+        ),
+        other => panic!("expected Response::Profiles, got {other:?}"),
     }
 
     // Removing a profile that does not exist is refused too (Go: `No profile named %q`), rather than
