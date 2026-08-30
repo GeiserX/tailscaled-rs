@@ -312,6 +312,77 @@ async fn down_round_trip_then_status_is_no_state() {
     harness.shutdown_and_verify().await;
 }
 
+/// `reload-config` over the real socket, on a node that is DOWN: the daemon must answer with the
+/// outcome-specific success line, not a generic "reloaded".
+///
+/// A `reload-config` reconciles one of three ways (`ipn::ReloadAction`), and only one of them makes
+/// the operator's edit live: `Rebuild` (engine rebuilt from the new prefs), `BringDown` (the reloaded
+/// `Enabled:false` stopped the node), or `PersistedOnly` (node down — the merged prefs sit on disk
+/// until the next `up`). The daemon returns the reconciled action from `ipn::drive_reload_config` and
+/// renders it with `ReloadAction::outcome_message`, so the confirmation answers "is my edit running?"
+/// instead of leaving the operator to guess.
+///
+/// This drives the whole production path over the wire — dispatch → `drive_reload_config` →
+/// `Backend::reload_config` → the message — for the one arm reachable offline (`PersistedOnly`; the
+/// live `Rebuild`/`BringDown` arms need a real engine, i.e. the gated e2e). It also pins the error
+/// path that precedes it: a daemon started WITHOUT `--config` has nothing to reload and must say so
+/// rather than report a success.
+#[tokio::test]
+async fn reload_config_reports_the_persisted_only_outcome_over_the_wire() {
+    let harness = Harness::start().await;
+
+    // (1) No `--config` in use → a clear error, never an Ok. (The harness's Backend::load records no
+    // config path, exactly like a `tailnetd` started without the flag.)
+    match harness.round_trip(r#"{"cmd":"reload_config"}"#).await {
+        Response::Error { message } => assert!(
+            message.contains("--config"),
+            "the no-config refusal must name the missing --config: {message}"
+        ),
+        other => panic!("expected Response::Error without a --config in use, got {other:?}"),
+    }
+
+    // (2) Point the daemon at a config file (as `tailnetd`'s main() does for `--config`) and reload
+    // it. The node is down (this harness never joins a tailnet), so the reconcile is PersistedOnly.
+    let cfg_path = harness.state_dir.join("daemon-config.json");
+    tokio::fs::write(
+        &cfg_path,
+        br#"{"version":"alpha0","Hostname":"reloaded-over-the-wire"}"#,
+    )
+    .await
+    .expect("write daemon config");
+    harness.backend.lock().await.set_config_path(cfg_path);
+
+    match harness.round_trip(r#"{"cmd":"reload_config"}"#).await {
+        Response::Ok { message } => {
+            // The generic line is not enough: on a down node nothing was applied live, and the
+            // message must say the edit lands on the next `up`.
+            assert!(
+                message.contains("next up"),
+                "a node-down reload must tell the operator it applies on the next up: {message}"
+            );
+            assert_eq!(
+                message,
+                tailscaled_rs::ipn::ReloadAction::PersistedOnly.outcome_message(),
+                "dispatch must render the reconciled action's own message"
+            );
+        }
+        other => panic!("expected Response::Ok from reload_config, got {other:?}"),
+    }
+
+    // The reloaded config really was adopted (so the message is not describing a no-op).
+    let status = harness.round_trip(r#"{"cmd":"status"}"#).await;
+    match status {
+        Response::Status(report) => assert_eq!(
+            report.prefs.hostname.as_deref(),
+            Some("reloaded-over-the-wire"),
+            "the reloaded Hostname must be visible in status"
+        ),
+        other => panic!("expected Response::Status, got {other:?}"),
+    }
+
+    harness.shutdown_and_verify().await;
+}
+
 /// 2b. auth gate is wired into dispatch (write/read split). Two layers:
 ///
 /// - **Allow-side, over the REAL socket as the owning peer:** the harness's daemon is started with
