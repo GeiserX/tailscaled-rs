@@ -131,8 +131,22 @@ and any of its static routes whose `utun` device is gone, and touches nothing el
 
 ## Install as a system service
 
-To run `tailnetd` as an always-on boot service instead of a foreground process, install it as a
-system daemon (systemd on Linux, launchd on macOS):
+On macOS or Linux with [Homebrew](https://brew.sh), the tap installs both binaries and registers the
+service in one step (it builds from source — the release workflow publishes Linux tarballs only):
+
+```bash
+brew tap GeiserX/tailscaled-rs
+brew install tailscaled-rs
+sudo brew services start tailscaled-rs      # sets TS_RS_EXPERIMENT for the daemon
+```
+
+> [!NOTE]
+> The tap repository is not published yet — the formula is ready ahead of it. Until then it installs
+> from a checkout: `brew install --build-from-source packaging/homebrew/tailscaled-rs.rb`.
+
+See [`packaging/homebrew/README.md`](packaging/homebrew/README.md) for what the formula builds, where
+state and logs go, and how the tap is refreshed for a release. Otherwise, install the daemon
+straight from a checkout (systemd on Linux, launchd on macOS):
 
 ```bash
 # Build, then install the system service (one command; requires root)
