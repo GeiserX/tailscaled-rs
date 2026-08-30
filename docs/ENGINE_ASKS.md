@@ -1034,3 +1034,43 @@ part of `detect()` today (`Hostname`, `Package`/`PACKAGE_TSNET`, `RoutableIPs`, 
 **Daemon impact once landed:** `tnet debug hostinfo` (READ) — with (a) a pure-local print like the
 existing `debug env`/`debug build-info`; with (b) a thin read-only LocalAPI verb. Consumed via a pin
 bump. Tracked in daemon bead tsd-b15. — daemon lane
+
+---
+
+## 33. Expose the DERP map — `Device::derp_map()` (for full-strength captive-portal detection)
+
+**Why:** Go's captive-portal detector (`net/captivedetection/endpoints.go`, `availableEndpoints`)
+builds its probe list from the DERP map: for every non-`Avoid`, non-`NoMeasureNoHome` region it takes
+each node's **IPv4** with `CanPort80` set and probes `http://<ip>/generate_204`. Two properties make
+those the good endpoints, and neither is reproducible without the map:
+
+- **They are addressed by IP, not hostname.** A captive portal almost always hijacks DNS too, so a
+  hostname probe measures the portal's resolver rather than the network path. Go probes DERP by
+  literal IPv4 for exactly this reason.
+- **They answer a challenge.** A DERP server echoes the request's `X-Tailscale-Challenge: ts_<host>`
+  back as `X-Tailscale-Response: response ts_<host>`. That closes the hole where a portal answers a
+  bare `204` to look innocent — a portal cannot synthesize the echo. Only DERP nodes implement it;
+  the generic `generate_204` endpoints do not.
+
+Verified against pin `9d847a6e`/v0.43.0: `Device::netcheck()` returns a `NetcheckReport` carrying only
+region **ids** and measured latencies (`ts_runtime::status::NetcheckReport`), and neither
+`ts_control` nor the `tailscale` facade re-exports the `ts_control_serde::derp_map` types, so the
+daemon cannot reach a node hostname, IPv4 or `CanPort80` flag. The DERP map is otherwise fully modelled
+inside the engine (`ts_control_serde/src/derp_map.rs` already carries the `Avoid`, `NoMeasureNoHome`
+and port-80 fields this needs, the last one documented there as being for "captive portal checks").
+
+Go's fallback when the map is empty is its baked-in `dnsfallback` static DERP map. The daemon
+deliberately does **not** ship a hard-coded copy of that: a stale list of somebody else's server IPs
+compiled into this fork would rot silently and probe addresses that may no longer be Tailscale's.
+
+**Ask:** `Device::derp_map(&self) -> Option<DerpMap>` (or any read-only projection carrying, per
+region, the region id, `avoid`/`no_measure_no_home`, and per node the IPv4 literal + `can_port80`),
+plus a facade re-export of the type. A `preferred_derp` on the existing netcheck report already gives
+the region ranking, so nothing else is needed.
+
+**Daemon impact once landed:** captive-portal detection (`src/ipn/captive.rs`) gains the DERP-node
+endpoints and the challenge/response check. The port is already written and unit-tested against
+synthetic regions — `available_endpoints(regions, preferred_region_id)` — so consuming this is a
+one-argument change at the single call site in `ipn::captive_portal_loop`. Until then detection runs on
+the two Tailscale endpoints Go always appends (`controlplane`/`login`), which need no map but are
+status-code-only. Tracked in daemon bead tsd-iqq.5. — daemon lane

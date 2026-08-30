@@ -73,6 +73,7 @@ use anyhow::{Context, Result, anyhow};
 use crate::localapi::{PeerReport, StatusReport};
 use crate::prefs::Prefs;
 
+mod captive;
 mod config;
 mod control_url;
 mod diag;
@@ -119,6 +120,96 @@ async fn link_monitor_loop(device: std::sync::Arc<tailscale::Device>) {
                 tracing::warn!(error = %e, "linkmon: rebind failed (will keep monitoring)");
             }
             last = now;
+        }
+    }
+}
+
+/// The captive-portal detection loop — Go `ipn/ipnlocal/captiveportal.go`, its
+/// `checkCaptivePortalLoop` and `performCaptiveDetection`: notice when this node is stuck behind an
+/// airport/hotel Wi-Fi login page, and say so, instead of leaving the operator with an opaque
+/// "cannot reach control".
+///
+/// Runs for the daemon's whole life — NOT bound to a device like [`link_monitor_loop`], because the
+/// interesting case is precisely the one where no device came up. Never returns.
+///
+/// ## The trigger
+///
+/// Detection is not periodic background chatter: it runs only while
+/// [`connectivity_impacted`](Backend::connectivity_impacted) holds (the operator wants the node up and
+/// it is not up) and [`should_run_captive_portal_detection`](Backend::should_run_captive_portal_detection)
+/// allows it. A `Running` node and a deliberately-`down` node both probe **zero** times. The first
+/// pass waits Go's [`DETECTION_INTERVAL`](captive::DETECTION_INTERVAL) so a blip during a normal
+/// bring-up cannot fire one.
+///
+/// While connectivity stays impacted the pass repeats every
+/// [`RECHECK_INTERVAL`](captive::RECHECK_INTERVAL). Go instead re-arms its 2s timer off health-tracker
+/// events; this fork has no health event bus, so it polls — and backing the repeat off keeps a node on
+/// a genuinely dead network from probing tailscale.com every two seconds forever (which matters most
+/// for exactly the headless cloud node that will never have a portal).
+///
+/// ## Why the lock is dropped across the probe
+///
+/// A detection pass makes real HTTP requests and can take [`TIMEOUT`](captive::TIMEOUT). It therefore
+/// runs with the backend lock **released** — the same discipline `reconcile_on_reload` follows — so a
+/// probe can never head-of-line block a concurrent `status`/`up`/`down`. The lock is retaken only to
+/// read the gate and to write the verdict.
+pub async fn captive_portal_loop(backend: std::sync::Arc<tokio::sync::Mutex<Backend>>) {
+    // When the last pass ran, so the recheck backoff is measured from the probe, not from the tick.
+    let mut last_run: Option<tokio::time::Instant> = None;
+    // When connectivity first became impacted in the current unhealthy episode, so the FIRST pass
+    // honours Go's `captivePortalDetectionInterval`. Cleared whenever connectivity recovers, so a
+    // later episode waits out the interval again rather than probing instantly.
+    let mut impacted_since: Option<tokio::time::Instant> = None;
+
+    loop {
+        tokio::time::sleep(captive::POLL_INTERVAL).await;
+
+        // Brief lock: read the gate, and on the healthy path clear the warning in the same
+        // acquisition. Never hold it across the probe below.
+        let impacted = {
+            let mut be = backend.lock().await;
+            let impacted = be.should_run_captive_portal_detection() && be.connectivity_impacted();
+            if !impacted {
+                // Go's healthy branch: connectivity is fine, so we know for sure there is no portal
+                // in the way — drop any warning. `set_captive_portal_detected` is a no-op (and
+                // silent) when nothing was raised, so a healthy node's tick costs one uncontended
+                // lock and two field reads.
+                be.set_captive_portal_detected(false);
+            }
+            impacted
+        };
+
+        if !impacted {
+            impacted_since = None;
+            last_run = None;
+            continue;
+        }
+
+        let since = *impacted_since.get_or_insert_with(tokio::time::Instant::now);
+        let due = match last_run {
+            // First pass of this episode: Go's 2s settle time.
+            None => since.elapsed() >= captive::DETECTION_INTERVAL,
+            // Still impacted after a pass: re-probe on the backoff.
+            Some(ran) => ran.elapsed() >= captive::RECHECK_INTERVAL,
+        };
+        if !due {
+            continue;
+        }
+        last_run = Some(tokio::time::Instant::now());
+
+        // OFF-LOCK. The endpoint set is empty because the engine exposes no DERP map to the daemon —
+        // see `captive`'s module docs and engine ask #33; `available_endpoints` then yields the two
+        // Tailscale endpoints Go always appends, which need no map. When a map does become available,
+        // this is the one call site that changes.
+        let found = captive::detect(&[], None).await;
+
+        // Re-read the gate under the lock before recording: the node may have converged to `Running`
+        // while we were probing, in which case Go's healthy branch owns the verdict, not a stale one.
+        let mut be = backend.lock().await;
+        if be.should_run_captive_portal_detection() && be.connectivity_impacted() {
+            be.set_captive_portal_detected(found);
+        } else {
+            be.set_captive_portal_detected(false);
         }
     }
 }
@@ -1349,6 +1440,20 @@ pub struct Backend {
     ///   - re-derived for the target profile in [`switch_profile`](Backend::switch_profile), which
     ///     repoints `key_path` at a different profile's key file.
     has_node_key: bool,
+    /// Whether the last captive-portal detection pass found a portal (Go's `captivePortalWarnable`
+    /// health state, held here because this fork has no health tracker to hold it).
+    ///
+    /// Written **only** by [`captive_portal_loop`], which owns the whole warning lifecycle: it sets
+    /// this on a positive detection and clears it the moment connectivity stops being impacted (Go's
+    /// `b.health.SetHealthy(captivePortalWarnable)` branch). Read by [`status`](Backend::status),
+    /// which projects it into [`StatusReport::health`](crate::localapi::StatusReport::health).
+    ///
+    /// Deliberately NOT a lifecycle wake edge: flipping it does not bump the generation, because the
+    /// generation is the concurrent-bring-up staleness token (see [`Backend::begin_up`]) and bumping
+    /// it from a background probe could make an in-flight `finish_up` discard its own device. A
+    /// `status --watch` therefore learns about the warning on its next snapshot rather than being
+    /// pushed one — consistent with this fork's `Notify` having no health stream at all.
+    captive_portal_detected: bool,
 }
 
 /// What a [`Backend::switch_profile`] call actually did — the daemon-side half of the reporting Go's
@@ -1496,6 +1601,8 @@ impl Backend {
             // path, and every later mutation is tracked at its transition (see the field doc's
             // invariant). `has_persisted_node_key` reads only `key_path`, which is already set above.
             has_node_key: false,
+            // No detection has run yet; the captive-portal loop is the only writer from here on.
+            captive_portal_detected: false,
         };
         backend.has_node_key = backend.has_persisted_node_key().await;
         Ok(backend)
@@ -3056,6 +3163,82 @@ impl Backend {
             // `stream_watch` hot path fires on EVERY engine state transition, where this fact never
             // changes (it only moves on key persist/wipe — see the `has_node_key` field invariant).
             have_node_key: self.has_node_key,
+            // Go `ipnstate.Status.Health`: the text of every health warning currently raised. Go's
+            // `health.Tracker.Strings()` emits one entry per unhealthy warnable; the captive-portal
+            // warnable is the only one this fork raises, so the list is either empty or that one
+            // message.
+            health: self.health_warnings(),
+        }
+    }
+
+    /// The health-warning texts `status` reports (Go `health.Tracker.Strings()`, whose output lands in
+    /// `ipnstate.Status.Health` and is what `tailscale status` prints under `# Health check:`).
+    ///
+    /// This fork registers exactly one warnable — Go's `captivePortalWarnable` — so the list is empty
+    /// on a healthy node and carries that single message when a portal was detected. The string is
+    /// Go's verbatim, so `tnet status` and `tailscale status` read identically.
+    fn health_warnings(&self) -> Vec<String> {
+        let mut health = Vec::new();
+        if self.captive_portal_detected {
+            health.push(captive::WARNABLE_TEXT.to_string());
+        }
+        health
+    }
+
+    /// Go `LocalBackend.shouldRunCaptivePortalDetection`: may captive-portal detection run at all?
+    ///
+    /// Go gates on two things: the `DisableCaptivePortalDetection` **control knob** and
+    /// `prefs.WantRunning()`. The engine at this pin surfaces no control knobs to the daemon (nor the
+    /// `NodeAttrDisableCaptivePortalDetection` node attribute that backs the knob), so only the
+    /// want-running half is enforceable here — and no local pref is invented to stand in for a
+    /// control-plane switch. That is not a licence to probe freely: the *trigger*
+    /// ([`connectivity_impacted`](Backend::connectivity_impacted)) is narrow enough that a node which
+    /// is connected, or deliberately down, never probes at all.
+    fn should_run_captive_portal_detection(&self) -> bool {
+        self.prefs.want_running
+    }
+
+    /// Whether this node's connectivity is impacted — the condition that makes a captive portal worth
+    /// probing for.
+    ///
+    /// This is the fork's stand-in for Go's trigger. Go watches its health tracker and probes when any
+    /// warnable with `ImpactsConnectivity` is unhealthy (`captivePortalHealthChange`). This daemon has
+    /// no health tracker, so the equivalent signal is read straight off the state machine: the
+    /// operator wants the node up, and it is not up. That is exactly the situation a portal produces —
+    /// registration and map-poll attempts failing against a network that answers everything — and it
+    /// excludes both a healthy `Running` node and a deliberately-`down` one, neither of which Go would
+    /// probe on either.
+    fn connectivity_impacted(&self) -> bool {
+        if !self.prefs.want_running {
+            return false;
+        }
+        let state = match self.device.as_ref() {
+            Some(dev) => state_from_device(dev.device_state()).0,
+            None => self.derive_state(false),
+        };
+        state != State::Running
+    }
+
+    /// Record the verdict of a captive-portal detection pass (Go's
+    /// `b.health.SetUnhealthy`/`SetHealthy(captivePortalWarnable)`). Called only by
+    /// [`captive_portal_loop`]; logs the edges, so a portal appearing or clearing is visible in the
+    /// daemon log and not only in `status`.
+    fn set_captive_portal_detected(&mut self, detected: bool) {
+        if self.captive_portal_detected == detected {
+            return;
+        }
+        self.captive_portal_detected = detected;
+        if detected {
+            tracing::warn!(
+                code = captive::WARNABLE_CODE,
+                "captive portal detected: {}",
+                captive::WARNABLE_TEXT
+            );
+        } else {
+            tracing::info!(
+                code = captive::WARNABLE_CODE,
+                "captive-portal warning cleared"
+            );
         }
     }
 
@@ -3808,7 +3991,81 @@ mod tests {
             // Cache starts `false` (a fresh backend, no key checked yet). Tests that need a key
             // present drive the real wipe/build paths, which keep the cache consistent on their own.
             has_node_key: false,
+            captive_portal_detected: false,
         }
+    }
+
+    // --- captive-portal detection (tsd-iqq.5) -----------------------------------------------------
+
+    #[test]
+    fn captive_detection_is_gated_on_wanting_to_be_up() {
+        // Go `shouldRunCaptivePortalDetection`: detection only ever runs for a node the operator
+        // actually wants connected. A `down` node must probe nothing at all.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-captive-gate-{}", std::process::id()));
+        let mut be = backend_for(&dir);
+
+        be.prefs.want_running = false;
+        assert!(
+            !be.should_run_captive_portal_detection(),
+            "a node that does not want to be running must never probe"
+        );
+        assert!(
+            !be.connectivity_impacted(),
+            "a deliberately-down node is not 'impacted'; it is doing what was asked"
+        );
+
+        be.prefs.want_running = true;
+        assert!(be.should_run_captive_portal_detection());
+    }
+
+    #[test]
+    fn connectivity_is_impacted_when_the_node_wants_up_but_has_no_engine() {
+        // The fork's stand-in for Go's health-tracker trigger: want-running and not Running. A
+        // device-less backend with want_running set is exactly the "up was asked for and did not
+        // land" case a captive portal produces.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-captive-trigger-{}", std::process::id()));
+        let mut be = backend_for(&dir);
+        be.prefs.want_running = true;
+
+        assert_ne!(
+            be.derive_state(false),
+            State::Running,
+            "no device installed, so the node cannot be Running"
+        );
+        assert!(
+            be.connectivity_impacted(),
+            "want-running with no live engine is the condition worth probing for a portal"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_detected_portal_becomes_the_go_health_warning_on_status() {
+        // The verdict has to reach the operator, and in Go's words. `status().health` is what
+        // `tnet status` prints under `# Health check:` and what `status --json` puts in `Health`.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-captive-health-{}", std::process::id()));
+        let mut be = backend_for(&dir);
+
+        assert!(
+            be.status().await.health.is_empty(),
+            "a node with no warning raised reports no health problems"
+        );
+
+        be.set_captive_portal_detected(true);
+        assert_eq!(
+            be.status().await.health,
+            vec!["This network requires you to log in using your web browser.".to_string()],
+            "the reported text must be Go's captivePortalWarnable text, verbatim"
+        );
+
+        // Go's healthy branch drops the warning again; `status` must stop reporting it.
+        be.set_captive_portal_detected(false);
+        assert!(
+            be.status().await.health.is_empty(),
+            "clearing the warning must clear the health list"
+        );
     }
 
     #[test]
