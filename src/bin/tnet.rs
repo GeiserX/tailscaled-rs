@@ -1118,7 +1118,11 @@ enum ServeCmd {
         /// The tailnet port to terminate TLS on and redirect from.
         #[arg(value_name = "PORT")]
         port: u16,
-        /// The `Location:` target to redirect to (supports the engine's `${HOST}` / `${REQUEST_URI}`).
+        /// The `Location:` target to redirect to. Sent verbatim — no variable expansion.
+        ///
+        /// The engine writes one fixed `Location:` header for every request on the port, so a
+        /// `${HOST}` / `${REQUEST_URI}` placeholder would be sent to the client as those literal
+        /// characters rather than expanded. Both are refused up front; write a literal URL.
         #[arg(value_name = "TO")]
         to: String,
         /// The redirect HTTP status (must be in 300..=399). Defaults to 302.
@@ -8010,6 +8014,19 @@ fn normalize_serve_target(target: &str) -> String {
     }
 }
 
+/// The redirect placeholder `to` carries, if it carries one this build cannot honour.
+///
+/// `serve redirect` sends its target verbatim: the engine's `serve_redirect` writes one fixed
+/// response for every request on the port and never parses the request, so there is no per-request
+/// value to substitute. `${HOST}` and `${REQUEST_URI}` were documented as expanded and never were —
+/// a target holding either redirects the client to a URL with those literal characters in it. Catch
+/// it where the config is authored instead of serving the broken `Location:`.
+fn unexpanded_redirect_var(to: &str) -> Option<&'static str> {
+    ["${HOST}", "${REQUEST_URI}"]
+        .into_iter()
+        .find(|placeholder| to.contains(placeholder))
+}
+
 /// Clean a `--set-path` mount point, faithful to Go `serve`'s `cleanURLPath`: empty → `/`; ensure a
 /// leading `/`; `path.Clean`; accept only if the cleaned form equals the (slash-prefixed) input or
 /// that input with a single trailing slash (so `/foo/` is allowed but `/foo/../bar` / `//foo` are
@@ -8632,6 +8649,12 @@ async fn run_serve(
             }
             if to.contains(['\r', '\n']) {
                 anyhow::bail!("redirect target must not contain CR or LF");
+            }
+            if let Some(placeholder) = unexpanded_redirect_var(&to) {
+                anyhow::bail!(
+                    "redirect target must not contain {placeholder}: the target is sent verbatim \
+                     in the Location: header and no variable expansion is performed. Use a literal URL."
+                );
             }
             let host = serve_host(socket).await?;
             let mut cfg = get_cfg().await?;
@@ -11884,6 +11907,35 @@ mod tests {
         assert_eq!(normalize_serve_target("5000"), "127.0.0.1:5000");
         assert_eq!(normalize_serve_target("10.0.0.5:22"), "10.0.0.5:22");
         assert_eq!(normalize_serve_target("localhost:8080"), "localhost:8080");
+    }
+
+    #[test]
+    fn unexpanded_redirect_var_refuses_the_placeholders_the_doc_promised() {
+        // Neither placeholder is expanded anywhere in the stack, so `serve redirect` refuses both
+        // rather than sending them to the client as literal characters in `Location:`.
+        assert_eq!(
+            unexpanded_redirect_var("https://${HOST}/new"),
+            Some("${HOST}")
+        );
+        assert_eq!(
+            unexpanded_redirect_var("https://dest.ts.net${REQUEST_URI}"),
+            Some("${REQUEST_URI}")
+        );
+        // Reported placeholder-first, so the message names one the caller can actually find.
+        assert_eq!(
+            unexpanded_redirect_var("https://${HOST}${REQUEST_URI}"),
+            Some("${HOST}")
+        );
+
+        // A literal URL passes, including one carrying a `$` that is not one of the two
+        // placeholders — `$` is a legal URL sub-delimiter and must not be refused on sight.
+        assert_eq!(unexpanded_redirect_var("https://dest.ts.net/new"), None);
+        assert_eq!(unexpanded_redirect_var("https://dest.ts.net/a$b"), None);
+        assert_eq!(
+            unexpanded_redirect_var("https://dest.ts.net/${OTHER}"),
+            None
+        );
+        assert_eq!(unexpanded_redirect_var("https://dest.ts.net/$HOST"), None);
     }
 
     #[test]

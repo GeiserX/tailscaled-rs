@@ -1232,7 +1232,12 @@ pub struct TcpPortHandler {
 /// `validate()` and checked daemon-side before the engine call.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RedirectSpec {
-    /// The `Location:` target. Supports the engine's `${HOST}` / `${REQUEST_URI}` expansion.
+    /// The `Location:` target, sent **verbatim**. There is no variable expansion: the engine's
+    /// `serve_redirect` writes one fixed response for every request on the port and never parses the
+    /// request, so it has no per-request value to substitute. A `${HOST}` / `${REQUEST_URI}`
+    /// placeholder reaches the client as those literal characters — write a literal URL. (`tnet serve
+    /// redirect` refuses both placeholders up front; a config that already carries one is still
+    /// served verbatim rather than silently dropped.)
     #[serde(rename = "To")]
     pub to: String,
     /// The redirect HTTP status (e.g. 301, 302). Must be in `300..=399`.

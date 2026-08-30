@@ -950,6 +950,37 @@ mod tests {
     }
 
     #[test]
+    fn build_web_serve_state_passes_the_redirect_target_through_verbatim() {
+        // The engine writes `to` straight into `Location:` and does no variable expansion, so the
+        // daemon must not invent one either: a target holding `${HOST}`/`${REQUEST_URI}` reaches the
+        // engine byte-for-byte. This pins the behaviour `RedirectSpec::to` documents. (`tnet serve
+        // redirect` refuses to author such a target; one already persisted is still served as-is
+        // rather than silently dropped, which is why it survives translation here.)
+        let mut cfg = ServeConfig::default();
+        cfg.tcp.insert(
+            "443".into(),
+            TcpPortHandler {
+                https: true,
+                redirect: Some(RedirectSpec {
+                    to: "https://${HOST}/${REQUEST_URI}".into(),
+                    status: 302,
+                }),
+                ..Default::default()
+            },
+        );
+        let state = build_web_serve_state(&cfg, "host.example.ts.net");
+        assert_eq!(
+            state.ports.get(&443),
+            Some(&tailscale::ServeTarget::Redirect {
+                to: "https://${HOST}/${REQUEST_URI}".into(),
+                status: 302
+            }),
+            "the redirect target must reach the engine unexpanded"
+        );
+        assert!(state.validate().is_ok());
+    }
+
+    #[test]
     fn build_web_serve_state_lone_root_mount_is_bare_target() {
         // A single "/" mount collapses to the bare target (no needless Path mux).
         let mut mounts = std::collections::BTreeMap::new();
