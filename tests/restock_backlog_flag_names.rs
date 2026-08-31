@@ -13,6 +13,14 @@
 //! checks the Homebrew formula against the tree it packages: the backlog text with
 //! [`include_str!`], and the fork's real flag surface by running the built `tnet` binary — clap's
 //! own parser, not a second copy of the flag list.
+//!
+//! That `up` entry has since been WORKED: all four Go spellings now reach `tnet up` — two as
+//! aliases, one as an accepted no-op, `--nickname` as a refusal that names `tnet set --nickname` —
+//! so the half of it that said they die at argument parsing is history, not a claim about the CLI
+//! as it stands. The
+//! checks below moved with the code — each Go spelling must now get PAST the parser, and
+//! `--nickname` must be answered by name — which is what keeps this file a guard on `tnet up`
+//! instead of a guard on a sentence nobody will read again.
 
 use std::process::Command;
 use std::process::Output;
@@ -58,17 +66,24 @@ fn tnet(args: &[&str]) -> Output {
 /// The long flags `tnet <subcommand>` accepts, read off its own `--help`. This is the fork's flag
 /// surface as clap reports it, so a flag renamed in `src/bin/tnet.rs` moves this set with it.
 fn accepted_flags(subcommand: &str) -> Vec<String> {
+    let mut flags: Vec<String> = help_text(subcommand)
+        .lines()
+        .filter_map(declared_flag)
+        .collect();
+    flags.sort();
+    flags.dedup();
+    flags
+}
+
+/// `tnet <subcommand> --help`, as clap renders it.
+fn help_text(subcommand: &str) -> String {
     let out = tnet(&[subcommand, "--help"]);
     assert!(
         out.status.success(),
         "`tnet {subcommand} --help` should exit 0, got {:?}",
         out.status
     );
-    let help = String::from_utf8(out.stdout).expect("clap help should be UTF-8");
-    let mut flags: Vec<String> = help.lines().filter_map(declared_flag).collect();
-    flags.sort();
-    flags.dedup();
-    flags
+    String::from_utf8(out.stdout).expect("clap help should be UTF-8")
 }
 
 /// The long flag a clap help line *declares*, if any: the option column is `    --authkey <KEY>`
@@ -171,30 +186,37 @@ fn every_flag_the_entry_credits_to_this_fork_is_one_tnet_up_accepts() {
 }
 
 #[test]
-fn tnet_up_really_rejects_each_go_spelling_the_entry_names() {
-    // The other half of the entry's premise: a command line copied from Go dies at argument
-    // parsing. If one of these is ever ported, the entry is stale and must be re-cut.
+fn tnet_up_takes_each_go_spelling_the_entry_names() {
+    // The entry's premise WAS that a command line copied from Go dies at argument parsing. That is
+    // the defect it asked to have fixed, so the check is inverted rather than deleted: every one of
+    // Go's four spellings must now get past clap. Each is given the argument shape Go gives it —
+    // `--host-routes` is Go's `notFalseVar`, a bool flag that never consumes the next argument.
     for flag in GO_UP_SPELLINGS {
-        let out = tnet(&["up", flag, "placeholder"]);
-        assert_eq!(
+        let argv: Vec<&str> = if flag == "--host-routes" {
+            vec!["up", flag]
+        } else {
+            vec!["up", flag, "placeholder"]
+        };
+        let out = tnet(&argv);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_ne!(
             out.status.code(),
             Some(2),
-            "`tnet up {flag}` should still exit 2 at argument parsing"
+            "`tnet up {flag}` should no longer exit 2 at argument parsing; got: {stderr}"
         );
-        let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
-            stderr.contains(&format!("unexpected argument '{flag}'")),
-            "`tnet up {flag}` should still fail with clap's \"unexpected argument\"; got: {stderr}"
+            !stderr.contains("unexpected argument"),
+            "`tnet up {flag}` should no longer hit clap's \"unexpected argument\"; got: {stderr}"
         );
     }
 }
 
 #[test]
 fn nickname_is_distinguished_from_the_flags_that_are_only_renames() {
-    // `--auth-key` and `--login-server` are aliases waiting to be written: `up` already carries the
-    // behaviour under another name. `--nickname` is not — `up` has no profile-naming flag at all,
-    // only `set` does — so accepting `up --nickname` is new behaviour, and the entry has to say so
-    // or the two get scoped as one job.
+    // `--auth-key` and `--login-server` were aliases waiting to be written: `up` already carried the
+    // behaviour under another name, and they are now clap aliases of it. `--nickname` was never that
+    // — `up` has no profile-naming flag, in this fork OR in Go, only `set` does (and Go's `login`) —
+    // so it is answered by name instead, pointing at where the behaviour lives.
     let description = entry_description();
     let up_flags = accepted_flags("up");
 
@@ -202,11 +224,34 @@ fn nickname_is_distinguished_from_the_flags_that_are_only_renames() {
         up_flags.contains(&"--authkey".to_owned())
             && up_flags.contains(&"--authkey-file".to_owned())
             && up_flags.contains(&"--control-url".to_owned()),
-        "`tnet up` should still carry the flags `--auth-key`/`--login-server` would alias onto"
+        "`tnet up` should still carry the flags `--auth-key`/`--login-server` alias onto"
     );
+    // An alias is one flag under two names, so it stays off the option column and is listed on its
+    // target's line — which is exactly what makes it a rename rather than a second flag.
+    let up_help = help_text("up");
+    for (canonical, alias) in [
+        ("--authkey", "--auth-key"),
+        ("--control-url", "--login-server"),
+    ] {
+        assert!(
+            !up_flags.contains(&alias.to_owned()),
+            "`{alias}` should be an alias of `{canonical}`, not a flag of its own"
+        );
+        assert!(
+            up_help.contains(&format!("[alias: {alias}]")),
+            "`tnet up --help` should show `{alias}` as an alias of `{canonical}`"
+        );
+    }
     assert!(
         !up_flags.contains(&"--nickname".to_owned()),
-        "`tnet up` now takes `--nickname`; this backlog entry is stale"
+        "`up --nickname` is answered by name, not offered as a flag: Go does not register it on \
+         `up` either"
+    );
+    let refusal = tnet(&["up", "--nickname", "work-laptop"]);
+    let refusal = String::from_utf8_lossy(&refusal.stderr).into_owned();
+    assert!(
+        refusal.contains("tnet set --nickname"),
+        "`tnet up --nickname` should name where profile naming lives; got: {refusal}"
     );
     assert!(
         accepted_flags("set").contains(&"--nickname".to_owned()),
