@@ -151,6 +151,10 @@ pub(crate) fn requires_write(request: &crate::localapi::Request) -> bool {
         // NOTHING (engaging the node is a separate `set --exit-node`), so it is a read like
         // `status`/`netcheck`. Go's `SuggestExitNode` LocalAPI handler is likewise a GET.
         | Request::SuggestExitNode
+        // `service list` only decodes the Service set control already delivered in the netmap. Go's
+        // `serveServices` is a GET that reads `nm.Services()` and mutates nothing, so it is a read
+        // like `status`/`dns status`.
+        | Request::Services
         // `syspolicy list`/`reload` (Go `tailscale syspolicy`) only read the effective MDM/system
         // policy. Go gates BOTH on `PermitRead` — its LocalAPI `policy/` handler checks only
         // `PermitRead`, even for the POST/reload, because "reload" re-reads the external policy
@@ -387,6 +391,11 @@ mod tests {
         assert!(
             !requires_write(&Request::Netcheck),
             "netcheck only reads the net-report (DERP-region latency) — a read, gated like status"
+        );
+        assert!(
+            !requires_write(&Request::Services),
+            "service list only decodes the Service set control already put in the netmap — a read \
+             (Go's serveServices is a GET), gated like status"
         );
     }
 

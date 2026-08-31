@@ -3588,6 +3588,16 @@ impl Backend {
         diag::dns_status(dev).await
     }
 
+    /// Report the Tailscale Services (VIPs) this node can reach (the `tnet service list` path; Go
+    /// `tailscale service list` over the `services` LocalAPI verb). Thin `pub` shim over
+    /// [`diag::services`], kept on `Backend` so the `server.rs` dispatch call site
+    /// (`Backend::services(&dev)`) is uniform with the other off-lock diagnostics. See
+    /// [`diag::services`] for the self-node capability map →
+    /// [`ServiceReport`](crate::localapi::ServiceReport) decode.
+    pub async fn services(dev: &tailscale::Device) -> crate::localapi::Response {
+        diag::services(dev).await
+    }
+
     /// Report the effective system policy (the `tnet syspolicy list` path; Go
     /// `GetEffectivePolicy(DefaultScope())`). A **static** associated fn (not `&self`): policy
     /// resolution reads no backend/engine/netmap state — like Go's `rsop.PolicyFor`, it merges the
