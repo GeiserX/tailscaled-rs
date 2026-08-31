@@ -125,6 +125,17 @@ not do. `--nickname` is the exception among them: like Go, it also renames the c
 so the name you pick is what `tnet switch --list` shows and what `tnet switch <name>` resolves
 against. `set` never re-authenticates and never changes whether the node is up or down.
 
+**App connector: the advertise half only.** `tnet up/set --advertise-connector` really does reach
+control — the engine sets `Hostinfo.AppConnector` from the pref at registration and on every map
+request, so the admin console sees the node offering the role. What this build does **not** have is
+the connector's data path: it never receives the connector domain list, never watches DNS lookups to
+learn a domain's addresses, and so never appends a learned route to `--advertise-routes`. An
+advertising node therefore serves no connector traffic. `tnet appc-routes` (Go `tailscale
+appc-routes`) reports exactly what follows from that — `not a connector` when the pref is off, and
+`-n`'s count of the routes you advertise — and refuses `--map`, `--all` and the default per-domain
+summary with that reason, rather than printing an empty map that would read as "learned nothing
+yet". Advertise the role only if something else in your tailnet is doing the connecting.
+
 State (node keys + prefs) lives in `$XDG_STATE_HOME/tailnetd` (override with `TAILNETD_STATE_DIR`);
 the control socket is `<state-dir>/tailnetd.sock` (override with `TAILNETD_SOCKET`).
 

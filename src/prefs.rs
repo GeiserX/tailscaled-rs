@@ -93,6 +93,13 @@ pub struct Prefs {
     /// IPs) is a separate subsystem neither this daemon nor the engine implements, so an advertising
     /// node serves no connector traffic. That is identical in effect to Go advertising the bool
     /// before control has assigned any domains. Default `false`.
+    ///
+    /// The readback follows from that: because nothing observes a domain, nothing is ever appended
+    /// to [`advertise_routes`](Prefs::advertise_routes), and there is no `appctype.RouteInfo` store
+    /// for a `appc-route-info` LocalAPI verb to expose. `tnet appc-routes` reports the two things
+    /// prefs alone can answer — Go's `not a connector`, and `-n`'s advertised-route count — and
+    /// refuses the three learned-route shapes with that reason. Filed as ask #34 in
+    /// `docs/ENGINE_ASKS.md`.
     pub advertise_app_connector: bool,
     /// Opt in to admin-console-triggered auto-updates (Go `tailscale set --auto-update` /
     /// `ipn.Prefs.AutoUpdate.Apply`). Tri-state, mirroring Go's `opt.Bool`: `None` = never stated
