@@ -373,6 +373,13 @@ pub enum Request {
     /// empty response). Read-only — it computes a suggestion from the netmap + latency, mutating
     /// nothing (gated like [`Status`](Request::Status)). Requires the node to be up.
     SuggestExitNode,
+    /// Report the Tailscale **Services** (VIPs) this node can reach (Go `tailscale service list` →
+    /// the LocalAPI `services` verb). Replies with [`Response::Services`]. Read-only — Go's
+    /// `serveServices` is a GET that only reads the netmap, so this is classified like
+    /// [`Status`](Request::Status). Requires the node to be up: the Service set is decoded from the
+    /// **self node's** capability map, which only exists once control has sent a netmap (Go's handler
+    /// answers `503 no netmap` in the same situation).
+    Services,
     /// Report the effective system policy / MDM configuration (Go `tailscale syspolicy list`).
     /// Replies with [`Response::Policy`]. Read-only — Go gates BOTH `list` and `reload` on
     /// `PermitRead` (the LocalAPI `policy/` handler checks only `PermitRead`), so this is classified
@@ -767,6 +774,18 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         suggestion: Option<ExitNodeSuggestionView>,
     },
+    /// The Tailscale Services (VIPs) this node can reach (reply to [`Request::Services`]), rendered
+    /// by `tnet service list`. Sorted by [`ServiceReport::name`], one entry per Service (Go returns a
+    /// `map[tailcfg.ServiceName]tailcfg.ServiceDetails`, which the CLI sorts by name before printing;
+    /// sorting daemon-side makes the wire itself deterministic). Empty when control has granted this
+    /// node no Services — an honest empty result, not an error. A **struct** variant (not a newtype
+    /// over the `Vec`): the `Response` enum is internally tagged (`tag = "kind"`), which cannot merge
+    /// its tag into a bare sequence, so the payload is carried as a named field — the same shape
+    /// `Files`/`FileTargets` use.
+    Services {
+        /// One entry per Service this node can reach.
+        services: Vec<ServiceReport>,
+    },
     /// The effective system policy snapshot (reply to [`Request::SyspolicyList`] /
     /// [`Request::SyspolicyReload`]), rendered by `tnet syspolicy list` / `reload`.
     Policy(PolicyReport),
@@ -937,6 +956,227 @@ pub struct PolicySetting {
     /// the setting resolved cleanly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// One Tailscale **Service** (a VIP service) this node can reach, in a [`Response::Services`] reply.
+/// The Rust analogue of Go's `tailcfg.ServiceDetails`, which control delivers to each node as the
+/// value of a `services/<opaque>` entry in the **self node's** capability map (Go
+/// `tailcfg.NodeAttrPrefixServices`; decoded daemon-side by `ipn::diag::services_from_cap_map`,
+/// the port of Go's `netmap.NetworkMap.Services()`).
+///
+/// A Service is not a peer: it is a virtual service with its own addresses, and which Services a
+/// node can see is decided by the tailnet's ACLs. Rendered by `tnet service list`, and consulted by
+/// `tnet ip <service-VIP>` (Go `ip.go`'s Service fallback).
+///
+/// Container-level `#[serde(default)]` so a wire document missing any field deserializes to the
+/// [`ServiceReport::default`] value rather than hard-erroring. Not `Eq`: an action's
+/// [`attributes`](ServiceActionReport::attributes) carry arbitrary JSON.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServiceReport {
+    /// The Service's canonical name, `svc:<dns-label>` (Go `ServiceDetails.Name`). This is the map
+    /// key Go's `services` verb returns, taken from the value's own `Name` field — never parsed out
+    /// of the capability key, whose suffix is opaque and server-chosen.
+    pub name: String,
+    /// An optional human-readable label (Go `ServiceDetails.DisplayName`). Empty when control sent
+    /// none; clients fall back to [`name`](ServiceReport::name).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub display_name: String,
+    /// The Service's virtual IP addresses (Go `ServiceDetails.Addrs`), re-rendered from the parsed
+    /// address so a differently-spelled literal normalizes. IPv4 first when the tailnet has IPv4
+    /// enabled — Go's table prints `Addrs[0]`, which is the v6 address on a v6-only tailnet.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub addrs: Vec<String>,
+    /// The protocol/port combinations the Service accepts (Go `ServiceDetails.Ports`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<ServicePortRange>,
+    /// How a client may interact with this Service (Go `ServiceDetails.Actions`). Empty when control
+    /// sent none, in which case clients infer the interaction from the ports instead.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<ServiceActionReport>,
+}
+
+/// One action a client may invoke against a [`ServiceReport`] — the Rust analogue of Go's
+/// `tailcfg.ServiceAction`. Drives the TYPE column of `tnet service list`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServiceActionReport {
+    /// The action's type slug (Go `ServiceAction.Type`, e.g. `ssh`, `http`, `postgresql`). Carried as
+    /// an opaque string, not an enum: Go tells clients to *ignore* types they do not recognize, so a
+    /// type this build has never heard of must survive the wire rather than fail it.
+    pub action_type: String,
+    /// The target TCP port for this action (Go `ServiceAction.Port`).
+    pub port: u16,
+    /// An optional label for client menus (Go `ServiceAction.DisplayName`). Empty when absent.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub display_name: String,
+    /// Optional per-action metadata (Go `ServiceAction.Attributes`), keyed by attribute name with the
+    /// raw JSON value kept verbatim — this daemon neither interprets nor validates it, exactly as Go
+    /// carries `RawMessage`. Preserved so `tnet service list --json` emits what control sent.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub attributes: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// A protocol + inclusive port range on a [`ServiceReport`] — the Rust analogue of Go's
+/// `tailcfg.ProtoPortRange`.
+///
+/// On the wire between control and the node this is a **string**, not an object: Go's type
+/// implements `encoding.TextMarshaler`, so a Service's `Ports` arrive as `"tcp:443"`, `"udp:1-100"`,
+/// `"443"` or `"*"`. The daemon parses that text form once ([`FromStr`]) and hands the CLI the
+/// decoded triple, so the renderer can both re-emit Go's spelling ([`Display`]) and answer the
+/// question Go's TYPE column asks — "is this a single TCP port?" — without re-parsing strings.
+///
+/// `proto == 0` means "all protocols" (Go's `int(0)`); otherwise it is an IP protocol number
+/// (6 = TCP, 17 = UDP). A `first..=last` span of `0..=65535` means "all ports".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServicePortRange {
+    /// IP protocol number (Go `ProtoPortRange.Proto`). `0` = all protocols.
+    pub proto: u8,
+    /// Inclusive first port (Go `Ports.First`).
+    pub first: u16,
+    /// Inclusive last port (Go `Ports.Last`).
+    pub last: u16,
+}
+
+/// Go `ipproto.preferredNames` — the protocol-number → name table `ipproto.Proto.MarshalText` emits
+/// and `UnmarshalText` accepts (case-insensitively). Mirrored so a rendered [`ServicePortRange`]
+/// matches Go's bytes and a parse accepts every name Go accepts. Numbers absent from the table
+/// render as their decimal value, as Go's does.
+const PROTO_NAMES: &[(u8, &str)] = &[
+    (51, "ah"),
+    (33, "dccp"),
+    (8, "egp"),
+    (50, "esp"),
+    (47, "gre"),
+    (1, "icmp"),
+    (2, "igmp"),
+    (9, "igp"),
+    (4, "ipv4"),
+    (58, "ipv6-icmp"),
+    (132, "sctp"),
+    (6, "tcp"),
+    (17, "udp"),
+];
+
+/// The IP protocol number of TCP, the only protocol Go infers a Service action type for.
+const PROTO_TCP: u8 = 6;
+
+impl ServicePortRange {
+    /// The full `0..=65535` "all ports" span (Go `PortRangeAny`).
+    fn ports_is_any(&self) -> bool {
+        self.first == 0 && self.last == 65535
+    }
+
+    /// Whether this range names exactly one TCP port, and which — the shape Go's
+    /// `serviceActionTypes` infers a well-known action from (`Proto` unset or TCP, `First == Last`).
+    /// `None` for anything else, which Go skips.
+    pub fn single_tcp_port(&self) -> Option<u16> {
+        if self.proto != 0 && self.proto != PROTO_TCP {
+            return None;
+        }
+        if self.first != self.last {
+            return None;
+        }
+        Some(self.first)
+    }
+}
+
+impl std::fmt::Display for ServicePortRange {
+    /// Mirrors Go `ProtoPortRange.String()`: `"*"` for all-protocols + all-ports; otherwise
+    /// `[<proto>:]<ports>`, where the proto token is present only when `proto != 0` and the ports
+    /// token is a single port, `*` for the any-span, or `first-last`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.proto == 0 && self.ports_is_any() {
+            return f.write_str("*");
+        }
+        if self.proto != 0 {
+            match PROTO_NAMES.iter().find(|(n, _)| *n == self.proto) {
+                Some((_, name)) => write!(f, "{name}:")?,
+                None => write!(f, "{}:", self.proto)?,
+            }
+        }
+        if self.ports_is_any() {
+            f.write_str("*")
+        } else if self.first == self.last {
+            write!(f, "{}", self.first)
+        } else {
+            write!(f, "{}-{}", self.first, self.last)
+        }
+    }
+}
+
+impl std::str::FromStr for ServicePortRange {
+    type Err = String;
+
+    /// Parse Go's text form `[<proto>:]<ports>` — the inverse of the [`Display`] impl, ported from
+    /// `tailcfg.parseProtoPortRange` + `ParseHostPortRange`.
+    ///
+    /// Go lower-cases the whole token first, splits on the LAST colon, and treats a colon-less token
+    /// as `*:<ports>` (all protocols). `<proto>` is `*` (all), a `PROTO_NAMES` name, or a decimal
+    /// number; `<ports>` is `*` (the any span), a single port, or `low-high` with `low <= high`.
+    /// Fail-closed: anything else is an error, so a Service carrying a port range this build cannot
+    /// read is dropped whole rather than rendered as a guess — which is Go's behaviour too (its
+    /// `json.Unmarshal` of the enclosing `ServiceDetails` fails and the Service is skipped).
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.is_empty() {
+            return Err("empty string".to_string());
+        }
+        let lower = s.to_ascii_lowercase();
+        if lower == "*" {
+            return Ok(Self {
+                proto: 0,
+                first: 0,
+                last: 65535,
+            });
+        }
+        // Go: a token with no colon is rewritten to `*:<ports>`, then split on the LAST colon.
+        let (proto_str, ports) = match lower.rsplit_once(':') {
+            Some((p, ports)) => (p, ports),
+            None => ("*", lower.as_str()),
+        };
+        if proto_str.is_empty() {
+            return Err("empty protocol".to_string());
+        }
+        if proto_str.contains(',') {
+            return Err("host cannot contain a comma (\",\")".to_string());
+        }
+        let proto = if proto_str == "*" {
+            0
+        } else {
+            match PROTO_NAMES.iter().find(|(_, name)| *name == proto_str) {
+                Some((n, _)) => *n,
+                None => proto_str
+                    .parse::<u8>()
+                    .map_err(|_| format!("unknown protocol {proto_str:?}"))?,
+            }
+        };
+        let (first, last) = if ports == "*" {
+            (0, 65535)
+        } else {
+            match ports.split_once('-') {
+                None => {
+                    let p = ports
+                        .parse::<u16>()
+                        .map_err(|_| format!("invalid port {ports:?}"))?;
+                    (p, p)
+                }
+                Some((lo, hi)) => {
+                    let lo = lo
+                        .parse::<u16>()
+                        .map_err(|_| format!("invalid port range {ports:?}"))?;
+                    let hi = hi
+                        .parse::<u16>()
+                        .map_err(|_| format!("invalid port range {ports:?}"))?;
+                    if lo > hi {
+                        return Err(format!("invalid port range {ports:?}"));
+                    }
+                    (lo, hi)
+                }
+            }
+        };
+        Ok(Self { proto, first, last })
+    }
 }
 
 /// A single waiting Taildrop file, returned by [`Request::FileList`]. Mirrors the engine's
@@ -2045,6 +2285,179 @@ mod tests {
                 assert!(v.accept_routes);
             }
             other => panic!("expected Prefs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_port_range_parses_and_renders_gos_text_form() {
+        use crate::localapi::ServicePortRange;
+        // Go's `ProtoPortRange` is a TextMarshaler, so a Service's `Ports` arrive as strings.
+        // Every documented form round-trips through the ported codec.
+        let cases = [
+            (
+                "*",
+                ServicePortRange {
+                    proto: 0,
+                    first: 0,
+                    last: 65535,
+                },
+            ),
+            (
+                "443",
+                ServicePortRange {
+                    proto: 0,
+                    first: 443,
+                    last: 443,
+                },
+            ),
+            (
+                "tcp:443",
+                ServicePortRange {
+                    proto: 6,
+                    first: 443,
+                    last: 443,
+                },
+            ),
+            (
+                "udp:1-100",
+                ServicePortRange {
+                    proto: 17,
+                    first: 1,
+                    last: 100,
+                },
+            ),
+            (
+                "tcp:*",
+                ServicePortRange {
+                    proto: 6,
+                    first: 0,
+                    last: 65535,
+                },
+            ),
+            (
+                "80-90",
+                ServicePortRange {
+                    proto: 0,
+                    first: 80,
+                    last: 90,
+                },
+            ),
+            (
+                "ipv6-icmp:0",
+                ServicePortRange {
+                    proto: 58,
+                    first: 0,
+                    last: 0,
+                },
+            ),
+        ];
+        for (text, want) in cases {
+            let got: ServicePortRange = text.parse().unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(got, want, "parsing {text:?}");
+            assert_eq!(got.to_string(), text, "rendering {want:?}");
+        }
+        // Go lower-cases the token and resolves a numeric protocol through the same name table, so
+        // both spellings normalize to the canonical one on the way back out.
+        assert_eq!(
+            "TCP:443".parse::<ServicePortRange>().unwrap().to_string(),
+            "tcp:443"
+        );
+        assert_eq!(
+            "6:443".parse::<ServicePortRange>().unwrap().to_string(),
+            "tcp:443"
+        );
+        // A protocol with no `preferredNames` entry renders as its decimal number, as Go's does.
+        assert_eq!(
+            "99:443".parse::<ServicePortRange>().unwrap().to_string(),
+            "99:443"
+        );
+        // Fail-closed: malformed text is an error, never a guessed range.
+        for bad in [
+            "",
+            "tcp:",
+            "tcp:notaport",
+            ":443",
+            "tcp:900-100",
+            "nosuchproto:443",
+        ] {
+            assert!(
+                bad.parse::<ServicePortRange>().is_err(),
+                "{bad:?} must not parse into a port range"
+            );
+        }
+    }
+
+    #[test]
+    fn service_port_range_single_tcp_port_matches_gos_inference_filter() {
+        use crate::localapi::ServicePortRange;
+        // Go infers a well-known action only from a single TCP port: an unset proto counts as TCP,
+        // a real non-TCP proto does not, and a range is skipped however it is spelled.
+        let single_tcp: ServicePortRange = "tcp:443".parse().unwrap();
+        assert_eq!(single_tcp.single_tcp_port(), Some(443));
+        let unset_proto: ServicePortRange = "22".parse().unwrap();
+        assert_eq!(unset_proto.single_tcp_port(), Some(22));
+        let udp: ServicePortRange = "udp:53".parse().unwrap();
+        assert_eq!(udp.single_tcp_port(), None);
+        let range: ServicePortRange = "tcp:80-90".parse().unwrap();
+        assert_eq!(range.single_tcp_port(), None);
+        let any: ServicePortRange = "*".parse().unwrap();
+        assert_eq!(any.single_tcp_port(), None);
+    }
+
+    #[test]
+    fn services_request_response_round_trip() {
+        // The `services` discriminant + the Services(Vec<ServiceReport>) reply must survive the wire
+        // (the CLI and daemon are separate processes agreeing only on this JSON format).
+        assert_eq!(
+            serde_json::to_string(&Request::Services).unwrap(),
+            r#"{"cmd":"services"}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<Request>(r#"{"cmd":"services"}"#).unwrap(),
+            Request::Services
+        ));
+        let report = ServiceReport {
+            name: "svc:db".into(),
+            display_name: "Production database".into(),
+            addrs: vec!["100.64.0.10".into(), "fd7a:115c:a1e0::a".into()],
+            ports: vec![ServicePortRange {
+                proto: 6,
+                first: 5432,
+                last: 5432,
+            }],
+            actions: vec![ServiceActionReport {
+                action_type: "postgresql".into(),
+                port: 5432,
+                display_name: "Postgres".into(),
+                attributes: std::collections::BTreeMap::from([(
+                    "tailscale.com/cap/resource-name".to_string(),
+                    serde_json::json!("orders"),
+                )]),
+            }],
+        };
+        let resp = Response::Services {
+            services: vec![report.clone()],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::Services { services } => assert_eq!(services, vec![report]),
+            other => panic!("expected Services, got {other:?}"),
+        }
+        // An empty Service set is a valid answer (the tailnet grants this node none), and every
+        // empty field of a bare report is dropped from the wire.
+        let empty = serde_json::to_string(&Response::Services {
+            services: vec![ServiceReport::default()],
+        })
+        .unwrap();
+        assert!(
+            !empty.contains("display_name")
+                && !empty.contains("addrs")
+                && !empty.contains("actions"),
+            "empty ServiceReport fields must be omitted from the wire: {empty}"
+        );
+        match serde_json::from_str::<Response>(&empty).unwrap() {
+            Response::Services { services } => assert_eq!(services, vec![ServiceReport::default()]),
+            other => panic!("expected Services, got {other:?}"),
         }
     }
 

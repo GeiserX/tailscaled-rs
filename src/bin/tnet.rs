@@ -627,8 +627,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Show tailnet IP addresses — this node's by default, or a peer's if named. Mirrors Go
-    /// `tailscale ip`.
+    /// Show tailnet IP addresses — this node's by default, or a peer's (or a Tailscale Service's)
+    /// if named. Mirrors Go `tailscale ip`.
     Ip {
         /// Show only the IPv4 address (Go `-4`). Mutually exclusive with `-6`.
         #[arg(short = '4', conflicts_with = "v6")]
@@ -640,7 +640,10 @@ enum Command {
         #[arg(short = '1')]
         first: bool,
         /// A peer (by MagicDNS name or IP) whose address to show instead of this node's. Resolved
-        /// against the current netmap (the peer set `status` reports).
+        /// against the current netmap (the peer set `status` reports). An address that matches no
+        /// peer is then matched against the VIPs of the Tailscale Services this node can reach, and
+        /// that Service's addresses are printed instead (Go's Service fallback) — `tnet service
+        /// list` shows them.
         #[arg(value_name = "PEER")]
         peer: Option<String>,
         /// Assert that one of the node's IPs matches this address (Go `tailscale ip --assert`).
@@ -997,6 +1000,18 @@ enum Command {
         cmd: Option<FunnelCmd>,
         #[command(flatten)]
         flags: ServeFlags,
+    },
+    /// Interact with Tailscale Services (Go `tailscale service`).
+    ///
+    /// A Tailscale Service is a virtual service with its own IP addresses; which Services this node
+    /// can reach is decided by the tailnet's ACLs. `list` shows the ones currently available here.
+    ///
+    /// This is the READ half of Services. Hosting one (`serve --service=svc:<name>`) still needs a
+    /// `Services` map in the LocalAPI `ServeConfig` this build does not carry, and is refused by
+    /// name rather than silently ignored — see `tnet serve --help`.
+    Service {
+        #[command(subcommand)]
+        cmd: ServiceCmd,
     },
     /// Debugging tools (Go `tailscale debug`).
     Debug {
@@ -1596,6 +1611,18 @@ enum SyspolicyCmd {
     /// result matches `list`.
     Reload {
         /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// `tnet service` subcommands (Go `tailscale service`). Go registers exactly one, `list`; its bare
+/// parent prints help, which is clap's behaviour for a subcommand group too.
+#[derive(Subcommand)]
+enum ServiceCmd {
+    /// List the Tailscale Services this node can access (Go `tailscale service list`).
+    List {
+        /// Output as JSON — Go's own array shape, one object per Service.
         #[arg(long)]
         json: bool,
     },
@@ -2621,6 +2648,12 @@ async fn main() -> Result<()> {
         Command::Syspolicy {
             cmd: SyspolicyCmd::Reload { json },
         } => run_syspolicy(&socket, Request::SyspolicyReload, json).await,
+        // `service list` (Go `tailscale service list`): the Services this node can reach, from the
+        // daemon's `services` verb, decorated with each Service's MagicDNS hostname (which needs the
+        // tailnet suffix `status` carries) — the same two LocalAPI calls Go makes.
+        Command::Service {
+            cmd: ServiceCmd::List { json },
+        } => run_service_list(&socket, json).await,
         Command::File { cmd } => run_file(&socket, cmd).await,
         // `configure kubeconfig` (Go `tailscale configure kubeconfig`): resolve the auth-proxy peer
         // against Status, then render the kubeconfig locally. No daemon verb of its own.
@@ -4793,6 +4826,10 @@ async fn run_whoami(socket: &std::path::Path, json: bool) -> Result<()> {
 /// `ip` (Go `tailscale ip`): self addresses by default, or a peer's if named, with -4/-6/-1
 /// filters. Inline because the filters + the optional peer lookup shape the output (and the peer
 /// case fetches Status to resolve by name/IP against the netmap).
+///
+/// An argument that matches no peer but IS an address falls through to the Tailscale Service set
+/// (Go `serviceAddrsMatchingIP`): a Service is a virtual service with its own VIPs, which belong to
+/// no peer, so without that arm naming one could only fail with "no peer found".
 async fn run_ip(
     socket: &std::path::Path,
     v4: bool,
@@ -4850,10 +4887,51 @@ async fn run_ip(
             // (Go prints `peer.TailscaleIPs` filtered by family). `PeerReport.ipv6` is populated by
             // the daemon's status projection when the peer has one.
             Some(p) => format_ip_filtered(Some(&p.ipv4), p.ipv6.as_deref(), sel),
-            None => {
-                eprintln!("no peer matching {peer:?} in the current netmap");
-                std::process::exit(1);
-            }
+            // No peer matched. Go then asks whether the address belongs to a Tailscale Service and,
+            // if so, prints THAT Service's addresses instead of failing — a Service is not a peer,
+            // so its VIP is in no peer's address list and used to be reported as "no peer found".
+            // The Service set is fetched only on this miss, the way `configure kubeconfig` fetches
+            // the DNS config only when the peer lookup came up empty: one fewer round trip on the
+            // common path, and a daemon that cannot answer `services` no longer breaks a lookup the
+            // netmap alone already settled.
+            None => match peer.parse::<std::net::IpAddr>() {
+                Ok(want) => {
+                    let services = match round_trip(socket, &Request::Services).await {
+                        Ok(Response::Services { services }) => services,
+                        Ok(Response::Error { message }) => {
+                            eprintln!("error: {message}");
+                            std::process::exit(1);
+                        }
+                        Ok(other) => {
+                            anyhow::bail!("unexpected response to services request: {other:?}")
+                        }
+                        Err(e) => {
+                            return Err(e).with_context(|| {
+                                format!("querying services at {}", socket.display())
+                            });
+                        }
+                    };
+                    match service_addrs_matching_ip(&services, want) {
+                        Some(addrs) => format_service_ips(addrs, sel),
+                        None => {
+                            // Go: `no peer or service found with IP %v`.
+                            eprintln!("no peer or service found with IP {want}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                // A name that matches no peer never reaches Go's Service arm either: Go resolves the
+                // argument to an address first (`tailscaleIPFromArg`), and only an address can match
+                // a Service VIP. Say so, and name the command that lists the Services.
+                Err(_) => {
+                    eprintln!(
+                        "no peer matching {peer:?} in the current netmap (a Tailscale Service is \
+                         matched by its VIP address — run `tnet service list` for the Services this \
+                         node can reach)"
+                    );
+                    std::process::exit(1);
+                }
+            },
         }
     } else {
         // Self addresses.
@@ -5471,6 +5549,318 @@ async fn run_syspolicy(socket: &std::path::Path, request: Request, json: bool) -
     };
     print!("{}", format_policy(&report, json));
     Ok(())
+}
+
+/// `service list` (Go `tailscale service list`): print the Tailscale Services this node can reach.
+///
+/// Two round trips, exactly as Go's `runServiceList` makes two LocalAPI calls: the `services` verb
+/// for the Service set, then `status` for the tailnet's MagicDNS suffix, which is what turns a
+/// Service's `svc:<label>` name into the hostname the HOSTNAME column (and the JSON) carries.
+async fn run_service_list(socket: &std::path::Path, json: bool) -> Result<()> {
+    let services = match round_trip(socket, &Request::Services).await {
+        Ok(Response::Services { services }) => services,
+        Ok(Response::Error { message }) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        Ok(other) => anyhow::bail!("unexpected response to services request: {other:?}"),
+        Err(e) => {
+            return Err(e).with_context(|| format!("querying services at {}", socket.display()));
+        }
+    };
+    let status = match round_trip(socket, &Request::Status).await {
+        Ok(Response::Status(s)) => s,
+        Ok(Response::Error { message }) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        Ok(other) => anyhow::bail!("unexpected response to status request: {other:?}"),
+        Err(e) => {
+            return Err(e).with_context(|| format!("querying status at {}", socket.display()));
+        }
+    };
+    print!(
+        "{}",
+        format_service_list(&services, status.magic_dns_suffix.as_deref(), json,)
+    );
+    Ok(())
+}
+
+/// The MagicDNS hostname of a Service, porting Go's `serviceHostname`: the name without its `svc:`
+/// prefix, joined to the tailnet's MagicDNS suffix. Empty when either half is missing — a name that
+/// carries no `svc:` prefix is not a valid service name (Go's `ServiceName.WithoutPrefix` returns
+/// `""` for it), and a node with no netmap suffix has no tailnet domain to build a name in.
+fn service_hostname(name: &str, magic_dns_suffix: Option<&str>) -> String {
+    let Some(bare) = name.strip_prefix("svc:") else {
+        return String::new();
+    };
+    let suffix = magic_dns_suffix.unwrap_or("").trim_matches('.');
+    if bare.is_empty() || suffix.is_empty() {
+        return String::new();
+    }
+    format!("{bare}.{suffix}")
+}
+
+/// Go `wellKnownPortActions`: the TCP ports a Service action type is conventionally inferred from,
+/// used for the TYPE column when a Service carries no explicit actions.
+const WELL_KNOWN_PORT_ACTIONS: &[(u16, &str)] = &[
+    (22, "ssh"),
+    (80, "http"),
+    (443, "http"),
+    (1433, "mssql"),
+    (3306, "mysql"),
+    (3389, "rdp"),
+    (5432, "postgresql"),
+    (5900, "vnc"),
+    (6443, "kubernetes"),
+    (9200, "elasticsearch"),
+    (26257, "cockroach"),
+    (27017, "mongodb"),
+];
+
+/// The most action types [`service_action_types`] names before summarizing the rest as
+/// "N other(s)" (Go `maxNamedTypes`).
+const MAX_NAMED_TYPES: usize = 2;
+
+/// Render a Service's action types for the TYPE column, porting Go's `serviceActionTypes`.
+///
+/// Explicit actions are shown by type; a Service carrying none has its types inferred from
+/// well-known single TCP ports ([`WELL_KNOWN_PORT_ACTIONS`]). Types are deduplicated in first-seen
+/// order, at most [`MAX_NAMED_TYPES`] are named, and the remainder is summarized — so `"-"` for
+/// none, `"http"` for one, `"http, ssh"` for two, `"http, ssh, 2 others"` beyond that.
+fn service_action_types(svc: &tailscaled_rs::localapi::ServiceReport) -> String {
+    let raw: Vec<&str> = if !svc.actions.is_empty() {
+        svc.actions.iter().map(|a| a.action_type.as_str()).collect()
+    } else {
+        svc.ports
+            .iter()
+            // Only a single (non-range) TCP port maps to a well-known action, as in Go.
+            .filter_map(|p| p.single_tcp_port())
+            .filter_map(|port| {
+                WELL_KNOWN_PORT_ACTIONS
+                    .iter()
+                    .find(|(p, _)| *p == port)
+                    .map(|(_, t)| *t)
+            })
+            .collect()
+    };
+    // Deduplicate, preserving first-seen order (Go's `seen` map + append).
+    let mut types: Vec<&str> = Vec::new();
+    for t in raw {
+        if !types.contains(&t) {
+            types.push(t);
+        }
+    }
+    if types.is_empty() {
+        return "-".to_string();
+    }
+    if types.len() <= MAX_NAMED_TYPES {
+        return types.join(", ");
+    }
+    let extra = types.len() - MAX_NAMED_TYPES;
+    let noun = if extra == 1 { "other" } else { "others" };
+    format!("{}, {extra} {noun}", types[..MAX_NAMED_TYPES].join(", "))
+}
+
+/// Go's `cmp.Or(s, "-")`: the string, or `-` when it is empty. Every column of Go's Service table
+/// falls back to a dash rather than printing a blank cell.
+fn or_dash(s: String) -> String {
+    if s.is_empty() { "-".to_string() } else { s }
+}
+
+/// Render `tnet service list` from a [`ServiceReport`](tailscaled_rs::localapi::ServiceReport) set
+/// (Go `runServiceList`). Pure (returns the string including its trailing newline) → unit-testable;
+/// the caller `print!`s it.
+///
+/// Human form reproduces Go's `text/tabwriter` table — a leading blank line, then a header and one
+/// row per Service across the IP / HOSTNAME / DISPLAY NAME / ENDPOINTS / TYPE columns, each column
+/// padded to `max(10, widest cell + 5)` which is what `tabwriter.NewWriter(…, 10, 5, 5, ' ', 0)`
+/// computes. An empty set prints Go's sentence instead of an empty table. IP is always `Addrs[0]`,
+/// as in Go: on a tailnet with IPv4 disabled the netmap carries only the v6 address, so index 0 is
+/// the address to show either way.
+///
+/// Every cell but the fixed headers is control-pushed, so it goes through
+/// [`sanitize_for_terminal`] before it is measured or printed — the same hardening
+/// `format_dns_status`/`format_whois` apply, since a compromised control server could otherwise
+/// smuggle terminal escapes into an operator's terminal. The `--json` path is serde-escaped.
+///
+/// `json` emits Go's own array shape — the `ServiceDetails` fields in Go's order plus the
+/// `Hostname` the CLI decorates each entry with — so `tailscale service list --json` consumers
+/// keep working: `Name`, `DisplayName`, `Addrs`, `Ports` (Go's `[<proto>:]<ports>` text form),
+/// `Actions`, `Hostname`, with Go's `omitzero`/`omitempty` fields dropped when empty.
+fn format_service_list(
+    services: &[tailscaled_rs::localapi::ServiceReport],
+    magic_dns_suffix: Option<&str>,
+    json: bool,
+) -> String {
+    if json {
+        /// One `service list --json` element: Go's embedded `ServiceDetails` fields, in Go's field
+        /// order, then the `Hostname` Go's `serviceListEntry` decorates it with.
+        #[derive(serde::Serialize)]
+        struct Entry<'a> {
+            #[serde(rename = "Name")]
+            name: &'a str,
+            #[serde(rename = "DisplayName", skip_serializing_if = "str::is_empty")]
+            display_name: &'a str,
+            #[serde(rename = "Addrs", skip_serializing_if = "<[String]>::is_empty")]
+            addrs: &'a [String],
+            #[serde(rename = "Ports", skip_serializing_if = "Vec::is_empty")]
+            ports: Vec<String>,
+            #[serde(rename = "Actions", skip_serializing_if = "Vec::is_empty")]
+            actions: Vec<Action<'a>>,
+            #[serde(rename = "Hostname")]
+            hostname: String,
+        }
+        /// One action inside an [`Entry`], in Go's `ServiceAction` field order.
+        #[derive(serde::Serialize)]
+        struct Action<'a> {
+            #[serde(rename = "Type")]
+            action_type: &'a str,
+            #[serde(rename = "Port")]
+            port: u16,
+            #[serde(rename = "DisplayName", skip_serializing_if = "str::is_empty")]
+            display_name: &'a str,
+            #[serde(
+                rename = "Attributes",
+                skip_serializing_if = "std::collections::BTreeMap::is_empty"
+            )]
+            attributes: &'a std::collections::BTreeMap<String, serde_json::Value>,
+        }
+        let entries: Vec<Entry<'_>> = services
+            .iter()
+            .map(|s| Entry {
+                name: &s.name,
+                display_name: &s.display_name,
+                addrs: &s.addrs,
+                ports: s.ports.iter().map(|p| p.to_string()).collect(),
+                actions: s
+                    .actions
+                    .iter()
+                    .map(|a| Action {
+                        action_type: &a.action_type,
+                        port: a.port,
+                        display_name: &a.display_name,
+                        attributes: &a.attributes,
+                    })
+                    .collect(),
+                hostname: service_hostname(&s.name, magic_dns_suffix),
+            })
+            .collect();
+        return format!(
+            "{}\n",
+            serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string())
+        );
+    }
+
+    if services.is_empty() {
+        // Go's exact sentence — an empty tailnet-ACL grant is a normal answer, not an error.
+        return "No Tailscale Services are available to this node.\n".to_string();
+    }
+
+    // Go's header + one row per Service. The leading space of the first cell is Go's (its format
+    // string is `"\n %s\t…"`), so it is part of the cell and counts toward the column width.
+    let mut rows: Vec<[String; 5]> = vec![[
+        " IP".to_string(),
+        "HOSTNAME".to_string(),
+        "DISPLAY NAME".to_string(),
+        "ENDPOINTS".to_string(),
+        "TYPE".to_string(),
+    ]];
+    for svc in services {
+        let ip = svc.addrs.first().cloned().unwrap_or_default();
+        let endpoints = svc
+            .ports
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        rows.push([
+            format!(" {}", or_dash(sanitize_for_terminal(&ip))),
+            or_dash(sanitize_for_terminal(&service_hostname(
+                &svc.name,
+                magic_dns_suffix,
+            ))),
+            or_dash(sanitize_for_terminal(&svc.display_name)),
+            or_dash(sanitize_for_terminal(&endpoints)),
+            sanitize_for_terminal(&service_action_types(svc)),
+        ]);
+    }
+    // Go `tabwriter.NewWriter(Stdout, 10, 5, 5, ' ', 0)`: every column is tab-terminated, so each
+    // one is padded to `max(minwidth, widest cell + padding)` — including the last, which is why
+    // Go's rows carry trailing spaces.
+    const MIN_WIDTH: usize = 10;
+    const PADDING: usize = 5;
+    let mut widths = [MIN_WIDTH; 5];
+    for row in &rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.chars().count() + PADDING);
+        }
+    }
+    // Go writes a newline BEFORE each line (its format string opens with `\n`) and one final
+    // `Fprintln`, so the table is preceded by a blank line and every row ends in a newline.
+    let mut out = String::from("\n");
+    for row in &rows {
+        for (i, cell) in row.iter().enumerate() {
+            let pad = widths[i].saturating_sub(cell.chars().count());
+            out.push_str(cell);
+            out.push_str(&" ".repeat(pad));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// The Service arm of Go `ip.go`'s peer lookup: the addresses of the Service whose VIPs contain
+/// `ip`, or `None` when no Service does. Ports Go's `allIPsForServiceWithIP`.
+///
+/// A Tailscale Service is not a peer — it is a virtual service with its own addresses — so an
+/// argument that names a Service VIP matches no peer, and before this it could only be reported as
+/// "no peer found". Addresses are compared PARSED, so a differently-spelled IPv6 literal still hits.
+fn service_addrs_matching_ip(
+    services: &[tailscaled_rs::localapi::ServiceReport],
+    ip: std::net::IpAddr,
+) -> Option<&[String]> {
+    services
+        .iter()
+        .find(|svc| {
+            svc.addrs
+                .iter()
+                .filter_map(|a| a.parse::<std::net::IpAddr>().ok())
+                .any(|a| a == ip)
+        })
+        .map(|svc| svc.addrs.as_slice())
+}
+
+/// Apply an [`IpSelect`] to a Service's address list — Go `ip.go`'s tail, which prints every
+/// address of the resolved target filtered by family (`-4`/`-6`) after `-1` has truncated the list
+/// to the first.
+///
+/// A peer has exactly one address per family, so [`format_ip_filtered`] can take them positionally;
+/// a Service carries a list, so the family of each address is determined by parsing it. An address
+/// that does not parse is dropped rather than mis-filed under a family it may not belong to.
+fn format_service_ips(addrs: &[String], sel: IpSelect) -> String {
+    // Go truncates to the first address BEFORE the family filter (`-1`, `-4` and `-6` are mutually
+    // exclusive, so the order is observable only through `-1`).
+    let considered = if sel.first {
+        addrs.get(..1).unwrap_or(addrs)
+    } else {
+        addrs
+    };
+    let mut out = String::new();
+    for addr in considered {
+        let Ok(parsed) = addr.parse::<std::net::IpAddr>() else {
+            continue;
+        };
+        let wanted = if parsed.is_ipv4() { !sel.v6 } else { !sel.v4 };
+        if wanted {
+            out.push_str(addr);
+            out.push('\n');
+        }
+    }
+    if out.is_empty() {
+        return "(no matching tailnet address)\n".to_string();
+    }
+    out
 }
 
 /// clap value parser for `cert --min-validity`: Go's duration grammar, then the one restriction this
@@ -16381,6 +16771,303 @@ mod tests {
     /// A tailnet whose MagicDNS carries one Tailscale Service record, advertised by a peer that is
     /// NOT the one the record is named after — which is the point: a Service is a DNS record plus a
     /// host route in some peer's AllowedIPs, not a peer of its own.
+    /// The two Services the `service list` tests render: one bare (no display name, no explicit
+    /// action — its type is inferred from a well-known TCP port) and one fully populated.
+    fn service_fixtures() -> Vec<tailscaled_rs::localapi::ServiceReport> {
+        use tailscaled_rs::localapi::{ServiceActionReport, ServicePortRange, ServiceReport};
+        vec![
+            ServiceReport {
+                name: "svc:api".into(),
+                display_name: String::new(),
+                addrs: vec!["100.64.0.11".into()],
+                ports: vec![ServicePortRange {
+                    proto: 6,
+                    first: 443,
+                    last: 443,
+                }],
+                actions: Vec::new(),
+            },
+            ServiceReport {
+                name: "svc:db".into(),
+                display_name: "Production database".into(),
+                addrs: vec!["100.64.0.10".into(), "fd7a:115c:a1e0::a".into()],
+                ports: vec![ServicePortRange {
+                    proto: 6,
+                    first: 5432,
+                    last: 5432,
+                }],
+                actions: vec![ServiceActionReport {
+                    action_type: "postgresql".into(),
+                    port: 5432,
+                    display_name: "Postgres".into(),
+                    attributes: std::collections::BTreeMap::new(),
+                }],
+            },
+        ]
+    }
+
+    #[test]
+    fn service_list_renders_gos_tabwriter_table() {
+        // Go's table: a leading blank line, the five headers, one row per Service, every column
+        // padded to `max(10, widest cell + 5)` (its `tabwriter.NewWriter(Stdout, 10, 5, 5, ' ', 0)`)
+        // including the last, which is why the rows end in trailing spaces. IP is `Addrs[0]`; the
+        // absent display name becomes Go's `-`; `svc:api` carries no explicit action, so its type is
+        // inferred from the well-known TCP port 443.
+        let out = format_service_list(&service_fixtures(), Some("tail0123.ts.net"), false);
+        assert_eq!(
+            out,
+            "\n IP              HOSTNAME                DISPLAY NAME            ENDPOINTS     TYPE           \n \
+             100.64.0.11     api.tail0123.ts.net     -                       tcp:443       http           \n \
+             100.64.0.10     db.tail0123.ts.net      Production database     tcp:5432      postgresql     \n"
+        );
+    }
+
+    #[test]
+    fn service_list_empty_prints_gos_sentence() {
+        // A node whose tailnet ACLs grant it no Service is an ordinary answer, not an error or an
+        // empty table — Go prints one sentence and exits 0.
+        assert_eq!(
+            format_service_list(&[], Some("tail0123.ts.net"), false),
+            "No Tailscale Services are available to this node.\n"
+        );
+        // And in JSON, an empty array (Go encodes the empty `entries` slice).
+        assert_eq!(
+            format_service_list(&[], Some("tail0123.ts.net"), true),
+            "[]\n"
+        );
+    }
+
+    #[test]
+    fn service_list_json_matches_gos_entry_shape() {
+        // Go emits `serviceListEntry`: the `ServiceDetails` fields in Go's own order, then the
+        // `Hostname` the CLI decorates each entry with. `omitzero`/`omitempty` fields are dropped
+        // when empty (svc:api has no DisplayName and no Actions), `Ports` are Go's text form, and
+        // `Hostname` is always present.
+        let out = format_service_list(&service_fixtures(), Some("tail0123.ts.net"), true);
+        assert_eq!(
+            out,
+            r#"[
+  {
+    "Name": "svc:api",
+    "Addrs": [
+      "100.64.0.11"
+    ],
+    "Ports": [
+      "tcp:443"
+    ],
+    "Hostname": "api.tail0123.ts.net"
+  },
+  {
+    "Name": "svc:db",
+    "DisplayName": "Production database",
+    "Addrs": [
+      "100.64.0.10",
+      "fd7a:115c:a1e0::a"
+    ],
+    "Ports": [
+      "tcp:5432"
+    ],
+    "Actions": [
+      {
+        "Type": "postgresql",
+        "Port": 5432,
+        "DisplayName": "Postgres"
+      }
+    ],
+    "Hostname": "db.tail0123.ts.net"
+  }
+]
+"#
+        );
+    }
+
+    #[test]
+    fn service_hostname_needs_both_the_prefix_and_a_suffix() {
+        // Go's `serviceHostname`: `<name-without-svc:>.<magicDNSSuffix>`, with the suffix's dots
+        // trimmed, and "" whenever either half is missing — a name that carries no `svc:` prefix is
+        // not a valid service name, and a node with no netmap suffix has no domain to build in.
+        assert_eq!(
+            service_hostname("svc:db", Some("tail0123.ts.net")),
+            "db.tail0123.ts.net"
+        );
+        assert_eq!(
+            service_hostname("svc:db", Some(".tail0123.ts.net.")),
+            "db.tail0123.ts.net"
+        );
+        assert_eq!(service_hostname("svc:db", None), "");
+        assert_eq!(service_hostname("svc:db", Some("")), "");
+        assert_eq!(service_hostname("db", Some("tail0123.ts.net")), "");
+        assert_eq!(service_hostname("svc:", Some("tail0123.ts.net")), "");
+        // An empty hostname reaches the table as Go's `-`, never as a blank cell.
+        let mut svc = service_fixtures();
+        svc.truncate(1);
+        let out = format_service_list(&svc, None, false);
+        assert!(
+            out.lines().nth(2).is_some_and(|l| l.contains(" -")),
+            "a Service with no resolvable hostname must print `-`:\n{out}"
+        );
+    }
+
+    #[test]
+    fn service_action_types_names_two_and_summarizes_the_rest() {
+        use tailscaled_rs::localapi::{ServiceActionReport, ServicePortRange, ServiceReport};
+        let action = |t: &str, port: u16| ServiceActionReport {
+            action_type: t.into(),
+            port,
+            display_name: String::new(),
+            attributes: std::collections::BTreeMap::new(),
+        };
+        let with_actions = |actions: Vec<ServiceActionReport>| ServiceReport {
+            name: "svc:x".into(),
+            actions,
+            ..Default::default()
+        };
+        // None → "-", one → the type, two → both, more → the first two plus a count. The noun is
+        // singular for exactly one extra (Go's `1 other`).
+        assert_eq!(service_action_types(&with_actions(vec![])), "-");
+        assert_eq!(
+            service_action_types(&with_actions(vec![action("http", 80)])),
+            "http"
+        );
+        assert_eq!(
+            service_action_types(&with_actions(vec![action("http", 80), action("ssh", 22)])),
+            "http, ssh"
+        );
+        assert_eq!(
+            service_action_types(&with_actions(vec![
+                action("http", 80),
+                action("ssh", 22),
+                action("vnc", 5900),
+            ])),
+            "http, ssh, 1 other"
+        );
+        assert_eq!(
+            service_action_types(&with_actions(vec![
+                action("http", 80),
+                action("ssh", 22),
+                action("vnc", 5900),
+                action("rdp", 3389),
+            ])),
+            "http, ssh, 2 others"
+        );
+        // Duplicates collapse in first-seen order (Go's `seen` map).
+        assert_eq!(
+            service_action_types(&with_actions(vec![
+                action("http", 80),
+                action("http", 443),
+                action("ssh", 22),
+            ])),
+            "http, ssh"
+        );
+        // With no explicit actions, types are inferred from well-known SINGLE TCP ports only: 443
+        // and 80 both mean http (and collapse), 6443 means kubernetes, a UDP port and a port range
+        // infer nothing, and an unknown port infers nothing.
+        let with_ports = |ports: Vec<&str>| ServiceReport {
+            name: "svc:x".into(),
+            ports: ports
+                .iter()
+                .map(|p| p.parse::<ServicePortRange>().unwrap())
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            service_action_types(&with_ports(vec!["tcp:443", "80", "6443"])),
+            "http, kubernetes"
+        );
+        assert_eq!(
+            service_action_types(&with_ports(vec!["udp:443", "tcp:80-90", "tcp:9999"])),
+            "-"
+        );
+        // An explicit action wins over the port inference entirely (Go only infers when Actions is
+        // empty), so a Service whose ports would infer `http` still reports only what it declares.
+        assert_eq!(
+            service_action_types(&ServiceReport {
+                name: "svc:x".into(),
+                ports: vec!["tcp:443".parse().unwrap()],
+                actions: vec![action("aws-s3", 443)],
+                ..Default::default()
+            }),
+            "aws-s3"
+        );
+    }
+
+    #[test]
+    fn ip_falls_back_to_a_service_vip() {
+        // Go `ip.go`: a peer miss is retried against the Service VIPs, and a hit prints THAT
+        // Service's addresses. The lookup compares parsed addresses, so an abbreviated IPv6 literal
+        // matches however the netmap spelled it.
+        let services = service_fixtures();
+        let hit: std::net::IpAddr = "fd7a:115c:a1e0:0::a".parse().unwrap();
+        assert_eq!(
+            service_addrs_matching_ip(&services, hit),
+            Some(["100.64.0.10".to_string(), "fd7a:115c:a1e0::a".to_string()].as_slice())
+        );
+        assert_eq!(
+            service_addrs_matching_ip(&services, "100.64.0.11".parse().unwrap()),
+            Some(["100.64.0.11".to_string()].as_slice())
+        );
+        // An address no Service carries is a miss — the caller then reports Go's "no peer or
+        // service found with IP".
+        assert_eq!(
+            service_addrs_matching_ip(&services, "100.64.0.99".parse().unwrap()),
+            None
+        );
+        assert_eq!(service_addrs_matching_ip(&[], hit), None);
+    }
+
+    #[test]
+    fn service_ips_honor_the_family_and_first_filters() {
+        // Go prints every address of the resolved Service, filtered by `-4`/`-6`, after `-1` has
+        // truncated the list to the first.
+        let addrs = vec!["100.64.0.10".to_string(), "fd7a:115c:a1e0::a".to_string()];
+        assert_eq!(
+            format_service_ips(&addrs, IpSelect::default()),
+            "100.64.0.10\nfd7a:115c:a1e0::a\n"
+        );
+        assert_eq!(
+            format_service_ips(
+                &addrs,
+                IpSelect {
+                    v4: true,
+                    ..Default::default()
+                }
+            ),
+            "100.64.0.10\n"
+        );
+        assert_eq!(
+            format_service_ips(
+                &addrs,
+                IpSelect {
+                    v6: true,
+                    ..Default::default()
+                }
+            ),
+            "fd7a:115c:a1e0::a\n"
+        );
+        assert_eq!(
+            format_service_ips(
+                &addrs,
+                IpSelect {
+                    first: true,
+                    ..Default::default()
+                }
+            ),
+            "100.64.0.10\n"
+        );
+        // A Service with only a v6 address (an IPv4-disabled tailnet) and `-4` selects nothing —
+        // reported as such, never as a fabricated address.
+        assert_eq!(
+            format_service_ips(
+                &["fd7a:115c:a1e0::a".to_string()],
+                IpSelect {
+                    v4: true,
+                    ..Default::default()
+                }
+            ),
+            "(no matching tailnet address)\n"
+        );
+    }
+
     fn kube_dns() -> tailscaled_rs::localapi::DnsStatusReport {
         tailscaled_rs::localapi::DnsStatusReport {
             magic_dns: true,
