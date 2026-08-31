@@ -18892,4 +18892,139 @@ users:
             "--browser and --no-browser are the same knob; asking for both is a usage error"
         );
     }
+
+    /// `docs/ENGINE_ASKS.md` §21 is an ask filed against an OLD engine pin, and eight of the flags
+    /// it asks for have since shipped. A reader who lands on the ask list decides what is still
+    /// missing from it, so a bullet left unmarked — or a rationale still asserting in the present
+    /// tense that the engine has no field for the flags below it — sends someone to re-ask for a
+    /// pref this build already holds, or to re-implement it.
+    ///
+    /// The oracle is [`get_settings`], the production projection `tnet get` prints: it is keyed by
+    /// the very `set`-flag names the ask list uses, and it has a row exactly for the settings this
+    /// build actually models. So the doc is checked against the code rather than against a second
+    /// copy of the list — adding a ninth flag to `get_settings` without marking its bullet fails
+    /// here, and so does marking a bullet the daemon does not model.
+    mod engine_asks_21 {
+        use super::*;
+
+        const ASKS: &str = include_str!("../../docs/ENGINE_ASKS.md");
+
+        const HEADING: &str = "## 21.";
+        const LIST_INTRO: &str = "**Ask — add the engine `Config` fields";
+
+        /// Ask #21's body, from its heading to the next top-level ask.
+        fn section() -> &'static str {
+            let start = ASKS
+                .find(HEADING)
+                .unwrap_or_else(|| panic!("docs/ENGINE_ASKS.md should still contain `{HEADING}`"));
+            let body = &ASKS[start..];
+            match body[HEADING.len()..].find("\n## ") {
+                Some(end) => &body[..HEADING.len() + end],
+                None => body,
+            }
+        }
+
+        /// The bullets of §21's ask list — the `- …` items between the `**Ask — …**` intro and the
+        /// next paragraph. Continuation lines are folded into their bullet so a flag named on the
+        /// second line still belongs to it.
+        fn ask_bullets() -> Vec<String> {
+            let section = section();
+            let start = section
+                .find(LIST_INTRO)
+                .unwrap_or_else(|| panic!("§21 should still open its list with `{LIST_INTRO}`"));
+            let mut bullets: Vec<String> = Vec::new();
+            for line in section[start..].lines().skip(1) {
+                if let Some(item) = line.strip_prefix("- ") {
+                    bullets.push(item.to_string());
+                } else if line.starts_with("  ") {
+                    if let Some(last) = bullets.last_mut() {
+                        last.push(' ');
+                        last.push_str(line.trim());
+                    }
+                } else if line.starts_with("**") {
+                    break; // the next paragraph (workload-identity flags) ends the list
+                }
+            }
+            bullets
+        }
+
+        /// Every `--flag` named in a bullet's HEAD — the part before the `→` that points at the
+        /// suggested engine field. The tail is prose about the field and can mention anything.
+        fn flags_asked_for(bullet: &str) -> Vec<String> {
+            let head = bullet.split('→').next().unwrap_or(bullet);
+            head.split('`')
+                .filter(|token| token.starts_with("--"))
+                // A bullet writes the flag with its value placeholder (`--operator <user>`); the
+                // name is the first word.
+                .filter_map(|token| token.split_whitespace().next())
+                .map(|token| token.trim_start_matches('-').to_string())
+                .collect()
+        }
+
+        #[test]
+        fn every_ask_bullet_is_marked_by_whether_this_build_models_the_flag() {
+            // The settings this build really has, straight from the projection `tnet get` prints.
+            let view = tailscaled_rs::localapi::PrefsView::default();
+            let modelled: Vec<&str> = get_settings(&view)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+
+            let bullets = ask_bullets();
+            let (mut shipped_seen, mut open_seen) = (0usize, 0usize);
+            for bullet in &bullets {
+                let flags = flags_asked_for(bullet);
+                assert!(
+                    !flags.is_empty(),
+                    "§21 ask bullet names no flag before its `→`: {bullet}"
+                );
+                let carried: Vec<&String> = flags
+                    .iter()
+                    .filter(|f| modelled.contains(&f.as_str()))
+                    .collect();
+                if carried.is_empty() {
+                    open_seen += 1;
+                    assert!(
+                        bullet.starts_with("⬜ STILL OPEN"),
+                        "§21 asks for {flags:?}, which this build does not model, so the bullet \
+                         must stay marked `⬜ STILL OPEN`: {bullet}"
+                    );
+                } else {
+                    shipped_seen += 1;
+                    assert!(
+                        bullet.starts_with("✅ SHIPPED"),
+                        "`tnet get` already reports {carried:?}, so §21's bullet is a shipped flag \
+                         and must say so rather than read as an open ask: {bullet}"
+                    );
+                }
+            }
+
+            // Guard the two branches above: if the list ever became all-shipped or all-open, the
+            // half that no longer runs would pass vacuously.
+            assert!(
+                shipped_seen > 0 && open_seen > 0,
+                "§21's list should still mix shipped and open asks (saw {shipped_seen} shipped, \
+                 {open_seen} open across {} bullets)",
+                bullets.len()
+            );
+        }
+
+        #[test]
+        fn the_filed_rationale_is_dated_rather_than_read_as_current() {
+            // The trap this catches: the "no field to carry them" paragraph left in the present
+            // tense under a banner that says eight of the flags shipped. Whichever half a reader
+            // believes, the other one misleads them.
+            let section = section();
+            assert!(
+                !section.contains("has **no field** to carry them"),
+                "§21 still asserts in the present tense that the engine has no field for the flags \
+                 below it; eight of them ship at the current pin"
+            );
+            assert!(
+                section.contains("the rationale AS FILED"),
+                "§21's superseded rationale should stay, labelled as the record of what was asked \
+                 for rather than as a description of the engine today"
+            );
+        }
+    }
 }
