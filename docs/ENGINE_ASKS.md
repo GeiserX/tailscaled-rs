@@ -1075,3 +1075,97 @@ synthetic regions — `available_endpoints(regions, preferred_region_id)` — so
 one-argument change at the single call site in `ipn::captive_portal_loop`. Until then detection runs on
 the two Tailscale endpoints Go always appends (`controlplane`/`login`), which need no map but are
 status-code-only. Tracked in daemon bead tsd-iqq.5. — daemon lane
+
+---
+
+## 34. Peer route-reachability probing — `Device::route_check{,_probe}()` + a probe hint on `suggest_exit_node()` (for `tailscale routecheck` and `exit-node suggest --force-probe`)
+
+**Why:** Upstream v1.102.3 added `tailscale routecheck`
+(`cmd/tailscale/cli/routecheck.go` @ `53a0d659afa51835dd7a9283873cca44261454f8`), which prints — for
+each prefix advertised by **more than one** router — which of those routers this node can actually
+reach right now. Human output is a `PREFIX`/`IP`/`HOSTNAME` tabwriter table under a `Reachable
+routers at <time>` header, sorted by prefix then hostname, with prefixes served by one router or
+fewer dropped; `--format=json|json-line` selects the machine shapes. It reads the **cached** report
+over `LocalClient.RouteCheck` (`POST /localapi/v0/routecheck`) and forces a fresh one with `--probe`
+(`RouteCheckProbe`, `POST /localapi/v0/routecheck?probe=true`); when no report exists yet the handler
+answers `204` and the CLI says `routecheck: report unavailable`.
+
+The same subsystem now backs `exit-node suggest --force-probe` ("perform a routecheck probe before
+suggesting"), which calls `LocalClient.SuggestExitNodeWithProbe`
+(`POST /localapi/v0/suggest-exit-node?probe=true`) so the ranking runs against a *fresh* reachability
+report rather than the cached one. Go registers that flag only when the routecheck build feature is
+compiled in, and `SuggestExitNodeWithProbe` returns `feature.ErrUnavailable` when it is not — so
+even Go refuses rather than silently downgrading to the unprobed suggestion.
+
+The report itself comes from `net/routecheck`: a `Client` that groups the netmap's **online** peers
+by the route prefixes they advertise (`GroupRoutersByPrefix`), probes the candidate routers through a
+`Pinger` interface (`Ping(ip, pingType, size, cb)`), and caches a
+`Report { Done time.Time, Reachable NodeSet }`, where `NodeSet` is `map[tailcfg.NodeID]Node` and
+`Node { ID, Name, Addr, Routes }`. `Report.IsReachable(id)` is the per-node verdict and
+`Report.RoutablePrefixes()` the prefix→routers view the CLI renders. Probing is control-gated —
+`routecheck.IsEnabled` checks the `NodeAttrClientSideReachability` and
+`NodeAttrClientSideReachabilityRouteCheck` node attributes — and refreshed in the background off
+netmap availability and network-monitor rebind (`NotifyNetMapAvailable`, `NeedsRefresh`,
+`WatchForNetMonRebind`, `Start`/`Close`).
+
+Verified against pin `9d847a6e`/v0.43.0: the engine has **no routecheck subsystem** — no reachability
+report type, no per-peer reachability verdict, no cache, no background refresh — and
+`Device::suggest_exit_node()` takes no argument, so there is no way to ask for a probe-fresh
+suggestion.
+
+**Why not a CLI-side facsimile.** The half the daemon *can* already compute is precisely the half
+that carries none of the meaning: `StatusNode.allowed_routes` is exposed, so grouping peers by
+advertised prefix and finding the multi-path ones is a few lines here. What it cannot say is which of
+those routers is **reachable** — and "reachable" is the entire report. `Device::ping` (netstack ICMP
+echo) and `Device::ping_disco` (on-demand disco RTT) exist per peer, but a CLI loop over them would
+be a different measurement, taken at a different moment, with no `Done` timestamp, no shared cache
+for `--probe` to refresh against, and no control gate — a table that looks like Go's and does not
+mean what Go's means. Refused under the honest-omission rule; hence this ask.
+
+**Ask (three pieces, the third small):**
+
+1. A reachability report on `Device`, the analog of `routecheck.Report`:
+
+```rust
+pub struct RouteReachabilityReport {
+    /// When the report was completed (Go `Report.Done`).
+    pub done: std::time::SystemTime,
+    /// The routers found reachable (Go `Report.Reachable`, a `NodeSet`).
+    pub reachable: Vec<ReachableRouter>,
+}
+
+pub struct ReachableRouter {
+    /// Go keys on `tailcfg.NodeID`; this fork's `StableNodeId` is the equivalent handle.
+    pub stable_id: StableNodeId,
+    pub name: String,
+    pub addr: std::net::IpAddr,
+    pub routes: Vec<ipnet::IpNet>,
+}
+
+/// The cached report, or `Ok(None)` if none has been computed yet.
+pub async fn route_check(&self) -> Result<Option<RouteReachabilityReport>, Error>;
+```
+
+   `Ok(None)` mirrors Go's `204` / `ErrRouteCheckReportUnavailable` — an honest empty result, not an
+   error, exactly as `suggest_exit_node`'s `Ok(None)` already is.
+
+2. `pub async fn route_check_probe(&self) -> Result<Option<RouteReachabilityReport>, Error>` — force a
+   refresh and return the new report (Go `RouteCheckProbe` / `Client.Refresh`).
+
+3. A probe hint on the existing suggestion: `Device::suggest_exit_node_with_probe()`, or an argument
+   on `suggest_exit_node`, that refreshes the reachability report before ranking — so
+   `exit-node suggest --force-probe` means what it says.
+
+The prefix grouping, the online/candidate filter, the disco pinger and the two node-attribute gates
+all live with the netmap and the data plane, which is why this belongs in the engine: the daemon has
+neither. Whether the background refresh loop (`Start`/`NeedsRefresh`/rebind watching) ships with it is
+the engine's call — a probe-on-demand `route_check_probe` plus a `route_check` that returns `None`
+until the first probe is enough to make both commands faithful.
+
+**Daemon impact once landed:** a new `tnet routecheck` — a read-only LocalAPI verb over
+`Device::route_check`, `--probe` over `route_check_probe`, the multi-path filter and the
+`PREFIX`/`IP`/`HOSTNAME` render, plus Go's `routecheck: report unavailable` for the empty report — and
+`tnet exit-node suggest --force-probe` stops being a refusal and becomes the probe-fresh call. That
+flag already parses today and is refused at runtime with a message naming this gap
+(`check_exit_node_suggest_flags` in `src/bin/tnet.rs`), so the same command line keeps working the day
+this lands. Consumed via a pin bump. Tracked in daemon bead tsd-reb30066. — daemon lane
