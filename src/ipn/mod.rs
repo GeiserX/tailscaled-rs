@@ -1378,21 +1378,24 @@ pub struct Backend {
     current_profile: String,
     prefs_path: PathBuf,
     key_path: PathBuf,
-    /// The `--config` file path the daemon was started with, or `None` when it was launched without
-    /// `--config`. Held so the `reload-config` LocalAPI verb (Go `tailscaled`'s `reload-config` route
-    /// → `LocalBackend.ReloadConfig`) can **re-read** the same declarative config file and re-adopt its
-    /// fields into the running backend. Set once from `tailnetd`'s `main()` via
-    /// [`set_config_path`](Backend::set_config_path) right after [`load`](Backend::load) when `--config`
-    /// is given; `reload_config` errors clearly when it is `None` (there is nothing to re-read). This is
-    /// process-local boot configuration — like Go, it is NOT persisted (a `--config`-less restart has no
-    /// config to reload), and it is deliberately profile-independent: a `switch` does not change which
-    /// `--config` file the daemon was launched with.
-    config_path: Option<PathBuf>,
+    /// The `--config` SOURCE the daemon was started with (a file path, or the `vm:user-data`
+    /// sentinel — see [`crate::conffile::ConfigSource`]), or `None` when it was launched without
+    /// `--config`, or when an `optional:` source turned out to be absent and the node booted
+    /// unconfigured (there is then no config to re-read, exactly as Go leaves `sys.InitialConfig`
+    /// nil in that case). Held so the `reload-config` LocalAPI verb (Go `tailscaled`'s
+    /// `reload-config` route → `LocalBackend.ReloadConfig`) can **re-read** the same declarative
+    /// config and re-adopt its fields into the running backend. Set once from `tailnetd`'s `main()`
+    /// via [`set_config_source`](Backend::set_config_source) right after [`load`](Backend::load) when
+    /// a config was actually loaded; `reload_config` errors clearly when it is `None` (there is
+    /// nothing to re-read). This is process-local boot configuration — like Go, it is NOT persisted (a
+    /// `--config`-less restart has no config to reload), and it is deliberately profile-independent: a
+    /// `switch` does not change which `--config` source the daemon was launched with.
+    config_source: Option<crate::conffile::ConfigSource>,
     /// The WireGuard/disco UDP listen port (Go `tailscaled --port` / `PORT`), or `None` for an
     /// OS-chosen ephemeral port (the default). Set once from `tailnetd`'s `main()` via
     /// [`set_listen_port`](Backend::set_listen_port) right after [`load`](Backend::load) when `--port`
     /// (or `PORT`) is given, and threaded into the engine [`tailscale::Config`] by
-    /// [`build_config`](Backend::build_config). Like `config_path`, this is process-local boot
+    /// [`build_config`](Backend::build_config). Like `config_source`, this is process-local boot
     /// configuration: NOT a pref, NOT persisted, and profile-independent (a `switch` does not change
     /// the listen port the daemon was launched with). `Some(p)` pins the bind so the node's UDP
     /// endpoint is stable across restarts; the engine falls back to an ephemeral port if `p` is taken.
@@ -1672,9 +1675,9 @@ impl Backend {
             current_profile,
             prefs_path,
             key_path,
-            // No `--config` by default; `tailnetd`'s `main()` calls `set_config_path` right after this
-            // when `--config <file>` was given, so `reload_config` can later re-read that exact file.
-            config_path: None,
+            // No `--config` by default; `tailnetd`'s `main()` calls `set_config_source` right after
+            // this when a `--config` source actually loaded, so `reload_config` can later re-read it.
+            config_source: None,
             // No fixed listen port by default (ephemeral, OS-chosen — Go's port 0); `tailnetd`'s
             // `main()` calls `set_listen_port` right after this when `--port`/`PORT` was given.
             listen_port: None,
@@ -1698,20 +1701,22 @@ impl Backend {
         Ok(backend)
     }
 
-    /// Record the `--config` file path the daemon was started with, so the `reload-config` LocalAPI
-    /// verb can later re-read it (see [`config_path`](Backend::config_path) and
+    /// Record the `--config` source the daemon was started with, so the `reload-config` LocalAPI
+    /// verb can later re-read it (see [`config_source`](Backend::config_source) and
     /// [`reload_config`](Backend::reload_config)). Called once from `tailnetd`'s `main()` right after
-    /// [`load`](Backend::load) when `--config <file>` was given — separate from `load` so the common
-    /// (config-less) startup path stays untouched and the rare config path is one explicit call. Idempotent
-    /// (last write wins), though the daemon only ever calls it once at boot.
-    pub fn set_config_path(&mut self, path: PathBuf) {
-        self.config_path = Some(path);
+    /// [`load`](Backend::load) when a `--config` source actually loaded — separate from `load` so the
+    /// common (config-less) startup path stays untouched and the rare config path is one explicit
+    /// call. NOT called when an `optional:` source was absent: there is nothing to re-read, so
+    /// `reload-config` correctly reports that no config is in use. Idempotent (last write wins),
+    /// though the daemon only ever calls it once at boot.
+    pub fn set_config_source(&mut self, source: crate::conffile::ConfigSource) {
+        self.config_source = Some(source);
     }
 
     /// Record the WireGuard/disco UDP listen port the daemon was started with (Go `tailscaled --port`
     /// / `PORT`), threaded into the engine config by [`build_config`](Backend::build_config). Called
     /// once from `tailnetd`'s `main()` right after [`load`](Backend::load) when `--port`/`PORT` was
-    /// given — separate from `load` (like [`set_config_path`](Backend::set_config_path)) so the common
+    /// given — separate from `load` (like [`set_config_source`](Backend::set_config_source)) so the common
     /// (ephemeral-port) startup path stays untouched. `None` is never passed (the caller only calls
     /// this when a port was given); a `Some(0)` would be honored verbatim by the engine as "pick any",
     /// equivalent to the default. Idempotent (last write wins); the daemon calls it once at boot.
@@ -4067,12 +4072,12 @@ impl Backend {
     /// "reload my settings" verb should do, so we do not. (This is the one deliberate narrowing vs. Go's
     /// boot path, where the key is consumed at first bring-up; flagged in the type docs.)
     pub async fn reload_config(&mut self) -> Result<ReloadAction> {
-        let path = match &self.config_path {
-            Some(p) => p.clone(),
+        let source = match &self.config_source {
+            Some(s) => s.clone(),
             None => {
                 return Err(anyhow!(
-                    "no --config file in use; reload-config requires the daemon to have been started \
-                     with --config"
+                    "no --config source in use; reload-config requires the daemon to have been \
+                     started with --config (and, for an `optional:` source, to have found it)"
                 ));
             }
         };
@@ -4080,9 +4085,9 @@ impl Backend {
         // unsupported-version file is rejected here, before any mutation — the same fail-hard contract
         // as boot). `apply_config` then validates every field BEFORE mutating prefs (all-or-nothing),
         // so a bad reload leaves the running node's prefs untouched.
-        let config = crate::conffile::load(&path)
-            .with_context(|| format!("reloading --config {}", path.display()))?;
-        tracing::info!(path = %path.display(), version = %config.version, "reloading --config");
+        let config = crate::conffile::load(&source)
+            .with_context(|| format!("reloading --config {source}"))?;
+        tracing::info!(source = %source, version = %config.version, "reloading --config");
         // Merge + persist (and capture, only to drop) the config's auth key — a reload is not a
         // re-auth (see the doc comment). `apply_config` already persists the merged prefs.
         let authkey = self.apply_config(&config).await?;
@@ -4186,8 +4191,8 @@ mod tests {
             prefs_path: dir.join("prefs.json"),
             key_path: dir.join("node.key.json"),
             // No `--config` by default; the reload-config tests set this explicitly when exercising
-            // the re-read path (`set_config_path`).
-            config_path: None,
+            // the re-read path (`set_config_source`).
+            config_source: None,
             // No fixed listen port by default (ephemeral); tests that exercise it set it explicitly.
             listen_port: None,
             device: None,
@@ -7291,7 +7296,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let config = crate::conffile::load(&cfg_path).expect("load config");
+        let config = crate::conffile::load(&crate::conffile::ConfigSource::File(cfg_path.clone()))
+            .expect("load config");
 
         let authkey = be.apply_config(&config).await.expect("apply_config");
 
@@ -7328,9 +7334,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reload_config_without_config_path_errors_clearly() {
+    async fn reload_config_without_config_source_errors_clearly() {
         // `reload_config` re-reads the `--config` file the daemon was started with. A daemon launched
-        // WITHOUT `--config` has nothing to reload (`config_path` is None) — it must fail with a clear,
+        // WITHOUT `--config` has nothing to reload (`config_source` is None) — it must fail with a clear,
         // actionable error (matching Go's ReloadConfig, which errors when there is no config file),
         // never silently no-op or panic.
         let dir =
@@ -7339,8 +7345,8 @@ mod tests {
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let mut be = backend_for(&dir);
         assert!(
-            be.config_path.is_none(),
-            "a backend with no --config has config_path None"
+            be.config_source.is_none(),
+            "a backend with no --config has config_source None"
         );
 
         let err = be
@@ -7373,7 +7379,7 @@ mod tests {
         // Record a config path (as `tailnetd`'s main() would after `--config`), then write a config to
         // it and reload.
         let cfg_path = dir.join("daemon-config.json");
-        be.set_config_path(cfg_path.clone());
+        be.set_config_source(crate::conffile::ConfigSource::File(cfg_path.clone()));
         tokio::fs::write(
             &cfg_path,
             br#"{"version":"alpha0","Hostname":"reloaded-host","ShieldsUp":true}"#,
@@ -7436,7 +7442,7 @@ mod tests {
         // Pretend the node was up-intent before the reload (a real up would also have a device).
         be.prefs.want_running = true;
         let cfg_path = dir.join("daemon-config.json");
-        be.set_config_path(cfg_path.clone());
+        be.set_config_source(crate::conffile::ConfigSource::File(cfg_path.clone()));
 
         // A config that keeps the node enabled → want_running stays true; down node → PersistedOnly.
         tokio::fs::write(
@@ -7548,7 +7554,7 @@ mod tests {
         be.prefs.hostname = Some("original-host".to_string());
 
         let cfg_path = dir.join("daemon-config.json");
-        be.set_config_path(cfg_path.clone());
+        be.set_config_source(crate::conffile::ConfigSource::File(cfg_path.clone()));
         // Unsupported version → `conffile::load` rejects it.
         tokio::fs::write(
             &cfg_path,

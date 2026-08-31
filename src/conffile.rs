@@ -1,10 +1,25 @@
 //! Declarative daemon config file — the Rust analogue of Go's `ipn.ConfigVAlpha` + `ipn/conffile`.
 //!
-//! `tailnetd --config <file>` loads a JSON document describing the node's intended prefs up front,
+//! `tailnetd --config <source>` loads a JSON document describing the node's intended prefs up front,
 //! the path headless / k8s / automated installs rely on (declarative prefs without an interactive
 //! `tnet up`). This module owns: the [`ConfigVAlpha`] DTO (Go-faithful field names), [`load`] (read +
 //! version-gate + strict-parse, mirroring `conffile.Load`), and [`Config::apply_to_prefs`] (merge the
 //! honored subset into [`Prefs`]).
+//!
+//! ## The flag takes a SOURCE, not just a path
+//!
+//! Go's `--config` value is a config *source* ([`ConfigFlag`] parses it):
+//!
+//! * a file path — the common case;
+//! * [`VM_USER_DATA_PATH`] (`vm:user-data`), the VM's user-data from the cloud instance metadata
+//!   service (EC2) — recognized here, but see [`load`]: this build cannot read it;
+//! * either of those behind an [`OPTIONAL_PREFIX`] (`optional:`) marker, meaning an **absent** source
+//!   is not fatal — the node boots unconfigured and can be enrolled interactively instead of failing
+//!   to start, while a source that is present but **invalid** still fails.
+//!
+//! That last distinction is why the read phase of [`load`] reports [`NoConfig`] (Go's
+//! `conffile.ErrNoConfig`) rather than one opaque failure: `optional:` must be able to tell "no config
+//! present" from "config present and malformed".
 //!
 //! ## Honest omission
 //!
@@ -133,16 +148,186 @@ pub struct ConfigVAlpha {
     pub static_endpoints: Vec<String>,
 }
 
-/// Load and parse a `--config` file (Go `conffile.Load`).
+/// The sentinel `--config` value meaning "read the config from the VM's user-data, via the cloud
+/// instance metadata service" instead of from a file on disk (Go `conffile.VMUserDataPath`).
+pub const VM_USER_DATA_PATH: &str = "vm:user-data";
+
+/// The prefix that marks a `--config` source as optional (Go `cmd/tailscaled`'s `optional:`): an
+/// absent source is not a startup failure. See [`ConfigFlag`].
+pub const OPTIONAL_PREFIX: &str = "optional:";
+
+/// "No config was provided" — the Rust analogue of Go's `conffile.ErrNoConfig`, and the error
+/// [`load`] reports for every **read-phase** failure: a missing or unreadable file, or a
+/// `vm:user-data` source this build cannot read.
 ///
-/// Reads `path`, parses it as **standard JSON** (this fork omits HuJSON — the comment-stripping
+/// It is deliberately distinguishable from the errors [`load`] returns once the bytes ARE in hand (a
+/// JSON syntax error, an absent/unsupported `version`), because that is the entire contract of the
+/// `optional:` prefix: **absent** → boot unconfigured; **present but malformed** → still fail. Callers
+/// classify with [`is_no_config`] (Go `errors.Is(err, conffile.ErrNoConfig)`) rather than by matching
+/// on message text.
+#[derive(Debug)]
+pub struct NoConfig {
+    /// The source as the operator named it (`/etc/tailnetd/config.json`, `vm:user-data`, …).
+    pub source: String,
+    /// Why nothing could be read from it (the underlying I/O error, or why the source is unreadable
+    /// by this build). Carried as a string because it is only ever reported, never re-inspected —
+    /// Go likewise flattens it in with `fmt.Errorf("%w: %v", ErrNoConfig, err)`.
+    pub reason: String,
+}
+
+impl std::fmt::Display for NoConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no config present at {}: {}", self.source, self.reason)
+    }
+}
+
+impl std::error::Error for NoConfig {}
+
+/// Does this error mean "the config source is absent" (as opposed to "present but invalid")? The Go
+/// `errors.Is(err, conffile.ErrNoConfig)` of this port.
+///
+/// Walks the whole [`anyhow`] chain, so a caller's own `.with_context(…)` wrapper — which every
+/// `--config` call site adds — cannot hide the classification.
+pub fn is_no_config(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| cause.is::<NoConfig>())
+}
+
+/// Where a `--config` document comes from.
+///
+/// Go passes the raw flag string to `conffile.Load`, where `vm:user-data` is a *sentinel* rather than
+/// a filename. Typing it here is the fix for this fork's original `PathBuf` flag, which had no way to
+/// express "not a path" and so tried to `open("vm:user-data")` and died at startup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfigSource {
+    /// A JSON config document at this path on disk.
+    File(std::path::PathBuf),
+    /// The VM's user-data, from the cloud instance metadata service (Go `VMUserDataPath`, EC2 today).
+    /// Recognized by this build but not readable by it — see [`load`].
+    VmUserData,
+}
+
+impl ConfigSource {
+    /// Classify a `--config` value whose `optional:` prefix (if any) has already been stripped — Go's
+    /// `switch path { case VMUserDataPath: readVMUserData() default: os.ReadFile(path) }`.
+    pub fn parse(value: &str) -> Self {
+        if value == VM_USER_DATA_PATH {
+            Self::VmUserData
+        } else {
+            Self::File(std::path::PathBuf::from(value))
+        }
+    }
+}
+
+impl std::fmt::Display for ConfigSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::File(path) => write!(f, "{}", path.display()),
+            Self::VmUserData => f.write_str(VM_USER_DATA_PATH),
+        }
+    }
+}
+
+/// A parsed `tailnetd --config` flag value: the [`ConfigSource`] plus whether the operator marked it
+/// `optional:` (Go strips that prefix in `cmd/tailscaled/tailscaled.go`, not in `conffile`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigFlag {
+    /// `optional:` was given: an **absent** source is not fatal — boot unconfigured and let the node
+    /// be enrolled interactively. A source that is present but invalid still fails.
+    pub optional: bool,
+    /// The source, with any `optional:` prefix stripped.
+    pub source: ConfigSource,
+}
+
+impl ConfigFlag {
+    /// Parse a raw `--config` value.
+    ///
+    /// `None` for an empty value: Go gates its whole config block on `args.confFile != ""`, so
+    /// `--config ""` means "no config given", not "read the file named ``". Note that
+    /// `--config optional:` (an empty source *behind* the marker) is NOT that case — it is an
+    /// optional source that is absent, which [`load`] duly reports as [`NoConfig`] and
+    /// [`ConfigFlag::load`] duly tolerates, exactly as Go's `os.ReadFile("")` does.
+    pub fn parse(value: &str) -> Option<Self> {
+        if value.is_empty() {
+            return None;
+        }
+        // Go: `if p, ok := strings.CutPrefix(path, "optional:"); ok { optional, path = true, p }` —
+        // ONE prefix is stripped, so `optional:optional:x` is an optional source literally named
+        // `optional:x`.
+        Some(match value.strip_prefix(OPTIONAL_PREFIX) {
+            Some(rest) => Self {
+                optional: true,
+                source: ConfigSource::parse(rest),
+            },
+            None => Self {
+                optional: false,
+                source: ConfigSource::parse(value),
+            },
+        })
+    }
+
+    /// [`load`] this flag's source, applying the `optional:` contract: `Ok(None)` means "no config
+    /// present, and that is allowed — carry on unconfigured" (Go's
+    /// `case optional && errors.Is(err, conffile.ErrNoConfig)`). Every other failure — including any
+    /// failure at all when `optional` is false, and a malformed-but-present config even when it is
+    /// true — is returned as an error, because a config the operator declared and that exists must
+    /// never be silently ignored.
+    pub fn load(&self) -> Result<Option<Config>> {
+        match load(&self.source) {
+            Ok(config) => Ok(Some(config)),
+            Err(e) if self.optional && is_no_config(&e) => {
+                tracing::info!(
+                    source = %self.source,
+                    reason = %e,
+                    "config: none present; continuing unconfigured (--config optional:)"
+                );
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Load and parse a `--config` source (Go `conffile.Load`).
+///
+/// Reads `source`, parses it as **standard JSON** (this fork omits HuJSON — the comment-stripping
 /// preprocessor Go gates behind a build feature; a config must be valid JSON here), gates the
 /// `version` (only `"alpha0"` is accepted — an empty or unrecognized version is a clear error, like
 /// Go), then decodes the full [`ConfigVAlpha`]. Fails loudly with context on any step (a misconfigured
 /// headless deploy must fail fast, not start half-configured).
-pub fn load(path: &std::path::Path) -> Result<Config> {
-    let raw =
-        std::fs::read(path).with_context(|| format!("reading config file {}", path.display()))?;
+///
+/// ## Two kinds of failure
+///
+/// A **read-phase** failure — the source is absent or unreadable — is reported as [`NoConfig`], which
+/// [`is_no_config`] recognizes anywhere in the error chain. Everything after the bytes are in hand
+/// (bad JSON, missing or unsupported `version`) is a plain error. Only the first kind is survivable,
+/// and only behind `optional:` — see [`ConfigFlag::load`].
+///
+/// ## `vm:user-data` is recognized but not readable here
+///
+/// Go reads [`VM_USER_DATA_PATH`] from the EC2 instance metadata service, behind its `HasAWS` build
+/// feature; a Go build *without* that feature returns `feature.ErrUnavailable`, which `conffile.Load`
+/// wraps in `ErrNoConfig` exactly like a missing file. This fork has no cloud-metadata client, so it
+/// takes that same branch. The point is the error path, and it is now the right one: the sentinel is
+/// recognized rather than mistaken for a filename, `--config optional:vm:user-data` (the cloud-init
+/// form) boots unconfigured instead of dying at startup, and a bare `--config vm:user-data` still
+/// fails loudly — naming what is missing — rather than silently ignoring a declared config source.
+pub fn load(source: &ConfigSource) -> Result<Config> {
+    let raw = match source {
+        ConfigSource::File(path) => std::fs::read(path).map_err(|e| {
+            anyhow!(NoConfig {
+                source: source.to_string(),
+                reason: e.to_string(),
+            })
+        })?,
+        ConfigSource::VmUserData => {
+            return Err(anyhow!(NoConfig {
+                source: VM_USER_DATA_PATH.to_string(),
+                reason: "reading a VM's user-data (cloud instance metadata) is not supported by \
+                         this build"
+                    .to_string(),
+            }));
+        }
+    };
 
     // Gate the version BEFORE decoding the whole body (Go decodes a {version} probe first), so an
     // unsupported version yields a precise message rather than a confusing field error.
@@ -151,26 +336,18 @@ pub fn load(path: &std::path::Path) -> Result<Config> {
         #[serde(default)]
         version: String,
     }
-    let probe: VersionProbe = serde_json::from_slice(&raw).with_context(|| {
-        format!(
-            "parsing config file {} (must be valid JSON)",
-            path.display()
-        )
-    })?;
+    let probe: VersionProbe = serde_json::from_slice(&raw)
+        .with_context(|| format!("parsing config file {source} (must be valid JSON)"))?;
     match probe.version.as_str() {
-        "" => bail!(
-            "config file {}: no \"version\" field defined (want \"alpha0\")",
-            path.display()
-        ),
+        "" => bail!("config file {source}: no \"version\" field defined (want \"alpha0\")"),
         "alpha0" => {}
         other => bail!(
-            "config file {}: unsupported \"version\" value {other:?}; want \"alpha0\" for now",
-            path.display()
+            "config file {source}: unsupported \"version\" value {other:?}; want \"alpha0\" for now"
         ),
     }
 
-    let parsed: ConfigVAlpha = serde_json::from_slice(&raw)
-        .with_context(|| format!("parsing config file {}", path.display()))?;
+    let parsed: ConfigVAlpha =
+        serde_json::from_slice(&raw).with_context(|| format!("parsing config file {source}"))?;
     Ok(Config {
         version: probe.version,
         parsed,
@@ -374,7 +551,7 @@ mod tests {
             CFG_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::write(&path, json).unwrap();
-        let loaded = load(&path);
+        let loaded = load(&ConfigSource::File(path.clone()));
         let _ = std::fs::remove_file(&path);
         match loaded {
             Ok(c) => c,
@@ -475,7 +652,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("nover.json");
         // `Config` has no `Debug`, so `unwrap_err()` won't compile — assert via the Err arm directly.
-        let err_str = |path: &std::path::Path| match load(path) {
+        let err_str = |path: &std::path::Path| match load(&ConfigSource::File(path.to_path_buf())) {
             Ok(_) => panic!("expected an error"),
             Err(e) => e.to_string(),
         };
@@ -607,5 +784,198 @@ mod tests {
         let mut p = Prefs::default();
         c.apply_to_prefs(&mut p).unwrap();
         assert_eq!(p.hostname.as_deref(), Some("h"));
+    }
+
+    /// A `--config` value is a SOURCE, not just a path: `optional:` is stripped (once), and
+    /// `vm:user-data` is a sentinel rather than a filename. Go:
+    /// `strings.CutPrefix(path, "optional:")` in `cmd/tailscaled` + `case VMUserDataPath` in
+    /// `conffile.Load`.
+    #[test]
+    fn config_flag_parses_optional_prefix_and_vm_user_data_sentinel() {
+        let flag = |v: &str| ConfigFlag::parse(v);
+
+        // Plain path: not optional, a file source.
+        assert_eq!(
+            flag("/etc/tailnetd/config.json"),
+            Some(ConfigFlag {
+                optional: false,
+                source: ConfigSource::File(std::path::PathBuf::from("/etc/tailnetd/config.json")),
+            })
+        );
+        // The sentinel, bare and behind the marker.
+        assert_eq!(
+            flag("vm:user-data"),
+            Some(ConfigFlag {
+                optional: false,
+                source: ConfigSource::VmUserData,
+            })
+        );
+        assert_eq!(
+            flag("optional:vm:user-data"),
+            Some(ConfigFlag {
+                optional: true,
+                source: ConfigSource::VmUserData,
+            }),
+            "the cloud-init form: optional marker + user-data sentinel"
+        );
+        // Optional file path.
+        assert_eq!(
+            flag("optional:/etc/tailnetd/config.json"),
+            Some(ConfigFlag {
+                optional: true,
+                source: ConfigSource::File(std::path::PathBuf::from("/etc/tailnetd/config.json")),
+            })
+        );
+        // Exactly ONE prefix is stripped (Go's CutPrefix), so the rest is a literal source name.
+        assert_eq!(
+            flag("optional:optional:x"),
+            Some(ConfigFlag {
+                optional: true,
+                source: ConfigSource::File(std::path::PathBuf::from("optional:x")),
+            })
+        );
+        // Empty value = "no --config given" (Go gates on `args.confFile != ""`).
+        assert_eq!(flag(""), None);
+        // But `optional:` with an empty source IS a flag — an optional source that is simply absent.
+        assert_eq!(
+            flag("optional:"),
+            Some(ConfigFlag {
+                optional: true,
+                source: ConfigSource::File(std::path::PathBuf::new()),
+            })
+        );
+        // Display round-trips the source as the operator wrote it (used in every error message).
+        assert_eq!(ConfigSource::VmUserData.to_string(), "vm:user-data");
+        assert_eq!(
+            ConfigSource::File(std::path::PathBuf::from("/tmp/c.json")).to_string(),
+            "/tmp/c.json"
+        );
+    }
+
+    /// The load error must distinguish "no config present" from "config present and malformed" —
+    /// Go's `conffile.ErrNoConfig` vs. a plain parse error. This is what makes `optional:` possible.
+    #[test]
+    fn absent_source_is_no_config_but_malformed_one_is_not() {
+        let dir = std::env::temp_dir().join(format!("tailnetd-conf-noconf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Missing file → NoConfig.
+        let missing = dir.join("definitely-absent.json");
+        let err = match load(&ConfigSource::File(missing.clone())) {
+            Ok(_) => panic!("a missing config file must not load"),
+            Err(e) => e,
+        };
+        assert!(
+            is_no_config(&err),
+            "a missing file is 'no config present': {err}"
+        );
+        assert!(err.to_string().contains("no config present"), "{err}");
+
+        // The classification survives a caller's context wrapper (every call site adds one).
+        let wrapped = err.context("loading --config");
+        assert!(
+            is_no_config(&wrapped),
+            "context must not hide the classification: {wrapped}"
+        );
+
+        // Present but malformed JSON → NOT NoConfig (it must still fail, even with `optional:`).
+        let broken = dir.join("broken.json");
+        std::fs::write(&broken, "{ this is not json").unwrap();
+        let err = match load(&ConfigSource::File(broken.clone())) {
+            Ok(_) => panic!("malformed JSON must not load"),
+            Err(e) => e,
+        };
+        assert!(
+            !is_no_config(&err),
+            "a present-but-malformed config is NOT 'no config present': {err}"
+        );
+
+        // Present but an unsupported version → also NOT NoConfig.
+        let badver = dir.join("badver.json");
+        std::fs::write(&badver, r#"{"version":"beta9"}"#).unwrap();
+        let err = match load(&ConfigSource::File(badver.clone())) {
+            Ok(_) => panic!("an unsupported version must not load"),
+            Err(e) => e,
+        };
+        assert!(!is_no_config(&err), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `vm:user-data` is RECOGNIZED (not treated as a filename) and reports absence, the branch Go
+    /// takes on a build without cloud-metadata support (`feature.ErrUnavailable`, wrapped in
+    /// `ErrNoConfig`). So the sentinel no longer dies with a bogus "no such file" and, behind
+    /// `optional:`, does not fail startup at all.
+    #[test]
+    fn vm_user_data_source_reports_no_config_naming_the_missing_support() {
+        let err = match load(&ConfigSource::VmUserData) {
+            Ok(_) => panic!("this build cannot read the VM user-data"),
+            Err(e) => e,
+        };
+        assert!(is_no_config(&err), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("vm:user-data"), "{msg}");
+        assert!(
+            msg.contains("not supported by this build"),
+            "the error must name what is missing, not pretend it was a file: {msg}"
+        );
+    }
+
+    /// The `optional:` contract end-to-end, through the production `ConfigFlag::load`:
+    /// absent + optional → boot unconfigured; absent + required → fail; present + malformed → fail
+    /// EVEN when optional; present + valid → load.
+    #[test]
+    fn optional_prefix_tolerates_an_absent_source_but_never_a_broken_one() {
+        let dir = std::env::temp_dir().join(format!("tailnetd-conf-opt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("absent.json");
+        let missing_s = missing.display().to_string();
+
+        // `Config` has no `Debug`, so `Result<Option<Config>>` cannot be unwrapped — match by hand.
+        let loaded = |value: &str| {
+            let flag = ConfigFlag::parse(value).expect("a non-empty --config value parses");
+            match flag.load() {
+                Ok(Some(_)) => Ok(true),
+                Ok(None) => Ok(false),
+                Err(e) => Err(e.to_string()),
+            }
+        };
+
+        // Absent + optional → Ok(None): the node boots unconfigured.
+        assert_eq!(
+            loaded(&format!("optional:{missing_s}")),
+            Ok(false),
+            "an absent optional source must not fail startup"
+        );
+        // Same for the cloud-init form this bead is named after.
+        assert_eq!(loaded("optional:vm:user-data"), Ok(false));
+        // Absent + required → error (unchanged fail-fast contract).
+        match loaded(&missing_s) {
+            Err(e) => assert!(e.contains("no config present"), "{e}"),
+            Ok(_) => panic!("a required but absent config must fail"),
+        }
+        match loaded("vm:user-data") {
+            Err(e) => assert!(e.contains("not supported by this build"), "{e}"),
+            Ok(_) => panic!("a required vm:user-data source must fail on this build"),
+        }
+
+        // Present but malformed → fails EVEN with `optional:` (the whole point: optional means
+        // "may be absent", never "may be broken").
+        let broken = dir.join("broken.json");
+        std::fs::write(&broken, r#"{"version":"beta9"}"#).unwrap();
+        let broken_s = broken.display().to_string();
+        match loaded(&format!("optional:{broken_s}")) {
+            Err(e) => assert!(e.contains("unsupported") && e.contains("beta9"), "{e}"),
+            Ok(_) => panic!("an optional-but-present-and-invalid config must still fail"),
+        }
+
+        // Present and valid → loaded, optional or not.
+        let good = dir.join("good.json");
+        std::fs::write(&good, r#"{"version":"alpha0","Hostname":"node-a"}"#).unwrap();
+        let good_s = good.display().to_string();
+        assert_eq!(loaded(&good_s), Ok(true));
+        assert_eq!(loaded(&format!("optional:{good_s}")), Ok(true));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
