@@ -113,6 +113,15 @@ fresh, surfacing a new login URL — handy to re-authenticate without changing a
 briefly bring the connection down while it re-registers, so avoid running it over a remote SSH/RDP
 session you could lock yourself out of.
 
+`tnet up` also answers to the spellings Go's `tailscale up` uses, so a command line copied from Go
+runs unedited: `--auth-key` is an alias of `--authkey` (and, like Go, a value of `file:<path>` under
+either spelling reads the key from that file), and `--login-server` is an alias of `--control-url`.
+Go's hidden `--host-routes` is accepted and does nothing — it has had to be `true` since Tailscale
+1.67, and this build's userspace netstack installs no host routes at all — while `--host-routes=false`
+is refused with Go's own "only 'true' is allowed". `up --nickname` is refused by name, pointing at
+`tnet set --nickname`: no `up` names a login profile, in this fork or in Go, which registers
+`--nickname` on `set` and `login` only.
+
 `tnet set` (Go `tailscale set`) adjusts policy prefs on an already-running node. Changing
 `--exit-node`, `--hostname`, `--accept-routes`, `--advertise-routes`, or `--advertise-exit-node`
 applies **live** — in place, with no reconnect (matching Go's `set`). `--shields-up`, `--ssh`,

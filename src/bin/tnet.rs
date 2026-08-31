@@ -43,11 +43,17 @@ struct Cli {
 enum Command {
     /// Bring the node up and connect to the tailnet.
     Up {
-        /// Pre-auth key for non-interactive registration. Exposes the key in argv/shell history;
-        /// prefer `--authkey-file` or the `TS_AUTH_KEY` env var. Precedence:
-        /// `--authkey-file` > `--authkey` > `$TS_AUTH_KEY`.
+        /// Pre-auth key for non-interactive registration, or `file:<path>` to read the key from a
+        /// file. Exposes a bare key in argv/shell history; prefer `file:`, `--authkey-file` or the
+        /// `TS_AUTH_KEY` env var. Precedence: `--authkey-file` > `--authkey` > `$TS_AUTH_KEY`.
         /// (INSECURE: visible in `ps`/shell history — prefer --authkey-file or $TS_AUTH_KEY.)
-        #[arg(long, conflicts_with = "authkey_file")]
+        //
+        // `--auth-key` is Go's canonical spelling: `up.go` registers the flag under that name and
+        // `cli.go`'s `CleanUpArgs` rewrites `--authkey` to it, so both spellings work upstream and
+        // both must work here. The `file:` prefix comes with the flag (Go `resolveValueFromFile`,
+        // reached through `upArgsT.getAuthKey`) and is resolved in `resolve_authkey`, so it is
+        // honoured under either spelling exactly as it is upstream.
+        #[arg(long, visible_alias = "auth-key", conflicts_with = "authkey_file")]
         authkey: Option<String>,
         /// Read the pre-auth key from a file (avoids argv/shell-history exposure). Takes precedence
         /// over `--authkey`; if neither is given, falls back to `$TS_AUTH_KEY`.
@@ -60,7 +66,12 @@ enum Command {
         /// `up`; a malformed URL fails loudly rather than silently using the default. Changing it on
         /// a node that is already running requires `--force-reauth` (switching control servers is a
         /// fresh registration, not an in-place tweak) — the daemon refuses the change otherwise.
-        #[arg(long)]
+        //
+        // `--login-server` is Go's name for this flag (`up.go` `newUpFlagSet`, mapped to
+        // `Prefs.ControlURL`) and the name `tnet login` already takes, so `up` was the odd one out.
+        // A pure alias: same value, same pref, same "can't change --login-server without
+        // --force-reauth" refusal, which this daemon already enforces on `--control-url`.
+        #[arg(long, visible_alias = "login-server")]
         control_url: Option<String>,
         /// Enable kernel-TUN mode (`TransportMode::Tun`) instead of the userspace netstack. Requires
         /// a daemon built with the `tun` feature and run as root; the daemon fails loudly otherwise.
@@ -271,6 +282,32 @@ enum Command {
         /// simply absent), not a stub.
         #[arg(long)]
         json: bool,
+        /// Install host routes to other Tailscale nodes (Go `up --host-routes`, hidden there too).
+        /// Accepted and inert: Go has required this to be `true` since Tailscale 1.67, and this
+        /// build's userspace netstack installs no host routes at all, so the only value Go allows is
+        /// the state this daemon is always in. `--host-routes=false` is refused with Go's own
+        /// message — see [`check_ported_up_flags`].
+        //
+        // Go types it as a `notFalseVar`, a bool flag whose `Set` accepts only "true". `num_args =
+        // 0..=1` + `require_equals` reproduces that shape: bare `--host-routes` is the flag's
+        // presence (Go's `IsBoolFlag`, which never consumes the next argument), and a value can only
+        // arrive as `--host-routes=<v>`, which is the only form Go's flag package passes to `Set`.
+        #[arg(
+            long,
+            hide = true,
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "true",
+            value_name = "true"
+        )]
+        host_routes: Option<String>,
+        /// NOT a `tnet up` flag, carried only so a ported command line reaches a refusal that names
+        /// where profile naming lives (`tnet set --nickname`) instead of clap's "unexpected
+        /// argument". Go does not register `--nickname` on `up` either — `up.go`'s shared flag set
+        /// gates it on `cmd == "login"` — so `up` is not the place this fork is missing it.
+        /// See [`check_ported_up_flags`].
+        #[arg(long, hide = true, value_name = "NAME")]
+        nickname: Option<String>,
     },
     /// Tweak individual prefs on an already-configured node, without an up/down cycle (the analogue
     /// of Go's `tailscale set`). This never (re)authenticates and never changes whether the node is
@@ -2206,6 +2243,8 @@ async fn main() -> Result<()> {
             id_token,
             audience,
             json,
+            host_routes,
+            nickname,
         } => {
             // Resolve the newer pref flags into their wire sentinels HERE and pass them as one named
             // struct (see `UpPrefFlags`): `run_up`'s positional list is long enough that another four
@@ -2218,6 +2257,12 @@ async fn main() -> Result<()> {
                 ),
                 advertise_connector: resolve_tristate(advertise_connector, no_advertise_connector),
                 report_posture: resolve_tristate(report_posture, no_report_posture),
+            };
+            // The two Go `up` spellings this CLI carries on the parser without a pref behind them
+            // (see `PortedUpFlags`); `run_up` gates them where Go's flag parser does — first.
+            let ported = PortedUpFlags {
+                host_routes,
+                nickname,
             };
             run_up(
                 &socket,
@@ -2254,6 +2299,7 @@ async fn main() -> Result<()> {
                 accept_risk,
                 resolve_wif(client_id, client_secret, id_token, audience).await?,
                 json,
+                ported,
             )
             .await
         }
@@ -2838,7 +2884,13 @@ async fn run_up(
     accept_risk: Option<String>,
     wif: WifFlags,
     json: bool,
+    ported: PortedUpFlags,
 ) -> Result<()> {
+    // The two Go `up` spellings this build carries with no pref behind them (see `PortedUpFlags`):
+    // Go decides both in its flag parser, before `runUp` looks at anything, so they are gated here
+    // ahead of every other check — a `--host-routes=false` command line must not first be told
+    // about some other flag it also got wrong.
+    check_ported_up_flags(&ported)?;
     // Go's own flag refusal first (stderr + exit 1), before any risk gate or daemon round-trip —
     // see `up_usage_refusal` for the ported check and why it is `up`-only.
     if let Some(message) = up_usage_refusal(
@@ -8449,23 +8501,25 @@ async fn poll_for_auth_url(socket: &std::path::Path) -> AuthOutcome {
 }
 
 /// Resolve the pre-auth key from the available sources, in precedence order:
-/// `--authkey-file` > `--authkey` > `$TS_AUTH_KEY`. Returns the secret wrapped so it is zeroized
-/// on drop and kept out of any debug/log output; `None` means no key was supplied (interactive
-/// login). `--authkey` and `--authkey-file` are mutually exclusive at the clap layer.
+/// `--authkey-file` > `--authkey`/`--auth-key` > `$TS_AUTH_KEY`. Returns the secret wrapped so it is
+/// zeroized on drop and kept out of any debug/log output; `None` means no key was supplied
+/// (interactive login). `--authkey` and `--authkey-file` are mutually exclusive at the clap layer.
+///
+/// A `--authkey`/`--auth-key` value beginning with `file:` is a PATH to the key rather than the key
+/// itself (Go `up.go` `resolveValueFromFile`, reached through `upArgsT.getAuthKey`), so the key can
+/// stay out of argv and shell history under Go's own spelling. Only the flag value is resolved that
+/// way, matching Go, which never applies the prefix to anything but the flag.
 async fn resolve_authkey(
     authkey: Option<String>,
     authkey_file: Option<PathBuf>,
 ) -> Result<Option<SecretString>> {
     if let Some(path) = authkey_file {
-        // Read from the file, then trim a single trailing newline so a here-doc / `echo > key`
-        // file works without smuggling whitespace into the key. Async read for consistency with
-        // the rest of the CLI's I/O.
-        let contents = tokio::fs::read_to_string(&path)
-            .await
-            .with_context(|| format!("reading auth key from {}", path.display()))?;
-        return Ok(Some(SecretString::from(contents.trim().to_owned())));
+        return Ok(Some(read_secret_file(&path, "auth key").await?));
     }
     if let Some(key) = authkey {
+        if let Some(path) = key.strip_prefix("file:") {
+            return Ok(Some(read_secret_file(path, "auth key").await?));
+        }
         return Ok(Some(SecretString::from(key)));
     }
     // Fall back to the env var (read manually rather than via clap `env` so it never surfaces in
@@ -8487,12 +8541,22 @@ async fn resolve_authkey(
 async fn read_secret_arg(value: Option<String>) -> Result<Option<SecretString>> {
     let Some(v) = value else { return Ok(None) };
     if let Some(path) = v.strip_prefix("file:") {
-        let contents = tokio::fs::read_to_string(path)
-            .await
-            .with_context(|| format!("reading secret from {path}"))?;
-        return Ok(Some(SecretString::from(contents.trim().to_owned())));
+        return Ok(Some(read_secret_file(path, "secret").await?));
     }
     Ok(Some(SecretString::from(v)))
+}
+
+/// Read a secret out of `path`, wrapped so it is zeroized on drop and never `Debug`-printed.
+/// Surrounding whitespace is trimmed (Go's `strings.TrimSpace` on a `file:` value), so a here-doc,
+/// `echo > key` or a CRLF file works without smuggling whitespace into the secret. `what` names the
+/// secret in the error context (`reading auth key from …`). Async for consistency with the rest of
+/// the CLI's I/O.
+async fn read_secret_file(path: impl AsRef<std::path::Path>, what: &str) -> Result<SecretString> {
+    let path = path.as_ref();
+    let contents = tokio::fs::read_to_string(path)
+        .await
+        .with_context(|| format!("reading {what} from {}", path.display()))?;
+    Ok(SecretString::from(contents.trim().to_owned()))
 }
 
 /// The workload-identity-federation / OAuth registration flags (`tnet up
@@ -8517,9 +8581,59 @@ struct UpPrefFlags {
     report_posture: Option<bool>,
 }
 
+/// The Go `up` flag spellings this CLI carries on the parser with **no pref behind them**, so a
+/// command line copied from `tailscale up` reaches an answer that names what happened instead of
+/// clap's "unexpected argument" (the same treatment the unmodelled `set` flags get — see
+/// [`UnmodelledSetFlags`]). Gated by [`check_ported_up_flags`].
+///
+/// The other two spellings that batch was about need no struct: `--auth-key` and `--login-server`
+/// are Go's names for flags this fork already has, so they are clap aliases of `--authkey` and
+/// `--control-url` and behave identically to them, value for value.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct PortedUpFlags {
+    /// `--host-routes[=<v>]`, hidden. `None` = absent; `Some("true")` = the flag's presence (Go's
+    /// `IsBoolFlag` default); any other value is Go's `notFalseVar` refusal.
+    host_routes: Option<String>,
+    /// `--nickname <NAME>`, hidden. Carried only to be refused by name: neither this fork's `up`
+    /// nor Go's takes a profile name.
+    nickname: Option<String>,
+}
+
+/// Gate the Go `up` spellings that carry no pref (see [`PortedUpFlags`]). `Ok(())` means the
+/// command line asked only for what this build already does, so `up` proceeds unchanged.
+///
+/// Ordering is Go's: both are decided in the flag parser (`notFalseVar.Set` for `--host-routes`;
+/// `--nickname` is simply not in `up`'s flag set), which runs before `runUp` reads the daemon's
+/// status or validates any other flag. So this runs before every other `up` check. Pure →
+/// unit-testable.
+fn check_ported_up_flags(flags: &PortedUpFlags) -> Result<()> {
+    // Go's `notFalseVar.Set` rejects every value but "true", and Go's flag package wraps that in
+    // `invalid boolean value %q for -host-routes: %v`. Same sentence, this CLI's flag spelling.
+    if let Some(value) = flags.host_routes.as_deref()
+        && value != "true"
+    {
+        anyhow::bail!(
+            "invalid boolean value {value:?} for --host-routes: unsupported value; only 'true' \
+             is allowed"
+        );
+    }
+    if flags.nickname.is_some() {
+        anyhow::bail!(
+            "--nickname is not a `tnet up` flag, and it is not a `tailscale up` flag upstream \
+             either: `up.go` builds one flag set for `up` and `login` and registers `--nickname` \
+             only when the command is `login`, so no `up` carries a profile name. This fork's \
+             profile naming lives on `tnet set --nickname <NAME>`, which renames the current login \
+             profile exactly as Go's `set --nickname` does — run that instead. (Go's other home \
+             for it, `login --nickname`, is not implemented here yet.)"
+        );
+    }
+    Ok(())
+}
+
 /// The Go pref flags `tailscale set` carries (`set.go` `newSetFlagSet`) beyond the ones this CLI
-/// already had — a superset of [`UpPrefFlags`], because Go registers `--nickname`, `--webclient`,
-/// `--auto-update` and `--update-check` on `set` only. Resolved and grouped for the same reason.
+/// already had — a superset of [`UpPrefFlags`], because Go registers `--webclient`, `--auto-update`
+/// and `--update-check` on `set` only, and `--nickname` on `set` and `login` but never on `up`.
+/// Resolved and grouped for the same reason.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct SetPrefFlags {
     /// `--advertise-connector` / `--no-advertise-connector` (reaches control; rebuilds a live node).
@@ -15834,20 +15948,22 @@ mod tests {
             }
             _ => panic!("expected Command::Up"),
         }
-        // Go does NOT register `--nickname`/`--webclient`/`--auto-update`/`--update-check` on `up`
-        // (only on `set`), so neither do we — an `up` that names them is a usage error, not a
+        // Go does NOT register `--webclient`/`--auto-update`/`--update-check` on `up` (only on
+        // `set`), so neither do we — an `up` that names them is a usage error, not a
         // silently-ignored flag.
-        for flag in [
-            "--nickname=x",
-            "--webclient",
-            "--auto-update",
-            "--update-check",
-        ] {
+        for flag in ["--webclient", "--auto-update", "--update-check"] {
             assert!(
                 Cli::try_parse_from(["tnet", "up", flag]).is_err(),
                 "{flag} must not be an `up` flag (Go registers it on `set` only)"
             );
         }
+        // `--nickname` is not an `up` pref either — Go registers it on `set` and `login` — but it is
+        // carried on the parser so a command line that names it is answered by name rather than by
+        // clap; see `up_nickname_is_answered_by_name_and_sent_to_set`.
+        assert!(
+            check_ported_up_flags(&parse_ported_up(&["--nickname=x"])).is_err(),
+            "`up --nickname` must not set a pref: it is refused"
+        );
     }
 
     #[test]
@@ -16164,6 +16280,187 @@ mod tests {
                 .to_string();
             assert!(err.contains("engine ask #34"), "{argv:?}: {err}");
         }
+    }
+
+    /// Parse a `tnet up` command line and project it onto the Go `up` spellings that carry no pref,
+    /// exactly as `main`'s `Command::Up` arm builds the value it hands to `run_up`.
+    fn parse_ported_up(argv: &[&str]) -> PortedUpFlags {
+        let mut full = vec!["tnet", "up"];
+        full.extend_from_slice(argv);
+        match Cli::try_parse_from(&full)
+            .unwrap_or_else(|e| panic!("`tnet up {argv:?}` should parse: {e}"))
+            .command
+        {
+            Command::Up {
+                host_routes,
+                nickname,
+                ..
+            } => PortedUpFlags {
+                host_routes,
+                nickname,
+            },
+            _ => panic!("expected Command::Up"),
+        }
+    }
+
+    #[test]
+    fn gos_up_spellings_land_on_this_forks_own_up_flags() {
+        // `--auth-key` and `--login-server` are Go's names for two flags this fork already had, so
+        // they are ALIASES: one flag, two spellings, identical behaviour. A ported command line that
+        // uses Go's names must set exactly what the fork's names set.
+        let Command::Up {
+            authkey,
+            control_url,
+            ..
+        } = Cli::try_parse_from([
+            "tnet",
+            "up",
+            "--auth-key",
+            "tskey-auth-example",
+            "--login-server",
+            "https://headscale.example.com",
+        ])
+        .expect("Go's spellings should parse")
+        .command
+        else {
+            panic!("expected Command::Up")
+        };
+        assert_eq!(authkey.as_deref(), Some("tskey-auth-example"));
+        assert_eq!(
+            control_url.as_deref(),
+            Some("https://headscale.example.com")
+        );
+
+        // Being one flag under two names is the point: naming it twice is naming one flag twice, and
+        // Go's own `--auth-key` still cannot be combined with this fork's `--authkey-file`.
+        for argv in [
+            vec!["--authkey", "a", "--auth-key", "b"],
+            vec![
+                "--control-url",
+                "http://a.example",
+                "--login-server",
+                "http://b.example",
+            ],
+            vec!["--auth-key", "a", "--authkey-file", "/dev/null"],
+        ] {
+            let mut full = vec!["tnet", "up"];
+            full.extend_from_slice(&argv);
+            assert!(
+                Cli::try_parse_from(&full).is_err(),
+                "{argv:?} names one flag twice (or a flag it conflicts with)"
+            );
+        }
+    }
+
+    #[test]
+    fn host_routes_accepts_only_the_value_go_allows() {
+        // Go registers `--host-routes` as a `notFalseVar`: a bool flag whose `Set` takes "true" and
+        // nothing else, hidden, and inert since Tailscale 1.67. Presence and `=true` are accepted
+        // and do nothing; every other value is Go's refusal, wrapped the way Go's flag package
+        // wraps it.
+        for argv in [vec!["--host-routes"], vec!["--host-routes=true"]] {
+            let flags = parse_ported_up(&argv);
+            assert_eq!(flags.host_routes.as_deref(), Some("true"), "{argv:?}");
+            check_ported_up_flags(&flags)
+                .unwrap_or_else(|e| panic!("{argv:?} is the one value Go allows: {e}"));
+        }
+        for value in ["false", "0", "1", "True", ""] {
+            let err = check_ported_up_flags(&parse_ported_up(&[&format!("--host-routes={value}")]))
+                .expect_err("Go allows only 'true'")
+                .to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "invalid boolean value {value:?} for --host-routes: unsupported value; only \
+                     'true' is allowed"
+                ),
+                "--host-routes={value}"
+            );
+        }
+        // Go's `IsBoolFlag` means the flag never consumes the following argument, so a
+        // space-separated value is not a value at all — `up` takes no positionals, so it is refused.
+        assert!(
+            Cli::try_parse_from(["tnet", "up", "--host-routes", "false"]).is_err(),
+            "`--host-routes false` passes `false` as a non-flag argument, as it does in Go"
+        );
+        // An absent flag asks for nothing.
+        assert_eq!(parse_ported_up(&[]), PortedUpFlags::default());
+        assert!(check_ported_up_flags(&PortedUpFlags::default()).is_ok());
+    }
+
+    #[test]
+    fn up_nickname_is_answered_by_name_and_sent_to_set() {
+        // `--nickname` is the one of the four that is NOT a rename of something `up` has: no `up`
+        // carries a profile name, here or upstream (`up.go` registers it only when the command is
+        // `login`). So it parses — no "unexpected argument" — and is refused with the command that
+        // does the job.
+        let flags = parse_ported_up(&["--nickname", "work-laptop"]);
+        assert_eq!(flags.nickname.as_deref(), Some("work-laptop"));
+        let err = check_ported_up_flags(&flags)
+            .expect_err("`up` names no profile")
+            .to_string();
+        assert!(err.contains("tnet set --nickname"), "{err}");
+        assert!(err.contains("`login`"), "{err}");
+
+        // Go decides both of these in its flag parser, and `--host-routes` is the one that can be
+        // wrong on its own line — so it is answered first, whatever else the command line carries.
+        let err = check_ported_up_flags(&parse_ported_up(&[
+            "--host-routes=false",
+            "--nickname",
+            "work-laptop",
+        ]))
+        .expect_err("both are refused")
+        .to_string();
+        assert!(err.contains("only 'true' is allowed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn auth_key_reads_the_file_a_file_prefix_names() {
+        use secrecy::ExposeSecret as _;
+        // Go's `--auth-key`/`--authkey` value may be `file:<path>` (`up.go` `resolveValueFromFile`,
+        // via `getAuthKey`), which is how a ported command line keeps the key out of argv without
+        // this fork's own `--authkey-file`. The contents are trimmed, as Go trims them.
+        let dir = std::env::temp_dir().join(format!("tnet-authkey-file-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("key");
+        tokio::fs::write(&path, b"  tskey-auth-from-file\r\n")
+            .await
+            .unwrap();
+
+        let from_prefix = resolve_authkey(Some(format!("file:{}", path.display())), None)
+            .await
+            .unwrap()
+            .expect("a key was supplied");
+        assert_eq!(from_prefix.expose_secret(), "tskey-auth-from-file");
+
+        // The fork's own `--authkey-file` reads the same file the same way, and still wins over a
+        // value given to `--authkey` (the documented precedence).
+        let from_flag = resolve_authkey(Some("tskey-inline".into()), Some(path.clone()))
+            .await
+            .unwrap()
+            .expect("a key was supplied");
+        assert_eq!(from_flag.expose_secret(), "tskey-auth-from-file");
+
+        // A bare value is still taken verbatim — only the `file:` prefix means a path.
+        let literal = resolve_authkey(Some("tskey-inline".into()), None)
+            .await
+            .unwrap()
+            .expect("a key was supplied");
+        assert_eq!(literal.expose_secret(), "tskey-inline");
+
+        // A `file:` path that does not exist is an error naming what it failed to read, not a key
+        // whose literal value is the path.
+        let missing = dir.join("absent");
+        let err = resolve_authkey(Some(format!("file:{}", missing.display())), None)
+            .await
+            .expect_err("the file is not there");
+        assert!(
+            format!("{err:#}").contains("reading auth key from"),
+            "{err:#}"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[test]
