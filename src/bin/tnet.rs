@@ -1313,6 +1313,43 @@ enum DebugCmd {
         #[arg(value_name = "HOSTNAME")]
         hostname: Vec<String>,
     },
+    /// Probe this network's port-mapping support and try to obtain a mapping, printing the whole
+    /// run as it happens (Go `tailscale debug portmap`). A **write** (gated root/same-uid by the
+    /// daemon): it asks the LAN gateway to forward traffic inward.
+    ///
+    /// Two peers behind NATs only get a *direct* path when a hole exists through each NAT. STUN
+    /// finds one on a well-behaved NAT; when it cannot, many home routers will open one on request
+    /// over NAT-PMP, PCP or UPnP-IGD. This command answers whether yours will, and what it gives
+    /// back: it resolves the default gateway, probes all three protocols, and — if any answers —
+    /// asks for a UDP mapping, printing `Probe: {PCP:… PMP:… UPnP:…}` and then the external
+    /// `ip:port` (or `no mapping`).
+    ///
+    /// Runs with the node up or down: the conversation is with the local router, not the tailnet.
+    /// NOTE: this build can obtain a mapping over NAT-PMP and PCP; a UPnP router is *detected* and
+    /// reported, but acquiring a mapping from it needs a SOAP/XML stack this fork does not have, and
+    /// the run says so rather than reporting UPnP as absent.
+    Portmap {
+        /// How long the whole run may take, as a Go duration (`5s`, `1500ms`, `1m`).
+        #[arg(long, value_name = "DURATION", default_value = "5s")]
+        duration: String,
+        /// Exercise only one protocol: `pmp`, `pcp` or `upnp`. Omit for all three. Deliberately a
+        /// free-form string rather than a clap value-enum: Go passes this straight to the daemon, so
+        /// a bad value is refused by the *daemon* with `unknown portmap debug type` on stderr and
+        /// exit 1 — not by the flag parser with a usage block and exit 2.
+        #[arg(long = "type", value_name = "pmp|pcp|upnp", default_value = "")]
+        ty: String,
+        /// Override gateway auto-detection with this gateway IP (must also pass `--self-addr`).
+        #[arg(long, value_name = "IP")]
+        gateway_addr: Option<String>,
+        /// Override auto-detection with this host's IP on the gateway's link (must also pass
+        /// `--gateway-addr`).
+        #[arg(long, value_name = "IP")]
+        self_addr: Option<String>,
+        /// Print all HTTP requests and responses made during the run to the log. Carried for parity
+        /// with Go; this build's UPnP leg issues no HTTP (see the note above), so it adds no output.
+        #[arg(long)]
+        log_http: bool,
+    },
     /// Print this binary's build metadata as JSON (Go `tailscale debug go-buildinfo`, which dumps
     /// Go's `runtime/debug.BuildInfo`). Purely local — no daemon round-trip. Rust has no runtime
     /// build-info reflection, so the same facts are stamped in at compile time by `build.rs`: the
@@ -2492,6 +2529,23 @@ async fn main() -> Result<()> {
             }
             // `debug resolve` is a host-resolver lookup in THIS process — no socket round-trip.
             DebugCmd::Resolve { net, hostname } => run_debug_resolve(&hostname, &net).await,
+            DebugCmd::Portmap {
+                duration,
+                ty,
+                gateway_addr,
+                self_addr,
+                log_http,
+            } => {
+                run_debug_portmap(
+                    &socket,
+                    &duration,
+                    &ty,
+                    gateway_addr.as_deref(),
+                    self_addr.as_deref(),
+                    log_http,
+                )
+                .await
+            }
             // `debug build-info` prints compile-time build facts — purely local, no round-trip.
             DebugCmd::BuildInfo => {
                 run_debug_build_info();
@@ -3537,6 +3591,110 @@ async fn run_debug_restun(socket: &std::path::Path) -> Result<()> {
         Ok(other) => anyhow::bail!("unexpected response to debug restun: {other:?}"),
         Err(e) => Err(e).with_context(|| format!("requesting restun at {}", socket.display())),
     }
+}
+
+/// Compose Go's `gateway_and_self` wire value from `--gateway-addr` + `--self-addr`, or say why the
+/// pair is unusable (Go `debugPortmap`'s pre-flight).
+///
+/// The two flags are meaningless apart — a gateway with no self address (or the reverse) names half
+/// a link — so Go refuses either alone with `if one of --gateway-addr and --self-addr is provided,
+/// the other must be as well`, and refuses a value that is not an IP with `invalid --gateway-addr: …`
+/// / `invalid --self-addr: …`. All three messages are Go's verbatim. `Ok(None)` means neither was
+/// given, i.e. auto-detect. Pure → unit-testable.
+fn portmap_gateway_and_self(
+    gateway_addr: Option<&str>,
+    self_addr: Option<&str>,
+) -> Result<Option<String>> {
+    match (gateway_addr, self_addr) {
+        (None, None) => Ok(None),
+        (Some(_), None) | (None, Some(_)) => anyhow::bail!(
+            "if one of --gateway-addr and --self-addr is provided, the other must be as well"
+        ),
+        (Some(gw), Some(me)) => {
+            let gw: std::net::IpAddr = gw
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid --gateway-addr: {e}"))?;
+            let me: std::net::IpAddr = me
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid --self-addr: {e}"))?;
+            // The daemon takes the pair as one `<gateway>/<self>` string, the same shape Go's client
+            // puts in its `gateway_and_self` query parameter.
+            Ok(Some(format!("{gw}/{me}")))
+        }
+    }
+}
+
+/// Turn `--duration` into the milliseconds the wire carries (Go's `fs.DurationVar` + the handler's
+/// `time.ParseDuration`).
+///
+/// A **negative** duration is clamped to zero rather than refused, which reproduces Go exactly: it
+/// parses fine there and becomes an already-expired context, so the run prints its
+/// deadline-exceeded line and stops. Pure → unit-testable.
+fn portmap_duration_ms(duration: &str) -> Result<u64> {
+    let nanos = parse_go_duration(duration).map_err(|e| anyhow::anyhow!(e))?;
+    Ok((nanos.max(0) / 1_000_000) as u64)
+}
+
+/// `debug portmap` (Go `tailscale debug portmap`): ask the daemon to probe this network's
+/// port-mapping support and try to obtain a mapping, printing each line of the run as it arrives.
+///
+/// Unlike every other one-shot verb, this STREAMS: the daemon writes one [`Response::PortmapLog`]
+/// frame per line for up to the requested duration and then closes the connection, so this reads
+/// until EOF and prints each `line` verbatim (matching the plain-text body `tailscale debug portmap`
+/// copies to stdout). A [`Response::Error`] — a refused `--type`, or a permission denial — is
+/// reported on stderr with exit 1.
+async fn run_debug_portmap(
+    socket: &std::path::Path,
+    duration: &str,
+    ty: &str,
+    gateway_addr: Option<&str>,
+    self_addr: Option<&str>,
+    log_http: bool,
+) -> Result<()> {
+    // Both refusals happen before the daemon is contacted, exactly like Go's.
+    let gateway_and_self = portmap_gateway_and_self(gateway_addr, self_addr)?;
+    let duration_ms = portmap_duration_ms(duration)?;
+
+    let stream = UnixStream::connect(socket)
+        .await
+        .context("connect (is tailnetd running?)")?;
+    let (read_half, mut write_half) = stream.into_split();
+
+    let mut line = serde_json::to_vec(&Request::DebugPortmap {
+        duration_ms,
+        ty: ty.to_string(),
+        gateway_and_self,
+        log_http,
+    })?;
+    line.push(b'\n');
+    write_half.write_all(&line).await?;
+    write_half.flush().await?;
+
+    let mut reader = BufReader::new(read_half);
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        let n = reader.read_line(&mut buf).await?;
+        if n == 0 {
+            // The daemon closed the stream: the run is over.
+            break;
+        }
+        let trimmed = buf.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Response>(trimmed)
+            .with_context(|| format!("parsing daemon portmap stream line: {trimmed:?}"))?
+        {
+            Response::PortmapLog { line } => println!("{line}"),
+            Response::Error { message } => {
+                eprintln!("error: {message}");
+                std::process::exit(1);
+            }
+            other => eprintln!("warning: unexpected reply on portmap stream: {other:?}"),
+        }
+    }
+    Ok(())
 }
 
 /// `reload-config` (Go `tailscaled`'s `reload-config`): ask the daemon to re-read its `--config` file
@@ -18680,6 +18838,130 @@ users:
         assert_eq!(cert_usage_refusal(true, true), None);
         assert_eq!(cert_usage_refusal(true, false), None);
         assert_eq!(cert_usage_refusal(false, false), None);
+    }
+
+    #[test]
+    fn portmap_refuses_half_a_gateway_pair() {
+        // Neither flag: auto-detect, which is the bare `tnet debug portmap`.
+        assert_eq!(portmap_gateway_and_self(None, None).expect("usable"), None);
+        // The pair is meaningless apart — a gateway with no self address (or the reverse) names
+        // half a link — so either alone is refused with Go's message, before the daemon is asked.
+        for half in [
+            portmap_gateway_and_self(Some("192.0.2.1"), None),
+            portmap_gateway_and_self(None, Some("192.0.2.2")),
+        ] {
+            assert_eq!(
+                half.expect_err("half a pair is refused").to_string(),
+                "if one of --gateway-addr and --self-addr is provided, the other must be as well"
+            );
+        }
+        // Both, and valid: they travel as one `<gateway>/<self>` string.
+        assert_eq!(
+            portmap_gateway_and_self(Some("192.0.2.1"), Some("192.0.2.2")).expect("usable"),
+            Some("192.0.2.1/192.0.2.2".to_string())
+        );
+        // Either one not being an IP is refused by name, so the operator knows which to fix.
+        assert!(
+            portmap_gateway_and_self(Some("not-an-ip"), Some("192.0.2.2"))
+                .expect_err("refused")
+                .to_string()
+                .starts_with("invalid --gateway-addr: ")
+        );
+        assert!(
+            portmap_gateway_and_self(Some("192.0.2.1"), Some("not-an-ip"))
+                .expect_err("refused")
+                .to_string()
+                .starts_with("invalid --self-addr: ")
+        );
+    }
+
+    #[test]
+    fn portmap_duration_uses_gos_grammar() {
+        assert_eq!(portmap_duration_ms("5s").expect("Go's default"), 5_000);
+        assert_eq!(portmap_duration_ms("1500ms").expect("sub-second"), 1_500);
+        assert_eq!(portmap_duration_ms("1m").expect("minutes"), 60_000);
+        // A negative duration is clamped to zero rather than refused, reproducing Go: it parses
+        // there and becomes an already-expired context, so the run reports its deadline and stops.
+        assert_eq!(portmap_duration_ms("-5s").expect("clamped"), 0);
+        // A bad duration explains itself in Go's words.
+        assert_eq!(
+            portmap_duration_ms("1d")
+                .expect_err("no day unit")
+                .to_string(),
+            r#"time: unknown unit "d" in duration "1d""#
+        );
+    }
+
+    #[test]
+    fn debug_portmap_command_line_matches_gos_flags() {
+        // Go's defaults: five seconds, every protocol, auto-detected gateway, no HTTP logging.
+        match Cli::try_parse_from(["tnet", "debug", "portmap"])
+            .expect("parses")
+            .command
+        {
+            Command::Debug {
+                cmd:
+                    DebugCmd::Portmap {
+                        duration,
+                        ty,
+                        gateway_addr,
+                        self_addr,
+                        log_http,
+                    },
+            } => {
+                assert_eq!(duration, "5s");
+                assert_eq!(ty, "");
+                assert_eq!(gateway_addr, None);
+                assert_eq!(self_addr, None);
+                assert!(!log_http);
+            }
+            // `Command` derives no Debug (it can hold an auth key), so name the miss directly.
+            _ => panic!("expected a `debug portmap` command"),
+        }
+        // Every flag Go takes, by Go's spelling.
+        match Cli::try_parse_from([
+            "tnet",
+            "debug",
+            "portmap",
+            "--duration",
+            "1s",
+            "--type",
+            "upnp",
+            "--gateway-addr",
+            "192.0.2.1",
+            "--self-addr",
+            "192.0.2.2",
+            "--log-http",
+        ])
+        .expect("parses")
+        .command
+        {
+            Command::Debug {
+                cmd:
+                    DebugCmd::Portmap {
+                        duration,
+                        ty,
+                        gateway_addr,
+                        self_addr,
+                        log_http,
+                    },
+            } => {
+                assert_eq!(duration, "1s");
+                assert_eq!(ty, "upnp");
+                assert_eq!(gateway_addr.as_deref(), Some("192.0.2.1"));
+                assert_eq!(self_addr.as_deref(), Some("192.0.2.2"));
+                assert!(log_http);
+            }
+            // `Command` derives no Debug (it can hold an auth key), so name the miss directly.
+            _ => panic!("expected a `debug portmap` command"),
+        }
+        // `--type` is deliberately free-form (Go passes it straight through), so an unknown value
+        // parses here and is refused by the DAEMON with `unknown portmap debug type` — not by clap
+        // with a usage block and exit 2.
+        assert!(
+            Cli::try_parse_from(["tnet", "debug", "portmap", "--type", "natpmp"]).is_ok(),
+            "a bad --type is the daemon's refusal to make, not the flag parser's"
+        );
     }
 
     #[test]

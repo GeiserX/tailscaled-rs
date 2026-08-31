@@ -206,6 +206,11 @@ pub(crate) fn requires_write(request: &crate::localapi::Request) -> bool {
         // re-derivation), gated on write exactly like `DebugRebind`. Even though it is lighter (no
         // socket swap), a non-owner must not be able to poke the datapath, so it is never a read.
         | Request::DebugReStun
+        // `DebugPortmap` asks the LAN gateway to open a hole to this host, over NAT-PMP/PCP/UPnP.
+        // Go gates `serveDebugPortmap` on `PermitWrite` ("debug access denied" otherwise), and a
+        // socket-reachable non-owner must not be able to make the router forward traffic inward, so
+        // it gates like `up`/`down` — never a read, despite reading like a diagnostic.
+        | Request::DebugPortmap { .. }
         // `ReloadConfig` re-reads the `--config` file and RECONFIGURES the running node (it merges +
         // persists the prefs and, on a live node, rebuilds the engine — a brief reconnect). Go gates
         // `serveReloadConfig` on `PermitWrite`; a socket-reachable non-owner must not be able to
@@ -365,6 +370,17 @@ mod tests {
         assert!(
             requires_write(&Request::DebugReStun),
             "debug restun forces a STUN re-probe (live-datapath endpoint mutation) — a write, gated like down"
+        );
+        assert!(
+            requires_write(&Request::DebugPortmap {
+                duration_ms: 5_000,
+                ty: String::new(),
+                gateway_and_self: None,
+                log_http: false,
+            }),
+            "debug portmap asks the LAN gateway to forward traffic inward (Go gates \
+             serveDebugPortmap on PermitWrite) — a write, so a non-root/non-owner local user can't \
+             make the router open a hole"
         );
         assert!(
             requires_write(&Request::ReloadConfig),

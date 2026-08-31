@@ -19,6 +19,8 @@
 //!   secrets the engine holds in memory, the in-RAM analogue of [`ensure_state_dir_secure`].
 //! - [`hostreap`] — startup cleanup of host routes/DNS a *hard-killed* previous run left behind
 //!   (the engine's graceful teardown never ran), so a crash cannot outlive the daemon.
+//! - [`portmap`] — the NAT-PMP / PCP / UPnP-IGD port-mapping client: ask the LAN router to open a
+//!   hole so peers can reach this node directly instead of through a relay.
 //!
 //! Two binaries consume it: `tailnetd` (the daemon) and `tnet` (the thin CLI client).
 
@@ -32,6 +34,7 @@ pub mod httpproxy;
 pub mod ipforward;
 pub mod ipn;
 pub mod localapi;
+pub mod portmap;
 pub mod prefs;
 pub mod server;
 pub mod socks5;
