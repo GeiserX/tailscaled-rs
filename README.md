@@ -68,11 +68,16 @@ export TS_RS_EXPERIMENT=this_is_unstable_software
 #   --statedir <dir>   state directory      (overrides TAILNETD_STATE_DIR)
 #   --socket <path>    LocalAPI socket path (overrides TAILNETD_SOCKET)
 #   --verbose <0|1|2>  log verbosity        (overrides TAILNETD_LOG; 0=info,1=debug,2=trace)
-#   --config <path>    declarative config file (Go --config / ipn.ConfigVAlpha) — set prefs up
+#   --config <source>  declarative config source (Go --config / ipn.ConfigVAlpha) — set prefs up
 #                      front without an interactive `tnet up` (headless/k8s). e.g.:
 #                        {"version":"alpha0","Enabled":true,"Hostname":"node-a",
 #                         "AuthKey":"file:/run/secrets/ts-authkey","acceptRoutes":true}
 #                      AuthKey may be a literal or "file:<path>". Merged over persisted prefs.
+#                      <source> is a path, or "vm:user-data" (the VM's user-data via the cloud
+#                      instance metadata service — recognized, but this build has no metadata
+#                      client, so it reports the source as absent). Prefix either with
+#                      "optional:" to boot UNCONFIGURED when the source is absent instead of
+#                      failing to start; a source that is present but invalid still fails.
 #   --version          print version and exit;  --help  full usage
 # e.g.  ./target/release/tailnetd --statedir /var/lib/tailnetd --verbose 1
 #

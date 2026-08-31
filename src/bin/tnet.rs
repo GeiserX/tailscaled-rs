@@ -904,7 +904,8 @@ enum Command {
     /// Requires the system `ssh` binary on `PATH`. Any trailing args are passed through to `ssh`.
     Ssh {
         /// Target as `[user@]host`. `host` is a peer's MagicDNS name (or bare hostname) or tailnet IP;
-        /// `user` defaults to the current local user when omitted (Go's behavior).
+        /// omitting `user@` passes the bare host to `ssh`, so your own `ssh_config` `User` directive
+        /// decides the login name (Go's behavior).
         #[arg(value_name = "[USER@]HOST")]
         target: String,
         /// Extra arguments passed verbatim to the system `ssh` after the destination (e.g. a remote
@@ -8531,7 +8532,8 @@ async fn run_nc(socket: &std::path::Path, host: &str, port: u16) -> Result<()> {
 /// `ProxyCommand` that tunnels over the tailnet through `tnet nc`.
 ///
 /// Faithful to Go's `runSSH`:
-/// - Split `[user@]host` on the first `@`; an absent user defaults to the current local user.
+/// - Split `[user@]host` on the first `@`; an absent `user@` leaves the username UNSET, so `ssh`
+///   applies the caller's own `ssh_config` `User` directive (upstream v1.102.3).
 /// - Resolve `host` against the netmap (`Status`): match a peer by MagicDNS/display name OR tailnet
 ///   IP. The SSH destination host is the peer's display name (its DNSName) so the host-key line keyed
 ///   by that name matches; if it has none we fall back to its IPv4.
@@ -8540,7 +8542,8 @@ async fn run_nc(socket: &std::path::Path, host: &str, port: u16) -> Result<()> {
 ///   the peer's name and each of its tailnet IPs (Go's `genKnownHosts`).
 /// - Exec `ssh` with `-o UpdateHostKeys no`, `-o StrictHostKeyChecking yes`,
 ///   `-o CanonicalizeHostname no`, `-o UserKnownHostsFile <file>`, and `-o ProxyCommand <tnet> [--socket
-///   <s>] nc %h %p` (our own binary's `nc`), then `user@host` and the passthrough args.
+///   <s>] nc %h %p` (our own binary's `nc`), then the destination — `user@host` when the target
+///   supplied a username, else the bare `host` — and the passthrough args.
 ///
 /// Returns an error on a resolution/setup failure; on success it never returns (it `exec`s, replacing
 /// this process with `ssh`). Requires the system `ssh` binary on `PATH`.
@@ -8552,32 +8555,8 @@ async fn run_ssh(
 ) -> Result<()> {
     use std::os::unix::process::CommandExt as _;
 
-    // 1. Parse `[user@]host`. Split on the FIRST `@` (Go `strings.Cut`); empty user → current local
-    //    user. A trailing/empty host is rejected (nothing to resolve).
-    let (user, host) = match target.split_once('@') {
-        Some((u, h)) => (u.to_string(), h.to_string()),
-        None => (current_login_user(), target.to_string()),
-    };
-    if host.is_empty() {
-        anyhow::bail!("ssh: empty host in target {target:?} (expected `[user@]host`)");
-    }
-    if user.is_empty() {
-        anyhow::bail!("ssh: empty user in target {target:?} (use `host` for the current user)");
-    }
-    // SECURITY: the username becomes the left half of the `user@host` argv element handed to `ssh`. A
-    // username that LEADS WITH `-` would make `user@host` parse as an ssh option (getopt flag
-    // injection — e.g. `-oProxyCommand=…@host` overrides the tunnel), and whitespace/`@` would split
-    // or malform the destination. The user half can come from an UNTRUSTED env var (`$USER`/`$LOGNAME`
-    // via `current_login_user`, unlike Go which reads the OS passwd entry), so guard it regardless of
-    // source. Reject rather than sanitize — a `-`-leading or whitespace username is operator/env error,
-    // and silently rewriting it would surprise. (The host half cannot lead with `-` because `user@` is
-    // always prefixed; it is resolved against the netmap below, not taken raw.)
-    if user.starts_with('-') || user.contains([' ', '\t', '\n', '\r', '@']) {
-        anyhow::bail!(
-            "ssh: refusing unsafe username {user:?} (leads with '-' or contains whitespace/@) — pass \
-             an explicit `user@host` with a valid username"
-        );
-    }
+    // 1. Parse `[user@]host` (see `split_ssh_target`): an absent `user@` leaves the username unset.
+    let (user, host) = split_ssh_target(target)?;
 
     // 2. Resolve the peer against the netmap. Fetch Status (not whois — that is IP-only) so a NAME
     //    also resolves, mirroring `ip <peer>` / Go's `peerStatusFromArg`.
@@ -8659,7 +8638,7 @@ async fn run_ssh(
     cmd.arg("-o")
         .arg(format!("UserKnownHostsFile {}", known_hosts_path.display()));
     cmd.arg("-o").arg(proxy_command);
-    cmd.arg(format!("{user}@{ssh_host}"));
+    cmd.arg(ssh_destination(user.as_deref(), &ssh_host));
     cmd.args(extra_args);
 
     // exec replaces this process; it only returns on failure (e.g. ssh binary vanished between the
@@ -8668,29 +8647,53 @@ async fn run_ssh(
     Err(anyhow::Error::from(err).context(format!("exec {}", ssh_bin.display())))
 }
 
-/// The current local login user, for the default SSH username when the target omits `user@` (Go uses
-/// `user.Current().Username`). Falls back through `$USER`/`$LOGNAME`, then `id -un`, then `"root"` —
-/// a best-effort that mirrors what a shell would use; the user can always pass `user@host` explicitly.
-fn current_login_user() -> String {
-    if let Ok(u) = std::env::var("USER")
-        && !u.is_empty()
-    {
-        return u;
+/// Split `tnet ssh`'s `[user@]host` target into an optional username and the host, on the FIRST `@`
+/// (Go `strings.Cut`).
+///
+/// A target with no `user@` carries NO username: since upstream v1.102.3 `tailscale ssh host` hands
+/// `ssh` the bare host, so the caller's own `ssh_config` (`Host` block, `User` directive) decides who
+/// to log in as. Reading the local account and splicing it in — what this did before — silently
+/// overrode that, and only for tailnet hosts.
+///
+/// Errors on an empty host (nothing to resolve) and on an empty or unsafe explicit username.
+fn split_ssh_target(target: &str) -> Result<(Option<String>, String)> {
+    let (user, host) = match target.split_once('@') {
+        Some((u, h)) => (Some(u.to_string()), h.to_string()),
+        None => (None, target.to_string()),
+    };
+    if host.is_empty() {
+        anyhow::bail!("ssh: empty host in target {target:?} (expected `[user@]host`)");
     }
-    if let Ok(u) = std::env::var("LOGNAME")
-        && !u.is_empty()
-    {
-        return u;
-    }
-    if let Ok(out) = std::process::Command::new("id").arg("-un").output()
-        && out.status.success()
-    {
-        let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !name.is_empty() {
-            return name;
+    if let Some(user) = &user {
+        if user.is_empty() {
+            anyhow::bail!(
+                "ssh: empty user in target {target:?} (use `host` to let your ssh_config decide)"
+            );
+        }
+        // SECURITY: an explicit username becomes the left half of the `user@host` argv element handed
+        // to `ssh`. A username that LEADS WITH `-` would make `user@host` parse as an ssh option
+        // (getopt flag injection — e.g. `-oProxyCommand=…@host` overrides the tunnel), and
+        // whitespace/`@` would split or malform the destination. That half is argv the caller controls,
+        // so guard it. Reject rather than sanitize — a `-`-leading or whitespace username is operator
+        // error, and silently rewriting it would surprise. (The host half cannot lead with `-` because
+        // `user@` is always prefixed; it is resolved against the netmap, not taken raw.)
+        if user.starts_with('-') || user.contains([' ', '\t', '\n', '\r', '@']) {
+            anyhow::bail!(
+                "ssh: refusing unsafe username {user:?} (leads with '-' or contains whitespace/@) — \
+                 pass an explicit `user@host` with a valid username"
+            );
         }
     }
-    "root".to_string()
+    Ok((user, host))
+}
+
+/// The `ssh` destination argv element: `user@host` when the target supplied a username, else the bare
+/// host so `ssh` resolves the user from the caller's `ssh_config` (upstream v1.102.3).
+fn ssh_destination(user: Option<&str>, ssh_host: &str) -> String {
+    match user {
+        Some(u) => format!("{u}@{ssh_host}"),
+        None => ssh_host.to_string(),
+    }
 }
 
 /// Locate the system `ssh` binary by scanning `$PATH` (Go's `findSSH` via `exec.LookPath`). Returns the
@@ -10738,6 +10741,56 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(render_known_hosts(&peer), "");
+    }
+
+    #[test]
+    fn ssh_target_without_user_yields_a_bare_destination() {
+        // Upstream v1.102.3: no `user@` means no username at all, so `ssh` applies the caller's own
+        // ssh_config `User` directive instead of the local account.
+        let (user, host) = split_ssh_target("laptop").expect("bare host parses");
+        assert_eq!(user, None);
+        assert_eq!(host, "laptop");
+        assert_eq!(
+            ssh_destination(user.as_deref(), "laptop.example.ts.net"),
+            "laptop.example.ts.net"
+        );
+    }
+
+    #[test]
+    fn ssh_target_with_user_keeps_user_at_host() {
+        let (user, host) = split_ssh_target("alice@laptop").expect("user@host parses");
+        assert_eq!(user.as_deref(), Some("alice"));
+        assert_eq!(host, "laptop");
+        assert_eq!(
+            ssh_destination(user.as_deref(), "laptop.example.ts.net"),
+            "alice@laptop.example.ts.net"
+        );
+    }
+
+    #[test]
+    fn ssh_target_splits_on_the_first_at() {
+        // Go's `strings.Cut`: only the first `@` separates, so the rest stays in the host (which then
+        // simply fails to resolve against the netmap).
+        let (user, host) = split_ssh_target("alice@bob@laptop").expect("first-@ split parses");
+        assert_eq!(user.as_deref(), Some("alice"));
+        assert_eq!(host, "bob@laptop");
+    }
+
+    #[test]
+    fn ssh_target_rejects_unsafe_or_missing_halves() {
+        // An explicitly supplied username is still argv the caller controls: a `-`-leading name would
+        // be read by ssh as an option, and whitespace would split the destination.
+        let err = split_ssh_target("-oProxyCommand=x@laptop")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("refusing unsafe username"), "{err}");
+        let err = split_ssh_target("bad user@laptop").unwrap_err().to_string();
+        assert!(err.contains("refusing unsafe username"), "{err}");
+        // An explicit but empty user, and a target with no host, are both unusable.
+        let err = split_ssh_target("@laptop").unwrap_err().to_string();
+        assert!(err.contains("empty user"), "{err}");
+        let err = split_ssh_target("alice@").unwrap_err().to_string();
+        assert!(err.contains("empty host"), "{err}");
     }
 
     #[test]

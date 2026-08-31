@@ -350,7 +350,11 @@ async fn reload_config_reports_the_persisted_only_outcome_over_the_wire() {
     )
     .await
     .expect("write daemon config");
-    harness.backend.lock().await.set_config_path(cfg_path);
+    harness
+        .backend
+        .lock()
+        .await
+        .set_config_source(tailscaled_rs::conffile::ConfigSource::File(cfg_path));
 
     match harness.round_trip(r#"{"cmd":"reload_config"}"#).await {
         Response::Ok { message } => {

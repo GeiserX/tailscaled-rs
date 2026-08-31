@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use tailscaled_rs::conffile;
 use tailscaled_rs::ipn::{self, Backend};
 use tailscaled_rs::prefs::Prefs;
 use tokio::sync::Mutex;
@@ -94,14 +95,29 @@ struct Args {
     /// failing bring-up (a collision never takes the node down). `0` means "pick any" (= omitting it).
     #[arg(long, value_name = "PORT")]
     port: Option<u16>,
-    /// Declarative config file (Go `tailscaled --config`, the `ipn.ConfigVAlpha` JSON). Loaded at
+    /// Declarative config SOURCE (Go `tailscaled --config`, the `ipn.ConfigVAlpha` JSON). Loaded at
     /// startup and merged over the persisted prefs — the headless/automated path for setting prefs
     /// without an interactive `tnet up`. An `AuthKey` (or `file:<path>`) in the config registers the
-    /// node. Fails fast on a malformed/unsupported-version file. (SIGHUP re-read is a follow-up: it
-    /// shares the same blocker as the existing prefs reload — adopting changed config fields into a
-    /// *running* engine needs an `ipn` `reload_prefs` primitive this crate does not yet own.)
-    #[arg(long, value_name = "PATH")]
-    config: Option<PathBuf>,
+    /// node. Fails fast on a malformed/unsupported-version config.
+    ///
+    /// The value is a *source*, not merely a path (Go's flag doc: "path to config file, or
+    /// 'vm:user-data' to use the VM's user-data (EC2); prefix with 'optional:' to boot unconfigured
+    /// when the source is absent instead of failing"):
+    ///
+    /// * `<path>` — a JSON config file on disk;
+    /// * `vm:user-data` — the VM's user-data from the cloud instance metadata service. Recognized,
+    ///   but this build has no cloud-metadata client, so it reports the source as absent (the same
+    ///   branch a Go build without its `HasAWS` feature takes) — see `tailscaled_rs::conffile::load`;
+    /// * `optional:<source>` — an ABSENT source is not fatal: the node boots unconfigured and can be
+    ///   enrolled interactively instead of refusing to start. A source that is present but INVALID
+    ///   still fails. This is what makes the `--config optional:vm:user-data` line in a cloud-init
+    ///   template safe to paste onto a host that is not the cloud it was written for.
+    ///
+    /// (SIGHUP re-read is a follow-up: it shares the same blocker as the existing prefs reload —
+    /// adopting changed config fields into a *running* engine needs an `ipn` `reload_prefs` primitive
+    /// this crate does not yet own. The `reload-config` LocalAPI verb re-reads this same source.)
+    #[arg(long, value_name = "SOURCE")]
+    config: Option<String>,
     /// Run a SOCKS5 proxy on `[host:]port` that dials **over the tailnet** (Go `tailscaled
     /// --socks5-server`). A bare port (`1055`) binds `127.0.0.1:<port>`; pass an explicit address to
     /// bind elsewhere (the proxy is UNAUTHENTICATED — the bind address is the security boundary, so it
@@ -348,24 +364,40 @@ async fn main() -> Result<()> {
         tracing::info!(port, "pinning WireGuard/disco listen port (--port/PORT)");
     }
 
-    // `--config <file>`: load the declarative config and merge it over the just-loaded prefs (Go
+    // `--config <source>`: load the declarative config and merge it over the just-loaded prefs (Go
     // `tailscaled --config`). The merge is layered + persisted by `apply_config`, so the config
     // refines the stored prefs and the merged intent survives a later restart. A malformed or
-    // unsupported-version file fails the daemon HARD (a misconfigured headless deploy must not start
+    // unsupported-version config fails the daemon HARD (a misconfigured headless deploy must not start
     // half-configured) — propagate the error rather than logging + continuing. The config's auth key
     // (if any) is threaded into auto-start as a registration credential (never persisted into prefs).
-    let config_authkey = match &args.config {
-        Some(path) => {
-            let config = tailscaled_rs::conffile::load(path)
-                .with_context(|| format!("loading --config {}", path.display()))?;
-            tracing::info!(path = %path.display(), version = %config.version, "applying --config");
-            let authkey = backend.apply_config(&config).await?;
-            // Record the config path on the backend so the `reload-config` LocalAPI verb (Go
-            // `tailscaled`'s `reload-config`) can re-read this exact file and re-adopt its fields into
-            // the running node. Done only on the `--config` path — a config-less daemon has nothing to
-            // reload (and `reload_config` errors clearly in that case).
-            backend.set_config_path(path.clone());
-            authkey
+    //
+    // The flag's value is a config SOURCE (`ConfigFlag::parse`): a path, the `vm:user-data` sentinel,
+    // or either behind `optional:`. `ConfigFlag::load` applies Go's optional contract — `Ok(None)`
+    // means "the source is absent and that was declared acceptable", so the node boots unconfigured
+    // and can be enrolled interactively, while a present-but-invalid config still fails even then.
+    // An absent optional source deliberately leaves the backend's config source UNSET: there is
+    // nothing to re-read, so `reload-config` says so plainly (Go leaves `sys.InitialConfig` nil the
+    // same way).
+    let config_authkey = match args.config.as_deref().and_then(conffile::ConfigFlag::parse) {
+        Some(flag) => {
+            match flag
+                .load()
+                .with_context(|| format!("loading --config {}", flag.source))?
+            {
+                Some(config) => {
+                    tracing::info!(source = %flag.source, version = %config.version, "applying --config");
+                    let authkey = backend.apply_config(&config).await?;
+                    // Record the config source on the backend so the `reload-config` LocalAPI verb (Go
+                    // `tailscaled`'s `reload-config`) can re-read this exact source and re-adopt its
+                    // fields into the running node. Done only when a config actually loaded — a
+                    // config-less daemon has nothing to reload (and `reload_config` errors clearly in
+                    // that case).
+                    backend.set_config_source(flag.source.clone());
+                    authkey
+                }
+                // `optional:` + absent: `ConfigFlag::load` already logged which source was missing.
+                None => None,
+            }
         }
         None => None,
     };
