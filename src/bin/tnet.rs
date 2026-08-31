@@ -5902,9 +5902,10 @@ async fn run_whois(socket: &std::path::Path, ip: String, json: bool) -> Result<(
 /// file name in a `list` reply is engine/peer-supplied, so it is run through `sanitize_for_terminal`
 /// inside `format_files` before printing (a sender could craft a hostile name).
 ///
-/// `get <dir> --verbose` sends the same request and only swaps the renderer for the drain's reply:
-/// [`format_files_got_verbose`] (Go's `tailscale file get --verbose` progress lines) in place of the
-/// compact [`format_files_got`].
+/// `get <dir> --verbose` sends the same request and only swaps the progress renderer for the
+/// drain's reply — [`format_files_got_verbose`] (Go's `tailscale file get --verbose` lines) in place
+/// of the compact [`format_files_got`]; the failures and the exit status are the same either way,
+/// which is what [`render_files_got`] assembles.
 async fn run_file(socket: &std::path::Path, cmd: FileCmd) -> Result<()> {
     // `--verbose` changes nothing about the request — it only picks a different renderer for the
     // drain's `FilesGot` reply — so read it off the subcommand here, before `cmd` is consumed below.
@@ -5961,15 +5962,17 @@ async fn run_file(socket: &std::path::Path, cmd: FileCmd) -> Result<()> {
         // Waiting Taildrop files (`tnet file list`). One line per file; an empty inbox prints a
         // clear placeholder rather than nothing.
         Response::Files { files } => print!("{}", format_files(&files)),
-        // Inbox-drain outcomes (`tnet file get <dir>`). Print one line per file; exit non-zero if any
-        // file failed (Go returns the last error), so scripts can detect a partial drain.
+        // Inbox-drain outcomes (`tnet file get <dir>`). Go's `runFileGetOneBatch` prints the
+        // batch's progress as it goes and *accumulates* the failures; `runFileGet` then prints all
+        // but the last of those and returns the last as the command's error (non-zero exit). So the
+        // failures land after the progress, not interleaved with it, and a drain that cleared
+        // nothing out of a non-empty inbox is itself one of those failures. `render_files_got`
+        // reproduces that split; the caller only has to place the two halves.
         Response::FilesGot { results } => {
-            if verbose {
-                print!("{}", format_files_got_verbose(&results));
-            } else {
-                print!("{}", format_files_got(&results));
-            }
-            if results.iter().any(|r| r.error.is_some()) {
+            let (out, last_error) = render_files_got(&results, verbose);
+            print!("{out}");
+            if let Some(err) = last_error {
+                eprintln!("{err}");
                 std::process::exit(1);
             }
         }
@@ -7235,47 +7238,107 @@ fn format_files(files: &[tailscaled_rs::localapi::WaitingFileReport]) -> String 
     out
 }
 
-/// Render the per-file outcomes of `tnet file get <dir>` (a [`Response::FilesGot`]). One line per
-/// file: a success shows where it landed + the byte count (`wrote <name> -> <path> (<n> bytes)`,
-/// noting a `rename` that landed at a different name), a failure shows the reason (`error: <name>:
-/// <reason>`) and leaves the file in the inbox. An empty inbox prints a clear placeholder. All
-/// control-supplied names/paths are sanitized for terminal display. Pure → unit-testable.
+/// Count the files a drain actually *moved* — Go's `deleted` in `runFileGetOneBatch`
+/// (`cmd/tailscale/cli/file.go`). A file counts only when it was both written to the target
+/// directory AND cleared from the inbox: one that landed on disk but could not be removed is not
+/// moved (the next drain would fetch it again), and one that never landed is still waiting.
+fn files_got_moved(results: &[tailscaled_rs::localapi::FileGotReport]) -> usize {
+    results
+        .iter()
+        .filter(|r| r.written.is_some() && r.error.is_none())
+        .count()
+}
+
+/// The failures of a `tnet file get <dir>` drain, in the order Go's `runFileGetOneBatch` appends
+/// them to its `errs` slice: one per file that did not come through, and then — when the drain
+/// cleared *nothing* out of a non-empty inbox — Go's `moved %d/%d files`.
+///
+/// That last one is the upstream subtlety this mirrors. Go emits the tally from two branches: under
+/// `if deleted == 0 && len(wfs) > 0` it appends `moved %d/%d files` to `errs` ("persistently stuck
+/// files are basically an error"), which happens whether or not `--verbose` was passed and which
+/// `runFileGet` returns as the command's error; only in the `else if fileGetArgs.verbose` branch is
+/// it the informational line [`format_files_got_verbose`] prints. So a fully stuck drain reports the
+/// tally and exits non-zero even without `--verbose`.
+///
+/// Names are peer-supplied and reasons are daemon-supplied, so both go through
+/// [`sanitize_for_terminal`]. Pure → unit-testable.
+fn file_get_errors(results: &[tailscaled_rs::localapi::FileGotReport]) -> Vec<String> {
+    let mut errs = Vec::new();
+    for r in results {
+        let name = sanitize_for_terminal(&r.name);
+        match (&r.written, &r.error) {
+            // A reason, with or without a file on disk. The written-but-not-cleared case is a
+            // failure in Go too (its `DeleteWaitingFile` error), reported separately from the
+            // `wrote` progress line the batch already printed.
+            (_, Some(e)) => errs.push(format!("error: {name}: {}", sanitize_for_terminal(e))),
+            // Neither written nor failed (should not happen — the daemon always sets one). Surface
+            // it defensively rather than let it pass for a clean success.
+            (None, None) => errs.push(format!("error: {name}: unknown outcome")),
+            (Some(_), None) => {}
+        }
+    }
+    let moved = files_got_moved(results);
+    if moved == 0 && !results.is_empty() {
+        errs.push(format!("moved {moved}/{} files", results.len()));
+    }
+    errs
+}
+
+/// Render a whole drain reply the way Go's `runFileGet` writes one: the batch's progress lines
+/// first — compact, or [`format_files_got_verbose`] under `--verbose` — then the accumulated
+/// failures, of which Go prints all but the last (`outln`, stdout) and *returns* the last as the
+/// command's error.
+///
+/// Returns `(stdout, last_error)`: the caller prints `stdout`, and a `Some` last error goes to
+/// stderr and exits non-zero. Splitting it this way (rather than interleaving `error:` lines into
+/// the progress) is what keeps the exit status keyed on Go's `errs` — including the stuck-inbox
+/// `moved 0/N files` that [`file_get_errors`] appends. Pure → unit-testable.
+fn render_files_got(
+    results: &[tailscaled_rs::localapi::FileGotReport],
+    verbose: bool,
+) -> (String, Option<String>) {
+    let mut out = if verbose {
+        format_files_got_verbose(results)
+    } else {
+        format_files_got(results)
+    };
+    let mut errs = file_get_errors(results);
+    let last = errs.pop();
+    for e in errs {
+        out.push_str(&e);
+        out.push('\n');
+    }
+    (out, last)
+}
+
+/// Render the per-file *progress* of `tnet file get <dir>` (a [`Response::FilesGot`]) in the compact
+/// (non-`--verbose`) mode: one line per file that landed, naming where it landed and its size
+/// (`wrote <name> -> <path> (<n> bytes)`; the path differs from `<dir>/<name>` under `rename`). An
+/// empty inbox prints a clear placeholder.
+///
+/// Failures are deliberately absent here: Go accumulates them and prints them *after* the batch,
+/// which [`file_get_errors`] and [`render_files_got`] reproduce, so emitting them inline as well
+/// would print each one twice and put them in the wrong order. A file that never landed therefore
+/// contributes no progress line at all — only its `error:` line, after.
+///
+/// (Printing anything per file is a fork addition: Go's non-verbose mode is silent on success. It
+/// stays because the compact mode is this CLI's default and a silent drain tells an operator
+/// nothing.)
+///
+/// All control-supplied names/paths are sanitized for terminal display. Pure → unit-testable.
 fn format_files_got(results: &[tailscaled_rs::localapi::FileGotReport]) -> String {
     if results.is_empty() {
         return "(no files waiting)\n".to_string();
     }
     let mut out = String::new();
     for r in results {
-        let name = sanitize_for_terminal(&r.name);
-        match (&r.written, &r.error) {
-            // Saved but with an error (the "not consumed" case: copied to disk yet the inbox delete
-            // failed). Surface BOTH — where it landed AND that it could not be cleared — so the
-            // operator knows the file will re-appear on the next drain. Error is checked before the
-            // plain-success arm so this never reads as a clean success.
-            (Some(path), Some(err)) => {
-                out.push_str(&format!(
-                    "wrote {name} -> {} ({} bytes), but: {}\n",
-                    sanitize_for_terminal(path),
-                    r.size,
-                    sanitize_for_terminal(err)
-                ));
-            }
-            // Clean success: written, no error. Note the actual path (differs under `rename`).
-            (Some(path), None) => {
-                out.push_str(&format!(
-                    "wrote {name} -> {} ({} bytes)\n",
-                    sanitize_for_terminal(path),
-                    r.size
-                ));
-            }
-            // Failure: report the reason; the file stays in the inbox.
-            (None, Some(err)) => {
-                out.push_str(&format!("error: {name}: {}\n", sanitize_for_terminal(err)));
-            }
-            // Neither (should not happen — the daemon always sets one) — surface defensively.
-            (None, None) => {
-                out.push_str(&format!("error: {name}: unknown outcome\n"));
-            }
+        if let Some(path) = &r.written {
+            out.push_str(&format!(
+                "wrote {} -> {} ({} bytes)\n",
+                sanitize_for_terminal(&r.name),
+                sanitize_for_terminal(path),
+                r.size
+            ));
         }
     }
     out
@@ -7286,16 +7349,20 @@ fn format_files_got(results: &[tailscaled_rs::localapi::FileGotReport]) -> Strin
 ///
 /// Go's two verbose lines, reproduced verbatim in shape:
 /// * per received file: `wrote <inbox name> as <path it landed at> (<n> bytes)` — the path differs
-///   from `<dir>/<name>` under the `rename` policy, which is exactly why Go prints both.
+///   from `<dir>/<name>` under the `rename` policy, which is exactly why Go prints both. Go prints
+///   it before it tries to clear the inbox, so a file that landed but could not be removed still
+///   gets its line (and then an `error:` line after the batch).
 /// * once at the end: `moved <received>/<waiting> files`, where `received` counts only the files
-///   that were both written AND cleared from the inbox (Go's `deleted`), so a file that landed on
-///   disk but could not be removed is *not* counted — a re-drain would fetch it again.
+///   that were both written AND cleared from the inbox ([`files_got_moved`], Go's `deleted`).
 ///
-/// Failures keep the compact `error: <name>: <reason>` line [`format_files_got`] uses: Go prints
-/// those through a different path (its accumulated `errs`, printed by `runFileGet`, not gated on
-/// `--verbose`), so they belong in both modes and there is no second Go shape to mirror. An empty
-/// inbox keeps the fork's `(no files waiting)` placeholder ahead of Go's `moved 0/0 files` tally, so
-/// the zero-file case says so in words instead of rendering as an empty list.
+/// The tally is conditional, because Go's is: it belongs to the `else if fileGetArgs.verbose`
+/// branch, so it is *not* printed here when the drain moved nothing out of a non-empty inbox — in
+/// that case the same numbers are an error instead ([`file_get_errors`]), which prints in both
+/// modes. Printing it here too would double it.
+///
+/// Failures are likewise not printed here — see [`format_files_got`]; they come after the batch.
+/// An empty inbox keeps the fork's `(no files waiting)` placeholder ahead of Go's `moved 0/0 files`
+/// tally, so the zero-file case says so in words instead of rendering as an empty list.
 ///
 /// NOTE: a `/dev/null` (wipe) drain renders through this same shape. Go's `wipeInbox` has its own
 /// verbose lines (`deleting <name> ...` / `deleted <n> files`); mirroring those is separate work and
@@ -7308,37 +7375,20 @@ fn format_files_got_verbose(results: &[tailscaled_rs::localapi::FileGotReport]) 
     if results.is_empty() {
         out.push_str("(no files waiting)\n");
     }
-    let mut moved = 0usize;
     for r in results {
-        let name = sanitize_for_terminal(&r.name);
-        match (&r.written, &r.error) {
-            // Landed on disk. Go's verbose line names both the inbox name and the real path.
-            (Some(path), err) => {
-                out.push_str(&format!(
-                    "wrote {name} as {} ({} bytes)\n",
-                    sanitize_for_terminal(path),
-                    r.size
-                ));
-                match err {
-                    // Written but not consumed: Go counts this as an error, not a move, and reports
-                    // the delete failure separately — so print the reason and leave `moved` alone.
-                    Some(e) => {
-                        out.push_str(&format!("error: {name}: {}\n", sanitize_for_terminal(e)))
-                    }
-                    None => moved += 1,
-                }
-            }
-            // Never written: the file stays in the inbox. Same failure line as the compact renderer.
-            (None, Some(e)) => {
-                out.push_str(&format!("error: {name}: {}\n", sanitize_for_terminal(e)));
-            }
-            // Neither (should not happen — the daemon always sets one) — surface defensively.
-            (None, None) => {
-                out.push_str(&format!("error: {name}: unknown outcome\n"));
-            }
+        if let Some(path) = &r.written {
+            out.push_str(&format!(
+                "wrote {} as {} ({} bytes)\n",
+                sanitize_for_terminal(&r.name),
+                sanitize_for_terminal(path),
+                r.size
+            ));
         }
     }
-    out.push_str(&format!("moved {moved}/{} files\n", results.len()));
+    let moved = files_got_moved(results);
+    if moved > 0 || results.is_empty() {
+        out.push_str(&format!("moved {moved}/{} files\n", results.len()));
+    }
     out
 }
 
@@ -11878,6 +11928,8 @@ mod tests {
     fn format_files_got_renders_success_and_failure_lines() {
         use tailscaled_rs::localapi::FileGotReport;
         // A drain with one success (written elsewhere under rename), one failure (left in inbox).
+        // The compact renderer carries only the progress; the failure comes out of the drain's
+        // accumulated errors, which `render_files_got` appends after it (Go's order).
         let results = vec![
             FileGotReport {
                 name: "a.txt".to_string(),
@@ -11898,38 +11950,198 @@ mod tests {
             "success line: {out}"
         );
         assert!(
-            out.contains("error: b.txt: refusing to overwrite"),
-            "failure line: {out}"
+            !out.contains("error:"),
+            "failures are not progress lines: {out}"
         );
-        // Empty drain → placeholder.
+        // One file did move, so the tally is not an error — the single failure is, and being the
+        // last (and only) one it is what the command returns.
+        let (stdout, last) = render_files_got(&results, false);
+        assert!(
+            stdout.contains("wrote a.txt -> /tmp/dl/a (1).txt (12 bytes)"),
+            "success line: {stdout}"
+        );
+        assert_eq!(
+            last.as_deref(),
+            Some("error: b.txt: refusing to overwrite /tmp/dl/b.txt: file already exists"),
+            "the failure is the command's error: {stdout}"
+        );
+        // Empty drain → placeholder, and no error (an empty inbox is not a stuck one).
         assert_eq!(format_files_got(&[]), "(no files waiting)\n");
+        assert_eq!(
+            render_files_got(&[], false),
+            ("(no files waiting)\n".to_string(), None)
+        );
     }
 
     #[test]
     fn format_files_got_shows_saved_but_not_consumed_as_error() {
         use tailscaled_rs::localapi::FileGotReport;
-        // The "not consumed" case: written to disk AND an error (inbox delete failed). The line must
-        // surface BOTH — where it landed and that it could not be cleared — and must NOT read as a
-        // clean success (so a script sees the non-zero exit the CLI derives from `error.is_some()`).
+        // The "not consumed" case: written to disk AND an error (inbox delete failed). Go prints the
+        // `wrote` line before it tries to clear the inbox and reports the delete failure separately,
+        // so BOTH must surface — where it landed and that it could not be cleared — and it must not
+        // read as a clean success. Nothing was cleared, so this drain is also Go's stuck case: the
+        // `moved 0/1 files` tally is the error the command returns.
         let results = vec![FileGotReport {
             name: "c.txt".to_string(),
             size: 7,
             written: Some("/tmp/dl/c.txt".to_string()),
             error: Some("saved but could not be removed from the inbox: Io(...)".to_string()),
         }];
-        let out = format_files_got(&results);
+        let (out, last) = render_files_got(&results, false);
         assert!(
             out.contains("wrote c.txt -> /tmp/dl/c.txt (7 bytes)"),
             "{out}"
         );
         assert!(
-            out.contains("but:"),
-            "must surface the delete failure: {out}"
-        );
-        assert!(
-            out.contains("could not be removed from the inbox"),
+            out.contains("error: c.txt: saved but could not be removed from the inbox"),
             "must name the reason: {out}"
         );
+        assert_eq!(
+            last.as_deref(),
+            Some("moved 0/1 files"),
+            "a drain that cleared nothing is Go's stuck-inbox error: {out}"
+        );
+    }
+
+    #[test]
+    fn file_get_stuck_inbox_reports_the_tally_without_verbose() {
+        use tailscaled_rs::localapi::FileGotReport;
+        // Go: `if deleted == 0 && len(wfs) > 0 { errs = append(errs, fmt.Errorf("moved %d/%d
+        // files", ...)) }` — "persistently stuck files are basically an error". That branch is NOT
+        // gated on --verbose, so a plain `tnet file get <dir>` that clears nothing must still report
+        // the tally and fail. Two files, neither cleared, no --verbose.
+        let results = vec![
+            FileGotReport {
+                name: "a.txt".to_string(),
+                size: 0,
+                written: None,
+                error: Some("refusing to overwrite /tmp/dl/a.txt".to_string()),
+            },
+            FileGotReport {
+                name: "b.txt".to_string(),
+                size: 5,
+                written: Some("/tmp/dl/b.txt".to_string()),
+                error: Some("saved but could not be removed from the inbox".to_string()),
+            },
+        ];
+        let (out, last) = render_files_got(&results, false);
+        assert_eq!(
+            last.as_deref(),
+            Some("moved 0/2 files"),
+            "the stuck tally is the command's error (non-zero exit): {out}"
+        );
+        // Both per-file failures still print, ahead of the returned error.
+        assert!(
+            out.contains("error: a.txt: refusing to overwrite /tmp/dl/a.txt\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("error: b.txt: saved but could not be removed from the inbox\n"),
+            "{out}"
+        );
+        // A drain that moved something is not stuck: no tally, no error, exit 0.
+        let moved = vec![FileGotReport {
+            name: "ok.txt".to_string(),
+            size: 3,
+            written: Some("/tmp/dl/ok.txt".to_string()),
+            error: None,
+        }];
+        let (out, last) = render_files_got(&moved, false);
+        assert_eq!(last, None, "a clean drain has no error: {out}");
+        assert!(
+            !out.contains("moved "),
+            "the informational tally stays verbose-only: {out}"
+        );
+    }
+
+    #[test]
+    fn file_get_stuck_inbox_does_not_print_the_tally_twice_under_verbose() {
+        use tailscaled_rs::localapi::FileGotReport;
+        // Go's tally is an if/else: the stuck case goes to `errs`, everything else to the verbose
+        // printf. Under --verbose a stuck drain must therefore report `moved 0/1 files` exactly once
+        // — as the error — and not also as the informational line.
+        let results = vec![FileGotReport {
+            name: "a.txt".to_string(),
+            size: 0,
+            written: None,
+            error: Some("refusing to overwrite /tmp/dl/a.txt".to_string()),
+        }];
+        let (out, last) = render_files_got(&results, true);
+        assert_eq!(last.as_deref(), Some("moved 0/1 files"), "{out}");
+        assert!(
+            !out.contains("moved "),
+            "the tally must not be printed as well as returned: {out}"
+        );
+    }
+
+    #[test]
+    fn file_get_errors_come_after_all_progress_lines() {
+        use tailscaled_rs::localapi::FileGotReport;
+        // Go prints the batch's progress as it goes and accumulates failures, printing them only
+        // once the batch is done. So every `wrote` line precedes every `error:` line, even when the
+        // failing file was drained first.
+        let results = vec![
+            FileGotReport {
+                name: "bad.txt".to_string(),
+                size: 0,
+                written: None,
+                error: Some("refusing to overwrite /tmp/dl/bad.txt".to_string()),
+            },
+            FileGotReport {
+                name: "ok.txt".to_string(),
+                size: 3,
+                written: Some("/tmp/dl/ok.txt".to_string()),
+                error: None,
+            },
+        ];
+        // Only the failure is left over, so it is the returned error and the printed body is pure
+        // progress; with a second failure the earlier one prints ahead of the `wrote` line's peer.
+        let (out, last) = render_files_got(&results, true);
+        assert_eq!(
+            out, "wrote ok.txt as /tmp/dl/ok.txt (3 bytes)\nmoved 1/2 files\n",
+            "progress only"
+        );
+        assert_eq!(
+            last.as_deref(),
+            Some("error: bad.txt: refusing to overwrite /tmp/dl/bad.txt")
+        );
+        let mut two = results.clone();
+        two.push(FileGotReport {
+            name: "worse.txt".to_string(),
+            size: 0,
+            written: None,
+            error: Some("disk full".to_string()),
+        });
+        let (out, last) = render_files_got(&two, true);
+        let wrote = out.find("wrote ok.txt").expect("progress line present");
+        let failed = out.find("error: bad.txt").expect("failure line present");
+        assert!(wrote < failed, "failures come after the progress: {out}");
+        assert_eq!(
+            last.as_deref(),
+            Some("error: worse.txt: disk full"),
+            "the last accumulated failure is the command's error: {out}"
+        );
+    }
+
+    #[test]
+    fn file_get_errors_flags_a_report_with_neither_outcome() {
+        use tailscaled_rs::localapi::FileGotReport;
+        // Defensive: the daemon always sets `written` or `error`, but a report with neither must not
+        // pass for a clean success — it counts as no move (so the drain is stuck) and says so.
+        let results = vec![FileGotReport {
+            name: "ghost.txt".to_string(),
+            size: 0,
+            written: None,
+            error: None,
+        }];
+        assert_eq!(
+            file_get_errors(&results),
+            vec![
+                "error: ghost.txt: unknown outcome".to_string(),
+                "moved 0/1 files".to_string()
+            ]
+        );
+        assert_eq!(files_got_moved(&results), 0);
     }
 
     #[test]
@@ -11963,9 +12175,15 @@ mod tests {
     #[test]
     fn format_files_got_verbose_empty_inbox_says_so() {
         // Zero waiting files must say so rather than render as an empty list; the Go tally follows.
+        // An empty inbox is not Go's stuck case (`len(wfs) > 0` fails), so the tally stays the
+        // informational line and the drain succeeds.
         assert_eq!(
             format_files_got_verbose(&[]),
             "(no files waiting)\nmoved 0/0 files\n"
+        );
+        assert_eq!(
+            render_files_got(&[], true),
+            ("(no files waiting)\nmoved 0/0 files\n".to_string(), None)
         );
     }
 
@@ -11995,12 +12213,14 @@ mod tests {
                 error: Some("refusing to overwrite /tmp/dl/clash.txt".to_string()),
             },
         ];
-        let out = format_files_got_verbose(&results);
+        assert_eq!(files_got_moved(&results), 1);
+        let (out, last) = render_files_got(&results, true);
         assert!(
             out.contains("wrote ok.txt as /tmp/dl/ok.txt (3 bytes)\n"),
             "{out}"
         );
-        // Written-but-stuck: the progress line still shows where it landed, followed by the reason.
+        // Written-but-stuck: the progress line still shows where it landed, and the reason follows
+        // with the rest of the batch's failures.
         assert!(
             out.contains("wrote stuck.txt as /tmp/dl/stuck.txt (7 bytes)\n"),
             "{out}"
@@ -12009,12 +12229,12 @@ mod tests {
             out.contains("error: stuck.txt: saved but could not be removed from the inbox\n"),
             "{out}"
         );
-        assert!(
-            out.contains("error: clash.txt: refusing to overwrite /tmp/dl/clash.txt\n"),
-            "{out}"
+        assert_eq!(
+            last.as_deref(),
+            Some("error: clash.txt: refusing to overwrite /tmp/dl/clash.txt")
         );
         assert!(
-            out.ends_with("moved 1/3 files\n"),
+            out.contains("moved 1/3 files\n"),
             "only the cleared file counts as moved: {out}"
         );
     }
@@ -12023,16 +12243,28 @@ mod tests {
     fn format_files_got_verbose_sanitizes_peer_supplied_name() {
         use tailscaled_rs::localapi::FileGotReport;
         // Same rule as the compact renderer: the inbox name comes from the sending peer (untrusted),
-        // so terminal escapes must never reach the verbose progress line either.
-        let results = vec![FileGotReport {
-            name: "evil\x1b[2J\x07.txt".to_string(),
-            size: 1,
-            written: Some("/tmp/evil\x1b[2J.txt".to_string()),
-            error: None,
-        }];
-        let out = format_files_got_verbose(&results);
+        // so terminal escapes must never reach the verbose progress line either — nor the failure
+        // lines, whose reason text is daemon-supplied.
+        let results = vec![
+            FileGotReport {
+                name: "evil\x1b[2J\x07.txt".to_string(),
+                size: 1,
+                written: Some("/tmp/evil\x1b[2J.txt".to_string()),
+                error: None,
+            },
+            FileGotReport {
+                name: "bad\x1b[2J.txt".to_string(),
+                size: 0,
+                written: None,
+                error: Some("refusing to overwrite /tmp/bad\x07.txt".to_string()),
+            },
+        ];
+        let (out, last) = render_files_got(&results, true);
         assert!(!out.contains('\x1b'), "ESC stripped from verbose line");
         assert!(!out.contains('\x07'), "BEL stripped from verbose line");
+        let last = last.expect("the failed file is the command's error");
+        assert!(!last.contains('\x1b'), "ESC stripped from the error");
+        assert!(!last.contains('\x07'), "BEL stripped from the error");
     }
 
     #[test]
