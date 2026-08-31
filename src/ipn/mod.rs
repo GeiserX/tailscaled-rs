@@ -83,7 +83,7 @@ mod profile;
 mod revert_guard;
 pub mod serve;
 mod state;
-mod syspolicy;
+pub mod syspolicy;
 
 // The reported [`State`] enum lives in [`state`] (with the pure state-derivation helpers) but is
 // part of `ipn`'s public surface — `crate::ipn::State` is referenced by `localapi` — so re-export

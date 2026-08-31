@@ -25,6 +25,7 @@
 pub mod auth;
 pub mod conffile;
 pub mod debugserver;
+pub mod goduration;
 pub mod hardening;
 pub mod hostreap;
 pub mod httpproxy;
