@@ -151,6 +151,20 @@ struct Args {
     /// which has anything to gate here.
     #[arg(long)]
     no_logs_no_support: bool,
+    /// JSON file registered as a **device-scope system-policy source** (Go `tailscaled
+    /// --syspolicy-file`, new in v1.102.3). This is the only way an admin on a non-Windows host can
+    /// supply MDM-style policy at all — without it `tnet syspolicy list` reports an empty policy set
+    /// on every platform, because Go's only other store is the Windows registry. The file is a JSON
+    /// object mapping policy keys to values (`{"Hostname": "kiosk-3", "CheckUpdates": "always"}`);
+    /// unknown keys and values of the wrong type are refused at startup rather than at first use.
+    /// Defaults to `/etc/tailscale/syspolicy.json` (`%ProgramData%\Tailscale\syspolicy.json` on
+    /// Windows) — an absent file is simply no policy, not an error — and **an empty value disables
+    /// the source**. A file that fails to load is logged and the daemon carries on: a broken policy
+    /// file must not keep the node off the tailnet. NOTE: the settings are *reported* today
+    /// (`tnet syspolicy list`/`reload`), not yet applied to prefs — Go applies them in
+    /// `ipnlocal.applySysPolicy`, a surface this fork does not have yet.
+    #[arg(long, value_name = "PATH", default_value_t = default_syspolicy_file())]
+    syspolicy_file: String,
     /// Run a debug HTTP server on `[host:]port` exposing `GET /debug/metrics` (Go `tailscaled
     /// --debug`). Serves the daemon's Prometheus metrics (the same text `tnet metrics` returns) over
     /// plain HTTP so a scraper can pull them without the unix LocalAPI socket. A bare port binds
@@ -254,6 +268,13 @@ async fn main() -> Result<()> {
             "--no-logs-no-support: tailnetd never uploads logs or telemetry; this flag is a no-op"
         );
     }
+
+    // `--syspolicy-file <path>` (Go `tailscaled --syspolicy-file`): register the JSON policy file as
+    // a device-scope system-policy source. Done HERE — right after logging is initialized, so a load
+    // failure has somewhere to be reported, and before anything that could consult a policy setting
+    // (Go calls its `loadSyspolicy` hook at the same point, after flag parsing and before the engine
+    // exists). Never fatal: see `load_syspolicy_file`.
+    load_syspolicy_file(&args.syspolicy_file);
 
     // Best-effort OS-level hardening (no-coredump / no-ptrace / no-swap) for the secrets the engine
     // will hold in memory. Done here — after the experiment gate and logging init (so its outcome is
@@ -1050,6 +1071,77 @@ fn bird_socket_refusal(path: Option<&str>) -> Option<String> {
     ))
 }
 
+/// The stock `--syspolicy-file` path for **this host** — Go `defaultSyspolicyFile`
+/// (`cmd/tailscaled/syspolicy.go`). Thin wrapper over [`default_syspolicy_file_for`] so the decision
+/// itself stays testable on any platform.
+fn default_syspolicy_file() -> String {
+    default_syspolicy_file_for(cfg!(windows), std::env::var("ProgramData").ok().as_deref())
+}
+
+/// Where `--syspolicy-file` points when the operator does not say — Go's `defaultSyspolicyFile`,
+/// with the host facts passed in rather than read from the environment.
+///
+/// On Windows the file sits with the rest of Tailscale's machine state under
+/// `%ProgramData%\Tailscale`; if `ProgramData` is somehow unset Go returns the **empty string**,
+/// which disables the source rather than guessing a path — so that case ports too. Everywhere else
+/// (Linux, the BSDs, illumos/Solaris, and a GUI-less macOS daemon) it is `/etc/tailscale`, the
+/// conventional home for admin-provided configuration.
+///
+/// Note that the default naming a file that does not exist is the *normal* case: an absent policy
+/// file is simply no policy (see `syspolicy::load_json_policy_file`), which is what makes it safe to
+/// point at a path the operator has never created. Pure → unit-testable.
+fn default_syspolicy_file_for(windows: bool, program_data: Option<&str>) -> String {
+    if windows {
+        return match program_data.filter(|pd| !pd.is_empty()) {
+            Some(pd) => Path::new(pd)
+                .join("Tailscale")
+                .join("syspolicy.json")
+                .to_string_lossy()
+                .into_owned(),
+            // Go returns "" here, and an empty value disables the source.
+            None => String::new(),
+        };
+    }
+    "/etc/tailscale/syspolicy.json".to_string()
+}
+
+/// Register `--syspolicy-file` as a device-scope policy source — the body of Go's `loadSyspolicy`
+/// hook in `cmd/tailscaled/syspolicy.go`, which runs once after flag parsing and before anything
+/// reads a policy setting.
+///
+/// Three behaviours port together, and each of them is the point:
+/// - **empty path disables it.** Go's hook returns immediately on `syspolicyFile == ""`, so
+///   `--syspolicy-file=""` is how an operator turns the file source off entirely (including on a
+///   Windows host with no `ProgramData`, whose default is already empty).
+/// - **an absent file is silent.** Not an error, no source registered — the shipped default path
+///   exists on almost no host.
+/// - **a load failure is logged and the daemon continues.** Go's hook is
+///   `if err := ...; err != nil { log.Printf("%v", err) }` — deliberately not `log.Fatal`. A policy
+///   file with a typo in it must not be able to keep a node off the tailnet, so the error is
+///   reported and startup proceeds with the source unregistered (all of it, never half of it).
+fn load_syspolicy_file(path: &str) {
+    if path.is_empty() {
+        tracing::debug!("--syspolicy-file is empty; the file policy source is disabled");
+        return;
+    }
+    match ipn::syspolicy::load_json_policy_file(
+        ipn::syspolicy::JSON_FILE_SOURCE_NAME,
+        Path::new(path),
+    ) {
+        Ok(ipn::syspolicy::LoadOutcome::NoFile) => {
+            tracing::debug!(
+                path,
+                "no system-policy file; the file policy source is inactive"
+            );
+        }
+        Ok(ipn::syspolicy::LoadOutcome::Registered { settings }) => {
+            tracing::info!(path, settings, "registered the system-policy file");
+        }
+        // Go: `log.Printf("%v", err)` — report it, keep going.
+        Err(e) => tracing::error!("{e}"),
+    }
+}
+
 /// The experimental-gate decision, pure so it can be unit-tested: the gate passes only when the
 /// env var holds exactly the required opt-in value. `None` (unset) and any other value fail.
 fn experiment_gate_ok(value: Option<&str>) -> bool {
@@ -1071,6 +1163,48 @@ fn verbose_to_level(level: u8) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn syspolicy_file_defaults_to_the_unix_admin_config_path() {
+        // Go's non-Windows branch is a literal, and it is the path an admin is told to create.
+        assert_eq!(
+            default_syspolicy_file_for(false, None),
+            "/etc/tailscale/syspolicy.json"
+        );
+        // `ProgramData` is a Windows notion; it must not leak into the Unix default.
+        assert_eq!(
+            default_syspolicy_file_for(false, Some("C:\\ProgramData")),
+            "/etc/tailscale/syspolicy.json"
+        );
+    }
+
+    #[test]
+    fn syspolicy_file_defaults_under_program_data_on_windows() {
+        let resolved = default_syspolicy_file_for(true, Some("C:\\ProgramData"));
+        // Asserted by parts rather than as one literal: the separator `Path::join` produces depends
+        // on the host running the test, and only the placement is Go's contract.
+        assert!(
+            resolved.starts_with("C:\\ProgramData"),
+            "the file belongs under %ProgramData%: {resolved}"
+        );
+        assert!(
+            resolved.contains("Tailscale"),
+            "the file sits in the Tailscale machine-state directory: {resolved}"
+        );
+        assert!(
+            resolved.ends_with("syspolicy.json"),
+            "the file is named syspolicy.json: {resolved}"
+        );
+    }
+
+    #[test]
+    fn syspolicy_file_default_is_empty_when_windows_has_no_program_data() {
+        // Go returns "" rather than guessing a path, and an empty value disables the source — so a
+        // Windows host with no ProgramData starts with no file policy instead of reading a wrong
+        // file. An empty variable is the same case as an unset one.
+        assert_eq!(default_syspolicy_file_for(true, None), "");
+        assert_eq!(default_syspolicy_file_for(true, Some("")), "");
+    }
 
     #[test]
     fn experiment_gate_rejects_unset() {
