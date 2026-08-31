@@ -961,3 +961,91 @@ async fn profile_switch_list_and_remove_round_trip_over_the_wire() {
 
     harness.shutdown_and_verify().await;
 }
+
+/// `debug statedir` must answer from the DAEMON, not from the CLI's own environment.
+///
+/// Go's `runPrintStateDir` (`cmd/tailscale/cli/debug.go` @ v1.100.0) round-trips
+/// `DebugResultJSON(ctx, "statedir")` and prints the daemon's answer, because the daemon's state dir
+/// is whatever *it* resolved at boot. The configuration that motivates the command is exactly the one
+/// where the two disagree: a `tailnetd` whose environment sets the state dir, and a `tnet` whose does
+/// not (or sets a different one). This drives both halves of that — the wire verb against a real
+/// daemon, and the built `tnet` binary run with `$TAILNETD_STATE_DIR` pointing somewhere else.
+#[tokio::test]
+async fn debug_statedir_answers_from_the_daemon_not_the_cli_environment() {
+    let harness = Harness::start().await;
+    let daemon_dir = harness.state_dir.display().to_string();
+
+    // The wire verb: the daemon reports the dir it was loaded with — with the node down (no engine),
+    // like Go's, which reads `TailscaleVarRoot()` and never touches the datapath.
+    match harness.round_trip(r#"{"cmd":"debug_state_dir"}"#).await {
+        Response::StateDir { dir } => assert_eq!(
+            dir, daemon_dir,
+            "the daemon must report the state dir it is actually using"
+        ),
+        other => panic!("expected Response::StateDir, got {other:?}"),
+    }
+
+    // A decoy for the CLI's environment: a path the daemon has never heard of. The CLI's cascade
+    // resolves it (`$TAILNETD_STATE_DIR` wins outright), so any answer computed CLI-side shows up
+    // here instead of the daemon's dir. Never created — nothing may depend on it existing.
+    let decoy = std::env::temp_dir().join(format!("tailnetd-decoy-{}", std::process::id()));
+    let decoy_str = decoy.display().to_string();
+
+    // The built `tnet`, pointed at this daemon's socket, with the decoy in its environment.
+    let socket = harness.socket_path.clone();
+    let decoy_env = decoy.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_tnet"))
+            .arg("--socket")
+            .arg(&socket)
+            .args(["debug", "statedir"])
+            .env("TAILNETD_STATE_DIR", &decoy_env)
+            .output()
+            .expect("the `tnet` binary built for this test should run")
+    })
+    .await
+    .expect("tnet subprocess join");
+    assert!(
+        out.status.success(),
+        "`tnet debug statedir` should exit 0 against a running daemon; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(
+        stdout,
+        format!("{daemon_dir}\n"),
+        "Go prints the daemon's path and nothing else, so a script can consume it"
+    );
+    assert!(
+        !stdout.contains(&decoy_str),
+        "the CLI's own $TAILNETD_STATE_DIR must not reach the answer: {stdout:?}"
+    );
+
+    // `--local` is the other question, and it still answers it: the CLI's own resolution plus the
+    // cascade rule that won — the fork's report, kept because it needs no daemon.
+    let decoy_env = decoy.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_tnet"))
+            .args(["debug", "statedir", "--local"])
+            .env("TAILNETD_STATE_DIR", &decoy_env)
+            .output()
+            .expect("the `tnet` binary built for this test should run")
+    })
+    .await
+    .expect("tnet --local subprocess join");
+    assert!(
+        out.status.success(),
+        "`debug statedir --local` should exit 0"
+    );
+    let local_stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        local_stdout.contains(&decoy_str) && local_stdout.contains("$TAILNETD_STATE_DIR"),
+        "--local must report the CLI's resolution and the rule that chose it: {local_stdout:?}"
+    );
+    assert!(
+        !tokio::fs::try_exists(&decoy).await.unwrap(),
+        "`debug statedir` must never create the dir it reports"
+    );
+
+    harness.shutdown_and_verify().await;
+}

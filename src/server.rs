@@ -1024,6 +1024,18 @@ async fn dispatch(
                 },
             }
         }
+        // `debug statedir` (Go `tailscale debug statedir` → the LocalAPI `debug` route's `statedir`
+        // action, which returns `TailscaleVarRoot()`): answer with the dir THIS daemon is using. That is
+        // the only reason the CLI asks instead of resolving its own — a root daemon under a unit that
+        // sets the dir and an unprivileged CLI resolve different paths from the same cascade. A brief
+        // lock, no engine, so it answers with the node down too (Go's does). The write-gate is enforced
+        // above by `auth::authorize`.
+        Request::DebugStateDir => {
+            let be = backend.lock().await;
+            Response::StateDir {
+                dir: be.state_dir().display().to_string(),
+            }
+        }
         // `reload-config` (Go `tailscaled`'s `reload-config` → `LocalBackend.ReloadConfig`): re-read the
         // `--config` file and adopt the changed fields into the running node. Like `Set`, this can drive
         // an off-lock device rebuild (when the node is up), so it goes through the `ipn::drive_reload_config`

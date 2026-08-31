@@ -639,6 +639,21 @@ pub enum Request {
     /// have changed but the socket is still fine. A **write** (mutates live datapath state): gated like
     /// `down`/`logout`. Needs the node up. Replies with [`Response::Ok`]/[`Response::Error`].
     DebugReStun,
+    /// Report the state directory **the daemon** is using (Go `tailscale debug statedir` → the LocalAPI
+    /// `debug` route's `statedir` action, `ipn/localapi/debug.go` @ v1.100.0, which JSON-encodes
+    /// `LocalBackend.TailscaleVarRoot()`), rendered by `tnet debug statedir`.
+    ///
+    /// The round trip is the entire point of the verb. The daemon's state dir is whatever it resolved
+    /// at boot — `--statedir`, or the cascade run in *its* environment (as root, with the unit's
+    /// `EnvironmentFile`). A CLI that re-runs that cascade in its own environment answers a different
+    /// question, and on the configuration people actually hit (root daemon + unprivileged `tnet`) it
+    /// answers it wrongly. Only the daemon knows.
+    ///
+    /// A **read** of one path, but gated as a write: Go gates its whole `debug` route on `PermitWrite`
+    /// ("debug access denied"), not per-action, so the faithful classification matches
+    /// [`DebugRebind`](Self::DebugRebind). Needs no engine — it answers with the node down, like Go's.
+    /// Replies with [`Response::StateDir`].
+    DebugStateDir,
     /// Re-read the daemon's `--config` file and adopt the changed fields into the running node (Go
     /// `tailscaled`'s `reload-config` LocalAPI route → `LocalBackend.ReloadConfig` → `setConfigLocked`,
     /// v1.100.0). Rendered by `tnet reload-config`. The daemon re-loads the same declarative config it
@@ -722,6 +737,16 @@ pub enum Response {
     Version {
         /// The daemon binary's version (its crate version, `CARGO_PKG_VERSION`).
         version: String,
+    },
+    /// The daemon's state directory (reply to [`Request::DebugStateDir`]), printed by `tnet debug
+    /// statedir`. Mirrors Go's `statedir` debug action, which encodes `TailscaleVarRoot()` as a bare
+    /// JSON string — including the empty one.
+    StateDir {
+        /// The daemon's state directory, or `""` when it has none. Empty is the wire analogue of Go's
+        /// empty `TailscaleVarRoot()`, which the CLI renders as Go's `no statedir is set` error rather
+        /// than as a blank line. This fork's daemon always has one (it needs a place for `prefs.json`),
+        /// so the empty case is the ported error path, not a state it reaches on its own.
+        dir: String,
     },
     /// The OIDC id-token minted by control (reply to [`Request::IdToken`]), printed by
     /// `tnet id-token`.
