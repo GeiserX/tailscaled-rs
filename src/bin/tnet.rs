@@ -700,13 +700,16 @@ enum Command {
     /// Show tailnet IP addresses — this node's by default, or a peer's (or a Tailscale Service's)
     /// if named. Mirrors Go `tailscale ip`.
     Ip {
-        /// Show only the IPv4 address (Go `-4`). Mutually exclusive with `-6`.
-        #[arg(short = '4', conflicts_with = "v6")]
+        /// Show only the IPv4 address (Go `-4`). Mutually exclusive with `-6` and `-1`.
+        #[arg(short = '4')]
         v4: bool,
-        /// Show only the IPv6 address (Go `-6`). Mutually exclusive with `-4`.
+        /// Show only the IPv6 address (Go `-6`). Mutually exclusive with `-4` and `-1`.
         #[arg(short = '6')]
         v6: bool,
-        /// Show only the first/primary address (Go `-1`).
+        /// Show only the first/primary address (Go `-1`). Mutually exclusive with `-4` and `-6`:
+        /// `-1` names the first address of the node's whole list, not the first of a family.
+        /// All three are refused together by [`ip_usage_refusal`] rather than by clap, so one
+        /// upstream check keeps one message.
         #[arg(short = '1')]
         first: bool,
         /// A peer (by MagicDNS name or IP) whose address to show instead of this node's. Resolved
@@ -4945,6 +4948,37 @@ async fn run_whoami(socket: &std::path::Path, json: bool) -> Result<()> {
 /// An argument that matches no peer but IS an address falls through to the Tailscale Service set
 /// (Go `serviceAddrsMatchingIP`): a Service is a virtual service with its own VIPs, which belong to
 /// no peer, so without that arm naming one could only fail with "no peer found".
+/// The refusal `tnet ip` owes its own flags before it looks at anything else — Go's `runIP`
+/// (`cmd/tailscale/cli/ip.go`, upstream v1.102.3 `53a0d659afa51835dd7a9283873cca44261454f8`) counts
+/// its three address selectors and rejects any two of them together:
+///
+/// ```text
+/// nflags := 0
+/// for _, b := range []bool{ipArgs.want1, v4, v6} { if b { nflags++ } }
+/// if nflags > 1 {
+///     return errors.New("tailscale ip -1, -4, and -6 are mutually exclusive")
+/// }
+/// ```
+///
+/// All three answer "which addresses print", and Go resolves that with one flag rather than a
+/// combination: `-1` means the first address of the node's (or Service's) whole list, NOT the first
+/// of a selected family. So `-6 -1` on a dual-stack target asks for something Go does not offer, and
+/// Go's own evaluation order — truncate to the first address, THEN filter by family — would answer
+/// it with an empty set. Refusing it is what keeps a plausible-looking command from printing nothing
+/// and calling that an answer.
+///
+/// `-4 -6` is the same Go check, which is why this is NOT a clap `conflicts_with`: clap would answer
+/// that one pair with its own stderr + exit 2 text while the other two pairs got Go's, and one
+/// upstream check should have one message. Go's is returned as an error (stderr, exit 1) rather than
+/// `outln`-ed, so the caller `bail!`s it instead of following [`switch_usage_refusal`]'s stdout path.
+/// Pure (no I/O, no process exit) so the whole refusal table is unit-testable.
+fn ip_usage_refusal(v4: bool, v6: bool, first: bool) -> Option<&'static str> {
+    if [first, v4, v6].into_iter().filter(|b| *b).count() > 1 {
+        return Some("tnet ip -1, -4, and -6 are mutually exclusive");
+    }
+    None
+}
+
 async fn run_ip(
     socket: &std::path::Path,
     v4: bool,
@@ -4953,6 +4987,11 @@ async fn run_ip(
     peer: Option<String>,
     assert: Option<String>,
 ) -> Result<()> {
+    // Go's flag refusal runs before `--assert` and before the `Status` call, so an unusable
+    // invocation costs no daemon round trip and says the same thing whether the daemon is up.
+    if let Some(message) = ip_usage_refusal(v4, v6, first) {
+        anyhow::bail!(message);
+    }
     let sel = IpSelect { v4, v6, first };
     // `--assert <ip>`: verify one of this node's own IPs matches; exit 0 on a match, 1 otherwise.
     // Prints nothing on success (Go's behavior) — it is a script predicate, not a display. Compares
@@ -5954,8 +5993,10 @@ fn service_addrs_matching_ip(
 /// a Service carries a list, so the family of each address is determined by parsing it. An address
 /// that does not parse is dropped rather than mis-filed under a family it may not belong to.
 fn format_service_ips(addrs: &[String], sel: IpSelect) -> String {
-    // Go truncates to the first address BEFORE the family filter (`-1`, `-4` and `-6` are mutually
-    // exclusive, so the order is observable only through `-1`).
+    // Go truncates to the first address BEFORE the family filter — `ips = ips[:1]`, then its match
+    // loop. Because Go refuses `-1` alongside `-4`/`-6` ([`ip_usage_refusal`] ports that check), the
+    // two never narrow the same call, so the order is unobservable; it is kept as Go writes it so
+    // this stays a port rather than a re-derivation.
     let considered = if sel.first {
         addrs.get(..1).unwrap_or(addrs)
     } else {
@@ -7680,30 +7721,40 @@ struct IpSelect {
 }
 
 /// Format `tnet ip` output applying an [`IpSelect`]: `-4` keeps only IPv4, `-6` only IPv6, `-1` only
-/// the first selected address (Go's quad-one). With no flags, both families print (IPv4 then IPv6),
-/// one per line. A placeholder is printed only when nothing is selectable. Pure → unit-testable.
+/// the first address (Go's quad-one). With no flags, both families print (IPv4 then IPv6), one per
+/// line. A placeholder is printed only when nothing is selectable. Pure → unit-testable.
+///
+/// The two narrowings run in Go's order — `-1` truncates the address list, and only then does the
+/// family filter run over what survived — so this and [`format_service_ips`] answer the same
+/// question the same way. [`ip_usage_refusal`] refuses `-1` alongside `-4`/`-6` exactly as Go does,
+/// so in practice at most one of the two ever narrows a call.
 fn format_ip_filtered(ipv4: Option<&str>, ipv6: Option<&str>, sel: IpSelect) -> String {
-    // Apply family filter: -4 drops v6, -6 drops v4; neither keeps both.
+    // Go's `ips`, in netmap order: IPv4 then IPv6. A node has at most one address per family here,
+    // so each one's family is positional — unlike a Service's list, nothing needs parsing.
+    let all: Vec<(&str, bool)> = [(ipv4, true), (ipv6, false)]
+        .into_iter()
+        .filter_map(|(addr, is_v4)| addr.map(|addr| (addr, is_v4)))
+        .collect();
+    // -1: only the first (Go's quad-one — the primary address). Go's `ips = ips[:1]`, ahead of the
+    // family filter below, which is its match loop.
+    let considered = if sel.first {
+        all.get(..1).unwrap_or(&all)
+    } else {
+        all.as_slice()
+    };
+    // Family filter: -4 drops v6, -6 drops v4; neither keeps both.
     let want_v4 = !sel.v6; // -6 hides v4
     let want_v6 = !sel.v4; // -4 hides v6
-    let mut addrs: Vec<&str> = Vec::new();
-    if want_v4 && let Some(v4) = ipv4 {
-        addrs.push(v4);
-    }
-    if want_v6 && let Some(v6) = ipv6 {
-        addrs.push(v6);
-    }
-    // -1: only the first (Go's quad-one — the primary address).
-    if sel.first {
-        addrs.truncate(1);
-    }
-    if addrs.is_empty() {
-        return "(no matching tailnet address)\n".to_string();
-    }
     let mut out = String::new();
-    for a in addrs {
-        out.push_str(a);
-        out.push('\n');
+    for (addr, is_v4) in considered {
+        let wanted = if *is_v4 { want_v4 } else { want_v6 };
+        if wanted {
+            out.push_str(addr);
+            out.push('\n');
+        }
+    }
+    if out.is_empty() {
+        return "(no matching tailnet address)\n".to_string();
     }
     out
 }
@@ -15328,7 +15379,11 @@ mod tests {
             ),
             "100.64.0.1\n"
         );
-        // -6 -1 → first of the v6-only set.
+        // -6 -1 → Go truncates to the first address (the v4 one) and only then filters for v6, so
+        // the combination selects NOTHING on a dual-stack node. That empty answer is exactly why Go
+        // refuses the combination up front rather than serving it; `ip_usage_refusal` ports the
+        // refusal, so no `tnet ip` invocation can reach this state. Asserted here so the ported
+        // evaluation order stays pinned even though the CLI no longer exposes it.
         assert_eq!(
             format_ip_filtered(
                 v4,
@@ -15339,7 +15394,12 @@ mod tests {
                     ..Default::default()
                 }
             ),
-            "fd7a::1\n"
+            "(no matching tailnet address)\n"
+        );
+        assert_eq!(
+            ip_usage_refusal(false, true, true),
+            Some("tnet ip -1, -4, and -6 are mutually exclusive"),
+            "and the CLI refuses it before the formatter ever sees it"
         );
         // -4 with only v6 available → nothing matches.
         assert_eq!(
@@ -15352,6 +15412,68 @@ mod tests {
                 }
             ),
             "(no matching tailnet address)\n"
+        );
+    }
+
+    #[test]
+    fn ip_refuses_gos_mutually_exclusive_selectors() {
+        // Ported from Go's `runIP` (`cmd/tailscale/cli/ip.go`), which counts `-1`, `-4` and `-6` and
+        // refuses as soon as two are set: `tailscale ip -1, -4, and -6 are mutually exclusive`.
+        const MESSAGE: &str = "tnet ip -1, -4, and -6 are mutually exclusive";
+
+        // Each flag alone is a usable invocation, as is none of them.
+        assert_eq!(ip_usage_refusal(false, false, false), None);
+        assert_eq!(ip_usage_refusal(true, false, false), None, "-4 alone");
+        assert_eq!(ip_usage_refusal(false, true, false), None, "-6 alone");
+        assert_eq!(ip_usage_refusal(false, false, true), None, "-1 alone");
+
+        // Every pair is refused — including `-4 -6`, which used to be clap's `conflicts_with` and so
+        // answered one third of Go's single check with a different message and a different exit code.
+        assert_eq!(ip_usage_refusal(true, true, false), Some(MESSAGE), "-4 -6");
+        assert_eq!(ip_usage_refusal(true, false, true), Some(MESSAGE), "-4 -1");
+        assert_eq!(ip_usage_refusal(false, true, true), Some(MESSAGE), "-6 -1");
+        assert_eq!(
+            ip_usage_refusal(true, true, true),
+            Some(MESSAGE),
+            "-4 -6 -1"
+        );
+    }
+
+    #[test]
+    fn ip_refusal_covers_the_service_arm_that_would_answer_emptily() {
+        // The refusal matters most on `tnet ip <service-VIP>`: a Service carries a LIST of addresses,
+        // so `-6 -1` reads like "the Service's IPv6 address". It is not — Go truncates to the first
+        // address before filtering, so on a dual-stack Service the pair selects nothing. Without the
+        // ported refusal the command would answer that empty set instead of refusing the flags.
+        let addrs = vec!["100.64.0.10".to_string(), "fd7a:115c:a1e0::a".to_string()];
+        assert_eq!(
+            format_service_ips(
+                &addrs,
+                IpSelect {
+                    v6: true,
+                    first: true,
+                    ..Default::default()
+                }
+            ),
+            "(no matching tailnet address)\n",
+            "Go's order: -1 truncates to the v4 address, then -6 filters it away"
+        );
+        assert_eq!(
+            ip_usage_refusal(false, true, true),
+            Some("tnet ip -1, -4, and -6 are mutually exclusive"),
+            "so the CLI never gets to print that"
+        );
+        // `-1` on its own still means what it means: the Service's first address, both families
+        // wanted, which is the answer Go gives and the one this arm keeps giving.
+        assert_eq!(
+            format_service_ips(
+                &addrs,
+                IpSelect {
+                    first: true,
+                    ..Default::default()
+                }
+            ),
+            "100.64.0.10\n"
         );
     }
 
