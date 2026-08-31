@@ -1200,6 +1200,26 @@ enum DebugCmd {
     /// the CLI just reports a missing socket. This prints the rule that won, so the split is one
     /// line to spot instead of a guess.
     Statedir,
+    /// Resolve a hostname to its IP addresses, one per line (Go `tailscale debug resolve`). Purely
+    /// local — a **host-resolver** lookup inside this CLI process (Go's `net.DefaultResolver`, i.e.
+    /// `getaddrinfo` here), NOT a MagicDNS query through the daemon: no LocalAPI round-trip and no
+    /// daemon state, so it answers with the node down. The lookup is bounded to 5 seconds (Go's
+    /// `context.WithTimeout`), and a resolver failure is reported rather than swallowed into an
+    /// empty result.
+    Resolve {
+        /// Which address family to resolve: `ip` (both, the default), `ip4` (IPv4 only) or `ip6`
+        /// (IPv6 only). Deliberately a free-form string rather than a clap value-enum: Go passes
+        /// this flag straight to `LookupIP`, so a bad value is refused by the *command* with
+        /// `unknown network <net>` on stderr and exit 1 — not by the flag parser with a usage block
+        /// and exit 2.
+        #[arg(long, value_name = "ip|ip4|ip6", default_value = "ip")]
+        net: String,
+        /// The hostname (or IP literal) to resolve. Exactly one, and for the same reason it is
+        /// collected as a list rather than a required single value: Go refuses any other count from
+        /// inside the command, with `usage: tnet debug resolve <hostname>`.
+        #[arg(value_name = "HOSTNAME")]
+        hostname: Vec<String>,
+    },
     /// Print this binary's build metadata as JSON (Go `tailscale debug go-buildinfo`, which dumps
     /// Go's `runtime/debug.BuildInfo`). Purely local — no daemon round-trip. Rust has no runtime
     /// build-info reflection, so the same facts are stamped in at compile time by `build.rs`: the
@@ -2341,6 +2361,8 @@ async fn main() -> Result<()> {
                 run_debug_statedir(&socket);
                 Ok(())
             }
+            // `debug resolve` is a host-resolver lookup in THIS process — no socket round-trip.
+            DebugCmd::Resolve { net, hostname } => run_debug_resolve(&hostname, &net).await,
             // `debug build-info` prints compile-time build facts — purely local, no round-trip.
             DebugCmd::BuildInfo => {
                 run_debug_build_info();
@@ -3623,6 +3645,118 @@ fn stat_report(path: &std::path::Path) -> String {
         }
     }
     out
+}
+
+/// How long `debug resolve` gives the host resolver before giving up (Go's
+/// `context.WithTimeout(ctx, 5*time.Second)`).
+const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The address family `debug resolve --net` selects (Go's `-net` flag: `ip`, `ip4`, `ip6`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolveNet {
+    /// `ip`: both families — whatever the resolver returns, unfiltered.
+    Ip,
+    /// `ip4`: IPv4 addresses only.
+    Ip4,
+    /// `ip6`: IPv6 addresses only.
+    Ip6,
+}
+
+/// Parse `debug resolve --net`. Go hands the raw flag string to `net.DefaultResolver.LookupIP`, which
+/// refuses anything outside `ip`/`ip4`/`ip6` with `UnknownNetworkError` — rendered `unknown network
+/// <net>`. That is an error from the command, so it is reproduced here rather than delegated to clap.
+/// Pure → unit-testable.
+fn parse_resolve_net(net: &str) -> Result<ResolveNet> {
+    match net {
+        "ip" => Ok(ResolveNet::Ip),
+        "ip4" => Ok(ResolveNet::Ip4),
+        "ip6" => Ok(ResolveNet::Ip6),
+        other => anyhow::bail!("unknown network {other}"),
+    }
+}
+
+/// Keep only the addresses of the family `net` selects — Go's `filterAddrList` with the `ipv4only` /
+/// `ipv6only` filters that `internetAddrList` picks per network.
+///
+/// An empty result is an ERROR, not an empty print: Go's `filterAddrList` returns `&AddrError{Err:
+/// "no suitable address found", Addr: host}` when the filter empties the list, which renders as
+/// `address <host>: no suitable address found`. So `--net ip6` against an IPv4-only name fails
+/// loudly instead of silently printing nothing. Pure → unit-testable.
+fn filter_resolve_addrs(
+    addrs: Vec<std::net::IpAddr>,
+    net: ResolveNet,
+    host: &str,
+) -> Result<Vec<std::net::IpAddr>> {
+    let kept: Vec<std::net::IpAddr> = addrs
+        .into_iter()
+        .filter(|ip| match net {
+            ResolveNet::Ip => true,
+            ResolveNet::Ip4 => ip.is_ipv4(),
+            ResolveNet::Ip6 => ip.is_ipv6(),
+        })
+        .collect();
+    if kept.is_empty() {
+        anyhow::bail!("address {host}: no suitable address found");
+    }
+    Ok(kept)
+}
+
+/// Render resolved addresses one per line (Go's `for _, ip := range ips { fmt.Printf("%s\n", ip) }`).
+/// Pure → unit-testable; the result ends in a newline whenever it is non-empty.
+fn resolve_report(addrs: &[std::net::IpAddr]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for ip in addrs {
+        let _ = writeln!(out, "{ip}");
+    }
+    out
+}
+
+/// Resolve `host` through the OS resolver, bounded to [`RESOLVE_TIMEOUT`], filtered to `net`'s family.
+///
+/// Mirrors Go's `net.DefaultResolver.LookupIP(ctx, net, host)`: an empty host is refused before any
+/// query, an IP literal short-circuits to itself (Go's resolver parses it before querying) while still
+/// going through the family filter, and everything else reaches the host resolver — `getaddrinfo(3)`
+/// via `tokio::net::lookup_host` on a blocking thread, the same resolver Go's cgo path uses. The `0`
+/// port is a placeholder: `lookup_host` resolves a host+port pair and only the address half is kept.
+///
+/// A resolver failure is surfaced with its own message intact (`lookup <host>: <error>`, the shape
+/// Go's `DNSError` renders), never swallowed into an empty list. On the deadline we report Go's
+/// `lookup <host>: i/o timeout`; the abandoned `getaddrinfo` call is not cancellable, so it runs to
+/// completion on its blocking thread and its result is dropped.
+async fn resolve_lookup(host: &str, net: ResolveNet) -> Result<Vec<std::net::IpAddr>> {
+    if host.is_empty() {
+        // Go's `LookupIP` guard: `&DNSError{Err: "no suitable address found", Name: ""}`.
+        anyhow::bail!("lookup : no suitable address found");
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return filter_resolve_addrs(vec![ip], net, host);
+    }
+    let addrs =
+        match tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host((host, 0u16))).await {
+            Err(_elapsed) => anyhow::bail!("lookup {host}: i/o timeout"),
+            Ok(Err(e)) => anyhow::bail!("lookup {host}: {e}"),
+            Ok(Ok(addrs)) => addrs.map(|a| a.ip()).collect::<Vec<_>>(),
+        };
+    filter_resolve_addrs(addrs, net, host)
+}
+
+/// `debug resolve` (Go `tailscale debug resolve`): resolve ONE hostname through the host resolver and
+/// print each address on its own line. Purely local — no daemon round-trip and nothing is mutated.
+///
+/// The refusals are Go's, in Go's order: the argument count is checked first (`len(args) != 1` →
+/// `usage: …`, before the flag is interpreted at all), then `--net`, then the lookup. Both go to
+/// stderr with exit 1 — Go returns them as errors from `Exec`, which its `main` prints and exits 1
+/// on — which is why the count is checked by hand instead of being declared to clap, whose own
+/// refusal would print a usage block to stderr and exit 2.
+async fn run_debug_resolve(hostname: &[String], net: &str) -> Result<()> {
+    if hostname.len() != 1 {
+        anyhow::bail!("usage: tnet debug resolve <hostname>");
+    }
+    let net = parse_resolve_net(net)?;
+    let addrs = resolve_lookup(&hostname[0], net).await?;
+    print!("{}", resolve_report(&addrs));
+    Ok(())
 }
 
 /// `debug statedir` (Go `tailscale debug statedir`): print the resolved state dir, the cascade rule
@@ -15842,6 +15976,150 @@ mod tests {
             "must print a trailing `  ...` when entries exceed the cap: {report:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- `debug resolve` ------------------------------------------------------------------------
+
+    #[test]
+    fn parse_resolve_net_accepts_gos_three_networks() {
+        assert_eq!(super::parse_resolve_net("ip").unwrap(), ResolveNet::Ip);
+        assert_eq!(super::parse_resolve_net("ip4").unwrap(), ResolveNet::Ip4);
+        assert_eq!(super::parse_resolve_net("ip6").unwrap(), ResolveNet::Ip6);
+    }
+
+    #[test]
+    fn parse_resolve_net_refuses_anything_else_like_go() {
+        // Go's `LookupIP` rejects every other network with `UnknownNetworkError` — including the
+        // ones that are perfectly valid networks elsewhere (`tcp`, `udp`), which is exactly the
+        // mistake a user makes when reaching for this flag.
+        for bad in ["tcp", "udp4", "ip5", "IP4", ""] {
+            let err = super::parse_resolve_net(bad).unwrap_err().to_string();
+            assert_eq!(err, format!("unknown network {bad}"), "for {bad:?}");
+        }
+    }
+
+    #[test]
+    fn filter_resolve_addrs_keeps_only_the_selected_family() {
+        let mixed = || {
+            vec![
+                "192.0.2.1".parse().unwrap(),
+                "2001:db8::1".parse().unwrap(),
+                "198.51.100.7".parse().unwrap(),
+            ]
+        };
+        // `ip` keeps everything, in resolver order.
+        let all = super::filter_resolve_addrs(mixed(), ResolveNet::Ip, "host.test").unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].to_string(), "192.0.2.1");
+        assert_eq!(all[1].to_string(), "2001:db8::1");
+
+        let v4 = super::filter_resolve_addrs(mixed(), ResolveNet::Ip4, "host.test").unwrap();
+        assert!(v4.iter().all(std::net::IpAddr::is_ipv4), "{v4:?}");
+        assert_eq!(v4.len(), 2);
+
+        let v6 = super::filter_resolve_addrs(mixed(), ResolveNet::Ip6, "host.test").unwrap();
+        assert_eq!(v6.len(), 1);
+        assert_eq!(v6[0].to_string(), "2001:db8::1");
+    }
+
+    #[test]
+    fn filter_resolve_addrs_errors_when_the_family_filter_empties_the_list() {
+        // Go's `filterAddrList` turns an empty filtered list into an `AddrError`, so `--net ip6`
+        // against an IPv4-only name FAILS rather than silently printing nothing.
+        let v4_only = vec!["192.0.2.1".parse().unwrap()];
+        let err = super::filter_resolve_addrs(v4_only, ResolveNet::Ip6, "host.test")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "address host.test: no suitable address found");
+    }
+
+    #[test]
+    fn resolve_report_prints_one_address_per_line() {
+        let addrs: Vec<std::net::IpAddr> =
+            vec!["192.0.2.1".parse().unwrap(), "2001:db8::1".parse().unwrap()];
+        // Go prints the bare address per line — no brackets on IPv6, no trailing blank line.
+        assert_eq!(super::resolve_report(&addrs), "192.0.2.1\n2001:db8::1\n");
+        assert_eq!(super::resolve_report(&[]), "");
+    }
+
+    #[tokio::test]
+    async fn resolve_lookup_short_circuits_an_ip_literal() {
+        // Go's resolver parses a literal before querying anything — so this must not need a resolver
+        // (and this test must not need a network).
+        let got = super::resolve_lookup("192.0.2.1", ResolveNet::Ip)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].to_string(), "192.0.2.1");
+
+        let got = super::resolve_lookup("2001:db8::1", ResolveNet::Ip6)
+            .await
+            .unwrap();
+        assert_eq!(got[0].to_string(), "2001:db8::1");
+    }
+
+    #[tokio::test]
+    async fn resolve_lookup_applies_the_family_filter_to_a_literal_too() {
+        // The short-circuit does not skip the filter: Go runs the literal through `filterAddrList`
+        // like any resolved address.
+        let err = super::resolve_lookup("192.0.2.1", ResolveNet::Ip6)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "address 192.0.2.1: no suitable address found");
+    }
+
+    #[tokio::test]
+    async fn resolve_lookup_refuses_an_empty_host_before_querying() {
+        // Go's `LookupIP` guards `host == ""` ahead of the resolver, so an empty argument is a
+        // command error, not a DNS round-trip.
+        let err = super::resolve_lookup("", ResolveNet::Ip)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "lookup : no suitable address found");
+    }
+
+    #[tokio::test]
+    async fn run_debug_resolve_refuses_the_wrong_argument_count() {
+        // Go: `if len(args) != 1 { return errors.New("usage: …") }` — zero and two are both wrong.
+        for args in [vec![], vec!["a.test".to_string(), "b.test".to_string()]] {
+            let err = super::run_debug_resolve(&args, "ip")
+                .await
+                .unwrap_err()
+                .to_string();
+            assert_eq!(err, "usage: tnet debug resolve <hostname>", "for {args:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn run_debug_resolve_checks_the_argument_count_before_the_network() {
+        // Go checks arity FIRST, so a call that is wrong twice over reports the usage line — not
+        // the network complaint.
+        let args = vec!["a.test".to_string(), "b.test".to_string()];
+        let err = super::run_debug_resolve(&args, "tcp")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "usage: tnet debug resolve <hostname>");
+    }
+
+    #[tokio::test]
+    async fn run_debug_resolve_refuses_an_unknown_network() {
+        let args = vec!["192.0.2.1".to_string()];
+        let err = super::run_debug_resolve(&args, "tcp")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "unknown network tcp");
+    }
+
+    #[tokio::test]
+    async fn run_debug_resolve_prints_a_resolvable_host() {
+        // The happy path through the real entry point, with a literal so no resolver (and no
+        // network) is involved: one argument, default network, no error.
+        let args = vec!["192.0.2.1".to_string()];
+        super::run_debug_resolve(&args, "ip").await.unwrap();
     }
 
     // --- `debug statedir` / `debug build-info` --------------------------------------------------
