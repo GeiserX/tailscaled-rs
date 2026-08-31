@@ -1048,6 +1048,18 @@ async fn dispatch(
                 message: format!("{e:#}"),
             },
         },
+        // `service list` (Go `tailscale service list`, read-only). Off-lock device call; needs the
+        // node up (the Service set is decoded from the self node's control-delivered capability map,
+        // which only exists once a netmap has arrived — Go's handler answers `503 no netmap` here).
+        Request::Services => {
+            let dev = { backend.lock().await.device_handle() };
+            match dev {
+                Some(dev) => Backend::services(&dev).await,
+                None => Response::Error {
+                    message: "node is not up".into(),
+                },
+            }
+        }
         // `syspolicy list`/`reload` (Go `tailscale syspolicy`, read-only). NO lock + NO device:
         // policy resolution reads OS/registered policy stores, independent of node lifecycle, so it
         // works whether or not the node is up (and never touches the engine). On Linux/Unix no store
