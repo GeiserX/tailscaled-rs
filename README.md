@@ -125,6 +125,18 @@ not do. `--nickname` is the exception among them: like Go, it also renames the c
 so the name you pick is what `tnet switch --list` shows and what `tnet switch <name>` resolves
 against. `set` never re-authenticates and never changes whether the node is up or down.
 
+Four of Go's `set` flags are **parsed but not modelled**, so a command line ported from Go reaches a
+refusal that names the gap instead of dying at the parser. For each, the value asking for the state
+this daemon is permanently in is accepted, and the other is refused: `--relay-server-port=` and
+`--relay-server-static-endpoints=` (disable / advertise none) are fine, but a port or an endpoint
+list is refused — this build runs no peer relay server; `--sync` is fine and `--no-sync` (Go
+`--sync=false`) is refused — there is no way to stop the map poll while staying up. Those three are
+engine-gated (`docs/ENGINE_ASKS.md` §34). The fourth, `--remote-config`, is refused **by choice and
+permanently**: it hands the tailnet admin full remote control of this node's prefs and LocalAPI,
+bypassing the per-feature double opt-in, which this daemon's local authorization model
+(`docs/THREAT_MODEL.md` §4.1) does not grant to the control plane. `--no-remote-config`, Go's
+default, is what this build always does.
+
 State (node keys + prefs) lives in `$XDG_STATE_HOME/tailnetd` (override with `TAILNETD_STATE_DIR`);
 the control socket is `<state-dir>/tailnetd.sock` (override with `TAILNETD_SOCKET`).
 
