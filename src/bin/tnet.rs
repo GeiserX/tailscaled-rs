@@ -432,6 +432,45 @@ enum Command {
         /// `--exit-node-allow-lan-access`; omitting both leaves the setting unchanged.
         #[arg(long)]
         no_exit_node_allow_lan_access: bool,
+        /// PARTLY SUPPORTED (Go `--relay-server-port`): the UDP port a peer-relay server binds on
+        /// all interfaces (`0` = pick a random unused port), or an EMPTY value
+        /// (`--relay-server-port=`) to disable relay-server functionality. This build runs no peer
+        /// relay, so only the empty (disable) value is honoured — it asks for the state this daemon
+        /// is always in. A port is parsed exactly as Go parses it and then REFUSED by name: see
+        /// [`check_unmodelled_set_flags`] and engine ask #34.
+        #[arg(long, value_name = "PORT")]
+        relay_server_port: Option<String>,
+        /// PARTLY SUPPORTED (Go `--relay-server-static-endpoints`): static `IP:port` endpoints to
+        /// advertise as candidates for relay connections (comma-separated, e.g.
+        /// `[2001:db8::1]:40000,192.0.2.1:40000`), or an EMPTY value to advertise none. As with
+        /// `--relay-server-port`, only the empty (advertise-none) value is honoured; a list is
+        /// parsed as Go parses it and then REFUSED by name.
+        #[arg(long, value_name = "IP:PORT,...")]
+        relay_server_static_endpoints: Option<String>,
+        /// NOT SUPPORTED by this build, by choice (Go `--remote-config`): delegate FULL remote
+        /// control of this node's prefs and LocalAPI to the tailnet admin, bypassing Tailscale's
+        /// per-feature double opt-in. Refused by name — this fork's authorization model is local
+        /// (THREAT_MODEL §4.1) and the control plane is not trusted to rewrite prefs or drive the
+        /// LocalAPI. `--no-remote-config` (Go's default) is what this build always does.
+        //
+        // `hide` mirrors Go, which registers both this and `--sync` with its `hidden` prefix — a
+        // faithful port keeps them off `--help` and lets the refusal do the explaining.
+        #[arg(long, hide = true, conflicts_with = "no_remote_config")]
+        remote_config: bool,
+        /// Do not delegate remote control of this node to the tailnet admin (Go
+        /// `--remote-config=false`). Accepted: it is what this build always does.
+        #[arg(long, hide = true)]
+        no_remote_config: bool,
+        /// Actively sync configuration from the control plane (Go `--sync`, default true). Accepted:
+        /// it is what this build always does while up.
+        #[arg(long, hide = true, conflicts_with = "no_sync")]
+        sync: bool,
+        /// NOT SUPPORTED by this build (Go `--sync=false`): stop syncing configuration from the
+        /// control plane, Go's kill switch for exercising netmap caching and offline operation.
+        /// Refused by name — the pinned engine offers no way to stop the map poll while staying up
+        /// (engine ask #34).
+        #[arg(long, hide = true)]
+        no_sync: bool,
         /// Pre-accept a named risk and skip its safety refusal (Go `--accept-risk`), e.g. `lose-ssh`
         /// or `all`. On `set` the enforced risk is `lose-ssh`: toggling the Tailscale SSH server
         /// (`--ssh`/`--no-ssh`) over a Tailscale SSH session reroutes/drops that session, so it is
@@ -2250,6 +2289,12 @@ async fn main() -> Result<()> {
             no_webclient,
             exit_node_allow_lan_access,
             no_exit_node_allow_lan_access,
+            relay_server_port,
+            relay_server_static_endpoints,
+            remote_config,
+            no_remote_config,
+            sync,
+            no_sync,
             accept_risk,
         } => {
             // Same grouping as the `up` arm above (see `SetPrefFlags`): resolve the eight newer pref
@@ -2267,6 +2312,14 @@ async fn main() -> Result<()> {
                     exit_node_allow_lan_access,
                     no_exit_node_allow_lan_access,
                 ),
+            };
+            // The four Go `set` flags this build parses but models no pref for (see
+            // `UnmodelledSetFlags`); `run_set` gates them where Go's `runSet` does.
+            let unmodelled = UnmodelledSetFlags {
+                relay_server_port,
+                relay_server_static_endpoints,
+                remote_config: resolve_tristate(remote_config, no_remote_config),
+                sync: resolve_tristate(sync, no_sync),
             };
             run_set(
                 &socket,
@@ -2288,6 +2341,7 @@ async fn main() -> Result<()> {
                 ssh,
                 no_ssh,
                 set_prefs,
+                unmodelled,
                 accept_risk,
             )
             .await
@@ -3177,8 +3231,9 @@ async fn run_login(
 }
 
 /// `set` (Go `tailscale set`): patch individual prefs on an already-configured node — never
-/// (re)authenticates, never changes up/down. Runs the SSH-toggle risk gate BEFORE building the
-/// request (so a refusal changes nothing), builds the wire `Request::Set`, round-trips it, then
+/// (re)authenticates, never changes up/down. Runs the SSH-toggle risk gate and then the unmodelled-
+/// flag gate ([`check_unmodelled_set_flags`]) BEFORE building the request (so a refusal changes
+/// nothing), builds the wire `Request::Set`, round-trips it, then
 /// renders the reply: `Ok` acknowledges, the accidental-revert guard (`RevertGuard`) and `Error`
 /// both exit non-zero without changing the node.
 #[allow(clippy::too_many_arguments)]
@@ -3202,6 +3257,7 @@ async fn run_set(
     ssh: bool,
     no_ssh: bool,
     set_prefs: SetPrefFlags,
+    unmodelled: UnmodelledSetFlags,
     accept_risk: Option<String>,
 ) -> Result<()> {
     // Risk gate (Go `presentSSHToggleRisk`, the `set` call site): toggling the Tailscale SSH
@@ -3211,6 +3267,11 @@ async fn run_set(
     // built, so a refusal changes nothing. (bead tsd-eqx — same enforcement as the `up` path.)
     refuse_ssh_toggle_risk_if_needed(socket, resolve_ssh(ssh, no_ssh), accept_risk.as_deref())
         .await?;
+    // The four Go `set` pref flags this build models no pref for: Go's own parsing, then this
+    // build's named refusal. Go's `runSet` runs the same parses AFTER the risk gate above and
+    // before `EditPrefs`, so the ordering — and the fact that a refusal here changes nothing on the
+    // node — matches upstream.
+    check_unmodelled_set_flags(&unmodelled)?;
     let request = Request::Set {
         hostname,
         // `--accept-routes`/`--no-accept-routes` tri-state (mirrors `--tun`).
@@ -6973,9 +7034,13 @@ fn format_profiles_json(profiles: &[tailscaled_rs::localapi::ProfileEntry]) -> S
 /// [`get_value_display`]. One source so the table, the `--json` map, and single-setting lookup agree.
 ///
 /// This is a SUBSET of Go's `tailscale get` settings (Go derives its list from the full `set` flag
-/// set; the ones still absent here are the Linux OS-router knobs — `snat-subnet-routes`,
-/// `stateful-filtering`, `netfilter-mode` — plus `unattended`/`relay-server-*`, none of which this
-/// fork models yet). One entry, `tun`, is a fork-specific extension
+/// set). Still absent: the Linux OS-router knobs — `snat-subnet-routes`, `stateful-filtering`,
+/// `netfilter-mode` — plus `unattended`, none of which this fork models yet; and the four
+/// `set`-only flags this fork parses but stores no pref for — `relay-server-port`,
+/// `relay-server-static-endpoints`, `remote-config` and `sync` (see [`UnmodelledSetFlags`]). Those
+/// four have no row here on purpose: there is no persisted value to report, and inventing a
+/// hard-coded row would claim a pref the daemon does not hold. One entry, `tun`, is a fork-specific
+/// extension
 /// (selecting the kernel-TUN vs userspace datapath) that Go's `get` has no counterpart for; it is
 /// intentionally surfaced because it is a real `tnet set` flag in this build.
 fn get_settings(
@@ -8473,6 +8538,155 @@ struct SetPrefFlags {
     webclient: Option<bool>,
     /// `--exit-node-allow-lan-access` / `--no-exit-node-allow-lan-access`.
     exit_node_allow_lan_access: Option<bool>,
+}
+
+/// The four Go `tailscale set` pref flags (`set.go` `newSetFlagSet`) this fork carries on the parser
+/// but does **not** model as prefs: `--relay-server-port`, `--relay-server-static-endpoints`,
+/// `--remote-config` and `--sync`. Grouped like [`SetPrefFlags`] so they thread through `run_set` as
+/// one value.
+///
+/// They exist here so a command line ported from Go reaches a refusal that NAMES what is missing
+/// instead of clap's "unexpected argument", the same treatment `serve`'s `--service` / `--tun` /
+/// `--proxy-protocol` / `--accept-app-caps` get (see [`check_serve_flags`]). Two of the four are
+/// two-valued, and for each of those exactly ONE value asks for a state this daemon is permanently
+/// in — relay server disabled, no static endpoints advertised, no remote configuration delegated,
+/// configuration synced from control. Those values are accepted as already-satisfied rather than
+/// refused, so a ported line that merely turns the feature OFF keeps working; the other value is
+/// refused by [`check_unmodelled_set_flags`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct UnmodelledSetFlags {
+    /// `--relay-server-port <PORT>`; Go types it as a STRING (not a uint) precisely so the empty
+    /// value `--relay-server-port=` can mean "disable", distinct from the flag being absent.
+    relay_server_port: Option<String>,
+    /// `--relay-server-static-endpoints <IP:PORT,…>`; a string for the same reason — the empty
+    /// value means "advertise none".
+    relay_server_static_endpoints: Option<String>,
+    /// `--remote-config` → `Some(true)`, `--no-remote-config` → `Some(false)`, absent → `None`.
+    remote_config: Option<bool>,
+    /// `--sync` → `Some(true)`, `--no-sync` (Go `--sync=false`) → `Some(false)`, absent → `None`.
+    sync: Option<bool>,
+}
+
+/// Parse a `--relay-server-port` value the way Go's `runSet` does — `strconv.ParseUint(s, 10, 16)`,
+/// so `0` is legal ("pick a random unused port") and anything outside a `uint16` is refused with
+/// Go's own `failed to set relay server port: …` prefix. Called only for a NON-empty value: Go's
+/// empty string means "disable" and never reaches the parse. Pure → unit-testable.
+fn parse_relay_server_port(value: &str) -> Result<u16> {
+    // Go's `ParseUint` permits no sign prefix at all, where Rust's `u16::from_str` accepts `+80`.
+    // Reject it here so `--relay-server-port=+80` fails the way Go's does rather than parsing.
+    if value.starts_with('+') {
+        anyhow::bail!("failed to set relay server port: invalid syntax");
+    }
+    value
+        .parse::<u16>()
+        .map_err(|e| anyhow::anyhow!("failed to set relay server port: {e}"))
+}
+
+/// Parse a `--relay-server-static-endpoints` value the way Go's `runSet` does: split on `,`, parse
+/// each entry as a `netip.AddrPort` (so IPv6 must be bracketed — `[2001:db8::1]:40000`), collect
+/// into a SET so duplicates collapse, then sort by `netip.AddrPort.Compare`. Called only for a
+/// NON-empty value (the empty string means "advertise none"). A bad entry gets Go's own message,
+/// `failed to set relay server static endpoints: "…" is not a valid IP:port` — the entry is rendered
+/// with `{:?}`, which both matches Go's `%q` quoting and escapes any control characters an
+/// adversarial argument might carry. Pure → unit-testable.
+fn parse_relay_static_endpoints(value: &str) -> Result<Vec<std::net::SocketAddr>> {
+    let mut endpoints: Vec<std::net::SocketAddr> = Vec::new();
+    for entry in value.split(',') {
+        let addr: std::net::SocketAddr = entry.parse().map_err(|_| {
+            anyhow::anyhow!(
+                "failed to set relay server static endpoints: {entry:?} is not a valid IP:port"
+            )
+        })?;
+        // Go builds a `set.Set[netip.AddrPort]`, so a repeated endpoint appears once.
+        if !endpoints.contains(&addr) {
+            endpoints.push(addr);
+        }
+    }
+    endpoints.sort_by_key(relay_endpoint_sort_key);
+    Ok(endpoints)
+}
+
+/// Sort key reproducing Go's `netip.AddrPort.Compare`: the address's bit length first (so every IPv4
+/// endpoint sorts before every IPv6 one), then the address bytes, then the port. Pure.
+fn relay_endpoint_sort_key(addr: &std::net::SocketAddr) -> (u8, [u8; 16], u16) {
+    match addr.ip() {
+        std::net::IpAddr::V4(v4) => {
+            let mut bytes = [0u8; 16];
+            bytes[..4].copy_from_slice(&v4.octets());
+            (0, bytes, addr.port())
+        }
+        std::net::IpAddr::V6(v6) => (1, v6.octets(), addr.port()),
+    }
+}
+
+/// Gate the four unmodelled Go `set` pref flags (see [`UnmodelledSetFlags`]): run Go's OWN parsing
+/// and its refusals first, then this build's named refusal for whichever value asks for behaviour
+/// the daemon does not have. `Ok(())` means every mentioned flag asked only for a state this daemon
+/// is permanently in, so `set` proceeds unchanged.
+///
+/// Ordering is Go's. `runSet` parses `--relay-server-port` and then
+/// `--relay-server-static-endpoints` at the very end, after the risk gates, and a parse failure
+/// returns before `EditPrefs` — so a malformed value is rejected here before any refusal fires, and
+/// nothing is written either way. `--remote-config`/`--sync` have no Go-side validation at all; they
+/// are checked last. Pure → unit-testable.
+fn check_unmodelled_set_flags(flags: &UnmodelledSetFlags) -> Result<()> {
+    // Go: `if setArgs.relayServerPort != ""` — the empty value skips the parse and disables.
+    let port = match flags.relay_server_port.as_deref() {
+        None | Some("") => None,
+        Some(value) => Some(parse_relay_server_port(value)?),
+    };
+    // Go: `if setArgs.relayServerStaticEndpoints != ""` — likewise.
+    let endpoints = match flags.relay_server_static_endpoints.as_deref() {
+        None | Some("") => Vec::new(),
+        Some(value) => parse_relay_static_endpoints(value)?,
+    };
+
+    if let Some(port) = port {
+        anyhow::bail!(
+            "--relay-server-port={port} is not supported by this build: running a peer relay \
+             server needs a UDP relay listener in the engine's magicsock plus a `Hostinfo.PeerRelay` \
+             advertisement for THIS node, and the pinned engine has neither — its `Config` carries \
+             no relay listen port, and it only READS a peer's relay role. Filed as engine ask #34. \
+             Drop the flag, or pass `--relay-server-port=` (disable), which is what this build \
+             always does"
+        );
+    }
+    if !endpoints.is_empty() {
+        let list = endpoints
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        anyhow::bail!(
+            "--relay-server-static-endpoints={list} is not supported by this build: static \
+             endpoints are candidates advertised BY a peer relay server, and this build runs none \
+             (see --relay-server-port); the pinned engine's `Config` carries no static-endpoint \
+             list either. Filed as engine ask #34. Drop the flag, or pass \
+             `--relay-server-static-endpoints=` (advertise none), which is what this build always \
+             does"
+        );
+    }
+    if flags.remote_config == Some(true) {
+        anyhow::bail!(
+            "--remote-config is not supported by this build, and is not a gap this fork intends to \
+             close: it delegates FULL remote control of this node's prefs and LocalAPI to the \
+             tailnet admin, bypassing Tailscale's per-feature double opt-in. This daemon's \
+             authorization model is local (THREAT_MODEL §4.1) — the control plane is a peer that is \
+             not trusted to rewrite prefs or invoke LocalAPI endpoints — so a control-delegated \
+             configuration channel is declined by design, not deferred to the engine. \
+             `--no-remote-config` (Go's default) is what this build always does"
+        );
+    }
+    if flags.sync == Some(false) {
+        anyhow::bail!(
+            "--no-sync (Go `--sync=false`) is not supported by this build: it is Go's kill switch \
+             for the control-plane configuration sync, there to exercise netmap caching and offline \
+             operation, and the pinned engine exposes no way to stop the map poll while the node \
+             stays up. Filed as engine ask #34. `--sync` (Go's default) is what this build always \
+             does"
+        );
+    }
+    Ok(())
 }
 
 /// Map an `--x` / `--no-x` pref flag pair to the tri-state `Option<bool>` the wire uses: enable →
@@ -15718,6 +15932,260 @@ mod tests {
                 Cli::try_parse_from(["tnet", "set", on, off]).is_err(),
                 "{on} and {off} must conflict"
             );
+        }
+    }
+
+    /// Parse a `tnet set` command line and project it onto the four unmodelled Go `set` pref flags,
+    /// exactly as `main`'s `Command::Set` arm builds the value it hands to `run_set`.
+    fn parse_unmodelled_set(argv: &[&str]) -> UnmodelledSetFlags {
+        let mut full = vec!["tnet", "set"];
+        full.extend_from_slice(argv);
+        match Cli::try_parse_from(full)
+            .unwrap_or_else(|e| panic!("{argv:?} should parse: {e}"))
+            .command
+        {
+            Command::Set {
+                relay_server_port,
+                relay_server_static_endpoints,
+                remote_config,
+                no_remote_config,
+                sync,
+                no_sync,
+                ..
+            } => UnmodelledSetFlags {
+                relay_server_port,
+                relay_server_static_endpoints,
+                remote_config: resolve_tristate(remote_config, no_remote_config),
+                sync: resolve_tristate(sync, no_sync),
+            },
+            _ => panic!("expected Command::Set"),
+        }
+    }
+
+    #[test]
+    fn the_four_unmodelled_set_flags_parse_instead_of_dying_at_the_parser() {
+        // The whole point of carrying them: a command line ported from Go reaches a refusal that
+        // names the gap, not clap's "unexpected argument". All four are `set`-only in Go
+        // (`set.go` `newSetFlagSet`; `up.go` registers none of them), so `tnet up` must still
+        // reject them.
+        let flags = parse_unmodelled_set(&[
+            "--relay-server-port=41641",
+            "--relay-server-static-endpoints=192.0.2.1:40000",
+            "--remote-config",
+            "--no-sync",
+        ]);
+        assert_eq!(
+            flags,
+            UnmodelledSetFlags {
+                relay_server_port: Some("41641".to_string()),
+                relay_server_static_endpoints: Some("192.0.2.1:40000".to_string()),
+                remote_config: Some(true),
+                sync: Some(false),
+            }
+        );
+
+        // Absent flags stay absent — an unmentioned flag must not look like a mentioned one.
+        assert_eq!(parse_unmodelled_set(&[]), UnmodelledSetFlags::default());
+        assert!(check_unmodelled_set_flags(&UnmodelledSetFlags::default()).is_ok());
+
+        // Go's bool flags become this build's `--x`/`--no-x` pairs, which must conflict.
+        for (on, off) in [
+            ("--remote-config", "--no-remote-config"),
+            ("--sync", "--no-sync"),
+        ] {
+            assert!(
+                Cli::try_parse_from(["tnet", "set", on, off]).is_err(),
+                "{on} and {off} must conflict"
+            );
+        }
+
+        // `up` does not carry them (Go registers them on `set` only).
+        for flag in [
+            "--relay-server-port=41641",
+            "--relay-server-static-endpoints=192.0.2.1:40000",
+            "--remote-config",
+            "--sync",
+        ] {
+            assert!(
+                Cli::try_parse_from(["tnet", "up", flag]).is_err(),
+                "{flag} is a set-only flag in Go"
+            );
+        }
+    }
+
+    #[test]
+    fn gos_own_relay_flag_parse_errors_come_first() {
+        // Go parses `--relay-server-port` with `strconv.ParseUint(s, 10, 16)`, so a non-number, a
+        // negative, a sign prefix and anything past 65535 all fail before any refusal — with Go's
+        // `failed to set relay server port:` prefix.
+        for value in ["notanumber", "-1", "+80", "65536", "1e5"] {
+            let err = check_unmodelled_set_flags(&parse_unmodelled_set(&[&format!(
+                "--relay-server-port={value}"
+            )]))
+            .expect_err("Go rejects this value")
+            .to_string();
+            assert!(
+                err.starts_with("failed to set relay server port: "),
+                "{value}: {err}"
+            );
+        }
+
+        // `netip.ParseAddrPort` needs brackets around an IPv6 literal and a port on every entry;
+        // Go names the offending entry with %q and stops at the first bad one.
+        for (value, bad) in [
+            ("192.0.2.1", "192.0.2.1"),
+            ("192.0.2.1:40000,2001:db8::1:40000", "2001:db8::1:40000"),
+            ("192.0.2.1:40000,,198.51.100.7:40000", ""),
+            ("192.0.2.1:99999", "192.0.2.1:99999"),
+        ] {
+            let err = check_unmodelled_set_flags(&parse_unmodelled_set(&[&format!(
+                "--relay-server-static-endpoints={value}"
+            )]))
+            .expect_err("Go rejects this list")
+            .to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "failed to set relay server static endpoints: {bad:?} is not a valid IP:port"
+                ),
+                "{value}"
+            );
+        }
+
+        // A malformed port is rejected before the endpoints are even looked at (Go parses the port
+        // first), and before this build's own refusals fire — so nothing reaches the daemon.
+        let err = check_unmodelled_set_flags(&parse_unmodelled_set(&[
+            "--relay-server-port=nope",
+            "--relay-server-static-endpoints=alsonope",
+            "--remote-config",
+        ]))
+        .expect_err("the port parse runs first")
+        .to_string();
+        assert!(
+            err.starts_with("failed to set relay server port: "),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn relay_endpoints_are_deduped_and_ordered_like_go() {
+        // Go collects into a `set.Set[netip.AddrPort]` then sorts with `netip.AddrPort.Compare`:
+        // every IPv4 endpoint before every IPv6 one, then by address, then by port. The refusal
+        // message names that normalized list, so this pins the normalization the parser produces.
+        let endpoints = parse_relay_static_endpoints(
+            "[2001:db8::1]:40000,198.51.100.7:40001,192.0.2.1:40000,198.51.100.7:40000,192.0.2.1:40000",
+        )
+        .expect("every entry is a valid IP:port");
+        assert_eq!(
+            endpoints
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            "192.0.2.1:40000,198.51.100.7:40000,198.51.100.7:40001,[2001:db8::1]:40000"
+        );
+
+        // Go's zero port is legal on the port flag ("pick a random unused port"), so it must reach
+        // the refusal rather than the parse error.
+        assert_eq!(parse_relay_server_port("0").unwrap(), 0);
+        assert_eq!(parse_relay_server_port("65535").unwrap(), 65535);
+    }
+
+    #[test]
+    fn the_value_this_build_already_guarantees_is_accepted() {
+        // Go types the two relay flags as STRINGS so the empty value means "disable" /
+        // "advertise none" — which is the state this daemon is permanently in, so those command
+        // lines keep working instead of being refused for asking for the status quo. Likewise
+        // `--no-remote-config` (never delegate) and `--sync` (do sync from control).
+        for argv in [
+            vec!["--relay-server-port="],
+            vec!["--relay-server-static-endpoints="],
+            vec!["--no-remote-config"],
+            vec!["--sync"],
+            vec![
+                "--relay-server-port=",
+                "--relay-server-static-endpoints=",
+                "--no-remote-config",
+                "--sync",
+            ],
+        ] {
+            check_unmodelled_set_flags(&parse_unmodelled_set(&argv))
+                .unwrap_or_else(|e| panic!("{argv:?} asks for the status quo: {e}"));
+        }
+    }
+
+    #[test]
+    fn the_value_that_needs_missing_behaviour_is_refused_by_name() {
+        // Each refusal must NAME the flag (and its value, where there is one) so a ported command
+        // line says what is missing, and must say plainly that this build does not support it.
+        for (argv, needle) in [
+            (
+                vec!["--relay-server-port=41641"],
+                "--relay-server-port=41641",
+            ),
+            (vec!["--relay-server-port=0"], "--relay-server-port=0"),
+            (
+                vec!["--relay-server-static-endpoints=198.51.100.7:40000,192.0.2.1:40000"],
+                // The normalized (deduped, Go-ordered) list, not the raw argument.
+                "--relay-server-static-endpoints=192.0.2.1:40000,198.51.100.7:40000",
+            ),
+            (vec!["--remote-config"], "--remote-config"),
+            (vec!["--no-sync"], "--no-sync"),
+        ] {
+            let err = check_unmodelled_set_flags(&parse_unmodelled_set(&argv))
+                .expect_err("this build cannot do this")
+                .to_string();
+            assert!(err.contains(needle), "{argv:?}: {err}");
+            assert!(
+                err.contains("not supported by this build"),
+                "{argv:?}: {err}"
+            );
+        }
+
+        // `--remote-config` is refused as a product decision, not as an engine gap: the message has
+        // to say so, or a reader will file it as another pin-bump wait.
+        let err = check_unmodelled_set_flags(&parse_unmodelled_set(&["--remote-config"]))
+            .expect_err("declined by design")
+            .to_string();
+        assert!(
+            err.contains("not a gap this fork intends to close"),
+            "{err}"
+        );
+        assert!(err.contains("double opt-in"), "{err}");
+
+        // The three that ARE engine-gated point at the filed ask instead.
+        for argv in [
+            vec!["--relay-server-port=41641"],
+            vec!["--relay-server-static-endpoints=192.0.2.1:40000"],
+            vec!["--no-sync"],
+        ] {
+            let err = check_unmodelled_set_flags(&parse_unmodelled_set(&argv))
+                .expect_err("engine-gated")
+                .to_string();
+            assert!(err.contains("engine ask #34"), "{argv:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn get_reports_no_row_for_the_unmodelled_set_flags() {
+        // `tnet get` keys its output by set-flag name, and these four store no pref — so they must
+        // NOT appear with a fabricated value. `format_get` errors on an unknown name, which is the
+        // honest answer here.
+        let view = tailscaled_rs::localapi::PrefsView::default();
+        for name in [
+            "relay-server-port",
+            "relay-server-static-endpoints",
+            "remote-config",
+            "sync",
+        ] {
+            assert!(
+                !get_settings(&view).iter().any(|(n, _)| *n == name),
+                "{name} has no persisted value to report"
+            );
+            let err = format_get(&view, Some(name), false)
+                .expect_err("no such setting")
+                .to_string();
+            assert!(err.contains(name), "{err}");
         }
     }
 

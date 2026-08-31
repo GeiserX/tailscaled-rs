@@ -1075,3 +1075,68 @@ synthetic regions — `available_endpoints(regions, preferred_region_id)` — so
 one-argument change at the single call site in `ipn::captive_portal_loop`. Until then detection runs on
 the two Tailscale endpoints Go always appends (`controlplane`/`login`), which need no map but are
 status-code-only. Tracked in daemon bead tsd-iqq.5. — daemon lane
+
+---
+
+## 34. A peer-relay server (listen port + static endpoints) and a config-sync kill switch — for the last four Go `set` pref flags
+
+**Why:** Go's `tailscale set` (`cmd/tailscale/cli/set.go` @ `53a0d659afa51835dd7a9283873cca44261454f8`)
+registers four pref flags this fork models no pref for. Three of them are engine-gated; the fourth is
+listed here only so nobody files it as an ask by mistake.
+
+- **`--relay-server-port <PORT>`** (Go `Prefs.RelayServerPort *uint16`) — the UDP port a **peer relay
+  server** binds on all interfaces; `0` means "pick a random unused port", and the flag's empty value
+  means "disable relay-server functionality". A peer relay is a node that forwards disco + WireGuard
+  frames between two peers that cannot reach each other directly, without the round trip to a DERP
+  region.
+- **`--relay-server-static-endpoints <IP:PORT,…>`** (Go `Prefs.RelayServerStaticEndpoints
+  []netip.AddrPort`) — static endpoints to advertise as candidates for relay connections, for a relay
+  behind a firewall pinhole whose reflexive address discovery will not find the right candidate. Go
+  documents them as "only relevant when RelayServerPort is non-nil".
+- **`--sync`** (Go `Prefs.Sync opt.Bool`, unset = true) — whether the node actively syncs its
+  configuration from the control plane. `--sync=false` is Go's kill switch, and its stated purpose is
+  testing: "to verify that netmap caching and offline operation work correctly".
+
+Verified against pin `9d847a6e`/v0.43.0. The engine can **read** a peer's relay role —
+`ts_control::node` carries `peer_relay` (Go `Hostinfo.PeerRelay`) and `NodeInfo::is_peer_relay()` —
+but there is nothing on the **serving** side: `ts_control::Config` has no relay listen port and no
+static-endpoint list (its fields run from `server_url` to `allow_http_key_fetch`), `ts_control::hostinfo`
+never sets `peer_relay` for this node, so our own `Hostinfo` cannot advertise the role, and
+`ts_magicsock` has no relay listener to bind. There is likewise no way to suspend the map poll while
+the node stays up, so `--sync=false` has nothing to switch off.
+
+**Ask:**
+
+1. `Config.relay_server_port: Option<u16>` — `None` disables (today's behaviour), `Some(0)` binds a
+   random unused port, `Some(p)` binds `p` on all interfaces. This is the same construction-time shape
+   as the already-shipped `wireguard_listen_port` (ask #22), and it matches Go, where the port is a
+   pref read at engine reconfigure.
+2. `Config.relay_server_static_endpoints: Vec<SocketAddr>` — advertised as relay candidates; ignored
+   when `relay_server_port` is `None`, mirroring Go.
+3. Set `Hostinfo.PeerRelay` for THIS node when a relay port is configured, so control and peers learn
+   the role — the read side (`NodeInfo::is_peer_relay`) already exists, and without the advertise side
+   a bound listener is unreachable.
+4. The magicsock UDP relay path itself: accept relayed disco/WireGuard frames on the bound port and
+   forward between the two peers. This is the substantial half; (1)–(3) are plumbing around it.
+5. Separately and much smaller: a way to stop syncing configuration from control without bringing the
+   node down — `Config.sync: bool` or a `Device::set_sync(bool)` — so `--sync=false` can exercise
+   netmap caching and offline operation the way Go's does.
+
+(1)–(4) are one feature and can land together; (5) is independent and is the cheap one.
+
+**NOT asked for: `--remote-config`** (Go `Prefs.RemoteConfig`, new since v1.100.0). It delegates full
+remote control of the node's prefs **and its LocalAPI** to the tailnet admin via the control plane,
+bypassing Tailscale's per-feature double opt-in — "a single client-side 'I trust the tailnet admin'
+switch", in Go's own words. This daemon's authorization model is local (THREAT_MODEL §4.1: every
+LocalAPI write is gated on the caller's peer UID — root or the daemon's owner — and the control plane
+is a peer whose input is validated, never a principal that may rewrite prefs or invoke local
+endpoints). Adopting `RemoteConfig` would add a second,
+remote write path into both, so this fork **declines the behaviour** rather than deferring it. Please do
+not build it on this daemon's account; if the engine ever wants it for another consumer, it should be a
+feature the embedder opts into explicitly, never a default.
+
+**Daemon impact once landed:** `tnet set --relay-server-port` / `--relay-server-static-endpoints`
+already parse (with Go's own `ParseUint`/`ParseAddrPort` validation, dedup and `AddrPort.Compare`
+ordering) and are refused by name in `check_unmodelled_set_flags`; wiring them is a wire `Set` field +
+pref + `get_settings` row, and the refusal is deleted. `--sync`/`--no-sync` is the same shape.
+`--remote-config` keeps its refusal permanently. Tracked in daemon bead tsd-re94825b. — daemon lane
