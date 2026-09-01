@@ -663,37 +663,48 @@ not forgotten; the drain itself is already faithful without it. — daemon lane
 > shows — which Go drives from the same `Prefs.ProfileName` — is **done**: `set --nickname` now also
 > renames the current profile, so `nickname` is carried by the ENGINE but not inert locally.
 
-**Why:** Go's `tailscale up`/`set` (v1.100.0 `up.go:99-148`, `set.go:76-122`) expose ~15 pref flags;
-this fork's `up`/`set` faithfully cover the ten that map to existing engine `Config` fields
-(`hostname`, `accept-routes`, `accept-dns`, `shields-up`, `exit-node`, `advertise-exit-node`,
-`advertise-routes`, `advertise-tags`, `ssh`, `tun`). The remainder are **not daemon-fixable today**
-because the pinned engine `Config` (rev `6035651`, `src/config.rs`) has **no field** to carry them, and
-the honest-omission rule forbids shipping a flag that parses but silently does nothing (the historical
-`accept_dns` inert-flag trap). Confirmed by reading the authoritative `Config` struct: its fields end
-at `audience`, with nothing for any of the flags below.
+**Why — the rationale AS FILED, against pin `6035651`. Superseded for eight of the flags; kept as
+the record of what was asked for and why.** Go's `tailscale up`/`set` (v1.100.0 `up.go:99-148`,
+`set.go:76-122`) expose ~15 pref flags; this fork's `up`/`set` faithfully covered only the ten that
+mapped to existing engine `Config` fields (`hostname`, `accept-routes`, `accept-dns`, `shields-up`,
+`exit-node`, `advertise-exit-node`, `advertise-routes`, `advertise-tags`, `ssh`, `tun`). The remainder
+were **not daemon-fixable at that pin** because the engine `Config` (rev `6035651`, `src/config.rs`)
+had **no field** to carry them, and the honest-omission rule forbids shipping a flag that parses but
+silently does nothing (the historical `accept_dns` inert-flag trap). That was confirmed by reading the
+authoritative `Config` struct: its fields ended at `audience`, with nothing for any of the flags below.
+
+**Why it still stands, at pin `9d847a6` — for the Linux router knobs only.** The engine has since
+added a field for eight of the flags and the daemon wired them (banner above), so "no field to carry
+them" now describes `--snat-subnet-routes`, `--stateful-filtering`, `--netfilter-mode` and
+`--unattended` alone: for those four the reasoning above is unchanged and they stay unshipped rather
+than parse-and-do-nothing. The list below is marked per entry — ✅ SHIPPED at `9d847a6` (the daemon
+carries the pref today), ⬜ STILL OPEN (no engine field; this is the live ask).
 
 **Ask — add the engine `Config` fields (Go pref name → suggested field), so the daemon can wire each
 faithfully (a wire `Up`/`Set` field + pref mapping + the revert-guard/`--reset` lockstep + a
 `get_settings` row):**
 
-- `--operator <user>` → `operator_user: Option<String>` (also the substrate for the operator-GID
-  LocalAPI authz matrix the daemon's THREAT_MODEL notes as a later phase).
-- `--exit-node-allow-lan-access <bool>` → `exit_node_allow_lan_access: bool` (Go
+- ✅ SHIPPED — `--operator <user>` → `operator_user: Option<String>` (also the substrate for the
+  operator-GID LocalAPI authz matrix the daemon's THREAT_MODEL notes as a later phase).
+- ✅ SHIPPED — `--exit-node-allow-lan-access <bool>` → `exit_node_allow_lan_access: bool` (Go
   `Prefs.ExitNodeAllowLANAccess`; only meaningful with an exit node selected).
-- `--nickname <name>` → `nickname: Option<String>` (Go `Prefs.ProfileName`-adjacent / node nickname).
-- `--report-posture <bool>` → `posture_checking: bool` (Go `Prefs.PostureChecking`).
-- `--auto-update <bool>` / `--update-check <bool>` → `auto_update: { apply: Option<bool>, check:
-  Option<bool> }` (Go `Prefs.AutoUpdate`). *(Caveat: the daemon also lists self-update as a NON-GOAL —
-  see DESIGN §"Non-goals". If the engine carries the pref purely as state to report to control, the
-  daemon can wire the flag as a pref without implementing an updater; flagging the tension.)*
-- `--advertise-connector <bool>` → an app-connector pref/field (Go `Prefs.AppConnector`). Distinct from
-  the existing `advertise_services` (that is service-advertise, not the app-connector role).
-- `--webclient <bool>` → `run_web_client: bool` (Go `Prefs.RunWebClient`). *(Also a daemon NON-GOAL as
-  a UI; same caveat as auto-update — pref-state only, no embedded server.)*
-- Linux subnet-router knobs: `--snat-subnet-routes`, `--stateful-filtering`, `--netfilter-mode`,
-  `--unattended` → the engine's router/netfilter layer (Go `Prefs.NoSNAT` / `NoStatefulFiltering` /
-  `NetfilterMode` / `Unattended`). These ride on the Linux OS-router (daemon bead tsd-m8s) and are
-  lower priority.
+- ✅ SHIPPED — `--nickname <name>` → `nickname: Option<String>` (Go `Prefs.ProfileName`-adjacent /
+  node nickname).
+- ✅ SHIPPED — `--report-posture <bool>` → `posture_checking: bool` (Go `Prefs.PostureChecking`).
+- ✅ SHIPPED — `--auto-update <bool>` / `--update-check <bool>` → `auto_update: { apply:
+  Option<bool>, check: Option<bool> }` (Go `Prefs.AutoUpdate`). *(Caveat: the daemon also lists
+  self-update as a NON-GOAL — see DESIGN §"Non-goals". If the engine carries the pref purely as
+  state to report to control, the daemon can wire the flag as a pref without implementing an
+  updater; flagging the tension.)*
+- ✅ SHIPPED — `--advertise-connector <bool>` → an app-connector pref/field (Go
+  `Prefs.AppConnector`). Distinct from the existing `advertise_services` (that is service-advertise,
+  not the app-connector role).
+- ✅ SHIPPED — `--webclient <bool>` → `run_web_client: bool` (Go `Prefs.RunWebClient`). *(Also a
+  daemon NON-GOAL as a UI; same caveat as auto-update — pref-state only, no embedded server.)*
+- ⬜ STILL OPEN — Linux subnet-router knobs: `--snat-subnet-routes`, `--stateful-filtering`,
+  `--netfilter-mode`, `--unattended` → the engine's router/netfilter layer (Go `Prefs.NoSNAT` /
+  `NoStatefulFiltering` / `NetfilterMode` / `Unattended`). These ride on the Linux OS-router (daemon
+  bead tsd-m8s) and are lower priority.
 
 **Workload-identity flags** (`--client-id`/`--client-secret`/`--id-token`/`--audience`) are a SEPARATE
 case: the engine `Config` **already has** `client_id`/`client_secret`/`id_token`/`audience`, but they

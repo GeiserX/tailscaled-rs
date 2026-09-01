@@ -136,7 +136,7 @@ against. `set` never re-authenticates and never changes whether the node is up o
 
 Four of Go's `set` flags are **parsed but not modelled**, so a command line ported from Go reaches a
 refusal that names the gap instead of dying at the parser. For each, the value asking for the state
-this daemon is permanently in is accepted, and the other is refused: `--relay-server-port=` and
+this daemon is currently in is accepted, and the other is refused: `--relay-server-port=` and
 `--relay-server-static-endpoints=` (disable / advertise none) are fine, but a port or an endpoint
 list is refused — this build runs no peer relay server; `--sync` is fine and `--no-sync` (Go
 `--sync=false`) is refused — there is no way to stop the map poll while staying up. Those three are
