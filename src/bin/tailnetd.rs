@@ -174,6 +174,26 @@ struct Args {
     /// unless given.
     #[arg(long, value_name = "[HOST:]PORT")]
     debug: Option<String>,
+    /// The daemon's subcommands. `None` is the ordinary case: run the daemon.
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// `tailnetd`'s subcommands — the analogue of Go `tailscaled`'s `subCommands` map, which `main`
+/// dispatches on `os.Args[1]` **before** parsing the daemon's own flag set, so a subcommand runs
+/// standalone and never starts a daemon.
+///
+/// Go's map holds four entries; only `debug` is ported here. `install-system-daemon` /
+/// `uninstall-system-daemon` are already reachable in this fork as `tnet install`/`uninstall`
+/// (`ipn::install`), and `be-child` is Go's Windows subprocess plumbing, which has nothing to be
+/// the child of here.
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Daemon-less network diagnostics: dump the host network state, follow link changes, or fetch a
+    /// URL — none of which need a running daemon or its socket (Go `tailscaled debug`).
+    ///
+    /// This is NOT the `--debug` flag above, which is the listen address of the metrics HTTP server.
+    Debug(tailscaled_rs::debugmode::DebugArgs),
 }
 
 /// Restore the default `SIGPIPE` disposition (terminate) before any output. The Rust runtime sets
@@ -199,6 +219,25 @@ async fn main() -> Result<()> {
     // flags before we touch the experiment gate or any state, matching how Go `tailscaled` parses its
     // flag set up front. The parsed values then override the env-derived defaults below.
     let args = Args::parse();
+
+    // `tailnetd debug …` (Go `tailscaled debug`): a SUBCOMMAND, dispatched first — before the
+    // `--bird-socket` refusal, before `--cleanup`, and before the experiment gate. All three of
+    // those orderings are deliberate and all three are Go's: Go dispatches its `subCommands` map on
+    // `os.Args[1]` at the top of `main`, ahead of its own flag parsing and every startup
+    // precondition, because the subcommand never starts a daemon. Here the experiment gate is the
+    // one that matters most — the gate exists because the ENGINE is unaudited, and `debug` never
+    // constructs one: it enumerates interfaces and speaks plain HTTP. Making an operator opt into
+    // experimental software before they may look at their own network state would defeat the point
+    // of the tool, which is diagnosing a node that will not come up.
+    //
+    // Bare message + exit 1 on failure mirrors Go's `log.SetFlags(0)` + `log.Fatal(err)`.
+    if let Some(Command::Debug(debug_args)) = &args.command {
+        if let Err(e) = tailscaled_rs::debugmode::run(debug_args) {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
 
     // `--bird-socket <path>` (Go `tailscaled --bird-socket`): parsed so a Go-shaped command line
     // reaches a refusal that names the missing integration, then refused HERE — before the
@@ -1443,6 +1482,45 @@ mod tests {
             message.contains("--advertise-routes"),
             "points at the route-advertising path that does work; got {message:?}"
         );
+    }
+
+    // --- the `debug` subcommand (Go `tailscaled debug`) ----------------------------------------
+    //
+    // The decision and the refusals are `tailscaled_rs::debugmode`'s, and are tested there. What
+    // belongs here is the daemon's own wiring: that `debug` is a subcommand at all, that its flag
+    // set is separate from the daemon's, that a stray positional REACHES the refusal instead of
+    // dying as clap's "unexpected argument", and that the unrelated `--debug` flag still works.
+
+    #[test]
+    fn debug_subcommand_parses_alongside_the_daemons_own_flags() {
+        use clap::Parser;
+        // No subcommand is the ordinary case: run the daemon.
+        assert!(Args::parse_from(["tailnetd"]).command.is_none());
+
+        let Some(Command::Debug(debug)) =
+            Args::parse_from(["tailnetd", "debug", "--ifconfig"]).command
+        else {
+            panic!("`tailnetd debug --ifconfig` should parse as the debug subcommand");
+        };
+        assert!(debug.ifconfig && !debug.monitor && debug.rest.is_empty());
+
+        // A stray positional is carried through rather than rejected by clap, so
+        // `debugmode::select` can refuse it with Go's own message.
+        let Some(Command::Debug(debug)) =
+            Args::parse_from(["tailnetd", "debug", "monitor"]).command
+        else {
+            panic!("a stray argument should still parse into the debug subcommand");
+        };
+        assert_eq!(debug.rest, vec!["monitor".to_string()]);
+
+        // A daemon-startup flag is NOT in the debug flag set (Go's is a separate `flag.FlagSet`).
+        assert!(Args::try_parse_from(["tailnetd", "debug", "--statedir", "/var/lib/x"]).is_err());
+
+        // …and the daemon's own `--debug <addr>` (the metrics server's listen address) is an
+        // unrelated flag that still parses on its own, with no subcommand.
+        let a = Args::parse_from(["tailnetd", "--debug", "9090"]);
+        assert_eq!(a.debug.as_deref(), Some("9090"));
+        assert!(a.command.is_none());
     }
 
     #[test]
