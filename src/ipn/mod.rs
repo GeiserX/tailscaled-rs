@@ -78,7 +78,7 @@ mod config;
 mod control_url;
 mod diag;
 pub mod install;
-mod linkmon;
+pub(crate) mod linkmon;
 mod profile;
 mod revert_guard;
 pub mod serve;

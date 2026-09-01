@@ -81,6 +81,16 @@ export TS_RS_EXPERIMENT=this_is_unstable_software
 #   --version          print version and exit;  --help  full usage
 # e.g.  ./target/release/tailnetd --statedir /var/lib/tailnetd --verbose 1
 #
+# tailnetd also takes a `debug` SUBCOMMAND (Go `tailscaled debug`) — daemon-less diagnostics for
+# when the node will not come up at all, which is exactly when `tnet` (which talks to a running
+# daemon over its socket) cannot help. It needs no daemon, no socket and no TS_RS_EXPERIMENT:
+#   tailnetd debug --ifconfig            dump the host's network state once, as JSON (on stderr)
+#   tailnetd debug --monitor             …and re-dump it on every link change, until interrupted
+#   tailnetd debug --get-url <url>       fetch a URL with a connection trace ("login" = the
+#                                        default control plane's login URL)
+# (Go's --derp and --portmap are declared and refused BY NAME: a DERP round-trip test needs a
+# standalone DERP client this daemon does not own, and port mapping does not exist in the engine.)
+#
 # NOTE: --statedir also moves the default socket to <dir>/tailnetd.sock. Since `tnet` has no
 # --statedir, point the client at it explicitly:  tnet --socket /var/lib/tailnetd/tailnetd.sock status
 # (or export TAILNETD_SOCKET). The packaged service uses the default /var/lib/tailnetd, so this only
