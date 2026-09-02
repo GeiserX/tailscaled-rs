@@ -6060,6 +6060,15 @@ async fn run_lock_disable(socket: &std::path::Path, secret: &str) -> Result<()> 
 /// the `argon2` crate defaults to and which would produce entirely different digests — so the
 /// algorithm is selected explicitly. Verified against Go goldens in the test below.
 fn run_lock_disablement_kdf(secret_hex: &str) -> Result<()> {
+    println!("{}", disablement_kdf_line(secret_hex)?);
+    Ok(())
+}
+
+/// All of `lock disablement-kdf` bar the print: decode the hex secret, run the KDF, and render Go's
+/// `disablement:%x` line. Split out of [`run_lock_disablement_kdf`] so the golden test can drive the
+/// shipped derivation instead of a copy of it — these goldens are what pins the crate's Argon2
+/// output across dependency bumps, so they have to exercise the code the command actually runs.
+fn disablement_kdf_line(secret_hex: &str) -> Result<String> {
     use argon2::{Algorithm, Argon2, Params, Version};
 
     let secret = hex_decode_lower(secret_hex)
@@ -6081,8 +6090,7 @@ fn run_lock_disablement_kdf(secret_hex: &str) -> Result<()> {
     for b in out {
         hex.push_str(&format!("{b:02x}"));
     }
-    println!("disablement:{hex}");
-    Ok(())
+    Ok(format!("disablement:{hex}"))
 }
 
 /// Decode a lower/upper-hex string to bytes (the disablement secret is hex). A small local helper so
@@ -17989,33 +17997,38 @@ mod tests {
         // The disablement KDF is a security primitive: a wrong digest means a lock initialized with
         // these values could never be disabled (the operator's secret would hash to something not in
         // the authority's set). Pin it byte-for-byte against Go `tka.DisablementKDF` v1.100.0 goldens.
-        // Re-derive the value the same way the command does (the command only adds the
-        // `disablement:`-prefix + print), so this proves the Argon2**i** selection + params + salt.
-        use argon2::{Algorithm, Argon2, Params, Version};
+        // Drive the shipped derivation (`disablement_kdf_line` is everything the command does bar
+        // the print), so this covers the Argon2**i** selection, the params, the salt, the
+        // `disablement:` prefix and the lower-hex rendering exactly as the command performs them --
+        // a re-derivation here would only re-check the test's own copy of the call.
         let kdf = |secret: &[u8]| -> String {
-            let params = Params::new(16 * 1024, 4, 4, Some(32)).unwrap();
-            let argon = Argon2::new(Algorithm::Argon2i, Version::V0x13, params);
-            let mut out = [0u8; 32];
-            argon
-                .hash_password_into(secret, b"tailscale network-lock disablement salt", &mut out)
-                .unwrap();
-            out.iter().map(|b| format!("{b:02x}")).collect()
+            let secret_hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
+            disablement_kdf_line(&secret_hex).expect("hex secret derives")
         };
         // Goldens straight from Go `tka.DisablementKDF` (v1.100.0).
         assert_eq!(
             kdf(&[0u8; 32]),
-            "f56df7e85d257a51c0aa17d2600502182359a1224b892ff4667002a7bc71aa56",
+            "disablement:f56df7e85d257a51c0aa17d2600502182359a1224b892ff4667002a7bc71aa56",
             "all-zero 32B"
         );
         assert_eq!(
             kdf(&[0xFFu8; 32]),
-            "fe74d82e0971202e69143984381f1834f0f3364e61e239a7d935c218e321811f",
+            "disablement:fe74d82e0971202e69143984381f1834f0f3364e61e239a7d935c218e321811f",
             "all-0xFF 32B"
         );
         assert_eq!(
             kdf(&[0xA5u8; 32]),
-            "c3fea8a0d70ede2555990ca60d70a8a03cbe627d2c9f3cb0e2ba7093d0884e2f",
+            "disablement:c3fea8a0d70ede2555990ca60d70a8a03cbe627d2c9f3cb0e2ba7093d0884e2f",
             "all-0xA5 32B (proves Argon2i, not Argon2id)"
+        );
+        // An unusable secret is refused by the command itself, not just by the decoder underneath.
+        assert!(
+            disablement_kdf_line("abc").is_err(),
+            "odd-length hex secret rejected"
+        );
+        assert!(
+            disablement_kdf_line("zz").is_err(),
+            "non-hex secret rejected"
         );
         // The hex decoder round-trips an odd/invalid input as an error, not a panic.
         assert!(hex_decode_lower("abc").is_err(), "odd-length hex rejected");
