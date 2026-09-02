@@ -1391,10 +1391,10 @@ async fn dispatch(
                 },
             }
         }
-        Request::Whois { ip } => {
+        Request::Whois { ip, port, proto } => {
             let dev = { backend.lock().await.device_handle() };
             match dev {
-                Some(dev) => Backend::whois(&dev, &ip).await,
+                Some(dev) => Backend::whois(&dev, &ip, port, proto).await,
                 None => Response::Error {
                     message: "node is not up".into(),
                 },

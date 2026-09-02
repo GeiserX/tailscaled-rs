@@ -725,11 +725,29 @@ enum Command {
         #[arg(long, value_name = "IP", conflicts_with = "peer")]
         assert: Option<String>,
     },
-    /// Show which tailnet node owns an IP address.
+    /// Show which tailnet node owns an address (Go `tailscale whois [--json] ip[:port]`).
     Whois {
-        /// The tailnet IP to resolve to its owning node.
-        #[arg(value_name = "IP")]
-        ip: String,
+        /// The address to resolve to its owning node: a tailnet IP, or Go's `ip[:port]` flow form
+        /// (`100.64.0.9:22`, `[fd7a::1]:22`). The port names a flow; see `--proto`.
+        //
+        // Collected as a list, not a single value, so the arity refusals are Go's own words rather
+        // than clap's: `whois_target` turns zero or two-plus arguments into the upstream messages.
+        // (A `//` comment, not a doc comment — this is why the type is a `Vec`, not something the
+        // `--help` reader needs.)
+        #[arg(value_name = "IP[:PORT]")]
+        target: Vec<String>,
+        /// Protocol of the flow to look up: `tcp` or `udp`; omitted means both (Go
+        /// `tailscale whois --proto`).
+        ///
+        /// HONEST SCOPE: accepted and carried to the daemon, but it cannot change the answer on this
+        /// build. Go consults `--proto` (and the port) only for flows tailscaled itself proxies —
+        /// its `ProxyMapper` fallback, reached when the address matches no node in the netmap — and
+        /// for a tailnet address, the only kind this fork resolves, Go answers by IP and ignores the
+        /// protocol too. The pinned engine keeps no proxied-flow table (engine ask #35), so a
+        /// proxied `127.0.0.1:port` flow that Go would attribute to a peer is reported here as
+        /// owned by no node, with or without this flag.
+        #[arg(long, value_name = "PROTO")]
+        proto: Option<String>,
         /// Emit the result as JSON (Go `tailscale whois --json`) — the raw `WhoisReport` object, for
         /// scripting, instead of the human table.
         #[arg(long)]
@@ -2671,7 +2689,11 @@ async fn main() -> Result<()> {
             peer,
             assert,
         } => run_ip(&socket, v4, v6, first, peer, assert).await,
-        Command::Whois { ip, json } => run_whois(&socket, ip, json).await,
+        Command::Whois {
+            target,
+            proto,
+            json,
+        } => run_whois(&socket, &target, proto.as_deref(), json).await,
         Command::IdToken { audience } => {
             dispatch_simple(&socket, Request::IdToken { audience }).await
         }
@@ -4935,8 +4957,12 @@ async fn run_whoami(socket: &std::path::Path, json: bool) -> Result<()> {
     };
     match round_trip(
         socket,
+        // `whoami` is Go's `whois` against this node's own tailnet IP: an address, never a flow,
+        // so it carries neither of Go's flow selectors.
         &Request::Whois {
             ip: self_ip.clone(),
+            port: None,
+            proto: None,
         },
     )
     .await
@@ -6420,12 +6446,73 @@ async fn run_exit_node_suggest(socket: &std::path::Path) -> Result<()> {
     }
 }
 
-/// `whois` (Go `tailscale whois <ip>`): round-trip Whois for the given tailnet IP, then render the
-/// owner. The node name is control-supplied text, so it is run through `sanitize_for_terminal` inside
-/// the formatter before printing. The queried `ip` is owned here (it is the not-found line's
-/// subject), so the render needs no read-back from the request.
-async fn run_whois(socket: &std::path::Path, ip: String, json: bool) -> Result<()> {
-    let response = round_trip(socket, &Request::Whois { ip: ip.clone() })
+/// Pick the single positional argument of `tnet whois`, porting Go's two arity refusals verbatim.
+///
+/// Go `runWhoIs` (cmd/tailscale/cli/whois.go) checks `len(args) > 1` first and `len(args) == 0`
+/// second, returning `too many arguments, expected at most one peer` and `missing argument, expected
+/// one peer`. clap would otherwise answer with its own wording, so the positional is a `Vec` and the
+/// count is judged here. Pure → unit-testable.
+fn whois_target(args: &[String]) -> Result<&str> {
+    if args.len() > 1 {
+        anyhow::bail!("too many arguments, expected at most one peer");
+    }
+    match args.first() {
+        Some(target) => Ok(target),
+        None => anyhow::bail!("missing argument, expected one peer"),
+    }
+}
+
+/// Split Go's `ip[:port]` whois argument into the wire request's address and optional port.
+///
+/// Mirrors the order Go's `serveWhoIs` tries: `netip.ParseAddr` first (a bare IP → port 0, carried
+/// here as `None`), then `netip.ParseAddrPort` (`1.2.3.4:22`, `[fd7a::1]:22`). Anything else is
+/// refused before the daemon round trip, so an unusable argument costs no socket connection and says
+/// the same thing whether or not the daemon is up. (Go's `nodekey:` whois form is a LocalAPI-only
+/// spelling with no CLI surface upstream, so it is not accepted here either.) Pure → unit-testable.
+fn parse_whois_target(target: &str) -> Result<(String, Option<u16>)> {
+    if let Ok(ip) = target.parse::<std::net::IpAddr>() {
+        return Ok((ip.to_string(), None));
+    }
+    match target.parse::<std::net::SocketAddr>() {
+        Ok(sock) => Ok((sock.ip().to_string(), Some(sock.port()))),
+        Err(_) => anyhow::bail!(
+            "invalid address {target:?}: expected an IP or Go's ip[:port] form \
+             (e.g. 100.64.0.9 or 100.64.0.9:22)"
+        ),
+    }
+}
+
+/// Parse `--proto` into the wire enum: Go's empty value (flag absent, or `--proto=`) is "both" →
+/// `None`; `tcp`/`udp` → the matching [`WhoisProto`]. Any other value is refused by
+/// [`WhoisProto::from_str`], which carries the message. Pure → unit-testable.
+fn parse_whois_proto(proto: Option<&str>) -> Result<Option<tailscaled_rs::localapi::WhoisProto>> {
+    match proto {
+        None | Some("") => Ok(None),
+        Some(value) => value
+            .parse::<tailscaled_rs::localapi::WhoisProto>()
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!(e)),
+    }
+}
+
+/// `whois` (Go `tailscale whois [--json] ip[:port]`): round-trip Whois for the given address, then
+/// render the owner. The node name is control-supplied text, so it is run through
+/// `sanitize_for_terminal` inside the formatter before printing. The queried address is echoed as the
+/// operator typed it (port included) on the not-found line, so the render needs no read-back from the
+/// request.
+///
+/// Argument arity, the `ip[:port]` split and `--proto` are all resolved before the daemon round trip
+/// — Go likewise fails in `runWhoIs` before it calls `WhoIsProto`.
+async fn run_whois(
+    socket: &std::path::Path,
+    args: &[String],
+    proto: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let target = whois_target(args)?;
+    let (ip, port) = parse_whois_target(target)?;
+    let proto = parse_whois_proto(proto)?;
+    let response = round_trip(socket, &Request::Whois { ip, port, proto })
         .await
         .with_context(|| format!("talking to daemon at {}", socket.display()))?;
     match response {
@@ -6438,7 +6525,7 @@ async fn run_whois(socket: &std::path::Path, ip: String, json: bool) -> Result<(
                     serde_json::to_string_pretty(&w).unwrap_or_else(|_| "{}".to_string())
                 );
             } else {
-                print!("{}", format_whois(&w, &ip));
+                print!("{}", format_whois(&w, target));
             }
             Ok(())
         }
@@ -7987,8 +8074,9 @@ fn format_file_targets(targets: &[tailscaled_rs::localapi::FileTargetReport]) ->
     out
 }
 
-/// Format the `tnet whois` output for a [`WhoisReport`]. If the IP matched no node, a single
-/// "no tailnet node owns <ip>" line (the caller passes the queried IP). Otherwise: the owning node's
+/// Format the `tnet whois` output for a [`WhoisReport`]. If the address matched no node, a single
+/// "no tailnet node owns <ip>" line — the caller passes the address as the operator typed it, so an
+/// `ip[:port]` flow argument is echoed with its port rather than silently narrowed. Otherwise: the owning node's
 /// name, its IPv4, the owning user (when control retained it), its liveness (`online`, and a
 /// `last-seen` line only when offline — an online node's last-seen is "now", matching `status`), its
 /// control-granted ACL `tags` and node-key `key-expiry` (when present), any control-granted node-level
@@ -13433,6 +13521,12 @@ mod tests {
             format_whois(&w, "100.64.0.9"),
             "no tailnet node owns 100.64.0.9\n"
         );
+        // Go's `ip[:port]` flow argument is echoed as typed: the operator asked about a flow, and a
+        // line naming only the bare IP would hide which query came back empty.
+        assert_eq!(
+            format_whois(&w, "100.64.0.9:22"),
+            "no tailnet node owns 100.64.0.9:22\n"
+        );
     }
 
     #[test]
@@ -16642,11 +16736,138 @@ mod tests {
             .expect("parses")
             .command
         {
-            Command::Whois { ip, json } => {
-                assert_eq!(ip, "100.64.0.9");
+            Command::Whois {
+                target,
+                proto,
+                json,
+            } => {
+                assert_eq!(target, vec!["100.64.0.9".to_string()]);
+                assert!(proto.is_none(), "no --proto means Go's empty value: both");
                 assert!(json);
             }
             _ => panic!("expected Command::Whois"),
+        }
+    }
+
+    #[test]
+    fn whois_accepts_gos_proto_flag_and_ip_port_argument() {
+        // The whole point of the bead: `tailscale whois --proto=tcp 100.64.0.9:22` copied from Go
+        // must reach the lookup instead of dying at argument parsing.
+        match Cli::try_parse_from(["tnet", "whois", "--proto=tcp", "100.64.0.9:22"])
+            .expect("Go's flag + ip:port argument must parse")
+            .command
+        {
+            Command::Whois {
+                target,
+                proto,
+                json,
+            } => {
+                assert_eq!(target, vec!["100.64.0.9:22".to_string()]);
+                assert_eq!(proto.as_deref(), Some("tcp"));
+                assert!(!json);
+            }
+            _ => panic!("expected Command::Whois"),
+        }
+        // Go's separated spelling (`--proto udp`) is the same flag.
+        match Cli::try_parse_from(["tnet", "whois", "--proto", "udp", "100.64.0.9"])
+            .expect("parses")
+            .command
+        {
+            Command::Whois { proto, .. } => assert_eq!(proto.as_deref(), Some("udp")),
+            _ => panic!("expected Command::Whois"),
+        }
+        // The positional is a list at the clap layer so the arity refusals can be Go's own words
+        // (see `whois_target`) — clap itself must accept zero and two arguments.
+        for argv in [
+            vec!["tnet", "whois"],
+            vec!["tnet", "whois", "100.64.0.9", "100.64.0.10"],
+        ] {
+            assert!(
+                Cli::try_parse_from(&argv).is_ok(),
+                "clap must defer the arity verdict to whois_target: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn whois_target_ports_gos_two_argument_refusals() {
+        // Go `runWhoIs`: `len(args) > 1` → "too many arguments, expected at most one peer";
+        // `len(args) == 0` → "missing argument, expected one peer". Both verbatim.
+        let one = ["100.64.0.9".to_string()];
+        assert_eq!(
+            whois_target(&one).expect("one argument is the peer"),
+            "100.64.0.9"
+        );
+        let none: [String; 0] = [];
+        assert_eq!(
+            whois_target(&none).unwrap_err().to_string(),
+            "missing argument, expected one peer"
+        );
+        let two = ["100.64.0.9".to_string(), "100.64.0.10".to_string()];
+        assert_eq!(
+            whois_target(&two).unwrap_err().to_string(),
+            "too many arguments, expected at most one peer"
+        );
+    }
+
+    #[test]
+    fn parse_whois_target_splits_gos_ip_port_form() {
+        // A bare IP keeps Go's port 0, which the wire spells `None`.
+        assert_eq!(
+            parse_whois_target("100.64.0.9").expect("a bare IP parses"),
+            ("100.64.0.9".to_string(), None)
+        );
+        // `ip:port` — the form the bead's copied command uses.
+        assert_eq!(
+            parse_whois_target("100.64.0.9:22").expect("ip:port parses"),
+            ("100.64.0.9".to_string(), Some(22))
+        );
+        // IPv6, bare and bracketed-with-port (Go's `whois` is documented for v4 or v6).
+        assert_eq!(
+            parse_whois_target("fd7a:115c:a1e0::1").expect("a bare IPv6 parses"),
+            ("fd7a:115c:a1e0::1".to_string(), None)
+        );
+        assert_eq!(
+            parse_whois_target("[fd7a:115c:a1e0::1]:22").expect("[v6]:port parses"),
+            ("fd7a:115c:a1e0::1".to_string(), Some(22))
+        );
+        // Anything else is refused here, before any daemon round trip, naming what was passed.
+        for bad in ["peer-b", "100.64.0.9:", "100.64.0.9:notaport", ""] {
+            let err = parse_whois_target(bad)
+                .expect_err("only an IP or ip:port is accepted")
+                .to_string();
+            assert!(
+                err.contains("expected an IP or Go's ip[:port] form"),
+                "the refusal should name the accepted forms: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_whois_proto_maps_gos_three_values() {
+        use tailscaled_rs::localapi::WhoisProto;
+        // Go: `protocol; one of "tcp" or "udp"; empty means both`. Absent and explicitly-empty are
+        // the same "both", which the wire spells `None`.
+        assert_eq!(parse_whois_proto(None).expect("absent is both"), None);
+        assert_eq!(parse_whois_proto(Some("")).expect("empty is both"), None);
+        assert_eq!(
+            parse_whois_proto(Some("tcp")).expect("tcp parses"),
+            Some(WhoisProto::Tcp)
+        );
+        assert_eq!(
+            parse_whois_proto(Some("udp")).expect("udp parses"),
+            Some(WhoisProto::Udp)
+        );
+        // A value outside Go's documented pair is refused rather than silently ignored: it could
+        // never select anything on this build, so a typo would otherwise look like it worked.
+        for bad in ["TCP", "sctp", "tcp6"] {
+            let err = parse_whois_proto(Some(bad))
+                .expect_err("only tcp/udp are accepted")
+                .to_string();
+            assert!(
+                err.contains("expected \"tcp\" or \"udp\""),
+                "the refusal should name the accepted values: {err}"
+            );
         }
     }
 

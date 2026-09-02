@@ -452,7 +452,9 @@ mod tests {
         );
         assert!(!requires_write(&Request::Ip));
         assert!(!requires_write(&Request::Whois {
-            ip: "100.64.0.1".into()
+            ip: "100.64.0.1".into(),
+            port: None,
+            proto: None,
         }));
         assert!(!requires_write(&Request::Ping {
             ip: "100.64.0.1".into(),
@@ -518,8 +520,12 @@ mod tests {
         assert_eq!(authorize(&Request::Ip, Access::ReadOnly), Ok(()));
         assert_eq!(
             authorize(
+                // Go's flow-scoped form (`whois --proto=tcp ip:port`) is the same `PermitRead`
+                // whois as the bare-IP one — the extra fields name a flow, they do not mutate.
                 &Request::Whois {
-                    ip: "100.64.0.1".into()
+                    ip: "100.64.0.1".into(),
+                    port: Some(22),
+                    proto: Some(crate::localapi::WhoisProto::Tcp),
                 },
                 Access::ReadOnly
             ),
