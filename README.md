@@ -68,13 +68,28 @@ export TS_RS_EXPERIMENT=this_is_unstable_software
 #   --statedir <dir>   state directory      (overrides TAILNETD_STATE_DIR)
 #   --socket <path>    LocalAPI socket path (overrides TAILNETD_SOCKET)
 #   --verbose <0|1|2>  log verbosity        (overrides TAILNETD_LOG; 0=info,1=debug,2=trace)
-#   --config <path>    declarative config file (Go --config / ipn.ConfigVAlpha) — set prefs up
+#   --config <source>  declarative config source (Go --config / ipn.ConfigVAlpha) — set prefs up
 #                      front without an interactive `tnet up` (headless/k8s). e.g.:
 #                        {"version":"alpha0","Enabled":true,"Hostname":"node-a",
 #                         "AuthKey":"file:/run/secrets/ts-authkey","acceptRoutes":true}
 #                      AuthKey may be a literal or "file:<path>". Merged over persisted prefs.
+#                      <source> is a path, or "vm:user-data" (the VM's user-data via the cloud
+#                      instance metadata service — recognized, but this build has no metadata
+#                      client, so it reports the source as absent). Prefix either with
+#                      "optional:" to boot UNCONFIGURED when the source is absent instead of
+#                      failing to start; a source that is present but invalid still fails.
 #   --version          print version and exit;  --help  full usage
 # e.g.  ./target/release/tailnetd --statedir /var/lib/tailnetd --verbose 1
+#
+# tailnetd also takes a `debug` SUBCOMMAND (Go `tailscaled debug`) — daemon-less diagnostics for
+# when the node will not come up at all, which is exactly when `tnet` (which talks to a running
+# daemon over its socket) cannot help. It needs no daemon, no socket and no TS_RS_EXPERIMENT:
+#   tailnetd debug --ifconfig            dump the host's network state once, as JSON (on stderr)
+#   tailnetd debug --monitor             …and re-dump it on every link change, until interrupted
+#   tailnetd debug --get-url <url>       fetch a URL with a connection trace ("login" = the
+#                                        default control plane's login URL)
+# (Go's --derp and --portmap are declared and refused BY NAME: a DERP round-trip test needs a
+# standalone DERP client this daemon does not own, and port mapping does not exist in the engine.)
 #
 # NOTE: --statedir also moves the default socket to <dir>/tailnetd.sock. Since `tnet` has no
 # --statedir, point the client at it explicitly:  tnet --socket /var/lib/tailnetd/tailnetd.sock status
@@ -108,6 +123,15 @@ fresh, surfacing a new login URL — handy to re-authenticate without changing a
 briefly bring the connection down while it re-registers, so avoid running it over a remote SSH/RDP
 session you could lock yourself out of.
 
+`tnet up` also answers to the spellings Go's `tailscale up` uses, so a command line copied from Go
+runs unedited: `--auth-key` is an alias of `--authkey` (and, like Go, a value of `file:<path>` under
+either spelling reads the key from that file), and `--login-server` is an alias of `--control-url`.
+Go's hidden `--host-routes` is accepted and does nothing — it has had to be `true` since Tailscale
+1.67, and this build's userspace netstack installs no host routes at all — while `--host-routes=false`
+is refused with Go's own "only 'true' is allowed". `up --nickname` is refused by name, pointing at
+`tnet set --nickname`: no `up` names a login profile, in this fork or in Go, which registers
+`--nickname` on `set` and `login` only.
+
 `tnet set` (Go `tailscale set`) adjusts policy prefs on an already-running node. Changing
 `--exit-node`, `--hostname`, `--accept-routes`, `--advertise-routes`, or `--advertise-exit-node`
 applies **live** — in place, with no reconnect (matching Go's `set`). `--shields-up`, `--ssh`,
@@ -119,6 +143,18 @@ but nothing in this build acts on them yet — each flag's `--help` says exactly
 not do. `--nickname` is the exception among them: like Go, it also renames the current login profile,
 so the name you pick is what `tnet switch --list` shows and what `tnet switch <name>` resolves
 against. `set` never re-authenticates and never changes whether the node is up or down.
+
+Four of Go's `set` flags are **parsed but not modelled**, so a command line ported from Go reaches a
+refusal that names the gap instead of dying at the parser. For each, the value asking for the state
+this daemon is currently in is accepted, and the other is refused: `--relay-server-port=` and
+`--relay-server-static-endpoints=` (disable / advertise none) are fine, but a port or an endpoint
+list is refused — this build runs no peer relay server; `--sync` is fine and `--no-sync` (Go
+`--sync=false`) is refused — there is no way to stop the map poll while staying up. Those three are
+engine-gated (`docs/ENGINE_ASKS.md` §34). The fourth, `--remote-config`, is refused **by choice and
+permanently**: it hands the tailnet admin full remote control of this node's prefs and LocalAPI,
+bypassing the per-feature double opt-in, which this daemon's local authorization model
+(`docs/THREAT_MODEL.md` §4.1) does not grant to the control plane. `--no-remote-config`, Go's
+default, is what this build always does.
 
 State (node keys + prefs) lives in `$XDG_STATE_HOME/tailnetd` (override with `TAILNETD_STATE_DIR`);
 the control socket is `<state-dir>/tailnetd.sock` (override with `TAILNETD_SOCKET`).

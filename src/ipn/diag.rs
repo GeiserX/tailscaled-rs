@@ -511,6 +511,17 @@ pub(super) async fn re_stun(dev: &tailscale::Device) -> Response {
 /// [`status`](super::Backend::status) uses to render peers (`fqdn`-or-`hostname` name +
 /// `tailnet_address.ipv4`), so the two diagnostic surfaces can never drift in how they name a node.
 ///
+/// `port` and `proto` carry Go's flow triple (`whois [--proto tcp|udp] ip[:port]`) through to here.
+/// Neither can change the answer on this engine, and that is checked, not assumed: `Device::whois`
+/// takes a `SocketAddr` whose port its `peer_tracker` immediately discards (`whois_addr` returns
+/// `addr.ip()`), and there is no proxied-flow table for a proto to select within — Go consults both
+/// only in its `ProxyMapper` fallback, which it reaches solely when the address matches NO node in
+/// the netmap. For every address this fork can resolve, Go answers by IP and ignores both too, so
+/// passing them is faithful rather than lossy. `port` is still handed to the engine (it is the
+/// `SocketAddr`'s port, ignored there); `proto` has nowhere to go and is bound below so it is
+/// explicitly accounted for rather than silently dropped. Engine ask #35 is the surface that would
+/// make either matter.
+///
 /// Maps the engine outcome to the wire [`WhoisReport`](crate::localapi::WhoisReport):
 /// - `Ok(Some(w))` → `found: true` with the node name/IPv4, the owner `user` (always `None` in
 ///   this fork — the domain node model drops the login), and just the capability *names* (the
@@ -520,7 +531,12 @@ pub(super) async fn re_stun(dev: &tailscale::Device) -> Response {
 ///   capability names.
 /// - `Ok(None)` → `found: false` (the IP matched no known tailnet node), all fields defaulted.
 /// - `Err(e)` → a clear [`Response::Error`] carrying the engine error.
-pub(super) async fn whois(dev: &tailscale::Device, ip: &str) -> Response {
+pub(super) async fn whois(
+    dev: &tailscale::Device,
+    ip: &str,
+    port: Option<u16>,
+    proto: Option<crate::localapi::WhoisProto>,
+) -> Response {
     // Parse first so a bad IP fails closed before the engine round-trip — naming the value. (The
     // device-absent "node is not up" branch now lives at the LocalAPI caller, which only reaches
     // here holding a device handle cloned off-lock; see `Backend::device_handle`.)
@@ -529,8 +545,15 @@ pub(super) async fn whois(dev: &tailscale::Device, ip: &str) -> Response {
             message: format!("invalid IP {ip:?}"),
         };
     };
-    // whois resolves by IP only (the engine ignores the port), so a 0 port is fine.
-    let sock = std::net::SocketAddr::new(addr, 0);
+    // The engine resolves by IP only — it discards the `SocketAddr`'s port — so Go's `ip[:port]`
+    // port rides along verbatim and a bare IP keeps Go's own 0 (`netip.AddrPortFrom(ip, 0)`).
+    let sock = std::net::SocketAddr::new(addr, port.unwrap_or(0));
+    // Bound, not used: there is no proxied-flow table on this engine for a protocol to select
+    // within (see the doc comment). Recorded in the trace so an operator debugging a flow lookup can
+    // see what the daemon was asked, and so the value is not silently swallowed.
+    if let Some(proto) = proto {
+        tracing::debug!(%proto, %sock, "whois: proto recorded; this engine resolves by IP only");
+    }
     match dev.whois(sock).await {
         Ok(Some(w)) => {
             // Reuse `StatusNode::from_node` — the exact name+ipv4 derivation `status` renders
@@ -1639,6 +1662,143 @@ pub(super) async fn debug_capture(dev: &tailscale::Device, path: &str, seconds: 
     }
 }
 
+/// The capability-key prefix under which control delivers the Services a node can reach (Go
+/// `tailcfg.NodeAttrPrefixServices`). The suffix after the prefix is an opaque, server-chosen
+/// identifier: consumers must take the canonical name from the value's own `Name` field and must
+/// NOT parse it out of the key.
+const SERVICES_CAP_PREFIX: &str = "services/";
+
+/// Go `tailcfg.ServiceDetails` as it arrives on the wire — the JSON value of one
+/// `services/<opaque>` capability entry. Deserialize-only, with Go's PascalCase field names, so the
+/// daemon can decode exactly what control sent before projecting it onto this crate's
+/// [`ServiceReport`] wire DTO.
+///
+/// `Addrs` deserializes straight into [`std::net::IpAddr`] and `Ports` into
+/// [`ServicePortRange`](crate::localapi::ServicePortRange), so a malformed address or port range
+/// fails the whole entry — which is what Go does too (`json.Unmarshal` into `[]netip.Addr` /
+/// `[]ProtoPortRange` errors, `netmap.Services()` sees the error and skips the capability).
+#[derive(serde::Deserialize)]
+struct GoServiceDetails {
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "DisplayName", default)]
+    display_name: String,
+    #[serde(rename = "Addrs", default)]
+    addrs: Vec<std::net::IpAddr>,
+    #[serde(rename = "Ports", default)]
+    ports: Vec<GoProtoPortRange>,
+    #[serde(rename = "Actions", default)]
+    actions: Vec<GoServiceAction>,
+}
+
+/// Go `tailcfg.ProtoPortRange` on the wire: a STRING in `[<proto>:]<ports>` form (the type
+/// implements `encoding.TextMarshaler`), not an object. Parsed through
+/// [`ServicePortRange`](crate::localapi::ServicePortRange)'s `FromStr`, which is the port of Go's
+/// own text codec.
+#[derive(serde::Deserialize)]
+#[serde(try_from = "String")]
+struct GoProtoPortRange(crate::localapi::ServicePortRange);
+
+impl TryFrom<String> for GoProtoPortRange {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.parse().map(GoProtoPortRange)
+    }
+}
+
+/// Go `tailcfg.ServiceAction` as it arrives on the wire.
+#[derive(serde::Deserialize)]
+struct GoServiceAction {
+    #[serde(rename = "Type", default)]
+    action_type: String,
+    #[serde(rename = "Port", default)]
+    port: u16,
+    #[serde(rename = "DisplayName", default)]
+    display_name: String,
+    #[serde(rename = "Attributes", default)]
+    attributes: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// Decode the Tailscale Services this node can reach out of the **self node's** capability map —
+/// the port of Go's `netmap.NetworkMap.Services()`.
+///
+/// Go walks the self node's `CapMap`, keeps the keys prefixed [`SERVICES_CAP_PREFIX`], unmarshals
+/// each key's values as `ServiceDetails`, and keys the result by the FIRST value's own `Name`
+/// (`result[svcs[0].Name] = svcs[0]`). A key whose values do not all decode, or that carries no
+/// value at all, is skipped — control published something this client cannot read, and a guess
+/// would be worse than an omission. This reproduces all of that, including "first value wins".
+///
+/// Returned sorted by service name (Go returns a map and its CLI sorts the keys before printing;
+/// sorting here makes the LocalAPI reply itself deterministic). Pure — takes the capability map, not
+/// a `Device`, so it is unit-testable against real capability payloads.
+pub(crate) fn services_from_cap_map(
+    cap_map: &std::collections::BTreeMap<String, Vec<String>>,
+) -> Vec<crate::localapi::ServiceReport> {
+    let mut out: std::collections::BTreeMap<String, crate::localapi::ServiceReport> =
+        std::collections::BTreeMap::new();
+    for (cap, values) in cap_map {
+        if !cap.starts_with(SERVICES_CAP_PREFIX) {
+            continue;
+        }
+        // Go's `UnmarshalNodeCapViewJSON` decodes EVERY value and returns the error from the first
+        // one that fails, so a single malformed value discards the whole capability key.
+        let decoded: Result<Vec<GoServiceDetails>, _> = values
+            .iter()
+            .map(|raw| serde_json::from_str::<GoServiceDetails>(raw))
+            .collect();
+        let Ok(decoded) = decoded else { continue };
+        // Go: `if err != nil || len(svcs) < 1 { continue }`, then takes `svcs[0]`.
+        let Some(svc) = decoded.into_iter().next() else {
+            continue;
+        };
+        out.insert(
+            svc.name.clone(),
+            crate::localapi::ServiceReport {
+                name: svc.name,
+                display_name: svc.display_name,
+                addrs: svc.addrs.iter().map(|a| a.to_string()).collect(),
+                ports: svc.ports.into_iter().map(|p| p.0).collect(),
+                actions: svc
+                    .actions
+                    .into_iter()
+                    .map(|a| crate::localapi::ServiceActionReport {
+                        action_type: a.action_type,
+                        port: a.port,
+                        display_name: a.display_name,
+                        attributes: a.attributes,
+                    })
+                    .collect(),
+            },
+        );
+    }
+    out.into_values().collect()
+}
+
+/// Report the Tailscale Services (VIPs) this node can reach (the `tnet service list` / Go
+/// `tailscale service list` read-only path, backed by Go's `services` LocalAPI verb).
+///
+/// Go's `serveServices` reads the netmap and returns `nm.Services()`; the equivalent here is the
+/// engine's [`Device::self_node`](tailscale::Device::self_node), whose `cap_map` is the same
+/// control-delivered capability map Go decodes — see [`services_from_cap_map`]. Read-only: it
+/// decodes what control already sent and changes nothing.
+///
+/// An engine error means there is no self node yet, i.e. no netmap has arrived — the situation Go
+/// answers with `503 no netmap` — so it surfaces as a clear [`Response::Error`] rather than an
+/// empty list, which would claim the tailnet grants this node no Services.
+pub(super) async fn services(dev: &tailscale::Device) -> Response {
+    match dev.self_node().await {
+        Ok(node) => Response::Services {
+            services: services_from_cap_map(&node.cap_map),
+        },
+        Err(e) => Response::Error {
+            message: format!(
+                "services query failed: {e:?} (no netmap yet? the Service set is control-delivered)"
+            ),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // After the lock-across-await fix (tsd), `ip_report`/`whois`/`ping`/`file_cp`/`file_list`/
@@ -1650,6 +1810,117 @@ mod tests {
     // and path-hardening decisions, which require a live `&Device` to reach inside the method
     // (integration territory — no offline `Device` constructor exists), are pinned here via their
     // underlying predicates.
+
+    #[test]
+    fn services_are_decoded_from_the_self_node_capability_map() {
+        use super::services_from_cap_map;
+        // Control delivers each visible Service as one `services/<opaque>` capability whose value is
+        // a JSON `tailcfg.ServiceDetails`. The key suffix is server-chosen and MUST NOT be parsed:
+        // the canonical name comes from the value's own `Name` field, which is why the key below
+        // ("a1b2") has nothing to do with the service name.
+        let cap_map = std::collections::BTreeMap::from([
+            (
+                "services/a1b2".to_string(),
+                vec![
+                    r#"{
+                    "Name": "svc:db",
+                    "DisplayName": "Production database",
+                    "Addrs": ["100.64.0.10", "fd7a:115c:a1e0::a"],
+                    "Ports": ["tcp:5432"],
+                    "Actions": [{"Type":"postgresql","Port":5432,"DisplayName":"Postgres"}]
+                }"#
+                    .to_string(),
+                ],
+            ),
+            (
+                "services/zzzz".to_string(),
+                vec![r#"{"Name":"svc:api","Ports":["tcp:443"]}"#.to_string()],
+            ),
+            // Not a Service capability — must be ignored, not mistaken for one.
+            (
+                "service-host".to_string(),
+                vec![r#"{"svc:db":["100.64.0.10"]}"#.to_string()],
+            ),
+            ("can-funnel".to_string(), vec![]),
+        ]);
+        let services = services_from_cap_map(&cap_map);
+        // Sorted by service name, so the reply is deterministic regardless of capability key.
+        assert_eq!(
+            services.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["svc:api", "svc:db"]
+        );
+        let db = &services[1];
+        assert_eq!(db.display_name, "Production database");
+        assert_eq!(db.addrs, vec!["100.64.0.10", "fd7a:115c:a1e0::a"]);
+        assert_eq!(db.ports.len(), 1);
+        assert_eq!(db.ports[0].to_string(), "tcp:5432");
+        assert_eq!(db.actions.len(), 1);
+        assert_eq!(db.actions[0].action_type, "postgresql");
+        assert_eq!(db.actions[0].port, 5432);
+        assert_eq!(db.actions[0].display_name, "Postgres");
+        // The Service with no DisplayName/Actions decodes to the empty defaults, never a fabrication.
+        assert_eq!(services[0].display_name, "");
+        assert!(services[0].actions.is_empty());
+    }
+
+    #[test]
+    fn services_skip_capabilities_this_client_cannot_read() {
+        use super::services_from_cap_map;
+        // Go's `netmap.Services()` skips a capability whose values do not all unmarshal, or that
+        // carries no value at all — a Service published in a form this client cannot read is
+        // omitted, never guessed at. A malformed address or port range fails the whole value, so
+        // each of these keys contributes nothing while the good one still comes through.
+        let cap_map = std::collections::BTreeMap::from([
+            (
+                "services/ok".to_string(),
+                vec![r#"{"Name":"svc:ok","Addrs":["100.64.0.11"]}"#.to_string()],
+            ),
+            ("services/empty".to_string(), vec![]),
+            (
+                "services/bad-json".to_string(),
+                vec!["not json at all".to_string()],
+            ),
+            (
+                "services/bad-addr".to_string(),
+                vec![r#"{"Name":"svc:bad","Addrs":["not-an-ip"]}"#.to_string()],
+            ),
+            (
+                "services/bad-port".to_string(),
+                vec![r#"{"Name":"svc:bad2","Ports":["tcp:notaport"]}"#.to_string()],
+            ),
+            // One good value and one broken one: Go returns the first error, discarding the key.
+            (
+                "services/half-bad".to_string(),
+                vec![r#"{"Name":"svc:half"}"#.to_string(), "{".to_string()],
+            ),
+        ]);
+        let services = services_from_cap_map(&cap_map);
+        assert_eq!(
+            services.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["svc:ok"]
+        );
+    }
+
+    #[test]
+    fn services_take_the_first_value_of_a_capability() {
+        use super::services_from_cap_map;
+        // Go keys the result by `svcs[0].Name` and stores `svcs[0]`: a capability carrying more than
+        // one well-formed value contributes only its first.
+        let cap_map = std::collections::BTreeMap::from([(
+            "services/multi".to_string(),
+            vec![
+                r#"{"Name":"svc:first","Addrs":["100.64.0.12"]}"#.to_string(),
+                r#"{"Name":"svc:second","Addrs":["100.64.0.13"]}"#.to_string(),
+            ],
+        )]);
+        let services = services_from_cap_map(&cap_map);
+        assert_eq!(
+            services.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["svc:first"]
+        );
+        // An empty capability map (no Services granted) is an empty list, not an error.
+        assert!(services_from_cap_map(&std::collections::BTreeMap::new()).is_empty());
+    }
 
     #[test]
     fn decode_hex_roundtrips_and_rejects_malformed() {
