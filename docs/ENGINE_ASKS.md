@@ -1151,3 +1151,98 @@ already parse (with Go's own `ParseUint`/`ParseAddrPort` validation, dedup and `
 ordering) and are refused by name in `check_unmodelled_set_flags`; wiring them is a wire `Set` field +
 pref + `get_settings` row, and the refusal is deleted. `--sync`/`--no-sync` is the same shape.
 `--remote-config` keeps its refusal permanently. Tracked in daemon bead tsd-re94825b. — daemon lane
+
+---
+
+## 35. Selectable ping types and a ping size — `Device::ping_typed` (for Go `ping --tsmp` / `--peerapi` / `--size`)
+
+**Why:** Go's `tailscale ping` (`cmd/tailscale/cli/ping.go` @
+`53a0d659afa51835dd7a9283873cca44261454f8`) does not have one probe, it has four, and the operator
+picks between them. `pingType()` maps `--tsmp`/`--icmp`/`--peerapi` onto a `tailcfg.PingType`
+(defaulting to `PingDisco`) and hands it, together with `--size`, to `LocalClient.PingWithOpts`. The
+four measure genuinely different things:
+
+- **disco** (`PingDisco`, the default) — a magicsock-level probe between the two endpoints. Answers
+  "is there a direct path, and how fast is it".
+- **ICMP** (`PingICMP`) — an ICMP echo injected into the tunnel, answered by the peer's *host OS
+  stack*. Answers "is the peer's OS reachable through WireGuard".
+- **TSMP** (`PingTSMP`) — through WireGuard, answered by the peer's *tailscaled*, neither host OS
+  stack involved. Answers "is the peer's daemon alive and does the packet filter admit me". Go
+  returns after the first pong for TSMP and ICMP alike.
+- **peerAPI** (`PingPeerAPI`) — not a ping: an HTTP hit on the peer's peerAPI server, printed as
+  `hit peerapi of %s (%s) at %s in %s` (node IP, node name, peerAPI URL, latency).
+
+`--size` ("size of the ping message (disco pings only). 0 for minimum size.") pads the disco probe,
+which is how an operator finds a path MTU problem.
+
+Verified against pin `9d847a6e`/v0.43.0. The engine has **two** of the four, but no way to choose
+between them and no size knob:
+
+- `Device::ping(dst, timeout) -> Result<Duration, PingError>` — "an ICMPv4 echo … from this device's
+  own tailnet IPv4 over the overlay netstack — never a host socket", answered by the peer's own OS
+  stack. That is Go's `PingICMP`, and it is what the daemon sends for every `tnet ping` today.
+- `Device::ping_disco(dst, timeout) -> Result<Option<(SocketAddr, Duration)>, Error>` — a fresh
+  disco probe returning the endpoint that answered and the RTT. That is Go's `PingDisco`.
+- **TSMP: nothing.** `ts_dataplane` admits IP protocol 99 past the ACL on the way in (Go's `case
+  ipproto.TSMP: return Accept`), and `ts_capabilityversion` records the version at which TSMP ping
+  became a thing, but no crate constructs a TSMP message and none answers one. A TSMP probe sent
+  today would never be replied to.
+- **peerAPI: a client, but not a probe.** `Device::push_file` reaches a peer's peerAPI over
+  `NodeInfo::peerapi_addr`, so the transport exists; there is no call that hits the peer's peerAPI
+  and reports its URL plus a latency.
+- **Size: no parameter.** Both ping calls take a destination and a timeout and choose the packet
+  themselves.
+
+**Ask:**
+
+1. A single typed entry point, so the caller selects the probe instead of the engine choosing for
+   it — e.g.
+
+   ```rust
+   pub enum PingKind { Disco, Icmp, Tsmp, PeerApi }
+
+   pub struct PingOpts { pub kind: PingKind, pub size: Option<usize>, pub timeout: Duration }
+
+   pub struct PingOutcome {
+       pub latency: Duration,
+       /// The direct endpoint that answered, when the probe went direct.
+       pub endpoint: Option<SocketAddr>,
+       /// `PingKind::PeerApi` only: the peer's peerAPI base URL that was hit.
+       pub peerapi_url: Option<String>,
+       /// The peer's node name, for Go's `pong from <name> (<ip>)` line.
+       pub node_name: Option<String>,
+   }
+
+   pub async fn ping_typed(&self, dst: IpAddr, opts: PingOpts) -> Result<PingOutcome, PingError>;
+   ```
+
+   `Disco` and `Icmp` are re-exports of the two calls that already exist, so those two arms are
+   plumbing.
+2. **TSMP, both halves.** Construct and send a TSMP ping over the tunnel, and answer an inbound one
+   from this node's own daemon rather than only admitting it past the ACL. This is the substantial
+   piece; it is also the one that makes `tailscale ping --tsmp` against a Rust node work *from a Go
+   node*, which is a two-way interop gap today, not just a missing CLI flag.
+3. **A peerAPI probe** — a `GET` on the peer's peerAPI base returning `(url, latency)`, reusing the
+   client `push_file` already has.
+4. **`size` on the disco probe**, padding the disco payload; ignored for the other kinds, exactly as
+   Go documents it ("disco pings only").
+5. Nice to have with (1): the peer's node name in the outcome, so `pong from <name> (<ip>)` can carry
+   the name Go prints instead of the IP standing in for it.
+
+(2) and (3) are independent of each other; (1) and (4) are small once either lands, and (1) alone —
+with `Tsmp`/`PeerApi` returning `Unsupported` — is already useful, because it lets the daemon report
+"not implemented" from the engine instead of refusing at the CLI.
+
+**Related, and worth fixing before any of this: the default probe is the wrong one.** Go's default is
+`PingDisco`; the daemon's `Request::Ping` calls `Device::ping` (ICMP) and then reads the direct-path
+endpoint from `Device::direct_path`, a cached snapshot of the last periodic disco probe. So `tnet
+ping` today reports an ICMP RTT next to a disco endpoint that can be up to one probe interval stale,
+and `--until-direct` can overshoot Go by a ping or two before it notices the upgrade. That needs no
+engine change — `Device::ping_disco` already returns both halves from one fresh probe — and is
+tracked as a daemon-side follow-up, noted here so the two are not confused.
+
+**Daemon impact once landed:** `tnet ping --tsmp`/`--peerapi`/`--size` already parse and are refused
+by name in `ping_probe_refusal` (`src/bin/tnet.rs`); wiring them is a ping-kind + size field on the
+`Ping` wire request, the `ipn::diag::ping` call, and Go's `hit peerapi of …` line for the peerAPI
+arm — then the refusal is deleted. `--icmp` is already honoured (it names the probe the daemon
+sends) and needs nothing. — daemon lane
