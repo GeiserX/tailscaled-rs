@@ -468,6 +468,12 @@ pub enum Request {
         /// backward-compatible (an older client sends the bare variant, which deserializes to `None`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         note: Option<String>,
+        /// Run the extra diagnostic pass (Go `bugreport --diagnose` →
+        /// `ipn.BugReportOpts.Diagnose` → `LocalBackend.Doctor`). The daemon then fills
+        /// [`Response::BugReport::checks`]; the marker itself is unaffected. `false` (the default)
+        /// keeps the wire byte-identical to a request from a client that predates the flag.
+        #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+        diagnose: bool,
     },
     /// Read the node's serve configuration (Go `GetServeConfig`; `tnet serve status`). Replies with
     /// [`Response::ServeConfig`]. Read-only — gated like [`Status`](Request::Status).
@@ -510,8 +516,21 @@ pub enum Request {
         /// Destination TCP port.
         port: u16,
     },
-    /// Bring the node down (`WantRunning = false`) without logging out.
-    Down,
+    /// Bring the node down (`WantRunning = false`) without logging out. A WRITE — gated like
+    /// `up`/`logout`.
+    Down {
+        /// The operator's justification for the disconnect (Go `tailscale down --reason`, which
+        /// travels as the base64 `X-Tailscale-Reason` LocalAPI header on the prefs edit). `None`
+        /// when the flag was omitted — which is also what an older client sending the bare
+        /// `{"cmd":"down"}` deserializes to.
+        ///
+        /// Same HONEST SCOPE as [`Logout::reason`](Request::Logout): this fork registers no policy
+        /// store that could *require* a justification and the engine has no audit-log transport to
+        /// control, so the daemon records the reason in its own log alongside the disconnect and
+        /// nothing else consumes it. It is not forwarded to the control plane.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     /// Log the node out (the analogue of Go's `tailscale logout`): deregister the node key with the
     /// control plane, tear the datapath down, and **discard the persisted node key** so the next
     /// `up` re-registers fresh (a new login) rather than resuming the old registration. This is
@@ -670,6 +689,21 @@ pub enum Request {
     /// have changed but the socket is still fine. A **write** (mutates live datapath state): gated like
     /// `down`/`logout`. Needs the node up. Replies with [`Response::Ok`]/[`Response::Error`].
     DebugReStun,
+    /// Report the state directory **the daemon** is using (Go `tailscale debug statedir` → the LocalAPI
+    /// `debug` route's `statedir` action, `ipn/localapi/debug.go` @ v1.100.0, which JSON-encodes
+    /// `LocalBackend.TailscaleVarRoot()`), rendered by `tnet debug statedir`.
+    ///
+    /// The round trip is the entire point of the verb. The daemon's state dir is whatever it resolved
+    /// at boot — `--statedir`, or the cascade run in *its* environment (as root, with the unit's
+    /// `EnvironmentFile`). A CLI that re-runs that cascade in its own environment answers a different
+    /// question, and on the configuration people actually hit (root daemon + unprivileged `tnet`) it
+    /// answers it wrongly. Only the daemon knows.
+    ///
+    /// A **read** of one path, but gated as a write: Go gates its whole `debug` route on `PermitWrite`
+    /// ("debug access denied"), not per-action, so the faithful classification matches
+    /// [`DebugRebind`](Self::DebugRebind). Needs no engine — it answers with the node down, like Go's.
+    /// Replies with [`Response::StateDir`].
+    DebugStateDir,
     /// Re-read the daemon's `--config` file and adopt the changed fields into the running node (Go
     /// `tailscaled`'s `reload-config` LocalAPI route → `LocalBackend.ReloadConfig` → `setConfigLocked`,
     /// v1.100.0). Rendered by `tnet reload-config`. The daemon re-loads the same declarative config it
@@ -754,6 +788,16 @@ pub enum Response {
         /// The daemon binary's version (its crate version, `CARGO_PKG_VERSION`).
         version: String,
     },
+    /// The daemon's state directory (reply to [`Request::DebugStateDir`]), printed by `tnet debug
+    /// statedir`. Mirrors Go's `statedir` debug action, which encodes `TailscaleVarRoot()` as a bare
+    /// JSON string — including the empty one.
+    StateDir {
+        /// The daemon's state directory, or `""` when it has none. Empty is the wire analogue of Go's
+        /// empty `TailscaleVarRoot()`, which the CLI renders as Go's `no statedir is set` error rather
+        /// than as a blank line. This fork's daemon always has one (it needs a place for `prefs.json`),
+        /// so the empty case is the ported error path, not a state it reaches on its own.
+        dir: String,
+    },
     /// The OIDC id-token minted by control (reply to [`Request::IdToken`]), printed by
     /// `tnet id-token`.
     IdToken {
@@ -835,6 +879,14 @@ pub enum Response {
         /// The marker string (a local identifier + daemon version + node state). NOT a server-side
         /// log id — this fork uploads nothing.
         marker: String,
+        /// The `--diagnose` pass, one `name: detail` line per check, ready to print (see
+        /// [`crate::ipn::doctor`]). EMPTY unless the request set
+        /// [`diagnose`](Request::BugReport::diagnose) — Go's `Doctor` likewise runs only then.
+        /// Returned rather than logged because this fork uploads no logs: the lines are for the
+        /// operator to read and paste, not for support to fetch. `#[serde(default)]` + skip keeps
+        /// the wire backward-compatible with a client that predates the flag.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        checks: Vec<String>,
     },
     /// The node's serve configuration (reply to [`Request::GetServeConfig`]), rendered by
     /// `tnet serve status`.
@@ -2099,9 +2151,32 @@ mod tests {
     #[test]
     fn request_down_wire_format() {
         assert_eq!(
-            serde_json::to_string(&Request::Down).unwrap(),
-            r#"{"cmd":"down"}"#
+            serde_json::to_string(&Request::Down { reason: None }).unwrap(),
+            r#"{"cmd":"down"}"#,
+            "no reason must serialize to the historical bare form"
         );
+        // `tnet down --reason "<text>"` (Go `tailscale down --reason`): the justification travels to
+        // the daemon verbatim, exactly as `logout --reason` does, and the bare `{"cmd":"down"}` an
+        // older client sends must still parse.
+        let json = serde_json::to_string(&Request::Down {
+            reason: Some("scheduled maintenance".into()),
+        })
+        .unwrap();
+        assert!(
+            json.contains(r#""cmd":"down""#)
+                && json.contains(r#""reason":"scheduled maintenance""#),
+            "{json}"
+        );
+        match serde_json::from_str::<Request>(&json).unwrap() {
+            Request::Down { reason } => {
+                assert_eq!(reason.as_deref(), Some("scheduled maintenance"))
+            }
+            other => panic!("expected Down, got {other:?}"),
+        }
+        match serde_json::from_str::<Request>(r#"{"cmd":"down"}"#).unwrap() {
+            Request::Down { reason } => assert_eq!(reason, None),
+            other => panic!("expected Down, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2301,31 +2376,98 @@ mod tests {
 
     #[test]
     fn bug_report_request_wire_is_back_compatible() {
-        // `BugReport` changed from a unit variant to `{ note: Option<String> }`. This LOCKS the wire
-        // back-compat both ways (the riskiest part of that change): a no-note request must serialize
-        // BYTE-IDENTICAL to the old bare unit variant (`skip_serializing_if` is what makes this hold —
-        // no `"note":null`), and the old bare JSON must still deserialize (→ note: None). Mirrors the
-        // per-variant wire-lock convention every sibling request already follows.
+        // `BugReport` changed from a unit variant to `{ note: Option<String> }`, and then grew
+        // `diagnose: bool`. This LOCKS the wire back-compat both ways (the riskiest part of those
+        // changes): a plain request must serialize BYTE-IDENTICAL to the old bare unit variant
+        // (`skip_serializing_if` on both fields is what makes this hold — no `"note":null`, no
+        // `"diagnose":false`), and the old bare JSON must still deserialize (→ note: None,
+        // diagnose: false). Mirrors the per-variant wire-lock convention every sibling request
+        // already follows.
         assert_eq!(
-            serde_json::to_string(&Request::BugReport { note: None }).unwrap(),
+            serde_json::to_string(&Request::BugReport {
+                note: None,
+                diagnose: false
+            })
+            .unwrap(),
             r#"{"cmd":"bug_report"}"#,
-            "no-note must be byte-identical to the old unit variant's wire form"
+            "a plain bugreport must be byte-identical to the old unit variant's wire form"
         );
-        // Old client's bare JSON → new struct variant with note: None (forward-compat).
+        // Old client's bare JSON → new struct variant with both fields defaulted (forward-compat).
         assert!(matches!(
             serde_json::from_str::<Request>(r#"{"cmd":"bug_report"}"#).unwrap(),
-            Request::BugReport { note: None }
+            Request::BugReport {
+                note: None,
+                diagnose: false
+            }
         ));
         // With a note, the field is present on the wire and round-trips.
         assert_eq!(
             serde_json::to_string(&Request::BugReport {
-                note: Some("dns broke".into())
+                note: Some("dns broke".into()),
+                diagnose: false
             })
             .unwrap(),
             r#"{"cmd":"bug_report","note":"dns broke"}"#
         );
         match serde_json::from_str::<Request>(r#"{"cmd":"bug_report","note":"x"}"#).unwrap() {
-            Request::BugReport { note } => assert_eq!(note.as_deref(), Some("x")),
+            Request::BugReport { note, diagnose } => {
+                assert_eq!(note.as_deref(), Some("x"));
+                assert!(!diagnose, "an absent diagnose key means the pass is off");
+            }
+            other => panic!("expected BugReport, got {other:?}"),
+        }
+        // `--diagnose` rides as its own key and round-trips.
+        assert_eq!(
+            serde_json::to_string(&Request::BugReport {
+                note: None,
+                diagnose: true
+            })
+            .unwrap(),
+            r#"{"cmd":"bug_report","diagnose":true}"#
+        );
+        match serde_json::from_str::<Request>(r#"{"cmd":"bug_report","diagnose":true}"#).unwrap() {
+            Request::BugReport { note, diagnose } => {
+                assert_eq!(note, None);
+                assert!(diagnose);
+            }
+            other => panic!("expected BugReport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bug_report_response_checks_are_wire_optional() {
+        // The reply grew `checks` alongside `--diagnose`. A marker-only reply (the no-`--diagnose`
+        // case, and every reply an older daemon sends) must stay byte-identical to the pre-change
+        // wire form, and old JSON must still deserialize — otherwise a mixed-version pair breaks on
+        // the one command an operator reaches for when things are already broken.
+        assert_eq!(
+            serde_json::to_string(&Response::BugReport {
+                marker: "BUG-1-0".into(),
+                checks: Vec::new()
+            })
+            .unwrap(),
+            r#"{"kind":"bug_report","marker":"BUG-1-0"}"#,
+            "no checks must not appear on the wire at all"
+        );
+        match serde_json::from_str::<Response>(r#"{"kind":"bug_report","marker":"BUG-1-0"}"#)
+            .unwrap()
+        {
+            Response::BugReport { marker, checks } => {
+                assert_eq!(marker, "BUG-1-0");
+                assert!(checks.is_empty(), "an absent checks key means no pass ran");
+            }
+            other => panic!("expected BugReport, got {other:?}"),
+        }
+        // With a pass, the lines ride along and round-trip in order.
+        let json = serde_json::to_string(&Response::BugReport {
+            marker: "BUG-1-0".into(),
+            checks: vec!["state: Running".into(), "profile: default".into()],
+        })
+        .unwrap();
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::BugReport { checks, .. } => {
+                assert_eq!(checks, ["state: Running", "profile: default"]);
+            }
             other => panic!("expected BugReport, got {other:?}"),
         }
     }

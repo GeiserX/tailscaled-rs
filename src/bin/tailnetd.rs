@@ -556,10 +556,11 @@ async fn main() -> Result<()> {
 
     // Captive-portal detection (Go `ipn/ipnlocal/captiveportal.go`): a daemon-lifetime task that
     // notices when this node is stuck behind an airport/hotel Wi-Fi login page and raises the
-    // `captive-portal-detected` health warning `tnet status` prints. Deliberately NOT tied to a
-    // device (unlike the link monitor): the case worth reporting is precisely the one where the
-    // engine never came up. It probes only while the node wants to be up and is not — a connected or
-    // deliberately-down node makes zero requests — so it costs nothing on a healthy headless node.
+    // `captive-portal-detected` health warning `tnet status` prints. Its own gate makes it inert
+    // outside `Running`, which is how it expresses the loop lifetime Go gets from starting the loop
+    // on entry to `ipn.Running` and cancelling it on the way out: it probes only while the node is
+    // up, wants to be up, and can reach no relay server. A healthy node, a node still coming up and
+    // a deliberately-down node all make zero requests, so it costs nothing on a headless node.
     //
     // Detached rather than a `select!` arm: it must never be able to end `serve`, and it owns no
     // resource needing orderly teardown beyond its `Arc`. Its handle is aborted after `serve` returns

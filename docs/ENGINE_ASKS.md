@@ -1240,3 +1240,190 @@ Go's `- tlpub:%x (%s key)` list, restore Go's self-key check against (2), and dr
 support-disablement note the command prints today. Until then the fork initializes only the subset the
 engine has — this node as the sole trusted key, one disablement secret — and says so where the
 operator hits it. Tracked in daemon bead tsd-reb2dfc1. — daemon lane
+
+## 37. Per-peer `Location` (and `Active`) on `StatusNode` — for `exit-node list`'s country/city columns and `--filter`
+
+**Why:** Go's `exit-node list` is a *location* browser. `cmd/tailscale/cli/exitnode.go` @
+`53a0d659afa51835dd7a9283873cca44261454f8` runs the exit-node peers through
+`filterFormatAndSortExitNodes`, which buckets them by `Location.CountryCode` then `Location.CityCode`,
+keeps only the highest-`Location.Priority` node per city (plus whichever is the active exit node),
+synthesises an `Any` city row holding the country's best node when a country has more than one city,
+sorts countries and cities by name, and honours `--filter` ("filter exit nodes by country") with a
+case-insensitive match against `Location.Country`. It then prints five columns — IP, HOSTNAME,
+COUNTRY, CITY, STATUS.
+
+Verified against pin `9d847a6e`/v0.43.0. The **wire** type is already there and already parsed:
+`ts_control_serde::Location` (`ts_control_serde/src/location.rs`) carries `country`, `country_code`,
+`city`, `city_code`, `latitude`, `longitude` and `priority`, and `HostInfo.location:
+Option<Location<'a>>` (`ts_control_serde/src/host_info.rs`) decodes it off the netmap. It is dropped
+one layer up: `impl From<..> for Node` (`ts_control/src/node.rs`) projects `host_info.services`,
+`host_info.net_info.preferred_derp` and `host_info.peer_relay` into the domain `Node` but not
+`host_info.location`, so `ts_control::Node` has no location field, `StatusNode`
+(`ts_runtime/src/status.rs`) has none either, and neither does the daemon's `PeerReport`. Nothing
+between the decoder and the CLI can group, sort or filter by country.
+
+`StatusNode` is also missing Go's `PeerStatus.Active` (traffic seen in the last couple of minutes),
+which `peerStatus` consults before `Online` when it picks the STATUS wording.
+
+**Ask:**
+
+1. Retain the decoded location on the domain node — `Node::location: Option<Location>` (an owned
+   analogue of `ts_control_serde::Location`), projected in `From<..> for Node` next to the other
+   `host_info` fields it already keeps, `None` when the peer declared none (never fabricated).
+2. Surface it on the status view — `StatusNode::location: Option<Location>`, the analogue of Go's
+   `ipnstate.PeerStatus.Location`. `priority` is the field the per-city reduction needs, so it has to
+   ride along with the names and codes.
+3. `StatusNode::active: bool` — Go's `PeerStatus.Active`, true when traffic has been seen for the peer
+   recently. Independent of (1) and (2) and useful to `tnet status` as well.
+
+All three are additive: today's behaviour is (1)/(2) always `None` and (3) always `false`.
+
+**Daemon impact once landed:** `tnet exit-node list` already prints Go's five columns, sorts by DNS
+name, ports Go's `peerStatus` and both of its error paths (`no exit nodes found`, `no exit nodes found
+for %q`), and accepts `--filter`. What it cannot do is *group*: with no `Location`, every peer takes
+Go's own no-location path — one unnamed country, one unnamed city, no priority reduction, no `Any`
+row, `-` printed for country and city — and any non-empty `--filter` can only reach the "found for %q"
+error. Wiring is: carry `location` through `peer_report_from_status_node` into `PeerReport`, then port
+`filterFormatAndSortExitNodes` itself (the country/city buckets, the priority reduction, the `Any`
+row, the two name sorts) and match `--filter` against the real country. (3) removes the last deviation
+in the STATUS column, where an idle-but-online selected exit node currently reads `selected` and Go
+says `selected but offline`. Tracked in daemon bead tsd-red57f03. — daemon lane
+
+## 38. Selectable ping types and a ping size — `Device::ping_typed` (for Go `ping --tsmp` / `--peerapi` / `--size`)
+
+**Why:** Go's `tailscale ping` (`cmd/tailscale/cli/ping.go` @
+`53a0d659afa51835dd7a9283873cca44261454f8`) does not have one probe, it has four, and the operator
+picks between them. `pingType()` maps `--tsmp`/`--icmp`/`--peerapi` onto a `tailcfg.PingType`
+(defaulting to `PingDisco`) and hands it, together with `--size`, to `LocalClient.PingWithOpts`. The
+four measure genuinely different things:
+
+- **disco** (`PingDisco`, the default) — a magicsock-level probe between the two endpoints. Answers
+  "is there a direct path, and how fast is it".
+- **ICMP** (`PingICMP`) — an ICMP echo injected into the tunnel, answered by the peer's *host OS
+  stack*. Answers "is the peer's OS reachable through WireGuard".
+- **TSMP** (`PingTSMP`) — through WireGuard, answered by the peer's *tailscaled*, neither host OS
+  stack involved. Answers "is the peer's daemon alive and does the packet filter admit me". Go
+  returns after the first pong for TSMP and ICMP alike.
+- **peerAPI** (`PingPeerAPI`) — not a ping: an HTTP hit on the peer's peerAPI server, printed as
+  `hit peerapi of %s (%s) at %s in %s` (node IP, node name, peerAPI URL, latency).
+
+`--size` ("size of the ping message (disco pings only). 0 for minimum size.") pads the disco probe,
+which is how an operator finds a path MTU problem.
+
+Verified against pin `9d847a6e`/v0.43.0. The engine has **two** of the four, but no way to choose
+between them and no size knob:
+
+- `Device::ping(dst, timeout) -> Result<Duration, PingError>` — "an ICMPv4 echo … from this device's
+  own tailnet IPv4 over the overlay netstack — never a host socket", answered by the peer's own OS
+  stack. That is Go's `PingICMP`, and it is what the daemon sends for every `tnet ping` today.
+- `Device::ping_disco(dst, timeout) -> Result<Option<(SocketAddr, Duration)>, Error>` — a fresh
+  disco probe returning the endpoint that answered and the RTT. That is Go's `PingDisco`.
+- **TSMP: nothing.** `ts_dataplane` admits IP protocol 99 past the ACL on the way in (Go's `case
+  ipproto.TSMP: return Accept`), and `ts_capabilityversion` records the version at which TSMP ping
+  became a thing, but no crate constructs a TSMP message and none answers one. A TSMP probe sent
+  today would never be replied to.
+- **peerAPI: a client, but not a probe.** `Device::push_file` reaches a peer's peerAPI over
+  `NodeInfo::peerapi_addr`, so the transport exists; there is no call that hits the peer's peerAPI
+  and reports its URL plus a latency.
+- **Size: no parameter.** Both ping calls take a destination and a timeout and choose the packet
+  themselves.
+
+**Ask:**
+
+1. A single typed entry point, so the caller selects the probe instead of the engine choosing for
+   it — e.g.
+
+   ```rust
+   pub enum PingKind { Disco, Icmp, Tsmp, PeerApi }
+
+   pub struct PingOpts { pub kind: PingKind, pub size: Option<usize>, pub timeout: Duration }
+
+   pub struct PingOutcome {
+       pub latency: Duration,
+       /// The direct endpoint that answered, when the probe went direct.
+       pub endpoint: Option<SocketAddr>,
+       /// `PingKind::PeerApi` only: the peer's peerAPI base URL that was hit.
+       pub peerapi_url: Option<String>,
+       /// The peer's node name, for Go's `pong from <name> (<ip>)` line.
+       pub node_name: Option<String>,
+   }
+
+   pub async fn ping_typed(&self, dst: IpAddr, opts: PingOpts) -> Result<PingOutcome, PingError>;
+   ```
+
+   `Disco` and `Icmp` are re-exports of the two calls that already exist, so those two arms are
+   plumbing.
+2. **TSMP, both halves.** Construct and send a TSMP ping over the tunnel, and answer an inbound one
+   from this node's own daemon rather than only admitting it past the ACL. This is the substantial
+   piece; it is also the one that makes `tailscale ping --tsmp` against a Rust node work *from a Go
+   node*, which is a two-way interop gap today, not just a missing CLI flag.
+3. **A peerAPI probe** — a `GET` on the peer's peerAPI base returning `(url, latency)`, reusing the
+   client `push_file` already has.
+4. **`size` on the disco probe**, padding the disco payload; ignored for the other kinds, exactly as
+   Go documents it ("disco pings only").
+5. Nice to have with (1): the peer's node name in the outcome, so `pong from <name> (<ip>)` can carry
+   the name Go prints instead of the IP standing in for it.
+
+(2) and (3) are independent of each other; (1) and (4) are small once either lands, and (1) alone —
+with `Tsmp`/`PeerApi` returning `Unsupported` — is already useful, because it lets the daemon report
+"not implemented" from the engine instead of refusing at the CLI.
+
+**Related, and worth fixing before any of this: the default probe is the wrong one.** Go's default is
+`PingDisco`; the daemon's `Request::Ping` calls `Device::ping` (ICMP) and then reads the direct-path
+endpoint from `Device::direct_path`, a cached snapshot of the last periodic disco probe. So `tnet
+ping` today reports an ICMP RTT next to a disco endpoint that can be up to one probe interval stale,
+and `--until-direct` can overshoot Go by a ping or two before it notices the upgrade. That needs no
+engine change — `Device::ping_disco` already returns both halves from one fresh probe — and is
+tracked as a daemon-side follow-up, noted here so the two are not confused.
+
+**Daemon impact once landed:** `tnet ping --tsmp`/`--peerapi`/`--size` already parse and are refused
+by name in `ping_probe_refusal` (`src/bin/tnet.rs`); wiring them is a ping-kind + size field on the
+`Ping` wire request, the `ipn::diag::ping` call, and Go's `hit peerapi of …` line for the peerAPI
+arm — then the refusal is deleted. `--icmp` is already honoured (it names the probe the daemon
+sends) and needs nothing. — daemon lane
+
+## 39. App-connector route learning + a `RouteInfo` readback (for `tnet appc-routes`)
+
+**Why:** the daemon already ships the *advertise* half of the app connector. `tnet up/set
+--advertise-connector` sets `Config.advertise_app_connector`, the engine folds it into
+`Hostinfo.AppConnector` at registration and on every map request, and control sees the node
+offering the role. Nothing behind that advertisement exists, in the daemon or the engine.
+
+Go's connector (`appc.AppConnector`, driven from `ipnlocal`) is three pieces the engine would own,
+because all three sit on the data plane:
+
+- **The configured domain set.** Control pushes it in the netmap capability map — the
+  `tailscale.com/app-connectors` cap (`appctype.AppConnectorAttr`: `domains`, wildcards, and
+  predetermined `routes`). The engine parses the netmap; the daemon never sees the capmap.
+- **DNS observation.** For each configured domain (`example.com`, or `*.example.com` matched
+  against the wildcard list) the connector watches the answers flowing through its own resolver and
+  records the addresses it sees. That is a tap on the MagicDNS forwarder — engine-side.
+- **Route advertisement.** Each newly observed address becomes a /32 or /128 the node advertises,
+  appended to the advertised-route set and re-sent to control.
+
+Verified against pin `9d847a6e`/v0.43.0: `Config.advertise_app_connector` is a plain bool the
+register/map-poll paths read, and nothing else in the engine references app connectors. There is no
+domain observation, no learned-route accumulation, and no store — so there is nothing for a readback
+verb to return.
+
+**Ask:** the learning path above, plus one read-only accessor over what it accumulated —
+`Device::app_connector_route_info(&self) -> Option<RouteInfo>` where `RouteInfo` mirrors Go's
+`appctype.RouteInfo`: `control: Vec<IpNet>` (routes from the policy's `routes` field), `domains:
+BTreeMap<String, Vec<IpAddr>>` (addresses learned per domain), `wildcards: Vec<String>` (the
+observed suffixes). `None` when the node is not advertising the role, so the caller can tell "not a
+connector" from "a connector that has learned nothing", which are different answers. The routes
+themselves should keep flowing through the existing advertised-route path rather than a second one.
+
+Split it if that is easier to land: the accessor is useless without the learning, but the *learning*
+alone is already the feature — a node that actually connects. The readback is how an operator
+confirms it.
+
+**Daemon impact once landed:** an `AppcRouteInfo` LocalAPI verb (read-only, the shape of
+`GetPrefs`) → `Device::app_connector_route_info`, consumed by `tnet appc-routes`. The CLI is already
+ported and its flag surface is settled: `appc_routes_shape` in `src/bin/tnet.rs` resolves Go's
+`-n` > `--map` > `--all` > summary precedence, and `appc_routes_output` answers the two prefs-only
+shapes today (Go's `not a connector`, and `-n`'s advertised-route count) while the other three
+return `appc_routes_refusal` — replace that arm with the three renderers ported from Go's
+`getAllOutput` / `getSummarizeLearnedOutput` and the command is complete. Until then
+`--advertise-connector` documents the limit at every place it appears (`tnet up`/`set --help`,
+`Prefs::advertise_app_connector`, README). Tracked in daemon bead tsd-ree961df. — engine lane
