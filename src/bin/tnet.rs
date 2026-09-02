@@ -953,8 +953,26 @@ enum Command {
     Bugreport {
         /// An optional note (Go `bugreport [note]`) appended to the marker — e.g. a short description
         /// of what went wrong. Control characters are stripped so the marker stays one clean token.
+        //
+        // Collected as a list, not a single value, so a second positional is refused in Go's words
+        // (`unknown arguments`, see `bugreport_note`) rather than clap's. (A `//` comment, not a doc
+        // comment — the `--help` reader needs the line above, not this.)
         #[arg(value_name = "NOTE")]
-        note: Option<String>,
+        note: Vec<String>,
+        /// Run additional in-depth checks (Go `bugreport --diagnose`) and print them with the
+        /// marker.
+        ///
+        /// Go's `--diagnose` makes the daemon run its `Doctor` pass and write the findings into the
+        /// log stream it is uploading, so support can read them next to the marker. This fork
+        /// uploads nothing, so the checks are printed here instead — on stderr, leaving stdout the
+        /// marker alone — for you to paste into the issue yourself.
+        #[arg(long)]
+        diagnose: bool,
+        /// Bracket a reproduction with two markers (Go `bugreport --record`): print one marker, wait
+        /// for you to reproduce the issue and press Enter, then print a second one. Quote both when
+        /// reporting, so the reader knows the window the problem happened in.
+        #[arg(long)]
+        record: bool,
     },
     /// Provision a TLS certificate + key for a tailnet domain via ACME (Go `tailscale cert`). The
     /// domain must be one of your tailnet's cert domains (`tnet dns status` lists them). Requires a
@@ -2431,7 +2449,11 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Command::Bugreport { note } => dispatch_simple(&socket, Request::BugReport { note }).await,
+        Command::Bugreport {
+            note,
+            diagnose,
+            record,
+        } => run_bugreport(&socket, &note, diagnose, record).await,
         Command::Cert {
             domain,
             cert_file,
@@ -2817,9 +2839,10 @@ async fn send_ok_or_die(socket: &std::path::Path, request: Request) -> Result<()
 }
 
 /// Round-trip a one-shot `Request` whose reply is rendered with no command-specific state, then
-/// return. Covers the truly-generic writes — `down`/`logout` (reply `Ok`), `bugreport` (reply
-/// `BugReport`), and `id-token` (reply `IdToken`) — distributing the former shared post-match render
-/// arms for those response shapes into one place. Models its error/exit handling on
+/// return. Covers the truly-generic writes — `down`/`logout` (reply `Ok`) and `id-token` (reply
+/// `IdToken`) — distributing the former shared post-match render arms for those response shapes into
+/// one place. (`bugreport` used to be here too; `--record` gave it a second round trip and a stdin
+/// wait between the two, so it has its own [`run_bugreport`] now.) Models its error/exit handling on
 /// [`send_ok_or_die`]: a `Response::Error` prints `error: <msg>` and exits 1; a transport error is
 /// returned with the same "talking to daemon" context the old fall-through block used.
 async fn dispatch_simple(socket: &std::path::Path, request: Request) -> Result<()> {
@@ -2830,13 +2853,6 @@ async fn dispatch_simple(socket: &std::path::Path, request: Request) -> Result<(
         Response::Ok { message } => {
             println!("ok: {message}");
         }
-        // `bugreport`: print the local marker + a one-line honesty note (no logs were uploaded).
-        Response::BugReport { marker } => {
-            println!("{marker}");
-            eprintln!(
-                "(local diagnostic marker — this client uploads no logs; quote it when reporting an issue)"
-            );
-        }
         // `id-token`: print the raw JWT on its own line (Go's `outln(tr.IDToken)`) for easy capture
         // into a variable / piping to a verifier. The token is opaque base64url — no sanitization
         // needed (it is control-minted, not free-form text).
@@ -2846,6 +2862,126 @@ async fn dispatch_simple(socket: &std::path::Path, request: Request) -> Result<(
             std::process::exit(1);
         }
         other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+/// Go's prompt between the two `--record` markers, verbatim (`cmd/tailscale/cli/bugreport.go`:
+/// `fmt.Println("Recording started; please reproduce your issue and then press Enter...")`).
+const RECORD_PROMPT: &str =
+    "Recording started; please reproduce your issue and then press Enter...";
+
+/// Go's closing line after the second `--record` marker, verbatim. It is the point of the whole
+/// flag: the pair brackets the reproduction, so BOTH markers have to reach whoever reads the report.
+const RECORD_FOOTER: &str =
+    "Please provide both bugreport markers above to the support team or GitHub issue.";
+
+/// Pick the single optional positional of `tnet bugreport`, porting Go's arity refusal verbatim.
+///
+/// Go `runBugReport` (`cmd/tailscale/cli/bugreport.go`) switches on `len(args)`: zero is no note,
+/// one is the note, and `default: return errors.New("unknown arguments")`. clap would otherwise
+/// answer a second positional with its own wording (and exit 2), so the positional is a `Vec` and
+/// the count is judged here. Pure → unit-testable.
+fn bugreport_note(args: &[String]) -> Result<Option<&str>> {
+    match args {
+        [] => Ok(None),
+        [note] => Ok(Some(note.as_str())),
+        _ => anyhow::bail!("unknown arguments"),
+    }
+}
+
+/// One `bugreport` round trip: ask the daemon for a marker (running the `--diagnose` pass when
+/// asked), print any checks, and return the marker for the caller to print.
+///
+/// The checks go to **stderr** and the marker to stdout, so `tnet bugreport --diagnose > marker.txt`
+/// still captures exactly the marker — the diagnostic block is for a human, and Go has no stdout
+/// counterpart for it at all (upstream those lines go into the uploaded log stream).
+async fn bugreport_round_trip(
+    socket: &std::path::Path,
+    note: Option<&str>,
+    diagnose: bool,
+) -> Result<String> {
+    let request = Request::BugReport {
+        note: note.map(str::to_string),
+        diagnose,
+    };
+    let response = round_trip(socket, &request)
+        .await
+        .with_context(|| format!("talking to daemon at {}", socket.display()))?;
+    match response {
+        Response::BugReport { marker, checks } => {
+            if !checks.is_empty() {
+                eprintln!("in-depth checks (--diagnose):");
+                for check in &checks {
+                    eprintln!("  {check}");
+                }
+            }
+            Ok(marker)
+        }
+        Response::Error { message } => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        other => anyhow::bail!("unexpected response to bugreport request: {other:?}"),
+    }
+}
+
+/// `bugreport` (Go `tailscale bugreport [--diagnose] [--record] [note]`): print a local diagnostic
+/// marker, optionally bracketing a reproduction with a second one.
+///
+/// `--record` is pure CLI choreography, as it is in Go: upstream it starts the request on a
+/// goroutine with a `Record` done-channel, prints the prompt, blocks on stdin, closes the channel to
+/// let the daemon finish, and prints the marker plus [`RECORD_FOOTER`] — the daemon writes a marker
+/// at each end of that held-open request, so the operator ends up with a before/after pair. This
+/// fork's marker is already a local identifier that needs nothing held open, so the same pair is two
+/// ordinary round trips around the same stdin wait, and the daemon needs no `record` field at all.
+///
+/// The stdin wait is Go's `fmt.Scanln()`: a line, and EOF is not an error. So a non-interactive
+/// `tnet bugreport --record < /dev/null` prints both markers immediately instead of hanging — the
+/// same thing Go does, and what makes the flag usable from a script that wraps a reproduction.
+///
+/// Stream split: the marker, the prompt and the footer are Go's own output and go to **stdout**
+/// (`outln`/`fmt.Println`); this fork's two additions — the `--diagnose` block and the one-line
+/// no-logs-were-uploaded note — go to stderr, so what a pipe collects is exactly what Go's would.
+async fn run_bugreport(
+    socket: &std::path::Path,
+    args: &[String],
+    diagnose: bool,
+    record: bool,
+) -> Result<()> {
+    // Go refuses a second positional before it contacts the daemon; so do we.
+    let note = bugreport_note(args)?;
+
+    println!("{}", bugreport_round_trip(socket, note, diagnose).await?);
+
+    if record {
+        println!("{RECORD_PROMPT}");
+        // Wait for the operator to reproduce the issue. A read error or EOF proceeds, exactly as
+        // Go's ignored `fmt.Scanln()` error does.
+        {
+            use tokio::io::AsyncBufReadExt as _;
+            let mut line = String::new();
+            let _ = tokio::io::BufReader::new(tokio::io::stdin())
+                .read_line(&mut line)
+                .await;
+        }
+        // The second marker closes the bracket. `--diagnose` (when asked for) runs on both ends, so
+        // the checks describe the daemon before AND after the reproduction — which is the state
+        // change a recorded report is trying to show.
+        println!("{}", bugreport_round_trip(socket, note, diagnose).await?);
+        println!("{RECORD_FOOTER}");
+    }
+
+    // The honesty note the marker has always carried, phrased for however many were printed: after a
+    // recording there are two, and BOTH are the report (Go's closing line says so as well).
+    if record {
+        eprintln!(
+            "(local diagnostic markers — this client uploads no logs; quote both when reporting an issue)"
+        );
+    } else {
+        eprintln!(
+            "(local diagnostic marker — this client uploads no logs; quote it when reporting an issue)"
+        );
     }
     Ok(())
 }
@@ -16589,6 +16725,67 @@ mod tests {
             }
             _ => panic!("expected Command::Whois"),
         }
+    }
+
+    #[test]
+    fn bugreport_takes_gos_diagnose_and_record_flags() {
+        // A `tailscale bugreport --diagnose --record "dns broke"` command line copied from Go must
+        // parse here, flags and note together.
+        match Cli::try_parse_from(["tnet", "bugreport", "--diagnose", "--record", "dns broke"])
+            .expect("Go's two flags plus the note must parse")
+            .command
+        {
+            Command::Bugreport {
+                note,
+                diagnose,
+                record,
+            } => {
+                assert_eq!(note, vec!["dns broke".to_string()]);
+                assert!(diagnose, "--diagnose is modelled");
+                assert!(record, "--record is modelled");
+            }
+            _ => panic!("expected Command::Bugreport"),
+        }
+        // Both flags default off, and the note stays optional.
+        match Cli::try_parse_from(["tnet", "bugreport"])
+            .expect("a bare bugreport still parses")
+            .command
+        {
+            Command::Bugreport {
+                note,
+                diagnose,
+                record,
+            } => {
+                assert!(note.is_empty());
+                assert!(!diagnose && !record, "neither flag is on by default");
+            }
+            _ => panic!("expected Command::Bugreport"),
+        }
+        // The positional is a list at the clap layer so the arity refusal can be Go's own words
+        // (see `bugreport_note`) — clap itself must accept two.
+        assert!(
+            Cli::try_parse_from(["tnet", "bugreport", "one", "two"]).is_ok(),
+            "clap must defer the arity verdict to bugreport_note"
+        );
+    }
+
+    #[test]
+    fn bugreport_note_ports_gos_unknown_arguments_refusal() {
+        // Go `runBugReport`: zero args → no note, one → the note, `default: errors.New("unknown
+        // arguments")`. The message is Go's, verbatim, because an operator following Go's docs will
+        // search for it.
+        assert_eq!(bugreport_note(&[]).expect("zero args is no note"), None);
+        let one = vec!["dns broke".to_string()];
+        assert_eq!(
+            bugreport_note(&one).expect("one arg is the note"),
+            Some("dns broke")
+        );
+        let two = vec!["dns".to_string(), "broke".to_string()];
+        assert_eq!(
+            bugreport_note(&two).unwrap_err().to_string(),
+            "unknown arguments",
+            "a second positional is Go's refusal, not clap's"
+        );
     }
 
     #[test]
