@@ -663,37 +663,48 @@ not forgotten; the drain itself is already faithful without it. — daemon lane
 > shows — which Go drives from the same `Prefs.ProfileName` — is **done**: `set --nickname` now also
 > renames the current profile, so `nickname` is carried by the ENGINE but not inert locally.
 
-**Why:** Go's `tailscale up`/`set` (v1.100.0 `up.go:99-148`, `set.go:76-122`) expose ~15 pref flags;
-this fork's `up`/`set` faithfully cover the ten that map to existing engine `Config` fields
-(`hostname`, `accept-routes`, `accept-dns`, `shields-up`, `exit-node`, `advertise-exit-node`,
-`advertise-routes`, `advertise-tags`, `ssh`, `tun`). The remainder are **not daemon-fixable today**
-because the pinned engine `Config` (rev `6035651`, `src/config.rs`) has **no field** to carry them, and
-the honest-omission rule forbids shipping a flag that parses but silently does nothing (the historical
-`accept_dns` inert-flag trap). Confirmed by reading the authoritative `Config` struct: its fields end
-at `audience`, with nothing for any of the flags below.
+**Why — the rationale AS FILED, against pin `6035651`. Superseded for eight of the flags; kept as
+the record of what was asked for and why.** Go's `tailscale up`/`set` (v1.100.0 `up.go:99-148`,
+`set.go:76-122`) expose ~15 pref flags; this fork's `up`/`set` faithfully covered only the ten that
+mapped to existing engine `Config` fields (`hostname`, `accept-routes`, `accept-dns`, `shields-up`,
+`exit-node`, `advertise-exit-node`, `advertise-routes`, `advertise-tags`, `ssh`, `tun`). The remainder
+were **not daemon-fixable at that pin** because the engine `Config` (rev `6035651`, `src/config.rs`)
+had **no field** to carry them, and the honest-omission rule forbids shipping a flag that parses but
+silently does nothing (the historical `accept_dns` inert-flag trap). That was confirmed by reading the
+authoritative `Config` struct: its fields ended at `audience`, with nothing for any of the flags below.
+
+**Why it still stands, at pin `9d847a6` — for the Linux router knobs only.** The engine has since
+added a field for eight of the flags and the daemon wired them (banner above), so "no field to carry
+them" now describes `--snat-subnet-routes`, `--stateful-filtering`, `--netfilter-mode` and
+`--unattended` alone: for those four the reasoning above is unchanged and they stay unshipped rather
+than parse-and-do-nothing. The list below is marked per entry — ✅ SHIPPED at `9d847a6` (the daemon
+carries the pref today), ⬜ STILL OPEN (no engine field; this is the live ask).
 
 **Ask — add the engine `Config` fields (Go pref name → suggested field), so the daemon can wire each
 faithfully (a wire `Up`/`Set` field + pref mapping + the revert-guard/`--reset` lockstep + a
 `get_settings` row):**
 
-- `--operator <user>` → `operator_user: Option<String>` (also the substrate for the operator-GID
-  LocalAPI authz matrix the daemon's THREAT_MODEL notes as a later phase).
-- `--exit-node-allow-lan-access <bool>` → `exit_node_allow_lan_access: bool` (Go
+- ✅ SHIPPED — `--operator <user>` → `operator_user: Option<String>` (also the substrate for the
+  operator-GID LocalAPI authz matrix the daemon's THREAT_MODEL notes as a later phase).
+- ✅ SHIPPED — `--exit-node-allow-lan-access <bool>` → `exit_node_allow_lan_access: bool` (Go
   `Prefs.ExitNodeAllowLANAccess`; only meaningful with an exit node selected).
-- `--nickname <name>` → `nickname: Option<String>` (Go `Prefs.ProfileName`-adjacent / node nickname).
-- `--report-posture <bool>` → `posture_checking: bool` (Go `Prefs.PostureChecking`).
-- `--auto-update <bool>` / `--update-check <bool>` → `auto_update: { apply: Option<bool>, check:
-  Option<bool> }` (Go `Prefs.AutoUpdate`). *(Caveat: the daemon also lists self-update as a NON-GOAL —
-  see DESIGN §"Non-goals". If the engine carries the pref purely as state to report to control, the
-  daemon can wire the flag as a pref without implementing an updater; flagging the tension.)*
-- `--advertise-connector <bool>` → an app-connector pref/field (Go `Prefs.AppConnector`). Distinct from
-  the existing `advertise_services` (that is service-advertise, not the app-connector role).
-- `--webclient <bool>` → `run_web_client: bool` (Go `Prefs.RunWebClient`). *(Also a daemon NON-GOAL as
-  a UI; same caveat as auto-update — pref-state only, no embedded server.)*
-- Linux subnet-router knobs: `--snat-subnet-routes`, `--stateful-filtering`, `--netfilter-mode`,
-  `--unattended` → the engine's router/netfilter layer (Go `Prefs.NoSNAT` / `NoStatefulFiltering` /
-  `NetfilterMode` / `Unattended`). These ride on the Linux OS-router (daemon bead tsd-m8s) and are
-  lower priority.
+- ✅ SHIPPED — `--nickname <name>` → `nickname: Option<String>` (Go `Prefs.ProfileName`-adjacent /
+  node nickname).
+- ✅ SHIPPED — `--report-posture <bool>` → `posture_checking: bool` (Go `Prefs.PostureChecking`).
+- ✅ SHIPPED — `--auto-update <bool>` / `--update-check <bool>` → `auto_update: { apply:
+  Option<bool>, check: Option<bool> }` (Go `Prefs.AutoUpdate`). *(Caveat: the daemon also lists
+  self-update as a NON-GOAL — see DESIGN §"Non-goals". If the engine carries the pref purely as
+  state to report to control, the daemon can wire the flag as a pref without implementing an
+  updater; flagging the tension.)*
+- ✅ SHIPPED — `--advertise-connector <bool>` → an app-connector pref/field (Go
+  `Prefs.AppConnector`). Distinct from the existing `advertise_services` (that is service-advertise,
+  not the app-connector role).
+- ✅ SHIPPED — `--webclient <bool>` → `run_web_client: bool` (Go `Prefs.RunWebClient`). *(Also a
+  daemon NON-GOAL as a UI; same caveat as auto-update — pref-state only, no embedded server.)*
+- ⬜ STILL OPEN — Linux subnet-router knobs: `--snat-subnet-routes`, `--stateful-filtering`,
+  `--netfilter-mode`, `--unattended` → the engine's router/netfilter layer (Go `Prefs.NoSNAT` /
+  `NoStatefulFiltering` / `NetfilterMode` / `Unattended`). These ride on the Linux OS-router (daemon
+  bead tsd-m8s) and are lower priority.
 
 **Workload-identity flags** (`--client-id`/`--client-secret`/`--id-token`/`--audience`) are a SEPARATE
 case: the engine `Config` **already has** `client_id`/`client_secret`/`id_token`/`audience`, but they
@@ -1078,7 +1089,300 @@ status-code-only. Tracked in daemon bead tsd-iqq.5. — daemon lane
 
 ---
 
-## 34. App-connector route learning + a `RouteInfo` readback (for `tnet appc-routes`)
+## 34. A peer-relay server (listen port + static endpoints) and a config-sync kill switch — for the last four Go `set` pref flags
+
+**Why:** Go's `tailscale set` (`cmd/tailscale/cli/set.go` @ `53a0d659afa51835dd7a9283873cca44261454f8`)
+registers four pref flags this fork models no pref for. Three of them are engine-gated; the fourth is
+listed here only so nobody files it as an ask by mistake.
+
+- **`--relay-server-port <PORT>`** (Go `Prefs.RelayServerPort *uint16`) — the UDP port a **peer relay
+  server** binds on all interfaces; `0` means "pick a random unused port", and the flag's empty value
+  means "disable relay-server functionality". A peer relay is a node that forwards disco + WireGuard
+  frames between two peers that cannot reach each other directly, without the round trip to a DERP
+  region.
+- **`--relay-server-static-endpoints <IP:PORT,…>`** (Go `Prefs.RelayServerStaticEndpoints
+  []netip.AddrPort`) — static endpoints to advertise as candidates for relay connections, for a relay
+  behind a firewall pinhole whose reflexive address discovery will not find the right candidate. Go
+  documents them as "only relevant when RelayServerPort is non-nil".
+- **`--sync`** (Go `Prefs.Sync opt.Bool`, unset = true) — whether the node actively syncs its
+  configuration from the control plane. `--sync=false` is Go's kill switch, and its stated purpose is
+  testing: "to verify that netmap caching and offline operation work correctly".
+
+Verified against pin `9d847a6e`/v0.43.0. The engine can **read** a peer's relay role —
+`ts_control::node` carries `peer_relay` (Go `Hostinfo.PeerRelay`) and `NodeInfo::is_peer_relay()` —
+but there is nothing on the **serving** side: `ts_control::Config` has no relay listen port and no
+static-endpoint list (its fields run from `server_url` to `allow_http_key_fetch`), `ts_control::hostinfo`
+never sets `peer_relay` for this node, so our own `Hostinfo` cannot advertise the role, and
+`ts_magicsock` has no relay listener to bind. There is likewise no way to suspend the map poll while
+the node stays up, so `--sync=false` has nothing to switch off.
+
+**Ask:**
+
+1. `Config.relay_server_port: Option<u16>` — `None` disables (today's behaviour), `Some(0)` binds a
+   random unused port, `Some(p)` binds `p` on all interfaces. This is the same construction-time shape
+   as the already-shipped `wireguard_listen_port` (ask #22), and it matches Go, where the port is a
+   pref read at engine reconfigure.
+2. `Config.relay_server_static_endpoints: Vec<SocketAddr>` — advertised as relay candidates; ignored
+   when `relay_server_port` is `None`, mirroring Go.
+3. Set `Hostinfo.PeerRelay` for THIS node when a relay port is configured, so control and peers learn
+   the role — the read side (`NodeInfo::is_peer_relay`) already exists, and without the advertise side
+   a bound listener is unreachable.
+4. The magicsock UDP relay path itself: accept relayed disco/WireGuard frames on the bound port and
+   forward between the two peers. This is the substantial half; (1)–(3) are plumbing around it.
+5. Separately and much smaller: a way to stop syncing configuration from control without bringing the
+   node down — `Config.sync: bool` or a `Device::set_sync(bool)` — so `--sync=false` can exercise
+   netmap caching and offline operation the way Go's does.
+
+(1)–(4) are one feature and can land together; (5) is independent and is the cheap one.
+
+**NOT asked for: `--remote-config`** (Go `Prefs.RemoteConfig`, new since v1.100.0). It delegates full
+remote control of the node's prefs **and its LocalAPI** to the tailnet admin via the control plane,
+bypassing Tailscale's per-feature double opt-in — "a single client-side 'I trust the tailnet admin'
+switch", in Go's own words. This daemon's authorization model is local (THREAT_MODEL §4.1: every
+LocalAPI write is gated on the caller's peer UID — root or the daemon's owner — and the control plane
+is a peer whose input is validated, never a principal that may rewrite prefs or invoke local
+endpoints). Adopting `RemoteConfig` would add a second,
+remote write path into both, so this fork **declines the behaviour** rather than deferring it. Please do
+not build it on this daemon's account; if the engine ever wants it for another consumer, it should be a
+feature the embedder opts into explicitly, never a default.
+
+**Daemon impact once landed:** `tnet set --relay-server-port` / `--relay-server-static-endpoints`
+already parse (with Go's own `ParseUint`/`ParseAddrPort` validation, dedup and `AddrPort.Compare`
+ordering) and are refused by name in `check_unmodelled_set_flags`; wiring them is a wire `Set` field +
+pref + `get_settings` row, and the refusal is deleted. `--sync`/`--no-sync` is the same shape.
+`--remote-config` keeps its refusal permanently. Tracked in daemon bead tsd-re94825b. — daemon lane
+
+## 35. Proxied-flow `whois` — a `(proto, ip:port) → node` lookup (for `tnet whois --proto`)
+
+**Why:** Go's `whois` is a *flow* lookup, not an address lookup. `cmd/tailscale/cli/whois.go` @
+`53a0d659afa51835dd7a9283873cca44261454f8` takes `ip[:port]` and a `--proto` selector (`protocol; one
+of "tcp" or "udp"; empty means both`) and calls `LocalClient.WhoIsProto`, which reaches
+`LocalBackend.WhoIs(proto, ipp)`. That method resolves by IP first (`cn.NodeByAddr`) and consults the
+protocol **only** in its fallback: when the address matches no node in the netmap and the port is
+non-zero, it asks `b.sys.ProxyMapper().WhoIsIPPort(proto, ipp)` — for `""` it tries `"tcp"` then
+`"udp"` — to map a locally-proxied flow (a `127.0.0.1:port` socket tailscaled itself proxied) back to
+the tailnet IP behind it, then resolves that. So the same `ip:port` really can belong to different
+sessions per protocol, but only for flows the daemon proxies.
+
+Verified against pin `9d847a6e`/v0.43.0. The engine has no such table and no port dimension at all:
+`Device::whois(SocketAddr)` (`src/lib.rs`) forwards to `ts_runtime`, whose `peer_tracker::whois_opt`
+calls `status::whois_addr(addr)` — the whole body of which is `addr.ip()` — and then
+`peer_by_tailnet_ip_opt`. There is no proxy-map type anywhere in the workspace, so nothing records
+which local socket belongs to which peer, and a protocol has nothing to select within.
+
+**Ask:**
+
+1. A proxied-flow registry in the engine, the analogue of Go's `proxymap.Mapper`: the netstack /
+   userspace-proxy paths record `(proto, local ip:port) → peer tailnet IP` when they proxy a
+   connection, and drop the entry when it closes.
+2. `Device::whois_proto(proto: Option<Proto>, addr: SocketAddr) -> Result<Option<WhoIs>, Error>` (or
+   a `proto` parameter on the existing `whois`): resolve by IP as today, and on a miss with a
+   non-zero port, consult (1) — trying `tcp` then `udp` when `proto` is `None`, which is Go's
+   empty-means-both order — and resolve the mapped tailnet IP.
+
+(1) is the substantial half; (2) is the surface over it. Both are additive: today's `whois(addr)` is
+(2) with `proto: None` and a port of 0.
+
+**Daemon impact once landed:** `tnet whois [--proto tcp|udp] ip[:port]` already parses Go's arguments
+in full, and the LocalAPI `Request::Whois` already carries `port` and `proto` through to
+`diag::whois`, which hands the port to the engine and can only record the protocol. Wiring it is one
+call-site change in `diag::whois` plus deleting the "recorded, cannot select" notes on the flag help
+and the wire docs. Until then a proxied flow that Go attributes to a peer is reported here as owned by
+no node, with or without the flag. Tracked in daemon bead tsd-re4d7624. — daemon lane
+
+## 36. Tailnet-lock init with a trusted-key set, several disablements, and this node's own lock key (for `tnet lock init`)
+
+**Why:** Go's `lock init` initializes the authority the operator describes, not a fixed one.
+`cmd/tailscale/cli/tailnet-lock.go` @ `53a0d659afa51835dd7a9283873cca44261454f8` takes
+`[--gen-disablement-for-support] --gen-disablements N <trusted-key>...`, where the positionals are the
+tailnet lock **public keys** (`tlpub:<hex>`, optionally `<key>?<votes>`) initially trusted to sign
+nodes — plus any pre-computed `disablement:<hex>` values — mints `N` disablement secrets itself,
+optionally mints one more that is transmitted to the coordination server for support, and calls
+`LocalClient.TailnetLockInit(ctx, keys, disablementValues, supportDisablement)`. Before any of that it
+refuses when `st.Enabled`, and refuses when the current node's own lock key is not among the trusted
+keys (`st.PublicKey`, from `NetworkLockStatus`) — "the tailnet lock key of the current node must be
+one of the trusted keys during initialization".
+
+Verified against pin `9d847a6e`/v0.43.0. The engine's init is a fixed single-node genesis:
+`Device::tka_init(disablement_secret: Vec<u8>)` (`src/lib.rs`) → `ts_runtime`'s `tka_init_run`
+(`control_runner.rs`), whose body builds `AumKey { kind: Ed25519, votes: 1, public:
+keys.network_lock_keys.public }` as the **sole** trusted key and `vec![disablement_value(&secret)]` as
+the **single** disablement value, then submits init/begin → init/finish. Three consequences:
+
+1. **No key set.** There is no parameter for one, so a tailnet cannot be locked with a second signing
+   node trusted from the start — the case Go's help is written around ("run `tailscale lock` on that
+   node, and copy the node's tailnet lock key").
+2. **No way to read this node's lock key.** `TkaStatus` (`ts_control/src/tka.rs`) carries only `head`
+   and `disabled` — no analogue of Go's `NetworkLockStatus.PublicKey` — and nothing else on `Device`
+   exposes `network_lock_keys.public`. So Go's self-key refusal cannot be *evaluated* here, and the
+   operator cannot obtain the key that Go's grammar requires them to pass.
+3. **The support disablement is unconditional.** `tka_init_run` sets
+   `TkaInitFinishRequest.support_disablement = disablement_secret` — the one secret it was given — so
+   the operator's disablement secret always reaches the coordination server. Upstream sends a
+   *separate*, purpose-minted secret there, and only when `--gen-disablement-for-support` is passed.
+
+**Ask** (extends #17 `tka_init` and #25's key-set half):
+
+1. `Device::tka_init(keys: Vec<AumKey>, disablement_values: Vec<Vec<u8>>, support_disablement:
+   Option<Vec<u8>>)` — the genesis built from the caller's trusted-key set and disablement values,
+   with the support secret sent only when it is `Some`. Today's call is that with the node's own key,
+   one derived value, and the secret repeated as the support disablement.
+2. This node's tailnet lock public key on the read path — a field on `TkaStatus` (Go's
+   `NetworkLockStatus.PublicKey`) or a `Device::tka_public_key()` — so the CLI can print it for the
+   operator to copy and can check Go's "current node must be among the trusted keys" refusal.
+
+**Daemon impact once landed:** `tnet lock init` already parses Go's whole positional grammar
+(`parse_lock_args`, a port of upstream's `parseTLArgs`, including `<key>?<votes>` and both
+`disablement:` prefixes) and already runs Go's `--confirm` two-step, its already-enabled refusal and
+its secret minting. Wiring is: pass the parsed keys and values to the new `tka_init`, delete the
+"this daemon cannot …" refusals in `plan_lock_init`, replace the placeholder trusted-key line with
+Go's `- tlpub:%x (%s key)` list, restore Go's self-key check against (2), and drop the
+support-disablement note the command prints today. Until then the fork initializes only the subset the
+engine has — this node as the sole trusted key, one disablement secret — and says so where the
+operator hits it. Tracked in daemon bead tsd-reb2dfc1. — daemon lane
+
+## 37. Per-peer `Location` (and `Active`) on `StatusNode` — for `exit-node list`'s country/city columns and `--filter`
+
+**Why:** Go's `exit-node list` is a *location* browser. `cmd/tailscale/cli/exitnode.go` @
+`53a0d659afa51835dd7a9283873cca44261454f8` runs the exit-node peers through
+`filterFormatAndSortExitNodes`, which buckets them by `Location.CountryCode` then `Location.CityCode`,
+keeps only the highest-`Location.Priority` node per city (plus whichever is the active exit node),
+synthesises an `Any` city row holding the country's best node when a country has more than one city,
+sorts countries and cities by name, and honours `--filter` ("filter exit nodes by country") with a
+case-insensitive match against `Location.Country`. It then prints five columns — IP, HOSTNAME,
+COUNTRY, CITY, STATUS.
+
+Verified against pin `9d847a6e`/v0.43.0. The **wire** type is already there and already parsed:
+`ts_control_serde::Location` (`ts_control_serde/src/location.rs`) carries `country`, `country_code`,
+`city`, `city_code`, `latitude`, `longitude` and `priority`, and `HostInfo.location:
+Option<Location<'a>>` (`ts_control_serde/src/host_info.rs`) decodes it off the netmap. It is dropped
+one layer up: `impl From<..> for Node` (`ts_control/src/node.rs`) projects `host_info.services`,
+`host_info.net_info.preferred_derp` and `host_info.peer_relay` into the domain `Node` but not
+`host_info.location`, so `ts_control::Node` has no location field, `StatusNode`
+(`ts_runtime/src/status.rs`) has none either, and neither does the daemon's `PeerReport`. Nothing
+between the decoder and the CLI can group, sort or filter by country.
+
+`StatusNode` is also missing Go's `PeerStatus.Active` (traffic seen in the last couple of minutes),
+which `peerStatus` consults before `Online` when it picks the STATUS wording.
+
+**Ask:**
+
+1. Retain the decoded location on the domain node — `Node::location: Option<Location>` (an owned
+   analogue of `ts_control_serde::Location`), projected in `From<..> for Node` next to the other
+   `host_info` fields it already keeps, `None` when the peer declared none (never fabricated).
+2. Surface it on the status view — `StatusNode::location: Option<Location>`, the analogue of Go's
+   `ipnstate.PeerStatus.Location`. `priority` is the field the per-city reduction needs, so it has to
+   ride along with the names and codes.
+3. `StatusNode::active: bool` — Go's `PeerStatus.Active`, true when traffic has been seen for the peer
+   recently. Independent of (1) and (2) and useful to `tnet status` as well.
+
+All three are additive: today's behaviour is (1)/(2) always `None` and (3) always `false`.
+
+**Daemon impact once landed:** `tnet exit-node list` already prints Go's five columns, sorts by DNS
+name, ports Go's `peerStatus` and both of its error paths (`no exit nodes found`, `no exit nodes found
+for %q`), and accepts `--filter`. What it cannot do is *group*: with no `Location`, every peer takes
+Go's own no-location path — one unnamed country, one unnamed city, no priority reduction, no `Any`
+row, `-` printed for country and city — and any non-empty `--filter` can only reach the "found for %q"
+error. Wiring is: carry `location` through `peer_report_from_status_node` into `PeerReport`, then port
+`filterFormatAndSortExitNodes` itself (the country/city buckets, the priority reduction, the `Any`
+row, the two name sorts) and match `--filter` against the real country. (3) removes the last deviation
+in the STATUS column, where an idle-but-online selected exit node currently reads `selected` and Go
+says `selected but offline`. Tracked in daemon bead tsd-red57f03. — daemon lane
+
+## 38. Selectable ping types and a ping size — `Device::ping_typed` (for Go `ping --tsmp` / `--peerapi` / `--size`)
+
+**Why:** Go's `tailscale ping` (`cmd/tailscale/cli/ping.go` @
+`53a0d659afa51835dd7a9283873cca44261454f8`) does not have one probe, it has four, and the operator
+picks between them. `pingType()` maps `--tsmp`/`--icmp`/`--peerapi` onto a `tailcfg.PingType`
+(defaulting to `PingDisco`) and hands it, together with `--size`, to `LocalClient.PingWithOpts`. The
+four measure genuinely different things:
+
+- **disco** (`PingDisco`, the default) — a magicsock-level probe between the two endpoints. Answers
+  "is there a direct path, and how fast is it".
+- **ICMP** (`PingICMP`) — an ICMP echo injected into the tunnel, answered by the peer's *host OS
+  stack*. Answers "is the peer's OS reachable through WireGuard".
+- **TSMP** (`PingTSMP`) — through WireGuard, answered by the peer's *tailscaled*, neither host OS
+  stack involved. Answers "is the peer's daemon alive and does the packet filter admit me". Go
+  returns after the first pong for TSMP and ICMP alike.
+- **peerAPI** (`PingPeerAPI`) — not a ping: an HTTP hit on the peer's peerAPI server, printed as
+  `hit peerapi of %s (%s) at %s in %s` (node IP, node name, peerAPI URL, latency).
+
+`--size` ("size of the ping message (disco pings only). 0 for minimum size.") pads the disco probe,
+which is how an operator finds a path MTU problem.
+
+Verified against pin `9d847a6e`/v0.43.0. The engine has **two** of the four, but no way to choose
+between them and no size knob:
+
+- `Device::ping(dst, timeout) -> Result<Duration, PingError>` — "an ICMPv4 echo … from this device's
+  own tailnet IPv4 over the overlay netstack — never a host socket", answered by the peer's own OS
+  stack. That is Go's `PingICMP`, and it is what the daemon sends for every `tnet ping` today.
+- `Device::ping_disco(dst, timeout) -> Result<Option<(SocketAddr, Duration)>, Error>` — a fresh
+  disco probe returning the endpoint that answered and the RTT. That is Go's `PingDisco`.
+- **TSMP: nothing.** `ts_dataplane` admits IP protocol 99 past the ACL on the way in (Go's `case
+  ipproto.TSMP: return Accept`), and `ts_capabilityversion` records the version at which TSMP ping
+  became a thing, but no crate constructs a TSMP message and none answers one. A TSMP probe sent
+  today would never be replied to.
+- **peerAPI: a client, but not a probe.** `Device::push_file` reaches a peer's peerAPI over
+  `NodeInfo::peerapi_addr`, so the transport exists; there is no call that hits the peer's peerAPI
+  and reports its URL plus a latency.
+- **Size: no parameter.** Both ping calls take a destination and a timeout and choose the packet
+  themselves.
+
+**Ask:**
+
+1. A single typed entry point, so the caller selects the probe instead of the engine choosing for
+   it — e.g.
+
+   ```rust
+   pub enum PingKind { Disco, Icmp, Tsmp, PeerApi }
+
+   pub struct PingOpts { pub kind: PingKind, pub size: Option<usize>, pub timeout: Duration }
+
+   pub struct PingOutcome {
+       pub latency: Duration,
+       /// The direct endpoint that answered, when the probe went direct.
+       pub endpoint: Option<SocketAddr>,
+       /// `PingKind::PeerApi` only: the peer's peerAPI base URL that was hit.
+       pub peerapi_url: Option<String>,
+       /// The peer's node name, for Go's `pong from <name> (<ip>)` line.
+       pub node_name: Option<String>,
+   }
+
+   pub async fn ping_typed(&self, dst: IpAddr, opts: PingOpts) -> Result<PingOutcome, PingError>;
+   ```
+
+   `Disco` and `Icmp` are re-exports of the two calls that already exist, so those two arms are
+   plumbing.
+2. **TSMP, both halves.** Construct and send a TSMP ping over the tunnel, and answer an inbound one
+   from this node's own daemon rather than only admitting it past the ACL. This is the substantial
+   piece; it is also the one that makes `tailscale ping --tsmp` against a Rust node work *from a Go
+   node*, which is a two-way interop gap today, not just a missing CLI flag.
+3. **A peerAPI probe** — a `GET` on the peer's peerAPI base returning `(url, latency)`, reusing the
+   client `push_file` already has.
+4. **`size` on the disco probe**, padding the disco payload; ignored for the other kinds, exactly as
+   Go documents it ("disco pings only").
+5. Nice to have with (1): the peer's node name in the outcome, so `pong from <name> (<ip>)` can carry
+   the name Go prints instead of the IP standing in for it.
+
+(2) and (3) are independent of each other; (1) and (4) are small once either lands, and (1) alone —
+with `Tsmp`/`PeerApi` returning `Unsupported` — is already useful, because it lets the daemon report
+"not implemented" from the engine instead of refusing at the CLI.
+
+**Related, and worth fixing before any of this: the default probe is the wrong one.** Go's default is
+`PingDisco`; the daemon's `Request::Ping` calls `Device::ping` (ICMP) and then reads the direct-path
+endpoint from `Device::direct_path`, a cached snapshot of the last periodic disco probe. So `tnet
+ping` today reports an ICMP RTT next to a disco endpoint that can be up to one probe interval stale,
+and `--until-direct` can overshoot Go by a ping or two before it notices the upgrade. That needs no
+engine change — `Device::ping_disco` already returns both halves from one fresh probe — and is
+tracked as a daemon-side follow-up, noted here so the two are not confused.
+
+**Daemon impact once landed:** `tnet ping --tsmp`/`--peerapi`/`--size` already parse and are refused
+by name in `ping_probe_refusal` (`src/bin/tnet.rs`); wiring them is a ping-kind + size field on the
+`Ping` wire request, the `ipn::diag::ping` call, and Go's `hit peerapi of …` line for the peerAPI
+arm — then the refusal is deleted. `--icmp` is already honoured (it names the probe the daemon
+sends) and needs nothing. — daemon lane
+
+## 39. App-connector route learning + a `RouteInfo` readback (for `tnet appc-routes`)
 
 **Why:** the daemon already ships the *advertise* half of the app connector. `tnet up/set
 --advertise-connector` sets `Config.advertise_app_connector`, the engine folds it into

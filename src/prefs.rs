@@ -98,7 +98,7 @@ pub struct Prefs {
     /// to [`advertise_routes`](Prefs::advertise_routes), and there is no `appctype.RouteInfo` store
     /// for a `appc-route-info` LocalAPI verb to expose. `tnet appc-routes` reports the two things
     /// prefs alone can answer — Go's `not a connector`, and `-n`'s advertised-route count — and
-    /// refuses the three learned-route shapes with that reason. Filed as ask #34 in
+    /// refuses the three learned-route shapes with that reason. Filed as ask #39 in
     /// `docs/ENGINE_ASKS.md`.
     pub advertise_app_connector: bool,
     /// Opt in to admin-console-triggered auto-updates (Go `tailscale set --auto-update` /
