@@ -1704,8 +1704,25 @@ enum DnsCmd {
 /// `tnet exit-node` subcommands.
 #[derive(Subcommand)]
 enum ExitNodeCmd {
-    /// List tailnet peers offering to be exit nodes.
-    List,
+    /// List tailnet peers offering to be exit nodes (Go `tailscale exit-node list`).
+    List {
+        /// Filter exit nodes by country (Go `tailscale exit-node list --filter`, same help text).
+        ///
+        /// Go matches this case-insensitively against each peer's `Location.Country` and errors with
+        /// `no exit nodes found for "<filter>"` when nothing matches. The pinned engine surfaces no
+        /// per-peer `Location` (engine ask #37), so every peer here has an empty country and a
+        /// non-empty filter can only ever reach that error — which is exactly what Go prints for a
+        /// tailnet whose exit nodes declare no location. An empty value (`--filter=`) means "no
+        /// filter", as it does upstream.
+        #[arg(long, value_name = "COUNTRY", default_value = "")]
+        filter: String,
+        /// Go's `runExitNodeList` refuses any positional before it contacts the daemon
+        /// (`unexpected non-flag arguments to 'tailscale exit-node list'`). Taking them here — rather
+        /// than letting clap answer with its own "unexpected argument" — is what lets that refusal be
+        /// reproduced verbatim; see [`exit_node_list_arg_refusal`].
+        #[arg(value_name = "ARGS", hide = true)]
+        args: Vec<String>,
+    },
     /// Suggest the best available exit node (Go `tailscale exit-node suggest`). The daemon picks a
     /// candidate by DERP-region proximity / latency and prints its name plus the `tnet set
     /// --exit-node=<id>` command to engage it. Prints a clear notice when no candidate is available.
@@ -2801,8 +2818,8 @@ async fn main() -> Result<()> {
         } => run_netcheck(&socket, json, format, every, verbose).await,
         // `exit-node list` (Go `tailscale exit-node list`): reuse Status, filter to exit-node peers.
         Command::ExitNode {
-            cmd: ExitNodeCmd::List,
-        } => run_exit_node_list(&socket).await,
+            cmd: ExitNodeCmd::List { filter, args },
+        } => run_exit_node_list(&socket, &filter, &args).await,
         // `exit-node suggest` (Go `tailscale exit-node suggest`): ask the daemon for the best candidate.
         Command::ExitNode {
             cmd: ExitNodeCmd::Suggest,
@@ -6658,8 +6675,29 @@ async fn run_cert(
     Ok(())
 }
 
+/// The refusal `tnet exit-node list` owes its own argument list before it contacts the daemon, or
+/// `None` when the invocation is usable.
+///
+/// Go's `runExitNodeList` (cmd/tailscale/cli/exitnode.go) opens with `if len(args) > 0 { return
+/// errors.New("unexpected non-flag arguments to 'tailscale exit-node list'") }` — the check runs
+/// *first*, so `tailscale exit-node list se` fails on the argument, not on a daemon that is not
+/// running. The message names this fork's own binary (`tnet`), as every other refusal this CLI
+/// prints does. Pure → unit-testable.
+fn exit_node_list_arg_refusal(args: &[String]) -> Option<&'static str> {
+    if args.is_empty() {
+        None
+    } else {
+        Some("unexpected non-flag arguments to 'tnet exit-node list'")
+    }
+}
+
 /// `exit-node list` (Go `tailscale exit-node list`): reuse Status, filter to exit-node peers.
-async fn run_exit_node_list(socket: &std::path::Path) -> Result<()> {
+async fn run_exit_node_list(socket: &std::path::Path, filter: &str, args: &[String]) -> Result<()> {
+    // Go refuses a stray positional before it opens the LocalAPI connection; do the same, so the
+    // operator is told about the argument rather than about the socket.
+    if let Some(refusal) = exit_node_list_arg_refusal(args) {
+        anyhow::bail!(refusal);
+    }
     let status = match round_trip(socket, &Request::Status).await {
         Ok(Response::Status(s)) => s,
         Ok(other) => anyhow::bail!("unexpected response to status: {other:?}"),
@@ -6667,7 +6705,10 @@ async fn run_exit_node_list(socket: &std::path::Path) -> Result<()> {
             return Err(e).with_context(|| format!("querying status at {}", socket.display()));
         }
     };
-    print!("{}", format_exit_node_list(&status.peers));
+    print!(
+        "{}",
+        format_exit_node_list(&status.peers, status.active_exit_node_id.as_deref(), filter)?
+    );
     Ok(())
 }
 
@@ -7564,33 +7605,169 @@ fn format_policy(r: &tailscaled_rs::localapi::PolicyReport, json: bool) -> Strin
     out
 }
 
-/// Render `tnet exit-node list`: one line per peer offering to be an exit node (IP, hostname, and
-/// online state when known), or a placeholder when none. Country/City columns (Go) are omitted —
-/// this fork has no control-supplied Location data. The hostname is control-supplied (netmap), so it
-/// is run through `sanitize_for_terminal` before display — both to strip terminal escapes and so an
-/// embedded `\n`/`\t` can't forge a fake exit-node row or shift the column (same hardening as
-/// `format_file_targets`/`format_whois`; see THREAT_MODEL §4.8). Pure → unit-testable.
-fn format_exit_node_list(peers: &[tailscaled_rs::localapi::PeerReport]) -> String {
-    let exits: Vec<&tailscaled_rs::localapi::PeerReport> =
-        peers.iter().filter(|p| p.is_exit_node).collect();
-    if exits.is_empty() {
-        return "(no exit nodes available in this tailnet)\n".to_string();
-    }
-    let mut out = String::from("IP               HOSTNAME\n");
-    for p in exits {
-        let online = match p.online {
-            Some(true) => "  (online)",
-            Some(false) => "  (offline)",
-            None => "",
+/// The STATUS cell of one `tnet exit-node list` row — a port of Go's `peerStatus`
+/// (cmd/tailscale/cli/exitnode.go): `selected but offline` / `offline` (each with a last-seen
+/// suffix when known) / `selected` / `-`.
+///
+/// `selected` means "this peer is the exit node traffic is currently egressing through", which Go
+/// reads from `PeerStatus.ExitNode` and this fork gets by matching the peer's stable id against
+/// `StatusReport::active_exit_node_id` — the same value, from the daemon's route updater.
+///
+/// TWO honest deviations, both from fields the pinned engine does not surface:
+///
+/// - Go gates the offline wording on `!peer.Active` (no traffic in the last couple of minutes) and
+///   only then looks at `Online`, so upstream labels a *selected but idle* exit node "selected but
+///   offline" even while it is online. `StatusNode` has no `Active` analogue, so liveness here is
+///   `online` alone (`Some(false)` = offline, matching [`peer_status_cell`]); an idle-but-online
+///   selected exit node reads "selected" rather than Go's "selected but offline".
+/// - Go's last-seen suffix is relative (`, last seen 5m ago`, its `lastSeenFmt`). The daemon carries
+///   `last_seen` as an absolute RFC3339 instant and this CLI already renders it verbatim in
+///   `tnet status`, so the same absolute spelling is used here rather than a second time formatter.
+///
+/// Pure → unit-testable.
+fn exit_node_peer_status(
+    p: &tailscaled_rs::localapi::PeerReport,
+    active_exit_node_id: Option<&str>,
+) -> String {
+    let selected =
+        !p.stable_id.is_empty() && active_exit_node_id.is_some_and(|id| id == p.stable_id);
+    if p.online == Some(false) {
+        // `last_seen` is a daemon-formatted timestamp, not free-form control text, but it rides the
+        // netmap so it gets the same sanitizing as every other cell.
+        let last_seen = match p.last_seen.as_deref() {
+            Some(seen) => format!(", last seen {}", sanitize_for_terminal(seen)),
+            None => String::new(),
         };
-        out.push_str(&format!(
-            "{:<16} {}{}\n",
-            p.ipv4,
-            sanitize_for_terminal(&p.name),
-            online
-        ));
+        return if selected {
+            format!("selected but offline{last_seen}")
+        } else {
+            format!("offline{last_seen}")
+        };
     }
-    out
+    if selected {
+        return "selected".to_string();
+    }
+    "-".to_string()
+}
+
+/// Render `tnet exit-node list` — Go's five columns (IP, HOSTNAME, COUNTRY, CITY, STATUS), its two
+/// error paths and its trailing hints. A port of `runExitNodeList` +
+/// `filterFormatAndSortExitNodes` (cmd/tailscale/cli/exitnode.go).
+///
+/// `Err` is returned for both of Go's failure paths, so like Go the command exits non-zero:
+/// `no exit nodes found` when no peer advertises a default route, and `no exit nodes found for
+/// "<filter>"` when `--filter` matches nothing.
+///
+/// WHAT THE COUNTRY/CITY COLUMNS SAY HERE. Go groups peers by `Location.CountryCode` then
+/// `Location.CityCode`, keeps the highest-`Location.Priority` node per city, and synthesises an
+/// "Any" city for a multi-city country. The pinned engine surfaces no per-peer `Location`: the wire
+/// type exists (`ts_control_serde::Location`, reached through `HostInfo.location`) but
+/// `ts_control::Node` does not retain it and `StatusNode` does not carry it, so `PeerReport` has
+/// nothing to group by (engine ask #37). That is not a reason to drop the columns: Go's own code
+/// substitutes the zero `Location` for a peer without one, which collapses the whole grouping to a
+/// single unnamed country holding a single unnamed city, applies no priority reduction ("Countries
+/// without location data should not be filtered further") and adds no "Any" row — and then prints
+/// `cmp.Or(name, "-")`, i.e. `-`. So every peer on this build takes Go's no-location path, and this
+/// renders exactly what `tailscale exit-node list` renders for exit nodes that declare no location:
+/// all of them, in DNS-name order, with `-` for country and city.
+///
+/// The layout reproduces Go's `tabwriter.NewWriter(Stdout, 10, 5, 5, ' ', 0)` — minwidth 10,
+/// padding 5 — including the trailing whitespace it leaves on each row (Go terminates the STATUS
+/// cell with a tab, so that column is padded like the others) and the blank line it opens with.
+///
+/// The hostname is control-supplied (netmap), so it is run through `sanitize_for_terminal` before
+/// display — both to strip terminal escapes and so an embedded `\n`/`\t` can't forge a fake
+/// exit-node row or shift a column (same hardening as `format_file_targets`/`format_whois`; see
+/// THREAT_MODEL §4.8). Go does no such sanitizing. Pure → unit-testable.
+fn format_exit_node_list(
+    peers: &[tailscaled_rs::localapi::PeerReport],
+    active_exit_node_id: Option<&str>,
+    filter: &str,
+) -> Result<String> {
+    let mut exits: Vec<&tailscaled_rs::localapi::PeerReport> =
+        peers.iter().filter(|p| p.is_exit_node).collect();
+    // Go: `if len(peers) == 0 { return errors.New("no exit nodes found") }` — an error with a
+    // non-zero exit, checked before any filtering, not a printed placeholder.
+    if exits.is_empty() {
+        anyhow::bail!("no exit nodes found");
+    }
+    // Go sorts by DNSName first, "as code below doesn't break ties and our input comes from a random
+    // range-over-map". The daemon's netmap order is just as arbitrary, so sort the same way to get
+    // Go's row order.
+    exits.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // Go's country filter is `filterBy != "" && !strings.EqualFold(loc.Country, filterBy)`, over a
+    // `Location` that is the zero value for a peer that declares none. No peer here carries one, so
+    // every country is "" and any non-empty filter drops every peer, leaving Go's
+    // `len(Countries) == 0 && filter != ""` error. An empty `--filter=` means "no filter", as upstream.
+    if !filter.is_empty() {
+        anyhow::bail!("no exit nodes found for {filter:?}");
+    }
+
+    // Go's header is written as `"\n %s\t%s\t%s\t%s\t%s\t"`, so the leading space belongs to the
+    // first cell.
+    let header = [" IP", "HOSTNAME", "COUNTRY", "CITY", "STATUS"];
+    let rows: Vec<[String; 5]> = exits
+        .iter()
+        .map(|p| {
+            [
+                format!(" {}", sanitize_for_terminal(&p.ipv4)),
+                // Go prints `strings.Trim(peer.DNSName, ".")`; the daemon's display name is an FQDN
+                // without the root dot, so trimming is a no-op on real data and a safeguard otherwise.
+                sanitize_for_terminal(p.name.trim_matches('.')),
+                // `cmp.Or(country.Name, "-")` / `cmp.Or(city.Name, "-")` — see the note above.
+                "-".to_string(),
+                "-".to_string(),
+                exit_node_peer_status(p, active_exit_node_id),
+            ]
+        })
+        .collect();
+
+    // Go's tabwriter (minwidth 10, padding 5, padchar ' '): a column is
+    // `max(minwidth, widest cell + padding)` wide, counted in runes, and every tab-terminated cell is
+    // padded to it. All five cells are tab-terminated upstream, so the STATUS column is padded too and
+    // rows end in whitespace — kept, so the output is byte-identical to `tailscale exit-node list`.
+    const MIN_WIDTH: usize = 10;
+    const PADDING: usize = 5;
+    let mut widths = [MIN_WIDTH; 5];
+    for (c, cell) in header.iter().enumerate() {
+        widths[c] = widths[c].max(cell.chars().count() + PADDING);
+    }
+    for row in &rows {
+        for (c, cell) in row.iter().enumerate() {
+            widths[c] = widths[c].max(cell.chars().count() + PADDING);
+        }
+    }
+    let render_row = |row: &[String; 5], out: &mut String| {
+        for (c, cell) in row.iter().enumerate() {
+            let pad = widths[c].saturating_sub(cell.chars().count());
+            out.push_str(cell);
+            out.push_str(&" ".repeat(pad));
+        }
+    };
+
+    // Every Go row is written as `"\n" + cells`, so the table opens with a blank line and each row is
+    // terminated by the next one; the last is terminated by the first of Go's two trailing
+    // `fmt.Fprintln(w)`, the second of which leaves the blank line before the hints.
+    let mut out = String::new();
+    out.push('\n');
+    render_row(&header.map(String::from), &mut out);
+    for row in &rows {
+        out.push('\n');
+        render_row(row, &mut out);
+    }
+    out.push('\n');
+    out.push('\n');
+    // Go's two unconditional hint lines, naming this fork's binary. Its third ("To have Tailscale
+    // suggest an exit node") is printed only when some peer carries the `suggest-exit-node` node
+    // attribute; the engine surfaces no per-peer capability map, so it is omitted rather than guessed.
+    out.push_str(
+        "# To view the complete list of exit nodes for a country, use `tnet exit-node list --filter=` followed by the country name.\n",
+    );
+    out.push_str(
+        "# To use an exit node, use `tnet set --exit-node=` followed by the IP or hostname.\n",
+    );
+    Ok(out)
 }
 
 /// Render `tnet switch --list`: one line per profile, `* ` marking the current one, then the id and
@@ -15233,46 +15410,151 @@ mod tests {
         );
     }
 
-    #[test]
-    fn format_exit_node_list_filters_and_placeholder() {
+    /// The three exit-node peers used by the rendering tests below, deliberately handed to the
+    /// renderer in an order that is neither DNS-name order nor IP order (Go sorts by DNS name).
+    fn exit_node_list_fixture() -> Vec<tailscaled_rs::localapi::PeerReport> {
         use tailscaled_rs::localapi::PeerReport;
-        // None offering → placeholder.
+        vec![
+            PeerReport {
+                name: "exit-c.example.ts.net".into(),
+                ipv4: "100.64.0.10".into(),
+                stable_id: "nC".into(),
+                is_exit_node: true,
+                online: Some(false),
+                last_seen: Some("2026-06-11T05:19:14+00:00".into()),
+                ..Default::default()
+            },
+            PeerReport {
+                name: "plain-b.example.ts.net".into(),
+                ipv4: "100.64.0.3".into(),
+                stable_id: "nB".into(),
+                is_exit_node: false,
+                ..Default::default()
+            },
+            PeerReport {
+                name: "exit-a.example.ts.net".into(),
+                ipv4: "100.64.0.9".into(),
+                stable_id: "nA".into(),
+                is_exit_node: true,
+                online: Some(true),
+                ..Default::default()
+            },
+        ]
+    }
+
+    #[test]
+    fn format_exit_node_list_prints_gos_five_columns_in_dns_name_order() {
+        let peers = exit_node_list_fixture();
+        let out =
+            format_exit_node_list(&peers, None, "").expect("two peers advertise a default route");
+        let lines: Vec<&str> = out.lines().collect();
+        // Go opens with a blank line, then the header, then one row per exit node.
+        assert_eq!(lines[0], "", "Go's leading `\\n` must survive: {out:?}");
+        for column in ["IP", "HOSTNAME", "COUNTRY", "CITY", "STATUS"] {
+            assert!(
+                lines[1].contains(column),
+                "header is missing the {column} column: {out:?}"
+            );
+        }
+        // Sorted by DNS name, so exit-a precedes exit-c even though it arrived second.
+        assert!(lines[2].starts_with(" 100.64.0.9"), "{out:?}");
+        assert!(lines[2].contains("exit-a.example.ts.net"), "{out:?}");
+        assert!(lines[3].starts_with(" 100.64.0.10"), "{out:?}");
+        assert!(lines[3].contains("exit-c.example.ts.net"), "{out:?}");
+        assert!(
+            !out.contains("plain-b"),
+            "a peer that advertises no default route must not appear: {out:?}"
+        );
+        // No engine Location ⇒ Go's `cmp.Or(name, "-")` renders both location columns as `-`.
+        assert_eq!(
+            lines[2].matches(" -").count(),
+            3,
+            "COUNTRY, CITY and STATUS should all be `-` for an online, unselected, locationless peer: {:?}",
+            lines[2]
+        );
+        // Go's STATUS wording, and its last-seen suffix on the offline peer.
+        assert!(
+            lines[3].contains("offline, last seen 2026-06-11T05:19:14+00:00"),
+            "{out:?}"
+        );
+        // Go's two trailing hint lines, after a blank separator line.
+        assert_eq!(lines[4], "", "{out:?}");
+        assert!(
+            lines[5].starts_with("# To view the complete list of exit nodes"),
+            "{out:?}"
+        );
+        assert!(lines[6].starts_with("# To use an exit node"), "{out:?}");
+        assert_eq!(lines.len(), 7, "unexpected extra output: {out:?}");
+    }
+
+    #[test]
+    fn format_exit_node_list_aligns_columns_like_gos_tabwriter() {
+        // Go's writer is `tabwriter.NewWriter(Stdout, 10, 5, 5, ' ', 0)`: each column is
+        // `max(10, widest cell + 5)` wide and every cell is padded to it, so the header cell and the
+        // row cell of a column start at the same offset.
+        let peers = exit_node_list_fixture();
+        let out = format_exit_node_list(&peers, None, "").expect("fixture has exit nodes");
+        let lines: Vec<&str> = out.lines().collect();
+        let hostname_column = lines[1]
+            .find("HOSTNAME")
+            .expect("header has a HOSTNAME column");
+        assert_eq!(
+            lines[2].find("exit-a.example.ts.net"),
+            Some(hostname_column),
+            "the hostname cell must start at the header's column offset: {out:?}"
+        );
+        // ` 100.64.0.10` is the widest IP cell (12 runes) → the column is 12 + 5 = 17 wide.
+        assert_eq!(hostname_column, 17, "{out:?}");
+    }
+
+    #[test]
+    fn format_exit_node_list_marks_the_selected_exit_node() {
+        // Go's `peerStatus` prints `selected` for the peer traffic currently egresses through, and
+        // `selected but offline` when that peer is also offline.
+        let peers = exit_node_list_fixture();
+        let out = format_exit_node_list(&peers, Some("nA"), "").expect("fixture has exit nodes");
+        assert!(
+            out.lines().nth(2).is_some_and(|l| l.contains("selected")),
+            "the active exit node's row should say `selected`: {out:?}"
+        );
+        let out = format_exit_node_list(&peers, Some("nC"), "").expect("fixture has exit nodes");
+        assert!(
+            out.lines()
+                .nth(3)
+                .is_some_and(|l| l.contains("selected but offline, last seen ")),
+            "an offline active exit node should say `selected but offline`: {out:?}"
+        );
+    }
+
+    #[test]
+    fn format_exit_node_list_errors_when_no_peer_advertises_a_default_route() {
+        use tailscaled_rs::localapi::PeerReport;
+        // Go: `if len(peers) == 0 { return errors.New("no exit nodes found") }` — an error, not a
+        // printed placeholder, so the command exits non-zero.
         let none = vec![PeerReport {
             name: "plain".into(),
             ipv4: "100.64.0.2".into(),
             is_exit_node: false,
             ..Default::default()
         }];
-        assert!(format_exit_node_list(&none).contains("no exit nodes"));
-        // Mixed → only exit-node peers listed, with online state.
-        let peers = vec![
-            PeerReport {
-                name: "exit-a".into(),
-                ipv4: "100.64.0.9".into(),
-                is_exit_node: true,
-                online: Some(true),
-                ..Default::default()
-            },
-            PeerReport {
-                name: "plain-b".into(),
-                ipv4: "100.64.0.3".into(),
-                is_exit_node: false,
-                ..Default::default()
-            },
-            PeerReport {
-                name: "exit-c".into(),
-                ipv4: "100.64.0.10".into(),
-                is_exit_node: true,
-                online: Some(false),
-                ..Default::default()
-            },
-        ];
-        let out = format_exit_node_list(&peers);
-        assert!(out.contains("exit-a") && out.contains("(online)"), "{out}");
-        assert!(out.contains("exit-c") && out.contains("(offline)"), "{out}");
+        let err = format_exit_node_list(&none, None, "").expect_err("no exit nodes → error");
+        assert_eq!(err.to_string(), "no exit nodes found");
+        // The empty case is judged before the filter, exactly as upstream.
+        let err = format_exit_node_list(&none, None, "Canada").expect_err("no exit nodes → error");
+        assert_eq!(err.to_string(), "no exit nodes found");
+    }
+
+    #[test]
+    fn format_exit_node_list_errors_when_the_country_filter_matches_nothing() {
+        // Go: `no exit nodes found for %q`. No peer here carries a `Location`, so Go's
+        // case-insensitive country match fails for every peer and any non-empty filter lands here.
+        let peers = exit_node_list_fixture();
+        let err = format_exit_node_list(&peers, None, "Canada").expect_err("no peer has a country");
+        assert_eq!(err.to_string(), r#"no exit nodes found for "Canada""#);
+        // `--filter=` (empty) is "no filter" upstream, so it must still list.
         assert!(
-            !out.contains("plain-b"),
-            "non-exit peer must not appear: {out}"
+            format_exit_node_list(&peers, None, "").is_ok(),
+            "an empty filter must not be treated as a filter"
         );
     }
 
@@ -15280,18 +15562,34 @@ mod tests {
     fn format_exit_node_list_resists_row_injection() {
         use tailscaled_rs::localapi::PeerReport;
         // The hostname is control-supplied (netmap); a name with an embedded newline must not be able
-        // to forge a second exit-node row (header line + one row per real exit, nothing more).
+        // to forge a second exit-node row, and an embedded tab must not shift a column.
         let peers = vec![PeerReport {
-            name: "real\n100.64.0.99  fake-exit".into(),
+            name: "real\n100.64.0.99  fake-exit\tforged".into(),
             ipv4: "100.64.0.9".into(),
             is_exit_node: true,
             online: Some(true),
             ..Default::default()
         }];
-        let out = format_exit_node_list(&peers);
-        // Header line + exactly one peer row = two newlines, no forged third line.
-        assert_eq!(out.matches('\n').count(), 2, "forged extra row: {out:?}");
+        let out = format_exit_node_list(&peers, None, "").expect("one exit node");
+        // Blank line + header + one peer row + blank line + two hint lines, nothing forged.
+        assert_eq!(out.lines().count(), 6, "forged extra row: {out:?}");
         assert!(out.contains('\u{FFFD}'), "newline not neutralized: {out:?}");
+        assert!(!out.contains('\t'), "tab not neutralized: {out:?}");
+    }
+
+    #[test]
+    fn exit_node_list_refuses_a_stray_positional_the_way_go_does() {
+        // Go's `runExitNodeList` opens with `len(args) > 0` → "unexpected non-flag arguments to
+        // 'tailscale exit-node list'", named for this fork's binary here.
+        assert_eq!(exit_node_list_arg_refusal(&[]), None);
+        assert_eq!(
+            exit_node_list_arg_refusal(&["se".to_string()]),
+            Some("unexpected non-flag arguments to 'tnet exit-node list'")
+        );
+        assert_eq!(
+            exit_node_list_arg_refusal(&["se".to_string(), "no".to_string()]),
+            Some("unexpected non-flag arguments to 'tnet exit-node list'")
+        );
     }
 
     #[test]
