@@ -126,6 +126,11 @@ secrecy = "0.10"
 # crate-default Argon2id). `default-features = false` keeps it alloc-only. Byte-for-byte verified
 # against Go v1.100.0 goldens in the command's test.
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+# `tnet lock init`: mint the tailnet-lock disablement secrets from the OS CSPRNG, the way Go's
+# `runTailnetLockInit` reads 32 bytes from `crypto/rand`. Only the raw OS entropy source is wanted
+# (no generator, no distributions), and `getrandom` is what the tree's crypto crates already use for
+# it — so this is a dependency EDGE, not a new crate. The `rand` crate below stays optional/ssh-only.
+getrandom = "0.3"
 # Peer-process euid for the same-user LocalAPI write policy. libc is already in the tree
 # (transitively via the engine); used only for geteuid() on unix.
 libc = "0.2"
