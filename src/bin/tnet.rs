@@ -1873,7 +1873,23 @@ enum ExitNodeCmd {
     /// Suggest the best available exit node (Go `tailscale exit-node suggest`). The daemon picks a
     /// candidate by DERP-region proximity / latency and prints its name plus the `tnet set
     /// --exit-node=<id>` command to engage it. Prints a clear notice when no candidate is available.
-    Suggest,
+    Suggest {
+        /// NOT SUPPORTED by this build (Go `--force-probe`): probe route reachability now and rank
+        /// the suggestion off that fresh report instead of the cached one. Parsed but refused, for
+        /// the same reason the refused `serve` flags are: a command line copied from Go gets an
+        /// error naming the missing capability rather than clap's opaque "unexpected argument", and
+        /// the grammar stays a superset so the same command line keeps working the day the gap
+        /// closes.
+        ///
+        /// Go's flag reaches `LocalClient.SuggestExitNodeWithProbe`, which re-runs the
+        /// `net/routecheck` peer-reachability probe first. The pinned engine has no routecheck
+        /// subsystem and `Device::suggest_exit_node()` takes no probe hint — see
+        /// `docs/ENGINE_ASKS.md` #40. Silently ignoring the flag would answer a request for a
+        /// freshly probed ranking with the cached-netcheck one; the refusal is
+        /// [`check_exit_node_suggest_flags`].
+        #[arg(long = "force-probe")]
+        force_probe: bool,
+    },
 }
 
 /// `tnet syspolicy` subcommands (Go `tailscale syspolicy`). Both honor `--json`.
@@ -2994,8 +3010,8 @@ async fn main() -> Result<()> {
         } => run_exit_node_list(&socket, &filter, &args).await,
         // `exit-node suggest` (Go `tailscale exit-node suggest`): ask the daemon for the best candidate.
         Command::ExitNode {
-            cmd: ExitNodeCmd::Suggest,
-        } => run_exit_node_suggest(&socket).await,
+            cmd: ExitNodeCmd::Suggest { force_probe },
+        } => run_exit_node_suggest(&socket, force_probe).await,
         // `appc-routes` (Go `tailscale appc-routes`): read-only and prefs-only. Two of Go's four
         // output shapes need nothing but prefs and are answered faithfully; the three that read the
         // learned-route store say why they cannot — see `appc_routes_refusal`.
@@ -7686,12 +7702,43 @@ async fn run_exit_node_list(socket: &std::path::Path, filter: &str, args: &[Stri
     Ok(())
 }
 
+/// Refuse `exit-node suggest --force-probe`, the one flag of Go's `exit-node suggest` grammar this
+/// build cannot honor.
+///
+/// Go's `--force-probe` routes the suggestion through `LocalClient.SuggestExitNodeWithProbe`, which
+/// re-runs the `net/routecheck` peer-reachability probe and ranks off that fresh report. The pinned
+/// engine (`9d847a6e`) has no routecheck subsystem at all and `Device::suggest_exit_node()` takes no
+/// probe hint, so the flag is refused rather than ignored: ignoring it would answer a request for a
+/// freshly probed ranking with the cached-netcheck one and say nothing about the substitution. The
+/// engine ask is `docs/ENGINE_ASKS.md` #40; until it lands, this is the honest answer.
+///
+/// Go itself only registers the flag when the routecheck build feature is compiled in, and its own
+/// `SuggestExitNodeWithProbe` returns `feature.ErrUnavailable` otherwise — so a refusal, not a
+/// silent downgrade, is also what Go does with the subsystem missing.
+fn check_exit_node_suggest_flags(force_probe: bool) -> Result<()> {
+    if force_probe {
+        anyhow::bail!(
+            "--force-probe is not supported by this build: a fresh reachability probe needs the \
+             engine's peer route-reachability subsystem (Go `net/routecheck`), which the pinned \
+             engine does not have, and its exit-node suggestion takes no probe hint. Refused \
+             rather than ignored — ignoring it would rank off the cached netcheck while you asked \
+             for a freshly probed report. Drop --force-probe for the suggestion this build can make"
+        );
+    }
+    Ok(())
+}
+
 /// `exit-node suggest` (Go `tailscale exit-node suggest`): ask the daemon for the best available exit
 /// node and print it with the `tnet set --exit-node=<id>` command to engage it. A `None` suggestion
 /// (no eligible candidate) prints a clear notice and exits 0 (not an error — there was simply nothing
 /// to suggest, matching Go's empty response). The suggested name is control-supplied text, so it is
 /// run through `sanitize_for_terminal` before printing.
-async fn run_exit_node_suggest(socket: &std::path::Path) -> Result<()> {
+///
+/// `--force-probe` is refused first, before the socket is touched — the flag asks for a measurement
+/// this build cannot take, so there is nothing to ask the daemon for. See
+/// [`check_exit_node_suggest_flags`].
+async fn run_exit_node_suggest(socket: &std::path::Path, force_probe: bool) -> Result<()> {
+    check_exit_node_suggest_flags(force_probe)?;
     let response = round_trip(socket, &Request::SuggestExitNode)
         .await
         .with_context(|| format!("talking to daemon at {}", socket.display()))?;
@@ -16873,6 +16920,51 @@ mod tests {
             exit_node_list_arg_refusal(&["se".to_string(), "no".to_string()]),
             Some("unexpected non-flag arguments to 'tnet exit-node list'")
         );
+    }
+
+    /// Parse `tnet exit-node suggest …` and hand back the sub-verb, so the flag surface under test
+    /// is clap's own parse of the real `Cli`, not a second copy of the grammar.
+    fn parse_exit_node_suggest(argv: &[&str]) -> ExitNodeCmd {
+        let mut args = vec!["tnet", "exit-node", "suggest"];
+        args.extend_from_slice(argv);
+        match Cli::try_parse_from(args).expect("exit-node suggest command line must parse") {
+            Cli {
+                command: Command::ExitNode { cmd },
+                ..
+            } => cmd,
+            _ => panic!("expected an exit-node command for {argv:?}"),
+        }
+    }
+
+    #[test]
+    fn exit_node_suggest_accepts_gos_force_probe_and_refuses_it() {
+        // Go v1.102.3 grew `exit-node suggest --force-probe`, which re-runs the `net/routecheck`
+        // reachability probe (`SuggestExitNodeWithProbe`) before ranking. The parser must accept the
+        // flag — a command line copied from Go should reach a message naming the missing capability,
+        // not clap's "unexpected argument".
+        let ExitNodeCmd::Suggest { force_probe } = parse_exit_node_suggest(&["--force-probe"])
+        else {
+            panic!("`--force-probe` must parse as the suggest sub-verb");
+        };
+        assert!(force_probe, "--force-probe must reach the sub-verb");
+
+        // …and it must be REFUSED, not ignored: this build ranks off the cached netcheck, so
+        // answering a probe request with that silently would report something the flag did not ask
+        // for.
+        let err = check_exit_node_suggest_flags(force_probe)
+            .expect_err("this build has no reachability probe")
+            .to_string();
+        assert!(err.contains("--force-probe"), "{err}");
+        assert!(err.contains("not supported by this build"), "{err}");
+        assert!(err.contains("routecheck"), "{err}");
+
+        // The plain Go/`tnet` spelling is untouched — no flag, no refusal.
+        let ExitNodeCmd::Suggest { force_probe } = parse_exit_node_suggest(&[]) else {
+            panic!("`exit-node suggest` must parse as the suggest sub-verb");
+        };
+        assert!(!force_probe, "the flag must default off");
+        check_exit_node_suggest_flags(force_probe)
+            .expect("the unprobed suggestion is what this build serves");
     }
 
     #[test]
