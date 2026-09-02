@@ -811,9 +811,27 @@ enum Command {
         #[arg(long, value_name = "PREFIX")]
         prefix: Option<String>,
         /// Do not open a browser window after starting (the server still runs). Without this, a
-        /// browser is opened to the served URL (best-effort).
+        /// browser is opened to the served URL (best-effort). Ignored with `--cgi`, which never
+        /// opens a browser (there is no long-lived server to browse to).
         #[arg(long)]
         no_browser: bool,
+        /// Run as a CGI script (Go `web --cgi`) instead of binding a listener: serve exactly ONE
+        /// request from the CGI/1.1 environment (`REQUEST_METHOD`, `REQUEST_URI` or
+        /// `SCRIPT_NAME`+`PATH_INFO`), write the response to stdout, and exit. This is the mode a
+        /// web server invokes the binary in per request, so nothing else may be written to stdout —
+        /// the startup line and the browser launch are both suppressed. `--listen` is meaningless
+        /// here (no listener is bound) and is refused alongside it.
+        #[arg(long)]
+        cgi: bool,
+        /// Absolute URL the UI is actually reached at (Go `web --origin`), when that is not the
+        /// address it bound — behind a reverse proxy, or under `--cgi`, where nothing is bound at
+        /// all. `--prefix` fixes the path the server answers on; only this fixes the scheme and
+        /// host. Must be an absolute `http`/`https` URL with a host and no query/fragment/userinfo
+        /// (e.g. `https://ts.example.com/tailscale`). Used for link generation only: the URL this
+        /// command reports and opens, and the `<link rel="canonical">` the served page states for
+        /// itself. This build's UI is read-only, so the origin gates nothing else.
+        #[arg(long, value_name = "URL")]
+        origin: Option<String>,
     },
     /// Check for (and optionally install) a newer release of this client (Go `tailscale update`).
     /// Queries the project's GitHub Releases for the latest version and compares it to the running
@@ -2700,18 +2718,25 @@ async fn main() -> Result<()> {
         // `web` (Go `tailscale web`): serve the read-only status UI. Reuses the same embedded HTTP
         // server as `status --web`, but with Go's command name + flags (default localhost:8088). The
         // `--readonly` flag is a no-op (this build's web UI is always read-only). `--prefix` serves
-        // the page under a URL path prefix (for reverse proxies).
+        // the page under a URL path prefix (for reverse proxies), `--origin` states the absolute URL
+        // the UI is reached at, and `--cgi` swaps the listener for one CGI request/response.
         Command::Web {
             listen,
             readonly: _,
             prefix,
             no_browser,
+            cgi,
+            origin,
         } => {
-            let listen = listen.unwrap_or_else(|| "localhost:8088".to_string());
-            let prefix = prefix.unwrap_or_default();
-            run_status_web(&socket, &listen, !no_browser, &prefix)
-                .await
-                .with_context(|| format!("serving web UI on {listen}"))
+            run_web(
+                &socket,
+                listen,
+                prefix.unwrap_or_default(),
+                !no_browser,
+                cgi,
+                origin.as_deref(),
+            )
+            .await
         }
         // `lock status` (Go `tailscale lock status`): fetch + render the TKA status.
         // `lock init` (Go `tailscale lock init`): initialize the lock with this node as sole trusted key.
@@ -3460,8 +3485,9 @@ async fn run_status(
     // off (`--no-browser`, or Go's `--browser=false`).
     if web {
         let listen = listen.unwrap_or_else(|| "127.0.0.1:8384".to_string());
-        // `status --web` serves at `/` (no path prefix).
-        return run_status_web(socket, &listen, browser, "/")
+        // `status --web` serves at `/` (no path prefix) and has no `--origin` of its own — Go
+        // registers that flag on `web`, not on `status`.
+        return run_status_web(socket, &listen, browser, "/", None)
             .await
             .with_context(|| format!("serving status --web on {listen}"));
     }
@@ -9116,10 +9142,24 @@ fn html_escape(s: &str) -> String {
 /// content rather than a byte-copy of Go's template). A header block (state, version, TUN, this node's
 /// name + IPs, MagicDNS suffix, active exit node) plus a peer table (name, IPs, online, exit-node,
 /// relay, last-seen). Every control-/peer-supplied string is [`html_escape`]d. Pure → unit-testable.
-fn render_status_html(s: &tailscaled_rs::localapi::StatusReport) -> String {
+fn render_status_html(
+    s: &tailscaled_rs::localapi::StatusReport,
+    canonical: Option<&str>,
+) -> String {
     let mut h = String::new();
     h.push_str("<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">");
     h.push_str("<title>tailnetd status</title>");
+    // The absolute URL this page is served at, when it is known (`web --origin`, or the address the
+    // listener bound). Behind a reverse proxy the bound address is not the address anyone reached,
+    // which is exactly what `--origin` supplies — so the page states the URL it is really served at
+    // instead of leaving a reader to guess. Escaped as an attribute: an origin is operator-supplied,
+    // but it lands in markup like every other value on this page.
+    if let Some(url) = canonical {
+        h.push_str(&format!(
+            "<link rel=\"canonical\" href=\"{}\">",
+            html_escape(url)
+        ));
+    }
     h.push_str(
         "<style>body{font-family:system-ui,sans-serif;margin:2rem;}\
          table{border-collapse:collapse;margin-top:1rem;}\
@@ -9245,6 +9285,279 @@ fn normalize_served_path(path_prefix: &str) -> String {
     }
 }
 
+/// Where `tnet web` listens when `--listen` is not given: Go `web`'s `localhost:8088`. Loopback, so
+/// the unauthenticated status page is not reachable from the network by default.
+const DEFAULT_WEB_LISTEN: &str = "localhost:8088";
+
+/// The body served for any path other than the one the UI is mounted at. Shared by both serving
+/// modes (listener and `--cgi`) so they cannot drift.
+const WEB_NOT_FOUND_BODY: &str = "<!DOCTYPE html><html><body>not found</body></html>";
+
+/// The body served when the daemon round-trip for the page's status fails. Deliberately generic —
+/// the cause is logged to stderr, not handed to whoever loaded the page.
+const WEB_UNAVAILABLE_BODY: &str = "<!DOCTYPE html><html><body>status unavailable</body></html>";
+
+/// The refusal `tnet web` owes its own flags before it binds anything or contacts the daemon, or
+/// `None` when the invocation is usable.
+///
+/// `--cgi` replaces the listener entirely: the process serves ONE request out of the CGI/1.1
+/// environment and exits, so there is no address to bind and `--listen` names a listener that will
+/// never exist. Go registers both flags on the same command and simply ignores the listen address in
+/// CGI mode; this fork refuses the combination instead, the same shape (and the same wording) it
+/// already uses for `cert --listen` without `--serve-demo`, so an operator who thinks they are
+/// choosing a port is told the port is not used rather than silently getting no listener.
+///
+/// The message goes to **stdout** and the caller exits **1**, matching this CLI's other usage
+/// refusals ([`switch_usage_refusal`], [`cert_usage_refusal`]) rather than clap's stderr + exit 2 —
+/// which is why this is a hand-rolled check and not an `#[arg(conflicts_with = ...)]`. Pure →
+/// unit-testable.
+fn web_usage_refusal(cgi: bool, has_listen: bool) -> Option<&'static str> {
+    if cgi && has_listen {
+        return Some("--listen can only be used without --cgi (a CGI script binds no listener)");
+    }
+    None
+}
+
+/// Validate + normalize a `web --origin` value into the base URL the UI is reached at, or the
+/// refusal explaining why it is not one.
+///
+/// Go's `--origin` ("origin at which the web UI is served (if behind a reverse proxy or used with
+/// cgi)") feeds the web server's origin override, which exists because the address the UI *bound* is
+/// not the address a browser *reached* it at. So the value has to be an absolute URL: a scheme and a
+/// host are exactly the two things `--prefix` cannot supply. A port and a path are optional (a proxy
+/// that mounts the UI under a path names it here); a query, a fragment or userinfo are not — those
+/// belong to a request, not to the base URL a page is served at, and silently dropping them would
+/// emit links that differ from what was asked for.
+///
+/// Normalization is: keep the scheme, the host and an explicit non-default port, drop a trailing
+/// slash from the path. So `https://ts.example.com/tailscale/` and `https://ts.example.com/tailscale`
+/// are the same origin. Pure → unit-testable.
+fn parse_web_origin(origin: &str) -> Result<String, String> {
+    let raw = origin.trim();
+    if raw.is_empty() {
+        return Err(
+            "--origin needs an absolute URL, e.g. https://ts.example.com/tailscale".to_string(),
+        );
+    }
+    let parsed = url::Url::parse(raw)
+        .map_err(|e| format!("--origin {raw:?} is not an absolute URL: {e}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(format!(
+                "--origin {raw:?} has scheme {other:?}; the web UI is reached over http or https"
+            ));
+        }
+    }
+    let Some(host) = parsed.host_str() else {
+        return Err(format!("--origin {raw:?} names no host"));
+    };
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(format!(
+            "--origin {raw:?} carries a query or fragment; it names the base URL the UI is served \
+             at, not one request to it"
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(format!(
+            "--origin {raw:?} carries credentials; it names the base URL the UI is served at"
+        ));
+    }
+    let mut base = format!("{}://{host}", parsed.scheme());
+    if let Some(port) = parsed.port() {
+        base.push_str(&format!(":{port}"));
+    }
+    base.push_str(parsed.path().trim_end_matches('/'));
+    Ok(base)
+}
+
+/// Split a [`parse_web_origin`] base into `(scheme://authority, path)` — the path is `""` when the
+/// origin names only a scheme and a host. Pure → unit-testable via [`web_ui_url`].
+fn split_origin_base(base: &str) -> (&str, &str) {
+    let after_scheme = match base.find("://") {
+        Some(i) => i + 3,
+        None => return (base, ""),
+    };
+    match base[after_scheme..].find('/') {
+        Some(j) => base.split_at(after_scheme + j),
+        None => (base, ""),
+    }
+}
+
+/// The absolute URL this UI is reached at — the one thing `--origin` exists to fix, and the only
+/// thing it can affect in this build (the UI is read-only, so an origin gates no request and
+/// authorizes nothing; it generates links).
+///
+/// - With `--origin`, that URL wins. An origin that already names a path (`https://ts.example.com/tailscale`)
+///   states the OUTSIDE path in full and is used verbatim: `--prefix` names the path this process
+///   answers on, which a proxy is free to map from a different one, so appending it would invent a
+///   path nobody serves. An origin that names only scheme+host takes the served path from `--prefix`,
+///   which is the pass-through case.
+/// - Without `--origin`, the URL is `http://<bound address>` plus the served path — what the previous
+///   behaviour always assumed.
+/// - With neither an origin nor a bound address (`--cgi` without `--origin`), the URL is genuinely
+///   unknown: a CGI script is told the path it was reached at but not the scheme or host the proxy
+///   in front of it published. `None`, rather than a guess.
+///
+/// Pure → unit-testable.
+fn web_ui_url(origin: Option<&str>, bound: Option<&str>, served_path: &str) -> Option<String> {
+    let (authority, path) = match origin {
+        Some(base) => {
+            let (authority, origin_path) = split_origin_base(base);
+            if !origin_path.is_empty() {
+                return Some(base.to_string());
+            }
+            (authority.to_string(), served_path)
+        }
+        None => (format!("http://{}", bound?), served_path),
+    };
+    Some(if path == "/" {
+        authority
+    } else {
+        format!("{authority}{path}")
+    })
+}
+
+/// What the web UI answers a request with. The read-only page has exactly one route, so this is the
+/// whole routing table — shared by the listener and `--cgi` so the two modes cannot answer the same
+/// request differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebRoute {
+    /// A fresh `status` fetch, rendered as the HTML page.
+    Page,
+    /// Anything else: another path, or a method other than `GET`.
+    NotFound,
+}
+
+/// Route one request: the status page is served at the configured path (`/` by default, `/<prefix>`
+/// with `--prefix`) for `GET` only; everything else is a 404. Pure → unit-testable.
+fn route_web_request(method: &str, path: &str, served_path: &str) -> WebRoute {
+    if method == "GET" && path == served_path {
+        WebRoute::Page
+    } else {
+        WebRoute::NotFound
+    }
+}
+
+/// The request path a CGI invocation was reached at, from the CGI/1.1 environment. Go's
+/// `net/http/cgi` builds the request URL from `REQUEST_URI` when the server supplied it and falls
+/// back to `SCRIPT_NAME` + `PATH_INFO` otherwise; this follows the same order, and strips the query
+/// string (the read-only page takes no parameters). An environment that carries none of the three
+/// yields `/`. Pure → unit-testable.
+fn cgi_request_path(
+    request_uri: Option<&str>,
+    script_name: Option<&str>,
+    path_info: Option<&str>,
+) -> String {
+    let path = match request_uri.map(str::trim).filter(|u| !u.is_empty()) {
+        Some(uri) => uri.split('?').next().unwrap_or("").to_string(),
+        None => format!(
+            "{}{}",
+            script_name.unwrap_or_default(),
+            path_info.unwrap_or_default()
+        ),
+    };
+    if path.is_empty() {
+        "/".to_string()
+    } else {
+        path
+    }
+}
+
+/// Serialize one CGI response: the `Status:` line Go's `net/http/cgi` child writer always emits,
+/// the content type, an explicit length, then the body after a blank line. Not an HTTP response —
+/// the invoking web server turns these headers into one. Pure → unit-testable.
+fn cgi_response(status: &str, body: &str) -> String {
+    format!(
+        "Status: {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// `tnet web` (Go `tailscale web`): resolve the flags, then serve the read-only status UI in
+/// whichever of the two modes was asked for.
+///
+/// Order is load-bearing: the usage refusal first (it costs nothing and must not be reached only
+/// after a bind), then the `--origin` validation (a bad origin is a usage error, not a serving
+/// failure), then the mode split. `--cgi` serves exactly one request on stdout and returns; the
+/// default binds a listener and runs until interrupted.
+async fn run_web(
+    socket: &std::path::Path,
+    listen: Option<String>,
+    prefix: String,
+    browser: bool,
+    cgi: bool,
+    origin: Option<&str>,
+) -> Result<()> {
+    if let Some(message) = web_usage_refusal(cgi, listen.is_some()) {
+        println!("{message}");
+        std::process::exit(1);
+    }
+    let origin = match origin {
+        Some(raw) => Some(parse_web_origin(raw).map_err(|e| anyhow::anyhow!(e))?),
+        None => None,
+    };
+    if cgi {
+        // CGI mode owns stdout: the response IS this process's stdout, so nothing may be printed
+        // alongside it (no startup line) and no browser is opened (there is no server to browse).
+        // Without `--origin` there is no way to know the scheme/host the proxy published, so the
+        // page states no canonical URL rather than a wrong one.
+        let served_path = normalize_served_path(&prefix);
+        let canonical = web_ui_url(origin.as_deref(), None, &served_path);
+        return run_web_cgi(socket, &served_path, canonical.as_deref()).await;
+    }
+    let listen = listen.unwrap_or_else(|| DEFAULT_WEB_LISTEN.to_string());
+    run_status_web(socket, &listen, browser, &prefix, origin.as_deref())
+        .await
+        .with_context(|| format!("serving web UI on {listen}"))
+}
+
+/// `tnet web --cgi` (Go `web --cgi` → `cgi.Serve`): serve ONE request from the CGI/1.1 environment
+/// and exit, instead of binding a listener. The web server in front of us set `REQUEST_METHOD` and
+/// the request path; we route it exactly as the listener does ([`route_web_request`]), fetch the
+/// live status for the page, and write the CGI response to stdout.
+///
+/// Errors are reported the way a CGI script must report them — as a response, not as a message on
+/// stdout: a failed daemon round-trip becomes a `500` whose cause goes to stderr (which the invoking
+/// server logs). The process still exits 0, because the response was delivered.
+async fn run_web_cgi(
+    socket: &std::path::Path,
+    served_path: &str,
+    canonical: Option<&str>,
+) -> Result<()> {
+    use std::io::Write as _;
+    let method = std::env::var("REQUEST_METHOD").unwrap_or_default();
+    let request_uri = std::env::var("REQUEST_URI").ok();
+    let script_name = std::env::var("SCRIPT_NAME").ok();
+    let path_info = std::env::var("PATH_INFO").ok();
+    let path = cgi_request_path(
+        request_uri.as_deref(),
+        script_name.as_deref(),
+        path_info.as_deref(),
+    );
+    let (status, body) = match route_web_request(&method, &path, served_path) {
+        WebRoute::Page => match round_trip(socket, &Request::Status).await {
+            Ok(Response::Status(s)) => ("200 OK", render_status_html(&s, canonical)),
+            other => {
+                if let Err(e) = other {
+                    eprintln!("web --cgi: status fetch failed: {e}");
+                }
+                (
+                    "500 Internal Server Error",
+                    WEB_UNAVAILABLE_BODY.to_string(),
+                )
+            }
+        },
+        WebRoute::NotFound => ("404 Not Found", WEB_NOT_FOUND_BODY.to_string()),
+    };
+    let response = cgi_response(status, &body);
+    let mut out = std::io::stdout().lock();
+    out.write_all(response.as_bytes())
+        .context("writing the CGI response to stdout")?;
+    out.flush().context("flushing the CGI response")?;
+    Ok(())
+}
+
 /// `tnet status --web`: serve an HTML status page from an embedded HTTP server (Go `tailscale status
 /// --web`). Binds a TCP listener on `listen` (default `127.0.0.1:8384`), optionally opens a browser at
 /// the URL, then accepts connections until interrupted: each request re-fetches the live status
@@ -9259,6 +9572,7 @@ async fn run_status_web(
     listen: &str,
     browser: bool,
     path_prefix: &str,
+    origin: Option<&str>,
 ) -> Result<()> {
     let served_path = normalize_served_path(path_prefix);
     let listener = tokio::net::TcpListener::bind(listen)
@@ -9277,12 +9591,12 @@ async fn run_status_web(
              anyone who can reach this address."
         );
     }
-    // The browseable URL includes the path prefix (so `--prefix /foo` opens `http://addr/foo`).
-    let url = if served_path == "/" {
-        format!("http://{addr}")
-    } else {
-        format!("http://{addr}{served_path}")
-    };
+    // The browseable URL includes the path prefix (so `--prefix /foo` opens `http://addr/foo`), and
+    // `--origin` replaces the bound address with the one a browser actually reaches — so behind a
+    // reverse proxy the operator is told (and the browser is sent to) the URL that works, not the
+    // private address this process happens to have bound. Always `Some` here: the address is bound.
+    let url = web_ui_url(origin, Some(&addr.to_string()), &served_path)
+        .unwrap_or_else(|| format!("http://{addr}"));
     println!("Serving Tailscale status at {url} ... (Ctrl-C to stop)");
     if browser {
         open_browser_best_effort(&url);
@@ -9310,9 +9624,10 @@ async fn run_status_web(
         // deadline inside the handler is what actually bounds a stalled client.
         let socket = socket.to_path_buf();
         let served_path = served_path.clone();
+        let canonical = url.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            serve_status_connection(conn, &socket, &served_path).await;
+            serve_status_connection(conn, &socket, &served_path, Some(&canonical)).await;
         });
     }
 }
@@ -9328,6 +9643,7 @@ async fn serve_status_connection(
     mut conn: tokio::net::TcpStream,
     socket: &std::path::Path,
     served_path: &str,
+    canonical: Option<&str>,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut buf = Vec::with_capacity(1024);
@@ -9356,11 +9672,16 @@ async fn serve_status_connection(
     }
     let request_line = String::from_utf8_lossy(&buf);
     let first_line = request_line.lines().next().unwrap_or("");
-    let (status, body) = match parse_request_target(first_line) {
-        // The status page is served at the configured path (default `/`, or `/<prefix>` when
-        // `--prefix` is given). Any other path → 404.
-        Some(("GET", p)) if p == served_path => match round_trip(socket, &Request::Status).await {
-            Ok(Response::Status(s)) => ("200 OK", render_status_html(&s)),
+    // The status page is served at the configured path (default `/`, or `/<prefix>` when `--prefix`
+    // is given) for `GET`. Any other request → 404. The routing decision is shared with `--cgi`
+    // ([`route_web_request`]) so the two serving modes cannot answer the same request differently.
+    let route = match parse_request_target(first_line) {
+        Some((method, path)) => route_web_request(method, path, served_path),
+        None => WebRoute::NotFound,
+    };
+    let (status, body) = match route {
+        WebRoute::Page => match round_trip(socket, &Request::Status).await {
+            Ok(Response::Status(s)) => ("200 OK", render_status_html(&s, canonical)),
             // Both the wrong-variant and the error case collapse to a 500; on a real error, log the
             // cause first so the failure isn't swallowed (the page itself stays generic).
             other => {
@@ -9369,14 +9690,11 @@ async fn serve_status_connection(
                 }
                 (
                     "500 Internal Server Error",
-                    "<!DOCTYPE html><html><body>status unavailable</body></html>".to_string(),
+                    WEB_UNAVAILABLE_BODY.to_string(),
                 )
             }
         },
-        _ => (
-            "404 Not Found",
-            "<!DOCTYPE html><html><body>not found</body></html>".to_string(),
-        ),
+        WebRoute::NotFound => ("404 Not Found", WEB_NOT_FOUND_BODY.to_string()),
     };
     let resp = format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -15785,7 +16103,7 @@ mod tests {
             have_node_key: true,
             ..Default::default()
         };
-        let html = render_status_html(&report);
+        let html = render_status_html(&report, None);
         assert!(html.starts_with("<!DOCTYPE html>"), "well-formed page");
         assert!(html.contains("Running") && html.contains("0.37.0") && html.contains("node-a"));
         assert!(html.contains("tail0123.ts.net") && html.contains("100.64.0.1"));
@@ -15802,7 +16120,7 @@ mod tests {
             state: "NeedsLogin".to_string(),
             ..Default::default()
         };
-        let empty_html = render_status_html(&empty);
+        let empty_html = render_status_html(&empty, None);
         assert!(empty_html.starts_with("<!DOCTYPE html>"));
         assert!(empty_html.contains("NeedsLogin") && empty_html.contains("no peers"));
     }
@@ -15818,7 +16136,7 @@ mod tests {
             auth_url: Some("https://login.example.com/a/\"><script>x".to_string()),
             ..Default::default()
         };
-        let html = render_status_html(&needs_login);
+        let html = render_status_html(&needs_login, None);
         assert!(
             html.contains("needs to be authenticated") && html.contains("Log in to authenticate"),
             "the login affordance must render when auth_url is set"
@@ -15844,7 +16162,7 @@ mod tests {
             error: Some("bad key <x>".to_string()),
             ..Default::default()
         };
-        let fhtml = render_status_html(&failed);
+        let fhtml = render_status_html(&failed, None);
         assert!(fhtml.contains("Registration failed") && fhtml.contains("bad key &lt;x&gt;"));
         assert!(
             !fhtml.contains("Log in to authenticate"),
@@ -15876,6 +16194,217 @@ mod tests {
         assert_eq!(normalize_served_path("/tailscale"), "/tailscale");
         assert_eq!(normalize_served_path("/tailscale/"), "/tailscale");
         assert_eq!(normalize_served_path("  /web/ui/  "), "/web/ui");
+    }
+
+    #[test]
+    fn web_usage_refusal_refuses_a_listen_address_that_is_never_bound() {
+        // `--cgi` serves one request out of the CGI environment and binds nothing, so a `--listen`
+        // next to it names an address that will never exist. Refused, in the same shape this CLI
+        // already uses for `cert --listen` without `--serve-demo`.
+        assert_eq!(
+            web_usage_refusal(true, true),
+            Some("--listen can only be used without --cgi (a CGI script binds no listener)")
+        );
+        // Every usable combination stays usable: a listener with an address, a listener with the
+        // default address, and CGI with no address at all.
+        assert_eq!(web_usage_refusal(false, true), None);
+        assert_eq!(web_usage_refusal(false, false), None);
+        assert_eq!(web_usage_refusal(true, false), None);
+    }
+
+    #[test]
+    fn parse_web_origin_normalizes_a_base_url_and_refuses_anything_else() {
+        // The reverse-proxy case Go's `--origin` exists for: scheme + host + the path the proxy
+        // publishes. A trailing slash is not a different origin.
+        assert_eq!(
+            parse_web_origin("https://ts.example.com/tailscale"),
+            Ok("https://ts.example.com/tailscale".to_string())
+        );
+        assert_eq!(
+            parse_web_origin("  https://ts.example.com/tailscale/  "),
+            Ok("https://ts.example.com/tailscale".to_string())
+        );
+        // Scheme + host alone is the pass-through proxy case; an explicit non-default port is kept,
+        // a default one is not (both name the same origin).
+        assert_eq!(
+            parse_web_origin("http://192.0.2.10:8088"),
+            Ok("http://192.0.2.10:8088".to_string())
+        );
+        assert_eq!(
+            parse_web_origin("https://ts.example.com:443/"),
+            Ok("https://ts.example.com".to_string())
+        );
+        // An IPv6 literal keeps its brackets, so the result is still a usable URL.
+        assert_eq!(
+            parse_web_origin("http://[2001:db8::1]:8088/ui"),
+            Ok("http://[2001:db8::1]:8088/ui".to_string())
+        );
+
+        // The refusals. A bare host is the mistake to expect — it is what `--prefix` habits produce
+        // — and it is precisely the input that carries no scheme, the thing `--origin` is for.
+        for bad in ["", "   ", "ts.example.com", "/tailscale"] {
+            assert!(
+                parse_web_origin(bad).is_err(),
+                "{bad:?} is not an absolute URL and must be refused"
+            );
+        }
+        assert!(
+            parse_web_origin("ftp://ts.example.com")
+                .unwrap_err()
+                .contains("http or https"),
+            "a non-http(s) scheme must be named in the refusal"
+        );
+        assert!(
+            parse_web_origin("https://ts.example.com/ui?a=1")
+                .unwrap_err()
+                .contains("query or fragment"),
+            "a query names one request, not the base URL the UI is served at"
+        );
+        assert!(
+            parse_web_origin("https://ts.example.com/ui#top")
+                .unwrap_err()
+                .contains("query or fragment")
+        );
+        assert!(
+            parse_web_origin("https://user:pw@ts.example.com")
+                .unwrap_err()
+                .contains("credentials")
+        );
+    }
+
+    #[test]
+    fn web_ui_url_prefers_the_origin_over_the_address_that_was_bound() {
+        // The defect: behind a reverse proxy the bound address is not the address anyone reaches,
+        // and `--prefix` fixes only the path. With an origin, the origin wins outright.
+        let origin = parse_web_origin("https://ts.example.com/tailscale").unwrap();
+        assert_eq!(
+            web_ui_url(Some(&origin), Some("127.0.0.1:8088"), "/tailscale").as_deref(),
+            Some("https://ts.example.com/tailscale")
+        );
+        // An origin that already names the outside path is used verbatim — the proxy is free to map
+        // it onto a different inside path, so appending `--prefix` would invent a URL nobody serves.
+        assert_eq!(
+            web_ui_url(Some(&origin), Some("127.0.0.1:8088"), "/inside").as_deref(),
+            Some("https://ts.example.com/tailscale")
+        );
+        // An origin that names only scheme + host is the pass-through case: the served path applies.
+        let host_only = parse_web_origin("https://ts.example.com").unwrap();
+        assert_eq!(
+            web_ui_url(Some(&host_only), None, "/tailscale").as_deref(),
+            Some("https://ts.example.com/tailscale")
+        );
+        assert_eq!(
+            web_ui_url(Some(&host_only), None, "/").as_deref(),
+            Some("https://ts.example.com")
+        );
+
+        // Without an origin, nothing changes from the previous behaviour: the bound address, plus
+        // the served path.
+        assert_eq!(
+            web_ui_url(None, Some("127.0.0.1:8088"), "/").as_deref(),
+            Some("http://127.0.0.1:8088")
+        );
+        assert_eq!(
+            web_ui_url(None, Some("127.0.0.1:8088"), "/tailscale").as_deref(),
+            Some("http://127.0.0.1:8088/tailscale")
+        );
+        // `--cgi` without `--origin`: nothing was bound and the proxy's scheme/host is not in the
+        // CGI environment, so the URL is unknown rather than guessed.
+        assert_eq!(web_ui_url(None, None, "/"), None);
+    }
+
+    #[test]
+    fn route_web_request_answers_only_get_at_the_served_path() {
+        // The one route the read-only page has — shared by the listener and `--cgi`.
+        assert_eq!(route_web_request("GET", "/", "/"), WebRoute::Page);
+        assert_eq!(
+            route_web_request("GET", "/tailscale", "/tailscale"),
+            WebRoute::Page
+        );
+        // A different path, a path that only looks right, and a non-GET method are all 404.
+        assert_eq!(route_web_request("GET", "/other", "/"), WebRoute::NotFound);
+        assert_eq!(
+            route_web_request("GET", "/tailscale", "/"),
+            WebRoute::NotFound
+        );
+        assert_eq!(route_web_request("POST", "/", "/"), WebRoute::NotFound);
+        assert_eq!(route_web_request("", "/", "/"), WebRoute::NotFound);
+    }
+
+    #[test]
+    fn cgi_request_path_follows_the_cgi_environment_precedence() {
+        // `REQUEST_URI` wins when the server supplied it (Go's `net/http/cgi` reads it first), and
+        // the query string is dropped — the read-only page takes no parameters.
+        assert_eq!(
+            cgi_request_path(Some("/tailscale?x=1"), Some("/tailscale"), None),
+            "/tailscale"
+        );
+        assert_eq!(cgi_request_path(Some("/"), Some("/ignored"), None), "/");
+        // Without it, the path is the script's own mount point plus whatever followed it.
+        assert_eq!(
+            cgi_request_path(None, Some("/tailscale"), Some("/extra")),
+            "/tailscale/extra"
+        );
+        assert_eq!(
+            cgi_request_path(None, Some("/tailscale"), None),
+            "/tailscale"
+        );
+        // An empty or absent environment is the root request, not an empty path (which would 404
+        // against every served path).
+        assert_eq!(cgi_request_path(None, None, None), "/");
+        assert_eq!(cgi_request_path(Some("   "), None, None), "/");
+    }
+
+    #[test]
+    fn cgi_response_is_headers_then_a_blank_line_then_the_body() {
+        let body = "<!DOCTYPE html><html><body>hi</body></html>";
+        let response = cgi_response("200 OK", body);
+        // Go's CGI child writer always emits a `Status:` line; the invoking web server turns these
+        // headers into the HTTP response.
+        assert!(response.starts_with("Status: 200 OK\r\n"), "{response}");
+        assert!(response.contains("Content-Type: text/html; charset=utf-8\r\n"));
+        assert!(response.contains(&format!("Content-Length: {}\r\n", body.len())));
+        // Exactly one blank line separates the headers from the body, and the body is last.
+        let (headers, rest) = response
+            .split_once("\r\n\r\n")
+            .expect("a CGI response ends its headers with a blank line");
+        assert!(!headers.contains("\r\n\r\n"));
+        assert_eq!(rest, body);
+        // The error routes reuse the same serializer, so their status reaches the server too.
+        assert!(
+            cgi_response("404 Not Found", WEB_NOT_FOUND_BODY).starts_with("Status: 404 Not Found")
+        );
+    }
+
+    #[test]
+    fn render_status_html_states_the_url_it_is_served_at() {
+        use tailscaled_rs::localapi::StatusReport;
+        let report = StatusReport {
+            state: "Running".to_string(),
+            ..Default::default()
+        };
+        // With a known absolute URL (from `--origin`, or the bound address), the page says so — the
+        // reverse-proxy case where the address this process bound is not the address anyone reached.
+        let origin = parse_web_origin("https://ts.example.com/tailscale").unwrap();
+        let url = web_ui_url(Some(&origin), None, "/").expect("an origin always yields a URL");
+        let html = render_status_html(&report, Some(&url));
+        assert!(
+            html.contains("<link rel=\"canonical\" href=\"https://ts.example.com/tailscale\">"),
+            "the page must state the absolute URL it is served at: {html}"
+        );
+        // Operator-supplied, but it still lands in markup: escaped like every other value.
+        let hostile = render_status_html(&report, Some("https://x/\"><script>y"));
+        assert!(
+            !hostile.contains("<script>y"),
+            "a canonical URL must not inject raw markup: {hostile}"
+        );
+        assert!(hostile.contains("&quot;&gt;&lt;script&gt;y"));
+        // `--cgi` without `--origin`: no URL is known, so the page claims none.
+        let unknown = render_status_html(&report, None);
+        assert!(
+            !unknown.contains("rel=\"canonical\""),
+            "an unknown URL must not be guessed at: {unknown}"
+        );
     }
 
     #[test]
