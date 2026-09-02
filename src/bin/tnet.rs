@@ -515,8 +515,37 @@ enum Command {
         #[arg(long, value_name = "RISK")]
         accept_risk: Option<String>,
     },
-    /// Disconnect the node without logging out.
-    Down,
+    /// Disconnect the node without logging out (Go `tailscale down`): clears `WantRunning` while
+    /// keeping the node registration, so a later `up` resumes the same node. Unlike `logout`, the
+    /// node key survives. Refuses a disconnect that would drop the Tailscale SSH session it was
+    /// typed into (see `--accept-risk`), and reports the node was already stopped — exit 0, no edit
+    /// — when there is nothing to disconnect.
+    Down {
+        /// Why this node is being disconnected (Go `tailscale down --reason`: "reason for the
+        /// disconnect, if required by a policy"), for a fleet where a policy asks the operator to
+        /// justify a disconnect. The text is sent to the daemon, which records it in its log
+        /// alongside the disconnect.
+        ///
+        /// HONEST SCOPE: the same as `logout --reason` (which see) — Go carries the reason as the
+        /// LocalAPI `RequestReason` so a node whose policy demands a justification can be
+        /// disconnected at all, and it lands in that node's audit log. This fork registers no policy
+        /// store on Unix (`tnet syspolicy list` shows why) and the engine has no audit-log transport
+        /// to control, so nothing *requires* a reason here and it is not forwarded to the control
+        /// plane — it is recorded locally, next to the disconnect it explains.
+        #[arg(long, value_name = "TEXT")]
+        reason: Option<String>,
+        /// Pre-accept a named risk and skip its safety refusal (Go `--accept-risk`), e.g. `lose-ssh`
+        /// or `all`. On `down` the enforced risk is `lose-ssh`: disconnecting over a Tailscale SSH
+        /// session tears down the very transport that session runs on, so it is refused unless you
+        /// pass `--accept-risk=lose-ssh`.
+        #[arg(long, value_name = "RISK")]
+        accept_risk: Option<String>,
+        /// Go's leftover non-flag arguments. `down` takes none; they are collected here only so the
+        /// refusal is Go's own `too many non-flag arguments: [...]` (stderr, exit 1) instead of
+        /// clap's "unexpected argument" (exit 2).
+        #[arg(value_name = "ARG", hide = true)]
+        args: Vec<String>,
+    },
     /// Log out: deregister this node from the control plane and discard its node key, so the next
     /// `up` registers as a fresh login (requires a new auth key / interactive login). Unlike `down`,
     /// which keeps the registration for a seamless reconnect, `logout` ends it. Mirrors Go
@@ -2628,7 +2657,13 @@ async fn main() -> Result<()> {
             .context("installing the tailnetd system service"),
         Command::Uninstall => tailscaled_rs::ipn::install::run_uninstall()
             .context("removing the tailnetd system service"),
-        Command::Down => dispatch_simple(&socket, Request::Down).await,
+        // `down` (Go `tailscale down`): a risk gate, an already-stopped short-circuit and a reason,
+        // so it needs more than a bare dispatch — see `run_down`.
+        Command::Down {
+            reason,
+            accept_risk,
+            args,
+        } => run_down(&socket, reason, accept_risk.as_deref(), &args).await,
         Command::Logout { reason } => dispatch_simple(&socket, Request::Logout { reason }).await,
         // `reload-config` (Go `tailscaled`'s `reload-config`): re-read the daemon's `--config` and adopt
         // it into the running node. A dedicated renderer (not `dispatch_simple`) so it prints a clean
@@ -2945,6 +2980,97 @@ async fn dispatch_simple(socket: &std::path::Path, request: Request) -> Result<(
         other => anyhow::bail!("unexpected response: {other:?}"),
     }
     Ok(())
+}
+
+/// Go's leftover-argument refusal for `down`, verbatim. `runDown` (cmd/tailscale/cli/down.go) opens
+/// with `if len(args) > 0 { return fmt.Errorf("too many non-flag arguments: %q", args) }` — `down`
+/// is a bare verb, so any positional is a typo (most often a flag value that lost its `--`). Go's
+/// `%q` on a `[]string` renders the slice as bracketed, space-separated, quoted members
+/// (`["foo" "bar"]`), which Rust's `{:?}` on each `&str` reproduces member-for-member. `None` when
+/// the invocation carried no non-flag argument, which is the only shape Go accepts. Pure →
+/// unit-testable.
+fn down_positional_refusal(args: &[String]) -> Option<String> {
+    if args.is_empty() {
+        return None;
+    }
+    let quoted: Vec<String> = args.iter().map(|arg| format!("{arg:?}")).collect();
+    Some(format!(
+        "too many non-flag arguments: [{}]",
+        quoted.join(" ")
+    ))
+}
+
+/// The pure decision behind `down`'s `lose-ssh` risk gate: `newDownFlagSet` calls
+/// `registerAcceptRiskFlag`, and `runDown` refuses when `isSSHOverTailscale()` — clearing
+/// `WantRunning` tears down the very transport the operator's SSH session is running over, so a
+/// `down` typed into a Tailscale SSH session disconnects it. `true` → refuse. Same shape as the
+/// `up --force-reauth` gate ([`is_ssh_over_tailscale`] + [`risk_accepted`]), with the environment
+/// probe left to the caller so the branch is unit-testable. Pure.
+fn down_ssh_refusal(over_ssh: bool, accepted: &str) -> bool {
+    over_ssh && !risk_accepted(accepted, "lose-ssh")
+}
+
+/// Whether `down` has nothing to do: Go's `runDown` fetches the status first and returns early —
+/// printing `Tailscale was already stopped.` and exiting 0 — when `st.BackendState` is `Stopped`,
+/// rather than issuing a redundant prefs edit. The comparison is against the same
+/// [`State::as_str`](tailscaled_rs::ipn::State::as_str) name the daemon puts in its status reply, so
+/// a rename of the state cannot silently un-wire the check. Pure.
+fn down_already_stopped(state: &str) -> bool {
+    state == tailscaled_rs::ipn::State::Stopped.as_str()
+}
+
+/// `down` (Go `tailscale down`): clear `WantRunning` without logging out — ported from
+/// `runDown` (cmd/tailscale/cli/down.go), in Go's order.
+///
+/// 1. **Leftover arguments** — `down` takes none; [`down_positional_refusal`] carries Go's message.
+/// 2. **The `lose-ssh` risk** — refuse over a Tailscale SSH session unless `--accept-risk=lose-ssh`
+///    (or `all`). Decided entirely CLI-side from `$SSH_CLIENT`, like Go's `isSSHOverTailscale`, and
+///    before anything reaches the daemon. Go prompts interactively here; this CLI has no TTY-prompt
+///    path, so — as everywhere else in this fork — it refuses fail-closed and names the override.
+/// 3. **Already stopped** — one read-only `status` round-trip; if the node is `Stopped`, say so on
+///    stderr and exit 0 without a redundant edit (Go's `warnf` + `return nil`).
+/// 4. **The edit** — `Request::Down`, carrying `--reason` for the daemon to record (Go attaches it
+///    to the prefs edit as `apitype.RequestReasonKey`; see the flag's doc for what it buys here).
+async fn run_down(
+    socket: &std::path::Path,
+    reason: Option<String>,
+    accept_risk: Option<&str>,
+    args: &[String],
+) -> Result<()> {
+    // Go's first check, before the risk gate and before any LocalAPI call.
+    if let Some(message) = down_positional_refusal(args) {
+        anyhow::bail!(message);
+    }
+    if down_ssh_refusal(is_ssh_over_tailscale(), accept_risk.unwrap_or("")) {
+        // Go's `presentRiskToUser(riskLoseSSH, ...)` wording for `down`, plus the override hint this
+        // CLI owes in place of Go's interactive y/N prompt.
+        eprintln!(
+            "You are connected over Tailscale; this action will disable Tailscale and result in \
+             your session disconnecting."
+        );
+        eprintln!("To override, re-run with --accept-risk=lose-ssh");
+        std::process::exit(1);
+    }
+    // Go's `localClient.Status(ctx)` pre-check. A transport failure is Go's `error fetching current
+    // status` — surfaced here with the same "talking to daemon" context every other verb uses, so a
+    // dead daemon reads the same whether or not this pre-check exists.
+    let state = match round_trip(socket, &Request::Status).await {
+        Ok(Response::Status(status)) => status.state,
+        Ok(Response::Error { message }) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        Ok(other) => anyhow::bail!("unexpected response to status (down pre-check): {other:?}"),
+        Err(e) => {
+            return Err(e).with_context(|| format!("talking to daemon at {}", socket.display()));
+        }
+    };
+    if down_already_stopped(&state) {
+        // Go's `warnf` — stderr, exit 0. Nothing changed, so this is not a failure.
+        eprintln!("Tailscale was already stopped.");
+        return Ok(());
+    }
+    dispatch_simple(socket, Request::Down { reason }).await
 }
 
 /// Go's prompt between the two `--record` markers, verbatim (`cmd/tailscale/cli/bugreport.go`:
@@ -12918,6 +13044,58 @@ mod tests {
         assert!(!risk_accepted("foo, lose-ssh", "lose-ssh"));
         assert!(!risk_accepted("", "lose-ssh"));
         assert!(!risk_accepted("other", "lose-ssh"));
+    }
+
+    #[test]
+    fn down_refuses_gos_leftover_arguments_with_gos_message() {
+        // Go `runDown`: `if len(args) > 0 { return fmt.Errorf("too many non-flag arguments: %q",
+        // args) }`. No arguments is the only accepted shape.
+        assert_eq!(down_positional_refusal(&[]), None);
+        assert_eq!(
+            down_positional_refusal(&["maintenance".to_string()]).as_deref(),
+            Some(r#"too many non-flag arguments: ["maintenance"]"#)
+        );
+        // Go's `%q` on a []string: bracketed, space-separated, each member quoted.
+        assert_eq!(
+            down_positional_refusal(&["a".to_string(), "b c".to_string()]).as_deref(),
+            Some(r#"too many non-flag arguments: ["a" "b c"]"#)
+        );
+    }
+
+    #[test]
+    fn down_over_ssh_refusal_predicate() {
+        // Go `runDown`'s `registerAcceptRiskFlag` + `isSSHOverTailscale()` gate: refuse iff we are
+        // over a Tailscale SSH session AND `lose-ssh` was not pre-accepted. `down` has no other
+        // precondition (unlike `up`, where the risk only exists with `--force-reauth`).
+        assert!(down_ssh_refusal(true, ""));
+        assert!(down_ssh_refusal(true, "other"));
+        assert!(!down_ssh_refusal(true, "lose-ssh"));
+        assert!(!down_ssh_refusal(true, "all"));
+        assert!(!down_ssh_refusal(true, "foo,lose-ssh"));
+        // Not over Tailscale SSH → nothing to lose, no refusal whatever the flag says.
+        assert!(!down_ssh_refusal(false, ""));
+        assert!(!down_ssh_refusal(false, "lose-ssh"));
+    }
+
+    #[test]
+    fn down_short_circuits_only_on_gos_stopped_state() {
+        // Go: `if st.BackendState == "Stopped" { warnf("Tailscale was already stopped."); return
+        // nil }` — every other state still gets the edit.
+        assert!(down_already_stopped("Stopped"));
+        assert!(down_already_stopped(
+            tailscaled_rs::ipn::State::Stopped.as_str()
+        ));
+        for other in [
+            "Running",
+            "Starting",
+            "NeedsLogin",
+            "NeedsMachineAuth",
+            "InUseOtherUser",
+            "NoState",
+            "stopped", // the state name is exact, like Go's string compare
+        ] {
+            assert!(!down_already_stopped(other), "{other} is not Stopped");
+        }
     }
 
     #[test]
