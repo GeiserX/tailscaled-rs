@@ -797,13 +797,51 @@ enum Command {
     /// By default this stops after 10 pings OR as soon as a **direct** (non-DERP) path is
     /// established, whichever comes first — matching Go. Each result line reports the path the pong
     /// took: `via <ip:port>` for a direct connection, `via DERP` when the overlay is still relayed.
+    ///
+    /// The argument is Go's `<hostname-or-IP>`: an IP literal is pinged as-is, anything else is
+    /// resolved against the netmap by MagicDNS name and then, failing that, through the host
+    /// resolver (Go's `tailscaleIPFromArg`).
     Ping {
-        /// The tailnet IP of the peer to ping.
-        #[arg(value_name = "IP")]
-        ip: String,
+        /// The peer to ping: a tailnet IP, a MagicDNS name (bare or fully qualified), or any name
+        /// the host resolver can turn into an address.
+        #[arg(value_name = "HOSTNAME-OR-IP")]
+        target: String,
         /// Per-attempt timeout in milliseconds (omit for a sensible default).
         #[arg(long, value_name = "MS")]
         timeout: Option<u64>,
+        /// Log how the argument was resolved, to stderr (Go `tailscale ping --verbose`): a
+        /// `lookup "my-laptop" => "100.64.0.2"` line, printed only when resolution actually changed
+        /// the argument (an IP literal resolves to itself, so it logs nothing).
+        #[arg(long)]
+        verbose: bool,
+        /// Do a TSMP-level ping — through WireGuard, but neither host OS stack (Go `--tsmp`).
+        /// **Accepted by the parser, then refused**: nothing in this fork sends or answers a TSMP
+        /// message. TSMP reaches the engine only as an inbound protocol number the dataplane admits
+        /// past the ACL, so a TSMP probe would never be replied to.
+        #[arg(long)]
+        tsmp: bool,
+        /// Do an ICMP-level ping — through WireGuard, but not the local host OS stack (Go
+        /// `--icmp`). **Honoured**, because it is the probe this fork's daemon already sends on
+        /// every `ping`: the engine's `Device::ping` puts an ICMPv4 echo on the overlay netstack,
+        /// never a host socket, and the peer's own OS stack answers it. So the flag changes one
+        /// thing, Go's own `if pingArgs.tsmp || pingArgs.icmp { return nil }`: the run ends at the
+        /// first pong instead of waiting for a direct path.
+        #[arg(long)]
+        icmp: bool,
+        /// Hit the peer's peerAPI HTTP server instead of pinging it (Go `--peerapi`). **Accepted by
+        /// the parser, then refused**: the engine's peerAPI client exists only to push Taildrop
+        /// files, so there is no probe that reports a peer's peerAPI URL and a latency, and the
+        /// daemon's wire carries neither.
+        #[arg(long)]
+        peerapi: bool,
+        /// Size of the ping message, disco pings only (Go `--size`; `0` = minimum size). `0` is the
+        /// probe this fork already sends, so it is accepted; **any larger size is refused**,
+        /// because the engine's ping calls take a destination and a timeout and choose the packet
+        /// themselves. Go's flag is a signed int and takes a negative size without complaint; this
+        /// one is unsigned, so `--size=-1` is a parse error rather than a padding request nothing
+        /// can honour.
+        #[arg(long, value_name = "N", default_value_t = 0)]
+        size: u32,
         /// Max number of pings to send (Go `-c`). Default 10; `0` means infinity (ping until a direct
         /// path is established, or forever if `--no-until-direct`). Prints one result line per
         /// attempt, then a summary; a failed attempt is counted but does not abort the rest.
@@ -2821,18 +2859,30 @@ async fn main() -> Result<()> {
         // attempt prints a result line, a failure is counted but does not abort the rest, and the
         // command exits non-zero only if NOTHING was received.
         Command::Ping {
-            ip,
+            target,
             timeout,
+            verbose,
+            tsmp,
+            icmp,
+            peerapi,
+            size,
             count,
             until_direct,
             no_until_direct,
         } => {
             run_ping(
                 &socket,
-                ip,
+                target,
                 timeout,
                 count,
                 resolve_until_direct(until_direct, no_until_direct),
+                verbose,
+                PingProbe {
+                    tsmp,
+                    icmp,
+                    peerapi,
+                    size,
+                },
             )
             .await
         }
@@ -5512,31 +5562,39 @@ async fn run_ip(
 /// `until_direct`) or forever. `until_direct` (Go's default-true) returns as soon as the overlay
 /// upgrades to a direct path — the ICMP echo each attempt sends is itself what nudges magicsock to
 /// attempt that upgrade.
+///
+/// `target` is Go's `<hostname-or-IP>`, resolved by [`resolve_ping_target`] before the first
+/// attempt. `probe` carries Go's four probe-shape knobs: `--icmp` names the probe the daemon
+/// already sends and only ends the run at the first pong, while the other three are refused up
+/// front by [`ping_probe_refusal`] because nothing below this layer can send them.
 async fn run_ping(
     socket: &std::path::Path,
-    ip: String,
+    target: String,
     timeout: Option<u64>,
     count: u32,
     until_direct: bool,
+    verbose: bool,
+    probe: PingProbe,
 ) -> Result<()> {
-    // Self-IP early return (Go ping.go: `if self { printf("%v is local Tailscale IP\n", ip); return nil }`).
-    // Pinging the node's OWN tailnet IP is a no-op that would otherwise hit the local netstack echo;
-    // Go short-circuits with a clear note + exit 0. We compare the target against this node's own
-    // addresses (Request::Ip). Parse both sides to an IpAddr so spelling variants normalize; a target
-    // that isn't a bare IP (or a status round-trip failure) simply falls through to the normal ping.
-    if let Ok(want) = ip.parse::<std::net::IpAddr>()
-        && let Ok(Response::Ip { ipv4, ipv6 }) = round_trip(socket, &Request::Ip).await
-    {
-        let is_self = [ipv4.as_deref(), ipv6.as_deref()]
-            .into_iter()
-            .flatten()
-            .filter_map(|s| s.parse::<std::net::IpAddr>().ok())
-            .any(|self_ip| self_ip == want);
-        if is_self {
-            println!("{want} is local Tailscale IP");
-            return Ok(());
-        }
+    // The engine-gated probe shapes are refused BEFORE the daemon is contacted and before the
+    // argument is resolved, the way `run_ip` refuses an unusable `-4 -6` first: an invocation this
+    // build cannot honour costs no round trip and says the same thing whether the daemon is up.
+    if let Some(message) = ping_probe_refusal(&probe) {
+        anyhow::bail!(message);
     }
+
+    // Go `tailscaleIPFromArg` + the `self` / `--verbose` arms around it. `None` ⇒ the argument named
+    // this node, which Go answers with one line and exit 0 rather than a ping.
+    let Some(ip) = resolve_ping_target(socket, &target, verbose).await? else {
+        return Ok(());
+    };
+
+    // Go returns from the loop the moment an ICMP-level ping is answered (`if pingArgs.tsmp ||
+    // pingArgs.icmp { return nil }`), and it does so BEFORE the `--until-direct` check — so one
+    // pong is success whatever path it took. Folding that into `until_direct` here is what keeps
+    // the exit verdict honest: with `--icmp` no direct path is being waited for, so its absence
+    // must not become `direct connection not established`.
+    let until_direct = until_direct && !probe.icmp;
 
     let infinite = count == 0;
     let mut received = 0u32;
@@ -5572,6 +5630,12 @@ async fn run_ping(
                 // Early stop: a direct (non-DERP) path is exactly what `--until-direct` waits for
                 // (Go returns success here without sending the rest of the count).
                 if until_direct && direct {
+                    break;
+                }
+                // `--icmp` (Go's `if pingArgs.tsmp || pingArgs.icmp { return nil }`): the peer's own
+                // OS stack answered, which is the whole question an ICMP-level ping asks. One pong
+                // ends the run.
+                if probe.icmp {
                     break;
                 }
                 if last {
@@ -5614,6 +5678,317 @@ async fn run_ping(
             eprintln!("direct connection not established");
             std::process::exit(1);
         }
+    }
+}
+
+/// Go's four probe-shape knobs on `ping`, kept together so the refusal has a single input and
+/// `run_ping` a single extra parameter.
+///
+/// Three of the four are engine-gated and refused by [`ping_probe_refusal`]. `--icmp` is not: it
+/// names the probe this fork's daemon already sends, so it is honoured — see [`PingProbe::icmp`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PingProbe {
+    /// Go `--tsmp`: a TSMP-level ping, through WireGuard but neither host OS stack. Refused.
+    tsmp: bool,
+    /// Go `--icmp`: an ICMP-level ping, through WireGuard but not the local host OS stack.
+    ///
+    /// **Honoured**, alone of the three selectors, because the engine call the daemon already makes
+    /// for every `ping` is exactly that probe: `Device::ping` sends "an ICMPv4 echo … from this
+    /// device's own tailnet IPv4 over the overlay netstack — never a host socket", and "a peer
+    /// answers from its own OS stack". So there is nothing to select and nothing to refuse; what
+    /// the flag changes is the loop, per Go's `if pingArgs.tsmp || pingArgs.icmp { return nil }` —
+    /// the run ends at the first pong rather than waiting for a direct path.
+    icmp: bool,
+    /// Go `--peerapi`: hit the peer's peerAPI HTTP server instead of pinging it. Refused.
+    peerapi: bool,
+    /// Go `--size`: the size of the disco ping message; `0` means the minimum size. `0` is accepted
+    /// (it asks for the probe already being sent); anything larger is refused.
+    size: u32,
+}
+
+/// Refuse the probe shapes this fork cannot send, naming the flag and the layer the gap is at.
+/// `None` ⇒ the invocation asks only for probes that exist here.
+///
+/// Go's `pingType()` turns `--tsmp`/`--icmp`/`--peerapi` into a `tailcfg.PingType` and hands it,
+/// with `--size`, to `LocalClient.PingWithOpts`. Of the four knobs:
+///
+/// * **`--icmp` is honoured**, not refused — see [`PingProbe::icmp`]. The engine's `Device::ping`
+///   *is* an ICMP-level ping through WireGuard that skips the local host OS stack, and it is what
+///   the daemon sends on every `ping`. Refusing it would state something untrue in the one place an
+///   operator would believe it.
+/// * **`--tsmp`** has nothing behind it. TSMP appears in the engine only as an inbound protocol
+///   number the dataplane admits past the ACL (`ts_dataplane`, Go's `case ipproto.TSMP: return
+///   Accept`); nothing constructs a TSMP message and nothing answers one, so a TSMP probe would
+///   never be replied to.
+/// * **`--peerapi`** is not a ping at all: Go opens the peer's peerAPI HTTP server and prints `hit
+///   peerapi of %s (%s) at %s in %s`. The engine has a peerAPI *client*, but only for pushing
+///   Taildrop files — there is no bare probe returning the peer's peerAPI URL and a latency, and
+///   the daemon's wire carries neither.
+/// * **`--size`** has no parameter to set: `Device::ping` and `Device::ping_disco` take a
+///   destination and a timeout, and choose the packet themselves.
+///
+/// Honouring any of the three would report the probe the daemon always sends while claiming to have
+/// measured something else, so they are refused and filed as engine ask #38 (`docs/ENGINE_ASKS.md`)
+/// rather than faked.
+fn ping_probe_refusal(probe: &PingProbe) -> Option<String> {
+    let mut asked: Vec<&str> = Vec::new();
+    if probe.tsmp {
+        asked.push("--tsmp");
+    }
+    if probe.peerapi {
+        asked.push("--peerapi");
+    }
+    if probe.size > 0 {
+        asked.push("--size");
+    }
+    if asked.is_empty() {
+        return None;
+    }
+    // Go's `pingType()` picks ONE selector by precedence (tsmp, then icmp, then peerapi) rather
+    // than refusing a combination, so there is no Go usage refusal to port here. We name every
+    // flag that was asked for instead of only the winning one: they are missing for the same
+    // reason, and dropping them one at a time would be three refusals in a row.
+    let (list, verb) = match asked.as_slice() {
+        [one] => ((*one).to_string(), "is"),
+        [rest @ .., last] => (format!("{} and {last}", rest.join(", ")), "are"),
+        [] => unreachable!("the empty case returned above"),
+    };
+    Some(format!(
+        "tnet ping {list} {verb} not supported by this fork.\n\
+         Go selects the probe with `tailcfg.PingType`: `--tsmp` goes through WireGuard but neither \
+         host OS stack, `--peerapi` is not a ping at all (it opens the peer's peerAPI HTTP server \
+         and prints `hit peerapi of …`), and `--size` pads the disco probe.\n\
+         None of the three exists a layer below. TSMP reaches the tailscale-rs engine only as an \
+         inbound protocol number the dataplane admits past the ACL — nothing builds a TSMP message \
+         and nothing answers one. The engine's peerAPI client exists solely to push Taildrop files; \
+         there is no probe that reports a peer's peerAPI URL and a latency. And \
+         `Device::ping`/`Device::ping_disco` take a destination and a timeout, with no size knob. \
+         Accepting {list} would report the probe this daemon always sends while claiming to have \
+         measured something else, so it is refused instead. Filed as engine ask #38 \
+         (docs/ENGINE_ASKS.md).\n\
+         What works today: `tnet ping <hostname-or-IP>`, and `--icmp` — the ICMP-level ping through \
+         WireGuard is the probe the daemon already sends, so that flag is honoured."
+    ))
+}
+
+/// Where `ping`'s `<hostname-or-IP>` argument resolved to — the port of Go's `tailscaleIPFromArg`
+/// (`cmd/tailscale/cli/ping.go`), which is the whole reason `tnet ping my-laptop` can work at all.
+///
+/// Go's order is: an IP literal is used as-is with no resolution; otherwise the netmap's peers are
+/// matched by MagicDNS name; otherwise this node itself; otherwise the host resolver. This enum is
+/// the netmap half (pure, so it is unit-testable); the resolver fallback is
+/// [`resolve_host_ip`], reached only on [`PingTarget::Unresolved`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PingTarget {
+    /// The argument already was an IP address. Go's `net.ParseIP` arm: used as-is.
+    Literal(String),
+    /// It named a peer in the netmap → that peer's first tailnet IP (Go `ps.TailscaleIPs[0]`).
+    Peer(String),
+    /// It named THIS node → Go prints `%v is local Tailscale IP` and returns success without
+    /// pinging. Reached both by Go's own `self` arm (a name matching `st.Self`) and by an IP
+    /// literal that is one of this node's addresses, which Go answers a layer down — see
+    /// [`ping_target_from_arg`].
+    SelfNode(String),
+    /// A peer matched by name but carries no tailnet IP → Go `node found but lacks an IP`.
+    NodeLacksIp,
+    /// Nothing in the netmap matched; the caller falls back to the host resolver.
+    Unresolved,
+}
+
+/// Resolve `ping`'s argument against the netmap, porting Go's `tailscaleIPFromArg`. Pure, so the
+/// whole decision table is unit-testable; the caller owns the status round trip and the DNS fallback.
+///
+/// Two things Go does elsewhere are folded in here, both marked below:
+///
+/// * **The self *IP* arm.** Go's `tailscaleIPFromArg` reports `self` only for a *name* that matches
+///   `st.Self`; an IP literal that happens to be one of this node's own addresses is caught by the
+///   daemon instead, which sets `PingResult.IsLocalIP` and an `Err` of `%v is local Tailscale IP`
+///   that the CLI prints verbatim before returning success. This fork's daemon has no `IsLocalIP`
+///   flag on the wire, so the CLI answers it from the status it already fetched — same line, same
+///   exit 0, one fewer round trip than the `Request::Ip` probe this replaced.
+/// * **`dnsOrQuoteHostname`** (Go `cmd/tailscale/cli/status.go`), the name Go matches against, is
+///   `dnsname.TrimSuffix(ps.DNSName, st.MagicDNSSuffix)` — see [`magic_dns_name_matches`].
+///
+/// Deviation, deliberate: Go iterates `st.Peer`, a *map*, so two peers sharing a MagicDNS name are
+/// resolved in Go's random map order; `peers` here is an ordered `Vec`, so the first match wins
+/// deterministically. Nothing in a real netmap makes that reachable — MagicDNS names are unique —
+/// and a deterministic answer is the better of the two.
+fn ping_target_from_arg(arg: &str, status: &tailscaled_rs::localapi::StatusReport) -> PingTarget {
+    // Go: `if net.ParseIP(hostOrIP) != nil { return hostOrIP, false, nil }` — an IP literal is used
+    // as-is, with no lookup at all. (Rust's `IpAddr` parser and Go's `net.ParseIP` agree on the
+    // shapes that matter here: both take dotted-quad IPv4 and RFC 4291 IPv6, and both reject
+    // leading zeros and zone suffixes.)
+    if let Ok(want) = arg.parse::<std::net::IpAddr>() {
+        // ADDITION (see the doc comment): Go's daemon answers this one, ours does not.
+        if self_tailnet_ips(status).any(|self_ip| self_ip == want) {
+            return PingTarget::SelfNode(want.to_string());
+        }
+        return PingTarget::Literal(arg.to_string());
+    }
+
+    let suffix = status.magic_dns_suffix.as_deref();
+    // Go: the peer loop, first match wins; a matched node with no IPs is an error, not a fall-through.
+    for peer in &status.peers {
+        if magic_dns_name_matches(arg, &peer.name, suffix) {
+            return match first_tailnet_ip(Some(peer.ipv4.as_str()), peer.ipv6.as_deref()) {
+                Some(ip) => PingTarget::Peer(ip.to_string()),
+                None => PingTarget::NodeLacksIp,
+            };
+        }
+    }
+    // Go: `if match(st.Self) && len(st.Self.TailscaleIPs) > 0`. Note the `&&` — a self match with no
+    // addresses falls through to the resolver rather than erroring, unlike the peer arm above.
+    if let Some(name) = status.self_name.as_deref()
+        && magic_dns_name_matches(arg, name, suffix)
+        && let Some(ip) = first_tailnet_ip(status.self_ipv4.as_deref(), status.self_ipv6.as_deref())
+    {
+        return PingTarget::SelfNode(ip.to_string());
+    }
+    PingTarget::Unresolved
+}
+
+/// This node's own tailnet addresses, parsed — the set an IP-literal argument is checked against by
+/// [`ping_target_from_arg`]. Parsing both sides means spelling variants compare equal rather than
+/// by string.
+fn self_tailnet_ips(
+    status: &tailscaled_rs::localapi::StatusReport,
+) -> impl Iterator<Item = std::net::IpAddr> + '_ {
+    [status.self_ipv4.as_deref(), status.self_ipv6.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s.parse::<std::net::IpAddr>().ok())
+}
+
+/// The first of a node's tailnet addresses — Go's `TailscaleIPs[0]`, which is the IPv4 whenever the
+/// node has one. An empty string is "absent" (the wire carries `ipv4` as a bare `String`, so a node
+/// without one arrives as `""`, not as a missing field).
+fn first_tailnet_ip<'a>(ipv4: Option<&'a str>, ipv6: Option<&'a str>) -> Option<&'a str> {
+    [ipv4, ipv6].into_iter().flatten().find(|s| !s.is_empty())
+}
+
+/// Does `arg` name the node whose display name is `name`, in the tailnet with MagicDNS suffix
+/// `suffix`? Go's `match` closure inside `tailscaleIPFromArg`:
+///
+/// ```go
+/// strings.EqualFold(hostOrIP, dnsOrQuoteHostname(st, ps)) || hostOrIP == ps.DNSName
+/// ```
+///
+/// so the **bare** MagicDNS name (`my-laptop`) matches case-insensitively and the **fully
+/// qualified** name matches exactly. Both arms are ported, including Go's asymmetry — only the bare
+/// form folds case.
+///
+/// One shape is not reachable here: when a peer has no `DNSName` at all, Go's `dnsOrQuoteHostname`
+/// falls back to `("<sanitized hostname>")`, parentheses and quotes included, which is a display
+/// string no operator would type as an argument. This fork's `PeerReport` carries a single
+/// `name` (the engine's `display_name`) with no separate hostname behind it, so there is nothing to
+/// fall back to and that arm is simply absent.
+///
+/// Go's `ps.DNSName` keeps its trailing dot (`my-laptop.tail0123.ts.net.`) while `display_name` does
+/// not, so an argument carrying Go's trailing dot is compared with it trimmed — otherwise a command
+/// line copied from Go would stop matching.
+fn magic_dns_name_matches(arg: &str, name: &str, suffix: Option<&str>) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let base = dns_trim_suffix(name, suffix.unwrap_or(""));
+    if !base.is_empty() && arg.eq_ignore_ascii_case(base) {
+        return true;
+    }
+    arg.strip_suffix('.').unwrap_or(arg) == name
+}
+
+/// Go `dnsname.HasSuffix` (`util/dnsname/dnsname.go`): does `name` end with the *component(s)* in
+/// `suffix`, ignoring leading and trailing dots on either? An empty suffix is always `false`, and a
+/// suffix that matches only mid-label (`ail0123.ts.net` against `tail0123.ts.net`) is `false` too —
+/// that is what the `ends_with('.')` check on the remainder is for.
+fn dns_has_suffix(name: &str, suffix: &str) -> bool {
+    let name = name.strip_suffix('.').unwrap_or(name);
+    let suffix = suffix.strip_suffix('.').unwrap_or(suffix);
+    let suffix = suffix.strip_prefix('.').unwrap_or(suffix);
+    match name.strip_suffix(suffix) {
+        // `strip_suffix("")` succeeds with the whole name, which is Go's `len(nameBase) < len(name)`
+        // being false — the empty-suffix case, and it must stay false.
+        Some(base) => base.len() < name.len() && base.ends_with('.'),
+        None => false,
+    }
+}
+
+/// Go `dnsname.TrimSuffix`: drop any trailing dot from `name` and remove `suffix` if the name ends
+/// with it, never returning a trailing dot. `my-laptop.tail0123.ts.net.` + `tail0123.ts.net` ⇒
+/// `my-laptop`; a name that does not carry the suffix comes back with only its trailing dot gone.
+fn dns_trim_suffix<'a>(name: &'a str, suffix: &str) -> &'a str {
+    let mut out = name;
+    if dns_has_suffix(name, suffix) {
+        out = out.strip_suffix('.').unwrap_or(out);
+        let suffix = suffix.trim_matches('.');
+        out = out.strip_suffix(suffix).unwrap_or(out);
+    }
+    out.strip_suffix('.').unwrap_or(out)
+}
+
+/// Resolve `ping`'s `<hostname-or-IP>` to the address to ping, and answer the two cases that end the
+/// command before a single probe is sent.
+///
+/// Returns `Ok(None)` when the argument named THIS node: Go prints `%v is local Tailscale IP` and
+/// returns success, so there is nothing left for the caller to do. `Ok(Some(ip))` is the address to
+/// ping.
+///
+/// Go's `runPing` fetches the status before anything else (for its running/starting check), and
+/// `tailscaleIPFromArg` fetches it again for the peer match; one fetch answers both here. A status
+/// round trip that fails ends the command, as it does in Go — a daemon that cannot describe its
+/// netmap is not going to answer a ping either, and saying so here names the real problem instead
+/// of letting ten attempts time out against it.
+///
+/// `--verbose` logs Go's `lookup %q => %q` line, and only when resolution actually moved the
+/// argument (Go: `if pingArgs.verbose && ip != hostOrIP`), so an IP literal logs nothing.
+async fn resolve_ping_target(
+    socket: &std::path::Path,
+    target: &str,
+    verbose: bool,
+) -> Result<Option<String>> {
+    let status = match round_trip(socket, &Request::Status).await {
+        Ok(Response::Status(s)) => s,
+        Ok(Response::Error { message }) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        Ok(other) => anyhow::bail!("unexpected response to status request: {other:?}"),
+        Err(e) => {
+            return Err(e).with_context(|| format!("querying status at {}", socket.display()));
+        }
+    };
+    let ip = match ping_target_from_arg(target, &status) {
+        PingTarget::Literal(ip) | PingTarget::Peer(ip) => ip,
+        PingTarget::SelfNode(ip) => {
+            println!("{ip} is local Tailscale IP");
+            return Ok(None);
+        }
+        // Go: `errors.New("node found but lacks an IP")`.
+        PingTarget::NodeLacksIp => anyhow::bail!("node found but lacks an IP"),
+        PingTarget::Unresolved => resolve_host_ip(target).await?,
+    };
+    if verbose && ip != target {
+        // Go logs this with `log.Printf`, i.e. to stderr, so it never pollutes the piped pong lines.
+        eprintln!("lookup {target:?} => {ip:?}");
+    }
+    Ok(Some(ip))
+}
+
+/// Go's last resort in `tailscaleIPFromArg`: the host resolver (`net.Resolver.LookupHost`), first
+/// address wins. Both of Go's failure texts are ported verbatim.
+///
+/// This is deliberately the *system* resolver, as in Go: a name that is not in the netmap may still
+/// be a subnet-route address behind a relay node, which only the host's own DNS (MagicDNS included,
+/// when `--accept-dns` programmed it) can answer.
+async fn resolve_host_ip(host: &str) -> Result<String> {
+    // `lookup_host` resolves a *socket* address, so it needs a port; `0` is never connected to and
+    // only the address half is read back.
+    let mut addrs = tokio::net::lookup_host((host, 0u16))
+        .await
+        .map_err(|e| anyhow::anyhow!("error looking up IP of {host:?}: {e}"))?;
+    match addrs.next() {
+        Some(addr) => Ok(addr.ip().to_string()),
+        None => anyhow::bail!("no IPs found for {host:?}"),
     }
 }
 
@@ -17238,6 +17613,277 @@ mod tests {
         assert_eq!(
             format_ping_miss("100.64.0.2", "unreachable", 3, 0),
             "ping 100.64.0.2 (3) failed: unreachable"
+        );
+    }
+
+    /// A netmap to resolve `ping` arguments against: this node plus three peers, one of which
+    /// carries no address at all. Mirrors what `Request::Status` returns.
+    fn ping_status() -> tailscaled_rs::localapi::StatusReport {
+        use tailscaled_rs::localapi::{PeerReport, StatusReport};
+        StatusReport {
+            self_name: Some("my-desktop.tail0123.ts.net".to_string()),
+            self_ipv4: Some("100.64.0.1".to_string()),
+            self_ipv6: Some("fd7a:115c:a1e0::1".to_string()),
+            magic_dns_suffix: Some("tail0123.ts.net".to_string()),
+            peers: vec![
+                PeerReport {
+                    name: "my-laptop.tail0123.ts.net".to_string(),
+                    ipv4: "100.64.0.2".to_string(),
+                    ipv6: Some("fd7a:115c:a1e0::2".to_string()),
+                    stable_id: "n1".to_string(),
+                    ..Default::default()
+                },
+                // A peer control has not given an address (Go's `len(ps.TailscaleIPs) == 0`).
+                PeerReport {
+                    name: "addressless.tail0123.ts.net".to_string(),
+                    ipv4: String::new(),
+                    ipv6: None,
+                    stable_id: "n2".to_string(),
+                    ..Default::default()
+                },
+                // A peer whose only address is IPv6, so `TailscaleIPs[0]` is that one.
+                PeerReport {
+                    name: "v6-only.tail0123.ts.net".to_string(),
+                    ipv4: String::new(),
+                    ipv6: Some("fd7a:115c:a1e0::3".to_string()),
+                    stable_id: "n3".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn dns_suffix_helpers_match_go_dnsname() {
+        // Go `dnsname.HasSuffix`: component-wise, dots on either side ignored.
+        assert!(dns_has_suffix(
+            "my-laptop.tail0123.ts.net.",
+            "tail0123.ts.net"
+        ));
+        assert!(dns_has_suffix(
+            "my-laptop.tail0123.ts.net",
+            ".tail0123.ts.net."
+        ));
+        // A mid-label match is NOT a suffix match — that is what the trailing-dot check is for.
+        assert!(!dns_has_suffix(
+            "my-laptop.tail0123.ts.net",
+            "ail0123.ts.net"
+        ));
+        // The name IS the suffix: nothing is left in front of it, so there is no leading dot.
+        assert!(!dns_has_suffix("tail0123.ts.net", "tail0123.ts.net"));
+        // Go documents the empty suffix as always false.
+        assert!(!dns_has_suffix("my-laptop.tail0123.ts.net", ""));
+
+        // Go `dnsname.TrimSuffix`: drop the trailing dot, then the suffix; never a trailing dot back.
+        assert_eq!(
+            dns_trim_suffix("my-laptop.tail0123.ts.net.", "tail0123.ts.net"),
+            "my-laptop"
+        );
+        assert_eq!(
+            dns_trim_suffix("my-laptop.tail0123.ts.net", "tail0123.ts.net"),
+            "my-laptop"
+        );
+        // A name in some other tailnet keeps its labels; only the trailing dot goes.
+        assert_eq!(
+            dns_trim_suffix("host.other.ts.net.", "tail0123.ts.net"),
+            "host.other.ts.net"
+        );
+        // No suffix known (the netmap has not landed yet) — same rule, nothing to trim.
+        assert_eq!(dns_trim_suffix("my-laptop.", ""), "my-laptop");
+    }
+
+    #[test]
+    fn magic_dns_name_matches_bare_and_qualified_like_go() {
+        let suffix = Some("tail0123.ts.net");
+        let name = "my-laptop.tail0123.ts.net";
+        // Go `strings.EqualFold(hostOrIP, dnsOrQuoteHostname(st, ps))`: the bare name, case-folded.
+        assert!(magic_dns_name_matches("my-laptop", name, suffix));
+        assert!(magic_dns_name_matches("MY-LAPTOP", name, suffix));
+        // Go `hostOrIP == ps.DNSName`: the fully qualified name, with or without Go's trailing dot.
+        assert!(magic_dns_name_matches(name, name, suffix));
+        assert!(magic_dns_name_matches(
+            "my-laptop.tail0123.ts.net.",
+            name,
+            suffix
+        ));
+        // Neither arm: a different node, and a partial label.
+        assert!(!magic_dns_name_matches("my-lapto", name, suffix));
+        assert!(!magic_dns_name_matches("other", name, suffix));
+        // A node whose name the netmap has not filled in matches nothing at all.
+        assert!(!magic_dns_name_matches("", "", suffix));
+        // Before the first netmap there is no suffix, so only the whole name matches.
+        assert!(magic_dns_name_matches(name, name, None));
+        assert!(!magic_dns_name_matches("my-laptop", name, None));
+    }
+
+    #[test]
+    fn ping_target_from_arg_ports_tailscale_ip_from_arg() {
+        let status = ping_status();
+
+        // Go: an IP literal is used as-is, with no resolution.
+        assert_eq!(
+            ping_target_from_arg("100.64.0.2", &status),
+            PingTarget::Literal("100.64.0.2".to_string())
+        );
+        // An IP literal that is one of THIS node's addresses is Go's daemon-side `IsLocalIP` —
+        // answered here from the same status, for either family.
+        assert_eq!(
+            ping_target_from_arg("100.64.0.1", &status),
+            PingTarget::SelfNode("100.64.0.1".to_string())
+        );
+        assert_eq!(
+            ping_target_from_arg("fd7a:115c:a1e0::1", &status),
+            PingTarget::SelfNode("fd7a:115c:a1e0::1".to_string())
+        );
+
+        // A peer by bare MagicDNS name, case-folded, and by its fully qualified name → its first
+        // tailnet IP (Go `ps.TailscaleIPs[0]`).
+        for arg in [
+            "my-laptop",
+            "MY-LAPTOP",
+            "my-laptop.tail0123.ts.net",
+            "my-laptop.tail0123.ts.net.",
+        ] {
+            assert_eq!(
+                ping_target_from_arg(arg, &status),
+                PingTarget::Peer("100.64.0.2".to_string()),
+                "{arg:?} should resolve to the laptop's tailnet IP"
+            );
+        }
+        // A peer whose only address is IPv6: that is its `TailscaleIPs[0]`.
+        assert_eq!(
+            ping_target_from_arg("v6-only", &status),
+            PingTarget::Peer("fd7a:115c:a1e0::3".to_string())
+        );
+
+        // This node by name → Go prints `%v is local Tailscale IP` and stops.
+        assert_eq!(
+            ping_target_from_arg("my-desktop", &status),
+            PingTarget::SelfNode("100.64.0.1".to_string())
+        );
+
+        // Go: a node matched by name but carrying no IP is an error, not a fall-through to DNS.
+        assert_eq!(
+            ping_target_from_arg("addressless", &status),
+            PingTarget::NodeLacksIp
+        );
+
+        // Nothing in the netmap → Go's host-resolver fallback, which the caller runs.
+        assert_eq!(
+            ping_target_from_arg("not-in-this-tailnet", &status),
+            PingTarget::Unresolved
+        );
+    }
+
+    #[test]
+    fn ping_target_from_arg_falls_through_when_self_has_no_address() {
+        // Go's self arm is `match(st.Self) && len(st.Self.TailscaleIPs) > 0` — the name matches but
+        // there is no address, so it falls through to the resolver instead of erroring (unlike the
+        // peer arm, which errors). A node that has not finished coming up looks exactly like this.
+        let status = tailscaled_rs::localapi::StatusReport {
+            self_name: Some("my-desktop.tail0123.ts.net".to_string()),
+            magic_dns_suffix: Some("tail0123.ts.net".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            ping_target_from_arg("my-desktop", &status),
+            PingTarget::Unresolved
+        );
+    }
+
+    /// Go's last resort, the host resolver: `localhost` is in every machine's `hosts` file, so this
+    /// exercises the real lookup without depending on a network or on a name server.
+    #[tokio::test]
+    async fn resolve_host_ip_uses_the_host_resolver() {
+        let ip = resolve_host_ip("localhost")
+            .await
+            .expect("localhost must resolve from the hosts file")
+            .parse::<std::net::IpAddr>()
+            .expect("the resolver's answer must be an address");
+        assert!(ip.is_loopback(), "localhost resolved to {ip}, not loopback");
+    }
+
+    #[test]
+    fn ping_probe_refusal_covers_only_what_the_engine_cannot_send() {
+        // The default disco-less invocation, and Go's `--size 0` ("minimum size"), ask for the
+        // probe the daemon already sends.
+        assert_eq!(ping_probe_refusal(&PingProbe::default()), None);
+        assert_eq!(
+            ping_probe_refusal(&PingProbe {
+                size: 0,
+                ..Default::default()
+            }),
+            None
+        );
+        // `--icmp` names that same probe — `Device::ping` is an ICMP echo over the overlay
+        // netstack — so it is honoured, not refused.
+        assert_eq!(
+            ping_probe_refusal(&PingProbe {
+                icmp: true,
+                ..Default::default()
+            }),
+            None
+        );
+
+        // Each engine-gated flag refuses by name, and says where the gap is.
+        for (probe, flag) in [
+            (
+                PingProbe {
+                    tsmp: true,
+                    ..Default::default()
+                },
+                "--tsmp",
+            ),
+            (
+                PingProbe {
+                    peerapi: true,
+                    ..Default::default()
+                },
+                "--peerapi",
+            ),
+            (
+                PingProbe {
+                    size: 1400,
+                    ..Default::default()
+                },
+                "--size",
+            ),
+        ] {
+            let message =
+                ping_probe_refusal(&probe).unwrap_or_else(|| panic!("{flag} must refuse"));
+            assert!(
+                message.contains(flag),
+                "the refusal must name {flag}; got:\n{message}"
+            );
+            assert!(
+                message.contains("engine ask #38"),
+                "the refusal must point at the filed engine ask; got:\n{message}"
+            );
+            assert!(
+                message.contains("--icmp"),
+                "the refusal must say which probe DOES work; got:\n{message}"
+            );
+        }
+
+        // All three at once are named in one refusal rather than three in a row, and the sentence
+        // agrees in number.
+        let message = ping_probe_refusal(&PingProbe {
+            tsmp: true,
+            icmp: true,
+            peerapi: true,
+            size: 1400,
+        })
+        .expect("three engine-gated flags must refuse");
+        assert!(
+            message.starts_with("tnet ping --tsmp, --peerapi and --size are not supported"),
+            "got:\n{message}"
+        );
+        // Go's own precedence (tsmp > icmp > peerapi) picks a winner; we refuse the set, so the
+        // honoured `--icmp` must not appear in the refused list.
+        assert!(
+            !message.contains("--tsmp, --icmp"),
+            "`--icmp` is honoured and must not be listed as refused; got:\n{message}"
         );
     }
 
