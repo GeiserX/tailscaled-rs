@@ -43,6 +43,13 @@
 //!   path rather than fabricating a per-interface bind the HTTP client cannot do.
 //! - **No `captiveportal_detected` client metric.** Go bumps a `clientmetric` counter; this daemon
 //!   has no client-metric registry of its own (`tnet metrics` proxies the engine's).
+//! - **One connectivity signal instead of a health tracker.** Go probes while *any* warnable with
+//!   `ImpactsConnectivity` is unhealthy. This fork has no health tracker, so
+//!   [`Backend::connectivity_impacted`](super::Backend) reads the single connectivity fact the engine
+//!   publishes — the net report names no reachable DERP region — which is what Go registers as
+//!   `no-derp-home` (`health/warnings.go`) and the warnable a portal actually trips, since the portal
+//!   answers the relay connections itself. The *state* the trigger runs in is Go's unchanged:
+//!   `Running`, and only `Running`.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -77,14 +84,29 @@ pub(super) const WARNABLE_TEXT: &str =
 /// `captivePortalDetectionInterval`). A short blip on the way up must not fire a probe.
 pub(super) const DETECTION_INTERVAL: Duration = Duration::from_secs(2);
 
+/// How long "this node cannot reach any relay server" must persist before it counts as a
+/// connectivity problem at all — Go `health.noDERPHomeWarnable`'s `TimeToVisible`
+/// (`health/warnings.go`: *"Tailscale could not connect to any relay server"*, `ImpactsConnectivity:
+/// true`, `TimeToVisible: 10 * time.Second`).
+///
+/// That warnable is the one this fork stands in for: with no health tracker, "the engine measured no
+/// reachable DERP region" is the observable that Go turns into `no-derp-home`, and Go only feeds it
+/// to captive-portal detection once it has been unhealthy for this long. Honouring the same delay
+/// keeps a node whose *first* DERP measurement simply has not landed yet — an empty report on a
+/// freshly-`Running` node is indistinguishable from a dead one — from probing on every bring-up.
+/// Go's [`DETECTION_INTERVAL`] is then spent on top, exactly as it is upstream, where the health
+/// change arrives at the loop only after the warnable becomes visible.
+pub(super) const NO_DERP_HOME_TIME_TO_VISIBLE: Duration = Duration::from_secs(10);
+
 /// How long to wait before re-probing while connectivity *stays* impacted.
 ///
 /// FORK BEHAVIOUR, not a Go constant. Go re-triggers detection from its health tracker: every health
 /// state change while connectivity is impacted pushes onto `needsCaptiveDetection`, which re-arms the
 /// 2s timer. This fork has no health-event bus (see `crate::localapi`'s note on the reduced `Notify`),
 /// so the loop polls instead — and a bare 2s poll would mean an unreachable-control node probes
-/// tailscale.com every two seconds forever. The first pass keeps Go's 2s latency; subsequent passes
-/// back off to this, which still notices a portal that appears while the node is already stuck.
+/// tailscale.com every two seconds forever. The first pass of an episode keeps Go's settle time
+/// ([`NO_DERP_HOME_TIME_TO_VISIBLE`] + [`DETECTION_INTERVAL`]); subsequent passes back off to this,
+/// which still notices a portal that appears while the node is already stuck.
 pub(super) const RECHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The captive-portal loop's tick — how often it re-reads whether connectivity is impacted. Fine
