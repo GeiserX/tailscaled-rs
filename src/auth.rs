@@ -109,9 +109,10 @@ impl AuthPolicy {
 
 /// The effective uid of the current process (the daemon's owner), used for the same-user check.
 ///
-/// Private — the rest of the daemon goes through [`AuthPolicy`] and never calls libc directly, so
-/// the single `unsafe` site lives here.
-fn current_euid() -> u32 {
+/// Crate-private, and the only `geteuid` site in the daemon: [`AuthPolicy`] compares it against the
+/// LocalAPI peer's uid, and `bugreport --diagnose` reports it in its `permissions` check (Go
+/// `doctor/permissions`). Nothing outside those two goes near libc for it.
+pub(crate) fn current_euid() -> u32 {
     // SAFETY: geteuid() always succeeds, takes no arguments, and has no preconditions.
     unsafe { libc::geteuid() }
 }
@@ -436,7 +437,9 @@ mod tests {
         );
         assert!(!requires_write(&Request::Ip));
         assert!(!requires_write(&Request::Whois {
-            ip: "100.64.0.1".into()
+            ip: "100.64.0.1".into(),
+            port: None,
+            proto: None,
         }));
         assert!(!requires_write(&Request::Ping {
             ip: "100.64.0.1".into(),
@@ -463,8 +466,18 @@ mod tests {
             "lock log only reads the locally-synced AUM chain — a read"
         );
         assert!(
-            !requires_write(&Request::BugReport { note: None }),
+            !requires_write(&Request::BugReport {
+                note: None,
+                diagnose: false
+            }),
             "bugreport only reads daemon state into a marker — a read"
+        );
+        assert!(
+            !requires_write(&Request::BugReport {
+                note: None,
+                diagnose: true
+            }),
+            "--diagnose only adds read-only checks (Go's Doctor mutates nothing) — still a read"
         );
         assert!(
             !requires_write(&Request::GetServeConfig),
@@ -502,8 +515,12 @@ mod tests {
         assert_eq!(authorize(&Request::Ip, Access::ReadOnly), Ok(()));
         assert_eq!(
             authorize(
+                // Go's flow-scoped form (`whois --proto=tcp ip:port`) is the same `PermitRead`
+                // whois as the bare-IP one — the extra fields name a flow, they do not mutate.
                 &Request::Whois {
-                    ip: "100.64.0.1".into()
+                    ip: "100.64.0.1".into(),
+                    port: Some(22),
+                    proto: Some(crate::localapi::WhoisProto::Tcp),
                 },
                 Access::ReadOnly
             ),

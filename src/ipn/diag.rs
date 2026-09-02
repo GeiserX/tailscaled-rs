@@ -511,6 +511,17 @@ pub(super) async fn re_stun(dev: &tailscale::Device) -> Response {
 /// [`status`](super::Backend::status) uses to render peers (`fqdn`-or-`hostname` name +
 /// `tailnet_address.ipv4`), so the two diagnostic surfaces can never drift in how they name a node.
 ///
+/// `port` and `proto` carry Go's flow triple (`whois [--proto tcp|udp] ip[:port]`) through to here.
+/// Neither can change the answer on this engine, and that is checked, not assumed: `Device::whois`
+/// takes a `SocketAddr` whose port its `peer_tracker` immediately discards (`whois_addr` returns
+/// `addr.ip()`), and there is no proxied-flow table for a proto to select within — Go consults both
+/// only in its `ProxyMapper` fallback, which it reaches solely when the address matches NO node in
+/// the netmap. For every address this fork can resolve, Go answers by IP and ignores both too, so
+/// passing them is faithful rather than lossy. `port` is still handed to the engine (it is the
+/// `SocketAddr`'s port, ignored there); `proto` has nowhere to go and is bound below so it is
+/// explicitly accounted for rather than silently dropped. Engine ask #35 is the surface that would
+/// make either matter.
+///
 /// Maps the engine outcome to the wire [`WhoisReport`](crate::localapi::WhoisReport):
 /// - `Ok(Some(w))` → `found: true` with the node name/IPv4, the owner `user` (always `None` in
 ///   this fork — the domain node model drops the login), and just the capability *names* (the
@@ -520,7 +531,12 @@ pub(super) async fn re_stun(dev: &tailscale::Device) -> Response {
 ///   capability names.
 /// - `Ok(None)` → `found: false` (the IP matched no known tailnet node), all fields defaulted.
 /// - `Err(e)` → a clear [`Response::Error`] carrying the engine error.
-pub(super) async fn whois(dev: &tailscale::Device, ip: &str) -> Response {
+pub(super) async fn whois(
+    dev: &tailscale::Device,
+    ip: &str,
+    port: Option<u16>,
+    proto: Option<crate::localapi::WhoisProto>,
+) -> Response {
     // Parse first so a bad IP fails closed before the engine round-trip — naming the value. (The
     // device-absent "node is not up" branch now lives at the LocalAPI caller, which only reaches
     // here holding a device handle cloned off-lock; see `Backend::device_handle`.)
@@ -529,8 +545,15 @@ pub(super) async fn whois(dev: &tailscale::Device, ip: &str) -> Response {
             message: format!("invalid IP {ip:?}"),
         };
     };
-    // whois resolves by IP only (the engine ignores the port), so a 0 port is fine.
-    let sock = std::net::SocketAddr::new(addr, 0);
+    // The engine resolves by IP only — it discards the `SocketAddr`'s port — so Go's `ip[:port]`
+    // port rides along verbatim and a bare IP keeps Go's own 0 (`netip.AddrPortFrom(ip, 0)`).
+    let sock = std::net::SocketAddr::new(addr, port.unwrap_or(0));
+    // Bound, not used: there is no proxied-flow table on this engine for a protocol to select
+    // within (see the doc comment). Recorded in the trace so an operator debugging a flow lookup can
+    // see what the daemon was asked, and so the value is not silently swallowed.
+    if let Some(proto) = proto {
+        tracing::debug!(%proto, %sock, "whois: proto recorded; this engine resolves by IP only");
+    }
     match dev.whois(sock).await {
         Ok(Some(w)) => {
             // Reuse `StatusNode::from_node` — the exact name+ipv4 derivation `status` renders

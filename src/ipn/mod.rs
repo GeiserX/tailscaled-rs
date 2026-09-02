@@ -77,6 +77,7 @@ mod captive;
 mod config;
 mod control_url;
 mod diag;
+pub mod doctor;
 pub mod install;
 pub(crate) mod linkmon;
 mod profile;
@@ -497,6 +498,15 @@ fn validate_exit_node_selector(exit_node: Option<&str>) -> Result<()> {
     }
     Ok(())
 }
+
+/// Per-daemon-process counter that disambiguates two diagnostic markers taken in the same second
+/// ([`Backend::bugreport`]). `bugreport --record` prints one marker before the reproduction and one
+/// after; the coarse Unix-seconds stamp alone would render both identically when the operator is
+/// quick, and a before/after pair that reads as one value brackets nothing. Relaxed ordering is
+/// enough: the only requirement is that two markers from one daemon differ, not that the numbers
+/// track any other event. Process-local and NOT persisted — a restart re-starts at 0, which is fine
+/// because the seconds stamp already separates runs.
+static MARKER_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Harden an operator-supplied `bugreport` note for embedding in the diagnostic marker: replace every
 /// control character (newlines, tabs, ANSI escapes, etc.) with `_` so the marker stays a single,
@@ -3512,26 +3522,43 @@ impl Backend {
         diag::metrics(dev)
     }
 
-    /// Build a LOCAL diagnostic marker (the `tnet bugreport` path). Unlike Go's `bugreport`, which
-    /// uploads logs to logtail and returns the server-side log id, this fork has no log-upload
-    /// backend — the marker is a purely local identifier the operator can quote when reporting an
-    /// issue. It carries a `BUG-` prefix, a coarse Unix-seconds stamp (rough ordering/uniqueness),
-    /// the daemon version, the active profile, and the `want_running` intent. Reads only `self` (no
-    /// engine round-trip), so it works whether or not the node is up.
+    /// Build a LOCAL diagnostic marker (the `tnet bugreport` path), optionally with the
+    /// `--diagnose` pass attached. Unlike Go's `bugreport`, which uploads logs to logtail and
+    /// returns the server-side log id, this fork has no log-upload backend — the marker is a purely
+    /// local identifier the operator can quote when reporting an issue. It carries a `BUG-` prefix,
+    /// a coarse Unix-seconds stamp, a per-daemon sequence number, the daemon version, the active
+    /// profile, and the `want_running` intent. Reads only `self` (no engine round-trip), so it works
+    /// whether or not the node is up.
+    ///
+    /// The sequence number is what makes two markers taken in the same second **distinguishable**,
+    /// which `bugreport --record` depends on: it brackets a reproduction with a before/after pair,
+    /// and a pair that renders identically brackets nothing. (Go gets this from the random hex
+    /// suffix in its own marker; this fork counts instead, so the marker stays deterministic.)
     ///
     /// `note` is the operator's optional free-text note (Go `bugreport [note]`); when present it is
     /// appended as `-note:<note>`. It is sanitized of control characters first — it is operator-/
     /// caller-supplied text and the marker is meant to be copy-pasted into an issue, so a stray
     /// newline/escape must not corrupt it.
-    pub fn bugreport(&self, note: Option<&str>) -> crate::localapi::Response {
-        // SystemTime is the real std clock; a coarse seconds stamp makes the marker roughly unique +
-        // orderable without adding a uuid dependency.
+    ///
+    /// `probe` is `Some` exactly when the request set `--diagnose` (Go
+    /// `ipn.BugReportOpts.Diagnose`): the caller gathers it **off** the backend lock — it makes
+    /// syscalls and, when the node is up, one engine round-trip — and this method then renders the
+    /// checks from it plus the local facts only `self` holds. See [`doctor`] for what the pass
+    /// covers and why its output is returned rather than logged.
+    pub fn bugreport(
+        &self,
+        note: Option<&str>,
+        probe: Option<&doctor::Probe>,
+    ) -> crate::localapi::Response {
+        // SystemTime is the real std clock; a coarse seconds stamp makes the marker orderable
+        // without adding a uuid dependency, and the counter below disambiguates within one second.
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        let seq = MARKER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut marker = format!(
-            "BUG-{secs}-v{}-profile:{}-want_running:{}",
+            "BUG-{secs}-{seq}-v{}-profile:{}-want_running:{}",
             env!("CARGO_PKG_VERSION"),
             self.current_profile,
             self.prefs.want_running,
@@ -3541,7 +3568,45 @@ impl Backend {
             // clean, copy-pasteable token. `sanitize_marker_note` maps any control char to '_'.
             marker.push_str(&format!("-note:{}", sanitize_marker_note(n)));
         }
-        crate::localapi::Response::BugReport { marker }
+
+        // `--diagnose`: the state-of-this-daemon half of the pass. Cheap and non-blocking — the
+        // engine state is a `watch` borrow, everything else is already in memory — except the one
+        // `faccessat` on the state dir, which is a single syscall on a path we already own.
+        let checks = match probe {
+            None => Vec::new(),
+            Some(probe) => {
+                let (state, _auth_url, error) = match self.device.as_ref() {
+                    Some(dev) => state_from_device(dev.device_state()),
+                    None => (self.derive_state(false), None, None),
+                };
+                doctor::checks(
+                    &doctor::LocalFacts {
+                        state: state.as_str(),
+                        error: error.as_deref(),
+                        want_running: self.prefs.want_running,
+                        logged_out: self.prefs.logged_out,
+                        node_up: self.device.is_some(),
+                        profile: &self.current_profile,
+                        have_node_key: self.has_node_key,
+                        state_dir: &self.state_dir,
+                        state_dir_writable: doctor::dir_writable(&self.state_dir),
+                        prefs: &self.prefs,
+                    },
+                    probe,
+                )
+            }
+        };
+
+        crate::localapi::Response::BugReport { marker, checks }
+    }
+
+    /// Gather the out-of-backend half of the `--diagnose` pass (Go's `Doctor` checks that touch the
+    /// OS or the engine). A thin `pub` shim over [`doctor::Probe::gather`], kept on `Backend` so the
+    /// `server.rs` dispatch call site is uniform with the other off-lock diagnostics: the dispatch
+    /// clones the engine handle under a brief lock, drops the lock, calls this, and only then takes
+    /// the lock again to build the marker.
+    pub async fn diagnose_probe(dev: Option<&tailscale::Device>) -> doctor::Probe {
+        doctor::Probe::gather(dev).await
     }
 
     /// Report Tailnet Lock status (the `tnet lock status` path). Thin `pub` shim over
@@ -3794,8 +3859,13 @@ impl Backend {
     /// Resolve a tailnet IP to the peer that owns it (the `tnet whois` / Go `tailscale whois` path).
     /// A thin `pub` shim over [`diag::whois`], kept on `Backend` so the `server.rs` dispatch call
     /// site (`Backend::whois(&dev, ..)`) is unchanged. See [`diag::whois`] for the full mapping.
-    pub async fn whois(dev: &tailscale::Device, ip: &str) -> crate::localapi::Response {
-        diag::whois(dev, ip).await
+    pub async fn whois(
+        dev: &tailscale::Device,
+        ip: &str,
+        port: Option<u16>,
+        proto: Option<crate::localapi::WhoisProto>,
+    ) -> crate::localapi::Response {
+        diag::whois(dev, ip, port, proto).await
     }
 
     /// Fetch an OIDC id-token for this node scoped to `audience` (the `tnet id-token` / Go
@@ -4383,7 +4453,8 @@ mod tests {
         let be = backend_for(&dir);
 
         // No note → no `-note:` segment.
-        let crate::localapi::Response::BugReport { marker } = be.bugreport(None) else {
+        let crate::localapi::Response::BugReport { marker, checks } = be.bugreport(None, None)
+        else {
             panic!("expected BugReport");
         };
         assert!(
@@ -4394,9 +4465,26 @@ mod tests {
             !marker.contains("-note:"),
             "no note segment when omitted: {marker}"
         );
+        assert!(
+            checks.is_empty(),
+            "no --diagnose probe means no checks: {checks:?}"
+        );
+
+        // Two markers taken back-to-back (the `--record` pair) must be DISTINGUISHABLE, even though
+        // the seconds stamp is the same — otherwise the before/after bracket is a single value
+        // printed twice.
+        let crate::localapi::Response::BugReport { marker: second, .. } = be.bugreport(None, None)
+        else {
+            panic!("expected BugReport");
+        };
+        assert_ne!(
+            marker, second,
+            "two markers from one daemon must differ (the --record pair brackets a reproduction)"
+        );
 
         // A note → appended as `-note:<note>`.
-        let crate::localapi::Response::BugReport { marker } = be.bugreport(Some("dns broke"))
+        let crate::localapi::Response::BugReport { marker, .. } =
+            be.bugreport(Some("dns broke"), None)
         else {
             panic!("expected BugReport");
         };
@@ -4407,8 +4495,8 @@ mod tests {
 
         // A hostile note (newline + ESC + BEL) → control chars replaced with '_', marker stays one
         // line/token.
-        let crate::localapi::Response::BugReport { marker } =
-            be.bugreport(Some("evil\n\x1b[2J\x07x"))
+        let crate::localapi::Response::BugReport { marker, .. } =
+            be.bugreport(Some("evil\n\x1b[2J\x07x"), None)
         else {
             panic!("expected BugReport");
         };
@@ -4427,6 +4515,62 @@ mod tests {
         assert!(
             marker.contains("-note:evil"),
             "readable part survives: {marker}"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn bugreport_diagnose_attaches_the_check_pass_without_changing_the_marker() {
+        // `bugreport --diagnose` (Go `BugReportOpts.Diagnose` → `LocalBackend.Doctor`): the flag adds
+        // checks and touches nothing else. Driven through the real dispatch path — the probe is
+        // gathered exactly as `server.rs` gathers it, with no engine (the node is down), which is
+        // also the state an operator most often runs this in.
+        let dir = std::env::temp_dir().join(format!("tailnetd-diagnose-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let be = backend_for(&dir);
+
+        let probe = Backend::diagnose_probe(None).await;
+        let crate::localapi::Response::BugReport { marker, checks } =
+            be.bugreport(Some("dns broke"), Some(&probe))
+        else {
+            panic!("expected BugReport");
+        };
+
+        // The marker is the same shape as without the flag: Go's `--diagnose` changes what is
+        // logged, never the identifier the operator quotes.
+        assert!(
+            marker.starts_with("BUG-"),
+            "marker unchanged in shape: {marker}"
+        );
+        assert!(
+            marker.contains("-note:dns broke"),
+            "the note still rides: {marker}"
+        );
+
+        let joined = checks.join("\n");
+        for expected in [
+            "state: ",
+            "profile: ",
+            "prefs: ",
+            "permissions: ",
+            "dns-resolvers: ",
+            "interfaces: ",
+            "not-checked: ",
+        ] {
+            assert!(
+                checks.iter().any(|l| l.starts_with(expected)),
+                "the pass should report {expected:?}; got:\n{joined}"
+            );
+        }
+        assert!(
+            joined.contains("dns-resolvers: not checked — the node is not up"),
+            "a down node must say the DNS check had nothing to judge; got:\n{joined}"
+        );
+        assert!(
+            joined.contains(&format!("state_dir={}", dir.display())),
+            "the permissions check names the real state dir; got:\n{joined}"
         );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;

@@ -468,6 +468,12 @@ pub enum Request {
         /// backward-compatible (an older client sends the bare variant, which deserializes to `None`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         note: Option<String>,
+        /// Run the extra diagnostic pass (Go `bugreport --diagnose` →
+        /// `ipn.BugReportOpts.Diagnose` → `LocalBackend.Doctor`). The daemon then fills
+        /// [`Response::BugReport::checks`]; the marker itself is unaffected. `false` (the default)
+        /// keeps the wire byte-identical to a request from a client that predates the flag.
+        #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+        diagnose: bool,
     },
     /// Read the node's serve configuration (Go `GetServeConfig`; `tnet serve status`). Replies with
     /// [`Response::ServeConfig`]. Read-only — gated like [`Status`](Request::Status).
@@ -535,9 +541,33 @@ pub enum Request {
     /// [`Status`](Request::Status).
     Ip,
     /// Resolve a tailnet IP to the peer that owns it (Go `tailscale whois`). Read-only.
+    ///
+    /// Go's argument is `ip[:port]` and its LocalAPI query is `?proto=&addr=`, so the flow triple is
+    /// carried here as three fields: the address in [`ip`](Request::Whois::ip), the optional flow
+    /// [`port`](Request::Whois::port), and the optional [`proto`](Request::Whois::proto). Both new
+    /// fields are `#[serde(default)]`, so a request written by an older CLI (address only) still
+    /// deserializes.
     Whois {
-        /// The tailnet IP to resolve.
+        /// The tailnet IP to resolve. Address only — the port travels in [`port`](Request::Whois::port),
+        /// the way Go's `serveWhoIs` splits `addr` into a `netip.AddrPort` before the lookup.
         ip: String,
+        /// The flow's port, from Go's `ip[:port]` argument form. `None` when the caller named a bare
+        /// IP (Go's `netip.AddrPortFrom(ip, 0)`).
+        ///
+        /// HONEST SCOPE: a whois is a *flow* lookup in Go only for flows tailscaled itself proxies —
+        /// `LocalBackend.WhoIs` consults the port (and [`proto`](Request::Whois::proto)) solely in its
+        /// `ProxyMapper` fallback, reached when the address matches no node in the netmap. When the
+        /// address IS a tailnet address — every address this fork can answer for — Go resolves it by
+        /// IP and never looks at the port. The engine's `Device::whois` likewise resolves by IP and
+        /// discards the port, so this field records what was asked without changing the answer. The
+        /// engine surface a proxied-flow lookup would need is engine ask #35.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        port: Option<u16>,
+        /// The flow's protocol (Go `whois --proto`, `?proto=` on the LocalAPI query). `None` is Go's
+        /// empty value: "both". See [`port`](Request::Whois::port) for why this fork records it but
+        /// cannot select on it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proto: Option<WhoisProto>,
     },
     /// Fetch an OIDC id-token for this node, scoped to `audience` (Go `tailscale id-token <aud>`).
     /// The daemon asks control to mint a signed JWT; replies with [`Response::IdToken`]. A WRITE: it
@@ -811,6 +841,14 @@ pub enum Response {
         /// The marker string (a local identifier + daemon version + node state). NOT a server-side
         /// log id — this fork uploads nothing.
         marker: String,
+        /// The `--diagnose` pass, one `name: detail` line per check, ready to print (see
+        /// [`crate::ipn::doctor`]). EMPTY unless the request set
+        /// [`diagnose`](Request::BugReport::diagnose) — Go's `Doctor` likewise runs only then.
+        /// Returned rather than logged because this fork uploads no logs: the lines are for the
+        /// operator to read and paste, not for support to fetch. `#[serde(default)]` + skip keeps
+        /// the wire backward-compatible with a client that predates the flag.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        checks: Vec<String>,
     },
     /// The node's serve configuration (reply to [`Request::GetServeConfig`]), rendered by
     /// `tnet serve status`.
@@ -857,6 +895,50 @@ pub struct RevertedPref {
     /// `"true"`/`"false"`; for a list it is the comma-joined set; for an optional string it is the
     /// value itself.
     pub value: String,
+}
+
+/// The transport protocol of the flow a [`Request::Whois`] asks about — Go `tailscale whois
+/// --proto`, documented upstream as `protocol; one of "tcp" or "udp"; empty means both`.
+///
+/// Go passes the flag's string straight through to `?proto=` unvalidated (an unrecognized value
+/// simply matches nothing in its proxied-flow table). This fork parses it into a closed enum
+/// instead — see [`FromStr`](WhoisProto::from_str) — because the value can never select anything
+/// here (engine ask #35), and a silently-ignored `--proto=TCP` typo would be indistinguishable from
+/// a working one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WhoisProto {
+    /// Go `--proto=tcp`.
+    Tcp,
+    /// Go `--proto=udp`.
+    Udp,
+}
+
+impl std::fmt::Display for WhoisProto {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        })
+    }
+}
+
+impl std::str::FromStr for WhoisProto {
+    type Err = String;
+
+    /// Parse Go's two documented values. Case-sensitive and exact, like every other proto string Go
+    /// compares against (`ProxyMapper.WhoIsIPPort` keys its table on the literal `"tcp"`/`"udp"`),
+    /// so `TCP` is a refusal rather than a silent alias. The empty string is NOT accepted here: it is
+    /// Go's "both", which this fork models as `None` at the call site, not as a variant.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "tcp" => Ok(Self::Tcp),
+            "udp" => Ok(Self::Udp),
+            other => Err(format!(
+                "invalid --proto {other:?}: expected \"tcp\" or \"udp\" (empty means both)"
+            )),
+        }
+    }
 }
 
 /// The identity behind a tailnet IP, returned by [`Request::Whois`]. The Rust analogue of tsnet's
@@ -2233,31 +2315,98 @@ mod tests {
 
     #[test]
     fn bug_report_request_wire_is_back_compatible() {
-        // `BugReport` changed from a unit variant to `{ note: Option<String> }`. This LOCKS the wire
-        // back-compat both ways (the riskiest part of that change): a no-note request must serialize
-        // BYTE-IDENTICAL to the old bare unit variant (`skip_serializing_if` is what makes this hold —
-        // no `"note":null`), and the old bare JSON must still deserialize (→ note: None). Mirrors the
-        // per-variant wire-lock convention every sibling request already follows.
+        // `BugReport` changed from a unit variant to `{ note: Option<String> }`, and then grew
+        // `diagnose: bool`. This LOCKS the wire back-compat both ways (the riskiest part of those
+        // changes): a plain request must serialize BYTE-IDENTICAL to the old bare unit variant
+        // (`skip_serializing_if` on both fields is what makes this hold — no `"note":null`, no
+        // `"diagnose":false`), and the old bare JSON must still deserialize (→ note: None,
+        // diagnose: false). Mirrors the per-variant wire-lock convention every sibling request
+        // already follows.
         assert_eq!(
-            serde_json::to_string(&Request::BugReport { note: None }).unwrap(),
+            serde_json::to_string(&Request::BugReport {
+                note: None,
+                diagnose: false
+            })
+            .unwrap(),
             r#"{"cmd":"bug_report"}"#,
-            "no-note must be byte-identical to the old unit variant's wire form"
+            "a plain bugreport must be byte-identical to the old unit variant's wire form"
         );
-        // Old client's bare JSON → new struct variant with note: None (forward-compat).
+        // Old client's bare JSON → new struct variant with both fields defaulted (forward-compat).
         assert!(matches!(
             serde_json::from_str::<Request>(r#"{"cmd":"bug_report"}"#).unwrap(),
-            Request::BugReport { note: None }
+            Request::BugReport {
+                note: None,
+                diagnose: false
+            }
         ));
         // With a note, the field is present on the wire and round-trips.
         assert_eq!(
             serde_json::to_string(&Request::BugReport {
-                note: Some("dns broke".into())
+                note: Some("dns broke".into()),
+                diagnose: false
             })
             .unwrap(),
             r#"{"cmd":"bug_report","note":"dns broke"}"#
         );
         match serde_json::from_str::<Request>(r#"{"cmd":"bug_report","note":"x"}"#).unwrap() {
-            Request::BugReport { note } => assert_eq!(note.as_deref(), Some("x")),
+            Request::BugReport { note, diagnose } => {
+                assert_eq!(note.as_deref(), Some("x"));
+                assert!(!diagnose, "an absent diagnose key means the pass is off");
+            }
+            other => panic!("expected BugReport, got {other:?}"),
+        }
+        // `--diagnose` rides as its own key and round-trips.
+        assert_eq!(
+            serde_json::to_string(&Request::BugReport {
+                note: None,
+                diagnose: true
+            })
+            .unwrap(),
+            r#"{"cmd":"bug_report","diagnose":true}"#
+        );
+        match serde_json::from_str::<Request>(r#"{"cmd":"bug_report","diagnose":true}"#).unwrap() {
+            Request::BugReport { note, diagnose } => {
+                assert_eq!(note, None);
+                assert!(diagnose);
+            }
+            other => panic!("expected BugReport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bug_report_response_checks_are_wire_optional() {
+        // The reply grew `checks` alongside `--diagnose`. A marker-only reply (the no-`--diagnose`
+        // case, and every reply an older daemon sends) must stay byte-identical to the pre-change
+        // wire form, and old JSON must still deserialize — otherwise a mixed-version pair breaks on
+        // the one command an operator reaches for when things are already broken.
+        assert_eq!(
+            serde_json::to_string(&Response::BugReport {
+                marker: "BUG-1-0".into(),
+                checks: Vec::new()
+            })
+            .unwrap(),
+            r#"{"kind":"bug_report","marker":"BUG-1-0"}"#,
+            "no checks must not appear on the wire at all"
+        );
+        match serde_json::from_str::<Response>(r#"{"kind":"bug_report","marker":"BUG-1-0"}"#)
+            .unwrap()
+        {
+            Response::BugReport { marker, checks } => {
+                assert_eq!(marker, "BUG-1-0");
+                assert!(checks.is_empty(), "an absent checks key means no pass ran");
+            }
+            other => panic!("expected BugReport, got {other:?}"),
+        }
+        // With a pass, the lines ride along and round-trip in order.
+        let json = serde_json::to_string(&Response::BugReport {
+            marker: "BUG-1-0".into(),
+            checks: vec!["state: Running".into(), "profile: default".into()],
+        })
+        .unwrap();
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::BugReport { checks, .. } => {
+                assert_eq!(checks, ["state: Running", "profile: default"]);
+            }
             other => panic!("expected BugReport, got {other:?}"),
         }
     }
@@ -2676,6 +2825,77 @@ mod tests {
         match serde_json::from_str::<Request>(r#"{"cmd":"logout"}"#).unwrap() {
             Request::Logout { reason } => assert_eq!(reason, None),
             other => panic!("expected Logout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn whois_request_carries_gos_flow_triple_and_stays_backward_compatible() {
+        // Go's `whois [--proto tcp|udp] ip[:port]` is a flow triple, so the request carries the port
+        // and the protocol alongside the address. Both are additive: the bare `{"cmd":"whois",
+        // "ip":...}` an older CLI sends must still parse, and a bare-IP request must still serialize
+        // to exactly that historical form (skip_serializing_if).
+        let json = serde_json::to_string(&Request::Whois {
+            ip: "100.64.0.9".into(),
+            port: Some(22),
+            proto: Some(WhoisProto::Tcp),
+        })
+        .unwrap();
+        assert_eq!(
+            json, r#"{"cmd":"whois","ip":"100.64.0.9","port":22,"proto":"tcp"}"#,
+            "the proto must ride the wire as Go's lowercase spelling"
+        );
+        match serde_json::from_str::<Request>(&json).unwrap() {
+            Request::Whois { ip, port, proto } => {
+                assert_eq!(ip, "100.64.0.9");
+                assert_eq!(port, Some(22));
+                assert_eq!(proto, Some(WhoisProto::Tcp));
+            }
+            other => panic!("expected Whois, got {other:?}"),
+        }
+        let bare = serde_json::to_string(&Request::Whois {
+            ip: "100.64.0.9".into(),
+            port: None,
+            proto: None,
+        })
+        .unwrap();
+        assert_eq!(
+            bare, r#"{"cmd":"whois","ip":"100.64.0.9"}"#,
+            "a bare-IP whois must serialize to the historical form"
+        );
+        match serde_json::from_str::<Request>(r#"{"cmd":"whois","ip":"100.64.0.9"}"#).unwrap() {
+            Request::Whois { ip, port, proto } => {
+                assert_eq!(ip, "100.64.0.9");
+                assert_eq!(port, None, "an older CLI's request means Go's port 0");
+                assert_eq!(proto, None, "and Go's empty proto: both");
+            }
+            other => panic!("expected Whois, got {other:?}"),
+        }
+        // A proto the daemon does not know must not deserialize into some default — the closed enum
+        // is what keeps a bogus value off the lookup path.
+        assert!(
+            serde_json::from_str::<Request>(r#"{"cmd":"whois","ip":"100.64.0.9","proto":"sctp"}"#)
+                .is_err(),
+            "an unknown proto must be a parse failure, not a silent fallback"
+        );
+    }
+
+    #[test]
+    fn whois_proto_parses_and_renders_gos_two_values() {
+        // Go documents the flag as `one of "tcp" or "udp"; empty means both`. The empty case is
+        // modelled as `None` at the call site, so `FromStr` accepts exactly the two named values,
+        // exactly as spelled.
+        assert_eq!("tcp".parse::<WhoisProto>(), Ok(WhoisProto::Tcp));
+        assert_eq!("udp".parse::<WhoisProto>(), Ok(WhoisProto::Udp));
+        assert_eq!(WhoisProto::Tcp.to_string(), "tcp");
+        assert_eq!(WhoisProto::Udp.to_string(), "udp");
+        for bad in ["TCP", "Udp", "sctp", "icmp", ""] {
+            let err = bad
+                .parse::<WhoisProto>()
+                .expect_err("only Go's two documented values parse");
+            assert!(
+                err.contains("expected \"tcp\" or \"udp\" (empty means both)"),
+                "the refusal should quote Go's own flag documentation: {err}"
+            );
         }
     }
 

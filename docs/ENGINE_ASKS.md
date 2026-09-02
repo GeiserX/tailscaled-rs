@@ -1152,9 +1152,144 @@ ordering) and are refused by name in `check_unmodelled_set_flags`; wiring them i
 pref + `get_settings` row, and the refusal is deleted. `--sync`/`--no-sync` is the same shape.
 `--remote-config` keeps its refusal permanently. Tracked in daemon bead tsd-re94825b. — daemon lane
 
----
+## 35. Proxied-flow `whois` — a `(proto, ip:port) → node` lookup (for `tnet whois --proto`)
 
-## 35. Selectable ping types and a ping size — `Device::ping_typed` (for Go `ping --tsmp` / `--peerapi` / `--size`)
+**Why:** Go's `whois` is a *flow* lookup, not an address lookup. `cmd/tailscale/cli/whois.go` @
+`53a0d659afa51835dd7a9283873cca44261454f8` takes `ip[:port]` and a `--proto` selector (`protocol; one
+of "tcp" or "udp"; empty means both`) and calls `LocalClient.WhoIsProto`, which reaches
+`LocalBackend.WhoIs(proto, ipp)`. That method resolves by IP first (`cn.NodeByAddr`) and consults the
+protocol **only** in its fallback: when the address matches no node in the netmap and the port is
+non-zero, it asks `b.sys.ProxyMapper().WhoIsIPPort(proto, ipp)` — for `""` it tries `"tcp"` then
+`"udp"` — to map a locally-proxied flow (a `127.0.0.1:port` socket tailscaled itself proxied) back to
+the tailnet IP behind it, then resolves that. So the same `ip:port` really can belong to different
+sessions per protocol, but only for flows the daemon proxies.
+
+Verified against pin `9d847a6e`/v0.43.0. The engine has no such table and no port dimension at all:
+`Device::whois(SocketAddr)` (`src/lib.rs`) forwards to `ts_runtime`, whose `peer_tracker::whois_opt`
+calls `status::whois_addr(addr)` — the whole body of which is `addr.ip()` — and then
+`peer_by_tailnet_ip_opt`. There is no proxy-map type anywhere in the workspace, so nothing records
+which local socket belongs to which peer, and a protocol has nothing to select within.
+
+**Ask:**
+
+1. A proxied-flow registry in the engine, the analogue of Go's `proxymap.Mapper`: the netstack /
+   userspace-proxy paths record `(proto, local ip:port) → peer tailnet IP` when they proxy a
+   connection, and drop the entry when it closes.
+2. `Device::whois_proto(proto: Option<Proto>, addr: SocketAddr) -> Result<Option<WhoIs>, Error>` (or
+   a `proto` parameter on the existing `whois`): resolve by IP as today, and on a miss with a
+   non-zero port, consult (1) — trying `tcp` then `udp` when `proto` is `None`, which is Go's
+   empty-means-both order — and resolve the mapped tailnet IP.
+
+(1) is the substantial half; (2) is the surface over it. Both are additive: today's `whois(addr)` is
+(2) with `proto: None` and a port of 0.
+
+**Daemon impact once landed:** `tnet whois [--proto tcp|udp] ip[:port]` already parses Go's arguments
+in full, and the LocalAPI `Request::Whois` already carries `port` and `proto` through to
+`diag::whois`, which hands the port to the engine and can only record the protocol. Wiring it is one
+call-site change in `diag::whois` plus deleting the "recorded, cannot select" notes on the flag help
+and the wire docs. Until then a proxied flow that Go attributes to a peer is reported here as owned by
+no node, with or without the flag. Tracked in daemon bead tsd-re4d7624. — daemon lane
+
+## 36. Tailnet-lock init with a trusted-key set, several disablements, and this node's own lock key (for `tnet lock init`)
+
+**Why:** Go's `lock init` initializes the authority the operator describes, not a fixed one.
+`cmd/tailscale/cli/tailnet-lock.go` @ `53a0d659afa51835dd7a9283873cca44261454f8` takes
+`[--gen-disablement-for-support] --gen-disablements N <trusted-key>...`, where the positionals are the
+tailnet lock **public keys** (`tlpub:<hex>`, optionally `<key>?<votes>`) initially trusted to sign
+nodes — plus any pre-computed `disablement:<hex>` values — mints `N` disablement secrets itself,
+optionally mints one more that is transmitted to the coordination server for support, and calls
+`LocalClient.TailnetLockInit(ctx, keys, disablementValues, supportDisablement)`. Before any of that it
+refuses when `st.Enabled`, and refuses when the current node's own lock key is not among the trusted
+keys (`st.PublicKey`, from `NetworkLockStatus`) — "the tailnet lock key of the current node must be
+one of the trusted keys during initialization".
+
+Verified against pin `9d847a6e`/v0.43.0. The engine's init is a fixed single-node genesis:
+`Device::tka_init(disablement_secret: Vec<u8>)` (`src/lib.rs`) → `ts_runtime`'s `tka_init_run`
+(`control_runner.rs`), whose body builds `AumKey { kind: Ed25519, votes: 1, public:
+keys.network_lock_keys.public }` as the **sole** trusted key and `vec![disablement_value(&secret)]` as
+the **single** disablement value, then submits init/begin → init/finish. Three consequences:
+
+1. **No key set.** There is no parameter for one, so a tailnet cannot be locked with a second signing
+   node trusted from the start — the case Go's help is written around ("run `tailscale lock` on that
+   node, and copy the node's tailnet lock key").
+2. **No way to read this node's lock key.** `TkaStatus` (`ts_control/src/tka.rs`) carries only `head`
+   and `disabled` — no analogue of Go's `NetworkLockStatus.PublicKey` — and nothing else on `Device`
+   exposes `network_lock_keys.public`. So Go's self-key refusal cannot be *evaluated* here, and the
+   operator cannot obtain the key that Go's grammar requires them to pass.
+3. **The support disablement is unconditional.** `tka_init_run` sets
+   `TkaInitFinishRequest.support_disablement = disablement_secret` — the one secret it was given — so
+   the operator's disablement secret always reaches the coordination server. Upstream sends a
+   *separate*, purpose-minted secret there, and only when `--gen-disablement-for-support` is passed.
+
+**Ask** (extends #17 `tka_init` and #25's key-set half):
+
+1. `Device::tka_init(keys: Vec<AumKey>, disablement_values: Vec<Vec<u8>>, support_disablement:
+   Option<Vec<u8>>)` — the genesis built from the caller's trusted-key set and disablement values,
+   with the support secret sent only when it is `Some`. Today's call is that with the node's own key,
+   one derived value, and the secret repeated as the support disablement.
+2. This node's tailnet lock public key on the read path — a field on `TkaStatus` (Go's
+   `NetworkLockStatus.PublicKey`) or a `Device::tka_public_key()` — so the CLI can print it for the
+   operator to copy and can check Go's "current node must be among the trusted keys" refusal.
+
+**Daemon impact once landed:** `tnet lock init` already parses Go's whole positional grammar
+(`parse_lock_args`, a port of upstream's `parseTLArgs`, including `<key>?<votes>` and both
+`disablement:` prefixes) and already runs Go's `--confirm` two-step, its already-enabled refusal and
+its secret minting. Wiring is: pass the parsed keys and values to the new `tka_init`, delete the
+"this daemon cannot …" refusals in `plan_lock_init`, replace the placeholder trusted-key line with
+Go's `- tlpub:%x (%s key)` list, restore Go's self-key check against (2), and drop the
+support-disablement note the command prints today. Until then the fork initializes only the subset the
+engine has — this node as the sole trusted key, one disablement secret — and says so where the
+operator hits it. Tracked in daemon bead tsd-reb2dfc1. — daemon lane
+
+## 37. Per-peer `Location` (and `Active`) on `StatusNode` — for `exit-node list`'s country/city columns and `--filter`
+
+**Why:** Go's `exit-node list` is a *location* browser. `cmd/tailscale/cli/exitnode.go` @
+`53a0d659afa51835dd7a9283873cca44261454f8` runs the exit-node peers through
+`filterFormatAndSortExitNodes`, which buckets them by `Location.CountryCode` then `Location.CityCode`,
+keeps only the highest-`Location.Priority` node per city (plus whichever is the active exit node),
+synthesises an `Any` city row holding the country's best node when a country has more than one city,
+sorts countries and cities by name, and honours `--filter` ("filter exit nodes by country") with a
+case-insensitive match against `Location.Country`. It then prints five columns — IP, HOSTNAME,
+COUNTRY, CITY, STATUS.
+
+Verified against pin `9d847a6e`/v0.43.0. The **wire** type is already there and already parsed:
+`ts_control_serde::Location` (`ts_control_serde/src/location.rs`) carries `country`, `country_code`,
+`city`, `city_code`, `latitude`, `longitude` and `priority`, and `HostInfo.location:
+Option<Location<'a>>` (`ts_control_serde/src/host_info.rs`) decodes it off the netmap. It is dropped
+one layer up: `impl From<..> for Node` (`ts_control/src/node.rs`) projects `host_info.services`,
+`host_info.net_info.preferred_derp` and `host_info.peer_relay` into the domain `Node` but not
+`host_info.location`, so `ts_control::Node` has no location field, `StatusNode`
+(`ts_runtime/src/status.rs`) has none either, and neither does the daemon's `PeerReport`. Nothing
+between the decoder and the CLI can group, sort or filter by country.
+
+`StatusNode` is also missing Go's `PeerStatus.Active` (traffic seen in the last couple of minutes),
+which `peerStatus` consults before `Online` when it picks the STATUS wording.
+
+**Ask:**
+
+1. Retain the decoded location on the domain node — `Node::location: Option<Location>` (an owned
+   analogue of `ts_control_serde::Location`), projected in `From<..> for Node` next to the other
+   `host_info` fields it already keeps, `None` when the peer declared none (never fabricated).
+2. Surface it on the status view — `StatusNode::location: Option<Location>`, the analogue of Go's
+   `ipnstate.PeerStatus.Location`. `priority` is the field the per-city reduction needs, so it has to
+   ride along with the names and codes.
+3. `StatusNode::active: bool` — Go's `PeerStatus.Active`, true when traffic has been seen for the peer
+   recently. Independent of (1) and (2) and useful to `tnet status` as well.
+
+All three are additive: today's behaviour is (1)/(2) always `None` and (3) always `false`.
+
+**Daemon impact once landed:** `tnet exit-node list` already prints Go's five columns, sorts by DNS
+name, ports Go's `peerStatus` and both of its error paths (`no exit nodes found`, `no exit nodes found
+for %q`), and accepts `--filter`. What it cannot do is *group*: with no `Location`, every peer takes
+Go's own no-location path — one unnamed country, one unnamed city, no priority reduction, no `Any`
+row, `-` printed for country and city — and any non-empty `--filter` can only reach the "found for %q"
+error. Wiring is: carry `location` through `peer_report_from_status_node` into `PeerReport`, then port
+`filterFormatAndSortExitNodes` itself (the country/city buckets, the priority reduction, the `Any`
+row, the two name sorts) and match `--filter` against the real country. (3) removes the last deviation
+in the STATUS column, where an idle-but-online selected exit node currently reads `selected` and Go
+says `selected but offline`. Tracked in daemon bead tsd-red57f03. — daemon lane
+
+## 38. Selectable ping types and a ping size — `Device::ping_typed` (for Go `ping --tsmp` / `--peerapi` / `--size`)
 
 **Why:** Go's `tailscale ping` (`cmd/tailscale/cli/ping.go` @
 `53a0d659afa51835dd7a9283873cca44261454f8`) does not have one probe, it has four, and the operator

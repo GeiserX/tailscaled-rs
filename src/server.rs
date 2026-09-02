@@ -1118,9 +1118,21 @@ async fn dispatch(
         }
         // `bugreport` (Go `tailscale bugreport`). Reads only daemon state under a brief lock (no
         // engine round-trip); works whether or not the node is up.
-        Request::BugReport { note } => {
+        //
+        // `--diagnose` (Go `BugReportOpts.Diagnose` → `LocalBackend.Doctor`) adds the checks that DO
+        // touch the OS and the engine, so they are gathered FIRST — engine handle cloned under a
+        // brief lock, lock dropped, probe run off-lock — and only then is the lock retaken to build
+        // the marker. That keeps the marker's "brief lock, no engine round-trip" promise true with
+        // the flag on, exactly as the other off-lock diagnostics do it.
+        Request::BugReport { note, diagnose } => {
+            let probe = if diagnose {
+                let dev = { backend.lock().await.device_handle() };
+                Some(Backend::diagnose_probe(dev.as_deref()).await)
+            } else {
+                None
+            };
             let be = backend.lock().await;
-            be.bugreport(note.as_deref())
+            be.bugreport(note.as_deref(), probe.as_ref())
         }
         // `serve status` (Go GetServeConfig): read the persisted serve config under a brief lock.
         Request::GetServeConfig => {
@@ -1257,10 +1269,10 @@ async fn dispatch(
                 },
             }
         }
-        Request::Whois { ip } => {
+        Request::Whois { ip, port, proto } => {
             let dev = { backend.lock().await.device_handle() };
             match dev {
-                Some(dev) => Backend::whois(&dev, &ip).await,
+                Some(dev) => Backend::whois(&dev, &ip, port, proto).await,
                 None => Response::Error {
                     message: "node is not up".into(),
                 },
