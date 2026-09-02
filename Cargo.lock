@@ -4816,6 +4816,7 @@ dependencies = [
  "geiserx_tailscale",
  "geiserx_ts_capabilityversion",
  "geiserx_ts_control",
+ "getrandom 0.3.4",
  "if-addrs",
  "ipnet",
  "libc",
