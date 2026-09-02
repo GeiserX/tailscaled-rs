@@ -725,11 +725,29 @@ enum Command {
         #[arg(long, value_name = "IP", conflicts_with = "peer")]
         assert: Option<String>,
     },
-    /// Show which tailnet node owns an IP address.
+    /// Show which tailnet node owns an address (Go `tailscale whois [--json] ip[:port]`).
     Whois {
-        /// The tailnet IP to resolve to its owning node.
-        #[arg(value_name = "IP")]
-        ip: String,
+        /// The address to resolve to its owning node: a tailnet IP, or Go's `ip[:port]` flow form
+        /// (`100.64.0.9:22`, `[fd7a::1]:22`). The port names a flow; see `--proto`.
+        //
+        // Collected as a list, not a single value, so the arity refusals are Go's own words rather
+        // than clap's: `whois_target` turns zero or two-plus arguments into the upstream messages.
+        // (A `//` comment, not a doc comment — this is why the type is a `Vec`, not something the
+        // `--help` reader needs.)
+        #[arg(value_name = "IP[:PORT]")]
+        target: Vec<String>,
+        /// Protocol of the flow to look up: `tcp` or `udp`; omitted means both (Go
+        /// `tailscale whois --proto`).
+        ///
+        /// HONEST SCOPE: accepted and carried to the daemon, but it cannot change the answer on this
+        /// build. Go consults `--proto` (and the port) only for flows tailscaled itself proxies —
+        /// its `ProxyMapper` fallback, reached when the address matches no node in the netmap — and
+        /// for a tailnet address, the only kind this fork resolves, Go answers by IP and ignores the
+        /// protocol too. The pinned engine keeps no proxied-flow table (engine ask #35), so a
+        /// proxied `127.0.0.1:port` flow that Go would attribute to a peer is reported here as
+        /// owned by no node, with or without this flag.
+        #[arg(long, value_name = "PROTO")]
+        proto: Option<String>,
         /// Emit the result as JSON (Go `tailscale whois --json`) — the raw `WhoisReport` object, for
         /// scripting, instead of the human table.
         #[arg(long)]
@@ -811,9 +829,27 @@ enum Command {
         #[arg(long, value_name = "PREFIX")]
         prefix: Option<String>,
         /// Do not open a browser window after starting (the server still runs). Without this, a
-        /// browser is opened to the served URL (best-effort).
+        /// browser is opened to the served URL (best-effort). Ignored with `--cgi`, which never
+        /// opens a browser (there is no long-lived server to browse to).
         #[arg(long)]
         no_browser: bool,
+        /// Run as a CGI script (Go `web --cgi`) instead of binding a listener: serve exactly ONE
+        /// request from the CGI/1.1 environment (`REQUEST_METHOD`, `REQUEST_URI` or
+        /// `SCRIPT_NAME`+`PATH_INFO`), write the response to stdout, and exit. This is the mode a
+        /// web server invokes the binary in per request, so nothing else may be written to stdout —
+        /// the startup line and the browser launch are both suppressed. `--listen` is meaningless
+        /// here (no listener is bound) and is refused alongside it.
+        #[arg(long)]
+        cgi: bool,
+        /// Absolute URL the UI is actually reached at (Go `web --origin`), when that is not the
+        /// address it bound — behind a reverse proxy, or under `--cgi`, where nothing is bound at
+        /// all. `--prefix` fixes the path the server answers on; only this fixes the scheme and
+        /// host. Must be an absolute `http`/`https` URL with a host and no query/fragment/userinfo
+        /// (e.g. `https://ts.example.com/tailscale`). Used for link generation only: the URL this
+        /// command reports and opens, and the `<link rel="canonical">` the served page states for
+        /// itself. This build's UI is read-only, so the origin gates nothing else.
+        #[arg(long, value_name = "URL")]
+        origin: Option<String>,
     },
     /// Check for (and optionally install) a newer release of this client (Go `tailscale update`).
     /// Queries the project's GitHub Releases for the latest version and compares it to the running
@@ -1537,18 +1573,53 @@ enum MetricsCmd {
 /// `tnet lock` subcommands.
 #[derive(Subcommand)]
 enum LockCmd {
-    /// Initialize Tailnet Lock for this tailnet with **this node** as the sole initial trusted key
-    /// (Go `tailscale lock init`, single-node case). The `disablement-secret` you supply is the
-    /// operator-held capability that can later turn the lock off (`tnet lock disable <secret>`) — keep
-    /// it safe; without it the lock cannot be disabled. Single-node only for now: if the tailnet has
-    /// other nodes that would need (re)signing under the new lock, control refuses and the engine
-    /// surfaces that (multi-node init is a deferred follow-up). Submit-only — the lock takes effect on
-    /// the next verified netmap sync.
+    /// Initialize Tailnet Lock for this tailnet (Go `tailscale lock init`). The positional arguments
+    /// are Go's, and mean what they mean in Go: the tailnet lock public keys (`tlpub:<hex>`,
+    /// optionally `<key>?<votes>`) initially trusted to sign nodes, and/or pre-computed
+    /// `disablement:<hex>` values. They are NOT a disablement secret — this command MINTS the
+    /// disablement secrets itself (`--gen-disablements`, default 1) and prints them once, after
+    /// which they cannot be shown again. Nothing happens without `--confirm`: without it the command
+    /// prints what it would do and the exact command to re-run.
+    ///
+    /// What this daemon can initialize is NARROWER than Go, and the difference is refused by name
+    /// rather than reinterpreted. The engine's `tka_init` takes no trusted-key set — it always
+    /// initializes trusting this node's own tailnet lock key alone, with one vote — stores exactly
+    /// one disablement value, which it derives itself from a secret, and exposes no way to read this
+    /// node's lock key back. So `<trusted-key>` arguments, `disablement:` values,
+    /// `--gen-disablement-for-support` and a `--gen-disablements` other than 1 are all refused
+    /// naming what is missing (docs/ENGINE_ASKS.md #36). `tnet lock init --confirm`, with no
+    /// positional arguments, is the whole of the supported subset: this node as the sole trusted
+    /// key, one minted disablement secret, printed once.
+    ///
+    /// Also unlike Go: the engine transmits that one secret to the coordination server as the
+    /// support disablement, which Go does only when asked with `--gen-disablement-for-support`.
+    /// Submit-only either way — the lock takes effect on the next verified netmap sync.
     Init {
-        /// The disablement secret to gate the lock with, hex-encoded. This is the value you later pass
-        /// to `tnet lock disable`. Choose a high-entropy secret and store it securely.
-        #[arg(value_name = "DISABLEMENT-SECRET")]
-        disablement_secret: String,
+        /// The tailnet lock keys initially trusted to sign nodes (`tlpub:<hex>`, or `<key>?<votes>`
+        /// to weight one), and/or pre-computed `disablement:<hex>` values — Go's positionals. This
+        /// daemon can honour neither (see the command help): they are parsed with Go's grammar and
+        /// then refused, never reinterpreted as something else.
+        #[arg(value_name = "TRUSTED-KEY")]
+        trusted_keys: Vec<String>,
+        /// Number of disablement secrets to generate (Go `--gen-disablements`, default 1). Only the
+        /// default can be initialized here — the engine stores exactly one disablement value.
+        #[arg(long = "gen-disablements", value_name = "N")]
+        gen_disablements: Option<usize>,
+        /// Generate one ADDITIONAL disablement secret and transmit it to the coordination server so
+        /// support can disable the lock (Go `--gen-disablement-for-support`). Refused here — see the
+        /// command help.
+        #[arg(long = "gen-disablement-for-support")]
+        gen_disablement_for_support: bool,
+        /// Do it (Go `--confirm`). Without this flag the command prints the keys it would trust, how
+        /// many secrets it would mint, and the exact command to re-run — and changes nothing.
+        #[arg(long)]
+        confirm: bool,
+        /// NOT a Go flag — an addition, and the only way to choose the secret yourself. Use this
+        /// hex-encoded secret as the lock's single disablement secret instead of minting one. This
+        /// is what `tnet lock init` used to take as its positional argument; it keeps working under
+        /// a name that cannot be confused with Go's `<trusted-key>` positional.
+        #[arg(long = "disablement-secret", value_name = "HEX-SECRET")]
+        disablement_secret: Option<String>,
     },
     /// Show Tailnet Lock status (read-only).
     Status {
@@ -2599,7 +2670,11 @@ async fn main() -> Result<()> {
             peer,
             assert,
         } => run_ip(&socket, v4, v6, first, peer, assert).await,
-        Command::Whois { ip, json } => run_whois(&socket, ip, json).await,
+        Command::Whois {
+            target,
+            proto,
+            json,
+        } => run_whois(&socket, &target, proto.as_deref(), json).await,
         Command::IdToken { audience } => {
             dispatch_simple(&socket, Request::IdToken { audience }).await
         }
@@ -2646,24 +2721,50 @@ async fn main() -> Result<()> {
         // `web` (Go `tailscale web`): serve the read-only status UI. Reuses the same embedded HTTP
         // server as `status --web`, but with Go's command name + flags (default localhost:8088). The
         // `--readonly` flag is a no-op (this build's web UI is always read-only). `--prefix` serves
-        // the page under a URL path prefix (for reverse proxies).
+        // the page under a URL path prefix (for reverse proxies), `--origin` states the absolute URL
+        // the UI is reached at, and `--cgi` swaps the listener for one CGI request/response.
         Command::Web {
             listen,
             readonly: _,
             prefix,
             no_browser,
+            cgi,
+            origin,
         } => {
-            let listen = listen.unwrap_or_else(|| "localhost:8088".to_string());
-            let prefix = prefix.unwrap_or_default();
-            run_status_web(&socket, &listen, !no_browser, &prefix)
-                .await
-                .with_context(|| format!("serving web UI on {listen}"))
+            run_web(
+                &socket,
+                listen,
+                prefix.unwrap_or_default(),
+                !no_browser,
+                cgi,
+                origin.as_deref(),
+            )
+            .await
         }
         // `lock status` (Go `tailscale lock status`): fetch + render the TKA status.
         // `lock init` (Go `tailscale lock init`): initialize the lock with this node as sole trusted key.
         Command::Lock {
-            cmd: LockCmd::Init { disablement_secret },
-        } => run_lock_init(&socket, &disablement_secret).await,
+            cmd:
+                LockCmd::Init {
+                    trusted_keys,
+                    gen_disablements,
+                    gen_disablement_for_support,
+                    confirm,
+                    disablement_secret,
+                },
+        } => {
+            run_lock_init(
+                &socket,
+                &LockInitArgs {
+                    positionals: &trusted_keys,
+                    gen_disablements,
+                    gen_disablement_for_support,
+                    confirm,
+                    supplied_secret: disablement_secret.as_deref(),
+                },
+            )
+            .await
+        }
         Command::Lock {
             cmd: LockCmd::Status { json },
         } => run_lock_status(&socket, json).await,
@@ -3406,8 +3507,9 @@ async fn run_status(
     // off (`--no-browser`, or Go's `--browser=false`).
     if web {
         let listen = listen.unwrap_or_else(|| "127.0.0.1:8384".to_string());
-        // `status --web` serves at `/` (no path prefix).
-        return run_status_web(socket, &listen, browser, "/")
+        // `status --web` serves at `/` (no path prefix) and has no `--origin` of its own — Go
+        // registers that flag on `web`, not on `status`.
+        return run_status_web(socket, &listen, browser, "/", None)
             .await
             .with_context(|| format!("serving status --web on {listen}"));
     }
@@ -4751,8 +4853,12 @@ async fn run_whoami(socket: &std::path::Path, json: bool) -> Result<()> {
     };
     match round_trip(
         socket,
+        // `whoami` is Go's `whois` against this node's own tailnet IP: an address, never a flow,
+        // so it carries neither of Go's flow selectors.
         &Request::Whois {
             ip: self_ip.clone(),
+            port: None,
+            proto: None,
         },
     )
     .await
@@ -5192,20 +5298,381 @@ async fn run_lock_log(socket: &std::path::Path, limit: usize, json: bool) -> Res
     Ok(())
 }
 
-/// `lock init <disablement-secret>` (Go `tailscale lock init`): initialize Tailnet Lock with this
-/// node as the sole trusted key, gated by the hex-encoded disablement secret. Prints the daemon's
-/// `ok` message or surfaces the error and exits non-zero. The secret is passed straight through on the
-/// wire (a local Unix-socket request, like the auth key) and is never echoed back by the daemon.
-async fn run_lock_init(socket: &std::path::Path, secret: &str) -> Result<()> {
-    let req = Request::LockInit {
-        secret_hex: secret.to_string(),
+/// One tailnet-lock trusted key parsed off `lock init`'s positional arguments — Go's `tka.Key` as
+/// far as this CLI needs it (`cmd/tailscale/cli/tailnet-lock.go` `parseTLArgs`): the 32-byte Ed25519
+/// public key and its vote weight (`<key>?<votes>`, default 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LockTrustedKey {
+    /// The raw 32-byte tailnet-lock public key (the hex after the `tlpub:`/`nlpub:` prefix).
+    public: [u8; 32],
+    /// Go `tka.Key.Votes` — the key's weight in the authority, 1 unless `?<votes>` said otherwise.
+    votes: u64,
+}
+
+/// Parse a tailnet-lock public key the way Go's `key.NLPublic.UnmarshalText` does
+/// (`types/key/nl.go` + `types/key/util.go` `parseHex` @ the pinned ref): the wire prefix `nlpub:`
+/// is tried first and the CLI prefix `tlpub:` second, so a string with neither reports the CLI one —
+/// which is the prefix a `lock` command's argument is expected to carry. The three failures are Go's,
+/// verbatim: wrong prefix, wrong hex length, non-hex character.
+fn parse_lock_public_key(s: &str) -> Result<[u8; 32]> {
+    let hex = match s.strip_prefix("nlpub:") {
+        Some(rest) => rest,
+        None => match s.strip_prefix("tlpub:") {
+            Some(rest) => rest,
+            None => anyhow::bail!("key hex string doesn't have expected type prefix tlpub:"),
+        },
     };
+    if hex.len() != 64 {
+        anyhow::bail!("key hex has the wrong size, got {} want 64", hex.len());
+    }
+    let bytes: Vec<u8> = (0..64)
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|_| anyhow!("invalid hex character in key"))?;
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+/// Split `lock`'s positional arguments into trusted keys and disablement values — a port of Go's
+/// `parseTLArgs(args, parseKeys, parseDisablements)` (`cmd/tailscale/cli/tailnet-lock.go`).
+///
+/// The grammar, and why it matters: an argument prefixed `disablement:` or `disablement-secret:` is
+/// a hex-encoded disablement **value**; anything else is a tailnet lock **public key**, optionally
+/// suffixed `?<votes>`. Nothing in this grammar is a disablement *secret* — the secrets are minted by
+/// `lock init` itself. Go's four error messages are carried over, including their 1-based argument
+/// index, because they are the whole feedback an operator gets on a mistyped key.
+fn parse_lock_args(
+    args: &[String],
+    parse_keys: bool,
+    parse_disablements: bool,
+) -> Result<(Vec<LockTrustedKey>, Vec<Vec<u8>>)> {
+    let mut keys = Vec::new();
+    let mut disablements = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        let n = i + 1;
+        if parse_disablements
+            && (a.starts_with("disablement:") || a.starts_with("disablement-secret:"))
+        {
+            // Go slices from the FIRST colon, so `disablement-secret:` is handled by the same arm —
+            // and, as upstream, its bytes are taken as a disablement value, not run through the KDF.
+            let hex = a.split_once(':').map(|(_, rest)| rest).unwrap_or_default();
+            let bytes =
+                hex_decode_lower(hex).map_err(|e| anyhow!("parsing disablement {n}: {e}"))?;
+            disablements.push(bytes);
+            continue;
+        }
+        if !parse_keys {
+            anyhow::bail!(
+                "parsing argument {n}: expected value with \"disablement:\" or \
+                 \"disablement-secret:\" prefix, got {a:?}"
+            );
+        }
+        let (key_text, votes_text) = match a.split_once('?') {
+            Some((k, v)) => (k, Some(v)),
+            None => (a.as_str(), None),
+        };
+        let public =
+            parse_lock_public_key(key_text).map_err(|e| anyhow!("parsing key {n}: {e}"))?;
+        let votes = match votes_text {
+            Some(v) => v
+                .parse::<u64>()
+                .map_err(|e| anyhow!("parsing key {n} votes: {e}"))?,
+            None => 1,
+        };
+        keys.push(LockTrustedKey { public, votes });
+    }
+    Ok((keys, disablements))
+}
+
+/// The `lock init` command line after clap — Go's `nlInitArgs` plus this fork's one addition.
+struct LockInitArgs<'a> {
+    /// Go's `<trusted-key>...` positionals (which may also carry `disablement:` values).
+    positionals: &'a [String],
+    /// Go `--gen-disablements`; `None` = not given, which is Go's default of 1.
+    gen_disablements: Option<usize>,
+    /// Go `--gen-disablement-for-support`.
+    gen_disablement_for_support: bool,
+    /// Go `--confirm`.
+    confirm: bool,
+    /// This fork's `--disablement-secret` (not a Go flag): use this secret instead of minting one.
+    supplied_secret: Option<&'a str>,
+}
+
+/// What `lock init` decided to do, once the arguments and the current lock state are both known.
+#[derive(Debug, PartialEq, Eq)]
+enum LockInitPlan {
+    /// Go's `--confirm` two-step: print this and change nothing.
+    Confirm(String),
+    /// Go's confirmed path: print `preamble` (the trusted keys, which Go prints as soon as it has
+    /// them, confirmed or not), hand `secret_hex` to the daemon, and print `notice` — which carries
+    /// the minted secret — only once the daemon reports success, exactly as Go builds `successMsg`
+    /// before the RPC and prints it after.
+    Init {
+        secret_hex: String,
+        preamble: String,
+        notice: String,
+    },
+}
+
+/// Decide what `tnet lock init` does, from its arguments and the lock status the daemon just
+/// reported. A port of Go's `runTailnetLockInit` (`cmd/tailscale/cli/tailnet-lock.go`) minus the
+/// two RPCs, so the whole decision — Go's two refusals, the argument grammar, the `--confirm`
+/// two-step and the minting — is one pure function the tests can drive.
+///
+/// Go's order is kept: the lock-already-enabled refusal comes before the arguments are even parsed
+/// (upstream asks control for the status first), then the argument grammar, then the trusted-key
+/// requirement, then the confirmation gate, and the secrets are minted last.
+///
+/// The trusted-key requirement is where this fork parts company with upstream, and it is the reason
+/// this command's grammar changed: Go refuses when the current node's own lock key is not among the
+/// trusted keys, and *this* daemon cannot even ask that question — the engine's `tka_init` takes no
+/// key set and will not report this node's lock key (docs/ENGINE_ASKS.md #36). Every argument that
+/// asks for something the engine cannot do is therefore refused by name. Accepting them would mean
+/// doing something other than what was asked, silently, with the tailnet's lock.
+///
+/// `mint` is the entropy source, injected so a test can pin the output byte for byte; production
+/// passes [`mint_disablement_secret`].
+fn plan_lock_init(
+    program: &str,
+    args: &LockInitArgs<'_>,
+    lock_enabled: bool,
+    mint: &mut dyn FnMut() -> Result<[u8; 32]>,
+) -> Result<LockInitPlan> {
+    use std::fmt::Write as _;
+
+    // Go: `if st.Enabled { return errors.New("tailnet lock is already enabled") }`, before anything
+    // else. Initializing an initialized lock is not a thing control would accept anyway; the point
+    // is that the operator hears it in one line instead of a control-side rejection.
+    if lock_enabled {
+        anyhow::bail!("tailnet lock is already enabled");
+    }
+
+    let (keys, disablements) = parse_lock_args(args.positionals, true, true)?;
+
+    if !keys.is_empty() {
+        anyhow::bail!(
+            "this daemon cannot initialize tailnet lock with a chosen trusted-key set. Upstream's \
+             rule is that \"the tailnet lock key of the current node must be one of the trusted \
+             keys during initialization\"; here the engine's `tka_init` takes no key set at all — it \
+             always initializes trusting this node's own tailnet lock key alone, with one vote — \
+             and exposes no way to read that key back, so a key set can neither be honoured nor \
+             checked. Re-run with no <trusted-key> arguments to initialize with this node as the \
+             sole trusted key (docs/ENGINE_ASKS.md #36)"
+        );
+    }
+    if !disablements.is_empty() {
+        anyhow::bail!(
+            "this daemon cannot initialize tailnet lock with a pre-computed disablement value. The \
+             engine's `tka_init` takes a disablement SECRET and derives the value from it itself, \
+             so a value computed offline with `tnet lock disablement-kdf` has nowhere to go. Supply \
+             the secret with --disablement-secret instead, or let this command mint one \
+             (docs/ENGINE_ASKS.md #36)"
+        );
+    }
+    if args.gen_disablement_for_support {
+        anyhow::bail!(
+            "this daemon cannot honour --gen-disablement-for-support: it asks for an ADDITIONAL \
+             disablement secret, minted separately and transmitted to the coordination server, and \
+             the engine's `tka_init` carries exactly one secret — which it already transmits as the \
+             support disablement. The secret this command uses is known to the coordination server \
+             either way, with or without this flag (docs/ENGINE_ASKS.md #36)"
+        );
+    }
+    if args.gen_disablements.is_some() && args.supplied_secret.is_some() {
+        anyhow::bail!(
+            "--gen-disablements can only be used without --disablement-secret: \
+             --disablement-secret supplies the one disablement secret, --gen-disablements asks this \
+             command to mint it"
+        );
+    }
+    let gen_disablements = args.gen_disablements.unwrap_or(1);
+    if args.supplied_secret.is_none() && gen_disablements == 0 {
+        // Upstream never validates this in code, but its help is explicit — "Initializing tailnet
+        // lock requires at least one disablement" — and a lock with no disablement value at all can
+        // never be turned off again, so it is refused here rather than left to control.
+        anyhow::bail!(
+            "initializing tailnet lock requires at least one disablement, so --gen-disablements 0 \
+             cannot be used: a lock with no disablement value could never be disabled"
+        );
+    }
+    if args.supplied_secret.is_none() && gen_disablements != 1 {
+        anyhow::bail!(
+            "this daemon cannot honour --gen-disablements {gen_disablements}: the engine's \
+             `tka_init` stores exactly one disablement value, so only --gen-disablements 1 (the \
+             default) can be initialized (docs/ENGINE_ASKS.md #36)"
+        );
+    }
+    // An unusable secret must fail before the confirmation step, not after it: Go likewise rejects
+    // malformed arguments before it prints anything.
+    if let Some(secret) = args.supplied_secret {
+        hex_decode_lower(secret).context("--disablement-secret must be hex-encoded")?;
+    }
+
+    // Go prints the trusted keys it is about to write into the genesis, one per line. There is only
+    // ever one here, and this daemon cannot print it — so it is named rather than shown.
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "You are initializing tailnet lock with the following trusted signing keys:"
+    );
+    let _ = writeln!(
+        out,
+        " - the tailnet lock key of this node (the only key this daemon can trust; it cannot print \
+         it)"
+    );
+    let _ = writeln!(out);
+
+    if !args.confirm {
+        match args.supplied_secret {
+            Some(secret) => {
+                let _ = writeln!(
+                    out,
+                    "The disablement secret supplied with --disablement-secret will be used; none \
+                     will be generated."
+                );
+                let _ = writeln!(out, "{SUPPORT_DISABLEMENT_NOTE}");
+                let _ = writeln!(
+                    out,
+                    "\nIf this is correct, please re-run this command with the --confirm flag:"
+                );
+                let _ = writeln!(
+                    out,
+                    "\t{program} lock init --confirm --disablement-secret {secret}"
+                );
+            }
+            None => {
+                // Go's sentence, unpluralized as upstream leaves it.
+                let _ = writeln!(
+                    out,
+                    "{gen_disablements} disablement secrets will be generated."
+                );
+                let _ = writeln!(out, "{SUPPORT_DISABLEMENT_NOTE}");
+                let _ = writeln!(
+                    out,
+                    "\nIf this is correct, please re-run this command with the --confirm flag:"
+                );
+                let _ = writeln!(
+                    out,
+                    "\t{program} lock init --confirm --gen-disablements {gen_disablements}"
+                );
+            }
+        }
+        return Ok(LockInitPlan::Confirm(out));
+    }
+
+    // Confirmed. `out` already holds the trusted-key block Go prints on this path too; from here the
+    // text is what gets printed only if the daemon accepts the init.
+    let mut notice = String::new();
+    let secret_hex = match args.supplied_secret {
+        Some(secret) => secret.to_string(),
+        None => {
+            let secret = mint()?;
+            let hex = hex_encode_upper(&secret);
+            let _ = writeln!(
+                notice,
+                "{gen_disablements} disablement secrets have been generated and are printed below. \
+                 Take note of them now, they WILL NOT be shown again."
+            );
+            let _ = writeln!(notice, "\tdisablement-secret:{hex}");
+            hex
+        }
+    };
+    let _ = writeln!(notice, "{SUPPORT_DISABLEMENT_NOTE}");
+    Ok(LockInitPlan::Init {
+        secret_hex,
+        preamble: out,
+        notice,
+    })
+}
+
+/// The one line this fork has to add to Go's `lock init` output: upstream mints a separate secret
+/// for the coordination server only when asked (`--gen-disablement-for-support`), while the engine's
+/// `tka_init` sends the single secret it is given as `TKAInitFinishRequest.SupportDisablement`
+/// unconditionally. An operator who is told nothing would believe the secret is theirs alone.
+const SUPPORT_DISABLEMENT_NOTE: &str = "Note: this daemon's engine also transmits the disablement \
+                                        secret to the coordination server as the support \
+                                        disablement, so its operator can disable the lock. Upstream \
+                                        does that only for --gen-disablement-for-support.";
+
+/// Mint one 32-byte tailnet-lock disablement secret from the OS CSPRNG — Go's
+/// `rand.Read(secret[:])` over `crypto/rand` in `runTailnetLockInit`. Failing to read entropy is
+/// surfaced, never worked around: a predictable disablement secret is worse than no lock.
+fn mint_disablement_secret() -> Result<[u8; 32]> {
+    let mut secret = [0u8; 32];
+    getrandom::fill(&mut secret).map_err(|e| {
+        anyhow!(
+            "reading {} bytes from the OS random source: {e}",
+            secret.len()
+        )
+    })?;
+    Ok(secret)
+}
+
+/// Encode bytes as UPPERCASE hex — Go prints the minted secret with `%X`, and the printed form is
+/// the form the operator will later paste into `tnet lock disable`, so it is also what goes on the
+/// wire (the daemon's hex decode is case-insensitive).
+fn hex_encode_upper(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02X}");
+        s
+    })
+}
+
+/// `lock init` (Go `tailscale lock init`): initialize Tailnet Lock for the tailnet.
+///
+/// Go's shape, kept: ask the daemon for the lock status first (so an already-enabled lock is refused
+/// in one line), decide everything in [`plan_lock_init`], and — only on the confirmed path — send
+/// the init and print the minted secret *after* the daemon accepts it. A failed init must not leave
+/// the operator holding a secret that gates nothing.
+///
+/// The secret is passed straight through on the wire (a local Unix-socket request, like the auth
+/// key) and is never echoed back by the daemon.
+async fn run_lock_init(socket: &std::path::Path, args: &LockInitArgs<'_>) -> Result<()> {
+    let status = match round_trip(socket, &Request::LockStatus)
+        .await
+        .with_context(|| format!("querying lock status at {}", socket.display()))?
+    {
+        Response::Lock(report) => report,
+        Response::Error { message } => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        other => anyhow::bail!("unexpected response to lock status: {other:?}"),
+    };
+
+    // Go prints `os.Args[0]` in the re-run line; the operator has to be able to paste it back.
+    let program = std::env::args()
+        .next()
+        .unwrap_or_else(|| "tnet".to_string());
+    let plan = plan_lock_init(&program, args, status.enabled, &mut mint_disablement_secret)?;
+    let (secret_hex, notice) = match plan {
+        LockInitPlan::Confirm(text) => {
+            print!("{text}");
+            return Ok(());
+        }
+        LockInitPlan::Init {
+            secret_hex,
+            preamble,
+            notice,
+        } => {
+            // Go prints the trusted keys as soon as it has parsed them, before the init RPC.
+            print!("{preamble}");
+            (secret_hex, notice)
+        }
+    };
+
+    let req = Request::LockInit { secret_hex };
     match round_trip(socket, &req)
         .await
         .with_context(|| format!("talking to daemon at {}", socket.display()))?
     {
         Response::Ok { message } => {
-            println!("ok: {message}");
+            print!("{notice}");
+            println!("Initialization complete.");
+            println!("{message}");
             Ok(())
         }
         Response::Error { message } => {
@@ -6236,12 +6703,73 @@ async fn run_exit_node_suggest(socket: &std::path::Path) -> Result<()> {
     }
 }
 
-/// `whois` (Go `tailscale whois <ip>`): round-trip Whois for the given tailnet IP, then render the
-/// owner. The node name is control-supplied text, so it is run through `sanitize_for_terminal` inside
-/// the formatter before printing. The queried `ip` is owned here (it is the not-found line's
-/// subject), so the render needs no read-back from the request.
-async fn run_whois(socket: &std::path::Path, ip: String, json: bool) -> Result<()> {
-    let response = round_trip(socket, &Request::Whois { ip: ip.clone() })
+/// Pick the single positional argument of `tnet whois`, porting Go's two arity refusals verbatim.
+///
+/// Go `runWhoIs` (cmd/tailscale/cli/whois.go) checks `len(args) > 1` first and `len(args) == 0`
+/// second, returning `too many arguments, expected at most one peer` and `missing argument, expected
+/// one peer`. clap would otherwise answer with its own wording, so the positional is a `Vec` and the
+/// count is judged here. Pure → unit-testable.
+fn whois_target(args: &[String]) -> Result<&str> {
+    if args.len() > 1 {
+        anyhow::bail!("too many arguments, expected at most one peer");
+    }
+    match args.first() {
+        Some(target) => Ok(target),
+        None => anyhow::bail!("missing argument, expected one peer"),
+    }
+}
+
+/// Split Go's `ip[:port]` whois argument into the wire request's address and optional port.
+///
+/// Mirrors the order Go's `serveWhoIs` tries: `netip.ParseAddr` first (a bare IP → port 0, carried
+/// here as `None`), then `netip.ParseAddrPort` (`1.2.3.4:22`, `[fd7a::1]:22`). Anything else is
+/// refused before the daemon round trip, so an unusable argument costs no socket connection and says
+/// the same thing whether or not the daemon is up. (Go's `nodekey:` whois form is a LocalAPI-only
+/// spelling with no CLI surface upstream, so it is not accepted here either.) Pure → unit-testable.
+fn parse_whois_target(target: &str) -> Result<(String, Option<u16>)> {
+    if let Ok(ip) = target.parse::<std::net::IpAddr>() {
+        return Ok((ip.to_string(), None));
+    }
+    match target.parse::<std::net::SocketAddr>() {
+        Ok(sock) => Ok((sock.ip().to_string(), Some(sock.port()))),
+        Err(_) => anyhow::bail!(
+            "invalid address {target:?}: expected an IP or Go's ip[:port] form \
+             (e.g. 100.64.0.9 or 100.64.0.9:22)"
+        ),
+    }
+}
+
+/// Parse `--proto` into the wire enum: Go's empty value (flag absent, or `--proto=`) is "both" →
+/// `None`; `tcp`/`udp` → the matching [`WhoisProto`]. Any other value is refused by
+/// [`WhoisProto::from_str`], which carries the message. Pure → unit-testable.
+fn parse_whois_proto(proto: Option<&str>) -> Result<Option<tailscaled_rs::localapi::WhoisProto>> {
+    match proto {
+        None | Some("") => Ok(None),
+        Some(value) => value
+            .parse::<tailscaled_rs::localapi::WhoisProto>()
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!(e)),
+    }
+}
+
+/// `whois` (Go `tailscale whois [--json] ip[:port]`): round-trip Whois for the given address, then
+/// render the owner. The node name is control-supplied text, so it is run through
+/// `sanitize_for_terminal` inside the formatter before printing. The queried address is echoed as the
+/// operator typed it (port included) on the not-found line, so the render needs no read-back from the
+/// request.
+///
+/// Argument arity, the `ip[:port]` split and `--proto` are all resolved before the daemon round trip
+/// — Go likewise fails in `runWhoIs` before it calls `WhoIsProto`.
+async fn run_whois(
+    socket: &std::path::Path,
+    args: &[String],
+    proto: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let target = whois_target(args)?;
+    let (ip, port) = parse_whois_target(target)?;
+    let proto = parse_whois_proto(proto)?;
+    let response = round_trip(socket, &Request::Whois { ip, port, proto })
         .await
         .with_context(|| format!("talking to daemon at {}", socket.display()))?;
     match response {
@@ -6254,7 +6782,7 @@ async fn run_whois(socket: &std::path::Path, ip: String, json: bool) -> Result<(
                     serde_json::to_string_pretty(&w).unwrap_or_else(|_| "{}".to_string())
                 );
             } else {
-                print!("{}", format_whois(&w, &ip));
+                print!("{}", format_whois(&w, target));
             }
             Ok(())
         }
@@ -7803,8 +8331,9 @@ fn format_file_targets(targets: &[tailscaled_rs::localapi::FileTargetReport]) ->
     out
 }
 
-/// Format the `tnet whois` output for a [`WhoisReport`]. If the IP matched no node, a single
-/// "no tailnet node owns <ip>" line (the caller passes the queried IP). Otherwise: the owning node's
+/// Format the `tnet whois` output for a [`WhoisReport`]. If the address matched no node, a single
+/// "no tailnet node owns <ip>" line — the caller passes the address as the operator typed it, so an
+/// `ip[:port]` flow argument is echoed with its port rather than silently narrowed. Otherwise: the owning node's
 /// name, its IPv4, the owning user (when control retained it), its liveness (`online`, and a
 /// `last-seen` line only when offline — an online node's last-seen is "now", matching `status`), its
 /// control-granted ACL `tags` and node-key `key-expiry` (when present), any control-granted node-level
@@ -8958,10 +9487,24 @@ fn html_escape(s: &str) -> String {
 /// content rather than a byte-copy of Go's template). A header block (state, version, TUN, this node's
 /// name + IPs, MagicDNS suffix, active exit node) plus a peer table (name, IPs, online, exit-node,
 /// relay, last-seen). Every control-/peer-supplied string is [`html_escape`]d. Pure → unit-testable.
-fn render_status_html(s: &tailscaled_rs::localapi::StatusReport) -> String {
+fn render_status_html(
+    s: &tailscaled_rs::localapi::StatusReport,
+    canonical: Option<&str>,
+) -> String {
     let mut h = String::new();
     h.push_str("<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">");
     h.push_str("<title>tailnetd status</title>");
+    // The absolute URL this page is served at, when it is known (`web --origin`, or the address the
+    // listener bound). Behind a reverse proxy the bound address is not the address anyone reached,
+    // which is exactly what `--origin` supplies — so the page states the URL it is really served at
+    // instead of leaving a reader to guess. Escaped as an attribute: an origin is operator-supplied,
+    // but it lands in markup like every other value on this page.
+    if let Some(url) = canonical {
+        h.push_str(&format!(
+            "<link rel=\"canonical\" href=\"{}\">",
+            html_escape(url)
+        ));
+    }
     h.push_str(
         "<style>body{font-family:system-ui,sans-serif;margin:2rem;}\
          table{border-collapse:collapse;margin-top:1rem;}\
@@ -9087,6 +9630,279 @@ fn normalize_served_path(path_prefix: &str) -> String {
     }
 }
 
+/// Where `tnet web` listens when `--listen` is not given: Go `web`'s `localhost:8088`. Loopback, so
+/// the unauthenticated status page is not reachable from the network by default.
+const DEFAULT_WEB_LISTEN: &str = "localhost:8088";
+
+/// The body served for any path other than the one the UI is mounted at. Shared by both serving
+/// modes (listener and `--cgi`) so they cannot drift.
+const WEB_NOT_FOUND_BODY: &str = "<!DOCTYPE html><html><body>not found</body></html>";
+
+/// The body served when the daemon round-trip for the page's status fails. Deliberately generic —
+/// the cause is logged to stderr, not handed to whoever loaded the page.
+const WEB_UNAVAILABLE_BODY: &str = "<!DOCTYPE html><html><body>status unavailable</body></html>";
+
+/// The refusal `tnet web` owes its own flags before it binds anything or contacts the daemon, or
+/// `None` when the invocation is usable.
+///
+/// `--cgi` replaces the listener entirely: the process serves ONE request out of the CGI/1.1
+/// environment and exits, so there is no address to bind and `--listen` names a listener that will
+/// never exist. Go registers both flags on the same command and simply ignores the listen address in
+/// CGI mode; this fork refuses the combination instead, the same shape (and the same wording) it
+/// already uses for `cert --listen` without `--serve-demo`, so an operator who thinks they are
+/// choosing a port is told the port is not used rather than silently getting no listener.
+///
+/// The message goes to **stdout** and the caller exits **1**, matching this CLI's other usage
+/// refusals ([`switch_usage_refusal`], [`cert_usage_refusal`]) rather than clap's stderr + exit 2 —
+/// which is why this is a hand-rolled check and not an `#[arg(conflicts_with = ...)]`. Pure →
+/// unit-testable.
+fn web_usage_refusal(cgi: bool, has_listen: bool) -> Option<&'static str> {
+    if cgi && has_listen {
+        return Some("--listen can only be used without --cgi (a CGI script binds no listener)");
+    }
+    None
+}
+
+/// Validate + normalize a `web --origin` value into the base URL the UI is reached at, or the
+/// refusal explaining why it is not one.
+///
+/// Go's `--origin` ("origin at which the web UI is served (if behind a reverse proxy or used with
+/// cgi)") feeds the web server's origin override, which exists because the address the UI *bound* is
+/// not the address a browser *reached* it at. So the value has to be an absolute URL: a scheme and a
+/// host are exactly the two things `--prefix` cannot supply. A port and a path are optional (a proxy
+/// that mounts the UI under a path names it here); a query, a fragment or userinfo are not — those
+/// belong to a request, not to the base URL a page is served at, and silently dropping them would
+/// emit links that differ from what was asked for.
+///
+/// Normalization is: keep the scheme, the host and an explicit non-default port, drop a trailing
+/// slash from the path. So `https://ts.example.com/tailscale/` and `https://ts.example.com/tailscale`
+/// are the same origin. Pure → unit-testable.
+fn parse_web_origin(origin: &str) -> Result<String, String> {
+    let raw = origin.trim();
+    if raw.is_empty() {
+        return Err(
+            "--origin needs an absolute URL, e.g. https://ts.example.com/tailscale".to_string(),
+        );
+    }
+    let parsed = url::Url::parse(raw)
+        .map_err(|e| format!("--origin {raw:?} is not an absolute URL: {e}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(format!(
+                "--origin {raw:?} has scheme {other:?}; the web UI is reached over http or https"
+            ));
+        }
+    }
+    let Some(host) = parsed.host_str() else {
+        return Err(format!("--origin {raw:?} names no host"));
+    };
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(format!(
+            "--origin {raw:?} carries a query or fragment; it names the base URL the UI is served \
+             at, not one request to it"
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(format!(
+            "--origin {raw:?} carries credentials; it names the base URL the UI is served at"
+        ));
+    }
+    let mut base = format!("{}://{host}", parsed.scheme());
+    if let Some(port) = parsed.port() {
+        base.push_str(&format!(":{port}"));
+    }
+    base.push_str(parsed.path().trim_end_matches('/'));
+    Ok(base)
+}
+
+/// Split a [`parse_web_origin`] base into `(scheme://authority, path)` — the path is `""` when the
+/// origin names only a scheme and a host. Pure → unit-testable via [`web_ui_url`].
+fn split_origin_base(base: &str) -> (&str, &str) {
+    let after_scheme = match base.find("://") {
+        Some(i) => i + 3,
+        None => return (base, ""),
+    };
+    match base[after_scheme..].find('/') {
+        Some(j) => base.split_at(after_scheme + j),
+        None => (base, ""),
+    }
+}
+
+/// The absolute URL this UI is reached at — the one thing `--origin` exists to fix, and the only
+/// thing it can affect in this build (the UI is read-only, so an origin gates no request and
+/// authorizes nothing; it generates links).
+///
+/// - With `--origin`, that URL wins. An origin that already names a path (`https://ts.example.com/tailscale`)
+///   states the OUTSIDE path in full and is used verbatim: `--prefix` names the path this process
+///   answers on, which a proxy is free to map from a different one, so appending it would invent a
+///   path nobody serves. An origin that names only scheme+host takes the served path from `--prefix`,
+///   which is the pass-through case.
+/// - Without `--origin`, the URL is `http://<bound address>` plus the served path — what the previous
+///   behaviour always assumed.
+/// - With neither an origin nor a bound address (`--cgi` without `--origin`), the URL is genuinely
+///   unknown: a CGI script is told the path it was reached at but not the scheme or host the proxy
+///   in front of it published. `None`, rather than a guess.
+///
+/// Pure → unit-testable.
+fn web_ui_url(origin: Option<&str>, bound: Option<&str>, served_path: &str) -> Option<String> {
+    let (authority, path) = match origin {
+        Some(base) => {
+            let (authority, origin_path) = split_origin_base(base);
+            if !origin_path.is_empty() {
+                return Some(base.to_string());
+            }
+            (authority.to_string(), served_path)
+        }
+        None => (format!("http://{}", bound?), served_path),
+    };
+    Some(if path == "/" {
+        authority
+    } else {
+        format!("{authority}{path}")
+    })
+}
+
+/// What the web UI answers a request with. The read-only page has exactly one route, so this is the
+/// whole routing table — shared by the listener and `--cgi` so the two modes cannot answer the same
+/// request differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebRoute {
+    /// A fresh `status` fetch, rendered as the HTML page.
+    Page,
+    /// Anything else: another path, or a method other than `GET`.
+    NotFound,
+}
+
+/// Route one request: the status page is served at the configured path (`/` by default, `/<prefix>`
+/// with `--prefix`) for `GET` only; everything else is a 404. Pure → unit-testable.
+fn route_web_request(method: &str, path: &str, served_path: &str) -> WebRoute {
+    if method == "GET" && path == served_path {
+        WebRoute::Page
+    } else {
+        WebRoute::NotFound
+    }
+}
+
+/// The request path a CGI invocation was reached at, from the CGI/1.1 environment. Go's
+/// `net/http/cgi` builds the request URL from `REQUEST_URI` when the server supplied it and falls
+/// back to `SCRIPT_NAME` + `PATH_INFO` otherwise; this follows the same order, and strips the query
+/// string (the read-only page takes no parameters). An environment that carries none of the three
+/// yields `/`. Pure → unit-testable.
+fn cgi_request_path(
+    request_uri: Option<&str>,
+    script_name: Option<&str>,
+    path_info: Option<&str>,
+) -> String {
+    let path = match request_uri.map(str::trim).filter(|u| !u.is_empty()) {
+        Some(uri) => uri.split('?').next().unwrap_or("").to_string(),
+        None => format!(
+            "{}{}",
+            script_name.unwrap_or_default(),
+            path_info.unwrap_or_default()
+        ),
+    };
+    if path.is_empty() {
+        "/".to_string()
+    } else {
+        path
+    }
+}
+
+/// Serialize one CGI response: the `Status:` line Go's `net/http/cgi` child writer always emits,
+/// the content type, an explicit length, then the body after a blank line. Not an HTTP response —
+/// the invoking web server turns these headers into one. Pure → unit-testable.
+fn cgi_response(status: &str, body: &str) -> String {
+    format!(
+        "Status: {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// `tnet web` (Go `tailscale web`): resolve the flags, then serve the read-only status UI in
+/// whichever of the two modes was asked for.
+///
+/// Order is load-bearing: the usage refusal first (it costs nothing and must not be reached only
+/// after a bind), then the `--origin` validation (a bad origin is a usage error, not a serving
+/// failure), then the mode split. `--cgi` serves exactly one request on stdout and returns; the
+/// default binds a listener and runs until interrupted.
+async fn run_web(
+    socket: &std::path::Path,
+    listen: Option<String>,
+    prefix: String,
+    browser: bool,
+    cgi: bool,
+    origin: Option<&str>,
+) -> Result<()> {
+    if let Some(message) = web_usage_refusal(cgi, listen.is_some()) {
+        println!("{message}");
+        std::process::exit(1);
+    }
+    let origin = match origin {
+        Some(raw) => Some(parse_web_origin(raw).map_err(|e| anyhow::anyhow!(e))?),
+        None => None,
+    };
+    if cgi {
+        // CGI mode owns stdout: the response IS this process's stdout, so nothing may be printed
+        // alongside it (no startup line) and no browser is opened (there is no server to browse).
+        // Without `--origin` there is no way to know the scheme/host the proxy published, so the
+        // page states no canonical URL rather than a wrong one.
+        let served_path = normalize_served_path(&prefix);
+        let canonical = web_ui_url(origin.as_deref(), None, &served_path);
+        return run_web_cgi(socket, &served_path, canonical.as_deref()).await;
+    }
+    let listen = listen.unwrap_or_else(|| DEFAULT_WEB_LISTEN.to_string());
+    run_status_web(socket, &listen, browser, &prefix, origin.as_deref())
+        .await
+        .with_context(|| format!("serving web UI on {listen}"))
+}
+
+/// `tnet web --cgi` (Go `web --cgi` → `cgi.Serve`): serve ONE request from the CGI/1.1 environment
+/// and exit, instead of binding a listener. The web server in front of us set `REQUEST_METHOD` and
+/// the request path; we route it exactly as the listener does ([`route_web_request`]), fetch the
+/// live status for the page, and write the CGI response to stdout.
+///
+/// Errors are reported the way a CGI script must report them — as a response, not as a message on
+/// stdout: a failed daemon round-trip becomes a `500` whose cause goes to stderr (which the invoking
+/// server logs). The process still exits 0, because the response was delivered.
+async fn run_web_cgi(
+    socket: &std::path::Path,
+    served_path: &str,
+    canonical: Option<&str>,
+) -> Result<()> {
+    use std::io::Write as _;
+    let method = std::env::var("REQUEST_METHOD").unwrap_or_default();
+    let request_uri = std::env::var("REQUEST_URI").ok();
+    let script_name = std::env::var("SCRIPT_NAME").ok();
+    let path_info = std::env::var("PATH_INFO").ok();
+    let path = cgi_request_path(
+        request_uri.as_deref(),
+        script_name.as_deref(),
+        path_info.as_deref(),
+    );
+    let (status, body) = match route_web_request(&method, &path, served_path) {
+        WebRoute::Page => match round_trip(socket, &Request::Status).await {
+            Ok(Response::Status(s)) => ("200 OK", render_status_html(&s, canonical)),
+            other => {
+                if let Err(e) = other {
+                    eprintln!("web --cgi: status fetch failed: {e}");
+                }
+                (
+                    "500 Internal Server Error",
+                    WEB_UNAVAILABLE_BODY.to_string(),
+                )
+            }
+        },
+        WebRoute::NotFound => ("404 Not Found", WEB_NOT_FOUND_BODY.to_string()),
+    };
+    let response = cgi_response(status, &body);
+    let mut out = std::io::stdout().lock();
+    out.write_all(response.as_bytes())
+        .context("writing the CGI response to stdout")?;
+    out.flush().context("flushing the CGI response")?;
+    Ok(())
+}
+
 /// `tnet status --web`: serve an HTML status page from an embedded HTTP server (Go `tailscale status
 /// --web`). Binds a TCP listener on `listen` (default `127.0.0.1:8384`), optionally opens a browser at
 /// the URL, then accepts connections until interrupted: each request re-fetches the live status
@@ -9101,6 +9917,7 @@ async fn run_status_web(
     listen: &str,
     browser: bool,
     path_prefix: &str,
+    origin: Option<&str>,
 ) -> Result<()> {
     let served_path = normalize_served_path(path_prefix);
     let listener = tokio::net::TcpListener::bind(listen)
@@ -9119,12 +9936,12 @@ async fn run_status_web(
              anyone who can reach this address."
         );
     }
-    // The browseable URL includes the path prefix (so `--prefix /foo` opens `http://addr/foo`).
-    let url = if served_path == "/" {
-        format!("http://{addr}")
-    } else {
-        format!("http://{addr}{served_path}")
-    };
+    // The browseable URL includes the path prefix (so `--prefix /foo` opens `http://addr/foo`), and
+    // `--origin` replaces the bound address with the one a browser actually reaches — so behind a
+    // reverse proxy the operator is told (and the browser is sent to) the URL that works, not the
+    // private address this process happens to have bound. Always `Some` here: the address is bound.
+    let url = web_ui_url(origin, Some(&addr.to_string()), &served_path)
+        .unwrap_or_else(|| format!("http://{addr}"));
     println!("Serving Tailscale status at {url} ... (Ctrl-C to stop)");
     if browser {
         open_browser_best_effort(&url);
@@ -9152,9 +9969,10 @@ async fn run_status_web(
         // deadline inside the handler is what actually bounds a stalled client.
         let socket = socket.to_path_buf();
         let served_path = served_path.clone();
+        let canonical = url.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            serve_status_connection(conn, &socket, &served_path).await;
+            serve_status_connection(conn, &socket, &served_path, Some(&canonical)).await;
         });
     }
 }
@@ -9170,6 +9988,7 @@ async fn serve_status_connection(
     mut conn: tokio::net::TcpStream,
     socket: &std::path::Path,
     served_path: &str,
+    canonical: Option<&str>,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut buf = Vec::with_capacity(1024);
@@ -9198,11 +10017,16 @@ async fn serve_status_connection(
     }
     let request_line = String::from_utf8_lossy(&buf);
     let first_line = request_line.lines().next().unwrap_or("");
-    let (status, body) = match parse_request_target(first_line) {
-        // The status page is served at the configured path (default `/`, or `/<prefix>` when
-        // `--prefix` is given). Any other path → 404.
-        Some(("GET", p)) if p == served_path => match round_trip(socket, &Request::Status).await {
-            Ok(Response::Status(s)) => ("200 OK", render_status_html(&s)),
+    // The status page is served at the configured path (default `/`, or `/<prefix>` when `--prefix`
+    // is given) for `GET`. Any other request → 404. The routing decision is shared with `--cgi`
+    // ([`route_web_request`]) so the two serving modes cannot answer the same request differently.
+    let route = match parse_request_target(first_line) {
+        Some((method, path)) => route_web_request(method, path, served_path),
+        None => WebRoute::NotFound,
+    };
+    let (status, body) = match route {
+        WebRoute::Page => match round_trip(socket, &Request::Status).await {
+            Ok(Response::Status(s)) => ("200 OK", render_status_html(&s, canonical)),
             // Both the wrong-variant and the error case collapse to a 500; on a real error, log the
             // cause first so the failure isn't swallowed (the page itself stays generic).
             other => {
@@ -9211,14 +10035,11 @@ async fn serve_status_connection(
                 }
                 (
                     "500 Internal Server Error",
-                    "<!DOCTYPE html><html><body>status unavailable</body></html>".to_string(),
+                    WEB_UNAVAILABLE_BODY.to_string(),
                 )
             }
         },
-        _ => (
-            "404 Not Found",
-            "<!DOCTYPE html><html><body>not found</body></html>".to_string(),
-        ),
+        WebRoute::NotFound => ("404 Not Found", WEB_NOT_FOUND_BODY.to_string()),
     };
     let resp = format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -12957,6 +13778,12 @@ mod tests {
             format_whois(&w, "100.64.0.9"),
             "no tailnet node owns 100.64.0.9\n"
         );
+        // Go's `ip[:port]` flow argument is echoed as typed: the operator asked about a flow, and a
+        // line naming only the bare IP would hide which query came back empty.
+        assert_eq!(
+            format_whois(&w, "100.64.0.9:22"),
+            "no tailnet node owns 100.64.0.9:22\n"
+        );
     }
 
     #[test]
@@ -13529,6 +14356,311 @@ mod tests {
 
         // Unknown setting → error (Go errors too).
         assert!(format_get(&view, Some("no-such-setting"), false).is_err());
+    }
+
+    /// A 64-hex tailnet-lock public key for the argument tests. Not a real key — the parse only
+    /// cares about the prefix, the length and the alphabet.
+    const TEST_LOCK_KEY: &str =
+        "tlpub:0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+
+    /// Arguments for `plan_lock_init` with everything at its default, so each test names only what
+    /// it is exercising.
+    fn init_args<'a>(positionals: &'a [String]) -> LockInitArgs<'a> {
+        LockInitArgs {
+            positionals,
+            gen_disablements: None,
+            gen_disablement_for_support: false,
+            confirm: false,
+            supplied_secret: None,
+        }
+    }
+
+    /// A deterministic stand-in for the OS CSPRNG so the minted secret is pinnable.
+    fn fixed_mint() -> impl FnMut() -> Result<[u8; 32]> {
+        || Ok([0xab; 32])
+    }
+
+    #[test]
+    fn parse_lock_args_ports_gos_positional_grammar() {
+        // A bare key: votes default to 1 (Go `tka.Key{..., Votes: 1}`), and both the CLI prefix and
+        // the wire prefix decode, as Go's `NLPublic.UnmarshalText` accepts either.
+        let args = vec![
+            TEST_LOCK_KEY.to_string(),
+            TEST_LOCK_KEY.replace("tlpub:", "nlpub:"),
+        ];
+        let (keys, disablements) = parse_lock_args(&args, true, true).unwrap();
+        assert_eq!(keys.len(), 2, "both prefixes must parse: {keys:?}");
+        assert_eq!(keys[0].public[0], 0x01);
+        assert_eq!(keys[0].public[31], 0x20);
+        assert_eq!(keys[0].votes, 1);
+        assert_eq!(keys[0].public, keys[1].public);
+        assert!(disablements.is_empty());
+
+        // `<key>?<votes>` weights a key (Go `strings.SplitN(a, "?", 2)` + `strconv.Atoi`).
+        let args = vec![format!("{TEST_LOCK_KEY}?3")];
+        let (keys, _) = parse_lock_args(&args, true, true).unwrap();
+        assert_eq!(keys[0].votes, 3);
+
+        // Both disablement prefixes are values, hex-decoded, in argument order.
+        let args = vec![
+            "disablement:00ff".to_string(),
+            "disablement-secret:1020".to_string(),
+        ];
+        let (keys, disablements) = parse_lock_args(&args, true, true).unwrap();
+        assert!(keys.is_empty());
+        assert_eq!(disablements, vec![vec![0x00, 0xff], vec![0x10, 0x20]]);
+
+        // Go's error messages, which are the only feedback a mistyped argument gets.
+        let err = |a: &str| {
+            parse_lock_args(&[a.to_string()], true, true)
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(
+            err("deadbeef")
+                .contains("parsing key 1: key hex string doesn't have expected type prefix tlpub:"),
+            "{}",
+            err("deadbeef")
+        );
+        assert!(
+            err("tlpub:00").contains("key hex has the wrong size, got 2 want 64"),
+            "{}",
+            err("tlpub:00")
+        );
+        assert!(
+            err(&TEST_LOCK_KEY.replace("0102", "zz02")).contains("invalid hex character in key"),
+            "{}",
+            err(&TEST_LOCK_KEY.replace("0102", "zz02"))
+        );
+        assert!(
+            err(&format!("{TEST_LOCK_KEY}?x")).contains("parsing key 1 votes"),
+            "{}",
+            err(&format!("{TEST_LOCK_KEY}?x"))
+        );
+        assert!(
+            err("disablement:0f0").contains("parsing disablement 1"),
+            "{}",
+            err("disablement:0f0")
+        );
+        // `parseKeys=false` (Go's `lock add`/`remove` shape) rejects a key with the message naming
+        // the two prefixes it does accept.
+        let e = parse_lock_args(&[TEST_LOCK_KEY.to_string()], false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("expected value with \"disablement:\" or \"disablement-secret:\" prefix"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn lock_init_never_reads_a_trusted_key_as_a_disablement_secret() {
+        // The regression this command's grammar change is for. Both spellings an operator could
+        // plausibly type used to be swallowed as a "disablement secret":
+        //   * a tailnet lock public key — Go's actual positional — which would have gated the lock
+        //     with a value that is, by construction, public;
+        //   * a bare hex secret, this fork's old positional, which quietly meant something else
+        //     than the same command line does upstream.
+        // Both must now fail, saying what is wrong.
+        let key = vec![TEST_LOCK_KEY.to_string()];
+        let e = plan_lock_init("tnet", &init_args(&key), false, &mut fixed_mint())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("cannot initialize tailnet lock with a chosen trusted-key set")
+                && e.contains(
+                    "the tailnet lock key of the current node must be one of the trusted keys \
+                     during initialization"
+                ),
+            "{e}"
+        );
+
+        let old_positional = vec!["00112233445566778899aabbccddeeff".to_string()];
+        let e = plan_lock_init(
+            "tnet",
+            &init_args(&old_positional),
+            false,
+            &mut fixed_mint(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("parsing key 1: key hex string doesn't have expected type prefix tlpub:"),
+            "a bare hex secret must now be read as Go reads it — a malformed key: {e}"
+        );
+    }
+
+    #[test]
+    fn lock_init_refuses_an_already_enabled_lock_before_anything_else() {
+        // Go checks the status first, so this wins even over an unparseable argument list.
+        let junk = vec!["not-a-key".to_string()];
+        let e = plan_lock_init("tnet", &init_args(&junk), true, &mut fixed_mint())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(e, "tailnet lock is already enabled");
+    }
+
+    #[test]
+    fn lock_init_without_confirm_changes_nothing_and_prints_the_rerun_command() {
+        let none: Vec<String> = Vec::new();
+        let plan = plan_lock_init("tnet", &init_args(&none), false, &mut fixed_mint()).unwrap();
+        let LockInitPlan::Confirm(text) = plan else {
+            panic!("without --confirm the plan must be the two-step, not an init");
+        };
+        assert!(
+            text.starts_with(
+                "You are initializing tailnet lock with the following trusted signing keys:\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("1 disablement secrets will be generated."),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "If this is correct, please re-run this command with the --confirm flag:"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("\ttnet lock init --confirm --gen-disablements 1\n"),
+            "the printed command must be runnable as-is: {text}"
+        );
+        // The operator learns about the support disablement BEFORE committing, not after.
+        assert!(
+            text.contains("transmits the disablement secret to the coordination server"),
+            "{text}"
+        );
+        // Nothing was minted: no secret may appear in the preview.
+        assert!(!text.contains("disablement-secret:"), "{text}");
+    }
+
+    #[test]
+    fn lock_init_with_confirm_mints_the_secret_and_prints_it_once() {
+        let none: Vec<String> = Vec::new();
+        let mut args = init_args(&none);
+        args.confirm = true;
+        let plan = plan_lock_init("tnet", &args, false, &mut fixed_mint()).unwrap();
+        let LockInitPlan::Init {
+            secret_hex,
+            preamble,
+            notice,
+        } = plan
+        else {
+            panic!("--confirm must produce an init");
+        };
+        // Go prints the trusted keys on the confirmed path too, not only in the preview.
+        assert!(
+            preamble.starts_with(
+                "You are initializing tailnet lock with the following trusted signing keys:\n"
+            ),
+            "{preamble}"
+        );
+        // 32 bytes of entropy, rendered the way Go renders it (`%X`), and the value handed to the
+        // daemon is the very value printed.
+        assert_eq!(secret_hex, "AB".repeat(32));
+        assert!(
+            notice.contains(
+                "1 disablement secrets have been generated and are printed below. Take note of \
+                 them now, they WILL NOT be shown again."
+            ),
+            "{notice}"
+        );
+        assert!(
+            notice.contains(&format!("\tdisablement-secret:{secret_hex}\n")),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("transmits the disablement secret to the coordination server"),
+            "{notice}"
+        );
+    }
+
+    #[test]
+    fn lock_init_refuses_the_arguments_this_engine_cannot_honour() {
+        let none: Vec<String> = Vec::new();
+
+        // A second disablement value cannot be stored.
+        let mut args = init_args(&none);
+        args.gen_disablements = Some(2);
+        let e = plan_lock_init("tnet", &args, false, &mut fixed_mint())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("cannot honour --gen-disablements 2"), "{e}");
+
+        // Nor may there be none: a lock with no disablement value could never be turned off.
+        let mut args = init_args(&none);
+        args.gen_disablements = Some(0);
+        let e = plan_lock_init("tnet", &args, false, &mut fixed_mint())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("requires at least one disablement"), "{e}");
+
+        // Nor can a separate one for the coordination server's operator.
+        let mut args = init_args(&none);
+        args.gen_disablement_for_support = true;
+        let e = plan_lock_init("tnet", &args, false, &mut fixed_mint())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("cannot honour --gen-disablement-for-support"),
+            "{e}"
+        );
+
+        // Nor a pre-computed disablement value, whichever prefix it carries.
+        let value = vec!["disablement:00ff".to_string()];
+        let e = plan_lock_init("tnet", &init_args(&value), false, &mut fixed_mint())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("pre-computed disablement value"), "{e}");
+
+        // Minting and supplying the secret are alternatives, not a combination.
+        let mut args = init_args(&none);
+        args.gen_disablements = Some(1);
+        args.supplied_secret = Some("00ff");
+        let e = plan_lock_init("tnet", &args, false, &mut fixed_mint())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("--gen-disablements can only be used without --disablement-secret"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn lock_init_can_still_be_given_the_operators_own_secret() {
+        // The capability the old positional had, under a name that cannot be mistaken for Go's.
+        let none: Vec<String> = Vec::new();
+        let mut args = init_args(&none);
+        args.confirm = true;
+        args.supplied_secret = Some("00ff10");
+        let plan = plan_lock_init("tnet", &args, false, &mut fixed_mint()).unwrap();
+        let LockInitPlan::Init {
+            secret_hex, notice, ..
+        } = plan
+        else {
+            panic!("--confirm must produce an init");
+        };
+        assert_eq!(
+            secret_hex, "00ff10",
+            "the supplied secret must be used verbatim"
+        );
+        assert!(
+            !notice.contains("disablement-secret:"),
+            "a supplied secret is not reprinted: {notice}"
+        );
+
+        // A malformed secret fails before the confirmation step, not after it.
+        let mut args = init_args(&none);
+        args.supplied_secret = Some("nothex");
+        let e = plan_lock_init("tnet", &args, false, &mut fixed_mint())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("--disablement-secret must be hex-encoded"),
+            "{e}"
+        );
     }
 
     #[test]
@@ -15627,7 +16759,7 @@ mod tests {
             have_node_key: true,
             ..Default::default()
         };
-        let html = render_status_html(&report);
+        let html = render_status_html(&report, None);
         assert!(html.starts_with("<!DOCTYPE html>"), "well-formed page");
         assert!(html.contains("Running") && html.contains("0.37.0") && html.contains("node-a"));
         assert!(html.contains("tail0123.ts.net") && html.contains("100.64.0.1"));
@@ -15644,7 +16776,7 @@ mod tests {
             state: "NeedsLogin".to_string(),
             ..Default::default()
         };
-        let empty_html = render_status_html(&empty);
+        let empty_html = render_status_html(&empty, None);
         assert!(empty_html.starts_with("<!DOCTYPE html>"));
         assert!(empty_html.contains("NeedsLogin") && empty_html.contains("no peers"));
     }
@@ -15660,7 +16792,7 @@ mod tests {
             auth_url: Some("https://login.example.com/a/\"><script>x".to_string()),
             ..Default::default()
         };
-        let html = render_status_html(&needs_login);
+        let html = render_status_html(&needs_login, None);
         assert!(
             html.contains("needs to be authenticated") && html.contains("Log in to authenticate"),
             "the login affordance must render when auth_url is set"
@@ -15686,7 +16818,7 @@ mod tests {
             error: Some("bad key <x>".to_string()),
             ..Default::default()
         };
-        let fhtml = render_status_html(&failed);
+        let fhtml = render_status_html(&failed, None);
         assert!(fhtml.contains("Registration failed") && fhtml.contains("bad key &lt;x&gt;"));
         assert!(
             !fhtml.contains("Log in to authenticate"),
@@ -15718,6 +16850,217 @@ mod tests {
         assert_eq!(normalize_served_path("/tailscale"), "/tailscale");
         assert_eq!(normalize_served_path("/tailscale/"), "/tailscale");
         assert_eq!(normalize_served_path("  /web/ui/  "), "/web/ui");
+    }
+
+    #[test]
+    fn web_usage_refusal_refuses_a_listen_address_that_is_never_bound() {
+        // `--cgi` serves one request out of the CGI environment and binds nothing, so a `--listen`
+        // next to it names an address that will never exist. Refused, in the same shape this CLI
+        // already uses for `cert --listen` without `--serve-demo`.
+        assert_eq!(
+            web_usage_refusal(true, true),
+            Some("--listen can only be used without --cgi (a CGI script binds no listener)")
+        );
+        // Every usable combination stays usable: a listener with an address, a listener with the
+        // default address, and CGI with no address at all.
+        assert_eq!(web_usage_refusal(false, true), None);
+        assert_eq!(web_usage_refusal(false, false), None);
+        assert_eq!(web_usage_refusal(true, false), None);
+    }
+
+    #[test]
+    fn parse_web_origin_normalizes_a_base_url_and_refuses_anything_else() {
+        // The reverse-proxy case Go's `--origin` exists for: scheme + host + the path the proxy
+        // publishes. A trailing slash is not a different origin.
+        assert_eq!(
+            parse_web_origin("https://ts.example.com/tailscale"),
+            Ok("https://ts.example.com/tailscale".to_string())
+        );
+        assert_eq!(
+            parse_web_origin("  https://ts.example.com/tailscale/  "),
+            Ok("https://ts.example.com/tailscale".to_string())
+        );
+        // Scheme + host alone is the pass-through proxy case; an explicit non-default port is kept,
+        // a default one is not (both name the same origin).
+        assert_eq!(
+            parse_web_origin("http://192.0.2.10:8088"),
+            Ok("http://192.0.2.10:8088".to_string())
+        );
+        assert_eq!(
+            parse_web_origin("https://ts.example.com:443/"),
+            Ok("https://ts.example.com".to_string())
+        );
+        // An IPv6 literal keeps its brackets, so the result is still a usable URL.
+        assert_eq!(
+            parse_web_origin("http://[2001:db8::1]:8088/ui"),
+            Ok("http://[2001:db8::1]:8088/ui".to_string())
+        );
+
+        // The refusals. A bare host is the mistake to expect — it is what `--prefix` habits produce
+        // — and it is precisely the input that carries no scheme, the thing `--origin` is for.
+        for bad in ["", "   ", "ts.example.com", "/tailscale"] {
+            assert!(
+                parse_web_origin(bad).is_err(),
+                "{bad:?} is not an absolute URL and must be refused"
+            );
+        }
+        assert!(
+            parse_web_origin("ftp://ts.example.com")
+                .unwrap_err()
+                .contains("http or https"),
+            "a non-http(s) scheme must be named in the refusal"
+        );
+        assert!(
+            parse_web_origin("https://ts.example.com/ui?a=1")
+                .unwrap_err()
+                .contains("query or fragment"),
+            "a query names one request, not the base URL the UI is served at"
+        );
+        assert!(
+            parse_web_origin("https://ts.example.com/ui#top")
+                .unwrap_err()
+                .contains("query or fragment")
+        );
+        assert!(
+            parse_web_origin("https://user:pw@ts.example.com")
+                .unwrap_err()
+                .contains("credentials")
+        );
+    }
+
+    #[test]
+    fn web_ui_url_prefers_the_origin_over_the_address_that_was_bound() {
+        // The defect: behind a reverse proxy the bound address is not the address anyone reaches,
+        // and `--prefix` fixes only the path. With an origin, the origin wins outright.
+        let origin = parse_web_origin("https://ts.example.com/tailscale").unwrap();
+        assert_eq!(
+            web_ui_url(Some(&origin), Some("127.0.0.1:8088"), "/tailscale").as_deref(),
+            Some("https://ts.example.com/tailscale")
+        );
+        // An origin that already names the outside path is used verbatim — the proxy is free to map
+        // it onto a different inside path, so appending `--prefix` would invent a URL nobody serves.
+        assert_eq!(
+            web_ui_url(Some(&origin), Some("127.0.0.1:8088"), "/inside").as_deref(),
+            Some("https://ts.example.com/tailscale")
+        );
+        // An origin that names only scheme + host is the pass-through case: the served path applies.
+        let host_only = parse_web_origin("https://ts.example.com").unwrap();
+        assert_eq!(
+            web_ui_url(Some(&host_only), None, "/tailscale").as_deref(),
+            Some("https://ts.example.com/tailscale")
+        );
+        assert_eq!(
+            web_ui_url(Some(&host_only), None, "/").as_deref(),
+            Some("https://ts.example.com")
+        );
+
+        // Without an origin, nothing changes from the previous behaviour: the bound address, plus
+        // the served path.
+        assert_eq!(
+            web_ui_url(None, Some("127.0.0.1:8088"), "/").as_deref(),
+            Some("http://127.0.0.1:8088")
+        );
+        assert_eq!(
+            web_ui_url(None, Some("127.0.0.1:8088"), "/tailscale").as_deref(),
+            Some("http://127.0.0.1:8088/tailscale")
+        );
+        // `--cgi` without `--origin`: nothing was bound and the proxy's scheme/host is not in the
+        // CGI environment, so the URL is unknown rather than guessed.
+        assert_eq!(web_ui_url(None, None, "/"), None);
+    }
+
+    #[test]
+    fn route_web_request_answers_only_get_at_the_served_path() {
+        // The one route the read-only page has — shared by the listener and `--cgi`.
+        assert_eq!(route_web_request("GET", "/", "/"), WebRoute::Page);
+        assert_eq!(
+            route_web_request("GET", "/tailscale", "/tailscale"),
+            WebRoute::Page
+        );
+        // A different path, a path that only looks right, and a non-GET method are all 404.
+        assert_eq!(route_web_request("GET", "/other", "/"), WebRoute::NotFound);
+        assert_eq!(
+            route_web_request("GET", "/tailscale", "/"),
+            WebRoute::NotFound
+        );
+        assert_eq!(route_web_request("POST", "/", "/"), WebRoute::NotFound);
+        assert_eq!(route_web_request("", "/", "/"), WebRoute::NotFound);
+    }
+
+    #[test]
+    fn cgi_request_path_follows_the_cgi_environment_precedence() {
+        // `REQUEST_URI` wins when the server supplied it (Go's `net/http/cgi` reads it first), and
+        // the query string is dropped — the read-only page takes no parameters.
+        assert_eq!(
+            cgi_request_path(Some("/tailscale?x=1"), Some("/tailscale"), None),
+            "/tailscale"
+        );
+        assert_eq!(cgi_request_path(Some("/"), Some("/ignored"), None), "/");
+        // Without it, the path is the script's own mount point plus whatever followed it.
+        assert_eq!(
+            cgi_request_path(None, Some("/tailscale"), Some("/extra")),
+            "/tailscale/extra"
+        );
+        assert_eq!(
+            cgi_request_path(None, Some("/tailscale"), None),
+            "/tailscale"
+        );
+        // An empty or absent environment is the root request, not an empty path (which would 404
+        // against every served path).
+        assert_eq!(cgi_request_path(None, None, None), "/");
+        assert_eq!(cgi_request_path(Some("   "), None, None), "/");
+    }
+
+    #[test]
+    fn cgi_response_is_headers_then_a_blank_line_then_the_body() {
+        let body = "<!DOCTYPE html><html><body>hi</body></html>";
+        let response = cgi_response("200 OK", body);
+        // Go's CGI child writer always emits a `Status:` line; the invoking web server turns these
+        // headers into the HTTP response.
+        assert!(response.starts_with("Status: 200 OK\r\n"), "{response}");
+        assert!(response.contains("Content-Type: text/html; charset=utf-8\r\n"));
+        assert!(response.contains(&format!("Content-Length: {}\r\n", body.len())));
+        // Exactly one blank line separates the headers from the body, and the body is last.
+        let (headers, rest) = response
+            .split_once("\r\n\r\n")
+            .expect("a CGI response ends its headers with a blank line");
+        assert!(!headers.contains("\r\n\r\n"));
+        assert_eq!(rest, body);
+        // The error routes reuse the same serializer, so their status reaches the server too.
+        assert!(
+            cgi_response("404 Not Found", WEB_NOT_FOUND_BODY).starts_with("Status: 404 Not Found")
+        );
+    }
+
+    #[test]
+    fn render_status_html_states_the_url_it_is_served_at() {
+        use tailscaled_rs::localapi::StatusReport;
+        let report = StatusReport {
+            state: "Running".to_string(),
+            ..Default::default()
+        };
+        // With a known absolute URL (from `--origin`, or the bound address), the page says so — the
+        // reverse-proxy case where the address this process bound is not the address anyone reached.
+        let origin = parse_web_origin("https://ts.example.com/tailscale").unwrap();
+        let url = web_ui_url(Some(&origin), None, "/").expect("an origin always yields a URL");
+        let html = render_status_html(&report, Some(&url));
+        assert!(
+            html.contains("<link rel=\"canonical\" href=\"https://ts.example.com/tailscale\">"),
+            "the page must state the absolute URL it is served at: {html}"
+        );
+        // Operator-supplied, but it still lands in markup: escaped like every other value.
+        let hostile = render_status_html(&report, Some("https://x/\"><script>y"));
+        assert!(
+            !hostile.contains("<script>y"),
+            "a canonical URL must not inject raw markup: {hostile}"
+        );
+        assert!(hostile.contains("&quot;&gt;&lt;script&gt;y"));
+        // `--cgi` without `--origin`: no URL is known, so the page claims none.
+        let unknown = render_status_html(&report, None);
+        assert!(
+            !unknown.contains("rel=\"canonical\""),
+            "an unknown URL must not be guessed at: {unknown}"
+        );
     }
 
     #[test]
@@ -15955,11 +17298,138 @@ mod tests {
             .expect("parses")
             .command
         {
-            Command::Whois { ip, json } => {
-                assert_eq!(ip, "100.64.0.9");
+            Command::Whois {
+                target,
+                proto,
+                json,
+            } => {
+                assert_eq!(target, vec!["100.64.0.9".to_string()]);
+                assert!(proto.is_none(), "no --proto means Go's empty value: both");
                 assert!(json);
             }
             _ => panic!("expected Command::Whois"),
+        }
+    }
+
+    #[test]
+    fn whois_accepts_gos_proto_flag_and_ip_port_argument() {
+        // The whole point of the bead: `tailscale whois --proto=tcp 100.64.0.9:22` copied from Go
+        // must reach the lookup instead of dying at argument parsing.
+        match Cli::try_parse_from(["tnet", "whois", "--proto=tcp", "100.64.0.9:22"])
+            .expect("Go's flag + ip:port argument must parse")
+            .command
+        {
+            Command::Whois {
+                target,
+                proto,
+                json,
+            } => {
+                assert_eq!(target, vec!["100.64.0.9:22".to_string()]);
+                assert_eq!(proto.as_deref(), Some("tcp"));
+                assert!(!json);
+            }
+            _ => panic!("expected Command::Whois"),
+        }
+        // Go's separated spelling (`--proto udp`) is the same flag.
+        match Cli::try_parse_from(["tnet", "whois", "--proto", "udp", "100.64.0.9"])
+            .expect("parses")
+            .command
+        {
+            Command::Whois { proto, .. } => assert_eq!(proto.as_deref(), Some("udp")),
+            _ => panic!("expected Command::Whois"),
+        }
+        // The positional is a list at the clap layer so the arity refusals can be Go's own words
+        // (see `whois_target`) — clap itself must accept zero and two arguments.
+        for argv in [
+            vec!["tnet", "whois"],
+            vec!["tnet", "whois", "100.64.0.9", "100.64.0.10"],
+        ] {
+            assert!(
+                Cli::try_parse_from(&argv).is_ok(),
+                "clap must defer the arity verdict to whois_target: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn whois_target_ports_gos_two_argument_refusals() {
+        // Go `runWhoIs`: `len(args) > 1` → "too many arguments, expected at most one peer";
+        // `len(args) == 0` → "missing argument, expected one peer". Both verbatim.
+        let one = ["100.64.0.9".to_string()];
+        assert_eq!(
+            whois_target(&one).expect("one argument is the peer"),
+            "100.64.0.9"
+        );
+        let none: [String; 0] = [];
+        assert_eq!(
+            whois_target(&none).unwrap_err().to_string(),
+            "missing argument, expected one peer"
+        );
+        let two = ["100.64.0.9".to_string(), "100.64.0.10".to_string()];
+        assert_eq!(
+            whois_target(&two).unwrap_err().to_string(),
+            "too many arguments, expected at most one peer"
+        );
+    }
+
+    #[test]
+    fn parse_whois_target_splits_gos_ip_port_form() {
+        // A bare IP keeps Go's port 0, which the wire spells `None`.
+        assert_eq!(
+            parse_whois_target("100.64.0.9").expect("a bare IP parses"),
+            ("100.64.0.9".to_string(), None)
+        );
+        // `ip:port` — the form the bead's copied command uses.
+        assert_eq!(
+            parse_whois_target("100.64.0.9:22").expect("ip:port parses"),
+            ("100.64.0.9".to_string(), Some(22))
+        );
+        // IPv6, bare and bracketed-with-port (Go's `whois` is documented for v4 or v6).
+        assert_eq!(
+            parse_whois_target("fd7a:115c:a1e0::1").expect("a bare IPv6 parses"),
+            ("fd7a:115c:a1e0::1".to_string(), None)
+        );
+        assert_eq!(
+            parse_whois_target("[fd7a:115c:a1e0::1]:22").expect("[v6]:port parses"),
+            ("fd7a:115c:a1e0::1".to_string(), Some(22))
+        );
+        // Anything else is refused here, before any daemon round trip, naming what was passed.
+        for bad in ["peer-b", "100.64.0.9:", "100.64.0.9:notaport", ""] {
+            let err = parse_whois_target(bad)
+                .expect_err("only an IP or ip:port is accepted")
+                .to_string();
+            assert!(
+                err.contains("expected an IP or Go's ip[:port] form"),
+                "the refusal should name the accepted forms: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_whois_proto_maps_gos_three_values() {
+        use tailscaled_rs::localapi::WhoisProto;
+        // Go: `protocol; one of "tcp" or "udp"; empty means both`. Absent and explicitly-empty are
+        // the same "both", which the wire spells `None`.
+        assert_eq!(parse_whois_proto(None).expect("absent is both"), None);
+        assert_eq!(parse_whois_proto(Some("")).expect("empty is both"), None);
+        assert_eq!(
+            parse_whois_proto(Some("tcp")).expect("tcp parses"),
+            Some(WhoisProto::Tcp)
+        );
+        assert_eq!(
+            parse_whois_proto(Some("udp")).expect("udp parses"),
+            Some(WhoisProto::Udp)
+        );
+        // A value outside Go's documented pair is refused rather than silently ignored: it could
+        // never select anything on this build, so a typo would otherwise look like it worked.
+        for bad in ["TCP", "sctp", "tcp6"] {
+            let err = parse_whois_proto(Some(bad))
+                .expect_err("only tcp/udp are accepted")
+                .to_string();
+            assert!(
+                err.contains("expected \"tcp\" or \"udp\""),
+                "the refusal should name the accepted values: {err}"
+            );
         }
     }
 

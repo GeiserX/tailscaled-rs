@@ -78,7 +78,7 @@ mod config;
 mod control_url;
 mod diag;
 pub mod install;
-mod linkmon;
+pub(crate) mod linkmon;
 mod profile;
 mod revert_guard;
 pub mod serve;
@@ -3794,8 +3794,13 @@ impl Backend {
     /// Resolve a tailnet IP to the peer that owns it (the `tnet whois` / Go `tailscale whois` path).
     /// A thin `pub` shim over [`diag::whois`], kept on `Backend` so the `server.rs` dispatch call
     /// site (`Backend::whois(&dev, ..)`) is unchanged. See [`diag::whois`] for the full mapping.
-    pub async fn whois(dev: &tailscale::Device, ip: &str) -> crate::localapi::Response {
-        diag::whois(dev, ip).await
+    pub async fn whois(
+        dev: &tailscale::Device,
+        ip: &str,
+        port: Option<u16>,
+        proto: Option<crate::localapi::WhoisProto>,
+    ) -> crate::localapi::Response {
+        diag::whois(dev, ip, port, proto).await
     }
 
     /// Fetch an OIDC id-token for this node scoped to `audience` (the `tnet id-token` / Go

@@ -64,6 +64,32 @@ struct Args {
     /// since `tnet` has no `--statedir` of its own.
     #[arg(long, value_name = "DIR")]
     statedir: Option<PathBuf>,
+    /// Encrypt the daemon's state file on disk (Go `tailscaled --encrypt-state`). **Accepted by the
+    /// parser, then refused at startup when it is on** — see `can_encrypt_state`. Go seals the
+    /// state file to the device's TPM (Linux and Windows only) by prefixing the state path with
+    /// `tpm:`, and when the flag is *unset* enables that by itself wherever the platform supports it
+    /// or the syspolicy key `EncryptState` asks for it.
+    ///
+    /// This fork has no state-store provider layer and no TPM/keystore integration: prefs and the
+    /// node key are written as plain JSON under a `0700` state dir, which `docs/THREAT_MODEL.md`
+    /// records as a trust boundary. At-rest encryption is therefore **out of scope for now**, and
+    /// the flag says so rather than being an unknown argument or a silent no-op that would claim
+    /// protection this build does not provide.
+    ///
+    /// Tri-state, like Go's `boolFlag` (`cmd/tailscaled/flag.go`), which tracks whether it was ever
+    /// set: absent, `--encrypt-state` (= on), or `--encrypt-state=false` (explicitly off, and inert
+    /// — Go validates only the "on" case). Go's `flag` package accepts a value for a bool flag only
+    /// in the `=` form, hence `require_equals`; the value spellings are Go's `strconv.ParseBool`
+    /// set, see `parse_go_bool`.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        value_parser = parse_go_bool
+    )]
+    encrypt_state: Option<bool>,
     /// Path of the LocalAPI control socket. Overrides `TAILNETD_SOCKET`. When omitted, resolves to
     /// `TAILNETD_SOCKET` else `<statedir>/tailnetd.sock`. Go `tailscaled --socket`.
     #[arg(long, value_name = "PATH")]
@@ -118,6 +144,27 @@ struct Args {
     /// this crate does not yet own. The `reload-config` LocalAPI verb re-reads this same source.)
     #[arg(long, value_name = "SOURCE")]
     config: Option<String>,
+    /// Bind this node's identity to a hardware-backed key (Go `tailscaled --hardware-attestation`).
+    /// **Accepted by the parser, then refused at startup when it is on** — see
+    /// `can_use_hardware_attestation`. Go uses TPM 2.0 on Linux and Windows, the Secure Enclave on
+    /// macOS and iOS and Keystore on Android, then marks the node hardware-attested to its backend;
+    /// when the flag is unset it defaults from the syspolicy key `HardwareAttestation`.
+    ///
+    /// There is no hardware key store anywhere in this fork — the node key is generated and held by
+    /// the `tailscale-rs` engine and persisted as an ordinary file — so there is no attestation key
+    /// to bind an identity to. **Out of scope for now**, and refused rather than ignored: a silently
+    /// accepted flag would leave an operator believing the identity is sealed to this machine.
+    ///
+    /// Tri-state like `--encrypt-state` above; `--hardware-attestation=false` is accepted and inert.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        value_parser = parse_go_bool
+    )]
+    hardware_attestation: Option<bool>,
     /// Run a SOCKS5 proxy on `[host:]port` that dials **over the tailnet** (Go `tailscaled
     /// --socks5-server`). A bare port (`1055`) binds `127.0.0.1:<port>`; pass an explicit address to
     /// bind elsewhere (the proxy is UNAUTHENTICATED — the bind address is the security boundary, so it
@@ -174,6 +221,26 @@ struct Args {
     /// unless given.
     #[arg(long, value_name = "[HOST:]PORT")]
     debug: Option<String>,
+    /// The daemon's subcommands. `None` is the ordinary case: run the daemon.
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// `tailnetd`'s subcommands — the analogue of Go `tailscaled`'s `subCommands` map, which `main`
+/// dispatches on `os.Args[1]` **before** parsing the daemon's own flag set, so a subcommand runs
+/// standalone and never starts a daemon.
+///
+/// Go's map holds four entries; only `debug` is ported here. `install-system-daemon` /
+/// `uninstall-system-daemon` are already reachable in this fork as `tnet install`/`uninstall`
+/// (`ipn::install`), and `be-child` is Go's Windows subprocess plumbing, which has nothing to be
+/// the child of here.
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Daemon-less network diagnostics: dump the host network state, follow link changes, or fetch a
+    /// URL — none of which need a running daemon or its socket (Go `tailscaled debug`).
+    ///
+    /// This is NOT the `--debug` flag above, which is the listen address of the metrics HTTP server.
+    Debug(tailscaled_rs::debugmode::DebugArgs),
 }
 
 /// Restore the default `SIGPIPE` disposition (terminate) before any output. The Rust runtime sets
@@ -200,6 +267,25 @@ async fn main() -> Result<()> {
     // flag set up front. The parsed values then override the env-derived defaults below.
     let args = Args::parse();
 
+    // `tailnetd debug …` (Go `tailscaled debug`): a SUBCOMMAND, dispatched first — before the
+    // `--bird-socket` refusal, before `--cleanup`, and before the experiment gate. All three of
+    // those orderings are deliberate and all three are Go's: Go dispatches its `subCommands` map on
+    // `os.Args[1]` at the top of `main`, ahead of its own flag parsing and every startup
+    // precondition, because the subcommand never starts a daemon. Here the experiment gate is the
+    // one that matters most — the gate exists because the ENGINE is unaudited, and `debug` never
+    // constructs one: it enumerates interfaces and speaks plain HTTP. Making an operator opt into
+    // experimental software before they may look at their own network state would defeat the point
+    // of the tool, which is diagnosing a node that will not come up.
+    //
+    // Bare message + exit 1 on failure mirrors Go's `log.SetFlags(0)` + `log.Fatal(err)`.
+    if let Some(Command::Debug(debug_args)) = &args.command {
+        if let Err(e) = tailscaled_rs::debugmode::run(debug_args) {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     // `--bird-socket <path>` (Go `tailscaled --bird-socket`): parsed so a Go-shaped command line
     // reaches a refusal that names the missing integration, then refused HERE — before the
     // `--cleanup` handling below, which is where Go puts the same check (top of `main`, above its
@@ -207,6 +293,20 @@ async fn main() -> Result<()> {
     // Bare message + exit 1 mirrors Go's `log.SetFlags(0)` + `log.Fatalf`. See `bird_socket_refusal`
     // for the reasoning and for the empty-path carve-out.
     if let Some(message) = bird_socket_refusal(args.bird_socket.as_deref()) {
+        eprintln!("{message}");
+        std::process::exit(1);
+    }
+
+    // `--encrypt-state` / `--hardware-attestation` (Go `tailscaled --encrypt-state` /
+    // `--hardware-attestation`): the explicit-flag half of Go's `handleTPMFlags`. Refused HERE, next
+    // to the `--bird-socket` refusal and for the same reasons — an operator who asked for a feature
+    // this build does not have should be told about the FLAG rather than about `--cleanup`'s result
+    // or an unrelated environment variable, and Go likewise validates these flags before it reaches
+    // its own cleanup path. Bare message + exit 1 mirrors Go's `log.SetFlags(0)` + `log.Fatal(err)`.
+    // The policy-driven half runs further down, once the syspolicy file is loaded.
+    if let Some(message) =
+        explicit_tpm_flag_refusal(args.encrypt_state, args.hardware_attestation, goos())
+    {
         eprintln!("{message}");
         std::process::exit(1);
     }
@@ -275,6 +375,19 @@ async fn main() -> Result<()> {
     // (Go calls its `loadSyspolicy` hook at the same point, after flag parsing and before the engine
     // exists). Never fatal: see `load_syspolicy_file`.
     load_syspolicy_file(&args.syspolicy_file);
+
+    // The system-policy half of Go's `handleTPMFlags`, run at Go's own position: immediately after
+    // the syspolicy file is registered, because these two arms are the only place the daemon reads a
+    // policy key at startup. Neither feature can be turned on here, so all this produces is the
+    // reporting Go does on the way past — see `tpm_policy_notices`.
+    for notice in tpm_policy_notices(
+        args.encrypt_state,
+        args.hardware_attestation,
+        |key| ipn::syspolicy::get_boolean(key, false),
+        goos(),
+    ) {
+        tracing::warn!("{notice}");
+    }
 
     // Best-effort OS-level hardening (no-coredump / no-ptrace / no-swap) for the secrets the engine
     // will hold in memory. Done here — after the experiment gate and logging init (so its outcome is
@@ -1071,6 +1184,203 @@ fn bird_socket_refusal(path: Option<&str>) -> Option<String> {
     ))
 }
 
+/// This host's OS in Go's `runtime.GOOS` spelling, so a message ported from Go names the platform
+/// the way Go's `%s` of `runtime.GOOS` would. Rust spells macOS `"macos"`; every other target this
+/// daemon builds for already agrees with Go.
+fn goos() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    }
+}
+
+/// Go `strconv.ParseBool` — the parser behind `cmd/tailscaled`'s `boolFlag.Set`
+/// (`cmd/tailscaled/flag.go` @ `53a0d659afa51835dd7a9283873cca44261454f8`).
+///
+/// Accepts exactly Go's twelve spellings and nothing else, so `--encrypt-state=yes` is refused here
+/// the way `tailscaled` refuses it instead of being accepted — or, worse, read as false — by a
+/// looser parser. The message is Go's own `strconv` error, which is what `boolFlag.Set` returns and
+/// Go's `flag` package prints back to the operator.
+fn parse_go_bool(s: &str) -> Result<bool, String> {
+    match s {
+        "1" | "t" | "T" | "TRUE" | "true" | "True" => Ok(true),
+        "0" | "f" | "F" | "FALSE" | "false" | "False" => Ok(false),
+        _ => Err(format!("strconv.ParseBool: parsing {s:?}: invalid syntax")),
+    }
+}
+
+/// Whether hardware attestation could be enabled here — Go `canUseHardwareAttestation`
+/// (`cmd/tailscaled/tailscaled.go` @ `53a0d659afa51835dd7a9283873cca44261454f8`).
+///
+/// Go's first test is `key.NewEmptyHardwareAttestationKey() == key.ErrUnsupported`: does this
+/// platform *and this build* have a hardware-attestation key type at all. This fork is permanently
+/// on that branch — neither the daemon nor the `tailscale-rs` engine has a hardware key store — so
+/// the answer is always no, and the error is Go's sentence with this binary's name in it.
+///
+/// Go's second test has nothing to port to: it refuses the flag against a **portable** state store
+/// (`kube:`, `arn:`) because a TPM-bound key cannot be migrated to another machine. `tailnetd` has
+/// no `--state` flag and no state-store providers, so every state path it can have is the local file
+/// store Go's `isPortableStore` reports as non-portable, and the refusal is unreachable. It lands
+/// the day a provider-prefixed `--state` does.
+///
+/// `Err` carries the short Go-shaped sentence; the callers decide whether it becomes a fatal
+/// refusal (an explicit flag) or a log line (a policy that asked for it).
+fn can_use_hardware_attestation() -> Result<(), String> {
+    Err(
+        "--hardware-attestation is not supported on this platform or in this build of tailnetd"
+            .to_string(),
+    )
+}
+
+/// Whether state-at-rest encryption could be enabled here — Go `canEncryptState`
+/// (`cmd/tailscaled/tailscaled.go` @ `53a0d659afa51835dd7a9283873cca44261454f8`).
+///
+/// Go's three tests, in order:
+///
+/// 1. `runtime.GOOS` is neither `windows` nor `linux` → `--encrypt-state is not supported on %s`.
+///    Ported verbatim: it is exactly as true of this fork as it is of Go, so an operator on macOS
+///    gets Go's own sentence.
+/// 2. `!feature.TPMAvailable()` → Go blames the device. Here the cause is the *build* — there is no
+///    TPM code to be available — so the sentence keeps Go's shape and names the honest reason.
+/// 3. `--state` carries a known provider prefix → `--encrypt-state can only be used with --state set
+///    to a local file path`. Unreachable for the same reason as the portable-store refusal in
+///    [`can_use_hardware_attestation`]: there is no `--state` flag and no provider prefixes.
+///
+/// `goos` is Go's `runtime.GOOS` spelling (pass [`goos()`]), taken as a parameter so the
+/// platform-specific arm is testable on any host.
+fn can_encrypt_state(goos: &str) -> Result<(), String> {
+    // Go: TPM encryption is only configurable on Windows and Linux; other platforms either use
+    // system APIs and are not configurable (Android/Apple) or support no encryption at all.
+    if goos != "windows" && goos != "linux" {
+        return Err(format!("--encrypt-state is not supported on {goos}"));
+    }
+    Err("--encrypt-state is not supported on this device or in this build of tailnetd".to_string())
+}
+
+/// The **explicit-flag** half of Go's `handleTPMFlags` — its two `case args.X.v:` arms, which fire
+/// when a flag was set *and* set to true, validate it, and `log.SetFlags(0)` + `log.Fatal(err)` when
+/// it cannot be honoured. Pure so it can be unit-tested; returns `None` when there is nothing to
+/// refuse, else the operator-facing message the caller prints before `exit(1)`.
+///
+/// The tri-state matters and is Go's: `--hardware-attestation=false` matches **neither** arm of Go's
+/// switch (the first needs `.v`, the second needs `!.set`), so an explicit "off" is inert and is not
+/// even validated. Only `None` — the flag omitted — reaches the policy half,
+/// [`tpm_policy_notices`].
+///
+/// Hardware attestation is checked before state encryption, which is Go's order: with both flags
+/// explicitly on, the attestation refusal is the one the operator sees.
+///
+/// Go runs both halves from one `handleTPMFlags()` call. This fork splits them because their
+/// preconditions differ: this half needs nothing but the command line, so it runs early — before
+/// `--cleanup` and before the experiment gate, exactly where the `--bird-socket` refusal runs and
+/// for the same reason (an operator who asked for a feature that does not exist should be told
+/// that, not told about an unrelated environment variable, and `--cleanup` must not quietly swallow
+/// the refusal — Go refuses ahead of its own cleanup too). The policy half needs the syspolicy file
+/// loaded and the logger up, so it runs where those exist.
+fn explicit_tpm_flag_refusal(
+    encrypt_state: Option<bool>,
+    hardware_attestation: Option<bool>,
+    goos: &str,
+) -> Option<String> {
+    // Go: `case args.hardwareAttestation.v:` — set AND true.
+    if hardware_attestation == Some(true)
+        && let Err(e) = can_use_hardware_attestation()
+    {
+        return Some(format!(
+            "error: {e}.\n\
+                 Go uses this flag to bind the node identity to a hardware-backed key — TPM 2.0 on \
+                 Linux and Windows, the Secure Enclave on macOS and iOS, Keystore on Android — and \
+                 then marks the node hardware-attested to its backend.\n\
+                 This fork has no hardware key store: the node key is generated and held by the \
+                 tailscale-rs engine and persisted as an ordinary file under the 0700 state dir \
+                 (docs/THREAT_MODEL.md records that as a trust boundary). With no attestation key \
+                 there is nothing to bind an identity to and nothing to report as attested, so \
+                 tailnetd refuses instead of accepting the flag as a no-op: a silently ignored \
+                 --hardware-attestation would leave an operator believing this node's identity is \
+                 sealed to this machine, when the key is a file that copies to any other machine.\n\
+                 Drop the flag to start tailnetd. Hardware-bound node identity is out of scope \
+                 until there is a platform key store to bind to — see docs/DESIGN.md."
+        ));
+    }
+    // Go: `case args.encryptState.v:` — "explicitly enabled, validate".
+    if encrypt_state == Some(true)
+        && let Err(e) = can_encrypt_state(goos)
+    {
+        return Some(format!(
+            "error: {e}.\n\
+                 Go encrypts the state file at rest by sealing it to the device's TPM (Linux and \
+                 Windows only), prefixing the state path with `tpm:` so the state store seals and \
+                 unseals through the TPM, and enables that by itself when the flag is unset and the \
+                 platform supports it.\n\
+                 tailnetd has no state-store provider layer and no TPM or keystore integration: \
+                 prefs and the node key are written as plain JSON under a 0700 state dir, protected \
+                 by filesystem permissions and best-effort process hardening (mlockall + coredump \
+                 suppression), not by a key. docs/THREAT_MODEL.md records that as a trust boundary, \
+                 and refusing here is what keeps it honest — accepting --encrypt-state as a no-op \
+                 would claim at-rest protection this build does not provide.\n\
+                 Drop the flag to start tailnetd. State-at-rest encryption is out of scope until \
+                 there is a platform key store to seal to — see docs/DESIGN.md."
+        ));
+    }
+    None
+}
+
+/// The **system-policy** half of Go's `handleTPMFlags` — its two `case !args.X.set:` arms, which
+/// fire when the flag was omitted, read the matching policy key, and default the flag from it *if*
+/// the device can honour it.
+///
+/// In this fork neither [`can_use_hardware_attestation`] nor [`can_encrypt_state`] can succeed, so
+/// Go's "default it on" branches are unreachable: both features stay off no matter what the policy
+/// says, and nothing downstream consumes a resolved value. What is left is the reporting Go does on
+/// the way past, which is the whole point of running this at all — an admin who wrote
+/// `{"HardwareAttestation": true}` into `--syspolicy-file` must not be left thinking it took effect.
+///
+/// Returns the lines to log, in Go's order (hardware attestation first). Two of them:
+///
+/// * `[unexpected] policy requires hardware attestation, but device does not support it: …` — Go's,
+///   verbatim, including its `[unexpected]` prefix.
+/// * A **fork addition** for `EncryptState`. Go stays silent there: its `case !args.encryptState.set`
+///   arm just leaves encryption off when `canEncryptState` fails, because on a Go build the operator
+///   can usually fix the device. Here the gap is permanent, so silence would leave `EncryptState`
+///   sitting in a policy file looking effective forever. The wording is deliberately not Go's, so
+///   nobody mistakes an addition for a port.
+///
+/// `policy_boolean` reads a boolean policy key (pass a closure over
+/// [`ipn::syspolicy::get_boolean`]); it is a parameter both so the branch stays testable without a
+/// registered policy source and so the read stays *lazy*, as Go's is — a flag that was set never
+/// consults the policy at all.
+fn tpm_policy_notices(
+    encrypt_state: Option<bool>,
+    hardware_attestation: Option<bool>,
+    policy_boolean: impl Fn(&str) -> bool,
+    goos: &str,
+) -> Vec<String> {
+    let mut notices = Vec::new();
+    // Go: `case !args.hardwareAttestation.set:`, whose `canUseHardwareAttestation` error branch then
+    // sets `args.hardwareAttestation.v = false` — off, which is the only value this fork can reach,
+    // and which nothing here consumes. The `&&` chain keeps the policy read lazy, as Go's is.
+    if hardware_attestation.is_none()
+        && let Err(e) = can_use_hardware_attestation()
+        && policy_boolean(ipn::syspolicy::PKEY_HARDWARE_ATTESTATION)
+    {
+        notices.push(format!(
+            "[unexpected] policy requires hardware attestation, but device does not support it: {e}"
+        ));
+    }
+    // Go: `case !args.encryptState.set:` — where Go stays silent (see the doc comment above).
+    if encrypt_state.is_none()
+        && let Err(e) = can_encrypt_state(goos)
+        && policy_boolean(ipn::syspolicy::PKEY_ENCRYPT_STATE)
+    {
+        notices.push(format!(
+            "policy sets {}, but state-at-rest encryption is not available here, so the state file \
+             stays unencrypted: {e}",
+            ipn::syspolicy::PKEY_ENCRYPT_STATE
+        ));
+    }
+    notices
+}
+
 /// The stock `--syspolicy-file` path for **this host** — Go `defaultSyspolicyFile`
 /// (`cmd/tailscaled/syspolicy.go`). Thin wrapper over [`default_syspolicy_file_for`] so the decision
 /// itself stays testable on any platform.
@@ -1443,6 +1753,273 @@ mod tests {
             message.contains("--advertise-routes"),
             "points at the route-advertising path that does work; got {message:?}"
         );
+    }
+
+    // --- `--encrypt-state` / `--hardware-attestation` (Go `tailscaled`'s TPM flags) -------------
+    //
+    // Go registers both only on a `buildfeatures.HasTPM` build and validates them in
+    // `handleTPMFlags`. This fork declares them unconditionally and refuses the "on" case, so a
+    // Go-shaped command line reaches a named refusal instead of clap's "unexpected argument". The
+    // cases below pin the tri-state (absent / on / explicitly off), the refusal messages, and the
+    // policy-driven reporting.
+
+    #[test]
+    fn parse_go_bool_accepts_exactly_gos_spellings() {
+        for on in ["1", "t", "T", "TRUE", "true", "True"] {
+            assert_eq!(parse_go_bool(on), Ok(true), "{on:?} is a Go true");
+        }
+        for off in ["0", "f", "F", "FALSE", "false", "False"] {
+            assert_eq!(parse_go_bool(off), Ok(false), "{off:?} is a Go false");
+        }
+        // Go's `strconv.ParseBool` takes none of these, so neither do we: a mistyped value must be
+        // a parse error, never a silent "false" that would look like the flag was honoured.
+        for bad in ["yes", "no", "on", "off", "TrUe", "2", ""] {
+            let err = parse_go_bool(bad).expect_err("{bad:?} is not a Go boolean");
+            assert!(
+                err.contains("strconv.ParseBool") && err.contains("invalid syntax"),
+                "keeps Go's error text; got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tpm_flags_parse_as_a_tristate_rather_than_being_unknown_arguments() {
+        // Omitted: neither flag was set, which is what sends them to the policy half.
+        let none = Args::parse_from(["tailnetd"]);
+        assert_eq!(none.encrypt_state, None);
+        assert_eq!(none.hardware_attestation, None);
+        // Bare: Go's `boolFlag` reports `IsBoolFlag`, so the flag alone means true.
+        let bare = Args::parse_from(["tailnetd", "--encrypt-state", "--hardware-attestation"]);
+        assert_eq!(bare.encrypt_state, Some(true));
+        assert_eq!(bare.hardware_attestation, Some(true));
+        // `=value`: the only form Go's flag package accepts for a bool, in Go's spellings.
+        let explicit = Args::parse_from([
+            "tailnetd",
+            "--encrypt-state=false",
+            "--hardware-attestation=T",
+        ]);
+        assert_eq!(explicit.encrypt_state, Some(false));
+        assert_eq!(explicit.hardware_attestation, Some(true));
+        // A non-boolean value is refused by the parser, not coerced.
+        assert!(Args::try_parse_from(["tailnetd", "--encrypt-state=yes"]).is_err());
+    }
+
+    #[test]
+    fn neither_tpm_feature_is_available_in_this_build() {
+        // Hardware attestation: Go's build/platform arm, which this fork is permanently on.
+        let e = can_use_hardware_attestation().expect_err("no hardware key store exists here");
+        assert!(
+            e.contains("--hardware-attestation is not supported on this platform or in this build"),
+            "keeps Go's sentence; got {e:?}"
+        );
+        // State encryption on a platform Go does not support either: Go's `%s`-of-GOOS arm, ported
+        // verbatim, so the operator sees the same sentence `tailscaled` would print.
+        assert_eq!(
+            can_encrypt_state("darwin"),
+            Err("--encrypt-state is not supported on darwin".to_string())
+        );
+        assert_eq!(
+            can_encrypt_state("freebsd"),
+            Err("--encrypt-state is not supported on freebsd".to_string())
+        );
+        // On the two platforms Go CAN encrypt on, the refusal names the build rather than the OS,
+        // because that is the honest reason here — there is no TPM code to be unavailable.
+        for os in ["linux", "windows"] {
+            let e = can_encrypt_state(os).expect_err("no TPM support is linked into this build");
+            assert!(
+                e.contains("--encrypt-state is not supported on this device or in this build"),
+                "names the build, not the OS, on {os}; got {e:?}"
+            );
+            assert!(
+                !e.contains(os),
+                "must not blame the platform Go supports; got {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_omitted_or_explicitly_off_tpm_flag_is_not_a_refusal() {
+        // Go's switch fires only on `args.X.v`, so both of these fall through untouched — an
+        // operator can leave `--encrypt-state=false` in a unit file and the daemon still starts.
+        assert_eq!(explicit_tpm_flag_refusal(None, None, "linux"), None);
+        assert_eq!(
+            explicit_tpm_flag_refusal(Some(false), Some(false), "linux"),
+            None
+        );
+        assert_eq!(
+            explicit_tpm_flag_refusal(Some(false), Some(false), "darwin"),
+            None
+        );
+    }
+
+    #[test]
+    fn an_explicit_encrypt_state_is_refused_and_the_message_says_why() {
+        let message = explicit_tpm_flag_refusal(Some(true), None, "linux")
+            .expect("--encrypt-state must be refused");
+        // Names the flag, so the operator can tell which argument stopped the daemon.
+        assert!(
+            message.contains("--encrypt-state is not supported"),
+            "keeps Go's refusal wording; got {message:?}"
+        );
+        // Says what Go does with the flag, so the refusal is legible to someone porting a Go unit
+        // file rather than reading as an arbitrary rejection.
+        assert!(
+            message.contains("TPM"),
+            "says what Go's flag does; got {message:?}"
+        );
+        // Names the actual reason: no state-store provider / keystore here, and what DOES protect
+        // the state dir instead.
+        assert!(
+            message.contains("no state-store provider layer") && message.contains("0700 state dir"),
+            "says WHY it is unsupported and what protects the state today; got {message:?}"
+        );
+        // Records the parity decision where the operator hits it, and points at the write-up.
+        assert!(
+            message.contains("out of scope") && message.contains("docs/DESIGN.md"),
+            "states the decision and where it is recorded; got {message:?}"
+        );
+        // Tells the operator what to do.
+        assert!(
+            message.contains("Drop the flag"),
+            "says how to start the daemon; got {message:?}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_hardware_attestation_is_refused_and_the_message_says_why() {
+        let message = explicit_tpm_flag_refusal(None, Some(true), "linux")
+            .expect("--hardware-attestation must be refused");
+        assert!(
+            message.contains("--hardware-attestation is not supported"),
+            "keeps Go's refusal wording; got {message:?}"
+        );
+        assert!(
+            message.contains("no hardware key store"),
+            "says WHY it is unsupported; got {message:?}"
+        );
+        // The concrete consequence of ignoring it, which is why this is a refusal and not a no-op.
+        assert!(
+            message.contains("copies to any other machine"),
+            "says what a silent no-op would let an operator believe; got {message:?}"
+        );
+        assert!(
+            message.contains("out of scope") && message.contains("Drop the flag"),
+            "states the decision and how to proceed; got {message:?}"
+        );
+    }
+
+    #[test]
+    fn hardware_attestation_is_refused_before_encrypt_state() {
+        // Go validates the attestation flag in the first switch, so with both flags on that is the
+        // error `log.Fatal` prints. Only one message ever reaches the operator, so which one it is
+        // matters.
+        let message = explicit_tpm_flag_refusal(Some(true), Some(true), "linux")
+            .expect("both flags on must still refuse");
+        assert!(
+            message.contains("--hardware-attestation is not supported"),
+            "Go's order puts hardware attestation first; got {message:?}"
+        );
+        assert!(
+            !message.contains("--encrypt-state"),
+            "only the first refusal is reported; got {message:?}"
+        );
+    }
+
+    #[test]
+    fn a_policy_that_asks_for_the_tpm_features_is_reported_not_silently_dropped() {
+        let notices = tpm_policy_notices(None, None, |_| true, "linux");
+        assert_eq!(notices.len(), 2, "one per key; got {notices:?}");
+        // Go's line, verbatim including its `[unexpected]` prefix.
+        assert!(
+            notices[0].starts_with(
+                "[unexpected] policy requires hardware attestation, but device does not support it:"
+            ),
+            "keeps Go's wording and order; got {:?}",
+            notices[0]
+        );
+        // The fork addition: Go stays silent here, which would leave `EncryptState` looking
+        // effective forever on a build that can never honour it.
+        assert!(
+            notices[1].contains("policy sets EncryptState")
+                && notices[1].contains("stays unencrypted"),
+            "says the policy did not take effect; got {:?}",
+            notices[1]
+        );
+    }
+
+    #[test]
+    fn a_policy_that_asks_for_neither_feature_says_nothing() {
+        // The default path on every host: no policy file, or one that sets other keys. Startup must
+        // stay quiet, exactly as Go's does when `GetBoolean` returns its default.
+        assert!(tpm_policy_notices(None, None, |_| false, "linux").is_empty());
+        assert!(tpm_policy_notices(None, None, |_| false, "darwin").is_empty());
+    }
+
+    #[test]
+    fn a_flag_that_was_set_never_consults_the_policy() {
+        // Go reads the policy only in its `case !args.X.set:` arm, so a daemon started with
+        // `--encrypt-state=false` must not be told about an `EncryptState` policy it already
+        // overrode. The closure panics to prove the read is not merely ignored but never made.
+        let notices = tpm_policy_notices(
+            Some(false),
+            Some(false),
+            |key| panic!("the policy must not be read for a flag that was set (asked for {key:?})"),
+            "linux",
+        );
+        assert!(notices.is_empty());
+        // Only the omitted flag's key is read when just one flag was set.
+        let notices = tpm_policy_notices(
+            Some(false),
+            None,
+            |key| {
+                assert_eq!(
+                    key,
+                    tailscaled_rs::ipn::syspolicy::PKEY_HARDWARE_ATTESTATION
+                );
+                true
+            },
+            "linux",
+        );
+        assert_eq!(notices.len(), 1);
+    }
+
+    // --- the `debug` subcommand (Go `tailscaled debug`) ----------------------------------------
+    //
+    // The decision and the refusals are `tailscaled_rs::debugmode`'s, and are tested there. What
+    // belongs here is the daemon's own wiring: that `debug` is a subcommand at all, that its flag
+    // set is separate from the daemon's, that a stray positional REACHES the refusal instead of
+    // dying as clap's "unexpected argument", and that the unrelated `--debug` flag still works.
+
+    #[test]
+    fn debug_subcommand_parses_alongside_the_daemons_own_flags() {
+        use clap::Parser;
+        // No subcommand is the ordinary case: run the daemon.
+        assert!(Args::parse_from(["tailnetd"]).command.is_none());
+
+        let Some(Command::Debug(debug)) =
+            Args::parse_from(["tailnetd", "debug", "--ifconfig"]).command
+        else {
+            panic!("`tailnetd debug --ifconfig` should parse as the debug subcommand");
+        };
+        assert!(debug.ifconfig && !debug.monitor && debug.rest.is_empty());
+
+        // A stray positional is carried through rather than rejected by clap, so
+        // `debugmode::select` can refuse it with Go's own message.
+        let Some(Command::Debug(debug)) =
+            Args::parse_from(["tailnetd", "debug", "monitor"]).command
+        else {
+            panic!("a stray argument should still parse into the debug subcommand");
+        };
+        assert_eq!(debug.rest, vec!["monitor".to_string()]);
+
+        // A daemon-startup flag is NOT in the debug flag set (Go's is a separate `flag.FlagSet`).
+        assert!(Args::try_parse_from(["tailnetd", "debug", "--statedir", "/var/lib/x"]).is_err());
+
+        // …and the daemon's own `--debug <addr>` (the metrics server's listen address) is an
+        // unrelated flag that still parses on its own, with no subcommand.
+        let a = Args::parse_from(["tailnetd", "--debug", "9090"]);
+        assert_eq!(a.debug.as_deref(), Some("9090"));
+        assert!(a.command.is_none());
     }
 
     #[test]

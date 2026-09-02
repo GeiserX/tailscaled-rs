@@ -535,9 +535,33 @@ pub enum Request {
     /// [`Status`](Request::Status).
     Ip,
     /// Resolve a tailnet IP to the peer that owns it (Go `tailscale whois`). Read-only.
+    ///
+    /// Go's argument is `ip[:port]` and its LocalAPI query is `?proto=&addr=`, so the flow triple is
+    /// carried here as three fields: the address in [`ip`](Request::Whois::ip), the optional flow
+    /// [`port`](Request::Whois::port), and the optional [`proto`](Request::Whois::proto). Both new
+    /// fields are `#[serde(default)]`, so a request written by an older CLI (address only) still
+    /// deserializes.
     Whois {
-        /// The tailnet IP to resolve.
+        /// The tailnet IP to resolve. Address only — the port travels in [`port`](Request::Whois::port),
+        /// the way Go's `serveWhoIs` splits `addr` into a `netip.AddrPort` before the lookup.
         ip: String,
+        /// The flow's port, from Go's `ip[:port]` argument form. `None` when the caller named a bare
+        /// IP (Go's `netip.AddrPortFrom(ip, 0)`).
+        ///
+        /// HONEST SCOPE: a whois is a *flow* lookup in Go only for flows tailscaled itself proxies —
+        /// `LocalBackend.WhoIs` consults the port (and [`proto`](Request::Whois::proto)) solely in its
+        /// `ProxyMapper` fallback, reached when the address matches no node in the netmap. When the
+        /// address IS a tailnet address — every address this fork can answer for — Go resolves it by
+        /// IP and never looks at the port. The engine's `Device::whois` likewise resolves by IP and
+        /// discards the port, so this field records what was asked without changing the answer. The
+        /// engine surface a proxied-flow lookup would need is engine ask #35.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        port: Option<u16>,
+        /// The flow's protocol (Go `whois --proto`, `?proto=` on the LocalAPI query). `None` is Go's
+        /// empty value: "both". See [`port`](Request::Whois::port) for why this fork records it but
+        /// cannot select on it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proto: Option<WhoisProto>,
     },
     /// Fetch an OIDC id-token for this node, scoped to `audience` (Go `tailscale id-token <aud>`).
     /// The daemon asks control to mint a signed JWT; replies with [`Response::IdToken`]. A WRITE: it
@@ -857,6 +881,50 @@ pub struct RevertedPref {
     /// `"true"`/`"false"`; for a list it is the comma-joined set; for an optional string it is the
     /// value itself.
     pub value: String,
+}
+
+/// The transport protocol of the flow a [`Request::Whois`] asks about — Go `tailscale whois
+/// --proto`, documented upstream as `protocol; one of "tcp" or "udp"; empty means both`.
+///
+/// Go passes the flag's string straight through to `?proto=` unvalidated (an unrecognized value
+/// simply matches nothing in its proxied-flow table). This fork parses it into a closed enum
+/// instead — see [`FromStr`](WhoisProto::from_str) — because the value can never select anything
+/// here (engine ask #35), and a silently-ignored `--proto=TCP` typo would be indistinguishable from
+/// a working one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WhoisProto {
+    /// Go `--proto=tcp`.
+    Tcp,
+    /// Go `--proto=udp`.
+    Udp,
+}
+
+impl std::fmt::Display for WhoisProto {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        })
+    }
+}
+
+impl std::str::FromStr for WhoisProto {
+    type Err = String;
+
+    /// Parse Go's two documented values. Case-sensitive and exact, like every other proto string Go
+    /// compares against (`ProxyMapper.WhoIsIPPort` keys its table on the literal `"tcp"`/`"udp"`),
+    /// so `TCP` is a refusal rather than a silent alias. The empty string is NOT accepted here: it is
+    /// Go's "both", which this fork models as `None` at the call site, not as a variant.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "tcp" => Ok(Self::Tcp),
+            "udp" => Ok(Self::Udp),
+            other => Err(format!(
+                "invalid --proto {other:?}: expected \"tcp\" or \"udp\" (empty means both)"
+            )),
+        }
+    }
 }
 
 /// The identity behind a tailnet IP, returned by [`Request::Whois`]. The Rust analogue of tsnet's
@@ -2676,6 +2744,77 @@ mod tests {
         match serde_json::from_str::<Request>(r#"{"cmd":"logout"}"#).unwrap() {
             Request::Logout { reason } => assert_eq!(reason, None),
             other => panic!("expected Logout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn whois_request_carries_gos_flow_triple_and_stays_backward_compatible() {
+        // Go's `whois [--proto tcp|udp] ip[:port]` is a flow triple, so the request carries the port
+        // and the protocol alongside the address. Both are additive: the bare `{"cmd":"whois",
+        // "ip":...}` an older CLI sends must still parse, and a bare-IP request must still serialize
+        // to exactly that historical form (skip_serializing_if).
+        let json = serde_json::to_string(&Request::Whois {
+            ip: "100.64.0.9".into(),
+            port: Some(22),
+            proto: Some(WhoisProto::Tcp),
+        })
+        .unwrap();
+        assert_eq!(
+            json, r#"{"cmd":"whois","ip":"100.64.0.9","port":22,"proto":"tcp"}"#,
+            "the proto must ride the wire as Go's lowercase spelling"
+        );
+        match serde_json::from_str::<Request>(&json).unwrap() {
+            Request::Whois { ip, port, proto } => {
+                assert_eq!(ip, "100.64.0.9");
+                assert_eq!(port, Some(22));
+                assert_eq!(proto, Some(WhoisProto::Tcp));
+            }
+            other => panic!("expected Whois, got {other:?}"),
+        }
+        let bare = serde_json::to_string(&Request::Whois {
+            ip: "100.64.0.9".into(),
+            port: None,
+            proto: None,
+        })
+        .unwrap();
+        assert_eq!(
+            bare, r#"{"cmd":"whois","ip":"100.64.0.9"}"#,
+            "a bare-IP whois must serialize to the historical form"
+        );
+        match serde_json::from_str::<Request>(r#"{"cmd":"whois","ip":"100.64.0.9"}"#).unwrap() {
+            Request::Whois { ip, port, proto } => {
+                assert_eq!(ip, "100.64.0.9");
+                assert_eq!(port, None, "an older CLI's request means Go's port 0");
+                assert_eq!(proto, None, "and Go's empty proto: both");
+            }
+            other => panic!("expected Whois, got {other:?}"),
+        }
+        // A proto the daemon does not know must not deserialize into some default — the closed enum
+        // is what keeps a bogus value off the lookup path.
+        assert!(
+            serde_json::from_str::<Request>(r#"{"cmd":"whois","ip":"100.64.0.9","proto":"sctp"}"#)
+                .is_err(),
+            "an unknown proto must be a parse failure, not a silent fallback"
+        );
+    }
+
+    #[test]
+    fn whois_proto_parses_and_renders_gos_two_values() {
+        // Go documents the flag as `one of "tcp" or "udp"; empty means both`. The empty case is
+        // modelled as `None` at the call site, so `FromStr` accepts exactly the two named values,
+        // exactly as spelled.
+        assert_eq!("tcp".parse::<WhoisProto>(), Ok(WhoisProto::Tcp));
+        assert_eq!("udp".parse::<WhoisProto>(), Ok(WhoisProto::Udp));
+        assert_eq!(WhoisProto::Tcp.to_string(), "tcp");
+        assert_eq!(WhoisProto::Udp.to_string(), "udp");
+        for bad in ["TCP", "Udp", "sctp", "icmp", ""] {
+            let err = bad
+                .parse::<WhoisProto>()
+                .expect_err("only Go's two documented values parse");
+            assert!(
+                err.contains("expected \"tcp\" or \"udp\" (empty means both)"),
+                "the refusal should quote Go's own flag documentation: {err}"
+            );
         }
     }
 
