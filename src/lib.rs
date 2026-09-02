@@ -22,6 +22,8 @@
 //!   come up at all.
 //! - [`hostreap`] — startup cleanup of host routes/DNS a *hard-killed* previous run left behind
 //!   (the engine's graceful teardown never ran), so a crash cannot outlive the daemon.
+//! - [`tunflag`] — `tailnetd --tun`, Go's tunnel-interface flag, resolved onto this fork's TUN
+//!   prefs so a `tailscaled` command line copied from a unit file or a container image starts.
 //!
 //! Two binaries consume it: `tailnetd` (the daemon) and `tnet` (the thin CLI client).
 
@@ -39,6 +41,7 @@ pub mod localapi;
 pub mod prefs;
 pub mod server;
 pub mod socks5;
+pub mod tunflag;
 
 use std::path::PathBuf;
 

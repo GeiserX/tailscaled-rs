@@ -4184,6 +4184,50 @@ impl Backend {
         self.prefs_tx.subscribe()
     }
 
+    /// Apply `tailnetd --tun` to the loaded prefs, persisting only if it actually changed something.
+    /// Returns whether it did, so the caller can say so in the boot log.
+    ///
+    /// Go carries the tunnel interface as a launch argument and hands it straight to
+    /// `wgengine.Config`; this fork carries it as a pref ([`Prefs::tun_enabled`] / [`Prefs::tun_name`],
+    /// set by `tnet up --tun`/`--tun-name`), so the flag has to land somewhere, and the pref is the
+    /// only place that reaches the engine. Mapping it here — rather than into a second, flag-only
+    /// override — keeps ONE answer to "what data path is this node using": `tnet status`, the boot
+    /// posture line, the exit-node leak warning and `check-ip-forwarding` all read the same pref, and
+    /// a later `tnet up --tun` changes the node the way it always did instead of being silently
+    /// outranked by an invisible launch value.
+    ///
+    /// Persisting matches how [`apply_config`](Backend::apply_config) treats `--config`: the flag is
+    /// part of the node's configured intent, so it survives a restart. Two deliberate narrowings:
+    ///
+    /// * **Nothing is written when nothing changed.** The overwhelmingly common case is a unit file
+    ///   passing `--tun=userspace-networking` to a daemon already on the netstack; that must not
+    ///   create a `prefs.json` for a node that was never configured, because the file's existence is
+    ///   itself state (the daemon derives `ever_configured` from it).
+    /// * **`ever_configured` is not set** even when it does write. Choosing a data path on the
+    ///   command line is not the deliberate "this node is configured" act that `up` or `--config` is.
+    ///
+    /// A resolved netstack transport leaves `tun_name`/`tun_mtu` alone — both are documented as ignored
+    /// while TUN is off, so clearing them would throw away a name the operator set for the next time
+    /// they enable it.
+    pub async fn apply_tun_flag(
+        &mut self,
+        transport: &crate::tunflag::TunTransport,
+    ) -> Result<bool> {
+        let (tun_enabled, tun_name) = match transport {
+            crate::tunflag::TunTransport::Netstack => (false, self.prefs.tun_name.clone()),
+            // `None` (Go's bare `utun` on darwin) means "let the platform default choose", which is
+            // exactly what a `None` `tun_name` already means to `build_config`.
+            crate::tunflag::TunTransport::Tun { name } => (true, name.clone()),
+        };
+        if self.prefs.tun_enabled == tun_enabled && self.prefs.tun_name == tun_name {
+            return Ok(false);
+        }
+        self.prefs.tun_enabled = tun_enabled;
+        self.prefs.tun_name = tun_name;
+        self.persist_prefs().await?;
+        Ok(true)
+    }
+
     /// Apply a declarative `--config` document over the loaded prefs and persist the result, returning
     /// the registration auth key the config supplied (if any) for the caller to feed into bring-up.
     ///
@@ -7601,6 +7645,83 @@ mod tests {
             !raw.contains("tskey-secret"),
             "the auth key must never be persisted into prefs.json: {raw}"
         );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn apply_tun_flag_maps_the_daemon_flag_onto_the_prefs_and_writes_only_on_change() {
+        // `Backend::apply_tun_flag` is the seam that turns `tailnetd --tun` into this node's data
+        // path. Go hands its `--tun` to `wgengine.Config`; here the pref is what reaches the engine,
+        // so the flag has to land there — and because prefs.json's mere existence is state, a flag
+        // that changes nothing must write nothing. Both halves are pinned here.
+        let dir = std::env::temp_dir().join(format!("tailnetd-tunflag-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+
+        // (1) `--tun=userspace-networking` on a daemon already on the netstack (the default, and the
+        //     overwhelmingly common unit-file case): nothing changed, so nothing is written — a
+        //     never-configured node must not acquire a prefs.json just by being started.
+        let changed = be
+            .apply_tun_flag(&crate::tunflag::TunTransport::Netstack)
+            .await
+            .expect("applying the netstack transport cannot fail");
+        assert!(!changed, "an unchanged transport must report no change");
+        assert!(
+            !be.prefs_path.exists(),
+            "an unchanged --tun must not create {}",
+            be.prefs_path.display()
+        );
+
+        // (2) `--tun=tailscale0`: TUN on, with that interface name, persisted — the launch flag is
+        //     part of the node's intent, so it survives a restart like a `--config` boot does.
+        let changed = be
+            .apply_tun_flag(&crate::tunflag::TunTransport::Tun {
+                name: Some("tailscale0".to_string()),
+            })
+            .await
+            .expect("applying a TUN transport cannot fail");
+        assert!(changed, "switching to TUN is a change");
+        assert!(be.prefs.tun_enabled);
+        assert_eq!(be.prefs.tun_name.as_deref(), Some("tailscale0"));
+        let reloaded = Prefs::load(&be.prefs_path)
+            .await
+            .expect("reload persisted prefs");
+        assert!(
+            reloaded.tun_enabled && reloaded.tun_name.as_deref() == Some("tailscale0"),
+            "the resolved transport must be persisted: {reloaded:?}"
+        );
+        // Choosing a data path on the command line is not the deliberate "this node is configured"
+        // act that `up` or `--config` is, so it must not flip `ever_configured`.
+        assert!(
+            !be.ever_configured,
+            "--tun must not mark the node configured"
+        );
+
+        // (3) Back to `--tun=userspace-networking`: TUN off, but the interface NAME is kept. It is
+        //     documented as ignored while TUN is off, so clearing it would silently throw away a
+        //     name the operator set for the next time they enable it.
+        let changed = be
+            .apply_tun_flag(&crate::tunflag::TunTransport::Netstack)
+            .await
+            .expect("applying the netstack transport cannot fail");
+        assert!(changed, "switching off TUN is a change");
+        assert!(!be.prefs.tun_enabled);
+        assert_eq!(
+            be.prefs.tun_name.as_deref(),
+            Some("tailscale0"),
+            "an off transport must not clear the configured interface name"
+        );
+
+        // (4) `--tun=utun` on macOS resolves to "no name" (Go's any-free-unit magic value), which is
+        //     already this daemon's spelling for "let the platform default choose".
+        let changed = be
+            .apply_tun_flag(&crate::tunflag::TunTransport::Tun { name: None })
+            .await
+            .expect("applying a TUN transport cannot fail");
+        assert!(changed, "TUN with no name is a change from netstack");
+        assert!(be.prefs.tun_enabled && be.prefs.tun_name.is_none());
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
