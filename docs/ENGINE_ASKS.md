@@ -1189,3 +1189,54 @@ in full, and the LocalAPI `Request::Whois` already carries `port` and `proto` th
 call-site change in `diag::whois` plus deleting the "recorded, cannot select" notes on the flag help
 and the wire docs. Until then a proxied flow that Go attributes to a peer is reported here as owned by
 no node, with or without the flag. Tracked in daemon bead tsd-re4d7624. — daemon lane
+
+## 36. Tailnet-lock init with a trusted-key set, several disablements, and this node's own lock key (for `tnet lock init`)
+
+**Why:** Go's `lock init` initializes the authority the operator describes, not a fixed one.
+`cmd/tailscale/cli/tailnet-lock.go` @ `53a0d659afa51835dd7a9283873cca44261454f8` takes
+`[--gen-disablement-for-support] --gen-disablements N <trusted-key>...`, where the positionals are the
+tailnet lock **public keys** (`tlpub:<hex>`, optionally `<key>?<votes>`) initially trusted to sign
+nodes — plus any pre-computed `disablement:<hex>` values — mints `N` disablement secrets itself,
+optionally mints one more that is transmitted to the coordination server for support, and calls
+`LocalClient.TailnetLockInit(ctx, keys, disablementValues, supportDisablement)`. Before any of that it
+refuses when `st.Enabled`, and refuses when the current node's own lock key is not among the trusted
+keys (`st.PublicKey`, from `NetworkLockStatus`) — "the tailnet lock key of the current node must be
+one of the trusted keys during initialization".
+
+Verified against pin `9d847a6e`/v0.43.0. The engine's init is a fixed single-node genesis:
+`Device::tka_init(disablement_secret: Vec<u8>)` (`src/lib.rs`) → `ts_runtime`'s `tka_init_run`
+(`control_runner.rs`), whose body builds `AumKey { kind: Ed25519, votes: 1, public:
+keys.network_lock_keys.public }` as the **sole** trusted key and `vec![disablement_value(&secret)]` as
+the **single** disablement value, then submits init/begin → init/finish. Three consequences:
+
+1. **No key set.** There is no parameter for one, so a tailnet cannot be locked with a second signing
+   node trusted from the start — the case Go's help is written around ("run `tailscale lock` on that
+   node, and copy the node's tailnet lock key").
+2. **No way to read this node's lock key.** `TkaStatus` (`ts_control/src/tka.rs`) carries only `head`
+   and `disabled` — no analogue of Go's `NetworkLockStatus.PublicKey` — and nothing else on `Device`
+   exposes `network_lock_keys.public`. So Go's self-key refusal cannot be *evaluated* here, and the
+   operator cannot obtain the key that Go's grammar requires them to pass.
+3. **The support disablement is unconditional.** `tka_init_run` sets
+   `TkaInitFinishRequest.support_disablement = disablement_secret` — the one secret it was given — so
+   the operator's disablement secret always reaches the coordination server. Upstream sends a
+   *separate*, purpose-minted secret there, and only when `--gen-disablement-for-support` is passed.
+
+**Ask** (extends #17 `tka_init` and #25's key-set half):
+
+1. `Device::tka_init(keys: Vec<AumKey>, disablement_values: Vec<Vec<u8>>, support_disablement:
+   Option<Vec<u8>>)` — the genesis built from the caller's trusted-key set and disablement values,
+   with the support secret sent only when it is `Some`. Today's call is that with the node's own key,
+   one derived value, and the secret repeated as the support disablement.
+2. This node's tailnet lock public key on the read path — a field on `TkaStatus` (Go's
+   `NetworkLockStatus.PublicKey`) or a `Device::tka_public_key()` — so the CLI can print it for the
+   operator to copy and can check Go's "current node must be among the trusted keys" refusal.
+
+**Daemon impact once landed:** `tnet lock init` already parses Go's whole positional grammar
+(`parse_lock_args`, a port of upstream's `parseTLArgs`, including `<key>?<votes>` and both
+`disablement:` prefixes) and already runs Go's `--confirm` two-step, its already-enabled refusal and
+its secret minting. Wiring is: pass the parsed keys and values to the new `tka_init`, delete the
+"this daemon cannot …" refusals in `plan_lock_init`, replace the placeholder trusted-key line with
+Go's `- tlpub:%x (%s key)` list, restore Go's self-key check against (2), and drop the
+support-disablement note the command prints today. Until then the fork initializes only the subset the
+engine has — this node as the sole trusted key, one disablement secret — and says so where the
+operator hits it. Tracked in daemon bead tsd-reb2dfc1. — daemon lane
