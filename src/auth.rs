@@ -207,6 +207,11 @@ pub(crate) fn requires_write(request: &crate::localapi::Request) -> bool {
         // re-derivation), gated on write exactly like `DebugRebind`. Even though it is lighter (no
         // socket swap), a non-owner must not be able to poke the datapath, so it is never a read.
         | Request::DebugReStun
+        // `DebugStateDir` only reads one path, but Go gates the ENTIRE LocalAPI `debug` route on
+        // `PermitWrite` ("debug access denied") rather than per-action, so the faithful classification
+        // is a write like `DebugRebind`/`DebugReStun`. It also discloses the daemon's on-disk layout,
+        // which a socket-reachable non-owner has no business enumerating.
+        | Request::DebugStateDir
         // `ReloadConfig` re-reads the `--config` file and RECONFIGURES the running node (it merges +
         // persists the prefs and, on a live node, rebuilds the engine — a brief reconnect). Go gates
         // `serveReloadConfig` on `PermitWrite`; a socket-reachable non-owner must not be able to
@@ -366,6 +371,11 @@ mod tests {
         assert!(
             requires_write(&Request::DebugReStun),
             "debug restun forces a STUN re-probe (live-datapath endpoint mutation) — a write, gated like down"
+        );
+        assert!(
+            requires_write(&Request::DebugStateDir),
+            "debug statedir rides Go's `debug` route, which gates on PermitWrite as a whole \
+             ('debug access denied') — so it is a write, like debug rebind/restun"
         );
         assert!(
             requires_write(&Request::ReloadConfig),

@@ -1711,6 +1711,20 @@ impl Backend {
         Ok(backend)
     }
 
+    /// The state directory this daemon is actually using — the root under which every profile's prefs
+    /// and keys live.
+    ///
+    /// Fixed at [`load`](Backend::load) from `tailnetd`'s `--statedir` (or from the
+    /// [`state_dir`](crate::state_dir) cascade as the daemon resolved it *at boot, in the daemon's own
+    /// environment*), so this is the only authoritative answer to "where is this node's state?": a CLI
+    /// re-running that cascade in a different environment — an unprivileged `tnet` against a root
+    /// `tailnetd` whose unit sets the dir — resolves a DIFFERENT path. Read by the
+    /// [`DebugStateDir`](crate::localapi::Request::DebugStateDir) LocalAPI verb, the analogue of Go's
+    /// `LocalBackend.TailscaleVarRoot()` that its `debug` route's `statedir` action returns.
+    pub fn state_dir(&self) -> &std::path::Path {
+        &self.state_dir
+    }
+
     /// Record the `--config` source the daemon was started with, so the `reload-config` LocalAPI
     /// verb can later re-read it (see [`config_source`](Backend::config_source) and
     /// [`reload_config`](Backend::reload_config)). Called once from `tailnetd`'s `main()` right after

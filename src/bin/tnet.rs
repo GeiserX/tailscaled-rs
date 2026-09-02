@@ -1407,17 +1407,25 @@ enum DebugCmd {
         #[arg(value_name = "FILE", required = true)]
         files: Vec<String>,
     },
-    /// Print the state directory this CLI resolved, WHY it resolved there, and the socket derived
-    /// from it (Go `tailscale debug statedir`). Purely local — it reports the paths the CLI would
-    /// use; nothing is read from the daemon, created, or mutated.
+    /// Print the state directory the DAEMON is using (Go `tailscale debug statedir`). Asks the
+    /// running daemon over the LocalAPI and prints that one path and nothing else — the CLI's own
+    /// environment never enters the answer, so a root `tailnetd` and an unprivileged `tnet` agree.
     ///
-    /// The state dir is chosen by a cascade (`$TAILNETD_STATE_DIR`, else the packaged system dir
-    /// when running as root, else `$XDG_STATE_HOME`/`$HOME`), and the winning rule is invisible in
-    /// the resulting path. That is exactly the shape of this fork's most common confusion: a root
-    /// `tailnetd` and an unprivileged `tnet` resolve *different* dirs, hence different sockets, and
-    /// the CLI just reports a missing socket. This prints the rule that won, so the split is one
-    /// line to spot instead of a guess.
-    Statedir,
+    /// Errors if the daemon is not reachable, and prints Go's `no statedir is set` if it reports
+    /// none. Nothing is created or mutated.
+    Statedir {
+        /// Report what THIS CLI would resolve — the state dir, the rule in the cascade that chose
+        /// it, and the socket derived from it — instead of asking the daemon.
+        ///
+        /// A fork extension with no upstream counterpart (Go's `debug statedir` takes no flags),
+        /// kept because it is the one form that still answers with no daemon running, which is when
+        /// the question is usually asked. The cascade (`$TAILNETD_STATE_DIR`, else the packaged
+        /// system dir when running as root, else `$XDG_STATE_HOME`/`$HOME`) is invisible in the
+        /// resulting path, so the winning rule is printed next to it: comparing this against the
+        /// bare `debug statedir` is how the classic root-daemon/unprivileged-CLI split is spotted.
+        #[arg(long)]
+        local: bool,
+    },
     /// Resolve a hostname to its IP addresses, one per line (Go `tailscale debug resolve`). Purely
     /// local — a **host-resolver** lookup inside this CLI process (Go's `net.DefaultResolver`, i.e.
     /// `getaddrinfo` here), NOT a MagicDNS query through the daemon: no LocalAPI round-trip and no
@@ -2675,11 +2683,9 @@ async fn main() -> Result<()> {
                 run_debug_stat(&files);
                 Ok(())
             }
-            // `debug statedir` reports the CLI's own path resolution — purely local, no round-trip.
-            DebugCmd::Statedir => {
-                run_debug_statedir(&socket);
-                Ok(())
-            }
+            // `debug statedir` asks the daemon which state dir IT is using (Go round-trips this);
+            // `--local` is the fork's no-daemon-needed report of the CLI's own resolution.
+            DebugCmd::Statedir { local } => run_debug_statedir(&socket, local).await,
             // `debug resolve` is a host-resolver lookup in THIS process — no socket round-trip.
             DebugCmd::Resolve { net, hostname } => run_debug_resolve(&hostname, &net).await,
             // `debug build-info` prints compile-time build facts — purely local, no round-trip.
@@ -4351,14 +4357,66 @@ async fn run_debug_resolve(hostname: &[String], net: &str) -> Result<()> {
     Ok(())
 }
 
-/// `debug statedir` (Go `tailscale debug statedir`): print the resolved state dir, the cascade rule
-/// that chose it, and the LocalAPI socket the CLI resolved. Purely local — it only reports paths, and
-/// deliberately does NOT create the state dir (a diagnostic that creates the thing it is diagnosing
-/// would mask the very "wrong dir" it exists to reveal). `socket` is the socket the CLI actually
-/// resolved (so an explicit `--socket`/`$TAILNETD_SOCKET` is reflected, not re-derived).
-fn run_debug_statedir(socket: &std::path::Path) {
-    let (dir, source) = tailscaled_rs::state_dir_with_source();
-    print!("{}", statedir_report(&dir, source, socket));
+/// `debug statedir` (Go `tailscale debug statedir`, `cmd/tailscale/cli/debug.go` @ v1.100.0): print
+/// the state directory **the daemon** is using.
+///
+/// Go's `runPrintStateDir` round-trips `DebugResultJSON(ctx, "statedir")` and prints just that path,
+/// erroring `no statedir is set` when the daemon reports none — and it has to, because only the daemon
+/// knows: it resolved its dir at boot, from its `--statedir` or from the cascade run in *its*
+/// environment. A CLI that re-ran the cascade in its own environment would answer a different question,
+/// and on the configuration this command exists for (a root `tailnetd` whose unit sets the state dir,
+/// an unprivileged `tnet`) it would answer it wrongly.
+///
+/// `local` selects the fork's no-round-trip report instead: the dir THIS CLI resolves, the cascade rule
+/// that chose it, and the socket the CLI resolved (an explicit `--socket`/`$TAILNETD_SOCKET` is
+/// reflected, not re-derived). It stays useful with no daemon running, and never creates the state dir
+/// — a diagnostic that created the thing it is diagnosing would mask the very "wrong dir" it exists to
+/// reveal.
+async fn run_debug_statedir(socket: &std::path::Path, local: bool) -> Result<()> {
+    if local {
+        let (dir, source) = tailscaled_rs::state_dir_with_source();
+        print!("{}", statedir_report(&dir, source, socket));
+        return Ok(());
+    }
+    match round_trip(socket, &Request::DebugStateDir).await {
+        Ok(Response::StateDir { dir }) => match statedir_line(&dir) {
+            Ok(line) => {
+                print!("{line}");
+                Ok(())
+            }
+            // Go returns this as the command's error; render it like every other daemon-reported
+            // failure here (message on stderr, exit 1) rather than as a stray blank line on stdout.
+            Err(message) => {
+                eprintln!("error: {message}");
+                std::process::exit(1);
+            }
+        },
+        Ok(Response::Error { message }) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        Ok(other) => anyhow::bail!("unexpected response to debug statedir: {other:?}"),
+        Err(e) => Err(e).with_context(|| {
+            format!(
+                "asking the daemon for its state dir at {}",
+                socket.display()
+            )
+        }),
+    }
+}
+
+/// Render the daemon's answer to `debug statedir`: the bare path plus a newline, or Go's
+/// `no statedir is set` when the daemon reports none.
+///
+/// Go's `runPrintStateDir` prints `fmt.Println(statedir)` on a non-empty answer and returns
+/// `errors.New("no statedir is set")` on the empty one; the output is one path and nothing else, so a
+/// script can consume it. Pure → unit-testable without a daemon.
+fn statedir_line(dir: &str) -> Result<String, &'static str> {
+    if dir.is_empty() {
+        Err("no statedir is set")
+    } else {
+        Ok(format!("{dir}\n"))
+    }
 }
 
 /// Build the `debug statedir` output (pure → unit-testable; no stdout, no filesystem writes).
@@ -20235,6 +20293,28 @@ mod tests {
     }
 
     // --- `debug statedir` / `debug build-info` --------------------------------------------------
+
+    #[test]
+    fn statedir_line_prints_the_daemons_path_and_nothing_else() {
+        // Go's `runPrintStateDir` prints the daemon's answer with `fmt.Println` — one path, one
+        // newline, no labels — so a script consuming `tnet debug statedir` gets a path.
+        assert_eq!(
+            super::statedir_line("/var/lib/tailnetd"),
+            Ok("/var/lib/tailnetd\n".to_string()),
+            "the daemon's path must be printed bare, with nothing else on the line"
+        );
+    }
+
+    #[test]
+    fn statedir_line_reports_go_s_no_statedir_error() {
+        // The ported error path: Go answers an empty `TailscaleVarRoot()` with
+        // `errors.New("no statedir is set")`, NOT with an empty line that reads as a valid path.
+        assert_eq!(
+            super::statedir_line(""),
+            Err("no statedir is set"),
+            "an empty answer from the daemon is Go's `no statedir is set` error"
+        );
+    }
 
     #[test]
     fn statedir_report_names_the_rule_that_won() {
