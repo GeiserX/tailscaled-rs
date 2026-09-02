@@ -81,6 +81,16 @@ export TS_RS_EXPERIMENT=this_is_unstable_software
 #   --version          print version and exit;  --help  full usage
 # e.g.  ./target/release/tailnetd --statedir /var/lib/tailnetd --verbose 1
 #
+# tailnetd also takes a `debug` SUBCOMMAND (Go `tailscaled debug`) — daemon-less diagnostics for
+# when the node will not come up at all, which is exactly when `tnet` (which talks to a running
+# daemon over its socket) cannot help. It needs no daemon, no socket and no TS_RS_EXPERIMENT:
+#   tailnetd debug --ifconfig            dump the host's network state once, as JSON (on stderr)
+#   tailnetd debug --monitor             …and re-dump it on every link change, until interrupted
+#   tailnetd debug --get-url <url>       fetch a URL with a connection trace ("login" = the
+#                                        default control plane's login URL)
+# (Go's --derp and --portmap are declared and refused BY NAME: a DERP round-trip test needs a
+# standalone DERP client this daemon does not own, and port mapping does not exist in the engine.)
+#
 # NOTE: --statedir also moves the default socket to <dir>/tailnetd.sock. Since `tnet` has no
 # --statedir, point the client at it explicitly:  tnet --socket /var/lib/tailnetd/tailnetd.sock status
 # (or export TAILNETD_SOCKET). The packaged service uses the default /var/lib/tailnetd, so this only
@@ -145,6 +155,17 @@ permanently**: it hands the tailnet admin full remote control of this node's pre
 bypassing the per-feature double opt-in, which this daemon's local authorization model
 (`docs/THREAT_MODEL.md` §4.1) does not grant to the control plane. `--no-remote-config`, Go's
 default, is what this build always does.
+
+**App connector: the advertise half only.** `tnet up/set --advertise-connector` really does reach
+control — the engine sets `Hostinfo.AppConnector` from the pref at registration and on every map
+request, so the admin console sees the node offering the role. What this build does **not** have is
+the connector's data path: it never receives the connector domain list, never watches DNS lookups to
+learn a domain's addresses, and so never appends a learned route to `--advertise-routes`. An
+advertising node therefore serves no connector traffic. `tnet appc-routes` (Go `tailscale
+appc-routes`) reports exactly what follows from that — `not a connector` when the pref is off, and
+`-n`'s count of the routes you advertise — and refuses `--map`, `--all` and the default per-domain
+summary with that reason, rather than printing an empty map that would read as "learned nothing
+yet". Advertise the role only if something else in your tailnet is doing the connecting.
 
 State (node keys + prefs) lives in `$XDG_STATE_HOME/tailnetd` (override with `TAILNETD_STATE_DIR`);
 the control socket is `<state-dir>/tailnetd.sock` (override with `TAILNETD_SOCKET`).

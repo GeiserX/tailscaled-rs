@@ -77,8 +77,9 @@ mod captive;
 mod config;
 mod control_url;
 mod diag;
+pub mod doctor;
 pub mod install;
-mod linkmon;
+pub(crate) mod linkmon;
 mod profile;
 mod revert_guard;
 pub mod serve;
@@ -124,22 +125,44 @@ async fn link_monitor_loop(device: std::sync::Arc<tailscale::Device>) {
     }
 }
 
+/// The captive-portal trigger, as a pure decision — extracted from
+/// [`Backend::connectivity_impacted`] so the "which state does this run in" question is testable
+/// without a live engine (the same split [`derive_state_from`] gets).
+///
+/// `state` is the node's current [`State`]; `derp_home` is whether the engine's net report names a
+/// reachable DERP region. Impacted means Go's pair: the loop is alive (upstream runs it **only**
+/// between entering and leaving `ipn.Running`) *and* something that impacts connectivity is unhealthy
+/// (here: no relay is reachable — Go's `no-derp-home`).
+fn connectivity_impacted_from(state: State, derp_home: bool) -> bool {
+    state == State::Running && !derp_home
+}
+
 /// The captive-portal detection loop — Go `ipn/ipnlocal/captiveportal.go`, its
 /// `checkCaptivePortalLoop` and `performCaptiveDetection`: notice when this node is stuck behind an
 /// airport/hotel Wi-Fi login page, and say so, instead of leaving the operator with an opaque
 /// "cannot reach control".
 ///
-/// Runs for the daemon's whole life — NOT bound to a device like [`link_monitor_loop`], because the
-/// interesting case is precisely the one where no device came up. Never returns.
+/// The task runs for the daemon's whole life, but it is **inert outside `Running`**: the gate below
+/// is false in every other state, which is how this fork expresses Go's loop *lifetime*. Upstream
+/// spawns `checkCaptivePortalLoop` when the backend enters `ipn.Running` and cancels its context on
+/// the way out (`ipn/ipnlocal/local.go`, `enterStateLocked`); a poll whose gate is false is the same
+/// thing without a task per state edge. Never returns.
 ///
 /// ## The trigger
 ///
 /// Detection is not periodic background chatter: it runs only while
-/// [`connectivity_impacted`](Backend::connectivity_impacted) holds (the operator wants the node up and
-/// it is not up) and [`should_run_captive_portal_detection`](Backend::should_run_captive_portal_detection)
-/// allows it. A `Running` node and a deliberately-`down` node both probe **zero** times. The first
-/// pass waits Go's [`DETECTION_INTERVAL`](captive::DETECTION_INTERVAL) so a blip during a normal
-/// bring-up cannot fire one.
+/// [`connectivity_impacted`](Backend::connectivity_impacted) holds — the node is `Running` and has no
+/// reachable relay (Go's `no-derp-home`) — and
+/// [`should_run_captive_portal_detection`](Backend::should_run_captive_portal_detection) allows it
+/// (the operator wants the node up). A healthy `Running` node, a node still coming up, and a
+/// deliberately-`down` node all probe **zero** times.
+///
+/// The first pass of an episode waits
+/// [`NO_DERP_HOME_TIME_TO_VISIBLE`](captive::NO_DERP_HOME_TIME_TO_VISIBLE) +
+/// [`DETECTION_INTERVAL`](captive::DETECTION_INTERVAL): upstream's health tracker only makes
+/// `no-derp-home` visible after the former, and its captive loop then spends the latter on its timer
+/// before probing. The sum is why a node whose first DERP measurement is merely still in flight does
+/// not probe on every bring-up.
 ///
 /// While connectivity stays impacted the pass repeats every
 /// [`RECHECK_INTERVAL`](captive::RECHECK_INTERVAL). Go instead re-arms its 2s timer off health-tracker
@@ -168,7 +191,8 @@ pub async fn captive_portal_loop(backend: std::sync::Arc<tokio::sync::Mutex<Back
         // acquisition. Never hold it across the probe below.
         let impacted = {
             let mut be = backend.lock().await;
-            let impacted = be.should_run_captive_portal_detection() && be.connectivity_impacted();
+            let impacted =
+                be.should_run_captive_portal_detection() && be.connectivity_impacted().await;
             if !impacted {
                 // Go's healthy branch: connectivity is fine, so we know for sure there is no portal
                 // in the way — drop any warning. `set_captive_portal_detected` is a no-op (and
@@ -187,8 +211,13 @@ pub async fn captive_portal_loop(backend: std::sync::Arc<tokio::sync::Mutex<Back
 
         let since = *impacted_since.get_or_insert_with(tokio::time::Instant::now);
         let due = match last_run {
-            // First pass of this episode: Go's 2s settle time.
-            None => since.elapsed() >= captive::DETECTION_INTERVAL,
+            // First pass of this episode: the settle time Go spends before its first probe —
+            // `no-derp-home`'s `TimeToVisible` (the health tracker's), then the captive loop's own
+            // `captivePortalDetectionInterval` on top.
+            None => {
+                since.elapsed()
+                    >= captive::NO_DERP_HOME_TIME_TO_VISIBLE + captive::DETECTION_INTERVAL
+            }
             // Still impacted after a pass: re-probe on the backoff.
             Some(ran) => ran.elapsed() >= captive::RECHECK_INTERVAL,
         };
@@ -203,10 +232,11 @@ pub async fn captive_portal_loop(backend: std::sync::Arc<tokio::sync::Mutex<Back
         // this is the one call site that changes.
         let found = captive::detect(&[], None).await;
 
-        // Re-read the gate under the lock before recording: the node may have converged to `Running`
-        // while we were probing, in which case Go's healthy branch owns the verdict, not a stale one.
+        // Re-read the gate under the lock before recording: the node may have found a relay (or left
+        // `Running` altogether) while we were probing, in which case Go's healthy branch owns the
+        // verdict, not a stale one.
         let mut be = backend.lock().await;
-        if be.should_run_captive_portal_detection() && be.connectivity_impacted() {
+        if be.should_run_captive_portal_detection() && be.connectivity_impacted().await {
             be.set_captive_portal_detected(found);
         } else {
             be.set_captive_portal_detected(false);
@@ -497,6 +527,15 @@ fn validate_exit_node_selector(exit_node: Option<&str>) -> Result<()> {
     }
     Ok(())
 }
+
+/// Per-daemon-process counter that disambiguates two diagnostic markers taken in the same second
+/// ([`Backend::bugreport`]). `bugreport --record` prints one marker before the reproduction and one
+/// after; the coarse Unix-seconds stamp alone would render both identically when the operator is
+/// quick, and a before/after pair that reads as one value brackets nothing. Relaxed ordering is
+/// enough: the only requirement is that two markers from one daemon differ, not that the numbers
+/// track any other event. Process-local and NOT persisted — a restart re-starts at 0, which is fine
+/// because the seconds stamp already separates runs.
+static MARKER_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Harden an operator-supplied `bugreport` note for embedding in the diagnostic marker: replace every
 /// control character (newlines, tabs, ANSI escapes, etc.) with `_` so the marker stays a single,
@@ -1699,6 +1738,20 @@ impl Backend {
         };
         backend.has_node_key = backend.has_persisted_node_key().await;
         Ok(backend)
+    }
+
+    /// The state directory this daemon is actually using — the root under which every profile's prefs
+    /// and keys live.
+    ///
+    /// Fixed at [`load`](Backend::load) from `tailnetd`'s `--statedir` (or from the
+    /// [`state_dir`](crate::state_dir) cascade as the daemon resolved it *at boot, in the daemon's own
+    /// environment*), so this is the only authoritative answer to "where is this node's state?": a CLI
+    /// re-running that cascade in a different environment — an unprivileged `tnet` against a root
+    /// `tailnetd` whose unit sets the dir — resolves a DIFFERENT path. Read by the
+    /// [`DebugStateDir`](crate::localapi::Request::DebugStateDir) LocalAPI verb, the analogue of Go's
+    /// `LocalBackend.TailscaleVarRoot()` that its `debug` route's `statedir` action returns.
+    pub fn state_dir(&self) -> &std::path::Path {
+        &self.state_dir
     }
 
     /// Record the `--config` source the daemon was started with, so the `reload-config` LocalAPI
@@ -3417,22 +3470,66 @@ impl Backend {
     /// Whether this node's connectivity is impacted — the condition that makes a captive portal worth
     /// probing for.
     ///
-    /// This is the fork's stand-in for Go's trigger. Go watches its health tracker and probes when any
-    /// warnable with `ImpactsConnectivity` is unhealthy (`captivePortalHealthChange`). This daemon has
-    /// no health tracker, so the equivalent signal is read straight off the state machine: the
-    /// operator wants the node up, and it is not up. That is exactly the situation a portal produces —
-    /// registration and map-poll attempts failing against a network that answers everything — and it
-    /// excludes both a healthy `Running` node and a deliberately-`down` one, neither of which Go would
-    /// probe on either.
-    fn connectivity_impacted(&self) -> bool {
+    /// This is the fork's stand-in for Go's trigger, and it runs in the state Go runs it in:
+    /// **`Running`**. Upstream starts `checkCaptivePortalLoop` on the transition *into* `ipn.Running`
+    /// and cancels it on the way out (`ipn/ipnlocal/local.go`, `enterStateLocked`), then probes only
+    /// while the health tracker reports some *other* `ImpactsConnectivity` warnable unhealthy
+    /// (`captivePortalHealthChange`). So the node upstream probes is the connected one that has lost
+    /// its path — the ordinary hotel-Wi-Fi case, where a portal appears mid-session — and nothing
+    /// else.
+    ///
+    /// This daemon has no health tracker, so the "some warnable impacts connectivity" half is read off
+    /// the one connectivity fact the engine does publish: the net-report
+    /// ([`netcheck`](tailscale::Device::netcheck)) has no reachable DERP region. That is precisely
+    /// what Go turns into `no-derp-home` (`health/warnings.go`: *"Tailscale could not connect to any
+    /// relay server"*, `ImpactsConnectivity: true`) — the warnable that actually fires when a portal
+    /// swallows a live node's traffic, since the portal answers the DERP connections instead of the
+    /// relay. The daemon's own state machine cannot supply this: the engine keeps publishing
+    /// `DeviceState::Running` once its netmap stream has attached, so a mid-session portal never
+    /// shows up as a state change.
+    ///
+    /// Deliberately **not** impacted:
+    /// - a node that is `Starting`/`NeedsLogin`/`Stopped`/`NoState` — upstream's loop is cancelled
+    ///   outside `Running`, so a node still coming up probes zero times;
+    /// - a `Running` node with a home relay — Go's healthy branch;
+    /// - a deliberately-`down` node (`want_running == false`), which
+    ///   [`should_run_captive_portal_detection`](Backend::should_run_captive_portal_detection)
+    ///   already excludes.
+    ///
+    /// The net-report read is an engine actor round-trip made under the backend lock, so it is
+    /// bounded by [`STATUS_QUERY_TIMEOUT`] exactly like [`status`](Backend::status)'s netmap query,
+    /// and is only ever issued in `Running` (where the control runner is past its auth loop and
+    /// answers its mailbox). A timeout or engine error reports *not* impacted: an unreadable signal is
+    /// not evidence of a broken path, and the next tick asks again.
+    async fn connectivity_impacted(&self) -> bool {
         if !self.prefs.want_running {
             return false;
         }
         let state = match self.device.as_ref() {
             Some(dev) => state_from_device(dev.device_state()).0,
+            // No engine at all: not `Running`, so upstream's loop would not be alive here.
             None => self.derive_state(false),
         };
-        state != State::Running
+        // Ask the engine only in `Running` — the one state where the answer can change the verdict,
+        // and the one state where the control runner is past its auth-retry loop and answering its
+        // mailbox (see `status`'s note on why it does the same).
+        let derp_home = match (state, self.device.as_ref()) {
+            (State::Running, Some(dev)) => {
+                match tokio::time::timeout(STATUS_QUERY_TIMEOUT, dev.netcheck()).await {
+                    Ok(Ok(report)) => report.preferred_derp.is_some(),
+                    Ok(Err(e)) => {
+                        tracing::debug!(error = %e, "captive: no net report; not probing this tick");
+                        true
+                    }
+                    Err(_) => {
+                        tracing::debug!("captive: net report timed out; not probing this tick");
+                        true
+                    }
+                }
+            }
+            _ => true,
+        };
+        connectivity_impacted_from(state, derp_home)
     }
 
     /// Record the verdict of a captive-portal detection pass (Go's
@@ -3512,26 +3609,43 @@ impl Backend {
         diag::metrics(dev)
     }
 
-    /// Build a LOCAL diagnostic marker (the `tnet bugreport` path). Unlike Go's `bugreport`, which
-    /// uploads logs to logtail and returns the server-side log id, this fork has no log-upload
-    /// backend — the marker is a purely local identifier the operator can quote when reporting an
-    /// issue. It carries a `BUG-` prefix, a coarse Unix-seconds stamp (rough ordering/uniqueness),
-    /// the daemon version, the active profile, and the `want_running` intent. Reads only `self` (no
-    /// engine round-trip), so it works whether or not the node is up.
+    /// Build a LOCAL diagnostic marker (the `tnet bugreport` path), optionally with the
+    /// `--diagnose` pass attached. Unlike Go's `bugreport`, which uploads logs to logtail and
+    /// returns the server-side log id, this fork has no log-upload backend — the marker is a purely
+    /// local identifier the operator can quote when reporting an issue. It carries a `BUG-` prefix,
+    /// a coarse Unix-seconds stamp, a per-daemon sequence number, the daemon version, the active
+    /// profile, and the `want_running` intent. Reads only `self` (no engine round-trip), so it works
+    /// whether or not the node is up.
+    ///
+    /// The sequence number is what makes two markers taken in the same second **distinguishable**,
+    /// which `bugreport --record` depends on: it brackets a reproduction with a before/after pair,
+    /// and a pair that renders identically brackets nothing. (Go gets this from the random hex
+    /// suffix in its own marker; this fork counts instead, so the marker stays deterministic.)
     ///
     /// `note` is the operator's optional free-text note (Go `bugreport [note]`); when present it is
     /// appended as `-note:<note>`. It is sanitized of control characters first — it is operator-/
     /// caller-supplied text and the marker is meant to be copy-pasted into an issue, so a stray
     /// newline/escape must not corrupt it.
-    pub fn bugreport(&self, note: Option<&str>) -> crate::localapi::Response {
-        // SystemTime is the real std clock; a coarse seconds stamp makes the marker roughly unique +
-        // orderable without adding a uuid dependency.
+    ///
+    /// `probe` is `Some` exactly when the request set `--diagnose` (Go
+    /// `ipn.BugReportOpts.Diagnose`): the caller gathers it **off** the backend lock — it makes
+    /// syscalls and, when the node is up, one engine round-trip — and this method then renders the
+    /// checks from it plus the local facts only `self` holds. See [`doctor`] for what the pass
+    /// covers and why its output is returned rather than logged.
+    pub fn bugreport(
+        &self,
+        note: Option<&str>,
+        probe: Option<&doctor::Probe>,
+    ) -> crate::localapi::Response {
+        // SystemTime is the real std clock; a coarse seconds stamp makes the marker orderable
+        // without adding a uuid dependency, and the counter below disambiguates within one second.
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        let seq = MARKER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut marker = format!(
-            "BUG-{secs}-v{}-profile:{}-want_running:{}",
+            "BUG-{secs}-{seq}-v{}-profile:{}-want_running:{}",
             env!("CARGO_PKG_VERSION"),
             self.current_profile,
             self.prefs.want_running,
@@ -3541,7 +3655,45 @@ impl Backend {
             // clean, copy-pasteable token. `sanitize_marker_note` maps any control char to '_'.
             marker.push_str(&format!("-note:{}", sanitize_marker_note(n)));
         }
-        crate::localapi::Response::BugReport { marker }
+
+        // `--diagnose`: the state-of-this-daemon half of the pass. Cheap and non-blocking — the
+        // engine state is a `watch` borrow, everything else is already in memory — except the one
+        // `faccessat` on the state dir, which is a single syscall on a path we already own.
+        let checks = match probe {
+            None => Vec::new(),
+            Some(probe) => {
+                let (state, _auth_url, error) = match self.device.as_ref() {
+                    Some(dev) => state_from_device(dev.device_state()),
+                    None => (self.derive_state(false), None, None),
+                };
+                doctor::checks(
+                    &doctor::LocalFacts {
+                        state: state.as_str(),
+                        error: error.as_deref(),
+                        want_running: self.prefs.want_running,
+                        logged_out: self.prefs.logged_out,
+                        node_up: self.device.is_some(),
+                        profile: &self.current_profile,
+                        have_node_key: self.has_node_key,
+                        state_dir: &self.state_dir,
+                        state_dir_writable: doctor::dir_writable(&self.state_dir),
+                        prefs: &self.prefs,
+                    },
+                    probe,
+                )
+            }
+        };
+
+        crate::localapi::Response::BugReport { marker, checks }
+    }
+
+    /// Gather the out-of-backend half of the `--diagnose` pass (Go's `Doctor` checks that touch the
+    /// OS or the engine). A thin `pub` shim over [`doctor::Probe::gather`], kept on `Backend` so the
+    /// `server.rs` dispatch call site is uniform with the other off-lock diagnostics: the dispatch
+    /// clones the engine handle under a brief lock, drops the lock, calls this, and only then takes
+    /// the lock again to build the marker.
+    pub async fn diagnose_probe(dev: Option<&tailscale::Device>) -> doctor::Probe {
+        doctor::Probe::gather(dev).await
     }
 
     /// Report Tailnet Lock status (the `tnet lock status` path). Thin `pub` shim over
@@ -3794,8 +3946,13 @@ impl Backend {
     /// Resolve a tailnet IP to the peer that owns it (the `tnet whois` / Go `tailscale whois` path).
     /// A thin `pub` shim over [`diag::whois`], kept on `Backend` so the `server.rs` dispatch call
     /// site (`Backend::whois(&dev, ..)`) is unchanged. See [`diag::whois`] for the full mapping.
-    pub async fn whois(dev: &tailscale::Device, ip: &str) -> crate::localapi::Response {
-        diag::whois(dev, ip).await
+    pub async fn whois(
+        dev: &tailscale::Device,
+        ip: &str,
+        port: Option<u16>,
+        proto: Option<crate::localapi::WhoisProto>,
+    ) -> crate::localapi::Response {
+        diag::whois(dev, ip, port, proto).await
     }
 
     /// Fetch an OIDC id-token for this node scoped to `audience` (the `tnet id-token` / Go
@@ -4027,6 +4184,50 @@ impl Backend {
         self.prefs_tx.subscribe()
     }
 
+    /// Apply `tailnetd --tun` to the loaded prefs, persisting only if it actually changed something.
+    /// Returns whether it did, so the caller can say so in the boot log.
+    ///
+    /// Go carries the tunnel interface as a launch argument and hands it straight to
+    /// `wgengine.Config`; this fork carries it as a pref ([`Prefs::tun_enabled`] / [`Prefs::tun_name`],
+    /// set by `tnet up --tun`/`--tun-name`), so the flag has to land somewhere, and the pref is the
+    /// only place that reaches the engine. Mapping it here — rather than into a second, flag-only
+    /// override — keeps ONE answer to "what data path is this node using": `tnet status`, the boot
+    /// posture line, the exit-node leak warning and `check-ip-forwarding` all read the same pref, and
+    /// a later `tnet up --tun` changes the node the way it always did instead of being silently
+    /// outranked by an invisible launch value.
+    ///
+    /// Persisting matches how [`apply_config`](Backend::apply_config) treats `--config`: the flag is
+    /// part of the node's configured intent, so it survives a restart. Two deliberate narrowings:
+    ///
+    /// * **Nothing is written when nothing changed.** The overwhelmingly common case is a unit file
+    ///   passing `--tun=userspace-networking` to a daemon already on the netstack; that must not
+    ///   create a `prefs.json` for a node that was never configured, because the file's existence is
+    ///   itself state (the daemon derives `ever_configured` from it).
+    /// * **`ever_configured` is not set** even when it does write. Choosing a data path on the
+    ///   command line is not the deliberate "this node is configured" act that `up` or `--config` is.
+    ///
+    /// A resolved netstack transport leaves `tun_name`/`tun_mtu` alone — both are documented as ignored
+    /// while TUN is off, so clearing them would throw away a name the operator set for the next time
+    /// they enable it.
+    pub async fn apply_tun_flag(
+        &mut self,
+        transport: &crate::tunflag::TunTransport,
+    ) -> Result<bool> {
+        let (tun_enabled, tun_name) = match transport {
+            crate::tunflag::TunTransport::Netstack => (false, self.prefs.tun_name.clone()),
+            // `None` (Go's bare `utun` on darwin) means "let the platform default choose", which is
+            // exactly what a `None` `tun_name` already means to `build_config`.
+            crate::tunflag::TunTransport::Tun { name } => (true, name.clone()),
+        };
+        if self.prefs.tun_enabled == tun_enabled && self.prefs.tun_name == tun_name {
+            return Ok(false);
+        }
+        self.prefs.tun_enabled = tun_enabled;
+        self.prefs.tun_name = tun_name;
+        self.persist_prefs().await?;
+        Ok(true)
+    }
+
     /// Apply a declarative `--config` document over the loaded prefs and persist the result, returning
     /// the registration auth key the config supplied (if any) for the caller to feed into bring-up.
     ///
@@ -4223,8 +4424,8 @@ mod tests {
 
     // --- captive-portal detection (tsd-iqq.5) -----------------------------------------------------
 
-    #[test]
-    fn captive_detection_is_gated_on_wanting_to_be_up() {
+    #[tokio::test]
+    async fn captive_detection_is_gated_on_wanting_to_be_up() {
         // Go `shouldRunCaptivePortalDetection`: detection only ever runs for a node the operator
         // actually wants connected. A `down` node must probe nothing at all.
         let dir =
@@ -4237,7 +4438,7 @@ mod tests {
             "a node that does not want to be running must never probe"
         );
         assert!(
-            !be.connectivity_impacted(),
+            !be.connectivity_impacted().await,
             "a deliberately-down node is not 'impacted'; it is doing what was asked"
         );
 
@@ -4246,10 +4447,41 @@ mod tests {
     }
 
     #[test]
-    fn connectivity_is_impacted_when_the_node_wants_up_but_has_no_engine() {
-        // The fork's stand-in for Go's health-tracker trigger: want-running and not Running. A
-        // device-less backend with want_running set is exactly the "up was asked for and did not
-        // land" case a captive portal produces.
+    fn captive_detection_triggers_in_the_state_go_triggers_it_in() {
+        // Go starts `checkCaptivePortalLoop` on entry to `ipn.Running` and cancels it on the way out
+        // (`ipn/ipnlocal/local.go`, `enterStateLocked`), then probes only while a warnable that
+        // impacts connectivity is unhealthy — here, no reachable relay (`no-derp-home`). So the one
+        // node that probes is the connected one that lost its path.
+        assert!(
+            connectivity_impacted_from(State::Running, false),
+            "a Running node with no reachable relay is exactly what Go probes: a portal appeared \
+             under a live session"
+        );
+        assert!(
+            !connectivity_impacted_from(State::Running, true),
+            "a Running node that reaches a relay is healthy; Go's healthy branch clears the warning"
+        );
+        for state in [
+            State::NoState,
+            State::NeedsLogin,
+            State::NeedsMachineAuth,
+            State::InUseOtherUser,
+            State::Starting,
+            State::Stopped,
+        ] {
+            assert!(
+                !connectivity_impacted_from(state, false),
+                "{}: upstream's loop is cancelled outside Running, so this state probes zero times",
+                state.as_str()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_node_that_never_came_up_does_not_probe() {
+        // The inverse of the case above, and the one this fork used to get backwards: a node whose
+        // engine is not up is NOT the node Go probes. Upstream's loop only exists between entering
+        // and leaving `ipn.Running`, so `Starting`/`NeedsLogin` must make no requests at all.
         let dir =
             std::env::temp_dir().join(format!("tailnetd-captive-trigger-{}", std::process::id()));
         let mut be = backend_for(&dir);
@@ -4261,8 +4493,8 @@ mod tests {
             "no device installed, so the node cannot be Running"
         );
         assert!(
-            be.connectivity_impacted(),
-            "want-running with no live engine is the condition worth probing for a portal"
+            !be.connectivity_impacted().await,
+            "a node still coming up is not the node upstream probes"
         );
     }
 
@@ -4383,7 +4615,8 @@ mod tests {
         let be = backend_for(&dir);
 
         // No note → no `-note:` segment.
-        let crate::localapi::Response::BugReport { marker } = be.bugreport(None) else {
+        let crate::localapi::Response::BugReport { marker, checks } = be.bugreport(None, None)
+        else {
             panic!("expected BugReport");
         };
         assert!(
@@ -4394,9 +4627,26 @@ mod tests {
             !marker.contains("-note:"),
             "no note segment when omitted: {marker}"
         );
+        assert!(
+            checks.is_empty(),
+            "no --diagnose probe means no checks: {checks:?}"
+        );
+
+        // Two markers taken back-to-back (the `--record` pair) must be DISTINGUISHABLE, even though
+        // the seconds stamp is the same — otherwise the before/after bracket is a single value
+        // printed twice.
+        let crate::localapi::Response::BugReport { marker: second, .. } = be.bugreport(None, None)
+        else {
+            panic!("expected BugReport");
+        };
+        assert_ne!(
+            marker, second,
+            "two markers from one daemon must differ (the --record pair brackets a reproduction)"
+        );
 
         // A note → appended as `-note:<note>`.
-        let crate::localapi::Response::BugReport { marker } = be.bugreport(Some("dns broke"))
+        let crate::localapi::Response::BugReport { marker, .. } =
+            be.bugreport(Some("dns broke"), None)
         else {
             panic!("expected BugReport");
         };
@@ -4407,8 +4657,8 @@ mod tests {
 
         // A hostile note (newline + ESC + BEL) → control chars replaced with '_', marker stays one
         // line/token.
-        let crate::localapi::Response::BugReport { marker } =
-            be.bugreport(Some("evil\n\x1b[2J\x07x"))
+        let crate::localapi::Response::BugReport { marker, .. } =
+            be.bugreport(Some("evil\n\x1b[2J\x07x"), None)
         else {
             panic!("expected BugReport");
         };
@@ -4427,6 +4677,62 @@ mod tests {
         assert!(
             marker.contains("-note:evil"),
             "readable part survives: {marker}"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn bugreport_diagnose_attaches_the_check_pass_without_changing_the_marker() {
+        // `bugreport --diagnose` (Go `BugReportOpts.Diagnose` → `LocalBackend.Doctor`): the flag adds
+        // checks and touches nothing else. Driven through the real dispatch path — the probe is
+        // gathered exactly as `server.rs` gathers it, with no engine (the node is down), which is
+        // also the state an operator most often runs this in.
+        let dir = std::env::temp_dir().join(format!("tailnetd-diagnose-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let be = backend_for(&dir);
+
+        let probe = Backend::diagnose_probe(None).await;
+        let crate::localapi::Response::BugReport { marker, checks } =
+            be.bugreport(Some("dns broke"), Some(&probe))
+        else {
+            panic!("expected BugReport");
+        };
+
+        // The marker is the same shape as without the flag: Go's `--diagnose` changes what is
+        // logged, never the identifier the operator quotes.
+        assert!(
+            marker.starts_with("BUG-"),
+            "marker unchanged in shape: {marker}"
+        );
+        assert!(
+            marker.contains("-note:dns broke"),
+            "the note still rides: {marker}"
+        );
+
+        let joined = checks.join("\n");
+        for expected in [
+            "state: ",
+            "profile: ",
+            "prefs: ",
+            "permissions: ",
+            "dns-resolvers: ",
+            "interfaces: ",
+            "not-checked: ",
+        ] {
+            assert!(
+                checks.iter().any(|l| l.starts_with(expected)),
+                "the pass should report {expected:?}; got:\n{joined}"
+            );
+        }
+        assert!(
+            joined.contains("dns-resolvers: not checked — the node is not up"),
+            "a down node must say the DNS check had nothing to judge; got:\n{joined}"
+        );
+        assert!(
+            joined.contains(&format!("state_dir={}", dir.display())),
+            "the permissions check names the real state dir; got:\n{joined}"
         );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -7339,6 +7645,83 @@ mod tests {
             !raw.contains("tskey-secret"),
             "the auth key must never be persisted into prefs.json: {raw}"
         );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn apply_tun_flag_maps_the_daemon_flag_onto_the_prefs_and_writes_only_on_change() {
+        // `Backend::apply_tun_flag` is the seam that turns `tailnetd --tun` into this node's data
+        // path. Go hands its `--tun` to `wgengine.Config`; here the pref is what reaches the engine,
+        // so the flag has to land there — and because prefs.json's mere existence is state, a flag
+        // that changes nothing must write nothing. Both halves are pinned here.
+        let dir = std::env::temp_dir().join(format!("tailnetd-tunflag-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+
+        // (1) `--tun=userspace-networking` on a daemon already on the netstack (the default, and the
+        //     overwhelmingly common unit-file case): nothing changed, so nothing is written — a
+        //     never-configured node must not acquire a prefs.json just by being started.
+        let changed = be
+            .apply_tun_flag(&crate::tunflag::TunTransport::Netstack)
+            .await
+            .expect("applying the netstack transport cannot fail");
+        assert!(!changed, "an unchanged transport must report no change");
+        assert!(
+            !be.prefs_path.exists(),
+            "an unchanged --tun must not create {}",
+            be.prefs_path.display()
+        );
+
+        // (2) `--tun=tailscale0`: TUN on, with that interface name, persisted — the launch flag is
+        //     part of the node's intent, so it survives a restart like a `--config` boot does.
+        let changed = be
+            .apply_tun_flag(&crate::tunflag::TunTransport::Tun {
+                name: Some("tailscale0".to_string()),
+            })
+            .await
+            .expect("applying a TUN transport cannot fail");
+        assert!(changed, "switching to TUN is a change");
+        assert!(be.prefs.tun_enabled);
+        assert_eq!(be.prefs.tun_name.as_deref(), Some("tailscale0"));
+        let reloaded = Prefs::load(&be.prefs_path)
+            .await
+            .expect("reload persisted prefs");
+        assert!(
+            reloaded.tun_enabled && reloaded.tun_name.as_deref() == Some("tailscale0"),
+            "the resolved transport must be persisted: {reloaded:?}"
+        );
+        // Choosing a data path on the command line is not the deliberate "this node is configured"
+        // act that `up` or `--config` is, so it must not flip `ever_configured`.
+        assert!(
+            !be.ever_configured,
+            "--tun must not mark the node configured"
+        );
+
+        // (3) Back to `--tun=userspace-networking`: TUN off, but the interface NAME is kept. It is
+        //     documented as ignored while TUN is off, so clearing it would silently throw away a
+        //     name the operator set for the next time they enable it.
+        let changed = be
+            .apply_tun_flag(&crate::tunflag::TunTransport::Netstack)
+            .await
+            .expect("applying the netstack transport cannot fail");
+        assert!(changed, "switching off TUN is a change");
+        assert!(!be.prefs.tun_enabled);
+        assert_eq!(
+            be.prefs.tun_name.as_deref(),
+            Some("tailscale0"),
+            "an off transport must not clear the configured interface name"
+        );
+
+        // (4) `--tun=utun` on macOS resolves to "no name" (Go's any-free-unit magic value), which is
+        //     already this daemon's spelling for "let the platform default choose".
+        let changed = be
+            .apply_tun_flag(&crate::tunflag::TunTransport::Tun { name: None })
+            .await
+            .expect("applying a TUN transport cannot fail");
+        assert!(changed, "TUN with no name is a change from netstack");
+        assert!(be.prefs.tun_enabled && be.prefs.tun_name.is_none());
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

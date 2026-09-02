@@ -17,13 +17,19 @@
 //! - [`server`] — the LocalAPI server, a Unix-domain-socket IPC surface the CLI talks to.
 //! - [`hardening`] — best-effort OS-level protection (no-coredump / no-ptrace / no-swap) for the
 //!   secrets the engine holds in memory, the in-RAM analogue of [`ensure_state_dir_secure`].
+//! - [`debugmode`] — `tailnetd debug`, the daemon-less network diagnostics subcommand (Go
+//!   `tailscaled debug`), which runs without a daemon or a socket — for the node that will not
+//!   come up at all.
 //! - [`hostreap`] — startup cleanup of host routes/DNS a *hard-killed* previous run left behind
 //!   (the engine's graceful teardown never ran), so a crash cannot outlive the daemon.
+//! - [`tunflag`] — `tailnetd --tun`, Go's tunnel-interface flag, resolved onto this fork's TUN
+//!   prefs so a `tailscaled` command line copied from a unit file or a container image starts.
 //!
 //! Two binaries consume it: `tailnetd` (the daemon) and `tnet` (the thin CLI client).
 
 pub mod auth;
 pub mod conffile;
+pub mod debugmode;
 pub mod debugserver;
 pub mod goduration;
 pub mod hardening;
@@ -35,6 +41,7 @@ pub mod localapi;
 pub mod prefs;
 pub mod server;
 pub mod socks5;
+pub mod tunflag;
 
 use std::path::PathBuf;
 

@@ -109,9 +109,10 @@ impl AuthPolicy {
 
 /// The effective uid of the current process (the daemon's owner), used for the same-user check.
 ///
-/// Private — the rest of the daemon goes through [`AuthPolicy`] and never calls libc directly, so
-/// the single `unsafe` site lives here.
-fn current_euid() -> u32 {
+/// Crate-private, and the only `geteuid` site in the daemon: [`AuthPolicy`] compares it against the
+/// LocalAPI peer's uid, and `bugreport --diagnose` reports it in its `permissions` check (Go
+/// `doctor/permissions`). Nothing outside those two goes near libc for it.
+pub(crate) fn current_euid() -> u32 {
     // SAFETY: geteuid() always succeeds, takes no arguments, and has no preconditions.
     unsafe { libc::geteuid() }
 }
@@ -173,7 +174,7 @@ pub(crate) fn requires_write(request: &crate::localapi::Request) -> bool {
         // and `FileGet` consumes/deletes an inbound file, so both mutate and gate like `up`/`down`.
         Request::Up { .. }
         | Request::Set { .. }
-        | Request::Down
+        | Request::Down { .. }
         | Request::Logout { .. }
         | Request::SwitchProfile { .. }
         | Request::DeleteProfile { .. }
@@ -206,6 +207,11 @@ pub(crate) fn requires_write(request: &crate::localapi::Request) -> bool {
         // re-derivation), gated on write exactly like `DebugRebind`. Even though it is lighter (no
         // socket swap), a non-owner must not be able to poke the datapath, so it is never a read.
         | Request::DebugReStun
+        // `DebugStateDir` only reads one path, but Go gates the ENTIRE LocalAPI `debug` route on
+        // `PermitWrite` ("debug access denied") rather than per-action, so the faithful classification
+        // is a write like `DebugRebind`/`DebugReStun`. It also discloses the daemon's on-disk layout,
+        // which a socket-reachable non-owner has no business enumerating.
+        | Request::DebugStateDir
         // `ReloadConfig` re-reads the `--config` file and RECONFIGURES the running node (it merges +
         // persists the prefs and, on a live node, rebuilds the engine — a brief reconnect). Go gates
         // `serveReloadConfig` on `PermitWrite`; a socket-reachable non-owner must not be able to
@@ -344,7 +350,7 @@ mod tests {
     #[test]
     fn requires_write_classifies_commands() {
         assert!(!requires_write(&Request::Status));
-        assert!(requires_write(&Request::Down));
+        assert!(requires_write(&Request::Down { reason: None }));
         assert!(
             requires_write(&Request::Logout { reason: None }),
             "logout deregisters + wipes the key — a write, gated like down"
@@ -365,6 +371,11 @@ mod tests {
         assert!(
             requires_write(&Request::DebugReStun),
             "debug restun forces a STUN re-probe (live-datapath endpoint mutation) — a write, gated like down"
+        );
+        assert!(
+            requires_write(&Request::DebugStateDir),
+            "debug statedir rides Go's `debug` route, which gates on PermitWrite as a whole \
+             ('debug access denied') — so it is a write, like debug rebind/restun"
         );
         assert!(
             requires_write(&Request::ReloadConfig),
@@ -436,7 +447,9 @@ mod tests {
         );
         assert!(!requires_write(&Request::Ip));
         assert!(!requires_write(&Request::Whois {
-            ip: "100.64.0.1".into()
+            ip: "100.64.0.1".into(),
+            port: None,
+            proto: None,
         }));
         assert!(!requires_write(&Request::Ping {
             ip: "100.64.0.1".into(),
@@ -463,8 +476,18 @@ mod tests {
             "lock log only reads the locally-synced AUM chain — a read"
         );
         assert!(
-            !requires_write(&Request::BugReport { note: None }),
+            !requires_write(&Request::BugReport {
+                note: None,
+                diagnose: false
+            }),
             "bugreport only reads daemon state into a marker — a read"
+        );
+        assert!(
+            !requires_write(&Request::BugReport {
+                note: None,
+                diagnose: true
+            }),
+            "--diagnose only adds read-only checks (Go's Doctor mutates nothing) — still a read"
         );
         assert!(
             !requires_write(&Request::GetServeConfig),
@@ -502,8 +525,12 @@ mod tests {
         assert_eq!(authorize(&Request::Ip, Access::ReadOnly), Ok(()));
         assert_eq!(
             authorize(
+                // Go's flow-scoped form (`whois --proto=tcp ip:port`) is the same `PermitRead`
+                // whois as the bare-IP one — the extra fields name a flow, they do not mutate.
                 &Request::Whois {
-                    ip: "100.64.0.1".into()
+                    ip: "100.64.0.1".into(),
+                    port: Some(22),
+                    proto: Some(crate::localapi::WhoisProto::Tcp),
                 },
                 Access::ReadOnly
             ),
@@ -526,7 +553,10 @@ mod tests {
     // flagged.
     #[test]
     fn read_only_caller_is_denied_writes() {
-        assert_eq!(authorize(&Request::Down, Access::ReadOnly), Err(Denied));
+        assert_eq!(
+            authorize(&Request::Down { reason: None }, Access::ReadOnly),
+            Err(Denied)
+        );
         assert_eq!(authorize(&up(), Access::ReadOnly), Err(Denied));
         assert_eq!(authorize(&set(), Access::ReadOnly), Err(Denied));
         // Taildrop transfers are writes: a read-only caller must be denied both.
@@ -544,7 +574,10 @@ mod tests {
     #[test]
     fn read_write_caller_may_do_everything() {
         assert_eq!(authorize(&Request::Status, Access::ReadWrite), Ok(()));
-        assert_eq!(authorize(&Request::Down, Access::ReadWrite), Ok(()));
+        assert_eq!(
+            authorize(&Request::Down { reason: None }, Access::ReadWrite),
+            Ok(())
+        );
         assert_eq!(authorize(&up(), Access::ReadWrite), Ok(()));
         assert_eq!(authorize(&set(), Access::ReadWrite), Ok(()));
         assert_eq!(authorize(&file_cp(), Access::ReadWrite), Ok(()));

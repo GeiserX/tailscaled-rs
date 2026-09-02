@@ -50,6 +50,16 @@ use serde_json::{Map, Value};
 use crate::goduration::{format_go_duration, parse_go_duration};
 use crate::localapi::{PolicyReport, PolicySetting};
 
+/// Go `pkey.EncryptState` — the policy key that asks a daemon to encrypt its state file at rest.
+/// Named because `tailnetd` reads it by name (Go's `handleTPMFlags` does the same via
+/// `policyclient.Get().GetBoolean(pkey.EncryptState, false)`), so the spelling has exactly one
+/// definition shared with [`DEFINITIONS`].
+pub const PKEY_ENCRYPT_STATE: &str = "EncryptState";
+
+/// Go `pkey.HardwareAttestation` — the policy key that asks a daemon to bind the node identity to a
+/// hardware-backed key. Read by name for the same reason as [`PKEY_ENCRYPT_STATE`].
+pub const PKEY_HARDWARE_ATTESTATION: &str = "HardwareAttestation";
+
 /// The scope name the CLI resolves, matching Go `setting.DefaultScope().String()` on non-Windows
 /// hosts (`"Device"`). Centralized so the report and any future scope plumbing agree on the spelling.
 const DEVICE_SCOPE: &str = "Device";
@@ -305,7 +315,7 @@ const DEFINITIONS: &[Definition] = &[
     def("ExitNodeID", ValueType::String),
     def("ExitNodeIP", ValueType::String),
     def("FlushDNSOnSessionUnlock", ValueType::Boolean),
-    def("EncryptState", ValueType::Boolean),
+    def(PKEY_ENCRYPT_STATE, ValueType::Boolean),
     def("Hostname", ValueType::String),
     def("LogSCMInteractions", ValueType::Boolean),
     def("LogTarget", ValueType::String),
@@ -313,7 +323,7 @@ const DEFINITIONS: &[Definition] = &[
     def("PostureChecking", ValueType::PreferenceOption),
     def("ReconnectAfter", ValueType::Duration),
     def("Tailnet", ValueType::String),
-    def("HardwareAttestation", ValueType::Boolean),
+    def(PKEY_HARDWARE_ATTESTATION, ValueType::Boolean),
     // User policy settings (configurable on a user- or device-basis; all of them are configurable
     // at the device scope, which is the only scope this daemon resolves).
     def("AdminConsole", ValueType::Visibility),
@@ -337,6 +347,42 @@ const DEFINITIONS: &[Definition] = &[
 /// `setting.DefinitionOf` lookup inside `Validate`.
 fn definition_of(key: &str) -> Option<&'static Definition> {
     DEFINITIONS.iter().find(|d| d.key == key)
+}
+
+/// Read a boolean policy setting from the effective device-scope policy — Go
+/// `syspolicy.GetBoolean(key, defaultValue)`, which `cmd/tailscaled` calls as
+/// `policyclient.Get().GetBoolean(pkey.EncryptState, false)`.
+///
+/// `default` is returned whenever Go would return its own default: the key is not configured by any
+/// registered source (Go's not-configured branch), the key is not a registered *boolean* definition
+/// (Go's `ErrTypeMismatch`), or the setting resolved to an error instead of a value. Go's signature
+/// is `(bool, error)` and every `cmd/tailscaled` caller discards the error and keeps the default, so
+/// the error is folded into the default here rather than handed to a caller that would drop it.
+///
+/// Side-effect-free, like every other read of the registered stores — see the invariant on
+/// [`registered_store_settings`].
+pub fn get_boolean(key: &str, default: bool) -> bool {
+    boolean_setting(&registered_store_settings(), key, default)
+}
+
+/// The decision behind [`get_boolean`], over an already-merged setting list so it is testable
+/// without touching the process-global registry.
+///
+/// The definition-table check is not redundant with the lookup: it is Go's `ErrTypeMismatch` guard,
+/// and it is what stops a caller asking for `GetBoolean("Hostname", …)` from getting a value parsed
+/// out of a string setting's rendered form.
+fn boolean_setting(settings: &[PolicySetting], key: &str, default: bool) -> bool {
+    if !matches!(definition_of(key), Some(d) if d.ty == ValueType::Boolean) {
+        return default;
+    }
+    settings
+        .iter()
+        .find(|s| s.key == key)
+        // A row carrying an error has no value; Go reports the error and the caller keeps the
+        // default, which is what falling through to `unwrap_or` does here.
+        .and_then(|s| s.value.as_deref())
+        .and_then(|v| v.parse::<bool>().ok())
+        .unwrap_or(default)
 }
 
 /// Parse the policy file's bytes into its top-level object — Go
@@ -848,5 +894,53 @@ mod tests {
             assert!(seen.insert(d.key), "duplicate policy key {:?}", d.key);
         }
         assert_eq!(seen.len(), DEFINITIONS.len());
+    }
+
+    // --- `get_boolean` (Go `syspolicy.GetBoolean`) ---------------------------------------------
+    //
+    // The two TPM policy keys `tailnetd` reads at startup are booleans, so this is the read path
+    // behind `handleTPMFlags`'s `policyclient.Get().GetBoolean(pkey.EncryptState, false)`.
+
+    #[test]
+    fn a_configured_boolean_policy_key_reads_as_its_value() {
+        let settings = resolve(r#"{"EncryptState": true, "HardwareAttestation": false}"#)
+            .expect("both keys are registered booleans");
+        // The default is deliberately the opposite of each configured value, so a `get_boolean`
+        // that ignored the file would fail rather than coincidentally agree with it.
+        assert!(boolean_setting(&settings, PKEY_ENCRYPT_STATE, false));
+        assert!(!boolean_setting(&settings, PKEY_HARDWARE_ATTESTATION, true));
+    }
+
+    #[test]
+    fn an_unconfigured_boolean_policy_key_reads_as_the_default() {
+        // Go's not-configured branch: the file sets one key, so the other must fall back.
+        let settings = resolve(r#"{"EncryptState": true}"#).expect("a registered boolean");
+        assert!(!boolean_setting(
+            &settings,
+            PKEY_HARDWARE_ATTESTATION,
+            false
+        ));
+        assert!(boolean_setting(&settings, PKEY_HARDWARE_ATTESTATION, true));
+    }
+
+    #[test]
+    fn a_non_boolean_or_unknown_key_reads_as_the_default() {
+        // Go's `ErrTypeMismatch`: `Hostname` is a string setting, so asking for it as a boolean
+        // yields the default rather than something parsed out of its rendered value. An unknown key
+        // has no definition at all and behaves the same way.
+        let settings = resolve(r#"{"Hostname": "true"}"#).expect("a registered string setting");
+        assert!(!boolean_setting(&settings, "Hostname", false));
+        assert!(boolean_setting(&settings, "Hostname", true));
+        assert!(!boolean_setting(&settings, "Hostnmae", false));
+    }
+
+    #[test]
+    fn get_boolean_returns_the_default_with_no_registered_source() {
+        // The public entry point over the process-global registry, which no unit test registers
+        // into (see `resolve`): a daemon started without `--syspolicy-file` must see the caller's
+        // default for both TPM keys, which is what keeps `handleTPMFlags` quiet by default.
+        assert!(!get_boolean(PKEY_ENCRYPT_STATE, false));
+        assert!(!get_boolean(PKEY_HARDWARE_ATTESTATION, false));
+        assert!(get_boolean(PKEY_ENCRYPT_STATE, true));
     }
 }
