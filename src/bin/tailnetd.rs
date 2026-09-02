@@ -43,11 +43,12 @@ const LONG_VERSION: &str = concat!(
 /// resolution (`tailscaled_rs::state_dir` / `socket_path`) is unchanged, so existing env-driven
 /// deployments behave exactly as before.
 ///
-/// One Go daemon flag Go also exposes is deliberately NOT a daemon-startup flag here: `--tun` (and
-/// its name/MTU) is a **pref**, set via `tnet up` (`--tun`/`--tun-name`/`--tun-mtu`), not a launch
-/// flag. `--port` (the WireGuard/disco UDP listen port) IS a startup flag (see below) — the engine
-/// gained a configurable listen port in v0.40.0. `--config` (declarative `ipn.ConfigVAlpha`) is a
-/// tracked follow-up that hangs off this flag surface.
+/// The data path is the one knob that is BOTH: `--tun` is a launch flag here as it is in Go, and it
+/// is also a pref (`tnet up --tun`/`--tun-name`/`--tun-mtu`), because the pref is what reaches the
+/// engine. The flag resolves onto that pref at startup — see the `--tun` field below and
+/// [`tailscaled_rs::tunflag`] — so a Go-shaped command line and a `tnet up` end at the same place
+/// instead of at two competing answers. `--port` (the WireGuard/disco UDP listen port) is a plain
+/// startup flag (see below) — the engine gained a configurable listen port in v0.40.0.
 #[derive(Parser, Debug)]
 #[command(
     name = "tailnetd",
@@ -112,6 +113,28 @@ struct Args {
     /// env filter when given. Go `tailscaled --verbose`.
     #[arg(long, short = 'v', value_name = "LEVEL")]
     verbose: Option<u8>,
+    /// Tunnel interface name; use `userspace-networking` to not use TUN (Go `tailscaled --tun`).
+    /// This is the single most-copied flag on a `tailscaled` command line — packaged systemd units,
+    /// container entrypoints and cloud images all pass `--tun=userspace-networking` or
+    /// `--tun=tailscale0` — so it is accepted in Go's full grammar: a device name (`tailscale0`),
+    /// `userspace-networking`, `tap:TAPNAME[:BRIDGENAME]`, or a comma-separated fallback list of
+    /// those tried left to right (Go's `createEngine` loop; `tailscale0,userspace-networking` is
+    /// Go's own Synology default). [`tailscaled_rs::tunflag`] resolves the value and owns every
+    /// refusal — a name this build cannot provide is a startup error that says which and why.
+    ///
+    /// **The resolved data path lands in the TUN prefs** (`tun_enabled`/`tun_name` — the same prefs
+    /// `tnet up --tun`/`--tun-name` write), because in this fork the pref is what reaches the
+    /// engine. Go instead threads `args.tunname` straight into `wgengine.Config`; it has no pref to
+    /// collide with. Mapping the flag onto the pref keeps a single answer to "what data path is this
+    /// node on" — see `Backend::apply_tun_flag`, which also explains why it persists.
+    ///
+    /// **Deliberate deviation: omitting the flag does not mean `tailscale0`.** Go's flag carries a
+    /// per-platform device default, so a bare `tailscaled` runs in TUN mode; an absent `--tun` here
+    /// leaves the persisted pref alone, and that pref defaults to the userspace netstack. A daemon
+    /// that started capturing OS-wide traffic because a flag was left OFF would be a far worse
+    /// surprise than a copied command line having to name the mode it wants.
+    #[arg(long, value_name = "NAME")]
+    tun: Option<String>,
     /// Fixed UDP port for WireGuard + disco (Go `tailscaled --port`). When omitted, falls back to the
     /// `PORT` env var (Go's `EnvironmentFile` convention; the explicit flag wins), and if neither is
     /// set the OS picks an ephemeral port (Go's port `0`, the default) — fine for the common
@@ -310,6 +333,28 @@ async fn main() -> Result<()> {
         eprintln!("{message}");
         std::process::exit(1);
     }
+
+    // `--tun <name>` (Go `tailscaled --tun`): resolve the requested data path from the command line.
+    // Refused HERE — with the neighbouring flag refusals, before the experiment gate — for the same
+    // reason they are: an operator who named an interface this build cannot provide should be told
+    // about the FLAG, not about an unrelated environment variable. Bare message + exit 1 mirrors Go's
+    // `log.SetFlags(0)` + `log.Fatal(err)`.
+    //
+    // Skipped entirely under `--cleanup`: Go validates `--tun` inside `createEngine`, which a cleanup
+    // run never reaches, and the one check Go does make earlier (its macOS root refusal) carves
+    // cleanup out by hand — so reclaiming a stale socket keeps working with whatever `--tun` the unit
+    // file happens to carry. The resolved transport is applied to prefs further down, once the
+    // backend has loaded them.
+    let tun_transport = match args.tun.as_deref().filter(|_| !args.cleanup) {
+        Some(value) => match tailscaled_rs::tunflag::resolve(value, goos()) {
+            Ok(transport) => Some(transport),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
 
     // `--cleanup` (Go `tailscaled --cleanup`): reclaim OS-level network state from a previous run,
     // then exit — WITHOUT running the engine, so it deliberately runs BEFORE the experiment gate
@@ -515,6 +560,30 @@ async fn main() -> Result<()> {
         None => None,
     };
 
+    // `--tun <name>`: map the resolved data path onto the TUN prefs — the only route to the engine
+    // here, where Go has a `wgengine.Config` field. Applied AFTER `--config` so an explicit flag on
+    // the command line outranks a config document, the way `--verbose` outranks `TAILNETD_LOG`.
+    // `apply_tun_flag` persists ONLY when the value changes something, so the overwhelmingly common
+    // `--tun=userspace-networking` in a unit file writes nothing at all; `persisted` in the log line
+    // below says which happened, so the flag is never silent about having rewritten an intent.
+    if let Some(transport) = &tun_transport {
+        let persisted = backend
+            .apply_tun_flag(transport)
+            .await
+            .context("applying --tun")?;
+        match transport {
+            tailscaled_rs::tunflag::TunTransport::Netstack => tracing::info!(
+                persisted,
+                "--tun: userspace networking; no kernel TUN interface (the engine's netstack)"
+            ),
+            tailscaled_rs::tunflag::TunTransport::Tun { name } => tracing::info!(
+                persisted,
+                name = name.as_deref().unwrap_or("<platform default>"),
+                "--tun: kernel TUN data path"
+            ),
+        }
+    }
+
     // Describe the daemon's effective posture once at boot so an operator tailing the log knows which
     // control plane it talks to, which data path it uses, and the exact build — without having to run
     // `tnet status`/`version`. (`control_url = None` → the engine default, Tailscale SaaS; `transport`
@@ -556,10 +625,11 @@ async fn main() -> Result<()> {
 
     // Captive-portal detection (Go `ipn/ipnlocal/captiveportal.go`): a daemon-lifetime task that
     // notices when this node is stuck behind an airport/hotel Wi-Fi login page and raises the
-    // `captive-portal-detected` health warning `tnet status` prints. Deliberately NOT tied to a
-    // device (unlike the link monitor): the case worth reporting is precisely the one where the
-    // engine never came up. It probes only while the node wants to be up and is not — a connected or
-    // deliberately-down node makes zero requests — so it costs nothing on a healthy headless node.
+    // `captive-portal-detected` health warning `tnet status` prints. Its own gate makes it inert
+    // outside `Running`, which is how it expresses the loop lifetime Go gets from starting the loop
+    // on entry to `ipn.Running` and cancelling it on the way out: it probes only while the node is
+    // up, wants to be up, and can reach no relay server. A healthy node, a node still coming up and
+    // a deliberately-down node all make zero requests, so it costs nothing on a headless node.
     //
     // Detached rather than a `select!` arm: it must never be able to end `serve`, and it owns no
     // resource needing orderly teardown beyond its `Arc`. Its handle is aborted after `serve` returns
