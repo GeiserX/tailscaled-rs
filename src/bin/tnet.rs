@@ -1730,9 +1730,19 @@ enum LockCmd {
         /// default of 50).
         #[arg(long, value_name = "N", default_value_t = 50)]
         limit: usize,
-        /// Output as JSON.
-        #[arg(long)]
-        json: bool,
+        /// Output as JSON, in a versioned schema (Go `--json`, a `jsonoutput.SchemaVersion`, NOT a
+        /// bool): bare `--json` and `--json=1` both select schema version 1, `--json=false` is the
+        /// human form, and any other version is refused by number. The value is parsed by
+        /// [`parse_json_schema_version`]; `require_equals` keeps `--json 1` from eating the next
+        /// argument, exactly as Go's `IsBoolFlag` does.
+        #[arg(
+            long,
+            value_name = "VERSION",
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "true"
+        )]
+        json: Option<String>,
     },
     /// Co-sign a node key into Tailnet Lock so that node may join the locked tailnet (Go `tailscale
     /// lock sign <node-key>`). This node must itself be a trusted signing node under the current
@@ -2911,7 +2921,12 @@ async fn main() -> Result<()> {
         // `lock log` (Go `tailscale lock log`): fetch + render the TKA update-chain history.
         Command::Lock {
             cmd: LockCmd::Log { limit, json },
-        } => run_lock_log(&socket, limit, json).await,
+        } => {
+            // Go's `flag` package parses `-json` before `Exec` ever runs, so a bad value fails
+            // without touching the daemon. Parse here, for the same ordering.
+            let json = json_schema_flag(json.as_deref())?;
+            run_lock_log(&socket, limit, json).await
+        }
         // `lock sign` (Go `tailscale lock sign`): co-sign a node key into the lock.
         Command::Lock {
             cmd: LockCmd::Sign { node_key },
@@ -6003,8 +6018,97 @@ async fn run_lock_status(socket: &std::path::Path, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Go's `jsonoutput.SchemaVersion` (`cmd/tailscale/cli/jsonoutput/jsonoutput.go` @
+/// `53a0d659afa51835dd7a9283873cca44261454f8`) — the value type behind a versioned `--json` flag.
+/// It is NOT a bool: it records both whether the flag was set and which output schema was asked for,
+/// so `--json`, `--json=true` and `--json=1` all mean "schema version 1" while `--json=2` is a
+/// version the command can then refuse by number.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct JsonSchemaVersion {
+    /// Go's `IsSet`: true for `--json`, `--json=true` and any `--json=<int>`; false when the flag is
+    /// absent or explicitly cleared with `--json=false`.
+    is_set: bool,
+    /// Go's `Version`: the requested schema version, 1 when the flag was given without one, 0 when
+    /// the flag is unset.
+    version: i64,
+}
+
+/// Parse one `--json` value the way Go's `SchemaVersion.Set` does: **integer first**, boolean
+/// second. The order is Go's and it matters — `--json=0` parses as version 0 (which the command then
+/// refuses as unrecognised), not as the boolean false that `strconv.ParseBool` would also accept.
+/// A value that is neither reports Go's own message, `parse error` (Go builds it by unwrapping the
+/// `flag` package's `invalid boolean value ...: parse error`).
+///
+/// One deliberate narrowing: Go parses the integer with `strconv.ParseInt(s, 0, ...)`, which also
+/// accepts `_` digit separators. Underscores are rejected here as a `parse error` rather than
+/// accepted; every other base-0 form (sign, `0x`/`0b`/`0o` prefixes, leading-zero octal) is honoured.
+fn parse_json_schema_version(s: &str) -> std::result::Result<JsonSchemaVersion, String> {
+    if let Some(version) = parse_go_base0_int(s) {
+        return Ok(JsonSchemaVersion {
+            is_set: true,
+            version,
+        });
+    }
+    // Go's `strconv.ParseBool` spellings. "1"/"0" are also boolean spellings there, but the integer
+    // branch above has already consumed them — again, Go's order.
+    match s {
+        "t" | "T" | "TRUE" | "true" | "True" => Ok(JsonSchemaVersion {
+            is_set: true,
+            version: 1,
+        }),
+        "f" | "F" | "FALSE" | "false" | "False" => Ok(JsonSchemaVersion::default()),
+        _ => Err("parse error".to_string()),
+    }
+}
+
+/// `strconv.ParseInt(s, 0, 64)` as far as a schema version needs it: an optional sign, then a base
+/// taken from the literal's prefix (`0x`/`0X` hex, `0b`/`0B` binary, `0o`/`0O` octal, a bare leading
+/// zero octal, otherwise decimal). Returns `None` for anything Go would reject.
+fn parse_go_base0_int(s: &str) -> Option<i64> {
+    let (negative, rest) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let (radix, digits) = if let Some(d) = rest.strip_prefix("0x").or(rest.strip_prefix("0X")) {
+        (16, d)
+    } else if let Some(d) = rest.strip_prefix("0b").or(rest.strip_prefix("0B")) {
+        (2, d)
+    } else if let Some(d) = rest.strip_prefix("0o").or(rest.strip_prefix("0O")) {
+        (8, d)
+    } else if rest.len() > 1 && rest.starts_with('0') {
+        (8, &rest[1..])
+    } else {
+        (10, rest)
+    };
+    // `from_str_radix` would happily take its own sign, so `0x-1` must not slip through as -1.
+    if digits.starts_with('+') || digits.starts_with('-') {
+        return None;
+    }
+    let magnitude = i64::from_str_radix(digits, radix).ok()?;
+    if negative {
+        magnitude.checked_neg()
+    } else {
+        Some(magnitude)
+    }
+}
+
+/// The clap side of a versioned `--json`: `None` (flag absent) is Go's zero `SchemaVersion`, and a
+/// value that will not parse is reported the way Go's `flag` package reports it, before the command
+/// runs and so before any daemon round-trip.
+fn json_schema_flag(raw: Option<&str>) -> Result<JsonSchemaVersion> {
+    match raw {
+        None => Ok(JsonSchemaVersion::default()),
+        Some(s) => parse_json_schema_version(s)
+            .map_err(|e| anyhow::anyhow!("invalid value {s:?} for flag --json: {e}")),
+    }
+}
+
 /// `lock log [--limit N]` (Go `tailscale lock log`): fetch + render the TKA update-chain history.
-async fn run_lock_log(socket: &std::path::Path, limit: usize, json: bool) -> Result<()> {
+async fn run_lock_log(
+    socket: &std::path::Path,
+    limit: usize,
+    json: JsonSchemaVersion,
+) -> Result<()> {
     let report = match round_trip(socket, &Request::LockLog { limit }).await {
         Ok(Response::LockLog(r)) => r,
         Ok(Response::Error { message }) => {
@@ -6016,7 +6120,7 @@ async fn run_lock_log(socket: &std::path::Path, limit: usize, json: bool) -> Res
             return Err(e).with_context(|| format!("querying lock log at {}", socket.display()));
         }
     };
-    print!("{}", format_lock_log(&report, json));
+    print!("{}", format_lock_log(&report, json)?);
     Ok(())
 }
 
@@ -7795,21 +7899,46 @@ fn format_lock_status(r: &tailscaled_rs::localapi::LockReport, json: bool) -> St
 /// Go `tailscale lock log` (`runNetworkLockLog` over `LocalClient.NetworkLockLog`): one stanza per
 /// update, **newest first**, each headed by the update's AUM hash and change kind.
 ///
-/// Two deliberate fork deviations, both stated rather than faked:
+/// One deliberate fork deviation, stated rather than faked: **no per-kind key detail.** Go decodes
+/// each update's raw AUM CBOR and prints what the change did (the added key's kind/id/metadata, the
+/// removed key id). This build carries the raw CBOR on the wire but does not decode it — the daemon
+/// has no AUM decoder — so a stanza reports the hash, the change kind and the ids of the keys that
+/// signed it. `--json` emits the raw CBOR (hex) so the full AUM can still be decoded out-of-band.
 ///
-/// - **No per-kind key detail.** Go decodes each update's raw AUM CBOR and prints what the change
-///   did (the added key's kind/id/metadata, the removed key id). This build carries the raw CBOR on
-///   the wire but does not decode it — the daemon has no AUM decoder — so a stanza reports the hash,
-///   the change kind and the ids of the keys that signed it. `--json` emits the raw CBOR (hex) so the
-///   full AUM can still be decoded out-of-band.
-/// - **The empty history says why.** Go's `NetworkLockLog` errors out when lock is not enabled; here
-///   the engine simply returns no entries, so the report carries the lock-enabled flag and this
-///   renderer prints "not enabled" or "enabled, nothing synced yet" rather than an empty table.
+/// Two refusals are Go's and are reproduced here rather than rendered around:
 ///
-/// `json` emits a fork-specific object (`enabled` + `entries`), NOT Go's `[]ipnstate.NetworkLockUpdate`
-/// array. Pure (returns the string incl. its trailing newline) → unit-testable.
-fn format_lock_log(r: &tailscaled_rs::localapi::LockLogReport, json: bool) -> String {
-    if json {
+/// - **A lock-disabled node is refused, not reported.** Go's `runTailnetLockLog` reads the lock
+///   status first and returns `errors.New("Tailnet Lock is not enabled")` before it asks for the log
+///   at all: no output, non-zero exit. This build learns the same fact from the reply's own
+///   `enabled` flag (the daemon already sends it, so no second round-trip is needed) and refuses on
+///   it. Printing an empty history instead would let `tnet lock log` succeed on exactly the node a
+///   script runs it to rule out.
+/// - **An unknown `--json` version is refused by number.** Go's `printTailnetLockLog` serves schema
+///   version 1 and answers anything else with `unrecognised version: %d`.
+///
+/// The version-1 payload carries Go's `jsonoutput.ResponseEnvelope` field (`SchemaVersion: "1"`) so
+/// a script can pin the schema it parses. What sits under the envelope is fork-specific and NOT Go's
+/// `Messages`/`AUM` shape: Go expands each update's decoded AUM into named fields, which needs the
+/// CBOR decoder this daemon does not have, so the object stays `enabled` + `entries` (hash, change,
+/// signing key ids, raw CBOR as hex) rather than borrowing Go's key names for something narrower
+/// than what those names mean upstream. `enabled` is always `true` now that the disabled case exits
+/// before printing; it is kept so the object does not change shape from the pre-refusal builds.
+///
+/// Pure (returns the string incl. its trailing newline, or Go's refusal) → unit-testable.
+fn format_lock_log(
+    r: &tailscaled_rs::localapi::LockLogReport,
+    json: JsonSchemaVersion,
+) -> Result<String> {
+    // Go `runTailnetLockLog`: the status gate comes first, before the log is even fetched, so it
+    // wins over every other outcome including an unrecognised `--json` version.
+    if !r.enabled {
+        anyhow::bail!("Tailnet Lock is not enabled");
+    }
+    if json.is_set {
+        // Go `printTailnetLockLog`: version 1 is the only schema this command speaks.
+        if json.version != 1 {
+            anyhow::bail!("unrecognised version: {}", json.version);
+        }
         use serde_json::{Map, Value, json};
         let entries: Vec<Value> = r
             .entries
@@ -7824,23 +7953,23 @@ fn format_lock_log(r: &tailscaled_rs::localapi::LockLogReport, json: bool) -> St
             })
             .collect();
         let mut root = Map::new();
+        // Go's `ResponseEnvelope.SchemaVersion` — a string, as upstream types it.
+        root.insert("SchemaVersion".into(), json!("1"));
         root.insert("enabled".into(), json!(r.enabled));
         root.insert("entries".into(), Value::Array(entries));
-        return format!(
+        return Ok(format!(
             "{}\n",
             serde_json::to_string_pretty(&root).unwrap_or_else(|_| "{}".to_string())
-        );
+        ));
     }
-    // Nothing to list: say which of the two empty cases this is (Go never reaches here — it errors
-    // instead — but an empty table would leave an operator guessing).
+    // Nothing to list, but the lock IS on: Go's loop simply prints nothing here, which would leave an
+    // operator unable to tell "no history" from "command did nothing". Say which it is.
     if r.entries.is_empty() {
-        if !r.enabled {
-            // Same wording as `lock status`'s not-enabled line, so the two verbs agree.
-            return "Tailnet Lock is NOT enabled.\n\n".to_string();
-        }
-        return "Tailnet Lock is ENABLED, but no update-chain history has synced to this node \
+        return Ok(
+            "Tailnet Lock is ENABLED, but no update-chain history has synced to this node \
                 yet.\n\n"
-            .to_string();
+                .to_string(),
+        );
     }
     let mut out = String::new();
     for e in &r.entries {
@@ -7867,7 +7996,7 @@ fn format_lock_log(r: &tailscaled_rs::localapi::LockLogReport, json: bool) -> St
         // Blank line between stanzas, like Go's `fmt.Fprintln` after each description.
         out.push('\n');
     }
-    out
+    Ok(out)
 }
 
 /// Render `tnet dns status` from a [`DnsStatusReport`](tailscaled_rs::localapi::DnsStatusReport)
@@ -15680,7 +15809,7 @@ mod tests {
                 },
             ],
         };
-        let h = format_lock_log(&report, false);
+        let h = format_lock_log(&report, JsonSchemaVersion::default()).unwrap();
         assert_eq!(
             h,
             "update AAAAQ (add-key)\n  signed by: tlpub:aabb, tlpub:ccdd\n\n\
@@ -15696,8 +15825,10 @@ mod tests {
         // build cannot produce; the bytes are `--json`-only).
         assert!(!h.contains("a1626b76"), "{h}");
 
-        let j = format_lock_log(&report, true);
+        let j = format_lock_log(&report, parse_json_schema_version("1").unwrap()).unwrap();
         let v: serde_json::Value = serde_json::from_str(&j).unwrap();
+        // Go's `jsonoutput.ResponseEnvelope` field, so a script can pin the schema it parses.
+        assert_eq!(v["SchemaVersion"], serde_json::json!("1"));
         assert_eq!(v["enabled"], serde_json::json!(true));
         assert_eq!(v["entries"].as_array().unwrap().len(), 2);
         assert_eq!(v["entries"][0]["hash"], serde_json::json!("AAAAQ"));
@@ -15710,29 +15841,114 @@ mod tests {
         assert_eq!(v["entries"][0]["raw"], serde_json::json!("a1626b76"));
     }
 
-    /// The two empty histories must be distinguishable in words, not an empty table: lock off vs.
-    /// lock on with nothing synced to this node yet.
+    /// A lock-disabled node is Go's error, not output. `runTailnetLockLog` reads the status first and
+    /// returns `errors.New("Tailnet Lock is not enabled")` before it ever asks for the log, so the
+    /// command exits non-zero with nothing printed — in both output modes, and whatever `--json` says.
     #[test]
-    fn format_lock_log_empty_says_which_empty_it_is() {
+    fn format_lock_log_refuses_a_lock_disabled_node() {
         use tailscaled_rs::localapi::LockLogReport;
-        // Lock not in use: the same sentence `lock status` prints, so the two verbs agree.
         let off = LockLogReport::default();
-        assert_eq!(
-            format_lock_log(&off, false),
-            "Tailnet Lock is NOT enabled.\n\n"
-        );
-        // Lock in use, but this node has synced no chain yet.
+        for json in [
+            JsonSchemaVersion::default(),
+            parse_json_schema_version("1").unwrap(),
+            // The status gate is Go's FIRST check, so it wins even over a bad schema version.
+            parse_json_schema_version("2").unwrap(),
+        ] {
+            let e = format_lock_log(&off, json).unwrap_err().to_string();
+            assert_eq!(e, "Tailnet Lock is not enabled", "{json:?}");
+        }
+    }
+
+    /// Lock on, but this node has synced no chain yet: Go's loop prints nothing at all, which reads
+    /// the same as a command that did nothing. Say which empty this is.
+    #[test]
+    fn format_lock_log_enabled_but_unsynced_says_so() {
+        use tailscaled_rs::localapi::LockLogReport;
         let on_but_empty = LockLogReport {
             enabled: true,
             entries: vec![],
         };
-        let h = format_lock_log(&on_but_empty, false);
+        let h = format_lock_log(&on_but_empty, JsonSchemaVersion::default()).unwrap();
         assert!(h.starts_with("Tailnet Lock is ENABLED,"), "{h}");
         assert!(h.contains("no update-chain history has synced"), "{h}");
-        // JSON stays a well-formed object with an empty list in both cases (no null, no bare array).
-        let v: serde_json::Value = serde_json::from_str(&format_lock_log(&off, true)).unwrap();
-        assert_eq!(v["enabled"], serde_json::json!(false));
+        // JSON stays a well-formed, envelope-carrying object with an empty list (no null, no bare
+        // array).
+        let v: serde_json::Value = serde_json::from_str(
+            &format_lock_log(&on_but_empty, parse_json_schema_version("1").unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["SchemaVersion"], serde_json::json!("1"));
         assert_eq!(v["entries"], serde_json::json!([]));
+    }
+
+    /// Go's `--json` on `lock log` is a `jsonoutput.SchemaVersion`, not a bool: integer first, boolean
+    /// second, and anything else is `parse error`.
+    #[test]
+    fn lock_log_json_flag_parses_as_a_schema_version() {
+        let set = |version| JsonSchemaVersion {
+            is_set: true,
+            version,
+        };
+        // Bare `--json` reaches us as clap's `default_missing_value`, which is Go's `-json=true`.
+        assert_eq!(parse_json_schema_version("true").unwrap(), set(1));
+        assert_eq!(parse_json_schema_version("True").unwrap(), set(1));
+        assert_eq!(parse_json_schema_version("t").unwrap(), set(1));
+        // `--json=1` — the spelling a Go command line carries — must mean the same thing.
+        assert_eq!(parse_json_schema_version("1").unwrap(), set(1));
+        // Integer parsing runs BEFORE boolean parsing, so "0" is version 0, not `false`.
+        assert_eq!(parse_json_schema_version("0").unwrap(), set(0));
+        assert_eq!(parse_json_schema_version("2").unwrap(), set(2));
+        // `strconv.ParseInt` base 0: sign and base prefixes are honoured.
+        assert_eq!(parse_json_schema_version("+3").unwrap(), set(3));
+        assert_eq!(parse_json_schema_version("-1").unwrap(), set(-1));
+        assert_eq!(parse_json_schema_version("0x10").unwrap(), set(16));
+        assert_eq!(parse_json_schema_version("010").unwrap(), set(8));
+        assert_eq!(parse_json_schema_version("0b101").unwrap(), set(5));
+        // Explicitly cleared: the human form, exactly as an absent flag.
+        assert_eq!(
+            parse_json_schema_version("false").unwrap(),
+            JsonSchemaVersion::default()
+        );
+        assert_eq!(
+            parse_json_schema_version("F").unwrap(),
+            JsonSchemaVersion::default()
+        );
+        // Neither an int nor a bool: Go's own wording.
+        for bad in ["garbage", "", "0x-1", "1.0", "1_0"] {
+            assert_eq!(
+                parse_json_schema_version(bad).unwrap_err(),
+                "parse error",
+                "{bad:?}"
+            );
+        }
+        // An absent flag is the zero value; a present-but-bad one names the flag, as `flag` does.
+        assert_eq!(
+            json_schema_flag(None).unwrap(),
+            JsonSchemaVersion::default()
+        );
+        assert_eq!(
+            json_schema_flag(Some("nope")).unwrap_err().to_string(),
+            r#"invalid value "nope" for flag --json: parse error"#
+        );
+    }
+
+    /// Version 1 is the only schema this command speaks; Go answers any other by number.
+    #[test]
+    fn format_lock_log_refuses_an_unrecognised_schema_version() {
+        use tailscaled_rs::localapi::LockLogReport;
+        let on = LockLogReport {
+            enabled: true,
+            entries: vec![],
+        };
+        for (flag, want) in [
+            ("2", "unrecognised version: 2"),
+            ("0", "unrecognised version: 0"),
+        ] {
+            let e = format_lock_log(&on, parse_json_schema_version(flag).unwrap())
+                .unwrap_err()
+                .to_string();
+            assert_eq!(e, want, "--json={flag}");
+        }
     }
 
     #[test]
