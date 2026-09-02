@@ -1408,11 +1408,14 @@ verb to return.
 
 **Ask:** the learning path above, plus one read-only accessor over what it accumulated —
 `Device::app_connector_route_info(&self) -> Option<RouteInfo>` where `RouteInfo` mirrors Go's
-`appctype.RouteInfo`: `control: Vec<IpNet>` (routes from the policy's `routes` field), `domains:
-BTreeMap<String, Vec<IpAddr>>` (addresses learned per domain), `wildcards: Vec<String>` (the
-observed suffixes). `None` when the node is not advertising the role, so the caller can tell "not a
-connector" from "a connector that has learned nothing", which are different answers. The routes
-themselves should keep flowing through the existing advertised-route path rather than a second one.
+`appctype.RouteInfo` (`types/appctype/appconnector.go`): `control: Vec<IpNet>` (routes from the
+policy's `routes` field), `domains: BTreeMap<String, Vec<IpAddr>>` (addresses learned per domain),
+`wildcards: Vec<String>` (the configured `*.` domains with the `*.` stripped — the watch list, not
+what the watching found: Go's `updateDomains` fills it from the control-pushed `domains` list alone,
+and `NewAppConnector` seeds a restarting connector's wildcard set straight back from it). `None`
+when the node is not advertising the role, so the caller can tell "not a connector" from "a
+connector that has learned nothing", which are different answers. The routes themselves should keep
+flowing through the existing advertised-route path rather than a second one.
 
 Split it if that is easier to land: the accessor is useless without the learning, but the *learning*
 alone is already the feature — a node that actually connects. The readback is how an operator

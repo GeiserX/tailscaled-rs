@@ -23156,6 +23156,126 @@ users:
         assert!(Cli::try_parse_from(["tnet", "appc-routes", "--json"]).is_err());
     }
 
+    /// `docs/ENGINE_ASKS.md` §39 is the ask an engine implementer would build
+    /// `Device::app_connector_route_info` from, and most of its value is that it says where each
+    /// field of Go's `appctype.RouteInfo` comes from. Two of the three are handed down by control
+    /// — the policy's `routes`, and the `*.` entries of its domain list — and only one is filled
+    /// by watching DNS. Getting that split wrong in the ask gets the accessor built wrong:
+    /// `appc.NewAppConnector` seeds a restarting connector's wildcard set straight out of
+    /// `RouteInfo.Wildcards`, so a `wildcards` derived from what was seen rather than from what was
+    /// configured comes back after a restart as a connector that no longer matches the subdomains
+    /// its own policy asked for.
+    ///
+    /// So the section is checked against itself. §39 already separates the two provenances in its
+    /// prose — a "configured domain set" bullet that control pushes, and a "DNS observation" bullet
+    /// that records what the resolver saw — and each field's parenthetical gloss has to land on the
+    /// right side of it. Both the vocabulary and the glosses are parsed out of the document, so
+    /// rewording either is free and reassigning a field's provenance is not.
+    mod engine_asks_39 {
+        const ASKS: &str = include_str!("../../docs/ENGINE_ASKS.md");
+
+        const HEADING: &str = "## 39.";
+
+        /// The words §39 uses for what the connector finds out at runtime, as opposed to what
+        /// control hands it. Prefixes, so "observation"/"observed" and "discovers"/"discovered"
+        /// both count.
+        const LEARNED: [&str; 3] = ["learn", "observ", "discover"];
+
+        /// §39's body, from its heading to the next top-level ask, with every run of whitespace
+        /// collapsed so a sentence broken over a line wrap reads as one string.
+        fn section() -> String {
+            let start = ASKS
+                .find(HEADING)
+                .unwrap_or_else(|| panic!("docs/ENGINE_ASKS.md should still contain `{HEADING}`"));
+            let body = &ASKS[start..];
+            let body = match body[HEADING.len()..].find("\n## ") {
+                Some(end) => &body[..HEADING.len() + end],
+                None => body,
+            };
+            body.split_whitespace().collect::<Vec<_>>().join(" ")
+        }
+
+        /// The parenthetical §39 attaches to one `RouteInfo` field in its **Ask:** sentence: the
+        /// field is written `` `name: Type` `` and the gloss is the `(…)` that follows it.
+        fn field_gloss(field: &str) -> String {
+            let section = section();
+            let named = format!("`{field}: ");
+            let start = section.find(&named).unwrap_or_else(|| {
+                panic!("§39 should still ask for a `RouteInfo` with a `{field}` field")
+            });
+            let open = start
+                + section[start..]
+                    .find('(')
+                    .unwrap_or_else(|| panic!("§39 should still gloss `{field}` with a `(…)`"));
+            let mut depth = 0usize;
+            for (offset, c) in section[open..].char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return section[open + 1..open + offset].to_string();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("§39's gloss for `{field}` is never closed")
+        }
+
+        /// The §39 bullet opening with this bold lead, up to the next bullet.
+        fn bullet(lead: &str) -> String {
+            let section = section();
+            let start = section
+                .find(lead)
+                .unwrap_or_else(|| panic!("§39 should still have its `{lead}` bullet"));
+            let body = &section[start..];
+            match body.find(" - **") {
+                Some(end) => body[..end].to_string(),
+                None => body.to_string(),
+            }
+        }
+
+        #[test]
+        fn the_two_provenances_the_glosses_are_read_against_are_still_the_sections_own() {
+            let observation = bullet("**DNS observation.**");
+            assert!(
+                LEARNED.iter().any(|word| observation.contains(word)),
+                "§39's DNS-observation bullet is the one place data arrives by watching; it should \
+                 still say so in those words: {observation}"
+            );
+            let configured = bullet("**The configured domain set.**");
+            assert!(
+                !LEARNED.iter().any(|word| configured.contains(word)),
+                "§39's configured-domain-set bullet describes what control pushes down, so the \
+                 vocabulary of runtime learning does not belong in it: {configured}"
+            );
+        }
+
+        #[test]
+        fn only_the_domains_field_is_glossed_as_something_the_connector_learns() {
+            let domains = field_gloss("domains");
+            assert!(
+                LEARNED.iter().any(|word| domains.contains(word)),
+                "`domains` is the field the DNS observation fills — the addresses seen per domain \
+                 — and its gloss should say so: {domains}"
+            );
+            for field in ["control", "wildcards"] {
+                let gloss = field_gloss(field);
+                assert!(
+                    !LEARNED.iter().any(|word| gloss.contains(word)),
+                    "`{field}` is pushed down by control, not learned by watching: glossing it as \
+                     learned points whoever builds the accessor at the wrong source, and Go seeds \
+                     a restarting connector from this very field: {gloss}"
+                );
+                assert!(
+                    gloss.contains("configured") || gloss.contains("polic"),
+                    "`{field}`'s gloss should name the policy it comes from: {gloss}"
+                );
+            }
+        }
+    }
+
     /// `docs/ENGINE_ASKS.md` §21 is an ask filed against an OLD engine pin, and eight of the flags
     /// it asks for have since shipped. A reader who lands on the ask list decides what is still
     /// missing from it, so a bullet left unmarked — or a rationale still asserting in the present
