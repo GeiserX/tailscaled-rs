@@ -1151,3 +1151,41 @@ already parse (with Go's own `ParseUint`/`ParseAddrPort` validation, dedup and `
 ordering) and are refused by name in `check_unmodelled_set_flags`; wiring them is a wire `Set` field +
 pref + `get_settings` row, and the refusal is deleted. `--sync`/`--no-sync` is the same shape.
 `--remote-config` keeps its refusal permanently. Tracked in daemon bead tsd-re94825b. — daemon lane
+
+## 35. Proxied-flow `whois` — a `(proto, ip:port) → node` lookup (for `tnet whois --proto`)
+
+**Why:** Go's `whois` is a *flow* lookup, not an address lookup. `cmd/tailscale/cli/whois.go` @
+`53a0d659afa51835dd7a9283873cca44261454f8` takes `ip[:port]` and a `--proto` selector (`protocol; one
+of "tcp" or "udp"; empty means both`) and calls `LocalClient.WhoIsProto`, which reaches
+`LocalBackend.WhoIs(proto, ipp)`. That method resolves by IP first (`cn.NodeByAddr`) and consults the
+protocol **only** in its fallback: when the address matches no node in the netmap and the port is
+non-zero, it asks `b.sys.ProxyMapper().WhoIsIPPort(proto, ipp)` — for `""` it tries `"tcp"` then
+`"udp"` — to map a locally-proxied flow (a `127.0.0.1:port` socket tailscaled itself proxied) back to
+the tailnet IP behind it, then resolves that. So the same `ip:port` really can belong to different
+sessions per protocol, but only for flows the daemon proxies.
+
+Verified against pin `9d847a6e`/v0.43.0. The engine has no such table and no port dimension at all:
+`Device::whois(SocketAddr)` (`src/lib.rs`) forwards to `ts_runtime`, whose `peer_tracker::whois_opt`
+calls `status::whois_addr(addr)` — the whole body of which is `addr.ip()` — and then
+`peer_by_tailnet_ip_opt`. There is no proxy-map type anywhere in the workspace, so nothing records
+which local socket belongs to which peer, and a protocol has nothing to select within.
+
+**Ask:**
+
+1. A proxied-flow registry in the engine, the analogue of Go's `proxymap.Mapper`: the netstack /
+   userspace-proxy paths record `(proto, local ip:port) → peer tailnet IP` when they proxy a
+   connection, and drop the entry when it closes.
+2. `Device::whois_proto(proto: Option<Proto>, addr: SocketAddr) -> Result<Option<WhoIs>, Error>` (or
+   a `proto` parameter on the existing `whois`): resolve by IP as today, and on a miss with a
+   non-zero port, consult (1) — trying `tcp` then `udp` when `proto` is `None`, which is Go's
+   empty-means-both order — and resolve the mapped tailnet IP.
+
+(1) is the substantial half; (2) is the surface over it. Both are additive: today's `whois(addr)` is
+(2) with `proto: None` and a port of 0.
+
+**Daemon impact once landed:** `tnet whois [--proto tcp|udp] ip[:port]` already parses Go's arguments
+in full, and the LocalAPI `Request::Whois` already carries `port` and `proto` through to
+`diag::whois`, which hands the port to the engine and can only record the protocol. Wiring it is one
+call-site change in `diag::whois` plus deleting the "recorded, cannot select" notes on the flag help
+and the wire docs. Until then a proxied flow that Go attributes to a peer is reported here as owned by
+no node, with or without the flag. Tracked in daemon bead tsd-re4d7624. — daemon lane
