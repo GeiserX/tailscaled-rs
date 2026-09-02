@@ -6321,17 +6321,36 @@ fn parse_lock_public_key(s: &str) -> Result<[u8; 32]> {
             None => anyhow::bail!("key hex string doesn't have expected type prefix tlpub:"),
         },
     };
-    if hex.len() != 64 {
-        anyhow::bail!("key hex has the wrong size, got {} want 64", hex.len());
+    // Go measures and indexes BYTES here (`mem.RO.Len`/`.At`), so this does too: the length check is
+    // already a byte count, and decoding out of `hex.as_bytes()` keeps the two consistent. Slicing
+    // the `str` instead — `&hex[i..i + 2]` — aborts the process on a 64-*byte* argument whose
+    // characters are multibyte (`tlpub:` + 21 × `€` + `a` is 64 bytes), because byte 2 is not a
+    // char boundary. Go reports a bad hex character there, and so must this.
+    let raw = hex.as_bytes();
+    if raw.len() != 64 {
+        anyhow::bail!("key hex has the wrong size, got {} want 64", raw.len());
     }
-    let bytes: Vec<u8> = (0..64)
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
-        .collect::<std::result::Result<_, _>>()
-        .map_err(|_| anyhow!("invalid hex character in key"))?;
     let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
+    for (byte, pair) in out.iter_mut().zip(raw.as_chunks::<2>().0) {
+        let (Some(hi), Some(lo)) = (hex_nibble(pair[0]), hex_nibble(pair[1])) else {
+            anyhow::bail!("invalid hex character in key");
+        };
+        *byte = (hi << 4) | lo;
+    }
     Ok(out)
+}
+
+/// One hex digit's value, or `None` when the byte is not `[0-9a-fA-F]` — Go's `fromHexChar`
+/// (`types/key/util.go` @ v1.100.0). Deliberately not `u8::from_str_radix`, which is both
+/// char-boundary sensitive and *more* permissive than Go: `u8::from_str_radix("+f", 16)` is
+/// `Ok(15)`, so a leading sign used to decode as a valid hex byte.
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Split `lock`'s positional arguments into trusted keys and disablement values — a port of Go's
@@ -6774,15 +6793,23 @@ fn disablement_kdf_line(secret_hex: &str) -> Result<String> {
 /// Decode a lower/upper-hex string to bytes (the disablement secret is hex). A small local helper so
 /// the `lock disablement-kdf` path has no extra dependency beyond the `argon2` KDF itself.
 fn hex_decode_lower(s: &str) -> Result<Vec<u8>> {
-    let s = s.trim();
-    if !s.len().is_multiple_of(2) {
+    // Byte-wise for the same reason as `parse_lock_public_key`: this decodes operator input — the
+    // `--disablement-secret` flag and the `disablement:`/`disablement-secret:` positionals — so a
+    // multibyte character has to come back as a bad hex byte, not as a panic from a `str` slice
+    // taken through the middle of it.
+    let raw = s.trim().as_bytes();
+    if !raw.len().is_multiple_of(2) {
         anyhow::bail!("odd-length hex string");
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&s[i..i + 2], 16)
-                .map_err(|_| anyhow!("invalid hex byte {:?}", &s[i..i + 2]))
+    raw.as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| match (hex_nibble(pair[0]), hex_nibble(pair[1])) {
+            (Some(hi), Some(lo)) => Ok((hi << 4) | lo),
+            _ => Err(anyhow!(
+                "invalid hex byte {:?}",
+                String::from_utf8_lossy(pair)
+            )),
         })
         .collect()
 }
@@ -16072,6 +16099,57 @@ mod tests {
             e.contains("expected value with \"disablement:\" or \"disablement-secret:\" prefix"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn lock_hex_arguments_reject_non_ascii_instead_of_panicking() {
+        // Every length check on this path counts BYTES, like Go's, so a multibyte argument can pass
+        // it and still not be splittable at byte 2. `str` indexing panicked there, killing the
+        // process on nothing worse than a mistyped key. 21 × `€` (3 bytes each) + `a` is 64 bytes.
+        let multibyte = "€".repeat(21) + "a";
+        assert_eq!(
+            multibyte.len(),
+            64,
+            "the fixture has to pass the byte-length check"
+        );
+
+        let e = parse_lock_public_key(&format!("tlpub:{multibyte}"))
+            .expect_err("non-ASCII must be an error, not a panic")
+            .to_string();
+        assert_eq!(e, "invalid hex character in key", "{e}");
+
+        // And through the argument parser an operator actually reaches, for both kinds of value.
+        let err = |a: &str| {
+            parse_lock_args(&[a.to_string()], true, true)
+                .expect_err("non-ASCII must be an error, not a panic")
+                .to_string()
+        };
+        let e = err(&format!("tlpub:{multibyte}"));
+        assert!(
+            e.contains("parsing key 1: invalid hex character in key"),
+            "{e}"
+        );
+        let e = err(&format!("disablement:{}", "€".repeat(2)));
+        assert!(e.contains("parsing disablement 1: invalid hex byte"), "{e}");
+
+        // `hex_decode_lower` takes the same operator input via `--disablement-secret`.
+        assert!(hex_decode_lower("€€").is_err(), "multibyte hex rejected");
+        assert_eq!(
+            hex_decode_lower("00FF").unwrap(),
+            vec![0x00, 0xff],
+            "upper-hex still decodes"
+        );
+
+        // `u8::from_str_radix` also accepted a leading sign, so `+f` decoded as 0x0f — one more
+        // string Go's `fromHexChar` refuses and this used to take.
+        assert!(
+            hex_decode_lower("+f").is_err(),
+            "leading sign is not a hex byte"
+        );
+        let e = parse_lock_public_key(&format!("tlpub:+f{}", "0".repeat(62)))
+            .expect_err("leading sign is not a hex byte")
+            .to_string();
+        assert_eq!(e, "invalid hex character in key", "{e}");
     }
 
     #[test]
