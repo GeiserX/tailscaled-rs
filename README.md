@@ -81,6 +81,16 @@ export TS_RS_EXPERIMENT=this_is_unstable_software
 #   --version          print version and exit;  --help  full usage
 # e.g.  ./target/release/tailnetd --statedir /var/lib/tailnetd --verbose 1
 #
+# tailnetd also takes a `debug` SUBCOMMAND (Go `tailscaled debug`) — daemon-less diagnostics for
+# when the node will not come up at all, which is exactly when `tnet` (which talks to a running
+# daemon over its socket) cannot help. It needs no daemon, no socket and no TS_RS_EXPERIMENT:
+#   tailnetd debug --ifconfig            dump the host's network state once, as JSON (on stderr)
+#   tailnetd debug --monitor             …and re-dump it on every link change, until interrupted
+#   tailnetd debug --get-url <url>       fetch a URL with a connection trace ("login" = the
+#                                        default control plane's login URL)
+# (Go's --derp and --portmap are declared and refused BY NAME: a DERP round-trip test needs a
+# standalone DERP client this daemon does not own, and port mapping does not exist in the engine.)
+#
 # NOTE: --statedir also moves the default socket to <dir>/tailnetd.sock. Since `tnet` has no
 # --statedir, point the client at it explicitly:  tnet --socket /var/lib/tailnetd/tailnetd.sock status
 # (or export TAILNETD_SOCKET). The packaged service uses the default /var/lib/tailnetd, so this only
@@ -113,6 +123,15 @@ fresh, surfacing a new login URL — handy to re-authenticate without changing a
 briefly bring the connection down while it re-registers, so avoid running it over a remote SSH/RDP
 session you could lock yourself out of.
 
+`tnet up` also answers to the spellings Go's `tailscale up` uses, so a command line copied from Go
+runs unedited: `--auth-key` is an alias of `--authkey` (and, like Go, a value of `file:<path>` under
+either spelling reads the key from that file), and `--login-server` is an alias of `--control-url`.
+Go's hidden `--host-routes` is accepted and does nothing — it has had to be `true` since Tailscale
+1.67, and this build's userspace netstack installs no host routes at all — while `--host-routes=false`
+is refused with Go's own "only 'true' is allowed". `up --nickname` is refused by name, pointing at
+`tnet set --nickname`: no `up` names a login profile, in this fork or in Go, which registers
+`--nickname` on `set` and `login` only.
+
 `tnet set` (Go `tailscale set`) adjusts policy prefs on an already-running node. Changing
 `--exit-node`, `--hostname`, `--accept-routes`, `--advertise-routes`, or `--advertise-exit-node`
 applies **live** — in place, with no reconnect (matching Go's `set`). `--shields-up`, `--ssh`,
@@ -124,6 +143,29 @@ but nothing in this build acts on them yet — each flag's `--help` says exactly
 not do. `--nickname` is the exception among them: like Go, it also renames the current login profile,
 so the name you pick is what `tnet switch --list` shows and what `tnet switch <name>` resolves
 against. `set` never re-authenticates and never changes whether the node is up or down.
+
+Four of Go's `set` flags are **parsed but not modelled**, so a command line ported from Go reaches a
+refusal that names the gap instead of dying at the parser. For each, the value asking for the state
+this daemon is currently in is accepted, and the other is refused: `--relay-server-port=` and
+`--relay-server-static-endpoints=` (disable / advertise none) are fine, but a port or an endpoint
+list is refused — this build runs no peer relay server; `--sync` is fine and `--no-sync` (Go
+`--sync=false`) is refused — there is no way to stop the map poll while staying up. Those three are
+engine-gated (`docs/ENGINE_ASKS.md` §34). The fourth, `--remote-config`, is refused **by choice and
+permanently**: it hands the tailnet admin full remote control of this node's prefs and LocalAPI,
+bypassing the per-feature double opt-in, which this daemon's local authorization model
+(`docs/THREAT_MODEL.md` §4.1) does not grant to the control plane. `--no-remote-config`, Go's
+default, is what this build always does.
+
+**App connector: the advertise half only.** `tnet up/set --advertise-connector` really does reach
+control — the engine sets `Hostinfo.AppConnector` from the pref at registration and on every map
+request, so the admin console sees the node offering the role. What this build does **not** have is
+the connector's data path: it never receives the connector domain list, never watches DNS lookups to
+learn a domain's addresses, and so never appends a learned route to `--advertise-routes`. An
+advertising node therefore serves no connector traffic. `tnet appc-routes` (Go `tailscale
+appc-routes`) reports exactly what follows from that — `not a connector` when the pref is off, and
+`-n`'s count of the routes you advertise — and refuses `--map`, `--all` and the default per-domain
+summary with that reason, rather than printing an empty map that would read as "learned nothing
+yet". Advertise the role only if something else in your tailnet is doing the connecting.
 
 State (node keys + prefs) lives in `$XDG_STATE_HOME/tailnetd` (override with `TAILNETD_STATE_DIR`);
 the control socket is `<state-dir>/tailnetd.sock` (override with `TAILNETD_SOCKET`).
