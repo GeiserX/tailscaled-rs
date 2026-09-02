@@ -1240,3 +1240,51 @@ Go's `- tlpub:%x (%s key)` list, restore Go's self-key check against (2), and dr
 support-disablement note the command prints today. Until then the fork initializes only the subset the
 engine has — this node as the sole trusted key, one disablement secret — and says so where the
 operator hits it. Tracked in daemon bead tsd-reb2dfc1. — daemon lane
+
+## 37. Per-peer `Location` (and `Active`) on `StatusNode` — for `exit-node list`'s country/city columns and `--filter`
+
+**Why:** Go's `exit-node list` is a *location* browser. `cmd/tailscale/cli/exitnode.go` @
+`53a0d659afa51835dd7a9283873cca44261454f8` runs the exit-node peers through
+`filterFormatAndSortExitNodes`, which buckets them by `Location.CountryCode` then `Location.CityCode`,
+keeps only the highest-`Location.Priority` node per city (plus whichever is the active exit node),
+synthesises an `Any` city row holding the country's best node when a country has more than one city,
+sorts countries and cities by name, and honours `--filter` ("filter exit nodes by country") with a
+case-insensitive match against `Location.Country`. It then prints five columns — IP, HOSTNAME,
+COUNTRY, CITY, STATUS.
+
+Verified against pin `9d847a6e`/v0.43.0. The **wire** type is already there and already parsed:
+`ts_control_serde::Location` (`ts_control_serde/src/location.rs`) carries `country`, `country_code`,
+`city`, `city_code`, `latitude`, `longitude` and `priority`, and `HostInfo.location:
+Option<Location<'a>>` (`ts_control_serde/src/host_info.rs`) decodes it off the netmap. It is dropped
+one layer up: `impl From<..> for Node` (`ts_control/src/node.rs`) projects `host_info.services`,
+`host_info.net_info.preferred_derp` and `host_info.peer_relay` into the domain `Node` but not
+`host_info.location`, so `ts_control::Node` has no location field, `StatusNode`
+(`ts_runtime/src/status.rs`) has none either, and neither does the daemon's `PeerReport`. Nothing
+between the decoder and the CLI can group, sort or filter by country.
+
+`StatusNode` is also missing Go's `PeerStatus.Active` (traffic seen in the last couple of minutes),
+which `peerStatus` consults before `Online` when it picks the STATUS wording.
+
+**Ask:**
+
+1. Retain the decoded location on the domain node — `Node::location: Option<Location>` (an owned
+   analogue of `ts_control_serde::Location`), projected in `From<..> for Node` next to the other
+   `host_info` fields it already keeps, `None` when the peer declared none (never fabricated).
+2. Surface it on the status view — `StatusNode::location: Option<Location>`, the analogue of Go's
+   `ipnstate.PeerStatus.Location`. `priority` is the field the per-city reduction needs, so it has to
+   ride along with the names and codes.
+3. `StatusNode::active: bool` — Go's `PeerStatus.Active`, true when traffic has been seen for the peer
+   recently. Independent of (1) and (2) and useful to `tnet status` as well.
+
+All three are additive: today's behaviour is (1)/(2) always `None` and (3) always `false`.
+
+**Daemon impact once landed:** `tnet exit-node list` already prints Go's five columns, sorts by DNS
+name, ports Go's `peerStatus` and both of its error paths (`no exit nodes found`, `no exit nodes found
+for %q`), and accepts `--filter`. What it cannot do is *group*: with no `Location`, every peer takes
+Go's own no-location path — one unnamed country, one unnamed city, no priority reduction, no `Any`
+row, `-` printed for country and city — and any non-empty `--filter` can only reach the "found for %q"
+error. Wiring is: carry `location` through `peer_report_from_status_node` into `PeerReport`, then port
+`filterFormatAndSortExitNodes` itself (the country/city buckets, the priority reduction, the `Any`
+row, the two name sorts) and match `--filter` against the real country. (3) removes the last deviation
+in the STATUS column, where an idle-but-online selected exit node currently reads `selected` and Go
+says `selected but offline`. Tracked in daemon bead tsd-red57f03. — daemon lane
