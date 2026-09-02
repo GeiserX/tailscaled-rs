@@ -125,7 +125,7 @@ secrecy = "0.10"
 # pure-local, offline Argon2i KDF Go `tka.DisablementKDF` uses (`argon2.Key`, i.e. Argon2i, NOT the
 # crate-default Argon2id). `default-features = false` keeps it alloc-only. Byte-for-byte verified
 # against Go v1.100.0 goldens in the command's test.
-argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
 # `tnet lock init`: mint the tailnet-lock disablement secrets from the OS CSPRNG, the way Go's
 # `runTailnetLockInit` reads 32 bytes from `crypto/rand`. Only the raw OS entropy source is wanted
 # (no generator, no distributions), and `getrandom` is what the tree's crypto crates already use for
