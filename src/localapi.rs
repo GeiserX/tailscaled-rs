@@ -468,6 +468,12 @@ pub enum Request {
         /// backward-compatible (an older client sends the bare variant, which deserializes to `None`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         note: Option<String>,
+        /// Run the extra diagnostic pass (Go `bugreport --diagnose` →
+        /// `ipn.BugReportOpts.Diagnose` → `LocalBackend.Doctor`). The daemon then fills
+        /// [`Response::BugReport::checks`]; the marker itself is unaffected. `false` (the default)
+        /// keeps the wire byte-identical to a request from a client that predates the flag.
+        #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+        diagnose: bool,
     },
     /// Read the node's serve configuration (Go `GetServeConfig`; `tnet serve status`). Replies with
     /// [`Response::ServeConfig`]. Read-only — gated like [`Status`](Request::Status).
@@ -870,6 +876,14 @@ pub enum Response {
         /// The marker string (a local identifier + daemon version + node state). NOT a server-side
         /// log id — this fork uploads nothing.
         marker: String,
+        /// The `--diagnose` pass, one `name: detail` line per check, ready to print (see
+        /// [`crate::ipn::doctor`]). EMPTY unless the request set
+        /// [`diagnose`](Request::BugReport::diagnose) — Go's `Doctor` likewise runs only then.
+        /// Returned rather than logged because this fork uploads no logs: the lines are for the
+        /// operator to read and paste, not for support to fetch. `#[serde(default)]` + skip keeps
+        /// the wire backward-compatible with a client that predates the flag.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        checks: Vec<String>,
     },
     /// The node's serve configuration (reply to [`Request::GetServeConfig`]), rendered by
     /// `tnet serve status`.
@@ -2406,31 +2420,98 @@ mod tests {
 
     #[test]
     fn bug_report_request_wire_is_back_compatible() {
-        // `BugReport` changed from a unit variant to `{ note: Option<String> }`. This LOCKS the wire
-        // back-compat both ways (the riskiest part of that change): a no-note request must serialize
-        // BYTE-IDENTICAL to the old bare unit variant (`skip_serializing_if` is what makes this hold —
-        // no `"note":null`), and the old bare JSON must still deserialize (→ note: None). Mirrors the
-        // per-variant wire-lock convention every sibling request already follows.
+        // `BugReport` changed from a unit variant to `{ note: Option<String> }`, and then grew
+        // `diagnose: bool`. This LOCKS the wire back-compat both ways (the riskiest part of those
+        // changes): a plain request must serialize BYTE-IDENTICAL to the old bare unit variant
+        // (`skip_serializing_if` on both fields is what makes this hold — no `"note":null`, no
+        // `"diagnose":false`), and the old bare JSON must still deserialize (→ note: None,
+        // diagnose: false). Mirrors the per-variant wire-lock convention every sibling request
+        // already follows.
         assert_eq!(
-            serde_json::to_string(&Request::BugReport { note: None }).unwrap(),
+            serde_json::to_string(&Request::BugReport {
+                note: None,
+                diagnose: false
+            })
+            .unwrap(),
             r#"{"cmd":"bug_report"}"#,
-            "no-note must be byte-identical to the old unit variant's wire form"
+            "a plain bugreport must be byte-identical to the old unit variant's wire form"
         );
-        // Old client's bare JSON → new struct variant with note: None (forward-compat).
+        // Old client's bare JSON → new struct variant with both fields defaulted (forward-compat).
         assert!(matches!(
             serde_json::from_str::<Request>(r#"{"cmd":"bug_report"}"#).unwrap(),
-            Request::BugReport { note: None }
+            Request::BugReport {
+                note: None,
+                diagnose: false
+            }
         ));
         // With a note, the field is present on the wire and round-trips.
         assert_eq!(
             serde_json::to_string(&Request::BugReport {
-                note: Some("dns broke".into())
+                note: Some("dns broke".into()),
+                diagnose: false
             })
             .unwrap(),
             r#"{"cmd":"bug_report","note":"dns broke"}"#
         );
         match serde_json::from_str::<Request>(r#"{"cmd":"bug_report","note":"x"}"#).unwrap() {
-            Request::BugReport { note } => assert_eq!(note.as_deref(), Some("x")),
+            Request::BugReport { note, diagnose } => {
+                assert_eq!(note.as_deref(), Some("x"));
+                assert!(!diagnose, "an absent diagnose key means the pass is off");
+            }
+            other => panic!("expected BugReport, got {other:?}"),
+        }
+        // `--diagnose` rides as its own key and round-trips.
+        assert_eq!(
+            serde_json::to_string(&Request::BugReport {
+                note: None,
+                diagnose: true
+            })
+            .unwrap(),
+            r#"{"cmd":"bug_report","diagnose":true}"#
+        );
+        match serde_json::from_str::<Request>(r#"{"cmd":"bug_report","diagnose":true}"#).unwrap() {
+            Request::BugReport { note, diagnose } => {
+                assert_eq!(note, None);
+                assert!(diagnose);
+            }
+            other => panic!("expected BugReport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bug_report_response_checks_are_wire_optional() {
+        // The reply grew `checks` alongside `--diagnose`. A marker-only reply (the no-`--diagnose`
+        // case, and every reply an older daemon sends) must stay byte-identical to the pre-change
+        // wire form, and old JSON must still deserialize — otherwise a mixed-version pair breaks on
+        // the one command an operator reaches for when things are already broken.
+        assert_eq!(
+            serde_json::to_string(&Response::BugReport {
+                marker: "BUG-1-0".into(),
+                checks: Vec::new()
+            })
+            .unwrap(),
+            r#"{"kind":"bug_report","marker":"BUG-1-0"}"#,
+            "no checks must not appear on the wire at all"
+        );
+        match serde_json::from_str::<Response>(r#"{"kind":"bug_report","marker":"BUG-1-0"}"#)
+            .unwrap()
+        {
+            Response::BugReport { marker, checks } => {
+                assert_eq!(marker, "BUG-1-0");
+                assert!(checks.is_empty(), "an absent checks key means no pass ran");
+            }
+            other => panic!("expected BugReport, got {other:?}"),
+        }
+        // With a pass, the lines ride along and round-trip in order.
+        let json = serde_json::to_string(&Response::BugReport {
+            marker: "BUG-1-0".into(),
+            checks: vec!["state: Running".into(), "profile: default".into()],
+        })
+        .unwrap();
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::BugReport { checks, .. } => {
+                assert_eq!(checks, ["state: Running", "profile: default"]);
+            }
             other => panic!("expected BugReport, got {other:?}"),
         }
     }
