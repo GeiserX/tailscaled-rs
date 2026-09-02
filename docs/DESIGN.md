@@ -144,19 +144,22 @@ of it off.)
 - **TPM / Secure-Enclave `--encrypt-state` and `--hardware-attestation`** — at-rest state encryption
   and hardware-bound node identity, both backed by a platform key store (TPM 2.0 on Linux/Windows,
   Secure Enclave on macOS/iOS, Keystore on Android). Real targets (Go has both, each defaulting from
-  a syspolicy key — `EncryptState`, `HardwareAttestation`); ***out of scope for now***, because both
-  need a platform keystore integration and a pluggable state-store layer that this fork does not
-  have. Today the state dir is `0700` + the process-hardening posture; that is the interim, not the
-  end state, and `docs/THREAT_MODEL.md` §5.8 records it as a trust boundary rather than a guarantee.
+  a syspolicy key — `EncryptState`, `HardwareAttestation`); ***blocked***, on two named substrates
+  this fork does not have yet: a platform keystore integration to hold the key, and a pluggable
+  state-store layer for the provider prefix to seal through. Deferred until those land — not a
+  decision to skip them. Today the state dir is `0700` + the process-hardening posture; that is the
+  interim, not the end state, and `docs/THREAT_MODEL.md` §5.8 records it as a trust boundary rather
+  than a guarantee.
 
-  The **decision is visible in the daemon**, not only here: `tailnetd` declares both flags and
-  refuses at startup when either is switched on (naming the missing integration, the way
-  `--bird-socket` does), and reports — rather than silently drops — a `--syspolicy-file` that sets
-  either policy key. Accepting either flag as a no-op would let a Go unit file carry across and leave
-  an operator believing the state is sealed or the identity machine-bound when neither is true. Go's
-  two *usage* refusals (a portable `kube:`/`arn:` state store for `--hardware-attestation`, a
-  provider-prefixed `--state` for `--encrypt-state`) are unreachable here and land with the state
-  store providers, if those are ever built.
+  The **deferral is visible in the daemon**, not only here: `tailnetd` declares both flags and
+  refuses at startup when either is switched on, naming the missing integration and what protects
+  the state today (the way `--bird-socket` does), and reports — rather than silently drops — a
+  `--syspolicy-file` that sets either policy key. A refusal that names its own unblock is what a
+  deferral looks like where the operator meets it; accepting either flag as a no-op would let a Go
+  unit file carry across and leave an operator believing the state is sealed or the identity
+  machine-bound when neither is true. Go's two *usage* refusals (a portable `kube:`/`arn:` state
+  store for `--hardware-attestation`, a provider-prefixed `--state` for `--encrypt-state`) are
+  unreachable until the state-store providers exist, and land with them.
 
 > The one **gate** (not a feature, can't be "matched away"): the **unaudited-crypto production bar**
 > (bead tsd-q8o) — this fork must not be *claimed production-ready* until an external crypto audit of

@@ -286,6 +286,26 @@ impl NetworkState {
         }
     }
 
+    /// The names of the interfaces that reported at least one address, in deterministic order.
+    ///
+    /// The compact half of the dump: `bugreport --diagnose` prints one line naming the interfaces
+    /// and whether the host has a usable path, where `tailnetd debug --ifconfig` prints the whole
+    /// JSON state. Both read the same snapshot, so they can never disagree about what the host has.
+    pub(crate) fn interface_names(&self) -> Vec<&str> {
+        self.interfaces.keys().map(String::as_str).collect()
+    }
+
+    /// Whether the host has a usable IPv4 underlay path — the FILTERED answer (see the field docs),
+    /// so the node's own overlay address never makes an offline host look connected.
+    pub(crate) fn have_v4(&self) -> bool {
+        self.have_v4
+    }
+
+    /// Whether the host has a usable IPv6 underlay path (filtered, as [`have_v4`](Self::have_v4)).
+    pub(crate) fn have_v6(&self) -> bool {
+        self.have_v6
+    }
+
     /// Whether the *path signal* differs between two states — the same decision
     /// [`LinkSnapshot::changed`] drives the rebind with, so `--monitor` prints a new state exactly
     /// when the running daemon would have rebound.
