@@ -1381,3 +1381,49 @@ by name in `ping_probe_refusal` (`src/bin/tnet.rs`); wiring them is a ping-kind 
 `Ping` wire request, the `ipn::diag::ping` call, and Go's `hit peerapi of …` line for the peerAPI
 arm — then the refusal is deleted. `--icmp` is already honoured (it names the probe the daemon
 sends) and needs nothing. — daemon lane
+
+## 39. App-connector route learning + a `RouteInfo` readback (for `tnet appc-routes`)
+
+**Why:** the daemon already ships the *advertise* half of the app connector. `tnet up/set
+--advertise-connector` sets `Config.advertise_app_connector`, the engine folds it into
+`Hostinfo.AppConnector` at registration and on every map request, and control sees the node
+offering the role. Nothing behind that advertisement exists, in the daemon or the engine.
+
+Go's connector (`appc.AppConnector`, driven from `ipnlocal`) is three pieces the engine would own,
+because all three sit on the data plane:
+
+- **The configured domain set.** Control pushes it in the netmap capability map — the
+  `tailscale.com/app-connectors` cap (`appctype.AppConnectorAttr`: `domains`, wildcards, and
+  predetermined `routes`). The engine parses the netmap; the daemon never sees the capmap.
+- **DNS observation.** For each configured domain (`example.com`, or `*.example.com` matched
+  against the wildcard list) the connector watches the answers flowing through its own resolver and
+  records the addresses it sees. That is a tap on the MagicDNS forwarder — engine-side.
+- **Route advertisement.** Each newly observed address becomes a /32 or /128 the node advertises,
+  appended to the advertised-route set and re-sent to control.
+
+Verified against pin `9d847a6e`/v0.43.0: `Config.advertise_app_connector` is a plain bool the
+register/map-poll paths read, and nothing else in the engine references app connectors. There is no
+domain observation, no learned-route accumulation, and no store — so there is nothing for a readback
+verb to return.
+
+**Ask:** the learning path above, plus one read-only accessor over what it accumulated —
+`Device::app_connector_route_info(&self) -> Option<RouteInfo>` where `RouteInfo` mirrors Go's
+`appctype.RouteInfo`: `control: Vec<IpNet>` (routes from the policy's `routes` field), `domains:
+BTreeMap<String, Vec<IpAddr>>` (addresses learned per domain), `wildcards: Vec<String>` (the
+observed suffixes). `None` when the node is not advertising the role, so the caller can tell "not a
+connector" from "a connector that has learned nothing", which are different answers. The routes
+themselves should keep flowing through the existing advertised-route path rather than a second one.
+
+Split it if that is easier to land: the accessor is useless without the learning, but the *learning*
+alone is already the feature — a node that actually connects. The readback is how an operator
+confirms it.
+
+**Daemon impact once landed:** an `AppcRouteInfo` LocalAPI verb (read-only, the shape of
+`GetPrefs`) → `Device::app_connector_route_info`, consumed by `tnet appc-routes`. The CLI is already
+ported and its flag surface is settled: `appc_routes_shape` in `src/bin/tnet.rs` resolves Go's
+`-n` > `--map` > `--all` > summary precedence, and `appc_routes_output` answers the two prefs-only
+shapes today (Go's `not a connector`, and `-n`'s advertised-route count) while the other three
+return `appc_routes_refusal` — replace that arm with the three renderers ported from Go's
+`getAllOutput` / `getSummarizeLearnedOutput` and the command is complete. Until then
+`--advertise-connector` documents the limit at every place it appears (`tnet up`/`set --help`,
+`Prefs::advertise_app_connector`, README). Tracked in daemon bead tsd-ree961df. — engine lane

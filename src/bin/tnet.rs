@@ -187,7 +187,11 @@ enum Command {
         /// Advertise this node as an app connector (Go `tailscale up --advertise-connector`). This
         /// reaches the control plane (`Hostinfo.AppConnector`) at registration and on every map
         /// poll. It advertises the ROLE only — this build implements no app-connector data path, so
-        /// the node serves no connector traffic. Mutually exclusive with `--no-advertise-connector`;
+        /// the node serves no connector traffic and never LEARNS a route: control-pushed connector
+        /// domains are not observed, no DNS lookup is watched, and nothing is added to
+        /// `--advertise-routes`. `tnet appc-routes` therefore reports the count of routes you set
+        /// yourself and refuses the learned-route shapes, rather than reporting an empty map.
+        /// Mutually exclusive with `--no-advertise-connector`;
         /// omitting both leaves the setting unchanged.
         #[arg(long, conflicts_with = "no_advertise_connector")]
         advertise_connector: bool,
@@ -397,7 +401,9 @@ enum Command {
         /// Advertise this node as an app connector (Go `tailscale set --advertise-connector`). This
         /// reaches the control plane (`Hostinfo.AppConnector`), which is a construction-time engine
         /// setting — so on a RUNNING node this rebuilds the device (a brief reconnect). It advertises
-        /// the ROLE only; this build implements no app-connector data path. Mutually exclusive with
+        /// the ROLE only; this build implements no app-connector data path, so the node never learns
+        /// a route for a connector domain and `tnet appc-routes` has only the routes you set yourself
+        /// to report. Mutually exclusive with
         /// `--no-advertise-connector`; omitting both leaves the setting unchanged.
         #[arg(long, conflicts_with = "no_advertise_connector")]
         advertise_connector: bool,
@@ -1006,6 +1012,34 @@ enum Command {
     ExitNode {
         #[command(subcommand)]
         cmd: ExitNodeCmd,
+    },
+    /// Print the app connector's route status (Go `tailscale appc-routes`). With no flag Go prints
+    /// each configured domain and how many routes it has learned for it; `--map` prints the learned
+    /// domain-to-routes map as JSON, `--all` adds the routes set in the policy's app-connector
+    /// `routes` field, and `-n` prints the total number of routes this node advertises. The three
+    /// flags are not mutually exclusive, as in Go: `-n` wins over `--map`, which wins over `--all`.
+    ///
+    /// This fork answers the two shapes Go reads out of prefs alone — a node that is not advertising
+    /// prints Go's `not a connector`, and `-n` prints the advertised-route count. The other three
+    /// need the learned domain-to-route store behind Go's `appc-route-info` LocalAPI verb, which is
+    /// part of the app-connector DATA path (control-pushed domains, the DNS observation that learns
+    /// each domain's addresses, the 4via6 mapping) that neither this daemon nor the `tailscale-rs`
+    /// engine implements — see `docs/ENGINE_ASKS.md` ask #39. Those three refuse with that reason
+    /// rather than print an empty result, which would read as "this connector has learned nothing
+    /// yet" — a different, and false, claim.
+    #[command(name = "appc-routes")]
+    AppcRoutes {
+        /// Print the learned domains and routes, and the extra routes configured in the policy's
+        /// app-connector `routes` field (Go `appc-routes --all`).
+        #[arg(long)]
+        all: bool,
+        /// Print the map of learned domains to their routes, as JSON (Go `appc-routes --map`).
+        #[arg(long)]
+        map: bool,
+        /// Print the total number of routes this node advertises — learned, set in the policy, or
+        /// set locally (Go `appc-routes -n`). Single-dash only, the way Go spells it.
+        #[arg(short = 'n')]
+        n: bool,
     },
     /// Diagnose the system policy / MDM configuration (Go `tailscale syspolicy`). `list` prints the
     /// effective policy; `reload` forces a re-read first. On Linux/Unix no policy store is registered
@@ -2962,6 +2996,10 @@ async fn main() -> Result<()> {
         Command::ExitNode {
             cmd: ExitNodeCmd::Suggest,
         } => run_exit_node_suggest(&socket).await,
+        // `appc-routes` (Go `tailscale appc-routes`): read-only and prefs-only. Two of Go's four
+        // output shapes need nothing but prefs and are answered faithfully; the three that read the
+        // learned-route store say why they cannot — see `appc_routes_refusal`.
+        Command::AppcRoutes { all, map, n } => run_appc_routes(&socket, all, map, n).await,
         // `syspolicy list`/`reload` (Go `tailscale syspolicy`): fetch + render the effective policy.
         Command::Syspolicy {
             cmd: SyspolicyCmd::List { json },
@@ -5242,6 +5280,124 @@ async fn run_get(
         }
     }
     Ok(())
+}
+
+/// Which of `appc-routes`' four output shapes the flags select.
+///
+/// Go's `runAppcRoutesInfo` (`cmd/tailscale/cli/appcroutes.go`) does not make `--all`, `--map` and
+/// `-n` mutually exclusive — it tests them in that reverse order and the first match returns, so
+/// `-n` beats `--map` beats `--all`, and passing none of them is the summary. This enum is that
+/// if-chain, named; the port keeps the precedence rather than inventing a `conflicts_with` Go has
+/// no equivalent of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppcRoutesShape {
+    /// `-n`: how many routes this node advertises.
+    Count,
+    /// `--map`: the learned domain-to-routes map, as JSON.
+    DomainMap,
+    /// `--all`: the learned routes, then the routes configured in the policy.
+    All,
+    /// No flag: one line per configured domain with its learned-route count.
+    Summary,
+}
+
+/// Resolve Go's `appc-routes` flag precedence. See [`AppcRoutesShape`].
+fn appc_routes_shape(all: bool, map: bool, n: bool) -> AppcRoutesShape {
+    if n {
+        AppcRoutesShape::Count
+    } else if map {
+        AppcRoutesShape::DomainMap
+    } else if all {
+        AppcRoutesShape::All
+    } else {
+        AppcRoutesShape::Summary
+    }
+}
+
+/// What each shape would have printed, phrased for a refusal that names what was *asked for* and
+/// not only what is missing — so `--map` and `--all` are distinguishable in the error.
+fn appc_routes_shape_wanted(shape: AppcRoutesShape) -> &'static str {
+    match shape {
+        AppcRoutesShape::Count => "the advertised-route count",
+        AppcRoutesShape::DomainMap => "the learned domain-to-routes map (`--map`)",
+        AppcRoutesShape::All => "the learned routes and the routes from policy (`--all`)",
+        AppcRoutesShape::Summary => "the learned-route count per configured domain",
+    }
+}
+
+/// Why the three learned-route shapes of `appc-routes` refuse, in the shape of this fork's other
+/// honest refusals ([`sysext_refusal`], [`mac_vpn_refusal`]): Go's `unsupported command:` opening,
+/// then the real reason, then what this fork does answer.
+///
+/// The reason is a genuine reduction, not a stub. `--advertise-connector` advertises the connector
+/// ROLE to control (`Hostinfo.AppConnector`) and that half is real; what is absent is the connector
+/// DATA path that would populate Go's `appctype.RouteInfo` — the control-pushed domain list, the
+/// per-domain DNS observation that learns target addresses, and the 4via6 domain-to-route mapping.
+/// Neither this daemon nor the pinned `tailscale-rs` engine implements any of it, so there is no
+/// store behind an `appc-route-info` verb to expose. Printing an empty map instead would be read as
+/// "this connector has learned nothing yet", which is a different and false claim — hence an error.
+fn appc_routes_refusal(shape: AppcRoutesShape) -> String {
+    format!(
+        "appc-routes: unsupported command: this node can advertise the app-connector ROLE \
+         (`--advertise-connector`, which control sees as `Hostinfo.AppConnector`) but implements no \
+         app-connector data path — no control-pushed connector domains, no per-domain DNS \
+         observation, no 4via6 domain-to-route mapping — so nothing ever learns a route and there is \
+         no store to print {wanted} from. Go reads one over its `appc-route-info` LocalAPI verb; the \
+         `tailscale-rs` engine neither learns nor persists app-connector routes (docs/ENGINE_ASKS.md \
+         ask #39), and printing an empty result here would read as \"this connector has learned \
+         nothing yet\", which is not what is true. `tnet appc-routes -n` still reports how many \
+         routes this node advertises, and `tnet get advertise-routes` lists them.",
+        wanted = appc_routes_shape_wanted(shape)
+    )
+}
+
+/// The `appc-routes` output for these prefs and shape: `Ok(the text to print)`, or `Err(the reason
+/// this fork cannot answer)`.
+///
+/// Ported from Go's `runAppcRoutesInfo` (`cmd/tailscale/cli/appcroutes.go`), whose order this keeps:
+/// the not-a-connector answer comes before `-n`, and `-n` before anything that reads the route-info
+/// store. Both of those read prefs alone, so both are faithful here; the three that need the store
+/// refuse — see [`appc_routes_refusal`].
+fn appc_routes_output(
+    view: &tailscaled_rs::localapi::PrefsView,
+    shape: AppcRoutesShape,
+) -> Result<String, String> {
+    if !view.advertise_connector {
+        // Go prints exactly this and exits 0 — "not advertising" is an answer, not a failure, and
+        // it is checked before any flag (so `-n` on a non-connector says this too).
+        return Ok("not a connector".to_string());
+    }
+    match shape {
+        // Go prints `len(prefs.AdvertiseRoutes)`. In Go that count also covers routes the connector
+        // learned, because learning appends them to this same pref; here nothing appends, so it is
+        // the count of the routes the operator set. Same field, same meaning, fewer sources.
+        AppcRoutesShape::Count => Ok(view.advertise_routes.len().to_string()),
+        needs_store => Err(appc_routes_refusal(needs_store)),
+    }
+}
+
+/// `appc-routes` (Go `tailscale appc-routes`): round-trip `GetPrefs`, then render the shape the
+/// flags selected. Read-only. Inline like `get`, because the flags shape the output and are not part
+/// of the wire request.
+async fn run_appc_routes(socket: &std::path::Path, all: bool, map: bool, n: bool) -> Result<()> {
+    let view = match round_trip(socket, &Request::GetPrefs).await {
+        Ok(Response::Prefs(v)) => v,
+        Ok(Response::Error { message }) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        Ok(other) => anyhow::bail!("unexpected response to appc-routes request: {other:?}"),
+        Err(e) => {
+            return Err(e).with_context(|| format!("getting prefs at {}", socket.display()));
+        }
+    };
+    match appc_routes_output(&view, appc_routes_shape(all, map, n)) {
+        Ok(out) => {
+            println!("{out}");
+            Ok(())
+        }
+        Err(reason) => Err(anyhow!(reason)),
+    }
 }
 
 /// `whoami` (Go `tailscale whoami`): resolve this node's own identity — Status to learn the self
@@ -22267,6 +22423,145 @@ users:
             Cli::try_parse_from(["tnet", "status", "--web", "--browser", "--no-browser"]).is_err(),
             "--browser and --no-browser are the same knob; asking for both is a usage error"
         );
+    }
+
+    /// Go's `appc-routes` flags are not mutually exclusive — `runAppcRoutesInfo` tests `-n`, then
+    /// `--map`, then `--all`, and the first match returns. The port must keep that precedence, not
+    /// invent a usage refusal Go does not have.
+    #[test]
+    fn appc_routes_flag_precedence_matches_go() {
+        assert_eq!(
+            appc_routes_shape(false, false, false),
+            AppcRoutesShape::Summary,
+            "no flag is Go's per-domain summary"
+        );
+        assert_eq!(appc_routes_shape(true, false, false), AppcRoutesShape::All);
+        assert_eq!(
+            appc_routes_shape(false, true, false),
+            AppcRoutesShape::DomainMap
+        );
+        assert_eq!(
+            appc_routes_shape(false, false, true),
+            AppcRoutesShape::Count
+        );
+        // `-n` wins over everything, and `--map` wins over `--all`.
+        assert_eq!(appc_routes_shape(true, true, true), AppcRoutesShape::Count);
+        assert_eq!(appc_routes_shape(false, true, true), AppcRoutesShape::Count);
+        assert_eq!(appc_routes_shape(true, false, true), AppcRoutesShape::Count);
+        assert_eq!(
+            appc_routes_shape(true, true, false),
+            AppcRoutesShape::DomainMap
+        );
+    }
+
+    /// The two shapes Go answers from prefs alone are answered here too; the three that read the
+    /// learned-route store refuse, because this fork has no such store to read.
+    #[test]
+    fn appc_routes_output_answers_what_prefs_can() {
+        use tailscaled_rs::localapi::PrefsView;
+
+        const EVERY_SHAPE: [AppcRoutesShape; 4] = [
+            AppcRoutesShape::Summary,
+            AppcRoutesShape::All,
+            AppcRoutesShape::DomainMap,
+            AppcRoutesShape::Count,
+        ];
+
+        // Not advertising: Go prints `not a connector` and exits 0. That check precedes every flag,
+        // so it is the answer for all four shapes — `-n` included.
+        let off = PrefsView {
+            advertise_connector: false,
+            advertise_routes: vec!["192.0.2.0/24".to_string()],
+            ..Default::default()
+        };
+        for shape in EVERY_SHAPE {
+            assert_eq!(
+                appc_routes_output(&off, shape)
+                    .expect("not-a-connector is an answer, not a failure"),
+                "not a connector",
+                "{shape:?} on a non-connector must be Go's one-line answer"
+            );
+        }
+
+        // Advertising + `-n`: Go's `len(prefs.AdvertiseRoutes)`, which this fork holds.
+        let on = PrefsView {
+            advertise_connector: true,
+            advertise_routes: vec![
+                "192.0.2.0/24".to_string(),
+                "198.51.100.0/24".to_string(),
+                "203.0.113.128/25".to_string(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            appc_routes_output(&on, AppcRoutesShape::Count).expect("`-n` reads prefs only"),
+            "3"
+        );
+        let bare = PrefsView {
+            advertise_connector: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            appc_routes_output(&bare, AppcRoutesShape::Count)
+                .expect("a connector advertising nothing is still a connector"),
+            "0"
+        );
+
+        // The three learned-route shapes refuse, each naming the shape it was asked for so `--map`
+        // and `--all` are distinguishable, and each pointing at the ask and at what does work.
+        for (shape, names) in [
+            (AppcRoutesShape::Summary, "per configured domain"),
+            (AppcRoutesShape::All, "`--all`"),
+            (AppcRoutesShape::DomainMap, "`--map`"),
+        ] {
+            let reason = appc_routes_output(&on, shape)
+                .expect_err("there is no learned-route store to read");
+            assert!(
+                reason.starts_with("appc-routes: unsupported command:"),
+                "Go's refusal opening must survive the port: {reason}"
+            );
+            assert!(
+                reason.contains(names),
+                "the refusal must name the shape asked for: {reason}"
+            );
+            assert!(
+                reason.contains("appc-route-info"),
+                "it must name the verb Go reads: {reason}"
+            );
+            assert!(
+                reason.contains("docs/ENGINE_ASKS.md ask #39"),
+                "it must cite the engine ask: {reason}"
+            );
+            assert!(
+                reason.contains("tnet appc-routes -n"),
+                "it must point at what this fork does answer: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn appc_routes_command_line_parses() {
+        match Cli::try_parse_from(["tnet", "appc-routes"])
+            .expect("parses")
+            .command
+        {
+            Command::AppcRoutes { all, map, n } => {
+                assert!(!all && !map && !n, "no flag is Go's summary shape");
+            }
+            _ => panic!("expected Command::AppcRoutes"),
+        }
+        // All three at once parses, because Go's do — precedence, not exclusion, decides.
+        match Cli::try_parse_from(["tnet", "appc-routes", "--all", "--map", "-n"])
+            .expect("Go's appc-routes flags are not mutually exclusive")
+            .command
+        {
+            Command::AppcRoutes { all, map, n } => assert!(all && map && n),
+            _ => panic!("expected Command::AppcRoutes"),
+        }
+        // Go spells the count flag single-dash; `--n` is not one of its long flags, nor ours.
+        assert!(Cli::try_parse_from(["tnet", "appc-routes", "--n"]).is_err());
+        // And a flag Go's `appc-routes` does not have stays unrecognised rather than ignored.
+        assert!(Cli::try_parse_from(["tnet", "appc-routes", "--json"]).is_err());
     }
 
     /// `docs/ENGINE_ASKS.md` §21 is an ask filed against an OLD engine pin, and eight of the flags
