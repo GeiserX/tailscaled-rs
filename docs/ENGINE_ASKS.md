@@ -1521,3 +1521,62 @@ until the first probe is enough to make both commands faithful.
 flag already parses today and is refused at runtime with a message naming this gap
 (`check_exit_node_suggest_flags` in `src/bin/tnet.rs`), so the same command line keeps working the day
 this lands. Consumed via a pin bump. Tracked in daemon bead tsd-reb30066. — daemon lane
+
+## 41. A client audit-log submission to control — so `logout --reason` / `down --reason` reach the tailnet
+
+**Why:** Upstream's `--reason` exists to satisfy a tailnet policy that requires a justification, and
+that policy is enforced on the **control plane**, not on the node. `runLogout`
+(`cmd/tailscale/cli/logout.go` @ `53a0d659afa51835dd7a9283873cca44261454f8`) does
+`ctx = apitype.RequestReasonKey.WithValue(ctx, logoutArgs.reason)` before `localClient.Logout(ctx)`;
+`apitype.RequestReasonKey` is the context key for the `X-Tailscale-Reason` LocalAPI header
+(`client/tailscale/apitype`), which tailscaled reads back onto the acting identity
+(`ipnauth.WithRequestReason`). The reason is then consumed by
+`actor.CheckProfileAccess(profile, ipnauth.Disconnect, auditLogFn)` — the check that can *refuse* the
+disconnect outright when a policy demands a justification — and the accompanying
+`AuditLogFunc(action tailcfg.ClientAuditAction, details string)` hands it to `ipn/auditlog`, which
+persists a `{Action, Details, TimeStamp}` transaction and retries it to control through
+`Transport.SendAuditLog(ctx, tailcfg.AuditLogRequest)`. `tailscale down --reason` takes the same
+route via the prefs edit.
+
+Verified against pin `9d847a6e`/v0.43.0: the engine has **no audit-log path to control** — no
+`AuditLogRequest` analogue, no client-audit endpoint on the control client, and no reason parameter
+anywhere near a state change: `Device::logout()` (`src/lib.rs`) takes no arguments and is implemented
+as a backdated `/machine/register` (`ts_control/src/tokio/logout.rs`), which carries a node key and an
+expiry and nothing else. The only `audit` strings in the tree are the netmap's
+`DataPlaneAuditLogID` fields, which are about data-plane logging, not client actions.
+
+**Why not a daemon-side facsimile.** The daemon already accepts the flag and writes the reason to its
+own log before the attempt, which is the honest half it can do alone: a local record, next to the
+event it explains. What it cannot do is the half that made the flag exist — put the justification
+where the tailnet's policy reads it. Nothing on this side of the LocalAPI can reach control except
+through the engine, so a "reason" that stops at the daemon can never satisfy a policy that requires
+one. Written down here rather than papered over.
+
+**Ask (either shape works):**
+
+1. A reason on the state changes that carry one in Go:
+
+```rust
+/// Log out, attaching the operator's justification for control's audit trail
+/// (Go `apitype.RequestReasonKey` → `tailcfg.AuditLogRequest`). `None` = today's behaviour.
+pub async fn logout_with_reason(&self, reason: Option<&str>) -> Result<(), ts_control::LogoutError>;
+```
+
+2. Or the general form, which also covers `down` and any later action Go audits:
+
+```rust
+pub enum ClientAuditAction { Disconnect, /* Go's `tailcfg.ClientAuditAction` set */ }
+
+/// Submit one client audit entry to control (Go `auditlog.Transport::SendAuditLog`).
+pub async fn send_audit_log(&self, action: ClientAuditAction, details: &str) -> Result<(), Error>;
+```
+
+Go's own logger persists and retries these because an audit entry must not be lost when control is
+briefly unreachable; whether that durability ships with the first cut is the engine's call — a
+best-effort submit is already the difference between a reason that leaves the node and one that does
+not.
+
+**Daemon impact once landed:** `tnet logout --reason` and `tnet down --reason` keep their existing
+command lines and stop being local-only — the daemon passes the reason it already receives to the
+engine instead of only logging it, and the "recorded locally, not forwarded to control" scope note on
+both flags (`src/bin/tnet.rs`, `src/server.rs`) goes away. Consumed via a pin bump. — daemon lane
