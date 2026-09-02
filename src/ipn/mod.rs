@@ -125,22 +125,44 @@ async fn link_monitor_loop(device: std::sync::Arc<tailscale::Device>) {
     }
 }
 
+/// The captive-portal trigger, as a pure decision — extracted from
+/// [`Backend::connectivity_impacted`] so the "which state does this run in" question is testable
+/// without a live engine (the same split [`derive_state_from`] gets).
+///
+/// `state` is the node's current [`State`]; `derp_home` is whether the engine's net report names a
+/// reachable DERP region. Impacted means Go's pair: the loop is alive (upstream runs it **only**
+/// between entering and leaving `ipn.Running`) *and* something that impacts connectivity is unhealthy
+/// (here: no relay is reachable — Go's `no-derp-home`).
+fn connectivity_impacted_from(state: State, derp_home: bool) -> bool {
+    state == State::Running && !derp_home
+}
+
 /// The captive-portal detection loop — Go `ipn/ipnlocal/captiveportal.go`, its
 /// `checkCaptivePortalLoop` and `performCaptiveDetection`: notice when this node is stuck behind an
 /// airport/hotel Wi-Fi login page, and say so, instead of leaving the operator with an opaque
 /// "cannot reach control".
 ///
-/// Runs for the daemon's whole life — NOT bound to a device like [`link_monitor_loop`], because the
-/// interesting case is precisely the one where no device came up. Never returns.
+/// The task runs for the daemon's whole life, but it is **inert outside `Running`**: the gate below
+/// is false in every other state, which is how this fork expresses Go's loop *lifetime*. Upstream
+/// spawns `checkCaptivePortalLoop` when the backend enters `ipn.Running` and cancels its context on
+/// the way out (`ipn/ipnlocal/local.go`, `enterStateLocked`); a poll whose gate is false is the same
+/// thing without a task per state edge. Never returns.
 ///
 /// ## The trigger
 ///
 /// Detection is not periodic background chatter: it runs only while
-/// [`connectivity_impacted`](Backend::connectivity_impacted) holds (the operator wants the node up and
-/// it is not up) and [`should_run_captive_portal_detection`](Backend::should_run_captive_portal_detection)
-/// allows it. A `Running` node and a deliberately-`down` node both probe **zero** times. The first
-/// pass waits Go's [`DETECTION_INTERVAL`](captive::DETECTION_INTERVAL) so a blip during a normal
-/// bring-up cannot fire one.
+/// [`connectivity_impacted`](Backend::connectivity_impacted) holds — the node is `Running` and has no
+/// reachable relay (Go's `no-derp-home`) — and
+/// [`should_run_captive_portal_detection`](Backend::should_run_captive_portal_detection) allows it
+/// (the operator wants the node up). A healthy `Running` node, a node still coming up, and a
+/// deliberately-`down` node all probe **zero** times.
+///
+/// The first pass of an episode waits
+/// [`NO_DERP_HOME_TIME_TO_VISIBLE`](captive::NO_DERP_HOME_TIME_TO_VISIBLE) +
+/// [`DETECTION_INTERVAL`](captive::DETECTION_INTERVAL): upstream's health tracker only makes
+/// `no-derp-home` visible after the former, and its captive loop then spends the latter on its timer
+/// before probing. The sum is why a node whose first DERP measurement is merely still in flight does
+/// not probe on every bring-up.
 ///
 /// While connectivity stays impacted the pass repeats every
 /// [`RECHECK_INTERVAL`](captive::RECHECK_INTERVAL). Go instead re-arms its 2s timer off health-tracker
@@ -169,7 +191,8 @@ pub async fn captive_portal_loop(backend: std::sync::Arc<tokio::sync::Mutex<Back
         // acquisition. Never hold it across the probe below.
         let impacted = {
             let mut be = backend.lock().await;
-            let impacted = be.should_run_captive_portal_detection() && be.connectivity_impacted();
+            let impacted =
+                be.should_run_captive_portal_detection() && be.connectivity_impacted().await;
             if !impacted {
                 // Go's healthy branch: connectivity is fine, so we know for sure there is no portal
                 // in the way — drop any warning. `set_captive_portal_detected` is a no-op (and
@@ -188,8 +211,13 @@ pub async fn captive_portal_loop(backend: std::sync::Arc<tokio::sync::Mutex<Back
 
         let since = *impacted_since.get_or_insert_with(tokio::time::Instant::now);
         let due = match last_run {
-            // First pass of this episode: Go's 2s settle time.
-            None => since.elapsed() >= captive::DETECTION_INTERVAL,
+            // First pass of this episode: the settle time Go spends before its first probe —
+            // `no-derp-home`'s `TimeToVisible` (the health tracker's), then the captive loop's own
+            // `captivePortalDetectionInterval` on top.
+            None => {
+                since.elapsed()
+                    >= captive::NO_DERP_HOME_TIME_TO_VISIBLE + captive::DETECTION_INTERVAL
+            }
             // Still impacted after a pass: re-probe on the backoff.
             Some(ran) => ran.elapsed() >= captive::RECHECK_INTERVAL,
         };
@@ -204,10 +232,11 @@ pub async fn captive_portal_loop(backend: std::sync::Arc<tokio::sync::Mutex<Back
         // this is the one call site that changes.
         let found = captive::detect(&[], None).await;
 
-        // Re-read the gate under the lock before recording: the node may have converged to `Running`
-        // while we were probing, in which case Go's healthy branch owns the verdict, not a stale one.
+        // Re-read the gate under the lock before recording: the node may have found a relay (or left
+        // `Running` altogether) while we were probing, in which case Go's healthy branch owns the
+        // verdict, not a stale one.
         let mut be = backend.lock().await;
-        if be.should_run_captive_portal_detection() && be.connectivity_impacted() {
+        if be.should_run_captive_portal_detection() && be.connectivity_impacted().await {
             be.set_captive_portal_detected(found);
         } else {
             be.set_captive_portal_detected(false);
@@ -3427,22 +3456,66 @@ impl Backend {
     /// Whether this node's connectivity is impacted — the condition that makes a captive portal worth
     /// probing for.
     ///
-    /// This is the fork's stand-in for Go's trigger. Go watches its health tracker and probes when any
-    /// warnable with `ImpactsConnectivity` is unhealthy (`captivePortalHealthChange`). This daemon has
-    /// no health tracker, so the equivalent signal is read straight off the state machine: the
-    /// operator wants the node up, and it is not up. That is exactly the situation a portal produces —
-    /// registration and map-poll attempts failing against a network that answers everything — and it
-    /// excludes both a healthy `Running` node and a deliberately-`down` one, neither of which Go would
-    /// probe on either.
-    fn connectivity_impacted(&self) -> bool {
+    /// This is the fork's stand-in for Go's trigger, and it runs in the state Go runs it in:
+    /// **`Running`**. Upstream starts `checkCaptivePortalLoop` on the transition *into* `ipn.Running`
+    /// and cancels it on the way out (`ipn/ipnlocal/local.go`, `enterStateLocked`), then probes only
+    /// while the health tracker reports some *other* `ImpactsConnectivity` warnable unhealthy
+    /// (`captivePortalHealthChange`). So the node upstream probes is the connected one that has lost
+    /// its path — the ordinary hotel-Wi-Fi case, where a portal appears mid-session — and nothing
+    /// else.
+    ///
+    /// This daemon has no health tracker, so the "some warnable impacts connectivity" half is read off
+    /// the one connectivity fact the engine does publish: the net-report
+    /// ([`netcheck`](tailscale::Device::netcheck)) has no reachable DERP region. That is precisely
+    /// what Go turns into `no-derp-home` (`health/warnings.go`: *"Tailscale could not connect to any
+    /// relay server"*, `ImpactsConnectivity: true`) — the warnable that actually fires when a portal
+    /// swallows a live node's traffic, since the portal answers the DERP connections instead of the
+    /// relay. The daemon's own state machine cannot supply this: the engine keeps publishing
+    /// `DeviceState::Running` once its netmap stream has attached, so a mid-session portal never
+    /// shows up as a state change.
+    ///
+    /// Deliberately **not** impacted:
+    /// - a node that is `Starting`/`NeedsLogin`/`Stopped`/`NoState` — upstream's loop is cancelled
+    ///   outside `Running`, so a node still coming up probes zero times;
+    /// - a `Running` node with a home relay — Go's healthy branch;
+    /// - a deliberately-`down` node (`want_running == false`), which
+    ///   [`should_run_captive_portal_detection`](Backend::should_run_captive_portal_detection)
+    ///   already excludes.
+    ///
+    /// The net-report read is an engine actor round-trip made under the backend lock, so it is
+    /// bounded by [`STATUS_QUERY_TIMEOUT`] exactly like [`status`](Backend::status)'s netmap query,
+    /// and is only ever issued in `Running` (where the control runner is past its auth loop and
+    /// answers its mailbox). A timeout or engine error reports *not* impacted: an unreadable signal is
+    /// not evidence of a broken path, and the next tick asks again.
+    async fn connectivity_impacted(&self) -> bool {
         if !self.prefs.want_running {
             return false;
         }
         let state = match self.device.as_ref() {
             Some(dev) => state_from_device(dev.device_state()).0,
+            // No engine at all: not `Running`, so upstream's loop would not be alive here.
             None => self.derive_state(false),
         };
-        state != State::Running
+        // Ask the engine only in `Running` — the one state where the answer can change the verdict,
+        // and the one state where the control runner is past its auth-retry loop and answering its
+        // mailbox (see `status`'s note on why it does the same).
+        let derp_home = match (state, self.device.as_ref()) {
+            (State::Running, Some(dev)) => {
+                match tokio::time::timeout(STATUS_QUERY_TIMEOUT, dev.netcheck()).await {
+                    Ok(Ok(report)) => report.preferred_derp.is_some(),
+                    Ok(Err(e)) => {
+                        tracing::debug!(error = %e, "captive: no net report; not probing this tick");
+                        true
+                    }
+                    Err(_) => {
+                        tracing::debug!("captive: net report timed out; not probing this tick");
+                        true
+                    }
+                }
+            }
+            _ => true,
+        };
+        connectivity_impacted_from(state, derp_home)
     }
 
     /// Record the verdict of a captive-portal detection pass (Go's
@@ -4293,8 +4366,8 @@ mod tests {
 
     // --- captive-portal detection (tsd-iqq.5) -----------------------------------------------------
 
-    #[test]
-    fn captive_detection_is_gated_on_wanting_to_be_up() {
+    #[tokio::test]
+    async fn captive_detection_is_gated_on_wanting_to_be_up() {
         // Go `shouldRunCaptivePortalDetection`: detection only ever runs for a node the operator
         // actually wants connected. A `down` node must probe nothing at all.
         let dir =
@@ -4307,7 +4380,7 @@ mod tests {
             "a node that does not want to be running must never probe"
         );
         assert!(
-            !be.connectivity_impacted(),
+            !be.connectivity_impacted().await,
             "a deliberately-down node is not 'impacted'; it is doing what was asked"
         );
 
@@ -4316,10 +4389,41 @@ mod tests {
     }
 
     #[test]
-    fn connectivity_is_impacted_when_the_node_wants_up_but_has_no_engine() {
-        // The fork's stand-in for Go's health-tracker trigger: want-running and not Running. A
-        // device-less backend with want_running set is exactly the "up was asked for and did not
-        // land" case a captive portal produces.
+    fn captive_detection_triggers_in_the_state_go_triggers_it_in() {
+        // Go starts `checkCaptivePortalLoop` on entry to `ipn.Running` and cancels it on the way out
+        // (`ipn/ipnlocal/local.go`, `enterStateLocked`), then probes only while a warnable that
+        // impacts connectivity is unhealthy — here, no reachable relay (`no-derp-home`). So the one
+        // node that probes is the connected one that lost its path.
+        assert!(
+            connectivity_impacted_from(State::Running, false),
+            "a Running node with no reachable relay is exactly what Go probes: a portal appeared \
+             under a live session"
+        );
+        assert!(
+            !connectivity_impacted_from(State::Running, true),
+            "a Running node that reaches a relay is healthy; Go's healthy branch clears the warning"
+        );
+        for state in [
+            State::NoState,
+            State::NeedsLogin,
+            State::NeedsMachineAuth,
+            State::InUseOtherUser,
+            State::Starting,
+            State::Stopped,
+        ] {
+            assert!(
+                !connectivity_impacted_from(state, false),
+                "{}: upstream's loop is cancelled outside Running, so this state probes zero times",
+                state.as_str()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_node_that_never_came_up_does_not_probe() {
+        // The inverse of the case above, and the one this fork used to get backwards: a node whose
+        // engine is not up is NOT the node Go probes. Upstream's loop only exists between entering
+        // and leaving `ipn.Running`, so `Starting`/`NeedsLogin` must make no requests at all.
         let dir =
             std::env::temp_dir().join(format!("tailnetd-captive-trigger-{}", std::process::id()));
         let mut be = backend_for(&dir);
@@ -4331,8 +4435,8 @@ mod tests {
             "no device installed, so the node cannot be Running"
         );
         assert!(
-            be.connectivity_impacted(),
-            "want-running with no live engine is the condition worth probing for a portal"
+            !be.connectivity_impacted().await,
+            "a node still coming up is not the node upstream probes"
         );
     }
 
