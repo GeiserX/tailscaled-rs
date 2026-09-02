@@ -516,8 +516,21 @@ pub enum Request {
         /// Destination TCP port.
         port: u16,
     },
-    /// Bring the node down (`WantRunning = false`) without logging out.
-    Down,
+    /// Bring the node down (`WantRunning = false`) without logging out. A WRITE — gated like
+    /// `up`/`logout`.
+    Down {
+        /// The operator's justification for the disconnect (Go `tailscale down --reason`, which
+        /// travels as the base64 `X-Tailscale-Reason` LocalAPI header on the prefs edit). `None`
+        /// when the flag was omitted — which is also what an older client sending the bare
+        /// `{"cmd":"down"}` deserializes to.
+        ///
+        /// Same HONEST SCOPE as [`Logout::reason`](Request::Logout): this fork registers no policy
+        /// store that could *require* a justification and the engine has no audit-log transport to
+        /// control, so the daemon records the reason in its own log alongside the disconnect and
+        /// nothing else consumes it. It is not forwarded to the control plane.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     /// Log the node out (the analogue of Go's `tailscale logout`): deregister the node key with the
     /// control plane, tear the datapath down, and **discard the persisted node key** so the next
     /// `up` re-registers fresh (a new login) rather than resuming the old registration. This is
@@ -2156,9 +2169,32 @@ mod tests {
     #[test]
     fn request_down_wire_format() {
         assert_eq!(
-            serde_json::to_string(&Request::Down).unwrap(),
-            r#"{"cmd":"down"}"#
+            serde_json::to_string(&Request::Down { reason: None }).unwrap(),
+            r#"{"cmd":"down"}"#,
+            "no reason must serialize to the historical bare form"
         );
+        // `tnet down --reason "<text>"` (Go `tailscale down --reason`): the justification travels to
+        // the daemon verbatim, exactly as `logout --reason` does, and the bare `{"cmd":"down"}` an
+        // older client sends must still parse.
+        let json = serde_json::to_string(&Request::Down {
+            reason: Some("scheduled maintenance".into()),
+        })
+        .unwrap();
+        assert!(
+            json.contains(r#""cmd":"down""#)
+                && json.contains(r#""reason":"scheduled maintenance""#),
+            "{json}"
+        );
+        match serde_json::from_str::<Request>(&json).unwrap() {
+            Request::Down { reason } => {
+                assert_eq!(reason.as_deref(), Some("scheduled maintenance"))
+            }
+            other => panic!("expected Down, got {other:?}"),
+        }
+        match serde_json::from_str::<Request>(r#"{"cmd":"down"}"#).unwrap() {
+            Request::Down { reason } => assert_eq!(reason, None),
+            other => panic!("expected Down, got {other:?}"),
+        }
     }
 
     #[test]

@@ -174,7 +174,7 @@ pub(crate) fn requires_write(request: &crate::localapi::Request) -> bool {
         // and `FileGet` consumes/deletes an inbound file, so both mutate and gate like `up`/`down`.
         Request::Up { .. }
         | Request::Set { .. }
-        | Request::Down
+        | Request::Down { .. }
         | Request::Logout { .. }
         | Request::SwitchProfile { .. }
         | Request::DeleteProfile { .. }
@@ -350,7 +350,7 @@ mod tests {
     #[test]
     fn requires_write_classifies_commands() {
         assert!(!requires_write(&Request::Status));
-        assert!(requires_write(&Request::Down));
+        assert!(requires_write(&Request::Down { reason: None }));
         assert!(
             requires_write(&Request::Logout { reason: None }),
             "logout deregisters + wipes the key — a write, gated like down"
@@ -559,7 +559,10 @@ mod tests {
     // flagged.
     #[test]
     fn read_only_caller_is_denied_writes() {
-        assert_eq!(authorize(&Request::Down, Access::ReadOnly), Err(Denied));
+        assert_eq!(
+            authorize(&Request::Down { reason: None }, Access::ReadOnly),
+            Err(Denied)
+        );
         assert_eq!(authorize(&up(), Access::ReadOnly), Err(Denied));
         assert_eq!(authorize(&set(), Access::ReadOnly), Err(Denied));
         // Taildrop transfers are writes: a read-only caller must be denied both.
@@ -577,7 +580,10 @@ mod tests {
     #[test]
     fn read_write_caller_may_do_everything() {
         assert_eq!(authorize(&Request::Status, Access::ReadWrite), Ok(()));
-        assert_eq!(authorize(&Request::Down, Access::ReadWrite), Ok(()));
+        assert_eq!(
+            authorize(&Request::Down { reason: None }, Access::ReadWrite),
+            Ok(())
+        );
         assert_eq!(authorize(&up(), Access::ReadWrite), Ok(()));
         assert_eq!(authorize(&set(), Access::ReadWrite), Ok(()));
         assert_eq!(authorize(&file_cp(), Access::ReadWrite), Ok(()));

@@ -447,7 +447,7 @@ async fn auth_gate_denies_write_allows_read() {
     // --- Deny-side, through the exact predicate `dispatch` calls before taking the backend lock. ---
     // A ReadOnly caller: the write verb is denied, the read verb is allowed. These are the real
     // `Request` values the daemon dispatches on (not stand-ins).
-    let write_req = Request::Down;
+    let write_req = Request::Down { reason: None };
     let read_req = Request::Status;
     assert_eq!(
         authorize(&write_req, Access::ReadOnly),
@@ -595,7 +595,7 @@ async fn wire_format_discriminants_are_stable() {
         "status request wire format drifted"
     );
     assert_eq!(
-        serde_json::to_string(&Request::Down).expect("serialize Down"),
+        serde_json::to_string(&Request::Down { reason: None }).expect("serialize Down"),
         r#"{"cmd":"down"}"#,
         "down request wire format drifted"
     );
@@ -615,7 +615,7 @@ async fn wire_format_discriminants_are_stable() {
         serde_json::from_str(r#"{"cmd":"status"}"#).expect("parse status request");
     assert!(matches!(parsed, Request::Status));
     let parsed: Request = serde_json::from_str(r#"{"cmd":"down"}"#).expect("parse down request");
-    assert!(matches!(parsed, Request::Down));
+    assert!(matches!(parsed, Request::Down { .. }));
 
     // The Taildrop verbs added this session — pin their `cmd` tags so a rename can't silently break
     // the CLI↔daemon contract. `file_targets` (read) is a unit variant; `file_get_dir` carries
