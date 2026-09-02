@@ -239,11 +239,14 @@ fn get_url(raw: &str) -> Result<()> {
     let parsed = url::Url::parse(&url).with_context(|| format!("parse URL {url:?}"))?;
     let (host, port) = host_port(&parsed)?;
 
-    // Go: `log.Printf("GetConn(%q)", hostPort)`.
+    // Go: `log.Printf("GetConn(%q)", hostPort)`. `host` keeps the brackets an IPv6 literal is
+    // written with, which is what Go's `net.JoinHostPort` puts in that hook's argument too.
     println!("GetConn(\"{host}:{port}\")");
-    println!("DNSStart: {{Host:{host}}}");
+    // The resolver half wants the address bare, and so does Go's `DNSStartInfo.Host`.
+    let lookup = lookup_host(&host);
+    println!("DNSStart: {{Host:{lookup}}}");
     let started = Instant::now();
-    match (host.as_str(), port).to_socket_addrs() {
+    match (lookup, port).to_socket_addrs() {
         Ok(addrs) => {
             let addrs: Vec<String> = addrs.map(|a| a.ip().to_string()).collect();
             println!(
@@ -310,6 +313,24 @@ fn host_port(url: &url::Url) -> Result<(String, u16)> {
         .with_context(|| format!("--get-url {url} has no host"))?
         .to_string();
     Ok((host, url.port().unwrap_or(default_port)))
+}
+
+/// The bare host to hand a resolver, stripped of the brackets an IPv6 literal is written with.
+///
+/// [`url::Url::host_str`] returns an IPv6 literal in its URL form — `[2001:db8::1]` — because that
+/// is how the host sits inside the URL, and that form is the right one for the `host:port` this
+/// command prints. It is wrong for a lookup: `ToSocketAddrs` for `(&str, u16)` parses a bare
+/// literal itself but hands anything else to the system resolver, which answers "nodename nor
+/// servname provided" for a bracketed one. `--get-url https://[2001:db8::1]/` therefore reported
+/// `DNSDone: err=...` for an address that needs no resolving at all — a resolution failure printed
+/// by a trace whose whole job is to say whether resolution is the thing that failed.
+///
+/// Only a matched pair is removed, so a name that merely contains a bracket is left for the
+/// resolver to reject on its own terms.
+fn lookup_host(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|bare| bare.strip_suffix(']'))
+        .unwrap_or(host)
 }
 
 /// Report the proxy environment the HTTP client will honour for this scheme — the analogue of Go's
@@ -595,6 +616,46 @@ mod tests {
             hp("http://192.0.2.10:8080/"),
             ("192.0.2.10".to_string(), 8080)
         );
+    }
+
+    #[test]
+    fn an_ipv6_literal_host_is_resolved_without_its_brackets() {
+        use std::net::{Ipv6Addr, SocketAddr};
+
+        let url = url::Url::parse("https://[2001:db8::1]/").unwrap();
+        let (host, port) = host_port(&url).unwrap();
+        // The dial string keeps the brackets: that is the `host:port` Go's `GetConn` hook is handed.
+        assert_eq!((host.as_str(), port), ("[2001:db8::1]", 443));
+
+        // The lookup does not. Bracketed, this went to the system resolver and came back an error,
+        // so the trace claimed a DNS failure for an address that never needed DNS.
+        let lookup = lookup_host(&host);
+        assert_eq!(lookup, "2001:db8::1");
+        let addrs: Vec<SocketAddr> = (lookup, port)
+            .to_socket_addrs()
+            .expect("a bare IPv6 literal resolves without a resolver")
+            .collect();
+        assert_eq!(
+            addrs,
+            vec![SocketAddr::from((
+                Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+                443
+            ))]
+        );
+    }
+
+    #[test]
+    fn lookup_host_only_strips_a_matched_pair_of_brackets() {
+        // A name, a bare IPv4 literal and a bare IPv6 literal are all passed through untouched.
+        assert_eq!(lookup_host("example.com"), "example.com");
+        assert_eq!(lookup_host("192.0.2.10"), "192.0.2.10");
+        assert_eq!(lookup_host("2001:db8::1"), "2001:db8::1");
+        // Nothing is invented for a half-bracketed oddity: the resolver refuses it, not us.
+        assert_eq!(lookup_host("[example.com"), "[example.com");
+        assert_eq!(lookup_host("example.com]"), "example.com]");
+        // Only the outer pair goes, so a bogus doubled form still fails to resolve rather than
+        // being quietly repaired into something the operator did not type.
+        assert_eq!(lookup_host("[[2001:db8::1]]"), "[2001:db8::1]");
     }
 
     #[test]
