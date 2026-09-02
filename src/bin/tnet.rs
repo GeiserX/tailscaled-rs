@@ -896,8 +896,9 @@ enum Command {
         cmd: LockCmd,
     },
     /// DNS commands. Currently `status` (read-only): the control-pushed MagicDNS configuration —
-    /// MagicDNS on/off, resolvers in preference order, split-DNS routes, search/cert domains, extra
-    /// records, and exit-node-filtered suffixes. Mirrors Go `tailscale dns status`.
+    /// MagicDNS on/off, resolvers in preference order, split-DNS routes and search domains, with
+    /// `--all` adding the advanced sections (cert domains, extra records, fallback resolvers,
+    /// exit-node-filtered suffixes). Mirrors Go `tailscale dns status`.
     Dns {
         #[command(subcommand)]
         cmd: DnsCmd,
@@ -1731,8 +1732,17 @@ enum LockCmd {
 /// the node's own MagicDNS path).
 #[derive(Subcommand)]
 enum DnsCmd {
-    /// Show the control-pushed MagicDNS configuration (read-only).
+    /// Show the control-pushed MagicDNS configuration (read-only). The default human output is Go's
+    /// short form — MagicDNS on/off, resolvers in preference order, split-DNS routes and search
+    /// domains; `--all` adds the advanced sections. Mirrors Go `tailscale dns status [--all]
+    /// [--json]`.
     Status {
+        /// Output advanced debugging information (Go `--all`): the fallback resolvers, certificate
+        /// domains, additional DNS records and the exit-node filtered set. Without it those four
+        /// sections are omitted, exactly as in Go. Has no effect under `--json`, which always
+        /// carries every field — again as in Go, where `--all` is only read by the text renderer.
+        #[arg(long)]
+        all: bool,
         /// Output as JSON.
         #[arg(long)]
         json: bool,
@@ -2880,8 +2890,8 @@ async fn main() -> Result<()> {
         } => run_lock_disablement_kdf(&secret),
         // `dns status` (Go `tailscale dns status`): fetch + render the control-pushed MagicDNS config.
         Command::Dns {
-            cmd: DnsCmd::Status { json },
-        } => run_dns_status(&socket, json).await,
+            cmd: DnsCmd::Status { all, json },
+        } => run_dns_status(&socket, all, json).await,
         Command::Dns {
             cmd: DnsCmd::Query { name, qtype, json },
         } => run_dns_query(&socket, &name, &qtype, json).await,
@@ -6092,7 +6102,8 @@ fn hex_decode_lower(s: &str) -> Result<Vec<u8>> {
 }
 
 /// `dns status` (Go `tailscale dns status`): fetch + render the control-pushed MagicDNS config.
-async fn run_dns_status(socket: &std::path::Path, json: bool) -> Result<()> {
+/// `all` is Go's `--all` — it widens the human rendering only (see [`format_dns_status`]).
+async fn run_dns_status(socket: &std::path::Path, all: bool, json: bool) -> Result<()> {
     let report = match round_trip(socket, &Request::DnsStatus).await {
         Ok(Response::DnsStatus(r)) => r,
         Ok(Response::Error { message }) => {
@@ -6104,7 +6115,7 @@ async fn run_dns_status(socket: &std::path::Path, json: bool) -> Result<()> {
             return Err(e).with_context(|| format!("querying dns status at {}", socket.display()));
         }
     };
-    print!("{}", format_dns_status(&report, json));
+    print!("{}", format_dns_status(&report, all, json));
     Ok(())
 }
 
@@ -7451,13 +7462,23 @@ fn format_lock_log(r: &tailscaled_rs::localapi::LockLogReport, json: bool) -> St
 }
 
 /// Render `tnet dns status` from a [`DnsStatusReport`](tailscaled_rs::localapi::DnsStatusReport)
-/// (Go `tailscale dns status`). Human form prints Go's MagicDNS-configuration sections — MagicDNS
-/// on/off, resolvers in preference order, split-DNS routes, search domains, fallback resolvers,
-/// certificate domains, additional DNS records, and exit-node-filtered suffixes — each empty section
-/// printing a parenthetical none-line, then a one-line honest note that the Go "Use Tailscale DNS"
-/// line *here* + the "System DNS configuration" section are not surfaced by this build (no engine
-/// OS-DNS accessor). The accept-dns pref itself IS modelled — surfaced via `tnet get accept-dns` (it
-/// just isn't echoed in this `dns status` view). `json` emits a REDUCED, fork-specific object — NOT
+/// (Go `tailscale dns status`). Human form prints Go's MagicDNS-configuration sections in Go's order,
+/// each empty section printing a parenthetical none-line, then a one-line honest note that the Go
+/// "Use Tailscale DNS" line *here* + the "System DNS configuration" section are not surfaced by this
+/// build (no engine OS-DNS accessor). The accept-dns pref itself IS modelled — surfaced via `tnet get
+/// accept-dns` (it just isn't echoed in this `dns status` view).
+///
+/// `all` is Go's `--all`, and gates the same split Go's `formatDNSStatusText(data, all)` gates: the
+/// default short form is MagicDNS on/off, resolvers in preference order, split-DNS routes and search
+/// domains, and `all` additionally prints the fallback resolvers (between routes and search domains,
+/// where Go prints them), the certificate domains, the additional DNS records and the exit-node
+/// filtered set. Go also gates a "Nameservers IP Addresses" section on `--all`; this build has no
+/// counterpart because the wire [`DnsStatusReport`] carries no nameserver list (the engine's
+/// `DnsConfig` exposes none), so that section is simply absent in both forms.
+///
+/// `all` deliberately does NOT reach the `json` branch: Go's `--json` marshals the whole
+/// `DNSStatusResult` regardless of `--all`, so the two flags are independent there rather than a
+/// usage error, and this fork matches that. `json` emits a REDUCED, fork-specific object — NOT
 /// byte-compatible with Go's `jsonoutput.DNSStatusResult`: resolvers/fallback-resolvers are plain
 /// `addr:port` STRINGS (Go nests `DNSResolverInfo{Addr, BootstrapResolution}` objects), MagicDNS-on
 /// is a top-level `MagicDNS` bool (Go nests it as `CurrentTailnet.MagicDNSEnabled`, with a separate
@@ -7465,7 +7486,11 @@ fn format_lock_log(r: &tailscaled_rs::localapi::LockLogReport, json: bool) -> St
 /// (Go: an array of `{Name,Type,Value}`), and there is no `SystemDNS`/`SystemDNSError`. Built via
 /// `serde_json` (escape-safe, 2-space pretty). Pure (returns the string incl. its trailing newline)
 /// → unit-testable.
-fn format_dns_status(r: &tailscaled_rs::localapi::DnsStatusReport, json: bool) -> String {
+fn format_dns_status(
+    r: &tailscaled_rs::localapi::DnsStatusReport,
+    all: bool,
+    json: bool,
+) -> String {
     if json {
         use serde_json::{Map, Value, json};
         let mut root = Map::new();
@@ -7538,6 +7563,19 @@ fn format_dns_status(r: &tailscaled_rs::localapi::DnsStatusReport, json: bool) -
         }
     }
 
+    // Go prints the fallback resolvers here — between the split-DNS routes and the search domains —
+    // and only under `--all`.
+    if all {
+        out.push_str("Fallback Resolvers:\n");
+        if r.fallback_resolvers.is_empty() {
+            out.push_str("  (none)\n");
+        } else {
+            for addr in &r.fallback_resolvers {
+                out.push_str(&format!("  - {}\n", sanitize_for_terminal(addr)));
+            }
+        }
+    }
+
     out.push_str("Search Domains:\n");
     if r.search_domains.is_empty() {
         out.push_str("  (none)\n");
@@ -7547,43 +7585,38 @@ fn format_dns_status(r: &tailscaled_rs::localapi::DnsStatusReport, json: bool) -
         }
     }
 
-    out.push_str("Fallback Resolvers:\n");
-    if r.fallback_resolvers.is_empty() {
-        out.push_str("  (none)\n");
-    } else {
-        for addr in &r.fallback_resolvers {
-            out.push_str(&format!("  - {}\n", sanitize_for_terminal(addr)));
+    // The rest of Go's advanced half: certificate domains, extra records and the exit-node filtered
+    // set. Omitted entirely (not printed as none-lines) when `--all` is off, exactly as in Go.
+    if all {
+        out.push_str("Certificate Domains:\n");
+        if r.cert_domains.is_empty() {
+            out.push_str("  (none)\n");
+        } else {
+            for domain in &r.cert_domains {
+                out.push_str(&format!("  - {}\n", sanitize_for_terminal(domain)));
+            }
         }
-    }
 
-    out.push_str("Certificate Domains:\n");
-    if r.cert_domains.is_empty() {
-        out.push_str("  (none)\n");
-    } else {
-        for domain in &r.cert_domains {
-            out.push_str(&format!("  - {}\n", sanitize_for_terminal(domain)));
+        out.push_str("Additional DNS Records:\n");
+        if r.extra_records.is_empty() {
+            out.push_str("  (none)\n");
+        } else {
+            for (name, addr) in &r.extra_records {
+                out.push_str(&format!(
+                    "  - {} -> {}\n",
+                    sanitize_for_terminal(name),
+                    sanitize_for_terminal(addr)
+                ));
+            }
         }
-    }
 
-    out.push_str("Additional DNS Records:\n");
-    if r.extra_records.is_empty() {
-        out.push_str("  (none)\n");
-    } else {
-        for (name, addr) in &r.extra_records {
-            out.push_str(&format!(
-                "  - {} -> {}\n",
-                sanitize_for_terminal(name),
-                sanitize_for_terminal(addr)
-            ));
-        }
-    }
-
-    out.push_str("Filtered suffixes (exit-node):\n");
-    if r.exit_node_filtered_set.is_empty() {
-        out.push_str("  (none)\n");
-    } else {
-        for suffix in &r.exit_node_filtered_set {
-            out.push_str(&format!("  - {}\n", sanitize_for_terminal(suffix)));
+        out.push_str("Filtered suffixes (exit-node):\n");
+        if r.exit_node_filtered_set.is_empty() {
+            out.push_str("  (none)\n");
+        } else {
+            for suffix in &r.exit_node_filtered_set {
+                out.push_str(&format!("  - {}\n", sanitize_for_terminal(suffix)));
+            }
         }
     }
 
@@ -15259,7 +15292,7 @@ mod tests {
         };
         // Human form: the populated resolver/route/search lines appear, MagicDNS reads enabled, and
         // the honest omission note is present.
-        let h = format_dns_status(&report, false);
+        let h = format_dns_status(&report, true, false); // `--all`: the advanced half included
         assert!(h.contains("MagicDNS: enabled tailnet-wide"), "{h}");
         assert!(h.contains("  - 100.100.100.100:53"), "{h}");
         assert!(h.contains("  - 8.8.8.8:53"), "{h}");
@@ -15275,7 +15308,7 @@ mod tests {
             "the honest omission note must be present: {h}"
         );
         // JSON form: Go-shaped keys + a bare MagicDNS bool, escape-safe via serde.
-        let j = format_dns_status(&report, true);
+        let j = format_dns_status(&report, false, true);
         let v: serde_json::Value = serde_json::from_str(&j).unwrap();
         assert_eq!(v["MagicDNS"], serde_json::json!(true));
         assert_eq!(
@@ -15301,7 +15334,7 @@ mod tests {
         use tailscaled_rs::localapi::DnsStatusReport;
         // The no-netmap / default report: MagicDNS disabled + every section a parenthetical none-line.
         let empty = DnsStatusReport::default();
-        let h = format_dns_status(&empty, false);
+        let h = format_dns_status(&empty, true, false);
         assert!(h.contains("MagicDNS: disabled tailnet-wide"), "{h}");
         assert!(
             h.contains("Resolvers (in preference order):\n  (none configured)"),
@@ -15318,9 +15351,132 @@ mod tests {
         );
         assert!(h.contains("not surfaced by this build"), "{h}");
         // JSON: a default report still carries a bare MagicDNS:false + empty collections.
-        let v: serde_json::Value = serde_json::from_str(&format_dns_status(&empty, true)).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&format_dns_status(&empty, false, true)).unwrap();
         assert_eq!(v["MagicDNS"], serde_json::json!(false));
         assert_eq!(v["Resolvers"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn dns_status_all_gates_the_advanced_sections_and_is_ignored_by_json() {
+        use tailscaled_rs::localapi::DnsStatusReport;
+        // Documentation-range addresses (RFC 5737) + a CGNAT tailnet address, so the fixture names
+        // nothing routable.
+        let report = DnsStatusReport {
+            magic_dns: true,
+            search_domains: vec!["user.ts.net".into()],
+            resolvers: vec!["100.100.100.100:53".into()],
+            routes: std::collections::BTreeMap::from([(
+                "corp.example.com".to_string(),
+                vec!["192.0.2.53:53".to_string()],
+            )]),
+            fallback_resolvers: vec!["198.51.100.53:53".into()],
+            cert_domains: vec!["host.user.ts.net".into()],
+            extra_records: vec![("printer.user.ts.net".into(), "100.64.0.7".into())],
+            exit_node_filtered_set: vec![".internal".into()],
+        };
+
+        // Default human form = Go's short form: the four ungated sections and nothing else. Each
+        // advanced section is ABSENT, not printed as an empty none-line.
+        let short = format_dns_status(&report, false, false);
+        for present in [
+            "=== MagicDNS configuration ===",
+            "MagicDNS: enabled tailnet-wide",
+            "Resolvers (in preference order):",
+            "Split DNS Routes:",
+            "Search Domains:",
+        ] {
+            assert!(
+                short.contains(present),
+                "short form must keep {present:?}: {short}"
+            );
+        }
+        for advanced in [
+            "Fallback Resolvers:",
+            "Certificate Domains:",
+            "Additional DNS Records:",
+            "Filtered suffixes (exit-node):",
+        ] {
+            assert!(
+                !short.contains(advanced),
+                "{advanced:?} is behind --all and must not appear by default: {short}"
+            );
+        }
+        // The values behind those headers are gone with them.
+        assert!(!short.contains("198.51.100.53:53"), "{short}");
+        assert!(!short.contains("printer.user.ts.net"), "{short}");
+        assert!(!short.contains(".internal"), "{short}");
+        // The honest-omission note is not part of the advanced half — it holds in both forms.
+        assert!(short.contains("not surfaced by this build"), "{short}");
+
+        // `--all` adds them back, in Go's order: the fallback resolvers sit between the split-DNS
+        // routes and the search domains, the rest follow the search domains.
+        let all = format_dns_status(&report, true, false);
+        let idx = |needle: &str| {
+            all.find(needle)
+                .unwrap_or_else(|| panic!("missing {needle:?}: {all}"))
+        };
+        assert!(
+            idx("Split DNS Routes:") < idx("Fallback Resolvers:"),
+            "{all}"
+        );
+        assert!(idx("Fallback Resolvers:") < idx("Search Domains:"), "{all}");
+        assert!(
+            idx("Search Domains:") < idx("Certificate Domains:"),
+            "{all}"
+        );
+        assert!(
+            idx("Certificate Domains:") < idx("Additional DNS Records:"),
+            "{all}"
+        );
+        assert!(
+            idx("Additional DNS Records:") < idx("Filtered suffixes (exit-node):"),
+            "{all}"
+        );
+        assert!(all.contains("  - 198.51.100.53:53"), "{all}");
+        assert!(all.contains("printer.user.ts.net -> 100.64.0.7"), "{all}");
+        // The short form is a prefix-wise subset: everything it prints, `--all` prints too.
+        for line in short.lines() {
+            assert!(all.contains(line), "--all dropped {line:?}: {all}");
+        }
+
+        // Go's `--json` marshals the whole result and never reads `--all`, so both spellings emit
+        // byte-identical JSON carrying every field.
+        let j_short = format_dns_status(&report, false, true);
+        let j_all = format_dns_status(&report, true, true);
+        assert_eq!(j_short, j_all, "--all must not change the JSON output");
+        let v: serde_json::Value = serde_json::from_str(&j_short).unwrap();
+        assert_eq!(
+            v["FallbackResolvers"],
+            serde_json::json!(["198.51.100.53:53"])
+        );
+        assert_eq!(v["ExitNodeFilteredSet"], serde_json::json!([".internal"]));
+    }
+
+    #[test]
+    fn dns_status_parses_gos_all_flag() {
+        // Go: `tailscale dns status [--all] [--json]` — both flags are plain, independent bools, so
+        // a runbook line carrying `--all` (with or without `--json`) must parse rather than exit 2.
+        let parse = |argv: &[&str]| {
+            let mut args = vec!["tnet", "dns", "status"];
+            args.extend_from_slice(argv);
+            match Cli::try_parse_from(args).expect("dns status command line must parse") {
+                Cli {
+                    command:
+                        Command::Dns {
+                            cmd: DnsCmd::Status { all, json },
+                        },
+                    ..
+                } => (all, json),
+                _ => panic!("expected a dns status command for {argv:?}"),
+            }
+        };
+        assert_eq!(parse(&[]), (false, false));
+        assert_eq!(parse(&["--all"]), (true, false));
+        assert_eq!(parse(&["--json"]), (false, true));
+        assert_eq!(parse(&["--all", "--json"]), (true, true));
+        // Neither flag takes a value, and an unknown one is still refused.
+        assert!(Cli::try_parse_from(["tnet", "dns", "status", "--everything"]).is_err());
     }
 
     #[test]
