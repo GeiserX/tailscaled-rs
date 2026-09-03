@@ -1408,11 +1408,14 @@ verb to return.
 
 **Ask:** the learning path above, plus one read-only accessor over what it accumulated —
 `Device::app_connector_route_info(&self) -> Option<RouteInfo>` where `RouteInfo` mirrors Go's
-`appctype.RouteInfo`: `control: Vec<IpNet>` (routes from the policy's `routes` field), `domains:
-BTreeMap<String, Vec<IpAddr>>` (addresses learned per domain), `wildcards: Vec<String>` (the
-observed suffixes). `None` when the node is not advertising the role, so the caller can tell "not a
-connector" from "a connector that has learned nothing", which are different answers. The routes
-themselves should keep flowing through the existing advertised-route path rather than a second one.
+`appctype.RouteInfo` (`types/appctype/appconnector.go`): `control: Vec<IpNet>` (routes from the
+policy's `routes` field), `domains: BTreeMap<String, Vec<IpAddr>>` (addresses learned per domain),
+`wildcards: Vec<String>` (the configured `*.` domains with the `*.` stripped — the watch list, not
+what the watching found: Go's `updateDomains` fills it from the control-pushed `domains` list alone,
+and `NewAppConnector` seeds a restarting connector's wildcard set straight back from it). `None`
+when the node is not advertising the role, so the caller can tell "not a connector" from "a
+connector that has learned nothing", which are different answers. The routes themselves should keep
+flowing through the existing advertised-route path rather than a second one.
 
 Split it if that is easier to land: the accessor is useless without the learning, but the *learning*
 alone is already the feature — a node that actually connects. The readback is how an operator
@@ -1552,9 +1555,9 @@ where the tailnet's policy reads it. Nothing on this side of the LocalAPI can re
 through the engine, so a "reason" that stops at the daemon can never satisfy a policy that requires
 one. Written down here rather than papered over.
 
-**Ask (either shape works):**
+**Ask (option 2 covers both commands; option 1 covers `logout` only):**
 
-1. A reason on the state changes that carry one in Go:
+1. A reason on the one state change that reaches the engine — `logout`:
 
 ```rust
 /// Log out, attaching the operator's justification for control's audit trail
@@ -1562,7 +1565,16 @@ one. Written down here rather than papered over.
 pub async fn logout_with_reason(&self, reason: Option<&str>) -> Result<(), ts_control::LogoutError>;
 ```
 
-2. Or the general form, which also covers `down` and any later action Go audits:
+   **This shape alone leaves `down --reason` local-only.** `down` never calls the engine:
+   `Backend::down` (`src/ipn/mod.rs`) tears the datapath down and persists `want_running = false`,
+   and that is the whole operation — there is no engine call for a reason to ride on. Go has the
+   same asymmetry and settles it a layer up: both commands land on
+   `actor.CheckProfileAccess(profile, ipnauth.Disconnect, auditLogFn)`, and the entry reaches control
+   through `auditlog`'s transport rather than through the logout registration itself. So option 1 is
+   the whole ask only if it ships with a way to submit a `Disconnect` entry that carries no state
+   change of its own — which is option 2.
+
+2. The general form, which covers `down` as well as `logout` and any later action Go audits:
 
 ```rust
 pub enum ClientAuditAction { Disconnect, /* Go's `tailcfg.ClientAuditAction` set */ }
@@ -1579,4 +1591,6 @@ not.
 **Daemon impact once landed:** `tnet logout --reason` and `tnet down --reason` keep their existing
 command lines and stop being local-only — the daemon passes the reason it already receives to the
 engine instead of only logging it, and the "recorded locally, not forwarded to control" scope note on
-both flags (`src/bin/tnet.rs`, `src/server.rs`) goes away. Consumed via a pin bump. — daemon lane
+both flags (`src/bin/tnet.rs`, `src/server.rs`) goes away. `down` gets there only through option 2's
+`send_audit_log` (`logout` can ride either shape), so option 1 on its own retires half the note.
+Consumed via a pin bump. — daemon lane

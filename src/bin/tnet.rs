@@ -6321,17 +6321,36 @@ fn parse_lock_public_key(s: &str) -> Result<[u8; 32]> {
             None => anyhow::bail!("key hex string doesn't have expected type prefix tlpub:"),
         },
     };
-    if hex.len() != 64 {
-        anyhow::bail!("key hex has the wrong size, got {} want 64", hex.len());
+    // Go measures and indexes BYTES here (`mem.RO.Len`/`.At`), so this does too: the length check is
+    // already a byte count, and decoding out of `hex.as_bytes()` keeps the two consistent. Slicing
+    // the `str` instead — `&hex[i..i + 2]` — aborts the process on a 64-*byte* argument whose
+    // characters are multibyte (`tlpub:` + 21 × `€` + `a` is 64 bytes), because byte 2 is not a
+    // char boundary. Go reports a bad hex character there, and so must this.
+    let raw = hex.as_bytes();
+    if raw.len() != 64 {
+        anyhow::bail!("key hex has the wrong size, got {} want 64", raw.len());
     }
-    let bytes: Vec<u8> = (0..64)
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
-        .collect::<std::result::Result<_, _>>()
-        .map_err(|_| anyhow!("invalid hex character in key"))?;
     let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
+    for (byte, pair) in out.iter_mut().zip(raw.as_chunks::<2>().0) {
+        let (Some(hi), Some(lo)) = (hex_nibble(pair[0]), hex_nibble(pair[1])) else {
+            anyhow::bail!("invalid hex character in key");
+        };
+        *byte = (hi << 4) | lo;
+    }
     Ok(out)
+}
+
+/// One hex digit's value, or `None` when the byte is not `[0-9a-fA-F]` — Go's `fromHexChar`
+/// (`types/key/util.go` @ v1.100.0). Deliberately not `u8::from_str_radix`, which is both
+/// char-boundary sensitive and *more* permissive than Go: `u8::from_str_radix("+f", 16)` is
+/// `Ok(15)`, so a leading sign used to decode as a valid hex byte.
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Split `lock`'s positional arguments into trusted keys and disablement values — a port of Go's
@@ -6774,15 +6793,23 @@ fn disablement_kdf_line(secret_hex: &str) -> Result<String> {
 /// Decode a lower/upper-hex string to bytes (the disablement secret is hex). A small local helper so
 /// the `lock disablement-kdf` path has no extra dependency beyond the `argon2` KDF itself.
 fn hex_decode_lower(s: &str) -> Result<Vec<u8>> {
-    let s = s.trim();
-    if !s.len().is_multiple_of(2) {
+    // Byte-wise for the same reason as `parse_lock_public_key`: this decodes operator input — the
+    // `--disablement-secret` flag and the `disablement:`/`disablement-secret:` positionals — so a
+    // multibyte character has to come back as a bad hex byte, not as a panic from a `str` slice
+    // taken through the middle of it.
+    let raw = s.trim().as_bytes();
+    if !raw.len().is_multiple_of(2) {
         anyhow::bail!("odd-length hex string");
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&s[i..i + 2], 16)
-                .map_err(|_| anyhow!("invalid hex byte {:?}", &s[i..i + 2]))
+    raw.as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| match (hex_nibble(pair[0]), hex_nibble(pair[1])) {
+            (Some(hi), Some(lo)) => Ok((hi << 4) | lo),
+            _ => Err(anyhow!(
+                "invalid hex byte {:?}",
+                String::from_utf8_lossy(pair)
+            )),
         })
         .collect()
 }
@@ -7526,7 +7553,9 @@ const MAX_CERT_DEMO_CONNECTIONS: usize = 64;
 /// deadline on the handshake and on the request read, so neither a flood nor a client that connects
 /// and says nothing can pile up handlers. Results are memoized in a [`CertDemoCerts`] cache — Go
 /// relies on its daemon's certificate cache for this; ours issues fresh every time, so without a
-/// cache one browser's six parallel connections would be six ACME issuances.
+/// cache one browser's six parallel connections would be six ACME issuances. The fetches the cache
+/// does NOT absorb are rationed by a [`CertDemoFetchBudget`], so a caller who varies the SNI name
+/// past the cache's cap cannot turn connections into daemon round-trips one for one.
 ///
 /// REDUCED SCOPE vs Go: Go's demo handler also redirects a bare-hostname request to the expanded
 /// MagicDNS name (its `ExpandSNIName` LocalAPI call); this fork's LocalAPI has no such call, so every
@@ -7545,6 +7574,7 @@ async fn run_cert_serve_demo(socket: &std::path::Path, listen: &str) -> Result<(
 
     let conn_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CERT_DEMO_CONNECTIONS));
     let certs: CertDemoCerts = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let budget: CertDemoBudget = Arc::new(tokio::sync::Mutex::new(CertDemoFetchBudget::new()));
     loop {
         let (conn, _peer) = match listener.accept().await {
             Ok(c) => c,
@@ -7559,17 +7589,19 @@ async fn run_cert_serve_demo(socket: &std::path::Path, listen: &str) -> Result<(
         };
         let socket = socket.to_path_buf();
         let certs = Arc::clone(&certs);
+        let budget = Arc::clone(&budget);
         tokio::spawn(async move {
             let _permit = permit;
-            serve_cert_demo_connection(conn, &socket, &certs).await;
+            serve_cert_demo_connection(conn, &socket, &certs, &budget).await;
         });
     }
 }
 
 /// The `cert --serve-demo` server's memo of what the daemon answered per SNI name: a ready TLS config
 /// for a name that certified, `None` for one that did not. Both halves matter — the negative entry is
-/// what stops a scanner that keeps opening connections for a name this tailnet cannot certify from
-/// driving one daemon round-trip (and one ACME attempt) per connection.
+/// what stops a client that keeps reconnecting for the same uncertifiable name from driving one
+/// daemon round-trip (and one ACME attempt) per connection. A memo alone cannot bound a caller who
+/// varies the name, which is what [`CertDemoFetchBudget`] is for.
 type CertDemoCerts = std::sync::Arc<
     tokio::sync::Mutex<
         std::collections::HashMap<String, Option<std::sync::Arc<rustls::ServerConfig>>>,
@@ -7578,20 +7610,123 @@ type CertDemoCerts = std::sync::Arc<
 
 /// How many distinct SNI names the demo server memoizes. Small on purpose: a demo answers for a
 /// handful of tailnet names, and the map is otherwise attacker-sized (any client picks the key).
-/// Beyond the cap, names are still served — they are simply re-fetched.
+/// Beyond the cap, names are still served — they are simply re-fetched, under the budget below.
 const MAX_CERT_DEMO_CERTS: usize = 16;
+
+/// How many daemon cert requests `cert --serve-demo` will start per [`CERT_DEMO_FETCH_WINDOW`],
+/// however many distinct SNI names ask for them.
+///
+/// The memo above bounds the map, not the work: the SNI name is the cache key and the client picks
+/// it, so anyone cycling more than [`MAX_CERT_DEMO_CERTS`] names misses every time and is back to one
+/// daemon round-trip — and, for a name the tailnet could certify, one ACME issuance — per connection.
+/// The connection cap does not help either; it bounds concurrency, not the rate through it. So the
+/// fetches are budgeted on their own, independent of how well the memo happens to be hitting.
+///
+/// Sized for a demo rather than for a fleet: a browser opens a handful of parallel connections and
+/// each cold one fetches, so the budget has to clear that comfortably while still being a small
+/// multiple of the names a demo actually answers for.
+const MAX_CERT_DEMO_FETCHES_PER_WINDOW: usize = 32;
+
+/// The window [`MAX_CERT_DEMO_FETCHES_PER_WINDOW`] is counted over.
+const CERT_DEMO_FETCH_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The demo server's fetch budget: a fixed window that resets whole rather than a sliding one, which
+/// is the cheap shape and the right one here — the point is a ceiling on daemon round-trips over
+/// time, not smoothness.
+///
+/// Takes `now` as an argument instead of reading the clock so the shed decision is testable without
+/// sleeping.
+#[derive(Debug)]
+struct CertDemoFetchBudget {
+    /// Start of the current window; `None` until the first fetch opens one.
+    window_start: Option<std::time::Instant>,
+    /// Fetches already granted inside that window.
+    spent: usize,
+}
+
+impl CertDemoFetchBudget {
+    fn new() -> Self {
+        Self {
+            window_start: None,
+            spent: 0,
+        }
+    }
+
+    /// Claim one fetch, returning `false` when this window's budget is spent. A `false` costs the
+    /// caller nothing but its own connection: nothing is memoized, so the very next window answers
+    /// the same name normally.
+    fn take(&mut self, now: std::time::Instant) -> bool {
+        match self.window_start {
+            Some(start) if now.duration_since(start) < CERT_DEMO_FETCH_WINDOW => {}
+            // No window open yet, or the open one has aged out: start a fresh one at `now`.
+            _ => {
+                self.window_start = Some(now);
+                self.spent = 0;
+            }
+        }
+        if self.spent >= MAX_CERT_DEMO_FETCHES_PER_WINDOW {
+            return false;
+        }
+        self.spent += 1;
+        true
+    }
+}
+
+/// The budget, shared by every connection handler (one budget per demo server, not per connection).
+type CertDemoBudget = std::sync::Arc<tokio::sync::Mutex<CertDemoFetchBudget>>;
+
+/// What the demo server should do for one SNI name, decided before any daemon round-trip.
+#[derive(Debug)]
+enum CertDemoLookup {
+    /// The memo already knows this name's outcome (`None` = the daemon would not certify it).
+    Memoized(Option<std::sync::Arc<rustls::ServerConfig>>),
+    /// Not memoized, and the budget granted a fetch.
+    Fetch,
+    /// Not memoized, and this window's fetch budget is spent — drop the handshake.
+    Shed,
+}
+
+/// Consult the memo, then the budget. A memo hit never spends budget: a demo that answers for the
+/// same few names keeps working at any rate, and only the *misses* — the ones that reach the daemon —
+/// are rationed.
+async fn cert_demo_lookup(
+    certs: &CertDemoCerts,
+    budget: &CertDemoBudget,
+    sni: &str,
+    now: std::time::Instant,
+) -> CertDemoLookup {
+    if let Some(hit) = certs.lock().await.get(sni) {
+        return CertDemoLookup::Memoized(hit.clone());
+    }
+    if budget.lock().await.take(now) {
+        CertDemoLookup::Fetch
+    } else {
+        CertDemoLookup::Shed
+    }
+}
 
 /// The TLS config `cert --serve-demo` should present for one SNI name: the memoized one, or the one
 /// built from a fresh daemon cert request (Go's per-ClientHello `localClient.GetCertificate`). `None`
 /// when the daemon will not certify that name — the handshake is then dropped, which is what Go's
-/// handshake does when `GetCertificate` returns an error.
+/// handshake does when `GetCertificate` returns an error — and `None` too when this window's
+/// [`CertDemoFetchBudget`] is spent, which drops the handshake the same way rather than adding
+/// another round-trip to a daemon already being asked as fast as it will be asked.
 async fn cert_demo_config_for(
     socket: &std::path::Path,
     certs: &CertDemoCerts,
+    budget: &CertDemoBudget,
     sni: &str,
 ) -> Option<std::sync::Arc<rustls::ServerConfig>> {
-    if let Some(hit) = certs.lock().await.get(sni) {
-        return hit.clone();
+    match cert_demo_lookup(certs, budget, sni, std::time::Instant::now()).await {
+        CertDemoLookup::Memoized(hit) => return hit,
+        CertDemoLookup::Shed => {
+            eprintln!(
+                "cert --serve-demo: too many certificate requests just now; not asking the daemon \
+                 to certify {sni:?}"
+            );
+            return None;
+        }
+        CertDemoLookup::Fetch => {}
     }
     // The lock is NOT held across the round-trip: a slow issuance must not stall every other
     // connection. Two connections racing on the same cold name each fetch once, then agree.
@@ -7669,6 +7804,7 @@ async fn serve_cert_demo_connection(
     conn: tokio::net::TcpStream,
     socket: &std::path::Path,
     certs: &CertDemoCerts,
+    budget: &CertDemoBudget,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -7679,7 +7815,7 @@ async fn serve_cert_demo_connection(
     let Some(sni) = start.client_hello().server_name().map(str::to_string) else {
         return; // No SNI: nothing to certify, as in Go.
     };
-    let Some(config) = cert_demo_config_for(socket, certs, &sni).await else {
+    let Some(config) = cert_demo_config_for(socket, certs, budget, &sni).await else {
         return;
     };
     let Ok(Ok(mut tls)) = tokio::time::timeout(CERT_DEMO_DEADLINE, start.into_stream(config)).await
@@ -15966,6 +16102,57 @@ mod tests {
     }
 
     #[test]
+    fn lock_hex_arguments_reject_non_ascii_instead_of_panicking() {
+        // Every length check on this path counts BYTES, like Go's, so a multibyte argument can pass
+        // it and still not be splittable at byte 2. `str` indexing panicked there, killing the
+        // process on nothing worse than a mistyped key. 21 × `€` (3 bytes each) + `a` is 64 bytes.
+        let multibyte = "€".repeat(21) + "a";
+        assert_eq!(
+            multibyte.len(),
+            64,
+            "the fixture has to pass the byte-length check"
+        );
+
+        let e = parse_lock_public_key(&format!("tlpub:{multibyte}"))
+            .expect_err("non-ASCII must be an error, not a panic")
+            .to_string();
+        assert_eq!(e, "invalid hex character in key", "{e}");
+
+        // And through the argument parser an operator actually reaches, for both kinds of value.
+        let err = |a: &str| {
+            parse_lock_args(&[a.to_string()], true, true)
+                .expect_err("non-ASCII must be an error, not a panic")
+                .to_string()
+        };
+        let e = err(&format!("tlpub:{multibyte}"));
+        assert!(
+            e.contains("parsing key 1: invalid hex character in key"),
+            "{e}"
+        );
+        let e = err(&format!("disablement:{}", "€".repeat(2)));
+        assert!(e.contains("parsing disablement 1: invalid hex byte"), "{e}");
+
+        // `hex_decode_lower` takes the same operator input via `--disablement-secret`.
+        assert!(hex_decode_lower("€€").is_err(), "multibyte hex rejected");
+        assert_eq!(
+            hex_decode_lower("00FF").unwrap(),
+            vec![0x00, 0xff],
+            "upper-hex still decodes"
+        );
+
+        // `u8::from_str_radix` also accepted a leading sign, so `+f` decoded as 0x0f — one more
+        // string Go's `fromHexChar` refuses and this used to take.
+        assert!(
+            hex_decode_lower("+f").is_err(),
+            "leading sign is not a hex byte"
+        );
+        let e = parse_lock_public_key(&format!("tlpub:+f{}", "0".repeat(62)))
+            .expect_err("leading sign is not a hex byte")
+            .to_string();
+        assert_eq!(e, "invalid hex character in key", "{e}");
+    }
+
+    #[test]
     fn lock_init_never_reads_a_trusted_key_as_a_disablement_secret() {
         // The regression this command's grammar change is for. Both spellings an operator could
         // plausibly type used to be swallowed as a "disablement secret":
@@ -22595,7 +22782,9 @@ users:
 
         let certs: CertDemoCerts =
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-        let first = cert_demo_config_for(&socket, &certs, "host.user.ts.net").await;
+        let budget: CertDemoBudget =
+            std::sync::Arc::new(tokio::sync::Mutex::new(CertDemoFetchBudget::new()));
+        let first = cert_demo_config_for(&socket, &certs, &budget, "host.user.ts.net").await;
         assert!(
             first.is_none(),
             "a name the daemon will not certify has no config to serve"
@@ -22612,7 +22801,7 @@ users:
 
         // The stub is gone now, so a second fetch that went to the daemon would fail differently —
         // this one is answered from the memo, and answers the same.
-        let second = cert_demo_config_for(&socket, &certs, "host.user.ts.net").await;
+        let second = cert_demo_config_for(&socket, &certs, &budget, "host.user.ts.net").await;
         assert!(second.is_none());
         assert_eq!(
             certs.lock().await.len(),
@@ -22621,6 +22810,125 @@ users:
         );
         let _ = std::fs::remove_file(&socket);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_demo_server_stops_asking_the_daemon_once_its_fetch_budget_is_spent() {
+        // The memo cannot bound this on its own: the SNI name is the cache key and the client picks
+        // it, so a caller that never repeats a name misses every time and (past the memo's cap) is
+        // not even remembered. Each miss is a daemon round-trip, and for a certifiable name an ACME
+        // attempt. So the misses are budgeted separately from the memo, and this is that budget:
+        // more distinct names than the budget allows must NOT become more daemon requests.
+        let dir = std::env::temp_dir().join(format!("tnet-demo-budget-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let socket = dir.join("daemon.sock");
+        let _ = std::fs::remove_file(&socket);
+        let listener =
+            tokio::net::UnixListener::bind(&socket).expect("bind the stub daemon socket");
+        // A stub daemon that answers every request and counts them — the count IS the assertion.
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&seen);
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (read, mut write) = tokio::io::split(stream);
+                let mut line = String::new();
+                let _ = tokio::io::BufReader::new(read).read_line(&mut line).await;
+                let _ = write
+                    .write_all(b"{\"kind\":\"error\",\"message\":\"no cert for that domain\"}\n")
+                    .await;
+            }
+        });
+
+        let certs: CertDemoCerts =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let budget: CertDemoBudget =
+            std::sync::Arc::new(tokio::sync::Mutex::new(CertDemoFetchBudget::new()));
+        let names: Vec<String> = (0..MAX_CERT_DEMO_FETCHES_PER_WINDOW + 8)
+            .map(|i| format!("scan{i}.user.ts.net"))
+            .collect();
+        for name in &names {
+            // Every one of these is a name the daemon refuses, so none of them can be served —
+            // what differs is whether the daemon was asked at all.
+            assert!(
+                cert_demo_config_for(&socket, &certs, &budget, name)
+                    .await
+                    .is_none(),
+                "the stub daemon certifies nothing, so {name} has no config"
+            );
+        }
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_CERT_DEMO_FETCHES_PER_WINDOW,
+            "{} distinct names must still cost at most one window's budget in daemon requests",
+            names.len()
+        );
+
+        // The budget rations the misses, not the memo: a name already answered for is still served
+        // from the memo with the budget spent, and costs no round-trip.
+        let memoized = cert_demo_config_for(&socket, &certs, &budget, &names[0]).await;
+        assert!(
+            memoized.is_none(),
+            "that name was refused, and is remembered"
+        );
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_CERT_DEMO_FETCHES_PER_WINDOW,
+            "a memo hit must not reach the daemon"
+        );
+        let _ = std::fs::remove_file(&socket);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_demo_fetch_budget_refills_only_when_its_window_rolls_over() {
+        // `take` reads its clock from the caller, so the window boundary is exercised here without
+        // sleeping through a minute of it.
+        let opened = std::time::Instant::now();
+        let mut budget = CertDemoFetchBudget::new();
+        for i in 0..MAX_CERT_DEMO_FETCHES_PER_WINDOW {
+            assert!(budget.take(opened), "fetch {i} is inside the first window");
+        }
+        assert!(
+            !budget.take(opened + CERT_DEMO_FETCH_WINDOW / 2),
+            "a spent window does not refill part-way through"
+        );
+        assert!(
+            budget.take(opened + CERT_DEMO_FETCH_WINDOW),
+            "the next window starts fresh — a shed connection is a delay, not a ban"
+        );
+
+        // A memo hit is answered without consulting the budget at all, so a demo answering for the
+        // same few names keeps working at any connection rate.
+        let certs: CertDemoCerts =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        certs
+            .lock()
+            .await
+            .insert("host.user.ts.net".to_string(), None);
+        let spent: CertDemoBudget =
+            std::sync::Arc::new(tokio::sync::Mutex::new(CertDemoFetchBudget::new()));
+        for _ in 0..MAX_CERT_DEMO_FETCHES_PER_WINDOW {
+            assert!(spent.lock().await.take(opened));
+        }
+        assert!(
+            matches!(
+                cert_demo_lookup(&certs, &spent, "host.user.ts.net", opened).await,
+                CertDemoLookup::Memoized(None)
+            ),
+            "a memoized name is answered from the memo, spent budget or not"
+        );
+        assert!(
+            matches!(
+                cert_demo_lookup(&certs, &spent, "other.user.ts.net", opened).await,
+                CertDemoLookup::Shed
+            ),
+            "an unmemoized name with no budget left is shed instead of asked for"
+        );
     }
 
     #[test]
@@ -23076,6 +23384,126 @@ users:
         assert!(Cli::try_parse_from(["tnet", "appc-routes", "--n"]).is_err());
         // And a flag Go's `appc-routes` does not have stays unrecognised rather than ignored.
         assert!(Cli::try_parse_from(["tnet", "appc-routes", "--json"]).is_err());
+    }
+
+    /// `docs/ENGINE_ASKS.md` §39 is the ask an engine implementer would build
+    /// `Device::app_connector_route_info` from, and most of its value is that it says where each
+    /// field of Go's `appctype.RouteInfo` comes from. Two of the three are handed down by control
+    /// — the policy's `routes`, and the `*.` entries of its domain list — and only one is filled
+    /// by watching DNS. Getting that split wrong in the ask gets the accessor built wrong:
+    /// `appc.NewAppConnector` seeds a restarting connector's wildcard set straight out of
+    /// `RouteInfo.Wildcards`, so a `wildcards` derived from what was seen rather than from what was
+    /// configured comes back after a restart as a connector that no longer matches the subdomains
+    /// its own policy asked for.
+    ///
+    /// So the section is checked against itself. §39 already separates the two provenances in its
+    /// prose — a "configured domain set" bullet that control pushes, and a "DNS observation" bullet
+    /// that records what the resolver saw — and each field's parenthetical gloss has to land on the
+    /// right side of it. Both the vocabulary and the glosses are parsed out of the document, so
+    /// rewording either is free and reassigning a field's provenance is not.
+    mod engine_asks_39 {
+        const ASKS: &str = include_str!("../../docs/ENGINE_ASKS.md");
+
+        const HEADING: &str = "## 39.";
+
+        /// The words §39 uses for what the connector finds out at runtime, as opposed to what
+        /// control hands it. Prefixes, so "observation"/"observed" and "discovers"/"discovered"
+        /// both count.
+        const LEARNED: [&str; 3] = ["learn", "observ", "discover"];
+
+        /// §39's body, from its heading to the next top-level ask, with every run of whitespace
+        /// collapsed so a sentence broken over a line wrap reads as one string.
+        fn section() -> String {
+            let start = ASKS
+                .find(HEADING)
+                .unwrap_or_else(|| panic!("docs/ENGINE_ASKS.md should still contain `{HEADING}`"));
+            let body = &ASKS[start..];
+            let body = match body[HEADING.len()..].find("\n## ") {
+                Some(end) => &body[..HEADING.len() + end],
+                None => body,
+            };
+            body.split_whitespace().collect::<Vec<_>>().join(" ")
+        }
+
+        /// The parenthetical §39 attaches to one `RouteInfo` field in its **Ask:** sentence: the
+        /// field is written `` `name: Type` `` and the gloss is the `(…)` that follows it.
+        fn field_gloss(field: &str) -> String {
+            let section = section();
+            let named = format!("`{field}: ");
+            let start = section.find(&named).unwrap_or_else(|| {
+                panic!("§39 should still ask for a `RouteInfo` with a `{field}` field")
+            });
+            let open = start
+                + section[start..]
+                    .find('(')
+                    .unwrap_or_else(|| panic!("§39 should still gloss `{field}` with a `(…)`"));
+            let mut depth = 0usize;
+            for (offset, c) in section[open..].char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return section[open + 1..open + offset].to_string();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("§39's gloss for `{field}` is never closed")
+        }
+
+        /// The §39 bullet opening with this bold lead, up to the next bullet.
+        fn bullet(lead: &str) -> String {
+            let section = section();
+            let start = section
+                .find(lead)
+                .unwrap_or_else(|| panic!("§39 should still have its `{lead}` bullet"));
+            let body = &section[start..];
+            match body.find(" - **") {
+                Some(end) => body[..end].to_string(),
+                None => body.to_string(),
+            }
+        }
+
+        #[test]
+        fn the_two_provenances_the_glosses_are_read_against_are_still_the_sections_own() {
+            let observation = bullet("**DNS observation.**");
+            assert!(
+                LEARNED.iter().any(|word| observation.contains(word)),
+                "§39's DNS-observation bullet is the one place data arrives by watching; it should \
+                 still say so in those words: {observation}"
+            );
+            let configured = bullet("**The configured domain set.**");
+            assert!(
+                !LEARNED.iter().any(|word| configured.contains(word)),
+                "§39's configured-domain-set bullet describes what control pushes down, so the \
+                 vocabulary of runtime learning does not belong in it: {configured}"
+            );
+        }
+
+        #[test]
+        fn only_the_domains_field_is_glossed_as_something_the_connector_learns() {
+            let domains = field_gloss("domains");
+            assert!(
+                LEARNED.iter().any(|word| domains.contains(word)),
+                "`domains` is the field the DNS observation fills — the addresses seen per domain \
+                 — and its gloss should say so: {domains}"
+            );
+            for field in ["control", "wildcards"] {
+                let gloss = field_gloss(field);
+                assert!(
+                    !LEARNED.iter().any(|word| gloss.contains(word)),
+                    "`{field}` is pushed down by control, not learned by watching: glossing it as \
+                     learned points whoever builds the accessor at the wrong source, and Go seeds \
+                     a restarting connector from this very field: {gloss}"
+                );
+                assert!(
+                    gloss.contains("configured") || gloss.contains("polic"),
+                    "`{field}`'s gloss should name the policy it comes from: {gloss}"
+                );
+            }
+        }
     }
 
     /// `docs/ENGINE_ASKS.md` §21 is an ask filed against an OLD engine pin, and eight of the flags
