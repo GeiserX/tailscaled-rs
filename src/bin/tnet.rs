@@ -7553,7 +7553,9 @@ const MAX_CERT_DEMO_CONNECTIONS: usize = 64;
 /// deadline on the handshake and on the request read, so neither a flood nor a client that connects
 /// and says nothing can pile up handlers. Results are memoized in a [`CertDemoCerts`] cache — Go
 /// relies on its daemon's certificate cache for this; ours issues fresh every time, so without a
-/// cache one browser's six parallel connections would be six ACME issuances.
+/// cache one browser's six parallel connections would be six ACME issuances. The fetches the cache
+/// does NOT absorb are rationed by a [`CertDemoFetchBudget`], so a caller who varies the SNI name
+/// past the cache's cap cannot turn connections into daemon round-trips one for one.
 ///
 /// REDUCED SCOPE vs Go: Go's demo handler also redirects a bare-hostname request to the expanded
 /// MagicDNS name (its `ExpandSNIName` LocalAPI call); this fork's LocalAPI has no such call, so every
@@ -7572,6 +7574,7 @@ async fn run_cert_serve_demo(socket: &std::path::Path, listen: &str) -> Result<(
 
     let conn_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CERT_DEMO_CONNECTIONS));
     let certs: CertDemoCerts = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let budget: CertDemoBudget = Arc::new(tokio::sync::Mutex::new(CertDemoFetchBudget::new()));
     loop {
         let (conn, _peer) = match listener.accept().await {
             Ok(c) => c,
@@ -7586,17 +7589,19 @@ async fn run_cert_serve_demo(socket: &std::path::Path, listen: &str) -> Result<(
         };
         let socket = socket.to_path_buf();
         let certs = Arc::clone(&certs);
+        let budget = Arc::clone(&budget);
         tokio::spawn(async move {
             let _permit = permit;
-            serve_cert_demo_connection(conn, &socket, &certs).await;
+            serve_cert_demo_connection(conn, &socket, &certs, &budget).await;
         });
     }
 }
 
 /// The `cert --serve-demo` server's memo of what the daemon answered per SNI name: a ready TLS config
 /// for a name that certified, `None` for one that did not. Both halves matter — the negative entry is
-/// what stops a scanner that keeps opening connections for a name this tailnet cannot certify from
-/// driving one daemon round-trip (and one ACME attempt) per connection.
+/// what stops a client that keeps reconnecting for the same uncertifiable name from driving one
+/// daemon round-trip (and one ACME attempt) per connection. A memo alone cannot bound a caller who
+/// varies the name, which is what [`CertDemoFetchBudget`] is for.
 type CertDemoCerts = std::sync::Arc<
     tokio::sync::Mutex<
         std::collections::HashMap<String, Option<std::sync::Arc<rustls::ServerConfig>>>,
@@ -7605,20 +7610,123 @@ type CertDemoCerts = std::sync::Arc<
 
 /// How many distinct SNI names the demo server memoizes. Small on purpose: a demo answers for a
 /// handful of tailnet names, and the map is otherwise attacker-sized (any client picks the key).
-/// Beyond the cap, names are still served — they are simply re-fetched.
+/// Beyond the cap, names are still served — they are simply re-fetched, under the budget below.
 const MAX_CERT_DEMO_CERTS: usize = 16;
+
+/// How many daemon cert requests `cert --serve-demo` will start per [`CERT_DEMO_FETCH_WINDOW`],
+/// however many distinct SNI names ask for them.
+///
+/// The memo above bounds the map, not the work: the SNI name is the cache key and the client picks
+/// it, so anyone cycling more than [`MAX_CERT_DEMO_CERTS`] names misses every time and is back to one
+/// daemon round-trip — and, for a name the tailnet could certify, one ACME issuance — per connection.
+/// The connection cap does not help either; it bounds concurrency, not the rate through it. So the
+/// fetches are budgeted on their own, independent of how well the memo happens to be hitting.
+///
+/// Sized for a demo rather than for a fleet: a browser opens a handful of parallel connections and
+/// each cold one fetches, so the budget has to clear that comfortably while still being a small
+/// multiple of the names a demo actually answers for.
+const MAX_CERT_DEMO_FETCHES_PER_WINDOW: usize = 32;
+
+/// The window [`MAX_CERT_DEMO_FETCHES_PER_WINDOW`] is counted over.
+const CERT_DEMO_FETCH_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The demo server's fetch budget: a fixed window that resets whole rather than a sliding one, which
+/// is the cheap shape and the right one here — the point is a ceiling on daemon round-trips over
+/// time, not smoothness.
+///
+/// Takes `now` as an argument instead of reading the clock so the shed decision is testable without
+/// sleeping.
+#[derive(Debug)]
+struct CertDemoFetchBudget {
+    /// Start of the current window; `None` until the first fetch opens one.
+    window_start: Option<std::time::Instant>,
+    /// Fetches already granted inside that window.
+    spent: usize,
+}
+
+impl CertDemoFetchBudget {
+    fn new() -> Self {
+        Self {
+            window_start: None,
+            spent: 0,
+        }
+    }
+
+    /// Claim one fetch, returning `false` when this window's budget is spent. A `false` costs the
+    /// caller nothing but its own connection: nothing is memoized, so the very next window answers
+    /// the same name normally.
+    fn take(&mut self, now: std::time::Instant) -> bool {
+        match self.window_start {
+            Some(start) if now.duration_since(start) < CERT_DEMO_FETCH_WINDOW => {}
+            // No window open yet, or the open one has aged out: start a fresh one at `now`.
+            _ => {
+                self.window_start = Some(now);
+                self.spent = 0;
+            }
+        }
+        if self.spent >= MAX_CERT_DEMO_FETCHES_PER_WINDOW {
+            return false;
+        }
+        self.spent += 1;
+        true
+    }
+}
+
+/// The budget, shared by every connection handler (one budget per demo server, not per connection).
+type CertDemoBudget = std::sync::Arc<tokio::sync::Mutex<CertDemoFetchBudget>>;
+
+/// What the demo server should do for one SNI name, decided before any daemon round-trip.
+#[derive(Debug)]
+enum CertDemoLookup {
+    /// The memo already knows this name's outcome (`None` = the daemon would not certify it).
+    Memoized(Option<std::sync::Arc<rustls::ServerConfig>>),
+    /// Not memoized, and the budget granted a fetch.
+    Fetch,
+    /// Not memoized, and this window's fetch budget is spent — drop the handshake.
+    Shed,
+}
+
+/// Consult the memo, then the budget. A memo hit never spends budget: a demo that answers for the
+/// same few names keeps working at any rate, and only the *misses* — the ones that reach the daemon —
+/// are rationed.
+async fn cert_demo_lookup(
+    certs: &CertDemoCerts,
+    budget: &CertDemoBudget,
+    sni: &str,
+    now: std::time::Instant,
+) -> CertDemoLookup {
+    if let Some(hit) = certs.lock().await.get(sni) {
+        return CertDemoLookup::Memoized(hit.clone());
+    }
+    if budget.lock().await.take(now) {
+        CertDemoLookup::Fetch
+    } else {
+        CertDemoLookup::Shed
+    }
+}
 
 /// The TLS config `cert --serve-demo` should present for one SNI name: the memoized one, or the one
 /// built from a fresh daemon cert request (Go's per-ClientHello `localClient.GetCertificate`). `None`
 /// when the daemon will not certify that name — the handshake is then dropped, which is what Go's
-/// handshake does when `GetCertificate` returns an error.
+/// handshake does when `GetCertificate` returns an error — and `None` too when this window's
+/// [`CertDemoFetchBudget`] is spent, which drops the handshake the same way rather than adding
+/// another round-trip to a daemon already being asked as fast as it will be asked.
 async fn cert_demo_config_for(
     socket: &std::path::Path,
     certs: &CertDemoCerts,
+    budget: &CertDemoBudget,
     sni: &str,
 ) -> Option<std::sync::Arc<rustls::ServerConfig>> {
-    if let Some(hit) = certs.lock().await.get(sni) {
-        return hit.clone();
+    match cert_demo_lookup(certs, budget, sni, std::time::Instant::now()).await {
+        CertDemoLookup::Memoized(hit) => return hit,
+        CertDemoLookup::Shed => {
+            eprintln!(
+                "cert --serve-demo: too many certificate requests just now; not asking the daemon \
+                 to certify {sni:?}"
+            );
+            return None;
+        }
+        CertDemoLookup::Fetch => {}
     }
     // The lock is NOT held across the round-trip: a slow issuance must not stall every other
     // connection. Two connections racing on the same cold name each fetch once, then agree.
@@ -7696,6 +7804,7 @@ async fn serve_cert_demo_connection(
     conn: tokio::net::TcpStream,
     socket: &std::path::Path,
     certs: &CertDemoCerts,
+    budget: &CertDemoBudget,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -7706,7 +7815,7 @@ async fn serve_cert_demo_connection(
     let Some(sni) = start.client_hello().server_name().map(str::to_string) else {
         return; // No SNI: nothing to certify, as in Go.
     };
-    let Some(config) = cert_demo_config_for(socket, certs, &sni).await else {
+    let Some(config) = cert_demo_config_for(socket, certs, budget, &sni).await else {
         return;
     };
     let Ok(Ok(mut tls)) = tokio::time::timeout(CERT_DEMO_DEADLINE, start.into_stream(config)).await
@@ -22673,7 +22782,9 @@ users:
 
         let certs: CertDemoCerts =
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-        let first = cert_demo_config_for(&socket, &certs, "host.user.ts.net").await;
+        let budget: CertDemoBudget =
+            std::sync::Arc::new(tokio::sync::Mutex::new(CertDemoFetchBudget::new()));
+        let first = cert_demo_config_for(&socket, &certs, &budget, "host.user.ts.net").await;
         assert!(
             first.is_none(),
             "a name the daemon will not certify has no config to serve"
@@ -22690,7 +22801,7 @@ users:
 
         // The stub is gone now, so a second fetch that went to the daemon would fail differently —
         // this one is answered from the memo, and answers the same.
-        let second = cert_demo_config_for(&socket, &certs, "host.user.ts.net").await;
+        let second = cert_demo_config_for(&socket, &certs, &budget, "host.user.ts.net").await;
         assert!(second.is_none());
         assert_eq!(
             certs.lock().await.len(),
@@ -22699,6 +22810,125 @@ users:
         );
         let _ = std::fs::remove_file(&socket);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_demo_server_stops_asking_the_daemon_once_its_fetch_budget_is_spent() {
+        // The memo cannot bound this on its own: the SNI name is the cache key and the client picks
+        // it, so a caller that never repeats a name misses every time and (past the memo's cap) is
+        // not even remembered. Each miss is a daemon round-trip, and for a certifiable name an ACME
+        // attempt. So the misses are budgeted separately from the memo, and this is that budget:
+        // more distinct names than the budget allows must NOT become more daemon requests.
+        let dir = std::env::temp_dir().join(format!("tnet-demo-budget-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let socket = dir.join("daemon.sock");
+        let _ = std::fs::remove_file(&socket);
+        let listener =
+            tokio::net::UnixListener::bind(&socket).expect("bind the stub daemon socket");
+        // A stub daemon that answers every request and counts them — the count IS the assertion.
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&seen);
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (read, mut write) = tokio::io::split(stream);
+                let mut line = String::new();
+                let _ = tokio::io::BufReader::new(read).read_line(&mut line).await;
+                let _ = write
+                    .write_all(b"{\"kind\":\"error\",\"message\":\"no cert for that domain\"}\n")
+                    .await;
+            }
+        });
+
+        let certs: CertDemoCerts =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let budget: CertDemoBudget =
+            std::sync::Arc::new(tokio::sync::Mutex::new(CertDemoFetchBudget::new()));
+        let names: Vec<String> = (0..MAX_CERT_DEMO_FETCHES_PER_WINDOW + 8)
+            .map(|i| format!("scan{i}.user.ts.net"))
+            .collect();
+        for name in &names {
+            // Every one of these is a name the daemon refuses, so none of them can be served —
+            // what differs is whether the daemon was asked at all.
+            assert!(
+                cert_demo_config_for(&socket, &certs, &budget, name)
+                    .await
+                    .is_none(),
+                "the stub daemon certifies nothing, so {name} has no config"
+            );
+        }
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_CERT_DEMO_FETCHES_PER_WINDOW,
+            "{} distinct names must still cost at most one window's budget in daemon requests",
+            names.len()
+        );
+
+        // The budget rations the misses, not the memo: a name already answered for is still served
+        // from the memo with the budget spent, and costs no round-trip.
+        let memoized = cert_demo_config_for(&socket, &certs, &budget, &names[0]).await;
+        assert!(
+            memoized.is_none(),
+            "that name was refused, and is remembered"
+        );
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_CERT_DEMO_FETCHES_PER_WINDOW,
+            "a memo hit must not reach the daemon"
+        );
+        let _ = std::fs::remove_file(&socket);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_demo_fetch_budget_refills_only_when_its_window_rolls_over() {
+        // `take` reads its clock from the caller, so the window boundary is exercised here without
+        // sleeping through a minute of it.
+        let opened = std::time::Instant::now();
+        let mut budget = CertDemoFetchBudget::new();
+        for i in 0..MAX_CERT_DEMO_FETCHES_PER_WINDOW {
+            assert!(budget.take(opened), "fetch {i} is inside the first window");
+        }
+        assert!(
+            !budget.take(opened + CERT_DEMO_FETCH_WINDOW / 2),
+            "a spent window does not refill part-way through"
+        );
+        assert!(
+            budget.take(opened + CERT_DEMO_FETCH_WINDOW),
+            "the next window starts fresh — a shed connection is a delay, not a ban"
+        );
+
+        // A memo hit is answered without consulting the budget at all, so a demo answering for the
+        // same few names keeps working at any connection rate.
+        let certs: CertDemoCerts =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        certs
+            .lock()
+            .await
+            .insert("host.user.ts.net".to_string(), None);
+        let spent: CertDemoBudget =
+            std::sync::Arc::new(tokio::sync::Mutex::new(CertDemoFetchBudget::new()));
+        for _ in 0..MAX_CERT_DEMO_FETCHES_PER_WINDOW {
+            assert!(spent.lock().await.take(opened));
+        }
+        assert!(
+            matches!(
+                cert_demo_lookup(&certs, &spent, "host.user.ts.net", opened).await,
+                CertDemoLookup::Memoized(None)
+            ),
+            "a memoized name is answered from the memo, spent budget or not"
+        );
+        assert!(
+            matches!(
+                cert_demo_lookup(&certs, &spent, "other.user.ts.net", opened).await,
+                CertDemoLookup::Shed
+            ),
+            "an unmemoized name with no budget left is shed instead of asked for"
+        );
     }
 
     #[test]
