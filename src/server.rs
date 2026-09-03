@@ -1042,19 +1042,25 @@ async fn dispatch(
         // free function — which mirrors `drive_set`'s three-phase lock discipline — rather than holding
         // the backend lock across the multi-second `Device::new` handshake. The daemon re-reads + merges
         // + persists under a brief lock, then rebuilds off-lock if a device is up; a node-down reload
-        // just persists (applies on the next `up`). `reload_config` fails clearly when there is no
-        // `--config` in use or the file is now malformed (running node untouched). The reconciled
-        // `ReloadAction` comes back so the success message can say which of those happened.
+        // just persists (applies on the next `up`). `reload_config` fails only when the
+        // file is now malformed (running node untouched); NOT being in config mode is a refusal, not
+        // a failure.
+        //
+        // The reply is Go's bare `ok` bool and nothing else. `LocalBackend.ReloadConfig` returns
+        // `(ok bool, err error)` and the CLI — not the backend — owns the two operator-facing lines,
+        // so the daemon deliberately sends no sentence of its own here: any wording invented at this
+        // layer would diverge from `tailscale debug reload-config`'s output. The reconciled
+        // `ReloadAction` is logged rather than returned, which is where it is actually useful (an
+        // operator reading the daemon log after a reload that stopped their node).
         Request::ReloadConfig => match ipn::drive_reload_config(backend).await {
-            // The reconcile that actually ran decides the confirmation: a generic "reloaded" cannot
-            // tell the operator whether their edit is RUNNING (the engine was rebuilt), whether it
-            // STOPPED the node (a reloaded `Enabled:false`), or whether it is only on disk awaiting
-            // the next `up` (node down). `ReloadAction::outcome_message` owns those strings.
-            Ok(action) => {
+            Ok(Some(action)) => {
                 tracing::info!(?action, "reload-config reconciled");
-                Response::Ok {
-                    message: action.outcome_message().to_string(),
-                }
+                Response::ReloadConfig { reloaded: true }
+            }
+            // Go's `(false, nil)`: no config in use, so nothing was reloaded and nothing failed.
+            Ok(None) => {
+                tracing::info!("reload-config: config mode not in use");
+                Response::ReloadConfig { reloaded: false }
             }
             Err(e) => Response::Error {
                 message: format!("{e:#}"),
