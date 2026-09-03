@@ -1,5 +1,12 @@
 {
   "schema": "parity-audit/v1",
+  "summary": {
+    "auditedPrs": 10,
+    "faithful": 5,
+    "gaps": 5,
+    "findings": 7,
+    "note": "Counted from the rows below, and consistent with them: every `gaps` row has at least one entry in `findings`, every `faithful` row has none. The description of the pull request that added this file said six faithful and four gaps. That miscounted #294, whose empty-`--nickname` divergence is recorded in `findings` and whose verdict here is `gaps`. The numbers in this block are the correct ones."
+  },
   "auditedPrs": [
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/293",
@@ -76,6 +83,13 @@
       "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/296",
       "title": "The kubeconfig parent directory is created one level deep where Go creates the whole tree",
       "detail": "setKubeconfigForPeer stats the target's parent and, when it does not exist, calls `os.MkdirAll(dir, 0755)` - so `KUBECONFIG=/var/tmp/a/b/config tailscale configure kubeconfig <peer>` creates a/b and writes the file. The merged set_kubeconfig_for_peer uses a single std::fs::DirBuilder::create, and its comment cites Go as `os.Mkdir(dir, 0755)`, 'one level, not MkdirAll'. Against the ref that citation is wrong, and the same command line fails with 'creating /var/tmp/a/b' where Go succeeds.",
+      "upstream": "cmd/tailscale/cli/configure-kube.go @ 53a0d659afa51835dd7a9283873cca44261454f8",
+      "severity": "minor"
+    },
+    {
+      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/296",
+      "title": "Go's checkKubeconfigWritable precheck was not ported, so an unwritable kubeconfig fails late and in other words",
+      "detail": "runConfigureKubeconfig calls `checkKubeconfigWritable(kubeconfigPath())` once the peer FQDN is resolved and before setKubeconfigForPeer touches anything. It walks from the target path up to the nearest existing ancestor, probes that with isWritable - a temp-file create-and-remove for a directory, an O_WRONLY open for a file - and on failure returns kubeconfigAccessErr: `cannot write kubeconfig at %q: %w`, with a sentence pointing at the open-source tailscaled distribution when the build is a sandboxed macOS GUI. The merged run_configure_kubeconfig has no equivalent. set_kubeconfig_for_peer discovers the problem only by acting, so an unwritable kubeconfig surfaces as whichever step fails first - `creating <dir>`, `reading kubeconfig <path>` or `opening kubeconfig <path> for writing` - the last of those only after the merge has already been computed, and the sandbox guidance is absent entirely. Both refuse and neither writes a partial file, so this is a message-and-ordering divergence rather than lost data. It is the second divergence PR #296's auditedPrs note names; only the parent-directory one had a finding.",
       "upstream": "cmd/tailscale/cli/configure-kube.go @ 53a0d659afa51835dd7a9283873cca44261454f8",
       "severity": "minor"
     },
