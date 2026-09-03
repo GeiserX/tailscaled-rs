@@ -1,0 +1,104 @@
+{
+  "schema": "parity-audit/v1",
+  "auditedPrs": [
+    {
+      "url": "https://github.com/GeiserX/tailscaled-rs/pull/293",
+      "verdict": "gaps",
+      "notes": "serve/funnel refusal ordering, zero-is-unset ports, --tun as the fifth serve type, --bg=false and the acceptAppCapsFlag grammar all match serve_v2.go. Two refusals from the same functions did not come across: the too-high port error and the literal 'Error: ' prefix on both --service refusals."
+    },
+    {
+      "url": "https://github.com/GeiserX/tailscaled-rs/pull/294",
+      "verdict": "gaps",
+      "notes": "The --exit-node-allow-lan-access refusal matches prefsFromUpArgs verbatim, including the up-only scope (Go registers --nickname on login, not up, so the up side is right). The --nickname profile rename matches setProfilePrefs for a non-empty name; the empty-name arm diverges."
+    },
+    {
+      "url": "https://github.com/GeiserX/tailscaled-rs/pull/296",
+      "verdict": "gaps",
+      "notes": "updateKubeconfig, appendOrSetNamed, kubeconfigPath's KUBECONFIG walk, the 0600 write and the two-way Service lookup all match configure-kube.go. The parent-directory creation was narrowed from Go's MkdirAll to a single level, and Go's checkKubeconfigWritable precheck has no analogue."
+    },
+    {
+      "url": "https://github.com/GeiserX/tailscaled-rs/pull/297",
+      "verdict": "faithful",
+      "notes": "Fork-internal failure ordering: it stops a failed profiles.json rename from skipping the engine reconcile. Go writes prefs and the login profile through one profileManager path, so there is no upstream behaviour this can diverge from; nothing in the success path moves."
+    },
+    {
+      "url": "https://github.com/GeiserX/tailscaled-rs/pull/299",
+      "verdict": "faithful",
+      "notes": "Backlog wording plus a test that drives the built tnet binary. Its factual claims check out against up.go at the pin: --auth-key and --login-server are registered on up, --nickname only on login."
+    },
+    {
+      "url": "https://github.com/GeiserX/tailscaled-rs/pull/301",
+      "verdict": "gaps",
+      "notes": "switch remove on the current profile is now Go's exit-0 no-op, ordered before the fork's default-profile refusal, and first-hit name matching now matches matchProfile's third pass. The pass through switch itself still diverges: an unmatched target is created rather than refused."
+    },
+    {
+      "url": "https://github.com/GeiserX/tailscaled-rs/pull/302",
+      "verdict": "faithful",
+      "notes": "Verified against tailscaled.go at the pin: the flag is declared, the empty-path carve-out matches the birdSocketPath != \"\" guard, and the refusal precedes the cleanup exit (line 290 vs line 520). The reworded reason is stated as a deliberate departure in the commit."
+    },
+    {
+      "url": "https://github.com/GeiserX/tailscaled-rs/pull/303",
+      "verdict": "faithful",
+      "notes": "Verb sets, the accepted bare parent, the 'unsupported command:' opening and the standalone-vs-GUI split all match configure_apple.go. Naming the refused verb and registering on Linux are declared departures; the out-of-scope ruling matches how Go gates the other six."
+    },
+    {
+      "url": "https://github.com/GeiserX/tailscaled-rs/pull/300",
+      "verdict": "faithful",
+      "notes": "Matches runFileGetOneBatch: the moved tally goes to errs when the drain cleared nothing from a non-empty inbox and to the verbose line otherwise, never both, and runFileGet's split of all-but-last to stdout and the last as the command error is reproduced."
+    },
+    {
+      "url": "https://github.com/GeiserX/tailscaled-rs/pull/304",
+      "verdict": "gaps",
+      "notes": "Argument-count-before-flag ordering, unknown network, the family filter's no-suitable-address error and the IP-literal short circuit all match runDebugResolve and the resolver it calls. The empty-hostname message does not."
+    }
+  ],
+  "gate": {
+    "ran": true,
+    "pass": true,
+    "detail": "On main at 0ae1de7 with CARGO_BUILD_JOBS=4, RUST_TEST_THREADS=4, TS_RS_EXPERIMENT set. cargo fmt --all --check: exit 0. cargo clippy --all-targets -- -D warnings: exit 0. cargo test --all-targets: exit 0, 816 tests passed across 26 targets, 0 failed. cargo build --release --bins: exit 0."
+  },
+  "findings": [
+    {
+      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/301",
+      "title": "A switch target that matches no profile is created instead of refused",
+      "detail": "Go's switchProfile calls matchProfile and, on a miss, prints 'No profile named %q' and exits 1 - it never creates a profile. The merged Backend::switch_profile falls through a resolver miss to `None if profile::is_valid_profile_id(target) => target` and treats the unmatched string as a new profile id: it tears down the live device, registers the id in profiles.json, repoints the current-profile pointer and comes up on empty prefs. So a mistyped `tnet switch wrok-laptop` disconnects the node into a brand-new empty profile where `tailscale switch wrok-laptop` would have refused and left the session alone. PR #301 fixes the adjacent tie case in resolve_target_to_id and names this hazard in its own commit body, but leaves the create-on-miss path in place.",
+      "upstream": "cmd/tailscale/cli/switch.go @ 53a0d659afa51835dd7a9283873cca44261454f8",
+      "severity": "major"
+    },
+    {
+      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/293",
+      "title": "Go's too-high serve port refusal was dropped from the ported srvTypeAndPortFromFlags",
+      "detail": "srvTypeAndPortFromFlags reads the four listener flags as plain uints and refuses an out-of-range one itself: `if v > math.MaxUint16 { return 0, 0, fmt.Errorf(\"port number %d is too high for %s flag\", v, srvType) }`, which runServeCombined prints as `error: ...` followed by the command help, exit 1. The merged ServeFlags types https/http/tcp/tls_terminated_tcp as Option<u16>, so `tnet serve --https=70000 3000` dies in clap with 'invalid value ... is not in 0..=65535' and exit 2 before serve_kind_and_port is reached. The same diff ported the zero-is-unset and 'cannot serve multiple types' rules out of that one function, and widened --proxy-protocol to u64 for exactly this reason, so the omission is inconsistent with its own approach.",
+      "upstream": "cmd/tailscale/cli/serve_v2.go @ 53a0d659afa51835dd7a9283873cca44261454f8",
+      "severity": "minor"
+    },
+    {
+      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/296",
+      "title": "The kubeconfig parent directory is created one level deep where Go creates the whole tree",
+      "detail": "setKubeconfigForPeer stats the target's parent and, when it does not exist, calls `os.MkdirAll(dir, 0755)` - so `KUBECONFIG=/var/tmp/a/b/config tailscale configure kubeconfig <peer>` creates a/b and writes the file. The merged set_kubeconfig_for_peer uses a single std::fs::DirBuilder::create, and its comment cites Go as `os.Mkdir(dir, 0755)`, 'one level, not MkdirAll'. Against the ref that citation is wrong, and the same command line fails with 'creating /var/tmp/a/b' where Go succeeds.",
+      "upstream": "cmd/tailscale/cli/configure-kube.go @ 53a0d659afa51835dd7a9283873cca44261454f8",
+      "severity": "minor"
+    },
+    {
+      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/304",
+      "title": "An empty hostname reports the wrong resolver error",
+      "detail": "runDebugResolve hands args[0] straight to net.DefaultResolver.LookupIP, which guards the empty host with `newDNSError(errNoSuchHost, host, \"\")`; errNoSuchHost is 'no such host' and DNSError.Error() renders 'lookup ' + Name + ': ' + Err, so `tailscale debug resolve \"\"` prints 'lookup : no such host'. The merged resolve_lookup bails with 'lookup : no suitable address found' - the string LookupIP uses for the different case where the family filter empties a non-empty result (errNoSuitableAddress). The two upstream failures are now indistinguishable: 'you gave me no name' reads as 'that name has no address of the family you asked for'.",
+      "upstream": "cmd/tailscale/cli/debug.go @ 53a0d659afa51835dd7a9283873cca44261454f8, reaching src/net/lookup.go @ tailscale/go 7275f792d406d3c386cc807937a45a4a7b699d42 (the toolchain rev go.toolchain.rev pins at that tailscale ref)",
+      "severity": "minor"
+    },
+    {
+      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/294",
+      "title": "An empty --nickname blanks the profile display name where Go restores the login name",
+      "detail": "setProfilePrefs is an if/else, not a guarded set: `if prefsIn.ProfileName() != \"\" { lp.Name = prefsIn.ProfileName() } else { lp.Name = up.LoginName }`. Go therefore never leaves a profile with a blank Name - clearing the nickname puts the account's login name back, which is what switch --list prints in its Account column and what matchProfile's third pass resolves against. The merged begin_set calls rename_current_profile(name.as_deref().unwrap_or(\"\")), storing an empty name, and both readers then fall back to the profile id. So after `tnet set --nickname=` the profile is addressable only by id, where Go leaves it addressable by login name. The commit body acknowledges the fallback differs; the daemon holds no login name to substitute, so closing this needs the value to be tracked first.",
+      "upstream": "ipn/ipnlocal/profiles.go @ 53a0d659afa51835dd7a9283873cca44261454f8",
+      "severity": "minor"
+    },
+    {
+      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/293",
+      "title": "Both --service refusals drop Go's literal 'Error: ' prefix",
+      "detail": "runServeCombined returns `errors.New(\"Error: --service flag is not supported with funnel\")` and `errors.New(\"Error: --service flag is only compatible with background mode\")` - the prefix is part of the string upstream, not added by a printer. check_serve_flags bails with those two lines minus the prefix, while the commit states the refusals land 'in Go's words'. A script matching upstream's stderr exactly does not match here.",
+      "upstream": "cmd/tailscale/cli/serve_v2.go @ 53a0d659afa51835dd7a9283873cca44261454f8",
+      "severity": "minor"
+    }
+  ]
+}
