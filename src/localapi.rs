@@ -712,10 +712,14 @@ pub enum Request {
     /// updated prefs to actually adopt the change (a brief reconnect, like a rebuild-only `set`); if the
     /// node is down, the merged prefs apply on the next `up`. A **write** — gated like `up`/`down`: Go
     /// gates `serveReloadConfig` on `PermitWrite`, and it reconfigures the running node. Fails with a
-    /// clear error when the daemon was started WITHOUT `--config` (there is nothing to reload) or when
-    /// the config file is now malformed (rejected with the running node untouched — the fail-fast
-    /// contract). Replies with [`Response::Ok`]/[`Response::Error`]. NOTE: a reloaded config's `AuthKey`
-    /// is deliberately ignored (a reload is not a re-registration — see the daemon's `reload_config`).
+    /// clear error ONLY when the config file is now malformed (rejected with the running node
+    /// untouched — the fail-fast contract); that is the [`Response::Error`] arm. A daemon started
+    /// WITHOUT `--config` is NOT an error: there is nothing to reload, so it replies
+    /// [`Response::ReloadConfig`] `{ reloaded: false }` — Go's `(false, nil)` — and the CLI decides
+    /// what that means to an operator. So the reply is [`Response::ReloadConfig`] (Go's `ok` bool) on
+    /// both non-failing paths, and [`Response::Error`] only on a genuine failure. NOTE: a reloaded
+    /// config's `AuthKey` is deliberately ignored (a reload is not a re-registration — see the
+    /// daemon's `reload_config`).
     ReloadConfig,
 }
 
@@ -891,6 +895,24 @@ pub enum Response {
     /// The node's serve configuration (reply to [`Request::GetServeConfig`]), rendered by
     /// `tnet serve status`.
     ServeConfig(ServeConfig),
+    /// The result of a [`Request::ReloadConfig`] — the faithful analogue of what Go's
+    /// `LocalBackend.ReloadConfig` hands back to its CLI: a bare `ok` bool.
+    ///
+    /// Go splits this verb across two layers, and so do we. The backend answers only "did I reload a
+    /// config?"; `cmd/tailscale/cli/debug.go`'s `reloadConfig` owns BOTH operator-facing lines
+    /// (`config reloaded` on ok, `config mode not in use` + exit 1 otherwise). Keeping the daemon
+    /// wordless here is what keeps `tnet reload-config`'s output byte-identical to `tailscale debug
+    /// reload-config`'s — a daemon-authored sentence on this path is a divergence by construction.
+    ///
+    /// Note what is NOT here: which reconcile ran (rebuild / bring-down / persisted-only). Go has no
+    /// such field, so it stays daemon-side, in the log line the server emits.
+    ReloadConfig {
+        /// Go's `ok`: `true` when the config file was re-read and adopted; `false` when the daemon is
+        /// not in config mode (started without `--config`, or with an `optional:` source that was not
+        /// found) and there was therefore nothing to reload. `false` is a REFUSAL, not a failure —
+        /// nothing was mutated, and no error occurred.
+        reloaded: bool,
+    },
     /// A command succeeded.
     Ok {
         /// Human-readable detail.
@@ -2190,6 +2212,27 @@ mod tests {
         assert!(matches!(
             serde_json::from_str::<Request>(r#"{"cmd":"reload_config"}"#).unwrap(),
             Request::ReloadConfig
+        ));
+    }
+
+    #[test]
+    fn response_reload_config_carries_only_gos_ok_bool() {
+        // The reply to `reload_config` is Go's `(ok bool, ...)` and nothing more — the CLI derives
+        // both of its lines from this bool. Pin the discriminant and the field (separate processes
+        // agree only on this JSON), and pin the ABSENCE of a daemon-authored message: adding one back
+        // is how the CLI's output drifts away from `tailscale debug reload-config`'s.
+        assert_eq!(
+            serde_json::to_string(&Response::ReloadConfig { reloaded: true }).unwrap(),
+            r#"{"kind":"reload_config","reloaded":true}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Response::ReloadConfig { reloaded: false }).unwrap(),
+            r#"{"kind":"reload_config","reloaded":false}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<Response>(r#"{"kind":"reload_config","reloaded":false}"#)
+                .unwrap(),
+            Response::ReloadConfig { reloaded: false }
         ));
     }
 

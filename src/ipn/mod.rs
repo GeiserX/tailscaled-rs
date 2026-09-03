@@ -1024,20 +1024,27 @@ pub async fn drive_set(
 ///
 /// ## Returns
 ///
-/// The [`ReloadAction`] that was actually reconciled — the reload's *outcome*, not just its success:
-/// `Rebuild` (the config is live on a rebuilt engine), `BringDown` (the reloaded `Enabled:false`
-/// stopped the node), or `PersistedOnly` (node down; the merged prefs apply on the next `up`). The
-/// LocalAPI server turns it into the operator-facing confirmation via
-/// [`ReloadAction::outcome_message`], because "reloaded" alone cannot tell an operator whether their
-/// edit is running yet.
+/// `Ok(Some(action))` with the [`ReloadAction`] that was actually reconciled — `Rebuild` (the config
+/// is live on a rebuilt engine), `BringDown` (the reloaded `Enabled:false` stopped the node), or
+/// `PersistedOnly` (node down; the merged prefs apply on the next `up`). The action is logged by the
+/// LocalAPI server; the wire reply carries only Go's `ok` bool, because that is all Go's
+/// `serveReloadConfig` returns and the CLI's wording is derived from it.
+///
+/// `Ok(None)` is Go's `(false, nil)`: the daemon is not in config mode, so there was nothing to
+/// reload and nothing was reconciled. It is a refusal, not an error — see
+/// [`reload_config`](Backend::reload_config).
 pub async fn drive_reload_config(
     backend: &std::sync::Arc<tokio::sync::Mutex<Backend>>,
-) -> Result<ReloadAction> {
+) -> Result<Option<ReloadAction>> {
     // Phase 1: brief lock — re-read the config, merge + persist, and decide the reconcile action.
     let action = {
         let mut be = backend.lock().await;
         be.reload_config().await
     }?;
+    // Not in config mode → no reconcile to run, and nothing was mutated.
+    let Some(action) = action else {
+        return Ok(None);
+    };
 
     match action {
         // Node down: persisting the merged prefs was the whole job; they apply on the next `up`.
@@ -1058,10 +1065,10 @@ pub async fn drive_reload_config(
         ReloadAction::Rebuild => rebuild_running_device(backend, "reload-config").await?,
     }
 
-    // Report WHICH reconcile actually ran, so the caller (the LocalAPI server) can tell the operator
-    // whether the reloaded config is already live (`Rebuild`/`BringDown`) or only persisted for the
-    // next `up` (`PersistedOnly`) — see [`ReloadAction::outcome_message`].
-    Ok(action)
+    // Report WHICH reconcile actually ran so the daemon can log it: the wire reply is Go's bare `ok`,
+    // but "the engine was rebuilt" vs "the node was brought down" vs "only persisted" is exactly what
+    // an operator reading the daemon log after an unexpected disconnect needs.
+    Ok(Some(action))
 }
 
 /// A single live engine pref-setter that [`Backend::begin_set`] issued (under its brief lock) to
@@ -4254,17 +4261,21 @@ impl Backend {
     /// v1.100.0). Used when an operator edits the declarative config and wants the changes adopted
     /// without restarting the daemon.
     ///
-    /// Returns `Ok(true)` when a device is currently up (so the caller — [`drive_reload_config`] — must
-    /// rebuild the running engine from the now-updated prefs to actually adopt the change) and
-    /// `Ok(false)` when the node is down (persisting the merged prefs was the whole job; they apply on
-    /// the next `up`). This mirrors the `begin_set` → [`SetAction`] split: a brief lock applies +
-    /// persists + decides, and the off-lock rebuild (if any) is the caller's job so the multi-second
-    /// `Device::new` never runs under the backend lock.
+    /// Returns `Ok(Some(action))` with the [`ReloadAction`] the caller — [`drive_reload_config`] — must
+    /// run to reconcile the live engine with the now-updated prefs, and `Ok(None)` when the daemon is
+    /// **not in config mode** (no `--config` source in use). That `Option` is Go's `(ok bool, err
+    /// error)` shape: `LocalBackend.ReloadConfig` returns `(false, nil)` — a refusal, not an error —
+    /// when `b.conf == nil`, and the CLI turns that into its own "config mode not in use" line. The
+    /// `Some` half mirrors the `begin_set` → [`SetAction`] split: a brief lock applies + persists +
+    /// decides, and the off-lock rebuild (if any) is the caller's job so the multi-second `Device::new`
+    /// never runs under the backend lock.
     ///
     /// ## Faithful behavior
     ///
-    /// - **No `--config` in use** → a clear error. Go's `ReloadConfig` likewise errors when there is no
-    ///   config file to reload; reloading is meaningless without one.
+    /// - **No `--config` in use** → `Ok(None)`, never an `Err`. Go's `ReloadConfig` returns
+    ///   `(false, nil)` here, and only its CLI decides what that means to an operator (a printed line
+    ///   plus exit 1). Reporting it as a daemon error would put the refusal on the wrong layer and
+    ///   give it the wrong wording.
     /// - **Malformed / unsupported-version file** → fails HARD (the error is propagated, NOTHING is
     ///   mutated or persisted). This is the same fail-fast contract as boot ([`conffile::load`] +
     ///   `apply_to_prefs`, which validates every field BEFORE touching `prefs`), so a bad reload can
@@ -4282,15 +4293,15 @@ impl Backend {
     /// changed authkey on a live node would force a surprise re-registration — strictly more than a
     /// "reload my settings" verb should do, so we do not. (This is the one deliberate narrowing vs. Go's
     /// boot path, where the key is consumed at first bring-up; flagged in the type docs.)
-    pub async fn reload_config(&mut self) -> Result<ReloadAction> {
+    pub async fn reload_config(&mut self) -> Result<Option<ReloadAction>> {
         let source = match &self.config_source {
             Some(s) => s.clone(),
-            None => {
-                return Err(anyhow!(
-                    "no --config source in use; reload-config requires the daemon to have been \
-                     started with --config (and, for an `optional:` source, to have found it)"
-                ));
-            }
+            // Not in config mode — the daemon was started without `--config` (or with an `optional:`
+            // source that was not found). Go's `ReloadConfig` returns `(false, nil)` here: there is
+            // nothing to reload, but nothing FAILED either. The refusal is logged once, by the
+            // LocalAPI server's `Ok(None)` arm, beside the log of the reconcile that the other arm
+            // ran; the CLI owns the user-facing wording and the exit code.
+            None => return Ok(None),
         };
         // Re-read + re-parse + version-gate the file, with context on failure (a malformed or
         // unsupported-version file is rejected here, before any mutation — the same fail-hard contract
@@ -4321,11 +4332,13 @@ impl Backend {
         //     down node sets intent up; it comes up on the next auto-start/`up`, NOT mid-reload —
         //     matching how a down node treats a re-applied up-intent, and avoiding a reload silently
         //     originating a connection).
-        Ok(match (self.device.is_some(), self.prefs.want_running) {
-            (true, true) => ReloadAction::Rebuild,
-            (true, false) => ReloadAction::BringDown,
-            (false, _) => ReloadAction::PersistedOnly,
-        })
+        Ok(Some(
+            match (self.device.is_some(), self.prefs.want_running) {
+                (true, true) => ReloadAction::Rebuild,
+                (true, false) => ReloadAction::BringDown,
+                (false, _) => ReloadAction::PersistedOnly,
+            },
+        ))
     }
 }
 
@@ -4333,6 +4346,10 @@ impl Backend {
 /// the freshly-merged-and-persisted config prefs. The prefs are ALREADY applied + persisted by the
 /// time this is returned (including `want_running`, which Go's config reload always re-applies); this
 /// only tells [`drive_reload_config`] how to bring the live engine into line.
+///
+/// It is DAEMON-side detail, not an operator-facing outcome: Go's `reload-config` LocalAPI route
+/// returns a bare `ok` bool and its CLI prints one fixed line, so this action is logged (with the
+/// reconcile it drove) rather than rendered into the reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReloadAction {
     /// Node down → nothing live to reconcile; the persisted prefs apply on the next `up`/auto-start.
@@ -4343,37 +4360,6 @@ pub enum ReloadAction {
     /// Node up but the reloaded config set `Enabled:false` (`want_running=false`) → tear the engine
     /// down to match the already-persisted intent (Go applies a reloaded `Enabled:false`).
     BringDown,
-}
-
-impl ReloadAction {
-    /// The operator-facing confirmation for a `reload-config` that reconciled via this action — what
-    /// the LocalAPI server returns (and `tnet reload-config` prints) on success.
-    ///
-    /// A bare "configuration reloaded" is ambiguous in the one way that matters: it cannot tell an
-    /// operator whether the edit they just made is RUNNING or merely on disk awaiting the next `up`.
-    /// The three outcomes are materially different, so each says which happened:
-    ///
-    /// * [`Rebuild`](ReloadAction::Rebuild) — the engine was rebuilt, so the config is live now (and
-    ///   the node briefly reconnected to get there — worth saying, since the operator may have seen
-    ///   the blip).
-    /// * [`BringDown`](ReloadAction::BringDown) — the reloaded `Enabled:false` STOPPED the node. A
-    ///   generic success line here would read as "all good" to an operator who just lost their tunnel.
-    /// * [`PersistedOnly`](ReloadAction::PersistedOnly) — the node was down, so nothing was applied
-    ///   live; the merged prefs take effect on the next `up`.
-    ///
-    /// The strings deliberately share the `configuration reloaded` prefix so the success shape stays
-    /// recognizable (and greppable) across all three.
-    pub fn outcome_message(self) -> &'static str {
-        match self {
-            ReloadAction::Rebuild => "configuration reloaded; engine rebuilt (brief reconnect)",
-            ReloadAction::BringDown => {
-                "configuration reloaded; node brought down (config set Enabled:false)"
-            }
-            ReloadAction::PersistedOnly => {
-                "configuration reloaded; node is down, so it applies on the next up"
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -7727,11 +7713,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reload_config_without_config_source_errors_clearly() {
+    async fn reload_config_without_config_source_refuses_without_erroring() {
         // `reload_config` re-reads the `--config` file the daemon was started with. A daemon launched
-        // WITHOUT `--config` has nothing to reload (`config_source` is None) — it must fail with a clear,
-        // actionable error (matching Go's ReloadConfig, which errors when there is no config file),
-        // never silently no-op or panic.
+        // WITHOUT `--config` has nothing to reload (`config_source` is None). Go's
+        // `LocalBackend.ReloadConfig` returns `(false, nil)` for exactly this case — a REFUSAL, not a
+        // failure — and leaves the wording and the exit code to its CLI. So this must be `Ok(None)`:
+        // an `Err` here would be a daemon-authored error string on the wire, which is both the wrong
+        // layer and the wrong words.
         let dir =
             std::env::temp_dir().join(format!("tailnetd-reloadcfg-none-{}", std::process::id()));
         let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -7742,14 +7730,17 @@ mod tests {
             "a backend with no --config has config_source None"
         );
 
-        let err = be
-            .reload_config()
-            .await
-            .expect_err("reload_config must error when no --config is in use");
-        let msg = err.to_string();
+        let outcome = be.reload_config().await.expect(
+            "not being in config mode is a refusal, not an error (Go returns (false, nil))",
+        );
+        assert_eq!(
+            outcome, None,
+            "no --config in use → None (Go's ok=false), never a reconcile action"
+        );
+        // And it stayed a no-op: nothing was configured or persisted by the refusal.
         assert!(
-            msg.contains("no --config") && msg.contains("reload-config"),
-            "the error must explain that reload-config needs --config: {msg}"
+            !be.ever_configured,
+            "a refused reload must not mark the node configured"
         );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -7783,7 +7774,7 @@ mod tests {
         let action = be.reload_config().await.expect("reload_config succeeds");
         assert_eq!(
             action,
-            ReloadAction::PersistedOnly,
+            Some(ReloadAction::PersistedOnly),
             "a down node (device: None) needs no live reconcile — the merged prefs apply on the next up"
         );
         // The config's fields landed on the in-memory prefs.
@@ -7846,7 +7837,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             be.reload_config().await.unwrap(),
-            ReloadAction::PersistedOnly,
+            Some(ReloadAction::PersistedOnly),
             "down node → PersistedOnly regardless of Enabled"
         );
         assert!(
@@ -7863,7 +7854,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             be.reload_config().await.unwrap(),
-            ReloadAction::PersistedOnly,
+            Some(ReloadAction::PersistedOnly),
             "still a down node → PersistedOnly (the live BringDown path needs a real device)"
         );
         assert!(
@@ -7877,60 +7868,6 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
-    }
-
-    #[test]
-    fn reload_action_outcome_message_distinguishes_the_three_reconciles() {
-        // The `reload-config` success line is all the operator gets back, and a bare "configuration
-        // reloaded" cannot answer the question they actually have: is my edit RUNNING? The three
-        // reconciles are materially different (live on a rebuilt engine / the node was just stopped /
-        // nothing applied yet), so each must say which one happened. Drive the production
-        // `outcome_message` for every variant — never a copy of its strings reassembled here.
-        let rebuild = ReloadAction::Rebuild.outcome_message();
-        let bring_down = ReloadAction::BringDown.outcome_message();
-        let persisted = ReloadAction::PersistedOnly.outcome_message();
-
-        // (1) All three differ — the whole point of splitting the message.
-        assert_ne!(
-            rebuild, bring_down,
-            "a rebuild and a bring-down must not read the same"
-        );
-        assert_ne!(
-            rebuild, persisted,
-            "a live rebuild must not read like a persisted-only reload"
-        );
-        assert_ne!(
-            bring_down, persisted,
-            "a bring-down must not read like a persisted-only reload"
-        );
-
-        // (2) All three keep the shared, greppable success prefix (the success shape is stable).
-        for msg in [rebuild, bring_down, persisted] {
-            assert!(
-                msg.starts_with("configuration reloaded"),
-                "every outcome keeps the `configuration reloaded` prefix: {msg}"
-            );
-        }
-
-        // (3) Each names what happened to the live node.
-        assert!(
-            rebuild.contains("rebuilt"),
-            "the rebuild outcome must say the engine was rebuilt: {rebuild}"
-        );
-        assert!(
-            bring_down.contains("brought down"),
-            "a reloaded Enabled:false stopped the node — the message must say so, not just \
-             report success: {bring_down}"
-        );
-        assert!(
-            persisted.contains("next up"),
-            "the persisted-only outcome must point at the next `up`: {persisted}"
-        );
-        // ...and the persisted-only line must NOT claim anything was applied to a live engine.
-        assert!(
-            !persisted.contains("rebuilt"),
-            "a node-down reload rebuilt nothing: {persisted}"
-        );
     }
 
     #[tokio::test]

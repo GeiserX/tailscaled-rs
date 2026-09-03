@@ -312,37 +312,84 @@ async fn down_round_trip_then_status_is_no_state() {
     harness.shutdown_and_verify().await;
 }
 
-/// `reload-config` over the real socket, on a node that is DOWN: the daemon must answer with the
-/// outcome-specific success line, not a generic "reloaded".
+/// `reload-config` end to end over the real socket: the daemon answers with Go's bare `ok` bool, and
+/// the CLI turns that bool into the exact bytes `tailscale debug reload-config` writes.
 ///
-/// A `reload-config` reconciles one of three ways (`ipn::ReloadAction`), and only one of them makes
-/// the operator's edit live: `Rebuild` (engine rebuilt from the new prefs), `BringDown` (the reloaded
-/// `Enabled:false` stopped the node), or `PersistedOnly` (node down — the merged prefs sit on disk
-/// until the next `up`). The daemon returns the reconciled action from `ipn::drive_reload_config` and
-/// renders it with `ReloadAction::outcome_message`, so the confirmation answers "is my edit running?"
-/// instead of leaving the operator to guess.
+/// Go splits this verb in two. `LocalBackend.ReloadConfig` returns `(ok bool, err error)` — `(true,
+/// nil)` when a config was re-read, `(false, nil)` when the daemon holds no config at all — and
+/// `cmd/tailscale/cli/debug.go`'s `reloadConfig` turns that bool into the only two lines an operator
+/// ever sees: `config reloaded` on ok, or `config mode not in use` followed by `os.Exit(1)`. Both go
+/// to STDOUT via `printf`, so neither carries an `error:` prefix. Keeping the split means the daemon
+/// must NOT author a sentence of its own: a message on this path is wording Go does not have, so a
+/// script grepping Go's output against this daemon would find nothing.
 ///
-/// This drives the whole production path over the wire — dispatch → `drive_reload_config` →
-/// `Backend::reload_config` → the message — for the one arm reachable offline (`PersistedOnly`; the
-/// live `Rebuild`/`BringDown` arms need a real engine, i.e. the gated e2e). It also pins the error
-/// path that precedes it: a daemon started WITHOUT `--config` has nothing to reload and must say so
-/// rather than report a success.
+/// This drives the whole production path — the built `tnet` binary → the socket → dispatch →
+/// `ipn::drive_reload_config` → `Backend::reload_config` → the reply → the printed line and the
+/// process exit code — for both bool arms:
+///
+/// * `reloaded: false` — no `--config` in use. It must be this NON-error reply, not
+///   `Response::Error`: Go's `(false, nil)` is a refusal, and the CLI (not the daemon) decides it
+///   means "print a line and exit 1".
+/// * `reloaded: true` — a config file was re-read and adopted. Which reconcile ran (here
+///   `PersistedOnly`, the one arm reachable with no engine; `Rebuild`/`BringDown` need a real
+///   tailnet, i.e. the gated e2e) stays daemon-side in the log, exactly as it does upstream.
+///
+/// The stdout/exit-code halves are the ones that would catch a regression in the CLI arm: swapping
+/// the two lines, or dropping the `exit(1)`, changes nothing a wire-level assertion can see.
 #[tokio::test]
-async fn reload_config_reports_the_persisted_only_outcome_over_the_wire() {
+async fn reload_config_speaks_gos_exact_lines_and_exit_codes_over_the_wire() {
     let harness = Harness::start().await;
 
-    // (1) No `--config` in use → a clear error, never an Ok. (The harness's Backend::load records no
-    // config path, exactly like a `tailnetd` started without the flag.)
-    match harness.round_trip(r#"{"cmd":"reload_config"}"#).await {
-        Response::Error { message } => assert!(
-            message.contains("--config"),
-            "the no-config refusal must name the missing --config: {message}"
-        ),
-        other => panic!("expected Response::Error without a --config in use, got {other:?}"),
+    /// Run the built `tnet reload-config` against this daemon's socket and hand back its output.
+    async fn run_tnet_reload_config(socket: &std::path::Path) -> std::process::Output {
+        let socket = socket.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            std::process::Command::new(env!("CARGO_BIN_EXE_tnet"))
+                .arg("--socket")
+                .arg(&socket)
+                .arg("reload-config")
+                .output()
+                .expect("the `tnet` binary built for this test should run")
+        })
+        .await
+        .expect("tnet subprocess join")
     }
 
+    // (1) No `--config` in use → `ok: false`, and NOT an error. (The harness's Backend::load records
+    // no config path, exactly like a `tailnetd` started without the flag.)
+    match harness.round_trip(r#"{"cmd":"reload_config"}"#).await {
+        Response::ReloadConfig { reloaded } => assert!(
+            !reloaded,
+            "not being in config mode must report ok=false (Go's (false, nil))"
+        ),
+        other => panic!(
+            "not being in config mode is Go's (false, nil) refusal, so the daemon must still reply \
+             ReloadConfig{{reloaded: false}}, got {other:?}"
+        ),
+    }
+
+    // ...and the bytes an operator (or their script) actually sees for that bool: Go's refusal line
+    // on stdout, nothing on stderr, exit 1.
+    let out = run_tnet_reload_config(&harness.socket_path).await;
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "config mode not in use\n",
+        "Go prints exactly this on the not-in-config-mode arm, via printf on stdout"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "",
+        "the refusal is not an error — Go uses printf, not errf, so stderr stays empty"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "Go's reloadConfig calls os.Exit(1) after printing the refusal"
+    );
+
     // (2) Point the daemon at a config file (as `tailnetd`'s main() does for `--config`) and reload
-    // it. The node is down (this harness never joins a tailnet), so the reconcile is PersistedOnly.
+    // it. The node is down (this harness never joins a tailnet), so the reconcile is PersistedOnly —
+    // which the operator-facing reply deliberately does not mention.
     let cfg_path = harness.state_dir.join("daemon-config.json");
     tokio::fs::write(
         &cfg_path,
@@ -357,23 +404,27 @@ async fn reload_config_reports_the_persisted_only_outcome_over_the_wire() {
         .set_config_source(tailscaled_rs::conffile::ConfigSource::File(cfg_path));
 
     match harness.round_trip(r#"{"cmd":"reload_config"}"#).await {
-        Response::Ok { message } => {
-            // The generic line is not enough: on a down node nothing was applied live, and the
-            // message must say the edit lands on the next `up`.
-            assert!(
-                message.contains("next up"),
-                "a node-down reload must tell the operator it applies on the next up: {message}"
-            );
-            assert_eq!(
-                message,
-                tailscaled_rs::ipn::ReloadAction::PersistedOnly.outcome_message(),
-                "dispatch must render the reconciled action's own message"
-            );
-        }
-        other => panic!("expected Response::Ok from reload_config, got {other:?}"),
+        Response::ReloadConfig { reloaded } => assert!(
+            reloaded,
+            "a config that was re-read and adopted must report ok=true"
+        ),
+        other => panic!("expected Response::ReloadConfig from reload_config, got {other:?}"),
     }
 
-    // The reloaded config really was adopted (so the message is not describing a no-op).
+    // ...and the success bytes: Go's one line on stdout, exit 0.
+    let out = run_tnet_reload_config(&harness.socket_path).await;
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "config reloaded\n",
+        "Go prints exactly this on ok — not a reworded 'configuration reloaded…' variant"
+    );
+    assert!(
+        out.status.success(),
+        "a successful reload exits 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The reloaded config really was adopted (so ok=true is not describing a no-op).
     let status = harness.round_trip(r#"{"cmd":"status"}"#).await;
     match status {
         Response::Status(report) => assert_eq!(

@@ -576,9 +576,10 @@ enum Command {
     /// SIGHUP): edit the declarative config the daemon was started with, then run this to apply the
     /// changes WITHOUT restarting. The settings merge over the current prefs (an unset config field is
     /// left as-is); if the node is up, the engine is rebuilt from the updated settings (a brief
-    /// reconnect). Requires the daemon to have been started with `--config` (errors otherwise), and a
-    /// now-malformed config is rejected with the running node left untouched. A reloaded config's auth
-    /// key is ignored (a reload is not a re-login).
+    /// reconnect). Requires the daemon to have been started with `--config`: without one this prints
+    /// `config mode not in use` and exits 1, as Go's does. A now-malformed config is rejected with the
+    /// running node left untouched. A reloaded config's auth key is ignored (a reload is not a
+    /// re-login).
     ReloadConfig,
     /// Authenticate this node with the control plane (Go `tailscale login`). With no `--authkey`, this
     /// is an **interactive login**: the node contacts control, reaches `NeedsLogin`, and the auth URL
@@ -4059,14 +4060,43 @@ async fn run_debug_restun(socket: &std::path::Path) -> Result<()> {
     }
 }
 
+/// The line `reload-config` prints and the exit code it leaves, from the daemon's `ok` bool — a
+/// byte-faithful port of Go's `reloadConfig` (`cmd/tailscale/cli/debug.go`), which is the whole of
+/// that command's user interface:
+///
+/// ```text
+/// ok, err := localClient.ReloadConfig(ctx)
+/// if err != nil { return err }
+/// if ok { printf("config reloaded\n"); return nil }
+/// printf("config mode not in use\n")
+/// os.Exit(1)
+/// ```
+///
+/// Both lines go to STDOUT (Go's `printf`, not `errf`), and the refusal exits 1 while still being a
+/// successful RPC — `ReloadConfig` returns `(false, nil)` when the daemon holds no config. Scripts
+/// grep these exact strings, so they are pinned here and asserted verbatim in the tests, rather than
+/// being re-worded on the daemon side where the reconcile detail happens to be known.
+fn render_reload_config(reloaded: bool) -> (&'static str, i32) {
+    if reloaded {
+        ("config reloaded", 0)
+    } else {
+        ("config mode not in use", 1)
+    }
+}
+
 /// `reload-config` (Go `tailscaled`'s `reload-config`): ask the daemon to re-read its `--config` file
-/// and adopt the changes into the running node. Prints the daemon's confirmation on success; on the
-/// daemon's error (no `--config` in use, or a now-malformed file — the node is left untouched in both
-/// cases) it prints the message and exits 1. Mirrors `run_debug_rebind`'s Ok/Error shape.
+/// and adopt the changes into the running node. Prints Go's line for the daemon's `ok` bool — see
+/// [`render_reload_config`] — and exits 1 on the not-in-config-mode refusal. A genuine failure (a
+/// now-malformed file; the node is left untouched) still comes back as `Response::Error` and takes
+/// the usual `error: …` + exit 1 path, matching Go returning the error to `ffcli`.
 async fn run_reload_config(socket: &std::path::Path) -> Result<()> {
     match round_trip(socket, &Request::ReloadConfig).await {
-        Ok(Response::Ok { message }) => {
-            println!("{message}");
+        Ok(Response::ReloadConfig { reloaded }) => {
+            let (line, code) = render_reload_config(reloaded);
+            println!("{line}");
+            if code != 0 {
+                std::process::exit(code);
+            }
             Ok(())
         }
         Ok(Response::Error { message }) => {
@@ -13767,6 +13797,34 @@ mod tests {
         let (site_id, v4) = unmap_via(&via).unwrap();
         assert_eq!(site_id, 7);
         assert_eq!(v4.to_string(), "10.1.2.0/24");
+    }
+
+    #[test]
+    fn reload_config_prints_gos_exact_lines_and_exit_codes() {
+        // These two strings ARE `reload-config`'s interface: Go's `reloadConfig`
+        // (cmd/tailscale/cli/debug.go @ v1.102.3) prints `config reloaded` on ok and, on the
+        // not-in-config-mode arm, `config mode not in use` before `os.Exit(1)`. Operators grep them,
+        // so assert them byte-for-byte off the production renderer — a reworded variant ("configuration
+        // reloaded…") matches nothing a Go-shaped script looks for.
+        assert_eq!(
+            render_reload_config(true),
+            ("config reloaded", 0),
+            "ok=true prints Go's exact success line and exits 0"
+        );
+        assert_eq!(
+            render_reload_config(false),
+            ("config mode not in use", 1),
+            "ok=false prints Go's exact refusal line and exits 1"
+        );
+
+        // Neither line is punctuated or prefixed: Go emits them bare on stdout via `printf`, with no
+        // `error:` prefix and no trailing period (the refusal is not an error — the RPC succeeded).
+        for (line, _) in [render_reload_config(true), render_reload_config(false)] {
+            assert!(
+                !line.starts_with("error:") && !line.ends_with('.') && !line.contains('\n'),
+                "the line is printed verbatim on stdout, exactly as Go's printf does: {line:?}"
+            );
+        }
     }
 
     #[test]

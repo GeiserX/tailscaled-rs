@@ -534,8 +534,8 @@ async fn main() -> Result<()> {
     // means "the source is absent and that was declared acceptable", so the node boots unconfigured
     // and can be enrolled interactively, while a present-but-invalid config still fails even then.
     // An absent optional source deliberately leaves the backend's config source UNSET: there is
-    // nothing to re-read, so `reload-config` says so plainly (Go leaves `sys.InitialConfig` nil the
-    // same way).
+    // nothing to re-read, so `reload-config` says so plainly — `config mode not in use`, exit 1 (Go
+    // leaves `sys.InitialConfig` nil the same way).
     let config_authkey = match args.config.as_deref().and_then(conffile::ConfigFlag::parse) {
         Some(flag) => {
             match flag
@@ -548,8 +548,9 @@ async fn main() -> Result<()> {
                     // Record the config source on the backend so the `reload-config` LocalAPI verb (Go
                     // `tailscaled`'s `reload-config`) can re-read this exact source and re-adopt its
                     // fields into the running node. Done only when a config actually loaded — a
-                    // config-less daemon has nothing to reload (and `reload_config` errors clearly in
-                    // that case).
+                    // config-less daemon has nothing to reload, and `reload_config` then returns
+                    // `Ok(None)` (Go's `(false, nil)`), which `tnet reload-config` reports as
+                    // `config mode not in use` + exit 1. Not an error: nothing failed.
                     backend.set_config_source(flag.source.clone());
                     authkey
                 }
