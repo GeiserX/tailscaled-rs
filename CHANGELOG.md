@@ -25,6 +25,49 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.54.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.53.0...v0.54.0) (2026-09-03)
+
+
+### Features
+
+* **appc-routes:** tell the operator the app connector advertises but never learns a route ([#341](https://github.com/GeiserX/tailscaled-rs/issues/341)) ([3d274d4](https://github.com/GeiserX/tailscaled-rs/commit/3d274d43cc4751ef695fe5e4d9e56592d8fbdcb6))
+* **configure:** adopt Go's macOS `sysext`/`mac-vpn`, rule the host-integration set out of scope ([#303](https://github.com/GeiserX/tailscaled-rs/issues/303)) ([73859c8](https://github.com/GeiserX/tailscaled-rs/commit/73859c867d520225267fc466c8f52e3c5aa131ef))
+* **debug:** port `debug resolve`, the one lookup that needs no daemon ([#304](https://github.com/GeiserX/tailscaled-rs/issues/304)) ([fe65d46](https://github.com/GeiserX/tailscaled-rs/commit/fe65d46efb343c0b9fdedf3b515015f931760d87))
+* **service:** let this build see the Tailscale Services (VIPs) a node can reach ([#309](https://github.com/GeiserX/tailscaled-rs/issues/309)) ([7dec267](https://github.com/GeiserX/tailscaled-rs/commit/7dec267124636249220453da7d742affd700dd81))
+* **set:** carry Go's last four `set` pref flags so a ported command line says what is missing ([#310](https://github.com/GeiserX/tailscaled-rs/issues/310)) ([1973cf9](https://github.com/GeiserX/tailscaled-rs/commit/1973cf95b8f6718570964e326ec29c9837fc0e12))
+* **syspolicy:** let an admin supply policy with `tailnetd --syspolicy-file` ([#308](https://github.com/GeiserX/tailscaled-rs/issues/308)) ([a6c3cef](https://github.com/GeiserX/tailscaled-rs/commit/a6c3cefc8bdf3392dab08d3ee46e4ca4b4db9796))
+* **tailnetd:** diagnose a node that never comes up, without a running daemon ([#324](https://github.com/GeiserX/tailscaled-rs/issues/324)) ([a515d4a](https://github.com/GeiserX/tailscaled-rs/commit/a515d4ac18604fe83bad8662e72acfe9617a23ca))
+* **tailnetd:** refuse Go's two TPM flags by name, and record the state-at-rest decision ([#325](https://github.com/GeiserX/tailscaled-rs/issues/325)) ([054224c](https://github.com/GeiserX/tailscaled-rs/commit/054224c908f8cbef983b38c6f61cce0cb12d412e))
+* **tailnetd:** take Go's `--tun`, the flag every unit file passes ([#344](https://github.com/GeiserX/tailscaled-rs/issues/344)) ([9f6c2cb](https://github.com/GeiserX/tailscaled-rs/commit/9f6c2cb79193c0e38be84ff5889c820774950a35))
+* **tnet:** give `down` Go's `--reason` and its lose-SSH refusal ([#336](https://github.com/GeiserX/tailscaled-rs/issues/336)) ([02d4d93](https://github.com/GeiserX/tailscaled-rs/commit/02d4d9331aabf6b2a1d2a985752b25ee34d29538))
+* **tnet:** give `exit-node list` Go's columns, `--filter` and refusals ([#331](https://github.com/GeiserX/tailscaled-rs/issues/331)) ([e3da1da](https://github.com/GeiserX/tailscaled-rs/commit/e3da1dac5abce5e2742d784fb574bf4814a67f5a))
+* **tnet:** let `ping` take the peer name you already know it by ([#337](https://github.com/GeiserX/tailscaled-rs/issues/337)) ([8dd1ca5](https://github.com/GeiserX/tailscaled-rs/commit/8dd1ca50de2b0ff1f24fd7390a32326b7e87ebfe))
+* **tnet:** make `bugreport` carry evidence, not just a bare marker ([#330](https://github.com/GeiserX/tailscaled-rs/issues/330)) ([2d333c2](https://github.com/GeiserX/tailscaled-rs/commit/2d333c2e9ba8e32c357734f5606af72b696219b9))
+* **tnet:** take `dns status --all`, and stop printing it by default ([#333](https://github.com/GeiserX/tailscaled-rs/issues/333)) ([95a3c81](https://github.com/GeiserX/tailscaled-rs/commit/95a3c81d7862ab1aeacf07e998cfc5c1008a891a))
+* **tnet:** take Go's whois flow arguments, so `whois --proto=tcp ip:port` runs ([#327](https://github.com/GeiserX/tailscaled-rs/issues/327)) ([1329596](https://github.com/GeiserX/tailscaled-rs/commit/1329596f889119f61fc98cf75a06fc88c94a8f43))
+* **up:** take Go's own `up` flag spellings so a ported command line runs ([#313](https://github.com/GeiserX/tailscaled-rs/issues/313)) ([09627e5](https://github.com/GeiserX/tailscaled-rs/commit/09627e5c404039c3dee8e13a207785b5f6b77bf4))
+* **web:** let a reverse-proxied or CGI-served web UI state the URL it is really reached at ([#326](https://github.com/GeiserX/tailscaled-rs/issues/326)) ([12f170a](https://github.com/GeiserX/tailscaled-rs/commit/12f170a8a062c7a8f94ff9c7d16e647717016a87))
+
+
+### Bug Fixes
+
+* bound demo cert fetches and name the API `down --reason` needs ([#349](https://github.com/GeiserX/tailscaled-rs/issues/349)) ([593192b](https://github.com/GeiserX/tailscaled-rs/commit/593192bc6b0298a9de416f74ec39780379bcadb3))
+* **captive:** probe the running node, not the one still coming up ([#340](https://github.com/GeiserX/tailscaled-rs/issues/340)) ([842a5db](https://github.com/GeiserX/tailscaled-rs/commit/842a5dbcb17b633fbba2e309dc4310d415f887d6))
+* **cert:** take Go's --serve-demo command line, which carries no domain ([#345](https://github.com/GeiserX/tailscaled-rs/issues/345)) ([075b24b](https://github.com/GeiserX/tailscaled-rs/commit/075b24b753757f073214828016530be03c608b21))
+* **config:** stop `--config` silently dropping prefs this daemon already has ([#323](https://github.com/GeiserX/tailscaled-rs/issues/323)) ([771f55d](https://github.com/GeiserX/tailscaled-rs/commit/771f55d610c48c07d93d8b8308462dd8268ef141))
+* **debug:** ask the daemon for its state dir instead of guessing from the CLI's environment ([#338](https://github.com/GeiserX/tailscaled-rs/issues/338)) ([b64d2cc](https://github.com/GeiserX/tailscaled-rs/commit/b64d2ccd254b71d7a68fe9fd7f9c6043dabe2df9))
+* **file:** report the stuck-inbox `moved 0/N files` failure without `--verbose` ([#300](https://github.com/GeiserX/tailscaled-rs/issues/300)) ([370b9fa](https://github.com/GeiserX/tailscaled-rs/commit/370b9fab05bd80441b642b63a26ca829f8585880))
+* **ip:** refuse the `-1`/`-4`/`-6` combinations Go refuses, instead of answering them with an empty set ([#319](https://github.com/GeiserX/tailscaled-rs/issues/319)) ([72d0519](https://github.com/GeiserX/tailscaled-rs/commit/72d051959f5a405c84c05a9345ceef431a844a86))
+* **set:** a failed `--nickname` rename no longer skips the engine reconcile ([#297](https://github.com/GeiserX/tailscaled-rs/issues/297)) ([f3ca6e6](https://github.com/GeiserX/tailscaled-rs/commit/f3ca6e6ef2e7356eca9ff27c9b43253b6f1c547a))
+* **ssh:** let ssh_config decide the login user when the target omits `user@` ([#305](https://github.com/GeiserX/tailscaled-rs/issues/305)) ([ede83c3](https://github.com/GeiserX/tailscaled-rs/commit/ede83c3182849df06f5dc44f5ba0dc355d67f193))
+* **switch:** match Go's `switch remove` on the current profile, and its first-hit name matching ([#301](https://github.com/GeiserX/tailscaled-rs/issues/301)) ([172435b](https://github.com/GeiserX/tailscaled-rs/commit/172435bee4759281978a889d29619617df99365d))
+* **tailnetd:** `--config` takes a source, so `optional:vm:user-data` boots instead of dying ([#306](https://github.com/GeiserX/tailscaled-rs/issues/306)) ([d57cc6a](https://github.com/GeiserX/tailscaled-rs/commit/d57cc6a9fca13210b676d5f39da7e3d09bf8a9a9))
+* **tailnetd:** refuse `--bird-socket` by name instead of dying on an unknown argument ([#302](https://github.com/GeiserX/tailscaled-rs/issues/302)) ([2038aeb](https://github.com/GeiserX/tailscaled-rs/commit/2038aebb53a41fde148ef2a5e356394164d8b8be))
+* **tailnetd:** stop `debug --get-url` faking a DNS failure for an IPv6 literal ([#335](https://github.com/GeiserX/tailscaled-rs/issues/335)) ([6aa85d3](https://github.com/GeiserX/tailscaled-rs/commit/6aa85d3b4f7053298a539c4919abd4ce1f4c723c))
+* **tnet:** stop `lock init` treating a public key as the lock's secret ([#329](https://github.com/GeiserX/tailscaled-rs/issues/329)) ([aba3502](https://github.com/GeiserX/tailscaled-rs/commit/aba3502ebc197139d1591bc9658555fce8f717da))
+* **tnet:** stop `lock log` succeeding on a lock-disabled node ([#339](https://github.com/GeiserX/tailscaled-rs/issues/339)) ([a68f1df](https://github.com/GeiserX/tailscaled-rs/commit/a68f1df756eb88807f5d7aa31624dbe52b04bf04))
+* **tnet:** stop a mistyped tailnet-lock key aborting the process ([#346](https://github.com/GeiserX/tailscaled-rs/issues/346)) ([250955f](https://github.com/GeiserX/tailscaled-rs/commit/250955fc7d1dbbd47c943cfd6ec886cf0bba16a7))
+
 ## [0.53.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.52.2...v0.53.0) (2026-08-30)
 
 
