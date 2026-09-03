@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.54.1](https://github.com/GeiserX/tailscaled-rs/compare/v0.54.0...v0.54.1) (2026-09-03)
+
+
+### Bug Fixes
+
+* **cli:** print Go's own reload-config lines so scripts still match ([#354](https://github.com/GeiserX/tailscaled-rs/issues/354)) ([bd471fa](https://github.com/GeiserX/tailscaled-rs/commit/bd471faa9fa91a979ddb0c981d60155a75b24d14))
+
 ## [0.54.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.53.0...v0.54.0) (2026-09-03)
 
 
