@@ -26,12 +26,14 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-/// A socket path that is never created, so an invocation either fails before the daemon round trip
-/// (the refusals) or fails *at* it — never against whatever daemon happens to be running on the
-/// build machine. Keyed by test name + pid so concurrent test binaries cannot collide.
+/// A socket path only this test owns, keyed by test name + pid so concurrent test binaries cannot
+/// collide. Nothing outside the test ever creates it, so an invocation either fails before the
+/// daemon round trip (the refusals) or fails *at* it — never against whatever daemon happens to be
+/// running on the build machine. [`stub_daemon`] and [`SocketWatch`] bind it deliberately.
 fn unused_socket_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("tnet-down-{name}-{}.sock", std::process::id()))
 }
@@ -112,6 +114,80 @@ fn stub_daemon(name: &str, replies: &[&str]) -> (PathBuf, mpsc::Receiver<Vec<Str
 fn requests(rx: &mpsc::Receiver<Vec<String>>) -> Vec<String> {
     rx.recv_timeout(Duration::from_secs(30))
         .expect("the stub daemon should report the requests it served")
+}
+
+/// A bound-but-unserved socket, for the refusals: it *observes* whether the CLI contacted the
+/// daemon instead of inferring it from a diagnostic. The absence of `"talking to daemon at"` only
+/// ever meant "no round trip failed" — that string is context on a transport error, so a reworded
+/// or suppressed message, or a daemon that answered, would leave a refusal that silently opened the
+/// socket looking clean. Watching the socket asks the question directly.
+///
+/// A watcher thread accepts every connection and drops it at once, so a CLI that does connect gets
+/// an EOF and fails fast rather than blocking on a reply that will never come (which would hang the
+/// test), and the accept is counted. [`SocketWatch::connections`] stops the watcher and reports the
+/// count.
+///
+/// The count is exact, not sampled: `connect(2)` against a listening `AF_UNIX` socket queues the
+/// connection in the backlog before it returns, so once the CLI has exited — which the caller has
+/// already waited for — anything it opened is counted or still queued, and the watcher drains the
+/// queue before it stops.
+struct SocketWatch {
+    path: PathBuf,
+    stop: Arc<AtomicBool>,
+    watcher: std::thread::JoinHandle<usize>,
+}
+
+impl SocketWatch {
+    fn bind(name: &str) -> Self {
+        let path = unused_socket_path(name);
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind the watched socket");
+        listener
+            .set_nonblocking(true)
+            .expect("watched listener must be pollable");
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let watcher = std::thread::spawn(move || {
+            let mut seen = 0usize;
+            loop {
+                match listener.accept() {
+                    // Dropped immediately: the peer, if any, sees EOF instead of waiting forever.
+                    Ok(_) => seen += 1,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // Backlog empty. Only now may a stop request end the watch, so a connection
+                        // that arrived just before it is still counted.
+                        if flag.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("watched socket accept failed: {e}"),
+                }
+            }
+            seen
+        });
+        Self {
+            path,
+            stop,
+            watcher,
+        }
+    }
+
+    fn path(&self) -> &PathBuf {
+        &self.path
+    }
+
+    /// Stop watching and report how many connections the CLI opened. Call it after the `tnet` run
+    /// has exited.
+    fn connections(self) -> usize {
+        self.stop.store(true, Ordering::Relaxed);
+        let seen = self
+            .watcher
+            .join()
+            .expect("the socket watcher should not panic");
+        let _ = std::fs::remove_file(&self.path);
+        seen
+    }
 }
 
 /// Go's flags are on the fork's own surface, so a command line copied from Go's docs parses.
@@ -224,17 +300,26 @@ fn an_already_stopped_node_is_reported_and_not_edited_again() {
 /// Go `runDown`'s leftover-argument refusal, verbatim, and before any daemon round trip.
 #[test]
 fn down_ports_gos_leftover_argument_refusal() {
+    // The socket is bound and watched, so "no round trip" is read off the socket rather than off
+    // the CLI's wording.
+    let watch = SocketWatch::bind("args");
     // The classic typo: a flag value that lost its `--reason`.
-    let out = tnet("args", &["down", "maintenance"]);
+    let out = tnet_with(watch.path(), None, &["down", "maintenance"]);
+    let connections = watch.connections();
     assert!(!out.status.success(), "a positional argument must fail");
     let err = stderr(&out);
     assert!(
         err.contains(r#"too many non-flag arguments: ["maintenance"]"#),
         "expected Go's message with Go's %q rendering: {err}"
     );
+    assert_eq!(
+        connections, 0,
+        "an unusable invocation must not cost a daemon round trip, and the socket saw {connections}"
+    );
+    // Secondary, on what the operator reads: no daemon-transport noise on top of Go's message.
     assert!(
         !err.contains("talking to daemon at"),
-        "an unusable invocation must not cost a daemon round trip: {err}"
+        "the refusal must be the whole error: {err}"
     );
     for clap_noise in ["unexpected argument", "Usage:"] {
         assert!(
@@ -248,8 +333,9 @@ fn down_ports_gos_leftover_argument_refusal() {
 /// locally, before the node is touched — unless `lose-ssh` was pre-accepted.
 #[test]
 fn down_over_tailscale_ssh_is_refused_unless_the_risk_is_accepted() {
-    let socket = unused_socket_path("risk");
-    let refused = tnet_with(&socket, Some("100.64.0.7 12345 22"), &["down"]);
+    let watch = SocketWatch::bind("risk");
+    let refused = tnet_with(watch.path(), Some("100.64.0.7 12345 22"), &["down"]);
+    let refused_connections = watch.connections();
     assert!(!refused.status.success(), "the refusal must be non-zero");
     let err = stderr(&refused);
     assert!(
@@ -260,17 +346,26 @@ fn down_over_tailscale_ssh_is_refused_unless_the_risk_is_accepted() {
         err.contains("--accept-risk=lose-ssh"),
         "the refusal must name the override: {err}"
     );
-    assert!(
-        !err.contains("talking to daemon at"),
-        "a refused `down` must not reach the daemon at all: {err}"
+    assert_eq!(
+        refused_connections, 0,
+        "a refused `down` must not reach the daemon; the socket saw {refused_connections}: {err}"
     );
 
     // An SSH client that is NOT on the tailnet has nothing to lose — Go's `isSSHOverTailscale` is
-    // false there, so the command proceeds (and here fails only at the missing daemon).
-    let off_tailnet = tnet_with(&socket, Some("192.0.2.9 12345 22"), &["down"]);
+    // false there, so the command proceeds and does open the socket. That is the control for the
+    // count above: the same observation registers the round trip a refusal must not make, so a
+    // zero there is the gate working, not the watch failing to see anything.
+    let control = SocketWatch::bind("risk-off-tailnet");
+    let off_tailnet = tnet_with(control.path(), Some("192.0.2.9 12345 22"), &["down"]);
+    assert_eq!(
+        control.connections(),
+        1,
+        "an off-tailnet SSH session must not trip the gate: {}",
+        stderr(&off_tailnet)
+    );
     assert!(
         stderr(&off_tailnet).contains("talking to daemon at"),
-        "an off-tailnet SSH session must not trip the gate: {}",
+        "and the round trip it made is the one that failed: {}",
         stderr(&off_tailnet)
     );
 }

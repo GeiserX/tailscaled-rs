@@ -12,7 +12,7 @@ use secrecy::{ExposeSecret, SecretString};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use tailscaled_rs::goduration::parse_go_duration;
+use tailscaled_rs::goduration::{format_go_duration, parse_go_duration};
 use tailscaled_rs::localapi::{Request, Response, RevertedPref};
 
 /// Env var consulted for the auth key when neither `--authkey` nor `--authkey-file` is given.
@@ -566,7 +566,8 @@ enum Command {
         /// policy store on Unix (`tnet syspolicy list` shows why) and the engine has no audit-log
         /// transport to control, so nothing *requires* a reason here and the reason is not forwarded
         /// to the control plane — it is recorded locally. The flag exists so the operator's habit and
-        /// the tooling that types it keep working against this daemon.
+        /// the tooling that types it keep working against this daemon. Forwarding it needs an engine
+        /// surface that does not exist yet; the ask is filed as `docs/ENGINE_ASKS.md` #41.
         #[arg(long, value_name = "TEXT")]
         reason: Option<String>,
     },
@@ -1083,9 +1084,17 @@ enum Command {
     /// directory; override the paths with `--cert-file`/`--key-file`, or pass `-` for either to write
     /// that PEM to stdout instead.
     Cert {
-        /// The DNS name to certify (one of the tailnet's cert domains).
-        #[arg(value_name = "DOMAIN")]
-        domain: String,
+        /// The DNS name to certify (one of the tailnet's cert domains) — or, with `--serve-demo`, the
+        /// address to listen on instead (optional, default `:443`).
+        ///
+        /// `--serve-demo` takes NO domain: it certifies whichever name each client asks for, so its
+        /// one positional is the listen address. Without it, exactly one domain is expected; anything
+        /// else is a usage error naming your tailnet's cert domains.
+        // A `Vec` rather than a required `String` because the count is what carries that meaning:
+        // the grammar and both of Go's refusals are judged by `cert_invocation`, not by clap. (A `//`
+        // comment, not a doc comment — the `--help` reader needs the lines above, not this.)
+        #[arg(value_name = "DOMAIN | LISTEN-ADDR")]
+        args: Vec<String>,
         /// Output path for the cert (leaf + chain) PEM, or `-` for stdout. Defaults to `DOMAIN.crt`
         /// when neither `--cert-file` nor `--key-file` is given.
         #[arg(long, value_name = "PATH")]
@@ -1102,27 +1111,31 @@ enum Command {
         /// left. This fork's engine keeps no cert cache — every `cert` issues fresh — so a
         /// full-lifetime certificate always satisfies the minimum and the flag changes nothing
         /// today. It is carried all the way to the engine (not swallowed by the CLI) so an
-        /// engine-side cache would honor it without a CLI change. Go additionally accepts a NEGATIVE
-        /// duration, where it has no effect; this refuses one rather than pretending to carry it.
-        #[arg(long, value_name = "DURATION", value_parser = parse_min_validity)]
+        /// engine-side cache would honor it without a CLI change. A negative duration parses, as it
+        /// does in Go, and means the same nothing: it is clamped to zero (no minimum).
+        // `allow_hyphen_values` is what lets the negative form be *typed*: Go's `flag` package takes
+        // the next argument as the value without inspecting it, so `--min-validity -1h` reaches
+        // `time.ParseDuration`, while clap would otherwise read `-1h` as an unknown flag.
+        #[arg(
+            long,
+            value_name = "DURATION",
+            allow_hyphen_values = true,
+            value_parser = parse_min_validity
+        )]
         min_validity: Option<std::time::Duration>,
         /// Instead of writing the cert to disk, serve HTTPS with it until interrupted (Ctrl-C), as a
         /// demo that the certificate works (Go `tailscale cert --serve-demo`). Every request gets a
         /// short "it works" page. `--cert-file`/`--key-file` are ignored in this mode — nothing is
         /// written — exactly as in Go.
         ///
-        /// GRAMMAR NOTE: Go's `--serve-demo` needs no domain (its daemon hands it a certificate per
-        /// SNI name as connections arrive) and takes the listen address as the positional argument.
-        /// This fork's LocalAPI has no per-SNI certificate hook, so the domain positional is still
-        /// required — it names the one certificate this server presents — and the listen address is
-        /// `--listen`.
+        /// Like Go, this mode takes NO domain: a certificate is fetched from the daemon per SNI name
+        /// as connections arrive, so the demo answers for whichever of the tailnet's cert domains a
+        /// browser asks for. The positional argument, if given, is the listen address (default
+        /// `:443`, which needs root); a bare `:PORT` binds every IPv4 interface, `[::]:PORT` binds
+        /// IPv6, `127.0.0.1:PORT` keeps the demo on this host. `--min-validity` is not consulted here
+        /// (Go's demo path does not pass it either).
         #[arg(long)]
         serve_demo: bool,
-        /// Address for `--serve-demo` to listen on (Go's positional argument, same default `:443`,
-        /// which needs root). A bare `:PORT` binds every IPv4 interface; write `[::]:PORT` for IPv6
-        /// or `127.0.0.1:PORT` to keep the demo on this host. Only valid with `--serve-demo`.
-        #[arg(long, value_name = "ADDR")]
-        listen: Option<String>,
     },
     /// Connect to a TCP port on a tailnet host and pipe stdin/stdout over the overlay (Go `tailscale
     /// nc`). Like netcat: bytes from stdin go to the peer, the peer's bytes go to stdout, until EOF.
@@ -2652,24 +2665,12 @@ async fn main() -> Result<()> {
             record,
         } => run_bugreport(&socket, &note, diagnose, record).await,
         Command::Cert {
-            domain,
+            args,
             cert_file,
             key_file,
             min_validity,
             serve_demo,
-            listen,
-        } => {
-            run_cert(
-                &socket,
-                domain,
-                cert_file,
-                key_file,
-                min_validity,
-                serve_demo,
-                listen,
-            )
-            .await
-        }
+        } => run_cert(&socket, args, cert_file, key_file, min_validity, serve_demo).await,
         // `nc` hijacks its connection (the daemon splices to the overlay after a one-line ack), so it
         // is handled by a dedicated piping path, not the generic round-trip.
         Command::Nc { host, port } => run_nc(&socket, &host, port)
@@ -6320,17 +6321,36 @@ fn parse_lock_public_key(s: &str) -> Result<[u8; 32]> {
             None => anyhow::bail!("key hex string doesn't have expected type prefix tlpub:"),
         },
     };
-    if hex.len() != 64 {
-        anyhow::bail!("key hex has the wrong size, got {} want 64", hex.len());
+    // Go measures and indexes BYTES here (`mem.RO.Len`/`.At`), so this does too: the length check is
+    // already a byte count, and decoding out of `hex.as_bytes()` keeps the two consistent. Slicing
+    // the `str` instead — `&hex[i..i + 2]` — aborts the process on a 64-*byte* argument whose
+    // characters are multibyte (`tlpub:` + 21 × `€` + `a` is 64 bytes), because byte 2 is not a
+    // char boundary. Go reports a bad hex character there, and so must this.
+    let raw = hex.as_bytes();
+    if raw.len() != 64 {
+        anyhow::bail!("key hex has the wrong size, got {} want 64", raw.len());
     }
-    let bytes: Vec<u8> = (0..64)
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
-        .collect::<std::result::Result<_, _>>()
-        .map_err(|_| anyhow!("invalid hex character in key"))?;
     let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
+    for (byte, pair) in out.iter_mut().zip(raw.as_chunks::<2>().0) {
+        let (Some(hi), Some(lo)) = (hex_nibble(pair[0]), hex_nibble(pair[1])) else {
+            anyhow::bail!("invalid hex character in key");
+        };
+        *byte = (hi << 4) | lo;
+    }
     Ok(out)
+}
+
+/// One hex digit's value, or `None` when the byte is not `[0-9a-fA-F]` — Go's `fromHexChar`
+/// (`types/key/util.go` @ v1.100.0). Deliberately not `u8::from_str_radix`, which is both
+/// char-boundary sensitive and *more* permissive than Go: `u8::from_str_radix("+f", 16)` is
+/// `Ok(15)`, so a leading sign used to decode as a valid hex byte.
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Split `lock`'s positional arguments into trusted keys and disablement values — a port of Go's
@@ -6773,15 +6793,23 @@ fn disablement_kdf_line(secret_hex: &str) -> Result<String> {
 /// Decode a lower/upper-hex string to bytes (the disablement secret is hex). A small local helper so
 /// the `lock disablement-kdf` path has no extra dependency beyond the `argon2` KDF itself.
 fn hex_decode_lower(s: &str) -> Result<Vec<u8>> {
-    let s = s.trim();
-    if !s.len().is_multiple_of(2) {
+    // Byte-wise for the same reason as `parse_lock_public_key`: this decodes operator input — the
+    // `--disablement-secret` flag and the `disablement:`/`disablement-secret:` positionals — so a
+    // multibyte character has to come back as a bad hex byte, not as a panic from a `str` slice
+    // taken through the middle of it.
+    let raw = s.trim().as_bytes();
+    if !raw.len().is_multiple_of(2) {
         anyhow::bail!("odd-length hex string");
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&s[i..i + 2], 16)
-                .map_err(|_| anyhow!("invalid hex byte {:?}", &s[i..i + 2]))
+    raw.as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| match (hex_nibble(pair[0]), hex_nibble(pair[1])) {
+            (Some(hi), Some(lo)) => Ok((hi << 4) | lo),
+            _ => Err(anyhow!(
+                "invalid hex byte {:?}",
+                String::from_utf8_lossy(pair)
+            )),
         })
         .collect()
 }
@@ -6962,16 +6990,40 @@ async fn fetch_netcheck_timed(
     Ok(report)
 }
 
-/// Render Go's verbose netcheck timing line. Go logs `netcheck: GetReport took 57ms; err=<nil>`
-/// (a `time.Duration` rounded to milliseconds, and `%v` of a nil error). This prints whole
-/// milliseconds rather than reimplementing Go's mixed-unit duration formatting, and always reports
-/// `err=<nil>`: an errored report exits before this line, so the only report that gets timed here is
-/// one that succeeded. Pure → unit-testable.
+/// Render Go's verbose netcheck timing line. Go logs
+/// `c.Logf("GetReport took %v; err=%v", d.Round(time.Millisecond), err)`, so the duration is rounded
+/// to a whole millisecond and then printed by `time.Duration`'s own `String()` — the mixed-unit form,
+/// where 1.5 seconds is `1.5s` and 90 seconds is `1m30s`, not `1500ms` and `90000ms`. This rounds
+/// with [`round_to_millisecond`] and renders with [`format_go_duration`], so a slow report reads the
+/// way it reads under `tailscale netcheck --verbose`.
+///
+/// `err=<nil>` is constant here: an errored report exits before this line, so the only report that
+/// gets timed is one that succeeded (Go reaches the same line with a non-nil error because it logs
+/// before it checks). Pure → unit-testable.
 fn netcheck_verbose_line(elapsed: std::time::Duration) -> String {
     format!(
-        "netcheck: GetReport took {}ms; err=<nil>",
-        elapsed.as_millis()
+        "netcheck: GetReport took {}; err=<nil>",
+        format_go_duration(round_to_millisecond(elapsed))
     )
+}
+
+/// Round a measured elapsed time to a whole millisecond the way Go's `Duration.Round(time.Millisecond)`
+/// does: to the nearest multiple, with a half rounded AWAY from zero (`1.5ms` → `2ms`), rather than
+/// truncating toward it. Returns nanoseconds, the unit [`format_go_duration`] takes.
+///
+/// Only the non-negative case exists here (the input is an `Instant` delta), so Go's negative branch
+/// has no analogue; an elapsed time too large for `i64` nanoseconds (≈292 years) saturates instead of
+/// wrapping. Pure → unit-testable.
+fn round_to_millisecond(elapsed: std::time::Duration) -> i64 {
+    const MILLI: u128 = 1_000_000;
+    let nanos = elapsed.as_nanos();
+    let rem = nanos % MILLI;
+    let rounded = if rem + rem < MILLI {
+        nanos - rem
+    } else {
+        nanos - rem + MILLI
+    };
+    i64::try_from(rounded).unwrap_or(i64::MAX)
 }
 
 /// Fetch one netcheck report from the daemon (a single `Request::Netcheck` round-trip). A plain
@@ -7335,37 +7387,131 @@ fn format_service_ips(addrs: &[String], sel: IpSelect) -> String {
     out
 }
 
-/// clap value parser for `cert --min-validity`: Go's duration grammar, then the one restriction this
-/// fork adds. Go's flag package accepts a negative duration here (where it simply has no effect, since
-/// nothing is ever less valid than "already expired"); the wire field is an unsigned second count, so
-/// rather than silently carrying a lie this refuses it. Everything else is Go's parser verbatim —
-/// including its error text, so `--min-validity 1d` explains itself the way `tailscale` does.
+/// clap value parser for `cert --min-validity`: Go's duration grammar, verbatim — including its error
+/// text, so `--min-validity 1d` explains itself the way `tailscale` does.
+///
+/// Go binds this flag with `fs.DurationVar`, which is `time.ParseDuration`'s WHOLE grammar, leading
+/// `-` included: `tailscale cert --min-validity -1h example.com` parses and issues a certificate,
+/// because a negative minimum is a demand every certificate already meets. The wire field here is an
+/// unsigned second count, so a negative value is clamped to zero — the same no-op, carried honestly —
+/// rather than made a refusal Go does not have. Pure → unit-testable.
 fn parse_min_validity(value: &str) -> Result<std::time::Duration, String> {
     let nanos = parse_go_duration(value)?;
-    if nanos < 0 {
-        return Err(format!(
-            "a negative minimum validity ({value:?}) asks for a certificate that is already expired"
-        ));
-    }
-    Ok(std::time::Duration::from_nanos(nanos as u64))
+    Ok(std::time::Duration::from_nanos(nanos.max(0) as u64))
 }
 
-/// The refusal `tnet cert` owes its own flags before it contacts the daemon, or `None` when the
-/// invocation is usable. `--listen` names the address `--serve-demo` binds, so on its own it asks for
-/// a listener that will never exist — Go refuses the same shape from the other direction, rejecting
-/// the listen argument it only accepts alongside `--serve-demo` ("too many arguments; max 1 allowed
-/// with --serve-demo (the listen address)"). The extra-positional half of Go's check is clap's job
-/// here: this fork's `cert` takes exactly one positional (the domain), so a second one is already
-/// refused.
+/// What a `tnet cert` command line asks for, once its positional arguments are read the way Go reads
+/// them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CertInvocation {
+    /// `--serve-demo`: serve HTTPS on `listen`, certifying nothing up front (Go's `s.Addr`).
+    ServeDemo { listen: String },
+    /// The ordinary form: issue a certificate for this one domain.
+    Issue { domain: String },
+}
+
+/// The two ways a `cert` command line can be unusable, each Go's own check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CertUsageError {
+    /// `--serve-demo` with two or more positionals (Go's `default:` arm of `switch len(args)`).
+    TooManyServeDemoArgs,
+    /// No `--serve-demo`, and not exactly one positional (Go's `if len(args) != 1`).
+    MissingDomain,
+}
+
+/// Read `cert`'s positional arguments the way Go's `runCert` reads them.
 ///
-/// The message goes to **stdout** and the caller exits **1**, matching Go's `outln` + `os.Exit(1)`
-/// (and this CLI's [`switch_usage_refusal`]) rather than clap's stderr + exit 2 — which is why this
-/// is a hand-rolled check and not an `#[arg(requires = ...)]`. Pure → unit-testable.
-fn cert_usage_refusal(serve_demo: bool, has_listen: bool) -> Option<&'static str> {
-    if has_listen && !serve_demo {
-        return Some("--listen can only be used with --serve-demo");
+/// The order is Go's and it matters: the `--serve-demo` branch is taken FIRST, before any domain
+/// check, because that mode needs no domain — the daemon hands it a certificate per SNI name as
+/// connections arrive. In that branch `len(args)` 0 means the default `:443`, 1 names the listen
+/// address, and 2+ is "too many arguments; max 1 allowed with --serve-demo (the listen address)".
+/// Only outside it does Go require exactly one argument, the domain. Pure → unit-testable.
+fn cert_invocation(serve_demo: bool, args: &[String]) -> Result<CertInvocation, CertUsageError> {
+    if serve_demo {
+        return match args {
+            [] => Ok(CertInvocation::ServeDemo {
+                listen: DEFAULT_CERT_DEMO_LISTEN.to_string(),
+            }),
+            [addr] => Ok(CertInvocation::ServeDemo {
+                listen: addr.clone(),
+            }),
+            _ => Err(CertUsageError::TooManyServeDemoArgs),
+        };
     }
-    None
+    match args {
+        [domain] => Ok(CertInvocation::Issue {
+            domain: domain.clone(),
+        }),
+        _ => Err(CertUsageError::MissingDomain),
+    }
+}
+
+/// What the daemon could tell us about the tailnet's cert domains when `cert` was typed without one —
+/// the input to the hint Go appends to its usage error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CertDomainHint {
+    /// The daemon could not be asked at all (Go: `localClient.Status` errored → no hint printed).
+    Unknown,
+    /// The node is not up, so it has no netmap to read cert domains from (Go: `st.BackendState !=
+    /// ipn.Running`).
+    NotRunning,
+    /// The cert domains control pushed to this node (Go: `st.CertDomains`).
+    Domains(Vec<String>),
+}
+
+/// Render the message an unusable `cert` command line exits with — Go's text in both cases.
+///
+/// [`CertUsageError::TooManyServeDemoArgs`] is one line, Go's verbatim. [`CertUsageError::MissingDomain`]
+/// is Go's `Usage:` line followed by the same hint `runCert` builds from the node's status: nothing at
+/// all when the status could not be read, "not running" when it is down, and otherwise either the
+/// tailnet has no cert domains, has exactly one (name it, so the operator can copy it), or has several
+/// (list them Go-style, `%q` of a `[]string` → `["a" "b"]`). Pure → unit-testable.
+fn cert_usage_message(err: CertUsageError, hint: &CertDomainHint) -> String {
+    match err {
+        CertUsageError::TooManyServeDemoArgs => {
+            "too many arguments; max 1 allowed with --serve-demo (the listen address)".to_string()
+        }
+        CertUsageError::MissingDomain => {
+            let mut msg = "Usage: tnet cert [flags] <domain>".to_string();
+            match hint {
+                CertDomainHint::Unknown => {}
+                CertDomainHint::NotRunning => {
+                    msg.push_str("\n\nThe node is not running.\n");
+                }
+                CertDomainHint::Domains(domains) => match domains.as_slice() {
+                    [] => msg.push_str(
+                        "\n\nHTTPS cert support is not enabled/configured for your tailnet.\n",
+                    ),
+                    [only] => msg.push_str(&format!("\n\nFor domain, use {only:?}.\n")),
+                    many => {
+                        let quoted: Vec<String> = many.iter().map(|d| format!("{d:?}")).collect();
+                        msg.push_str(&format!(
+                            "\n\nValid domain options: [{}].\n",
+                            quoted.join(" ")
+                        ));
+                    }
+                },
+            }
+            msg
+        }
+    }
+}
+
+/// Ask the daemon for the tailnet's cert domains, for the hint on `cert`'s usage error. Best-effort
+/// by design (Go ignores its own status error here and simply prints no hint), so every failure maps
+/// to a hint variant instead of an error: a daemon that cannot be reached is
+/// [`CertDomainHint::Unknown`], and the one refusal this read has — `node is not up`, the daemon's
+/// answer when there is no engine to read a netmap from — is [`CertDomainHint::NotRunning`].
+///
+/// Go reads `CertDomains` off the same `Status` call it uses for `BackendState`; this fork carries
+/// them on the DNS status instead (they arrive with the rest of the control-pushed DNS config), which
+/// is the same field from the same netmap.
+async fn cert_domain_hint(socket: &std::path::Path) -> CertDomainHint {
+    match round_trip(socket, &Request::DnsStatus).await {
+        Ok(Response::DnsStatus(report)) => CertDomainHint::Domains(report.cert_domains),
+        Ok(Response::Error { .. }) => CertDomainHint::NotRunning,
+        _ => CertDomainHint::Unknown,
+    }
 }
 
 /// Where `cert --serve-demo` listens when `--listen` is not given: Go's `:443`, the port a browser
@@ -7393,47 +7539,29 @@ fn normalize_demo_listen(listen: &str) -> String {
 /// handshake is not free.
 const MAX_CERT_DEMO_CONNECTIONS: usize = 64;
 
-/// `cert --serve-demo` (Go `tailscale cert --serve-demo`): serve HTTPS with the certificate just
-/// issued, so the operator can point a browser at the domain and see that it works, instead of
-/// writing the PEMs to disk. Runs until interrupted (Ctrl-C).
+/// `cert --serve-demo` (Go `tailscale cert --serve-demo`): serve HTTPS until interrupted (Ctrl-C), so
+/// the operator can point a browser at a tailnet name and see that certificates work, instead of
+/// writing PEMs to disk.
 ///
-/// Terminates TLS with the issued leaf+chain and its key, and answers every request with the same
-/// short page Go serves. Each connection is handled on its own task under a
-/// [`MAX_CERT_DEMO_CONNECTIONS`] semaphore, with a deadline on the handshake and on the request read,
-/// so neither a flood nor a client that connects and says nothing can pile up handlers.
+/// Certificates are fetched PER CONNECTION, from the SNI name the client asked for — Go's
+/// `tls.Config.GetCertificate: localClient.GetCertificate`, which is a LocalAPI cert call per
+/// ClientHello. That is why this mode needs no domain on the command line: whichever of the tailnet's
+/// cert domains a browser asks for is the one issued. The handshake is deferred with a
+/// [`tokio_rustls::LazyConfigAcceptor`] so the SNI name can be read before a TLS config exists.
+///
+/// Each connection is handled on its own task under a [`MAX_CERT_DEMO_CONNECTIONS`] semaphore, with a
+/// deadline on the handshake and on the request read, so neither a flood nor a client that connects
+/// and says nothing can pile up handlers. Results are memoized in a [`CertDemoCerts`] cache — Go
+/// relies on its daemon's certificate cache for this; ours issues fresh every time, so without a
+/// cache one browser's six parallel connections would be six ACME issuances. The fetches the cache
+/// does NOT absorb are rationed by a [`CertDemoFetchBudget`], so a caller who varies the SNI name
+/// past the cache's cap cannot turn connections into daemon round-trips one for one.
 ///
 /// REDUCED SCOPE vs Go: Go's demo handler also redirects a bare-hostname request to the expanded
-/// MagicDNS name (its `ExpandSNIName` LocalAPI call), and it serves whatever certificate matches the
-/// SNI of each connection. This fork's LocalAPI offers neither, so the server presents the one
-/// certificate `cert` was asked for and serves the page to every request.
-async fn run_cert_serve_demo(
-    domain: &str,
-    cert_pem: &str,
-    key_pem: &str,
-    listen: &str,
-) -> Result<()> {
+/// MagicDNS name (its `ExpandSNIName` LocalAPI call); this fork's LocalAPI has no such call, so every
+/// request gets the page.
+async fn run_cert_serve_demo(socket: &std::path::Path, listen: &str) -> Result<()> {
     use std::sync::Arc;
-
-    let certs = rustls_pemfile::certs(&mut cert_pem.as_bytes())
-        .collect::<Result<Vec<_>, _>>()
-        .context("parsing the issued certificate PEM")?;
-    if certs.is_empty() {
-        anyhow::bail!("the daemon returned no certificate for {domain:?}");
-    }
-    let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
-        .context("parsing the issued private-key PEM")?
-        .ok_or_else(|| anyhow!("the daemon returned no private key for {domain:?}"))?;
-    // Name the crypto provider explicitly rather than relying on a process default: this binary also
-    // links other TLS users, and an ambiguous default is a runtime panic, not a build error.
-    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .context("selecting TLS protocol versions")?
-    .with_no_client_auth()
-    .with_single_cert(certs, key)
-    .context("loading the issued certificate into the TLS server")?;
-    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
 
     let bind = normalize_demo_listen(listen);
     let listener = tokio::net::TcpListener::bind(&bind)
@@ -7442,9 +7570,11 @@ async fn run_cert_serve_demo(
     let addr = listener
         .local_addr()
         .context("resolving the listen address")?;
-    println!("running TLS server on {addr} for {domain} ... (Ctrl-C to stop)");
+    println!("running TLS server on {addr} ... (Ctrl-C to stop)");
 
     let conn_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CERT_DEMO_CONNECTIONS));
+    let certs: CertDemoCerts = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let budget: CertDemoBudget = Arc::new(tokio::sync::Mutex::new(CertDemoFetchBudget::new()));
     loop {
         let (conn, _peer) = match listener.accept().await {
             Ok(c) => c,
@@ -7457,28 +7587,240 @@ async fn run_cert_serve_demo(
             eprintln!("cert --serve-demo: connection cap reached; dropping connection");
             continue;
         };
-        let acceptor = acceptor.clone();
+        let socket = socket.to_path_buf();
+        let certs = Arc::clone(&certs);
+        let budget = Arc::clone(&budget);
         tokio::spawn(async move {
             let _permit = permit;
-            serve_cert_demo_connection(conn, acceptor).await;
+            serve_cert_demo_connection(conn, &socket, &certs, &budget).await;
         });
     }
 }
 
-/// Serve one `cert --serve-demo` connection: complete the TLS handshake, read the request line, and
-/// write the demo page. Best-effort throughout — a handshake failure (a plain-HTTP client, a scanner)
-/// or any read/write error just drops the connection; this is a demonstration server, not a hardened
-/// endpoint. Both the handshake and the request-line read are bounded in time (and the read in bytes)
-/// so a client that connects and then says nothing cannot hold a handler forever.
+/// The `cert --serve-demo` server's memo of what the daemon answered per SNI name: a ready TLS config
+/// for a name that certified, `None` for one that did not. Both halves matter — the negative entry is
+/// what stops a client that keeps reconnecting for the same uncertifiable name from driving one
+/// daemon round-trip (and one ACME attempt) per connection. A memo alone cannot bound a caller who
+/// varies the name, which is what [`CertDemoFetchBudget`] is for.
+type CertDemoCerts = std::sync::Arc<
+    tokio::sync::Mutex<
+        std::collections::HashMap<String, Option<std::sync::Arc<rustls::ServerConfig>>>,
+    >,
+>;
+
+/// How many distinct SNI names the demo server memoizes. Small on purpose: a demo answers for a
+/// handful of tailnet names, and the map is otherwise attacker-sized (any client picks the key).
+/// Beyond the cap, names are still served — they are simply re-fetched, under the budget below.
+const MAX_CERT_DEMO_CERTS: usize = 16;
+
+/// How many daemon cert requests `cert --serve-demo` will start per [`CERT_DEMO_FETCH_WINDOW`],
+/// however many distinct SNI names ask for them.
+///
+/// The memo above bounds the map, not the work: the SNI name is the cache key and the client picks
+/// it, so anyone cycling more than [`MAX_CERT_DEMO_CERTS`] names misses every time and is back to one
+/// daemon round-trip — and, for a name the tailnet could certify, one ACME issuance — per connection.
+/// The connection cap does not help either; it bounds concurrency, not the rate through it. So the
+/// fetches are budgeted on their own, independent of how well the memo happens to be hitting.
+///
+/// Sized for a demo rather than for a fleet: a browser opens a handful of parallel connections and
+/// each cold one fetches, so the budget has to clear that comfortably while still being a small
+/// multiple of the names a demo actually answers for.
+const MAX_CERT_DEMO_FETCHES_PER_WINDOW: usize = 32;
+
+/// The window [`MAX_CERT_DEMO_FETCHES_PER_WINDOW`] is counted over.
+const CERT_DEMO_FETCH_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The demo server's fetch budget: a fixed window that resets whole rather than a sliding one, which
+/// is the cheap shape and the right one here — the point is a ceiling on daemon round-trips over
+/// time, not smoothness.
+///
+/// Takes `now` as an argument instead of reading the clock so the shed decision is testable without
+/// sleeping.
+#[derive(Debug)]
+struct CertDemoFetchBudget {
+    /// Start of the current window; `None` until the first fetch opens one.
+    window_start: Option<std::time::Instant>,
+    /// Fetches already granted inside that window.
+    spent: usize,
+}
+
+impl CertDemoFetchBudget {
+    fn new() -> Self {
+        Self {
+            window_start: None,
+            spent: 0,
+        }
+    }
+
+    /// Claim one fetch, returning `false` when this window's budget is spent. A `false` costs the
+    /// caller nothing but its own connection: nothing is memoized, so the very next window answers
+    /// the same name normally.
+    fn take(&mut self, now: std::time::Instant) -> bool {
+        match self.window_start {
+            Some(start) if now.duration_since(start) < CERT_DEMO_FETCH_WINDOW => {}
+            // No window open yet, or the open one has aged out: start a fresh one at `now`.
+            _ => {
+                self.window_start = Some(now);
+                self.spent = 0;
+            }
+        }
+        if self.spent >= MAX_CERT_DEMO_FETCHES_PER_WINDOW {
+            return false;
+        }
+        self.spent += 1;
+        true
+    }
+}
+
+/// The budget, shared by every connection handler (one budget per demo server, not per connection).
+type CertDemoBudget = std::sync::Arc<tokio::sync::Mutex<CertDemoFetchBudget>>;
+
+/// What the demo server should do for one SNI name, decided before any daemon round-trip.
+#[derive(Debug)]
+enum CertDemoLookup {
+    /// The memo already knows this name's outcome (`None` = the daemon would not certify it).
+    Memoized(Option<std::sync::Arc<rustls::ServerConfig>>),
+    /// Not memoized, and the budget granted a fetch.
+    Fetch,
+    /// Not memoized, and this window's fetch budget is spent — drop the handshake.
+    Shed,
+}
+
+/// Consult the memo, then the budget. A memo hit never spends budget: a demo that answers for the
+/// same few names keeps working at any rate, and only the *misses* — the ones that reach the daemon —
+/// are rationed.
+async fn cert_demo_lookup(
+    certs: &CertDemoCerts,
+    budget: &CertDemoBudget,
+    sni: &str,
+    now: std::time::Instant,
+) -> CertDemoLookup {
+    if let Some(hit) = certs.lock().await.get(sni) {
+        return CertDemoLookup::Memoized(hit.clone());
+    }
+    if budget.lock().await.take(now) {
+        CertDemoLookup::Fetch
+    } else {
+        CertDemoLookup::Shed
+    }
+}
+
+/// The TLS config `cert --serve-demo` should present for one SNI name: the memoized one, or the one
+/// built from a fresh daemon cert request (Go's per-ClientHello `localClient.GetCertificate`). `None`
+/// when the daemon will not certify that name — the handshake is then dropped, which is what Go's
+/// handshake does when `GetCertificate` returns an error — and `None` too when this window's
+/// [`CertDemoFetchBudget`] is spent, which drops the handshake the same way rather than adding
+/// another round-trip to a daemon already being asked as fast as it will be asked.
+async fn cert_demo_config_for(
+    socket: &std::path::Path,
+    certs: &CertDemoCerts,
+    budget: &CertDemoBudget,
+    sni: &str,
+) -> Option<std::sync::Arc<rustls::ServerConfig>> {
+    match cert_demo_lookup(certs, budget, sni, std::time::Instant::now()).await {
+        CertDemoLookup::Memoized(hit) => return hit,
+        CertDemoLookup::Shed => {
+            eprintln!(
+                "cert --serve-demo: too many certificate requests just now; not asking the daemon \
+                 to certify {sni:?}"
+            );
+            return None;
+        }
+        CertDemoLookup::Fetch => {}
+    }
+    // The lock is NOT held across the round-trip: a slow issuance must not stall every other
+    // connection. Two connections racing on the same cold name each fetch once, then agree.
+    let built = match round_trip(
+        socket,
+        &Request::Cert {
+            domain: sni.to_string(),
+            // Go's demo path calls `GetCertificate`, which carries no minimum validity either.
+            min_validity_secs: None,
+        },
+    )
+    .await
+    {
+        Ok(Response::Cert { cert_pem, key_pem }) => match cert_demo_tls_config(&cert_pem, &key_pem)
+        {
+            Ok(config) => Some(std::sync::Arc::new(config)),
+            Err(e) => {
+                eprintln!("cert --serve-demo: unusable certificate for {sni:?}: {e:#}");
+                None
+            }
+        },
+        Ok(Response::Error { message }) => {
+            eprintln!("cert --serve-demo: no certificate for {sni:?}: {message}");
+            None
+        }
+        Ok(other) => {
+            eprintln!("cert --serve-demo: unexpected response to cert: {other:?}");
+            None
+        }
+        Err(e) => {
+            eprintln!("cert --serve-demo: requesting a certificate for {sni:?} failed: {e:#}");
+            None
+        }
+    };
+    let mut cache = certs.lock().await;
+    if cache.len() < MAX_CERT_DEMO_CERTS {
+        cache.insert(sni.to_string(), built.clone());
+    }
+    built
+}
+
+/// Load an issued leaf+chain and its key into a TLS server config for the demo listener.
+///
+/// The crypto provider is named explicitly rather than taken from the process default: this binary
+/// links other TLS users, and an ambiguous default is a runtime panic, not a build error.
+fn cert_demo_tls_config(cert_pem: &str, key_pem: &str) -> Result<rustls::ServerConfig> {
+    use std::sync::Arc;
+
+    let certs = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .context("parsing the issued certificate PEM")?;
+    if certs.is_empty() {
+        anyhow::bail!("the daemon returned no certificate");
+    }
+    let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+        .context("parsing the issued private-key PEM")?
+        .ok_or_else(|| anyhow!("the daemon returned no private key"))?;
+    rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .context("selecting TLS protocol versions")?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .context("loading the issued certificate into the TLS server")
+}
+
+/// Serve one `cert --serve-demo` connection: read the ClientHello for its SNI name, fetch that name's
+/// certificate, finish the handshake, read the request line, and write the demo page. Best-effort
+/// throughout — a handshake failure (a plain-HTTP client, a scanner), a name the daemon will not
+/// certify, or any read/write error just drops the connection; this is a demonstration server, not a
+/// hardened endpoint. A ClientHello with NO SNI is dropped for the same reason Go's is: there is no
+/// name to fetch a certificate for. Both the handshake and the request-line read are bounded in time
+/// (and the read in bytes) so a client that connects and then says nothing cannot hold a handler
+/// forever.
 async fn serve_cert_demo_connection(
     conn: tokio::net::TcpStream,
-    acceptor: tokio_rustls::TlsAcceptor,
+    socket: &std::path::Path,
+    certs: &CertDemoCerts,
+    budget: &CertDemoBudget,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let Ok(Ok(mut tls)) = tokio::time::timeout(CERT_DEMO_DEADLINE, acceptor.accept(conn)).await
+    let start = tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), conn);
+    let Ok(Ok(start)) = tokio::time::timeout(CERT_DEMO_DEADLINE, start).await else {
+        return; // Handshake stalled or was not TLS at all.
+    };
+    let Some(sni) = start.client_hello().server_name().map(str::to_string) else {
+        return; // No SNI: nothing to certify, as in Go.
+    };
+    let Some(config) = cert_demo_config_for(socket, certs, budget, &sni).await else {
+        return;
+    };
+    let Ok(Ok(mut tls)) = tokio::time::timeout(CERT_DEMO_DEADLINE, start.into_stream(config)).await
     else {
-        return; // Handshake timed out or failed (e.g. a plain-HTTP request to an HTTPS port).
+        return;
     };
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
@@ -7525,7 +7867,11 @@ const CERT_DEMO_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5
 const CERT_DEMO_BODY: &str = "<h1>Hello from tailscaled-rs</h1>It works.";
 
 /// `cert <domain>` (Go `tailscale cert`): round-trip a [`Request::Cert`], then write the issued
-/// cert+key PEMs. File handling mirrors Go's `runCert`: when neither `--cert-file` nor `--key-file`
+/// cert+key PEMs.
+///
+/// The positional arguments are read first, by [`cert_invocation`], because Go's `runCert` reads them
+/// first — and its `--serve-demo` branch is taken before any domain check, so that mode never reaches
+/// the issuance below (see [`run_cert_serve_demo`]). File handling mirrors Go's `runCert`: when neither `--cert-file` nor `--key-file`
 /// is given, default to `DOMAIN.crt` + `DOMAIN.key` in the cwd (with `*.` → `wildcard_.` so a wildcard
 /// domain is a legal filename); `-` writes that PEM to stdout instead of a file. The cert is written
 /// `0644` (public), the key `0600` (Go's perms — the private key must not be world-readable). A
@@ -7533,19 +7879,31 @@ const CERT_DEMO_BODY: &str = "<h1>Hello from tailscaled-rs</h1>It works.";
 /// that we print and exit non-zero on (never a partial write).
 async fn run_cert(
     socket: &std::path::Path,
-    domain: String,
+    args: Vec<String>,
     cert_file: Option<String>,
     key_file: Option<String>,
     min_validity: Option<std::time::Duration>,
     serve_demo: bool,
-    listen: Option<String>,
 ) -> Result<()> {
-    // This command's own flag refusal, before any daemon round-trip (Go checks its own flag/argument
-    // grammar first too).
-    if let Some(message) = cert_usage_refusal(serve_demo, listen.is_some()) {
-        println!("{message}");
-        std::process::exit(1);
-    }
+    // Go's argument grammar first, and its `--serve-demo` branch before any domain check: that mode
+    // certifies nothing up front, takes the listen address as its optional positional, and never
+    // reaches the issuance path below.
+    let domain = match cert_invocation(serve_demo, &args) {
+        Ok(CertInvocation::ServeDemo { listen }) => {
+            return run_cert_serve_demo(socket, &listen).await;
+        }
+        Ok(CertInvocation::Issue { domain }) => domain,
+        Err(err) => {
+            // Only the missing-domain refusal carries Go's status-derived hint, and only it costs a
+            // round-trip to build.
+            let hint = match err {
+                CertUsageError::MissingDomain => cert_domain_hint(socket).await,
+                CertUsageError::TooManyServeDemoArgs => CertDomainHint::Unknown,
+            };
+            eprintln!("error: {}", cert_usage_message(err, &hint));
+            std::process::exit(1);
+        }
+    };
     let (cert_pem, key_pem) = match round_trip(
         socket,
         &Request::Cert {
@@ -7566,14 +7924,6 @@ async fn run_cert(
             return Err(e).with_context(|| format!("requesting cert at {}", socket.display()));
         }
     };
-
-    // `--serve-demo`: serve the certificate instead of writing it out, and never return (Ctrl-C
-    // stops it). Like Go, `--cert-file`/`--key-file` are not consulted on this path — nothing is
-    // written to disk.
-    if serve_demo {
-        let listen = listen.unwrap_or_else(|| DEFAULT_CERT_DEMO_LISTEN.to_string());
-        return run_cert_serve_demo(&domain, &cert_pem, &key_pem, &listen).await;
-    }
 
     // Go's default-filename rule: only when BOTH flags are unset. `*.` → `wildcard_.` keeps a wildcard
     // domain a legal path. GUARD (L1): the domain is interpolated into the default filename, so refuse
@@ -10894,11 +11244,12 @@ const WEB_UNAVAILABLE_BODY: &str = "<!DOCTYPE html><html><body>status unavailabl
 /// environment and exits, so there is no address to bind and `--listen` names a listener that will
 /// never exist. Go registers both flags on the same command and simply ignores the listen address in
 /// CGI mode; this fork refuses the combination instead, the same shape (and the same wording) it
-/// already uses for `cert --listen` without `--serve-demo`, so an operator who thinks they are
-/// choosing a port is told the port is not used rather than silently getting no listener.
+/// already uses for the other flag-pair refusals it ports (Go's "can only be used with" shape, as in
+/// [`up_usage_refusal`]), so an operator who thinks they are choosing a port is told the port is not
+/// used rather than silently getting no listener.
 ///
 /// The message goes to **stdout** and the caller exits **1**, matching this CLI's other usage
-/// refusals ([`switch_usage_refusal`], [`cert_usage_refusal`]) rather than clap's stderr + exit 2 —
+/// refusals ([`switch_usage_refusal`]) rather than clap's stderr + exit 2 —
 /// which is why this is a hand-rolled check and not an `#[arg(conflicts_with = ...)]`. Pure →
 /// unit-testable.
 fn web_usage_refusal(cgi: bool, has_listen: bool) -> Option<&'static str> {
@@ -15751,6 +16102,57 @@ mod tests {
     }
 
     #[test]
+    fn lock_hex_arguments_reject_non_ascii_instead_of_panicking() {
+        // Every length check on this path counts BYTES, like Go's, so a multibyte argument can pass
+        // it and still not be splittable at byte 2. `str` indexing panicked there, killing the
+        // process on nothing worse than a mistyped key. 21 × `€` (3 bytes each) + `a` is 64 bytes.
+        let multibyte = "€".repeat(21) + "a";
+        assert_eq!(
+            multibyte.len(),
+            64,
+            "the fixture has to pass the byte-length check"
+        );
+
+        let e = parse_lock_public_key(&format!("tlpub:{multibyte}"))
+            .expect_err("non-ASCII must be an error, not a panic")
+            .to_string();
+        assert_eq!(e, "invalid hex character in key", "{e}");
+
+        // And through the argument parser an operator actually reaches, for both kinds of value.
+        let err = |a: &str| {
+            parse_lock_args(&[a.to_string()], true, true)
+                .expect_err("non-ASCII must be an error, not a panic")
+                .to_string()
+        };
+        let e = err(&format!("tlpub:{multibyte}"));
+        assert!(
+            e.contains("parsing key 1: invalid hex character in key"),
+            "{e}"
+        );
+        let e = err(&format!("disablement:{}", "€".repeat(2)));
+        assert!(e.contains("parsing disablement 1: invalid hex byte"), "{e}");
+
+        // `hex_decode_lower` takes the same operator input via `--disablement-secret`.
+        assert!(hex_decode_lower("€€").is_err(), "multibyte hex rejected");
+        assert_eq!(
+            hex_decode_lower("00FF").unwrap(),
+            vec![0x00, 0xff],
+            "upper-hex still decodes"
+        );
+
+        // `u8::from_str_radix` also accepted a leading sign, so `+f` decoded as 0x0f — one more
+        // string Go's `fromHexChar` refuses and this used to take.
+        assert!(
+            hex_decode_lower("+f").is_err(),
+            "leading sign is not a hex byte"
+        );
+        let e = parse_lock_public_key(&format!("tlpub:+f{}", "0".repeat(62)))
+            .expect_err("leading sign is not a hex byte")
+            .to_string();
+        assert_eq!(e, "invalid hex character in key", "{e}");
+    }
+
+    #[test]
     fn lock_init_never_reads_a_trusted_key_as_a_disablement_secret() {
         // The regression this command's grammar change is for. Both spellings an operator could
         // plausibly type used to be swallowed as a "disablement secret":
@@ -18800,7 +19202,7 @@ mod tests {
     fn web_usage_refusal_refuses_a_listen_address_that_is_never_bound() {
         // `--cgi` serves one request out of the CGI environment and binds nothing, so a `--listen`
         // next to it names an address that will never exist. Refused, in the same shape this CLI
-        // already uses for `cert --listen` without `--serve-demo`.
+        // already uses for the flag-pair refusals it ports from Go ("can only be used with").
         assert_eq!(
             web_usage_refusal(true, true),
             Some("--listen can only be used without --cgi (a CGI script binds no listener)")
@@ -22233,16 +22635,18 @@ users:
     }
 
     #[test]
-    fn min_validity_flag_refuses_a_negative_duration() {
-        // The wire field is an unsigned second count, so a negative minimum cannot be carried
-        // honestly. Go accepts one (where it has no effect); this says so instead of dropping it.
+    fn min_validity_flag_takes_gos_whole_duration_grammar() {
         assert_eq!(
             parse_min_validity("720h"),
             Ok(std::time::Duration::from_secs(720 * 3600))
         );
         assert_eq!(parse_min_validity("0"), Ok(std::time::Duration::ZERO));
-        let err = parse_min_validity("-1h").expect_err("a negative minimum must be refused");
-        assert!(err.contains("already expired"), "{err}");
+        // Go binds this with `fs.DurationVar`, so a NEGATIVE duration parses and issuance goes
+        // ahead: `tailscale cert --min-validity -1h example.com` writes a certificate. A refusal
+        // here would fail a command line Go accepts, so the value is clamped to zero instead — the
+        // same no-op, in the unsigned second count the wire carries.
+        assert_eq!(parse_min_validity("-1h"), Ok(std::time::Duration::ZERO));
+        assert_eq!(parse_min_validity("-0.5s"), Ok(std::time::Duration::ZERO));
         // A grammar error still comes back in Go's words, not ours.
         assert_eq!(
             parse_min_validity("1d"),
@@ -22292,18 +22696,289 @@ users:
     }
 
     #[test]
-    fn cert_refuses_listen_without_serve_demo() {
-        // `--listen` only names the address `--serve-demo` binds; on its own it asks for a listener
-        // that is never created, so it is refused before the daemon round-trip rather than silently
-        // ignored.
+    fn cert_serve_demo_takes_a_listen_address_and_no_domain() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Go's `--serve-demo` branch runs before any domain check and needs no domain at all: the
+        // daemon hands it a certificate per SNI name. With no positional it listens on `:443`.
         assert_eq!(
-            cert_usage_refusal(false, true),
-            Some("--listen can only be used with --serve-demo")
+            cert_invocation(true, &args(&[])),
+            Ok(CertInvocation::ServeDemo {
+                listen: ":443".to_string()
+            })
         );
-        // Every usable combination stays usable.
-        assert_eq!(cert_usage_refusal(true, true), None);
-        assert_eq!(cert_usage_refusal(true, false), None);
-        assert_eq!(cert_usage_refusal(false, false), None);
+        // The one positional it does take is the LISTEN ADDRESS, not a domain.
+        assert_eq!(
+            cert_invocation(true, &args(&[":8443"])),
+            Ok(CertInvocation::ServeDemo {
+                listen: ":8443".to_string()
+            })
+        );
+        assert_eq!(
+            cert_invocation(true, &args(&["127.0.0.1:8443"])),
+            Ok(CertInvocation::ServeDemo {
+                listen: "127.0.0.1:8443".to_string()
+            })
+        );
+        // Two or more is Go's `default:` arm, refused in Go's words.
+        assert_eq!(
+            cert_invocation(true, &args(&["host.user.ts.net", ":8443"])),
+            Err(CertUsageError::TooManyServeDemoArgs)
+        );
+        assert_eq!(
+            cert_usage_message(
+                CertUsageError::TooManyServeDemoArgs,
+                &CertDomainHint::Unknown
+            ),
+            "too many arguments; max 1 allowed with --serve-demo (the listen address)"
+        );
+        // Without `--serve-demo` the single positional is the domain, and any other count is Go's
+        // `len(args) != 1` usage error.
+        assert_eq!(
+            cert_invocation(false, &args(&["host.user.ts.net"])),
+            Ok(CertInvocation::Issue {
+                domain: "host.user.ts.net".to_string()
+            })
+        );
+        assert_eq!(
+            cert_invocation(false, &args(&[])),
+            Err(CertUsageError::MissingDomain)
+        );
+        assert_eq!(
+            cert_invocation(false, &args(&["a.ts.net", "b.ts.net"])),
+            Err(CertUsageError::MissingDomain)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_demo_server_fetches_a_certificate_for_the_name_it_was_asked_for() {
+        // Go's demo server has no domain because its TLS config fetches one per ClientHello
+        // (`GetCertificate: localClient.GetCertificate`). This is that fetch: the SNI name is what
+        // the daemon is asked to certify, and a name it will not certify is remembered so a scanner
+        // that keeps reconnecting cannot drive one ACME attempt per connection.
+        let dir = std::env::temp_dir().join(format!("tnet-demo-sni-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let socket = dir.join("daemon.sock");
+        let _ = std::fs::remove_file(&socket);
+        let listener =
+            tokio::net::UnixListener::bind(&socket).expect("bind the stub daemon socket");
+        // A stub daemon that serves ONE request and records it: a second round trip would find no
+        // listener and is visible as a `None` on the channel.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            let (stream, _) = listener.accept().await.expect("one connection");
+            let (read, mut write) = tokio::io::split(stream);
+            let mut line = String::new();
+            tokio::io::BufReader::new(read)
+                .read_line(&mut line)
+                .await
+                .expect("the request line");
+            write
+                .write_all(b"{\"kind\":\"error\",\"message\":\"no cert for that domain\"}\n")
+                .await
+                .expect("the stub reply");
+            let _ = tx.send(line.trim().to_string());
+        });
+
+        let certs: CertDemoCerts =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let budget: CertDemoBudget =
+            std::sync::Arc::new(tokio::sync::Mutex::new(CertDemoFetchBudget::new()));
+        let first = cert_demo_config_for(&socket, &certs, &budget, "host.user.ts.net").await;
+        assert!(
+            first.is_none(),
+            "a name the daemon will not certify has no config to serve"
+        );
+        let served = rx.await.expect("the stub daemon should have been asked");
+        assert!(
+            served.contains(r#""cmd":"cert""#) && served.contains(r#""domain":"host.user.ts.net""#),
+            "the SNI name is the domain the demo certifies: {served}"
+        );
+        assert!(
+            !served.contains("min_validity_secs"),
+            "Go's demo path carries no minimum validity either: {served}"
+        );
+
+        // The stub is gone now, so a second fetch that went to the daemon would fail differently —
+        // this one is answered from the memo, and answers the same.
+        let second = cert_demo_config_for(&socket, &certs, &budget, "host.user.ts.net").await;
+        assert!(second.is_none());
+        assert_eq!(
+            certs.lock().await.len(),
+            1,
+            "the outcome for that name is remembered, negative included"
+        );
+        let _ = std::fs::remove_file(&socket);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_demo_server_stops_asking_the_daemon_once_its_fetch_budget_is_spent() {
+        // The memo cannot bound this on its own: the SNI name is the cache key and the client picks
+        // it, so a caller that never repeats a name misses every time and (past the memo's cap) is
+        // not even remembered. Each miss is a daemon round-trip, and for a certifiable name an ACME
+        // attempt. So the misses are budgeted separately from the memo, and this is that budget:
+        // more distinct names than the budget allows must NOT become more daemon requests.
+        let dir = std::env::temp_dir().join(format!("tnet-demo-budget-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let socket = dir.join("daemon.sock");
+        let _ = std::fs::remove_file(&socket);
+        let listener =
+            tokio::net::UnixListener::bind(&socket).expect("bind the stub daemon socket");
+        // A stub daemon that answers every request and counts them — the count IS the assertion.
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&seen);
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (read, mut write) = tokio::io::split(stream);
+                let mut line = String::new();
+                let _ = tokio::io::BufReader::new(read).read_line(&mut line).await;
+                let _ = write
+                    .write_all(b"{\"kind\":\"error\",\"message\":\"no cert for that domain\"}\n")
+                    .await;
+            }
+        });
+
+        let certs: CertDemoCerts =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let budget: CertDemoBudget =
+            std::sync::Arc::new(tokio::sync::Mutex::new(CertDemoFetchBudget::new()));
+        let names: Vec<String> = (0..MAX_CERT_DEMO_FETCHES_PER_WINDOW + 8)
+            .map(|i| format!("scan{i}.user.ts.net"))
+            .collect();
+        for name in &names {
+            // Every one of these is a name the daemon refuses, so none of them can be served —
+            // what differs is whether the daemon was asked at all.
+            assert!(
+                cert_demo_config_for(&socket, &certs, &budget, name)
+                    .await
+                    .is_none(),
+                "the stub daemon certifies nothing, so {name} has no config"
+            );
+        }
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_CERT_DEMO_FETCHES_PER_WINDOW,
+            "{} distinct names must still cost at most one window's budget in daemon requests",
+            names.len()
+        );
+
+        // The budget rations the misses, not the memo: a name already answered for is still served
+        // from the memo with the budget spent, and costs no round-trip.
+        let memoized = cert_demo_config_for(&socket, &certs, &budget, &names[0]).await;
+        assert!(
+            memoized.is_none(),
+            "that name was refused, and is remembered"
+        );
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_CERT_DEMO_FETCHES_PER_WINDOW,
+            "a memo hit must not reach the daemon"
+        );
+        let _ = std::fs::remove_file(&socket);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_demo_fetch_budget_refills_only_when_its_window_rolls_over() {
+        // `take` reads its clock from the caller, so the window boundary is exercised here without
+        // sleeping through a minute of it.
+        let opened = std::time::Instant::now();
+        let mut budget = CertDemoFetchBudget::new();
+        for i in 0..MAX_CERT_DEMO_FETCHES_PER_WINDOW {
+            assert!(budget.take(opened), "fetch {i} is inside the first window");
+        }
+        assert!(
+            !budget.take(opened + CERT_DEMO_FETCH_WINDOW / 2),
+            "a spent window does not refill part-way through"
+        );
+        assert!(
+            budget.take(opened + CERT_DEMO_FETCH_WINDOW),
+            "the next window starts fresh — a shed connection is a delay, not a ban"
+        );
+
+        // A memo hit is answered without consulting the budget at all, so a demo answering for the
+        // same few names keeps working at any connection rate.
+        let certs: CertDemoCerts =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        certs
+            .lock()
+            .await
+            .insert("host.user.ts.net".to_string(), None);
+        let spent: CertDemoBudget =
+            std::sync::Arc::new(tokio::sync::Mutex::new(CertDemoFetchBudget::new()));
+        for _ in 0..MAX_CERT_DEMO_FETCHES_PER_WINDOW {
+            assert!(spent.lock().await.take(opened));
+        }
+        assert!(
+            matches!(
+                cert_demo_lookup(&certs, &spent, "host.user.ts.net", opened).await,
+                CertDemoLookup::Memoized(None)
+            ),
+            "a memoized name is answered from the memo, spent budget or not"
+        );
+        assert!(
+            matches!(
+                cert_demo_lookup(&certs, &spent, "other.user.ts.net", opened).await,
+                CertDemoLookup::Shed
+            ),
+            "an unmemoized name with no budget left is shed instead of asked for"
+        );
+    }
+
+    #[test]
+    fn cert_usage_error_carries_gos_cert_domain_hint() {
+        let usage = |hint: CertDomainHint| cert_usage_message(CertUsageError::MissingDomain, &hint);
+        let domains =
+            |d: &[&str]| CertDomainHint::Domains(d.iter().map(|s| s.to_string()).collect());
+        // A status this fork could not read prints the bare usage line — Go appends no hint either
+        // when its own `Status` call fails.
+        assert_eq!(
+            usage(CertDomainHint::Unknown),
+            "Usage: tnet cert [flags] <domain>"
+        );
+        // The four hints Go builds, in Go's words.
+        assert!(
+            usage(CertDomainHint::NotRunning).ends_with("\n\nThe node is not running.\n"),
+            "{}",
+            usage(CertDomainHint::NotRunning)
+        );
+        assert!(
+            usage(domains(&[]))
+                .ends_with("\n\nHTTPS cert support is not enabled/configured for your tailnet.\n"),
+            "{}",
+            usage(domains(&[]))
+        );
+        assert!(
+            usage(domains(&["host.user.ts.net"]))
+                .ends_with("\n\nFor domain, use \"host.user.ts.net\".\n"),
+            "{}",
+            usage(domains(&["host.user.ts.net"]))
+        );
+        // Go's `%q` of a []string: bracketed, space-separated, quoted.
+        assert!(
+            usage(domains(&["a.user.ts.net", "b.user.ts.net"]))
+                .ends_with("\n\nValid domain options: [\"a.user.ts.net\" \"b.user.ts.net\"].\n"),
+            "{}",
+            usage(domains(&["a.user.ts.net", "b.user.ts.net"]))
+        );
+        // Every hint keeps Go's usage line first.
+        for hint in [
+            CertDomainHint::Unknown,
+            CertDomainHint::NotRunning,
+            domains(&[]),
+            domains(&["host.user.ts.net"]),
+        ] {
+            assert!(
+                usage(hint).starts_with("Usage: tnet cert [flags] <domain>"),
+                "the usage line comes first"
+            );
+        }
     }
 
     #[test]
@@ -22343,29 +23018,57 @@ users:
 
     #[test]
     fn cert_command_parses_the_demo_and_validity_flags() {
-        match Cli::try_parse_from([
-            "tnet",
-            "cert",
-            "--serve-demo",
-            "--listen",
-            "127.0.0.1:8443",
-            "--min-validity",
-            "720h",
-            "host.user.ts.net",
-        ])
-        .expect("parses")
-        .command
+        // Go's `tailscale cert --serve-demo` takes no domain at all, and `tailscale cert --serve-demo
+        // :8443` names the listen address positionally. Both have to reach the command.
+        match Cli::try_parse_from(["tnet", "cert", "--serve-demo"])
+            .expect("`--serve-demo` with no domain is a valid Go command line")
+            .command
         {
             Command::Cert {
-                domain,
+                args, serve_demo, ..
+            } => {
+                assert!(serve_demo);
+                assert!(args.is_empty());
+                assert_eq!(
+                    cert_invocation(serve_demo, &args),
+                    Ok(CertInvocation::ServeDemo {
+                        listen: ":443".to_string()
+                    })
+                );
+            }
+            _ => panic!("expected Command::Cert"),
+        }
+        match Cli::try_parse_from(["tnet", "cert", "--serve-demo", ":8443"])
+            .expect("parses")
+            .command
+        {
+            Command::Cert {
+                args, serve_demo, ..
+            } => assert_eq!(
+                cert_invocation(serve_demo, &args),
+                Ok(CertInvocation::ServeDemo {
+                    listen: ":8443".to_string()
+                })
+            ),
+            _ => panic!("expected Command::Cert"),
+        }
+        match Cli::try_parse_from(["tnet", "cert", "--min-validity", "720h", "host.user.ts.net"])
+            .expect("parses")
+            .command
+        {
+            Command::Cert {
+                args,
                 min_validity,
                 serve_demo,
-                listen,
                 ..
             } => {
-                assert_eq!(domain, "host.user.ts.net");
-                assert!(serve_demo);
-                assert_eq!(listen.as_deref(), Some("127.0.0.1:8443"));
+                assert!(!serve_demo);
+                assert_eq!(
+                    cert_invocation(serve_demo, &args),
+                    Ok(CertInvocation::Issue {
+                        domain: "host.user.ts.net".to_string()
+                    })
+                );
                 assert_eq!(
                     min_validity,
                     Some(std::time::Duration::from_secs(720 * 3600))
@@ -22381,15 +23084,18 @@ users:
             Command::Cert {
                 min_validity,
                 serve_demo,
-                listen,
                 ..
             } => {
                 assert!(!serve_demo);
-                assert_eq!(listen, None);
                 assert_eq!(min_validity, None);
             }
             _ => panic!("expected Command::Cert"),
         }
+        // The listen address is Go's positional; there is no `--listen` flag on `cert`.
+        assert!(
+            Cli::try_parse_from(["tnet", "cert", "--serve-demo", "--listen", ":8443"]).is_err(),
+            "`cert` must not grow a flag Go does not have"
+        );
         // A duration Go's parser rejects is rejected at parse time, before anything is issued.
         assert!(
             Cli::try_parse_from(["tnet", "cert", "--min-validity", "1d", "host.user.ts.net"])
@@ -22448,9 +23154,33 @@ users:
             netcheck_verbose_line(std::time::Duration::from_millis(57)),
             "netcheck: GetReport took 57ms; err=<nil>"
         );
+        // Go prints `%v` of a `time.Duration`, which is the mixed-unit form — never a millisecond
+        // count past a second. A 1.234s report is `1.234s`, 1.5s is `1.5s`, and 90s is `1m30s`.
         assert_eq!(
             netcheck_verbose_line(std::time::Duration::from_millis(1_234)),
-            "netcheck: GetReport took 1234ms; err=<nil>"
+            "netcheck: GetReport took 1.234s; err=<nil>"
+        );
+        assert_eq!(
+            netcheck_verbose_line(std::time::Duration::from_millis(1_500)),
+            "netcheck: GetReport took 1.5s; err=<nil>"
+        );
+        assert_eq!(
+            netcheck_verbose_line(std::time::Duration::from_secs(90)),
+            "netcheck: GetReport took 1m30s; err=<nil>"
+        );
+        // `d.Round(time.Millisecond)`: sub-millisecond detail is rounded away, not truncated, with a
+        // half going away from zero.
+        assert_eq!(
+            netcheck_verbose_line(std::time::Duration::from_micros(57_400)),
+            "netcheck: GetReport took 57ms; err=<nil>"
+        );
+        assert_eq!(
+            netcheck_verbose_line(std::time::Duration::from_micros(57_500)),
+            "netcheck: GetReport took 58ms; err=<nil>"
+        );
+        assert_eq!(
+            netcheck_verbose_line(std::time::Duration::from_micros(400)),
+            "netcheck: GetReport took 0s; err=<nil>"
         );
         // `--verbose` is off by default, and pairs with the other netcheck flags.
         match Cli::try_parse_from(["tnet", "netcheck", "--verbose", "--every", "5"])
@@ -22654,6 +23384,126 @@ users:
         assert!(Cli::try_parse_from(["tnet", "appc-routes", "--n"]).is_err());
         // And a flag Go's `appc-routes` does not have stays unrecognised rather than ignored.
         assert!(Cli::try_parse_from(["tnet", "appc-routes", "--json"]).is_err());
+    }
+
+    /// `docs/ENGINE_ASKS.md` §39 is the ask an engine implementer would build
+    /// `Device::app_connector_route_info` from, and most of its value is that it says where each
+    /// field of Go's `appctype.RouteInfo` comes from. Two of the three are handed down by control
+    /// — the policy's `routes`, and the `*.` entries of its domain list — and only one is filled
+    /// by watching DNS. Getting that split wrong in the ask gets the accessor built wrong:
+    /// `appc.NewAppConnector` seeds a restarting connector's wildcard set straight out of
+    /// `RouteInfo.Wildcards`, so a `wildcards` derived from what was seen rather than from what was
+    /// configured comes back after a restart as a connector that no longer matches the subdomains
+    /// its own policy asked for.
+    ///
+    /// So the section is checked against itself. §39 already separates the two provenances in its
+    /// prose — a "configured domain set" bullet that control pushes, and a "DNS observation" bullet
+    /// that records what the resolver saw — and each field's parenthetical gloss has to land on the
+    /// right side of it. Both the vocabulary and the glosses are parsed out of the document, so
+    /// rewording either is free and reassigning a field's provenance is not.
+    mod engine_asks_39 {
+        const ASKS: &str = include_str!("../../docs/ENGINE_ASKS.md");
+
+        const HEADING: &str = "## 39.";
+
+        /// The words §39 uses for what the connector finds out at runtime, as opposed to what
+        /// control hands it. Prefixes, so "observation"/"observed" and "discovers"/"discovered"
+        /// both count.
+        const LEARNED: [&str; 3] = ["learn", "observ", "discover"];
+
+        /// §39's body, from its heading to the next top-level ask, with every run of whitespace
+        /// collapsed so a sentence broken over a line wrap reads as one string.
+        fn section() -> String {
+            let start = ASKS
+                .find(HEADING)
+                .unwrap_or_else(|| panic!("docs/ENGINE_ASKS.md should still contain `{HEADING}`"));
+            let body = &ASKS[start..];
+            let body = match body[HEADING.len()..].find("\n## ") {
+                Some(end) => &body[..HEADING.len() + end],
+                None => body,
+            };
+            body.split_whitespace().collect::<Vec<_>>().join(" ")
+        }
+
+        /// The parenthetical §39 attaches to one `RouteInfo` field in its **Ask:** sentence: the
+        /// field is written `` `name: Type` `` and the gloss is the `(…)` that follows it.
+        fn field_gloss(field: &str) -> String {
+            let section = section();
+            let named = format!("`{field}: ");
+            let start = section.find(&named).unwrap_or_else(|| {
+                panic!("§39 should still ask for a `RouteInfo` with a `{field}` field")
+            });
+            let open = start
+                + section[start..]
+                    .find('(')
+                    .unwrap_or_else(|| panic!("§39 should still gloss `{field}` with a `(…)`"));
+            let mut depth = 0usize;
+            for (offset, c) in section[open..].char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return section[open + 1..open + offset].to_string();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("§39's gloss for `{field}` is never closed")
+        }
+
+        /// The §39 bullet opening with this bold lead, up to the next bullet.
+        fn bullet(lead: &str) -> String {
+            let section = section();
+            let start = section
+                .find(lead)
+                .unwrap_or_else(|| panic!("§39 should still have its `{lead}` bullet"));
+            let body = &section[start..];
+            match body.find(" - **") {
+                Some(end) => body[..end].to_string(),
+                None => body.to_string(),
+            }
+        }
+
+        #[test]
+        fn the_two_provenances_the_glosses_are_read_against_are_still_the_sections_own() {
+            let observation = bullet("**DNS observation.**");
+            assert!(
+                LEARNED.iter().any(|word| observation.contains(word)),
+                "§39's DNS-observation bullet is the one place data arrives by watching; it should \
+                 still say so in those words: {observation}"
+            );
+            let configured = bullet("**The configured domain set.**");
+            assert!(
+                !LEARNED.iter().any(|word| configured.contains(word)),
+                "§39's configured-domain-set bullet describes what control pushes down, so the \
+                 vocabulary of runtime learning does not belong in it: {configured}"
+            );
+        }
+
+        #[test]
+        fn only_the_domains_field_is_glossed_as_something_the_connector_learns() {
+            let domains = field_gloss("domains");
+            assert!(
+                LEARNED.iter().any(|word| domains.contains(word)),
+                "`domains` is the field the DNS observation fills — the addresses seen per domain \
+                 — and its gloss should say so: {domains}"
+            );
+            for field in ["control", "wildcards"] {
+                let gloss = field_gloss(field);
+                assert!(
+                    !LEARNED.iter().any(|word| gloss.contains(word)),
+                    "`{field}` is pushed down by control, not learned by watching: glossing it as \
+                     learned points whoever builds the accessor at the wrong source, and Go seeds \
+                     a restarting connector from this very field: {gloss}"
+                );
+                assert!(
+                    gloss.contains("configured") || gloss.contains("polic"),
+                    "`{field}`'s gloss should name the policy it comes from: {gloss}"
+                );
+            }
+        }
     }
 
     /// `docs/ENGINE_ASKS.md` §21 is an ask filed against an OLD engine pin, and eight of the flags
