@@ -32,7 +32,11 @@
 /// Every prose document in the repository, by repository-relative path.
 ///
 /// Not just the seven that hold a table today: a table added to `CONTRIBUTING.md` tomorrow should
-/// be covered the moment it is written, not the moment someone remembers this list exists.
+/// be covered the moment it is written, not the moment someone remembers this list exists. This
+/// list is hand-written because [`include_str!`] is a compile-time macro and cannot walk a
+/// directory — so [`every_markdown_document_in_the_repository_is_scanned`] holds it against the
+/// repository's actual inventory and fails on anything missing. Adding a document and forgetting
+/// this list is a red test, not a silent hole.
 ///
 /// `CHANGELOG.md` is out because release-please writes it, and the two beads files
 /// (`.beads/README.md`, `.agents/skills/beads/SKILL.md`) are out because the tool vendors them —
@@ -79,6 +83,63 @@ const DOCS: &[(&str, &str)] = &[
         include_str!("../test-support/headscale/README.md"),
     ),
 ];
+
+/// Markdown that lives in this repository but is not this repository's prose, and why each one is
+/// out of [`DOCS`]. Everything else the inventory reports has to be scanned.
+const NOT_OUR_PROSE: &[(&str, &str)] = &[(
+    "CHANGELOG.md",
+    "release-please writes it; nobody hand-edits a table into it",
+)];
+
+/// Whether the path sits in a tool-owned directory. Every one of them is a dot-directory
+/// (`.beads/`, `.agents/`): the tool vendors the file, its shape is not ours to fix, and
+/// `.agents/skills/beads/SKILL.md` is not even present in a fresh checkout, so `include_str!`
+/// could not read it if we wanted to.
+fn is_vendored(path: &str) -> bool {
+    path.split('/').any(|component| component.starts_with('.'))
+}
+
+/// The documents an inventory obliges [`DOCS`] to carry: all of it, less the vendored trees and
+/// the entries [`NOT_OUR_PROSE`] names.
+fn must_be_scanned(inventory: &[String]) -> Vec<&str> {
+    inventory
+        .iter()
+        .map(String::as_str)
+        .filter(|path| {
+            !is_vendored(path) && !NOT_OUR_PROSE.iter().any(|(excluded, _)| excluded == path)
+        })
+        .collect()
+}
+
+/// Every Markdown file this repository tracks, taken from git rather than from a directory walk:
+/// the inventory that matters is what the repository *publishes*, and a walk would also drag in
+/// the ignored local-only working docs `.gitignore` names (`docs/GOAL.md` and friends), which no
+/// checkout but that developer's own has.
+fn tracked_markdown() -> Vec<String> {
+    let listing = std::process::Command::new("git")
+        .args([
+            "-C",
+            env!("CARGO_MANIFEST_DIR"),
+            "ls-files",
+            "-z",
+            "--",
+            "*.md",
+        ])
+        .output()
+        .expect("this guard takes the document inventory from git, so it needs `git` on PATH");
+    assert!(
+        listing.status.success(),
+        "`git ls-files` failed in {}: {}",
+        env!("CARGO_MANIFEST_DIR"),
+        String::from_utf8_lossy(&listing.stderr).trim(),
+    );
+    String::from_utf8(listing.stdout)
+        .expect("`git ls-files -z` emits paths verbatim, and this repository's are all UTF-8")
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect()
+}
 
 /// Rows that split today and are *not* repaired by this change, keyed by document and by the text
 /// their first cell starts with (a line number would be stale within a week — §4.5 of the parity
@@ -208,52 +269,98 @@ fn first_cell(cells: &[String]) -> String {
         .unwrap_or_default()
 }
 
+/// A code fence that is currently open: which character opened it, and how long the opening run
+/// was. GFM closes a fence only with a run of the *same* character that is at least as long, so a
+/// tilde line inside a backtick fence is content — and the tables in that content are somebody's
+/// example, not a table this repository renders.
+struct Fence {
+    marker: char,
+    length: usize,
+}
+
+/// The fence run a line opens or closes with, as `(marker, run length, what follows the run)`.
+/// Three or more backticks or tildes, and nothing else counts.
+fn fence_run(line: &str) -> Option<(char, usize, &str)> {
+    let marker = line.chars().next().filter(|ch| *ch == '`' || *ch == '~')?;
+    let length = line.chars().take_while(|ch| *ch == marker).count();
+    (length >= 3).then(|| (marker, length, &line[length..]))
+}
+
+/// Whether the line holds a `|` that the renderer would split on. A table may omit its outer
+/// pipes, so this — not a leading `|` — is what makes a line a table row candidate.
+fn has_unescaped_pipe(line: &str) -> bool {
+    let mut escaped = false;
+    for ch in line.chars() {
+        match ch {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            '|' => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Every line in `doc` that a renderer would truncate or refuse to make a table of.
 fn table_defects(doc: &'static str, text: &str) -> Vec<TableDefect> {
     let mut found = Vec::new();
-    let mut fenced = false;
+    let mut fence: Option<Fence> = None;
     // `Some(n)` only while inside a table body, so a stray pipe in prose is never a "row".
     let mut expected: Option<usize> = None;
-    // The last pipe-prefixed line seen, as `(1-based line, cells)`. When a delimiter row turns up
+    // The last table row candidate seen, as `(1-based line, cells)`. When a delimiter row turns up
     // it is that line's header, and the two widths have to agree.
     let mut previous: Option<(usize, Vec<String>)> = None;
 
     for (index, raw) in text.lines().enumerate() {
         let line = raw.trim();
-        if line.starts_with("```") || line.starts_with("~~~") {
-            fenced = !fenced;
+        if let Some(open) = &fence {
+            if let Some((marker, length, tail)) = fence_run(line)
+                && marker == open.marker
+                && length >= open.length
+                && tail.trim().is_empty()
+            {
+                fence = None;
+            }
+            continue;
+        }
+        // A backtick fence's info string may not contain a backtick, so a prose line that opens
+        // with three of them and closes a span later is not a fence.
+        if let Some((marker, length, tail)) = fence_run(line)
+            && (marker == '~' || !tail.contains('`'))
+        {
+            fence = Some(Fence { marker, length });
             expected = None;
             previous = None;
             continue;
         }
-        if fenced {
-            continue;
-        }
-        if !line.starts_with('|') {
+        if !has_unescaped_pipe(line) {
             expected = None;
             previous = None;
             continue;
         }
 
         let row = cells(line);
-        if is_delimiter_row(&row) {
-            // Only the delimiter that *opens* a table has a header above it; an all-dashes line in
-            // a body is a body row, and comparing it to the row before would invent a defect.
-            if expected.is_none()
-                && let Some((header_line, header)) = previous.take()
-                && header.len() != row.len()
-            {
-                found.push(TableDefect {
-                    doc,
-                    line: header_line,
-                    first_cell: first_cell(&header),
-                    defect: Defect::HeaderWidthMismatch {
-                        header_cells: header.len(),
-                        delimiter_cells: row.len(),
-                    },
-                });
+        // A delimiter row only *opens* a table, and only when a header sits directly above it. An
+        // all-dashes line inside a table body is a body row — it neither re-declares the table's
+        // width nor has a header to be measured against.
+        if expected.is_none() && is_delimiter_row(&row) {
+            if let Some((header_line, header)) = previous.take() {
+                if header.len() == row.len() {
+                    expected = Some(row.len());
+                } else {
+                    // The widths disagree, so GFM never makes a table of this block at all: the
+                    // header stays a paragraph, and so does everything under it.
+                    found.push(TableDefect {
+                        doc,
+                        line: header_line,
+                        first_cell: first_cell(&header),
+                        defect: Defect::HeaderWidthMismatch {
+                            header_cells: header.len(),
+                            delimiter_cells: row.len(),
+                        },
+                    });
+                }
             }
-            expected = Some(row.len());
             previous = None;
             continue;
         }
@@ -308,6 +415,69 @@ fn no_table_in_this_repository_loses_text_when_rendered() {
         "{} markdown table line(s) lose text when rendered:\n\n{}",
         offenders.len(),
         offenders.join("\n\n"),
+    );
+}
+
+/// The other half of "every prose document in the repository": [`DOCS`] is a hand-written list, and
+/// a hand-written list of files rots the first time someone adds a file. So the list is checked
+/// against the repository instead of trusted — a new document that nobody wired in here fails this
+/// test with the line to add, and a `DOCS` entry for a path git no longer tracks fails it too.
+#[test]
+fn every_markdown_document_in_the_repository_is_scanned() {
+    let inventory = tracked_markdown();
+    assert!(
+        inventory.len() > 1,
+        "`git ls-files -- '*.md'` returned {} path(s); the inventory cannot be that small, so the \
+         check below would pass vacuously",
+        inventory.len(),
+    );
+
+    let scanned: Vec<&str> = DOCS.iter().map(|(path, _)| *path).collect();
+    let missing: Vec<&str> = must_be_scanned(&inventory)
+        .into_iter()
+        .filter(|path| !scanned.contains(path))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{} markdown document(s) in this repository are not scanned by this guard:\n{}\n\nAdd \
+         each to `DOCS` as `(\"path\", include_str!(\"../path\"))`, or record it in \
+         `NOT_OUR_PROSE` with the reason it is not ours to check.",
+        missing.len(),
+        missing.join("\n"),
+    );
+
+    let stale: Vec<&str> = scanned
+        .iter()
+        .copied()
+        .filter(|path| !inventory.iter().any(|tracked| tracked == path))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "`DOCS` names {} path(s) this repository does not track: {}. Drop them, or track them.",
+        stale.len(),
+        stale.join(", "),
+    );
+}
+
+/// The exclusions are a short list of named files and the tool-owned dot-directories, and nothing
+/// else — in particular they must not swallow a document merely because it is new.
+#[test]
+fn the_inventory_excludes_only_the_vendored_and_the_named() {
+    let inventory: Vec<String> = [
+        "README.md",
+        "CHANGELOG.md",
+        ".beads/README.md",
+        ".agents/skills/beads/SKILL.md",
+        "docs/BRAND_NEW.md",
+    ]
+    .iter()
+    .map(|path| (*path).to_string())
+    .collect();
+
+    assert_eq!(
+        must_be_scanned(&inventory),
+        ["README.md", "docs/BRAND_NEW.md"],
+        "a document nobody has seen before is still this repository's prose",
     );
 }
 
@@ -438,4 +608,98 @@ fn a_well_formed_table_is_silent() {
 ";
     let found = table_defects("test.md", doc);
     assert!(found.is_empty(), "nothing to report here: {found:#?}");
+}
+
+/// A fence closes only for the marker that opened it, at least as long. Otherwise a tilde line
+/// *inside* a backtick fence drops the scanner back into prose mode halfway through somebody's
+/// example, and that example's tables — which no renderer ever draws — get audited as ours.
+#[test]
+fn a_different_fence_marker_does_not_end_the_block() {
+    let doc = "\
+```markdown
+~~~
+| Item | Note |
+| --- | --- |
+| broken | `tcp|udp` |
+~~~
+```
+
+| Item | Note |
+| --- | --- |
+| also broken | `tcp|udp` |
+";
+    let found = table_defects("test.md", doc);
+    assert_eq!(
+        found.len(),
+        1,
+        "only the table outside the fence is this repository's: {found:#?}",
+    );
+    assert_eq!(found[0].line, 11, "the row after the fence closed");
+}
+
+/// GFM lets a table drop its outer pipes. Such a table renders — and truncates — exactly like any
+/// other, so a scanner that only looks at lines beginning with `|` never sees the loss.
+#[test]
+fn a_table_without_outer_pipes_is_scanned_too() {
+    let doc = "\
+Item | Note
+--- | ---
+fine | ok
+broken | `tcp|udp` and more
+";
+    let found = table_defects("test.md", doc);
+    assert_eq!(found.len(), 1, "the overflowing row: {found:#?}");
+    assert_eq!(found[0].line, 4);
+    assert_eq!(
+        found[0].defect,
+        Defect::RowOverflows {
+            header_cells: 2,
+            row_cells: 3,
+            dropped: "udp` and more".to_string(),
+        },
+    );
+}
+
+/// Dashes in a body cell are content, not a second delimiter row: the table's width was settled by
+/// the header. Taking the width from such a row would raise the bar for every row after it, and the
+/// overflow that follows would go unreported.
+#[test]
+fn a_dashes_row_inside_a_table_does_not_re_declare_its_width() {
+    let doc = "\
+| Item | Note |
+| --- | --- |
+| --- | --- | --- |
+| broken | `tcp|udp` |
+";
+    let found = table_defects("test.md", doc);
+    assert_eq!(
+        found.len(),
+        2,
+        "the dashes row overflows too, and the row after it is still measured against the header: \
+         {found:#?}",
+    );
+    assert_eq!(found[0].line, 3);
+    assert_eq!(found[1].line, 4);
+    assert_eq!(
+        found[1].defect,
+        Defect::RowOverflows {
+            header_cells: 2,
+            row_cells: 3,
+            dropped: "udp` ".to_string(),
+        },
+    );
+}
+
+/// Dashes with no header above them are a paragraph of dashes, not an empty table — so the lines
+/// under them are prose and cannot overflow anything.
+#[test]
+fn a_delimiter_row_with_no_header_opens_nothing() {
+    let doc = "\
+Prose, then a blank line.
+
+| --- | --- |
+| a | b | c |
+";
+    let found = table_defects("test.md", doc);
+    assert!(found.is_empty(), "no table was ever opened: {found:#?}");
 }
