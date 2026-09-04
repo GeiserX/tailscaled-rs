@@ -269,21 +269,44 @@ fn first_cell(cells: &[String]) -> String {
         .unwrap_or_default()
 }
 
-/// A code fence that is currently open: which character opened it, and how long the opening run
-/// was. GFM closes a fence only with a run of the *same* character that is at least as long, so a
-/// tilde line inside a backtick fence is content — and the tables in that content are somebody's
-/// example, not a table this repository renders.
+/// A code fence that is currently open: which character opened it, how long the opening run was,
+/// and how far that run was indented. GFM closes a fence only with a run of the *same* character
+/// that is at least as long, so a tilde line inside a backtick fence is content — and only with a
+/// run indented no more than three columns past the opening one, so a backtick line indented four
+/// columns deeper than the fence it sits in is content too. The tables in that content are
+/// somebody's example, not a table this repository renders.
 struct Fence {
     marker: char,
     length: usize,
+    indent: usize,
 }
 
-/// The fence run a line opens or closes with, as `(marker, run length, what follows the run)`.
-/// Three or more backticks or tildes, and nothing else counts.
-fn fence_run(line: &str) -> Option<(char, usize, &str)> {
+/// How many columns of indentation a line opens with, expanding tabs to four-column stops the way
+/// CommonMark does before it measures any indentation of its own.
+fn indent_columns(line: &str) -> usize {
+    let mut columns = 0;
+    for ch in line.chars() {
+        match ch {
+            ' ' => columns += 1,
+            '\t' => columns += 4 - columns % 4,
+            _ => break,
+        }
+    }
+    columns
+}
+
+/// The fence run a line opens or closes with, as `(indent, marker, run length, what follows the
+/// run)`. Three or more backticks or tildes, and nothing else counts.
+///
+/// The line has to arrive with its leading whitespace intact. How far a run is indented is half of
+/// what separates a fence from a line that merely looks like one: strip it first and an indented
+/// pseudo-fence *inside* a block reads as the run that ends it.
+fn fence_run(line: &str) -> Option<(usize, char, usize, &str)> {
+    let indent = indent_columns(line);
+    let line = line.trim_start();
     let marker = line.chars().next().filter(|ch| *ch == '`' || *ch == '~')?;
     let length = line.chars().take_while(|ch| *ch == marker).count();
-    (length >= 3).then(|| (marker, length, &line[length..]))
+    (length >= 3).then(|| (indent, marker, length, &line[length..]))
 }
 
 /// Whether the line holds a `|` that the renderer would split on. A table may omit its outer
@@ -314,9 +337,13 @@ fn table_defects(doc: &'static str, text: &str) -> Vec<TableDefect> {
     for (index, raw) in text.lines().enumerate() {
         let line = raw.trim();
         if let Some(open) = &fence {
-            if let Some((marker, length, tail)) = fence_run(line)
+            // Three columns past the opening run is as far as a closing one may sit. The bound is
+            // relative because the absolute one would be wrong inside a list item, where every
+            // line of the block — the opening fence included — starts past column three.
+            if let Some((indent, marker, length, tail)) = fence_run(raw)
                 && marker == open.marker
                 && length >= open.length
+                && indent <= open.indent + 3
                 && tail.trim().is_empty()
             {
                 fence = None;
@@ -325,10 +352,14 @@ fn table_defects(doc: &'static str, text: &str) -> Vec<TableDefect> {
         }
         // A backtick fence's info string may not contain a backtick, so a prose line that opens
         // with three of them and closes a span later is not a fence.
-        if let Some((marker, length, tail)) = fence_run(line)
+        if let Some((indent, marker, length, tail)) = fence_run(raw)
             && (marker == '~' || !tail.contains('`'))
         {
-            fence = Some(Fence { marker, length });
+            fence = Some(Fence {
+                marker,
+                length,
+                indent,
+            });
             expected = None;
             previous = None;
             continue;
@@ -635,6 +666,86 @@ fn a_different_fence_marker_does_not_end_the_block() {
         "only the table outside the fence is this repository's: {found:#?}",
     );
     assert_eq!(found[0].line, 11, "the row after the fence closed");
+}
+
+/// A fence run indented four columns past the fence it sits in closes nothing — CommonMark reads
+/// it as the block's own content — so the block runs on and the pipes under it are still somebody's
+/// example. Trim the line before looking for the run and that distinction is gone: the scanner
+/// drops back into prose mode in the middle of the example and audits it as a table of ours.
+#[test]
+fn an_indented_run_inside_a_fence_does_not_close_it() {
+    let doc = "\
+```markdown
+A fence nested in a list item is indented, so an example of one is indented here:
+
+    ```
+| Item | Note |
+| --- | --- |
+| example | `tcp|udp` |
+    ```
+```
+
+| Item | Note |
+| --- | --- |
+| ours | `tcp|udp` |
+";
+    let found = table_defects("test.md", doc);
+    assert_eq!(
+        found.len(),
+        1,
+        "only the table after the fence closed is this repository's: {found:#?}",
+    );
+    assert_eq!(found[0].line, 13, "the row below the block, not inside it");
+}
+
+/// The bound on a closing run is three columns past the *opening* one, not three past the left
+/// margin. A fence two list levels deep starts well past column three and still opens a block — an
+/// absolute three-column rule would leave that block open, and audit the example inside it as ours.
+#[test]
+fn a_fence_indented_inside_a_list_still_opens_and_closes() {
+    let doc = "\
+1. Step one:
+
+   - Then:
+
+     ```
+     | Item | Note |
+     | --- | --- |
+     | example | `tcp|udp` |
+     ```
+
+| Item | Note |
+| --- | --- |
+| ours | `tcp|udp` |
+";
+    let found = table_defects("test.md", doc);
+    assert_eq!(
+        found.len(),
+        1,
+        "the list's example is fenced, however deep it sits: {found:#?}",
+    );
+    assert_eq!(found[0].line, 13, "the row after the list, not inside it");
+}
+
+/// A tab is four columns, which is how CommonMark counts one before it decides what a line is. A
+/// tab-indented run inside a fence is therefore content, exactly as four spaces would be.
+#[test]
+fn a_tab_indented_run_inside_a_fence_does_not_close_it() {
+    assert_eq!(indent_columns("\t"), 4, "one tab reaches the first stop");
+    assert_eq!(indent_columns(" \t"), 4, "and a space before it still does");
+
+    let doc = "\
+```
+\t```
+```
+
+| Item | Note |
+| --- | --- |
+| ours | `tcp|udp` |
+";
+    let found = table_defects("test.md", doc);
+    assert_eq!(found.len(), 1, "the tabbed run was content: {found:#?}");
+    assert_eq!(found[0].line, 7, "the row after the block, not inside it");
 }
 
 /// GFM lets a table drop its outer pipes. Such a table renders — and truncates — exactly like any
