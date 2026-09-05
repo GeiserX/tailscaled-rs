@@ -6,8 +6,9 @@
 //!
 //! So the rule is mechanical and this test enforces it mechanically: every entry cites exactly one
 //! upstream path, at the same commit the file pins in its header, written `<path> @ <commit>`. A
-//! path that starts with a slash, carries a space, or names no file is not a citation; a commit
-//! that disagrees with `pin` means the entry and the sweep are describing two different trees.
+//! path that starts with a slash, climbs out of the tree with `..`, carries a space, or names no
+//! file is not a citation; a commit that disagrees with `pin` means the entry and the sweep are
+//! describing two different trees.
 //!
 //! The other half of the contract is one gap per entry, and the two fields that carry the gap are
 //! the two this file holds unique: no two entries may file the same `title`, and no two may file
@@ -82,7 +83,14 @@ fn citation_defect(upstream: &str, pin: &str) -> Option<String> {
             "citation commit should be the pinned commit {pin:?}, got {commit:?}"
         ));
     }
-    if path.is_empty() || path.starts_with('/') || path.contains(' ') {
+    // `..` is rejected for the same reason a leading slash is: both name something the pinned tree
+    // does not hold. `../outside.go` climbs out of the upstream checkout, so there is no file at
+    // that path in the commit the entry cites and the reader has nothing to open.
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.contains(' ')
+        || path.split('/').any(|component| component == "..")
+    {
         return Some(format!(
             "citation path should be a repo-relative upstream path, got {path:?}"
         ));
@@ -259,6 +267,32 @@ fn a_citation_that_names_a_directory_is_a_defect() {
     let defect = citation_defect(&format!("cmd/tailscale/cli @ {PIN}"), PIN)
         .expect("a package is not a file");
     assert!(defect.contains("Go source file"), "{defect}");
+}
+
+/// A path that climbs out of the pinned tree names no file in it, whether it climbs from the root
+/// or from halfway down a real directory. Both shapes end at something the reader cannot open at
+/// the cited commit, which is the same failure as the absolute path next to it.
+#[test]
+fn a_citation_that_climbs_out_of_the_tree_is_a_defect() {
+    for escaping in [
+        "../outside.go",
+        "cmd/tailscale/cli/../../../outside.go",
+        "..",
+    ] {
+        let defect = citation_defect(&format!("{escaping} @ {PIN}"), PIN)
+            .unwrap_or_else(|| panic!("{escaping:?} leaves the pinned tree"));
+        assert!(defect.contains("repo-relative"), "{escaping:?}: {defect}");
+    }
+}
+
+/// The rejection is of the `..` path component, not of the two characters wherever they land: a
+/// file whose name merely contains a dot run is an ordinary citation.
+#[test]
+fn a_dot_run_inside_a_name_is_not_a_climb() {
+    assert_eq!(
+        citation_defect(&format!("tsnet/tsnet_test..go @ {PIN}"), PIN),
+        None
+    );
 }
 
 #[test]
