@@ -2653,13 +2653,19 @@ ens18\t0000000A\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0
         // A gateway route that is not RTF_UP (flags 0x0002 alone), an up-but-not-gateway route, a
         // malformed flags field, and a default route to a PUBLIC gateway — none of which is a home
         // router — followed by the one that is.
+        //
+        // The Gateway column is little-endian hex, so it reads back-to-front: `0100000A` is
+        // 10.0.0.1, `010200C0` is 192.0.2.1 (public, so not a home router), and `01A8A8C0` is
+        // 192.168.168.1. Writing one of these big-endian silently changes which address the row
+        // carries — that is how a private gateway turns into a public one and the row stops
+        // testing what it is here to test.
         let contents = "\
 Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT
 eth0\t00000000\t0100000A\t0002\t0\t0\t0\t00000000\t0\t0\t0
 eth0\t0000000A\t0100000A\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0
 eth0\t00000000\t0100000A\tzzzz\t0\t0\t0\t00000000\t0\t0\t0
-eth0\t00000000\t0100C000\t0003\t0\t0\t0\t00000000\t0\t0\t0
-wlan0\t00000000\t01A8C0C0\t0003\t0\t0\t0\t00000000\t0\t0\t0
+eth0\t00000000\t010200C0\t0003\t0\t0\t0\t00000000\t0\t0\t0
+wlan0\t00000000\t01A8A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0
 ";
         assert_eq!(
             parse_proc_net_route(contents),
