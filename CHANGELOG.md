@@ -25,6 +25,18 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.55.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.54.3...v0.55.0) (2026-09-05)
+
+
+### Features
+
+* **portmap:** ask the router for a port when STUN cannot punch through ([#372](https://github.com/GeiserX/tailscaled-rs/issues/372)) ([45d85c3](https://github.com/GeiserX/tailscaled-rs/commit/45d85c3089c2496a6616610826aec60224e42449))
+
+
+### Bug Fixes
+
+* **portmap:** stop a closed client from leaving a mapping on the router ([#370](https://github.com/GeiserX/tailscaled-rs/issues/370)) ([86c4055](https://github.com/GeiserX/tailscaled-rs/commit/86c40558718ac9cb075fb5b9858dc42f699e7bb9))
+
 ## [0.54.3](https://github.com/GeiserX/tailscaled-rs/compare/v0.54.2...v0.54.3) (2026-09-05)
 
 
