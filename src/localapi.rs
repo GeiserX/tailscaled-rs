@@ -950,8 +950,9 @@ pub enum Response {
     },
     /// One line of a `debug portmap` run's log (a streamed reply to [`Request::DebugPortmap`]).
     /// The daemon emits these as the run narrates itself and then closes the connection; the CLI
-    /// prints each `line` verbatim, so the output is byte-identical to what `tailscale debug
-    /// portmap` writes to stdout.
+    /// prints each `line` after neutralizing control characters (parts of a line are built from
+    /// what a device on the local network answered), so the output is byte-identical to what
+    /// `tailscale debug portmap` writes to stdout for any line of plain printable text.
     PortmapLog {
         /// One log line, without its trailing newline.
         line: String,
@@ -2453,7 +2454,7 @@ mod tests {
             other => panic!("expected DebugPortmap, got {other:?}"),
         }
         // The reply is a stream of log lines; each frame must survive the process boundary intact,
-        // because the CLI prints `line` verbatim.
+        // because the CLI prints `line` (control characters neutralized) as one line of output.
         let json = serde_json::to_string(&Response::PortmapLog {
             line: "Probe: {PCP:false PMP:true UPnP:true}".into(),
         })

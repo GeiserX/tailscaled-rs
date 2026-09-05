@@ -2121,6 +2121,20 @@ pub async fn debug_portmap(logf: LogSink, opts: &DebugPortmapOpts) -> Result<(),
     };
     let client = Client::new(prefixed, debug);
 
+    // Go's `defer c.Close()`: close the client on EVERY way out of this function — the early
+    // returns below, the normal end, and a *cancelled* run (the daemon aborts this task when the
+    // client hangs up, so this drop is the only cleanup that gets to happen). Closing drops the
+    // change hook and releases a mapping we obtained, so an abandoned diagnostic does not leave a
+    // mapping on the router to expire on its own. `close` is idempotent.
+    struct CloseOnDrop(Arc<Client>);
+    impl Drop for CloseOnDrop {
+        fn drop(&mut self) {
+            self.0.close();
+        }
+    }
+    // Declared after `client`, so it drops (and closes) before the client itself does.
+    let _closer = CloseOnDrop(Arc::clone(&client));
+
     // An explicit `<gateway>/<self>` pair wins over auto-detection; a malformed one is reported and
     // ends the run rather than being silently ignored (Go parses it with MustParseAddr, having
     // validated it in the CLI first).
@@ -2216,7 +2230,7 @@ pub async fn debug_portmap(logf: LogSink, opts: &DebugPortmapOpts) -> Result<(),
             logf("serveDebugPortmap: context done: context deadline exceeded");
         }
     }
-    client.close();
+    // `_closer` closes the client here, and on every early return above.
     Ok(())
 }
 
