@@ -5,6 +5,11 @@
     "faithful": 4,
     "gaps": 6,
     "findings": 9,
+    "upstream": {
+      "ref": "v1.102.3",
+      "commit": "53a0d659afa51835dd7a9283873cca44261454f8",
+      "note": "The revision every upstream citation below is a line number in. Cite it with the commit, not the tag: `git show <commit>:cmd/tailscale/cli/up.go | sed -n 305,307p` reproduces the row, and a reader who resolves a bare `up.go:305` against `main` instead will find something else there and read the audit as stale."
+    },
     "note": "Counted from the rows below, and consistent with them: every `gaps` row has at least one entry in `findings`, every `faithful` row has none. Re-deriving the ten rows against upstream v1.102.3 moved #299 from `faithful` to `gaps` - the backlog prose it rewrote still credits Go's `tailscale up` with `--nickname` - and wrote up two more divergences under #293, so this edition states four faithful, six gaps and nine findings where the first one stated five, five and seven."
   },
   "auditedPrs": [
@@ -16,6 +21,7 @@
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/294",
       "verdict": "gaps",
+      "upstream": "cmd/tailscale/cli/up.go @ 53a0d659afa51835dd7a9283873cca44261454f8",
       "notes": "The --exit-node-allow-lan-access refusal is verbatim prefsFromUpArgs (up.go:305-307) and correctly scoped to up only. The --nickname rename matches setProfilePrefs for a non-empty name; the empty-name arm diverges (Go's else branch restores the login name)."
     },
     {
@@ -41,6 +47,7 @@
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/302",
       "verdict": "faithful",
+      "upstream": "cmd/tailscaled/tailscaled.go @ 53a0d659afa51835dd7a9283873cca44261454f8",
       "notes": "Checked against cmd/tailscaled/tailscaled.go at the pin: the flag is declared (line 222), the empty-path carve-out matches `args.birdSocketPath != \"\"` (line 290), and the refusal precedes the --cleanup exit (290 vs 520), as ported. Exit 1 on stderr matches log.SetFlags(0)+log.Fatalf. The reworded reason is a stated departure."
     },
     {
