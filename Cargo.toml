@@ -1,6 +1,6 @@
 [package]
 name = "tailscaled-rs"
-version = "0.54.1"
+version = "0.54.2"
 edition = "2024"
 rust-version = "1.95"
 license = "BSD-3-Clause"
