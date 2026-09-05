@@ -1,5 +1,12 @@
 {
   "schema": "parity-audit/v1",
+  "summary": {
+    "auditedPrs": 10,
+    "faithful": 4,
+    "gaps": 6,
+    "findings": 9,
+    "note": "Counted from the rows below, and consistent with them: every `gaps` row has at least one entry in `findings`, every `faithful` row has none. Re-deriving the ten rows against upstream v1.102.3 moved #299 from `faithful` to `gaps` - the backlog prose it rewrote still credits Go's `tailscale up` with `--nickname` - and wrote up two more divergences under #293, so this edition states four faithful, six gaps and nine findings where the first one stated five, five and seven."
+  },
   "auditedPrs": [
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/293",
