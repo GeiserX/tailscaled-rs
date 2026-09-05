@@ -2121,6 +2121,20 @@ pub async fn debug_portmap(logf: LogSink, opts: &DebugPortmapOpts) -> Result<(),
     };
     let client = Client::new(prefixed, debug);
 
+    // Go's `defer c.Close()`: close the client on EVERY way out of this function — the early
+    // returns below, the normal end, and a *cancelled* run (the daemon aborts this task when the
+    // client hangs up, so this drop is the only cleanup that gets to happen). Closing drops the
+    // change hook and releases a mapping we obtained, so an abandoned diagnostic does not leave a
+    // mapping on the router to expire on its own. `close` is idempotent.
+    struct CloseOnDrop(Arc<Client>);
+    impl Drop for CloseOnDrop {
+        fn drop(&mut self) {
+            self.0.close();
+        }
+    }
+    // Declared after `client`, so it drops (and closes) before the client itself does.
+    let _closer = CloseOnDrop(Arc::clone(&client));
+
     // An explicit `<gateway>/<self>` pair wins over auto-detection; a malformed one is reported and
     // ends the run rather than being silently ignored (Go parses it with MustParseAddr, having
     // validated it in the CLI first).
@@ -2216,7 +2230,7 @@ pub async fn debug_portmap(logf: LogSink, opts: &DebugPortmapOpts) -> Result<(),
             logf("serveDebugPortmap: context done: context deadline exceeded");
         }
     }
-    client.close();
+    // `_closer` closes the client here, and on every early return above.
     Ok(())
 }
 
@@ -2653,13 +2667,19 @@ ens18\t0000000A\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0
         // A gateway route that is not RTF_UP (flags 0x0002 alone), an up-but-not-gateway route, a
         // malformed flags field, and a default route to a PUBLIC gateway — none of which is a home
         // router — followed by the one that is.
+        //
+        // The Gateway column is little-endian hex, so it reads back-to-front: `0100000A` is
+        // 10.0.0.1, `010200C0` is 192.0.2.1 (public, so not a home router), and `01A8A8C0` is
+        // 192.168.168.1. Writing one of these big-endian silently changes which address the row
+        // carries — that is how a private gateway turns into a public one and the row stops
+        // testing what it is here to test.
         let contents = "\
 Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT
 eth0\t00000000\t0100000A\t0002\t0\t0\t0\t00000000\t0\t0\t0
 eth0\t0000000A\t0100000A\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0
 eth0\t00000000\t0100000A\tzzzz\t0\t0\t0\t00000000\t0\t0\t0
-eth0\t00000000\t0100C000\t0003\t0\t0\t0\t00000000\t0\t0\t0
-wlan0\t00000000\t01A8C0C0\t0003\t0\t0\t0\t00000000\t0\t0\t0
+eth0\t00000000\t010200C0\t0003\t0\t0\t0\t00000000\t0\t0\t0
+wlan0\t00000000\t01A8A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0
 ";
         assert_eq!(
             parse_proc_net_route(contents),

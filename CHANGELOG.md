@@ -25,6 +25,20 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.54.3](https://github.com/GeiserX/tailscaled-rs/compare/v0.54.2...v0.54.3) (2026-09-05)
+
+
+### Bug Fixes
+
+* **portmap:** stop an abandoned debug run and defuse its log lines ([#368](https://github.com/GeiserX/tailscaled-rs/issues/368)) ([566984a](https://github.com/GeiserX/tailscaled-rs/commit/566984ae1dabc2e0a62592b4cfda396abb9dd09e))
+
+## [0.54.2](https://github.com/GeiserX/tailscaled-rs/compare/v0.54.1...v0.54.2) (2026-09-05)
+
+
+### Bug Fixes
+
+* **audit:** restate the totals the re-derived parity audit dropped ([#364](https://github.com/GeiserX/tailscaled-rs/issues/364)) ([1cda69d](https://github.com/GeiserX/tailscaled-rs/commit/1cda69dcde2ca5bf5fc4bdcebddc15f8c13b6f8b))
+
 ## [0.54.1](https://github.com/GeiserX/tailscaled-rs/compare/v0.54.0...v0.54.1) (2026-09-03)
 
 
