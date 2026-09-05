@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.55.1](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.0...v0.55.1) (2026-09-05)
+
+
+### Bug Fixes
+
+* **portmap:** release a PCP mapping the gateway still recognises ([#373](https://github.com/GeiserX/tailscaled-rs/issues/373)) ([5131774](https://github.com/GeiserX/tailscaled-rs/commit/5131774b534642253a896066d7ede7e4b1a41a90))
+
 ## [0.55.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.54.3...v0.55.0) (2026-09-05)
 
 
