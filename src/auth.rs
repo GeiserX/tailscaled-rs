@@ -212,6 +212,11 @@ pub(crate) fn requires_write(request: &crate::localapi::Request) -> bool {
         // is a write like `DebugRebind`/`DebugReStun`. It also discloses the daemon's on-disk layout,
         // which a socket-reachable non-owner has no business enumerating.
         | Request::DebugStateDir
+        // `DebugPortmap` asks the LAN gateway to open a hole to this host, over NAT-PMP/PCP/UPnP.
+        // Go gates `serveDebugPortmap` on `PermitWrite` ("debug access denied" otherwise), and a
+        // socket-reachable non-owner must not be able to make the router forward traffic inward, so
+        // it gates like `up`/`down` — never a read, despite reading like a diagnostic.
+        | Request::DebugPortmap { .. }
         // `ReloadConfig` re-reads the `--config` file and RECONFIGURES the running node (it merges +
         // persists the prefs and, on a live node, rebuilds the engine — a brief reconnect). Go gates
         // `serveReloadConfig` on `PermitWrite`; a socket-reachable non-owner must not be able to
@@ -376,6 +381,17 @@ mod tests {
             requires_write(&Request::DebugStateDir),
             "debug statedir rides Go's `debug` route, which gates on PermitWrite as a whole \
              ('debug access denied') — so it is a write, like debug rebind/restun"
+        );
+        assert!(
+            requires_write(&Request::DebugPortmap {
+                duration_ms: 5_000,
+                ty: String::new(),
+                gateway_and_self: None,
+                log_http: false,
+            }),
+            "debug portmap asks the LAN gateway to forward traffic inward (Go gates \
+             serveDebugPortmap on PermitWrite) — a write, so a non-root/non-owner local user can't \
+             make the router open a hole"
         );
         assert!(
             requires_write(&Request::ReloadConfig),

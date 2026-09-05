@@ -1104,3 +1104,84 @@ async fn debug_statedir_answers_from_the_daemon_not_the_cli_environment() {
 
     harness.shutdown_and_verify().await;
 }
+
+/// `debug portmap` STREAMS its log over the connection and then closes it — unlike every other
+/// one-shot verb, which answers with a single line. This drives the real server branch end to end:
+/// send the request, read frames until EOF, and check the run narrated itself the way Go's does.
+///
+/// The gateway is pinned to a documentation-range address (RFC 5737 TEST-NET-1) that nothing can
+/// answer on, and `"ty":"pmp"` keeps the run to NAT-PMP alone. That second half matters: the UPnP
+/// leg discovers over the SSDP *multicast* group on port 1900, which the gateway override does
+/// not constrain, so on a LAN with a real IGD it would find one and the run would narrate a fourth
+/// line. Restricted to NAT-PMP, the only packet that leaves is addressed to the unroutable gateway,
+/// so the run is deterministic wherever it executes: it reports the gateway it used, reports that
+/// nothing answered, and stops.
+#[tokio::test]
+async fn debug_portmap_streams_its_log_then_closes_the_connection() {
+    let harness = Harness::start().await;
+
+    let stream = UnixStream::connect(&harness.socket_path)
+        .await
+        .expect("CLI connect to LocalAPI socket for debug portmap");
+    let (read_half, mut write_half) = stream.into_split();
+    write_half
+        .write_all(
+            b"{\"cmd\":\"debug_portmap\",\"duration_ms\":500,\"ty\":\"pmp\",\"gateway_and_self\":\"192.0.2.1/192.0.2.2\"}\n",
+        )
+        .await
+        .expect("write debug portmap request");
+    write_half.flush().await.expect("flush request");
+
+    let mut reader = BufReader::new(read_half);
+    let mut lines = Vec::new();
+    loop {
+        let mut buf = String::new();
+        let n = tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut buf))
+            .await
+            .expect("the run is bounded by its own duration, so the stream must end")
+            .expect("read portmap stream line");
+        if n == 0 {
+            // The daemon closed the connection: the run is over. That EOF is what the CLI stops on.
+            break;
+        }
+        let trimmed = buf.trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Response>(trimmed).expect("portmap frame is Response JSON") {
+            Response::PortmapLog { line } => lines.push(line),
+            other => panic!("expected PortmapLog frames, got {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        lines,
+        vec![
+            "gw=192.0.2.1; self=192.0.2.2".to_string(),
+            "Probe: {PCP:false PMP:false UPnP:false}".to_string(),
+            "no portmapping services available".to_string(),
+        ],
+        "the streamed run must read exactly like `tailscale debug portmap` on a network with no \
+         port-mapping service"
+    );
+
+    harness.shutdown_and_verify().await;
+}
+
+/// A `--type` the port mapper does not know is refused with Go's message — the daemon's 400 —
+/// before anything is probed, and it arrives as a single `Response::Error` rather than a log frame,
+/// so the CLI can exit non-zero.
+#[tokio::test]
+async fn debug_portmap_refuses_an_unknown_type() {
+    let harness = Harness::start().await;
+
+    match harness
+        .round_trip(r#"{"cmd":"debug_portmap","duration_ms":500,"ty":"natpmp"}"#)
+        .await
+    {
+        Response::Error { message } => assert_eq!(message, "unknown portmap debug type"),
+        other => panic!("expected Response::Error for a bad --type, got {other:?}"),
+    }
+
+    harness.shutdown_and_verify().await;
+}
