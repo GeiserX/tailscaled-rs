@@ -101,6 +101,12 @@ pub enum PortmapError {
     Io(String),
 }
 
+/// The cause [`Client::create_or_get_mapping`] reports when the client was closed while the attempt
+/// was in flight: the gateway did grant a mapping, but [`Client::store_mapping`] released it again
+/// rather than store it on a closed client, so there is nothing to hand back. It has no upstream
+/// counterpart — Go stores the late mapping instead.
+const CLOSED_MID_ATTEMPT: &str = "client closed";
+
 impl PortmapError {
     /// Wrap `self` as Go's `NoMappingError{err}` — the shape `createOrGetMapping` returns so callers
     /// can tell "we asked and got nothing" apart from "the socket broke".
@@ -1229,6 +1235,14 @@ impl Client {
     /// The change hook is dropped too — Go's `Close` stops publishing mapping updates — which also
     /// releases whatever the hook captured (for `debug portmap`, the operator's log sink), so a
     /// background attempt that outlives the run cannot keep writing to it.
+    ///
+    /// "Refuse further use" is enforced at the two points where a mapping can still appear after
+    /// this returns: [`Client::maybe_start_mapping`] starts no new attempt, and
+    /// [`Client::store_mapping`] releases rather than stores a mapping that an attempt already in
+    /// flight goes on to obtain. Closing does *not* cancel that in-flight attempt — cancelling it
+    /// at an arbitrary await point could drop the answer to a mapping request the gateway had
+    /// already granted, which is the same leak with no record of what to release. It is bounded by
+    /// its own five-second timeout and its result is rejected on arrival.
     pub fn close(&self) {
         {
             let mut st = self.state.lock().expect("portmap state lock");
@@ -1253,16 +1267,8 @@ impl Client {
     fn invalidate_mappings_locked(st: &mut State, release_old: bool) {
         if let Some(m) = st.mapping.take()
             && release_old
-            && let Ok(handle) = tokio::runtime::Handle::try_current()
         {
-            let pkt = m.release_packet(mapping_nonce().unwrap_or([0u8; 12]));
-            let gw = m.gw;
-            handle.spawn(async move {
-                // Best effort, exactly like Go's: bind, write once, drop.
-                if let Ok(sock) = tokio::net::UdpSocket::bind("0.0.0.0:0").await {
-                    let _ = sock.send_to(&pkt, gw).await;
-                }
-            });
+            Self::release_mapping(m);
         }
         st.pmp_pub_ip = None;
         st.pmp_pub_ip_time = None;
@@ -1271,6 +1277,26 @@ impl Client {
         st.pcp_last_epoch = 0;
         st.upnp_saw_time = None;
         st.upnp_metas.clear();
+    }
+
+    /// Give `m` back to the gateway: a zero-lifetime request of its own protocol, sent once and
+    /// forgotten (Go `pmpMapping.Release` / `pcpMapping.Release`).
+    ///
+    /// Go's `Release` blocks; here it is a spawned best-effort send, so the synchronous callers
+    /// stay synchronous. With no Tokio runtime in scope (a unit test) there is nothing to spawn
+    /// onto and the release is skipped — the caller has already dropped the mapping either way.
+    fn release_mapping(m: Mapping) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let pkt = m.release_packet(mapping_nonce().unwrap_or([0u8; 12]));
+        let gw = m.gw;
+        handle.spawn(async move {
+            // Best effort, exactly like Go's: bind, write once, drop.
+            if let Ok(sock) = tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+                let _ = sock.send_to(&pkt, gw).await;
+            }
+        });
     }
 
     /// The gateway and our address for it, invalidating everything cached if either moved (Go
@@ -1644,7 +1670,10 @@ impl Client {
     fn maybe_start_mapping(self: &Arc<Self>) {
         {
             let mut st = self.state.lock().expect("portmap state lock");
-            if st.running_create {
+            // A closed client asks for nothing more. Go only sets the flag and never reads it, so
+            // upstream a caller still holding the client can start a fresh attempt after `Close`
+            // and obtain a mapping nobody will ever release; `close` here means what it says.
+            if st.closed || st.running_create {
                 return;
             }
             st.running_create = true;
@@ -1896,7 +1925,9 @@ impl Client {
                         good_until: stamp + grant.lifetime,
                         epoch: grant.epoch,
                     };
-                    self.store_mapping(m);
+                    if !self.store_mapping(m) {
+                        return Err(PortmapError::NoMapping(CLOSED_MID_ATTEMPT.into()));
+                    }
                     return Ok(m.external);
                 }
                 other => {
@@ -1922,7 +1953,9 @@ impl Client {
                     good_until,
                     epoch,
                 };
-                self.store_mapping(m);
+                if !self.store_mapping(m) {
+                    return Err(PortmapError::NoMapping(CLOSED_MID_ATTEMPT.into()));
+                }
                 return Ok(m.external);
             }
         }
@@ -1946,9 +1979,33 @@ impl Client {
     }
 
     /// Record a freshly created mapping and log it the way Go's deferred summary does.
-    fn store_mapping(&self, m: Mapping) {
+    ///
+    /// Returns `false` when [`Client::close`] won the race against the attempt that obtained `m`.
+    /// This is the one place a mapping becomes ours, so it is the one place that has to consult the
+    /// closed flag: a background attempt started before the close keeps running (it is bounded by
+    /// its own five-second timeout), and without this check its mapping would be stored on a client
+    /// nobody will close again and left on the router until its two-hour lease expired. A rejected
+    /// mapping is released immediately instead, which is what `close` would have done had it seen
+    /// it. Go has the same window and does not close it (`net/portmapper`'s `createOrGetMapping`
+    /// stores under `mu` without consulting `c.closed`); this fork does, because `debug portmap`
+    /// closes its client on every cancelled run and promises the run leaves nothing behind.
+    #[must_use]
+    fn store_mapping(&self, m: Mapping) -> bool {
         {
             let mut st = self.state.lock().expect("portmap state lock");
+            if st.closed {
+                // Not stored, so `close` can never find it: release it here or it is lost. The
+                // state lock goes first, because both the release and the log sink are the
+                // caller's code.
+                drop(st);
+                Self::release_mapping(m);
+                self.logf(format!(
+                    "released mapping obtained after close: external={} type={}",
+                    m.external,
+                    m.kind.as_str()
+                ));
+                return false;
+            }
             st.mapping = Some(m);
         }
         if self.debug.verbose_logs {
@@ -1969,6 +2026,7 @@ impl Client {
                 unix(m.renew_after)
             ));
         }
+        true
     }
 
     /// The UPnP leg of `createOrGetMapping` (Go `getUPnPPortMapping`).
@@ -2844,6 +2902,10 @@ wlan0\t00000000\t01A8A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0
     struct FakeIgd {
         pxp_port: u16,
         upnp_port: u16,
+        /// Every NAT-PMP/PCP datagram the router received, in arrival order — including the
+        /// zero-lifetime release requests, which are the only outside evidence that the client gave
+        /// a mapping back.
+        seen: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     }
 
     /// What the fake router is willing to do.
@@ -2882,11 +2944,13 @@ wlan0\t00000000\t01A8A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0
                 .expect("bind fake ssdp socket");
             let pxp_port = pxp.local_addr().expect("pxp local addr").port();
             let upnp_port = upnp.local_addr().expect("ssdp local addr").port();
+            let (seen_tx, seen) = tokio::sync::mpsc::unbounded_channel();
 
             tokio::spawn(async move {
                 let mut buf = [0u8; RECV_BUF];
                 while let Ok((n, src)) = pxp.recv_from(&mut buf).await {
                     let req = &buf[..n];
+                    let _ = seen_tx.send(req.to_vec());
                     let reply = match req.first().copied() {
                         Some(PMP_VERSION) if cfg.pmp => fake_pmp_reply(req, cfg.pmp_result),
                         Some(PCP_VERSION) if cfg.pcp => fake_pcp_reply(req),
@@ -2915,7 +2979,16 @@ wlan0\t00000000\t01A8A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0
             FakeIgd {
                 pxp_port,
                 upnp_port,
+                seen,
             }
+        }
+
+        /// The next datagram the router received, or `None` if none arrives within `within`.
+        async fn next_request(&mut self, within: Duration) -> Option<Vec<u8>> {
+            tokio::time::timeout(within, self.seen.recv())
+                .await
+                .ok()
+                .flatten()
         }
 
         /// A client wired to this fake: loopback gateway, loopback self, redirected ports.
@@ -3223,6 +3296,118 @@ wlan0\t00000000\t01A8A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0
             logged.contains("UPnP device discovered at http://127.0.0.1:5000/rootDesc.xml")
                 && logged.contains("not implemented by this build"),
             "the run names the device it found and why it cannot use it: {logged}"
+        );
+    }
+
+    /// The race `close` has to win, asserted where it is decided. An attempt that was already in
+    /// flight goes on to obtain a mapping after the client is closed; storing it would leave the
+    /// forwarding open on the router until its two-hour lease ran out, because the client that
+    /// would have released it is closed and nothing closes it twice.
+    ///
+    /// No socket: this calls the store point directly, so it runs everywhere.
+    #[tokio::test]
+    async fn a_mapping_that_lands_after_close_is_rejected_and_released() {
+        let (logf, lines) = collector();
+        let c = Client::new(logf, DebugKnobs::default());
+        let now = SystemTime::now();
+        let m = Mapping {
+            kind: MappingKind::Pmp,
+            gw: "192.0.2.1:5351".parse().expect("gateway addr"),
+            internal: "192.0.2.2:41641".parse().expect("internal addr"),
+            external: "192.0.2.1:45678".parse().expect("external addr"),
+            renew_after: now + Duration::from_secs(3_600),
+            good_until: now + Duration::from_secs(7_200),
+            epoch: 7,
+        };
+        c.close();
+
+        assert!(
+            !c.store_mapping(m),
+            "a mapping obtained after close must be refused"
+        );
+        assert!(
+            !c.have_mapping(),
+            "and must not be cached on a closed client"
+        );
+        let logged = lines.lock().expect("log lock").join("\n");
+        assert_eq!(
+            logged, "released mapping obtained after close: external=192.0.2.1:45678 type=pmp",
+            "the run says what became of it: releasing it is the only thing keeping it off the \
+             router"
+        );
+    }
+
+    /// `close` also means no *new* attempt. The daemon holds its `Arc<Client>` until the cancelled
+    /// run's task is reaped, so a caller can still ask — and must not start an attempt whose
+    /// mapping nobody would be left to release.
+    #[tokio::test]
+    async fn a_closed_client_starts_no_further_mapping_attempt() {
+        let c = Client::new(discard(), DebugKnobs::default());
+        c.set_gateway_lookup(Arc::new(|| {
+            Some((
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)),
+            ))
+        }));
+        c.close();
+
+        assert_eq!(
+            c.get_cached_mapping_or_start_creating_one(),
+            None,
+            "a closed client has no mapping to hand back"
+        );
+        // Read before this test awaits anything: on the current-thread runtime `#[tokio::test]`
+        // builds, a spawned attempt cannot have run and cleared the flag behind us, so this is
+        // exactly what `maybe_start_mapping` decided.
+        assert!(
+            !c.state.lock().expect("portmap state lock").running_create,
+            "a closed client must not start a background mapping attempt"
+        );
+    }
+
+    /// The same rejection end to end, against the fake router: the mapping is really granted on the
+    /// wire, and the release really goes back to the gateway. This is the path a background attempt
+    /// takes after `close` — `maybe_start_mapping`'s task is a spawned call to this same function.
+    #[tokio::test]
+    async fn a_mapping_granted_after_close_is_released_back_to_the_gateway() {
+        if !loopback_udp_works().await {
+            skipped_no_loopback_udp(
+                "a_mapping_granted_after_close_is_released_back_to_the_gateway",
+            );
+            return;
+        }
+        let mut igd = FakeIgd::start(FakeIgdConfig::default()).await;
+        let (logf, _lines) = collector();
+        let c = igd.client(DebugKnobs::default(), logf);
+        c.set_local_port(41641);
+        c.close();
+
+        let err = c
+            .create_or_get_mapping()
+            .await
+            .expect_err("a mapping the closed client gave back is not a mapping it can return");
+        assert_eq!(err.to_string(), "no NAT mapping available: client closed");
+        assert!(!c.have_mapping());
+
+        // What the router saw: the public-address ask, the map ask, and — only because the mapping
+        // was rejected — a zero-lifetime request releasing the port it had just granted.
+        let deleted = MAP_LIFETIME_DELETE.to_be_bytes();
+        let mut release = None;
+        while let Some(req) = igd.next_request(Duration::from_secs(3)).await {
+            if req.first() == Some(&PMP_VERSION)
+                && req.get(1) == Some(&PMP_OP_MAP_UDP)
+                && req.get(8..12) == Some(&deleted[..])
+            {
+                release = Some(req);
+                break;
+            }
+        }
+        let release = release
+            .expect("a mapping obtained after close must be released, not left on the router");
+        assert_eq!(
+            u16::from_be_bytes([release[6], release[7]]),
+            45678,
+            "the release names the external port the router granted"
         );
     }
 
