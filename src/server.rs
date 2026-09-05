@@ -802,10 +802,10 @@ async fn stream_nc(
 /// Stream a `debug portmap` run over this connection (the daemon half of Go's `serveDebugPortmap`).
 ///
 /// The port-mapping client narrates itself through a synchronous log sink, while the socket write is
-/// async, so the two are joined by an unbounded channel: the sink pushes a line, this loop forwards
-/// it as one [`Response::PortmapLog`] frame and flushes. When the run ends it drops its sender, the
-/// channel closes, and the loop returns — which closes the connection, exactly the EOF the CLI stops
-/// reading on.
+/// async, so the two are joined by an unbounded channel: the sink pushes a line, and
+/// [`pump_debug_portmap`] forwards it as one [`Response::PortmapLog`] frame and flushes. When the
+/// run ends it drops its sender, the channel closes, and the pump returns — which closes the
+/// connection, exactly the EOF the CLI stops reading on.
 ///
 /// A `--type` the run refuses (Go's 400 `unknown portmap debug type`) is reported as a single
 /// [`Response::Error`] frame instead, before any log line, so the CLI can exit non-zero.
@@ -832,14 +832,45 @@ async fn stream_debug_portmap(
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let logf: crate::portmap::LogSink = Arc::new(move |line: &str| {
-        // A send failure means the reader is gone (client disconnected); the run is bounded by its
-        // own deadline, so dropping the line is the whole response.
+        // A send failure means the reader is gone (client disconnected); the pump cancels the run
+        // on its way out, so dropping the line is the whole response.
         let _ = tx.send(line.to_string());
     });
 
     // Run the diagnostic on its own task so log lines are forwarded to the socket WHILE it runs
     // rather than after it finishes (the operator is watching a live probe).
-    let mut run = tokio::spawn(async move { crate::portmap::debug_portmap(logf, &opts).await });
+    let run = tokio::spawn(async move { crate::portmap::debug_portmap(logf, &opts).await });
+
+    pump_debug_portmap(write_half, &mut rx, run).await
+}
+
+/// Forward one `debug portmap` run's log lines to the client until the run ends, then report its
+/// verdict. The streaming half of [`stream_debug_portmap`], split out so the cancellation contract
+/// below can be exercised with a task that would otherwise outlive the connection.
+///
+/// **The run is cancelled when this returns**, however it returns. Dropping a `JoinHandle` only
+/// *detaches* the task — it keeps running to completion with nothing left to read it — so without
+/// the guard a client that hangs up mid-run (every `write_response` below then fails with EPIPE,
+/// and `?` returns) would leave the probe holding its UDP socket and re-trying mappings for the
+/// whole client-chosen `--duration`, which has no upper bound. Go has this for free: its handler
+/// derives the run's context from the HTTP request, so a disconnect cancels the run and the
+/// handler's defers close the portmapper (`feature/debugportmapper/debugportmapper.go`,
+/// `serveDebugPortmap`). The abort guard is that context, and
+/// [`crate::portmap::debug_portmap`]'s own close-on-drop guard is those defers.
+async fn pump_debug_portmap(
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    mut run: tokio::task::JoinHandle<Result<(), String>>,
+) -> Result<()> {
+    /// Cancels the run it names when it goes out of scope, including on the `?` early returns
+    /// below. Aborting an already-finished task is a no-op, so the normal path pays nothing.
+    struct CancelOnDrop(tokio::task::AbortHandle);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _cancel = CancelOnDrop(run.abort_handle());
 
     // Stop on whichever comes first: the sink closing, or the run returning. Both are needed. The
     // run's own deadline is the operator's bound, but a background mapping attempt it kicked off can
@@ -1782,6 +1813,52 @@ mod tests {
             .expect("read_capped_line");
         writer.await.expect("writer task");
         (result, out)
+    }
+
+    /// A `debug portmap` run must not outlive the client that asked for it. When the connection
+    /// breaks mid-run every write fails and the pump returns early — at which point it has to
+    /// *cancel* the run, because dropping a `JoinHandle` only detaches the task and it would keep
+    /// probing (and holding its UDP socket) for the whole client-chosen `--duration`, which is
+    /// unbounded.
+    #[tokio::test]
+    async fn portmap_run_is_cancelled_when_the_client_hangs_up() {
+        let (client, server) = UnixStream::pair().expect("UnixStream::pair");
+        // The operator hit ^C: the reading end is gone before the first line goes out, so every
+        // write below fails with EPIPE.
+        drop(client);
+        let (_read_half, mut write_half) = server.into_split();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        // Stand in for a long run: `tnet debug portmap --duration 1h` is a legal request, and this
+        // task never finishes on its own inside the test's patience.
+        let run = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            Ok(())
+        });
+        let cancelled = run.abort_handle();
+        tx.send("gw=192.0.2.1; self=192.0.2.2".to_string())
+            .expect("queue the run's first log line");
+
+        let err = pump_debug_portmap(&mut write_half, &mut rx, run)
+            .await
+            .expect_err("writing to a hung-up client must fail");
+        // It failed on the write itself — the peer is gone, so the send never blocks — and not by
+        // sitting in `write_response`'s stalled-client timeout.
+        let err = format!("{err:#}");
+        assert!(
+            !err.contains("timed out"),
+            "a hung-up client fails the write immediately, not by timeout: {err}"
+        );
+
+        // The abort lands the next time the runtime polls the task, so allow a bounded moment for
+        // it — but only a moment: without the cancellation this never becomes true.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !cancelled.is_finished() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the run must be cancelled when the client hangs up, not left detached");
     }
 
     #[tokio::test]

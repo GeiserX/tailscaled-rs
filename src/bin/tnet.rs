@@ -4187,9 +4187,10 @@ fn portmap_duration_ms(duration: &str) -> Result<u64> {
 ///
 /// Unlike every other one-shot verb, this STREAMS: the daemon writes one [`Response::PortmapLog`]
 /// frame per line for up to the requested duration and then closes the connection, so this reads
-/// until EOF and prints each `line` verbatim (matching the plain-text body `tailscale debug portmap`
-/// copies to stdout). A [`Response::Error`] — a refused `--type`, or a permission denial — is
-/// reported on stderr with exit 1.
+/// until EOF and prints each `line` (matching the plain-text body `tailscale debug portmap` copies
+/// to stdout, save for the terminal sanitization [`render_portmap_frame`] applies). A
+/// [`Response::Error`] — a refused `--type`, or a permission denial — is reported on stderr with
+/// exit 1.
 async fn run_debug_portmap(
     socket: &std::path::Path,
     duration: &str,
@@ -4230,18 +4231,57 @@ async fn run_debug_portmap(
         if trimmed.is_empty() {
             continue;
         }
-        match serde_json::from_str::<Response>(trimmed)
-            .with_context(|| format!("parsing daemon portmap stream line: {trimmed:?}"))?
-        {
-            Response::PortmapLog { line } => println!("{line}"),
-            Response::Error { message } => {
+        let frame = serde_json::from_str::<Response>(trimmed)
+            .with_context(|| format!("parsing daemon portmap stream line: {trimmed:?}"))?;
+        match render_portmap_frame(frame) {
+            PortmapFrame::Log(line) => println!("{line}"),
+            PortmapFrame::Failed(message) => {
                 eprintln!("error: {message}");
                 std::process::exit(1);
             }
-            other => eprintln!("warning: unexpected reply on portmap stream: {other:?}"),
+            PortmapFrame::Unexpected(warning) => eprintln!("warning: {warning}"),
         }
     }
     Ok(())
+}
+
+/// What one frame off the `debug portmap` stream turns into on this terminal.
+#[derive(Debug, PartialEq, Eq)]
+enum PortmapFrame {
+    /// One log line for stdout; the run continues.
+    Log(String),
+    /// The run refused itself: stderr, then exit 1.
+    Failed(String),
+    /// A reply that does not belong on this stream: a stderr warning, and the run continues.
+    Unexpected(String),
+}
+
+/// Render one decoded [`Response`] from the `debug portmap` stream for the terminal.
+///
+/// **The text in these frames is not the daemon's own.** A `debug portmap` run narrates what the
+/// local network answered, and several of its lines are built straight from bytes a device on that
+/// LAN chose: an SSDP discovery reply's `LOCATION`/`SERVER` headers reach the operator through
+/// `UPnP device discovered at <location> (<server>)`, and a header line the parser rejects is
+/// echoed whole in `unrecognized UPnP discovery response; ignoring: malformed MIME header line:
+/// <line>`. Printing those verbatim would hand anything answering an M-SEARCH on the local link a
+/// write channel into the terminal of whoever is debugging their router — ANSI/OSC escapes, and an
+/// embedded newline that forges an extra, entirely fake line of the run's log.
+///
+/// So both text-bearing frames go through the same sanitizers the rest of this CLI already applies
+/// to semi-trusted, remotely-supplied strings: [`sanitize_for_terminal`] for a log line, which is
+/// one record per frame and therefore must not contain a line break, and [`sanitize_multiline`] for
+/// an error message, which is free-form prose that may legitimately wrap. Real portmapper output —
+/// `gw=…`, `Probe: {PCP:… PMP:… UPnP:…}`, `mapping: …` — is plain printable text, so this is
+/// byte-identical to Go's output for every well-behaved network. Go itself does no sanitizing here
+/// (`serveDebugPortmap` writes the lines into the HTTP response and the CLI `io.Copy`s them to
+/// stdout); this fork is deliberately stricter, as it already is for peer and control-supplied
+/// names.
+fn render_portmap_frame(frame: Response) -> PortmapFrame {
+    match frame {
+        Response::PortmapLog { line } => PortmapFrame::Log(sanitize_for_terminal(&line)),
+        Response::Error { message } => PortmapFrame::Failed(sanitize_multiline(&message)),
+        other => PortmapFrame::Unexpected(format!("unexpected reply on portmap stream: {other:?}")),
+    }
 }
 
 /// `reload-config` (Go `tailscaled`'s `reload-config`): ask the daemon to re-read its `--config` file
@@ -23249,6 +23289,59 @@ users:
                 .expect_err("no day unit")
                 .to_string(),
             r#"time: unknown unit "d" in duration "1d""#
+        );
+    }
+
+    #[test]
+    fn portmap_log_lines_cannot_carry_escapes_into_the_terminal() {
+        // A `debug portmap` line is not the daemon's own text: this one is the shape the run emits
+        // for a discovered UPnP device, whose LOCATION and SERVER come straight out of an SSDP
+        // reply that anything on the local link can send. Decode it off the wire exactly as the
+        // stream loop does, so the frame under test is a real one.
+        let wire = serde_json::to_string(&Response::PortmapLog {
+            line: "portmapper: UPnP device discovered at \u{1b}]8;;http://evil/\u{7}http://192.0.2.1:5000/rootDesc.xml (\u{1b}[2mMiniUPnPd/2.1\nmapping: 192.0.2.9:41641)".to_string(),
+        })
+        .expect("serialize a portmap log frame");
+        let frame = serde_json::from_str::<Response>(&wire).expect("decode a portmap log frame");
+
+        let PortmapFrame::Log(rendered) = render_portmap_frame(frame) else {
+            panic!("a portmap_log frame renders as a log line");
+        };
+        // No escape introducer, no OSC terminator: the hyperlink/colour injection is defused.
+        assert!(
+            !rendered.contains('\u{1b}') && !rendered.contains('\u{7}'),
+            "terminal escapes must not survive to stdout: {rendered:?}"
+        );
+        // No newline either — one frame is one line, so an embedded '\n' would forge a whole extra
+        // line of the run's log (here, a `mapping:` line reporting an address never obtained).
+        assert!(
+            !rendered.contains('\n'),
+            "a log line must not be able to forge a second line: {rendered:?}"
+        );
+        // The readable part is preserved, so the operator still sees which device answered.
+        assert!(
+            rendered.contains("http://192.0.2.1:5000/rootDesc.xml")
+                && rendered.contains("MiniUPnPd/2.1"),
+            "sanitizing must not eat the diagnostic itself: {rendered:?}"
+        );
+
+        // An ordinary line — everything a well-behaved network produces — is passed through
+        // unchanged, so this stays byte-identical to `tailscale debug portmap`.
+        let plain = "Probe: {PCP:false PMP:true UPnP:true}";
+        assert_eq!(
+            render_portmap_frame(Response::PortmapLog {
+                line: plain.to_string()
+            }),
+            PortmapFrame::Log(plain.to_string())
+        );
+
+        // The stream's error frame gets the free-form treatment: escapes neutralized, but a
+        // multi-line message still wraps.
+        assert_eq!(
+            render_portmap_frame(Response::Error {
+                message: "unknown portmap debug type\n\u{1b}[2Jwiped".to_string()
+            }),
+            PortmapFrame::Failed("unknown portmap debug type\n\u{FFFD}[2Jwiped".to_string())
         );
     }
 
