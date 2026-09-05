@@ -101,11 +101,12 @@ pub enum PortmapError {
     Io(String),
 }
 
-/// The cause [`Client::create_or_get_mapping`] reports when the client was closed while the attempt
-/// was in flight: the gateway did grant a mapping, but [`Client::store_mapping`] released it again
-/// rather than store it on a closed client, so there is nothing to hand back. It has no upstream
-/// counterpart — Go stores the late mapping instead.
-const CLOSED_MID_ATTEMPT: &str = "client closed";
+/// The cause [`Client::create_or_get_mapping`] reports when the client is closed: either the attempt
+/// never started (the check on entry) or it was in flight when [`Client::close`] ran and
+/// [`Client::store_mapping`] released the mapping the gateway had granted rather than store it on a
+/// closed client. Either way there is nothing to hand back. It has no upstream counterpart — Go
+/// neither refuses the call nor rejects the late mapping.
+const CLOSED_CLIENT: &str = "client closed";
 
 impl PortmapError {
     /// Wrap `self` as Go's `NoMappingError{err}` — the shape `createOrGetMapping` returns so callers
@@ -1024,6 +1025,14 @@ struct Mapping {
     good_until: SystemTime,
     /// The service's epoch counter at the time of the grant.
     epoch: u32,
+    /// PCP only: the 96-bit mapping nonce the request that created this mapping carried. `None` for
+    /// NAT-PMP, which has no such field.
+    ///
+    /// Kept because PCP identifies a mapping by it: a MAP request whose internal address, protocol
+    /// and internal port match an existing mapping but whose nonce does not "MUST be rejected with
+    /// a NOT_AUTHORIZED error" (RFC 6887 §11.3), and a release *is* a MAP request. Inventing a
+    /// fresh nonce to release with therefore leaves the mapping on the router.
+    nonce: Option<[u8; 12]>,
 }
 
 /// Render a [`SystemTime`] as Go's `Time.Unix()` — seconds since the epoch — for the debug strings.
@@ -1059,21 +1068,34 @@ impl Mapping {
 
     /// The datagram that releases this mapping: a zero-lifetime request of the same protocol (Go
     /// `pmpMapping.Release` / `pcpMapping.Release`).
-    fn release_packet(&self, nonce: [u8; 12]) -> Vec<u8> {
+    ///
+    /// The PCP release identifies the mapping the way RFC 6887 requires — same internal address and
+    /// port, same [`nonce`](Mapping::nonce) — and zeroes the suggested external address and port,
+    /// which §15.1 demands of every zero-lifetime request ("MUST be set to zero on transmission and
+    /// MUST be ignored on reception"). This is where the port mapper diverges from Go, whose
+    /// `pcpMapping` keeps no nonce: `buildPCPRequestMappingPacket` draws a fresh one from
+    /// `crypto/rand` on every call, so Go's release asks a conforming gateway to delete a mapping it
+    /// cannot recognise and the forwarding stays open for the rest of the lease.
+    fn release_packet(&self) -> Vec<u8> {
         match self.kind {
             MappingKind::Pmp => build_pmp_request_mapping_packet(
                 self.internal.port(),
+                // Go sends the external port here. RFC 6886 §3.4 asks for zero on a deletion, but
+                // it also makes the gateway ignore the field, so this stays as Go has it: the
+                // internal port is what identifies a NAT-PMP mapping.
                 self.external.port(),
                 MAP_LIFETIME_DELETE,
             )
             .to_vec(),
             MappingKind::Pcp => build_pcp_request_mapping_packet(
-                nonce,
+                // A PCP mapping is only ever built with its nonce; the fallback is unreachable and
+                // deliberately not a fresh random value, which is the bug this avoids.
+                self.nonce.unwrap_or([0u8; 12]),
                 self.internal.ip(),
                 self.internal.port(),
-                self.external.port(),
+                0,
                 MAP_LIFETIME_DELETE,
-                self.external.ip(),
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             )
             .to_vec(),
         }
@@ -1236,13 +1258,15 @@ impl Client {
     /// releases whatever the hook captured (for `debug portmap`, the operator's log sink), so a
     /// background attempt that outlives the run cannot keep writing to it.
     ///
-    /// "Refuse further use" is enforced at the two points where a mapping can still appear after
-    /// this returns: [`Client::maybe_start_mapping`] starts no new attempt, and
-    /// [`Client::store_mapping`] releases rather than stores a mapping that an attempt already in
-    /// flight goes on to obtain. Closing does *not* cancel that in-flight attempt — cancelling it
-    /// at an arbitrary await point could drop the answer to a mapping request the gateway had
-    /// already granted, which is the same leak with no record of what to release. It is bounded by
-    /// its own five-second timeout and its result is rejected on arrival.
+    /// "Refuse further use" is enforced at the three points where a mapping can still appear after
+    /// this returns: [`Client::maybe_start_mapping`] starts no new attempt,
+    /// [`Client::create_or_get_mapping`] refuses on entry — which covers both an attempt that was
+    /// spawned but had not started yet and a direct caller — and [`Client::store_mapping`] releases
+    /// rather than stores a mapping that an attempt already in flight goes on to obtain. Closing
+    /// does *not* cancel that in-flight attempt — cancelling it at an arbitrary await point could
+    /// drop the answer to a mapping request the gateway had already granted, which is the same leak
+    /// with no record of what to release. It is bounded by its own five-second timeout and its
+    /// result is rejected on arrival.
     pub fn close(&self) {
         {
             let mut st = self.state.lock().expect("portmap state lock");
@@ -1289,7 +1313,7 @@ impl Client {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        let pkt = m.release_packet(mapping_nonce().unwrap_or([0u8; 12]));
+        let pkt = m.release_packet();
         let gw = m.gw;
         handle.spawn(async move {
             // Best effort, exactly like Go's: bind, write once, drop.
@@ -1388,9 +1412,10 @@ fn recent(t: Option<SystemTime>) -> bool {
 ///
 /// Read from the kernel CSPRNG. The nonce is what lets a client tell its own MAP response from an
 /// off-path forgery, so a failed read must not silently fall back to something guessable: it returns
-/// `None`, and the mapping path refuses rather than sending a predictable nonce. (The
-/// fire-and-forget *release* path substitutes zeros — that mapping is being torn down either way,
-/// and a release carrying the wrong nonce is simply ignored by the server.)
+/// `None`, and the mapping path refuses rather than sending a predictable nonce. The *release* path
+/// does not call this at all: it reuses [`Mapping::nonce`], the nonce the gateway granted the
+/// mapping under, because a release carrying any other nonce is one a conforming server must refuse
+/// (RFC 6887 §11.3) rather than one it ignores.
 fn mapping_nonce() -> Option<[u8; 12]> {
     use std::io::Read;
     let mut nonce = [0u8; 12];
@@ -1720,7 +1745,19 @@ impl Client {
     ///
     /// Every failure is a [`PortmapError::NoMapping`], carrying Go's cause, so a caller can tell
     /// "asked, got nothing" apart from a broken socket.
+    ///
+    /// A closed client refuses before it asks anything, with `client closed`.
     pub async fn create_or_get_mapping(&self) -> Result<SocketAddr, PortmapError> {
+        // Checked first, and again in `store_mapping`, because the two catch different attempts.
+        // `maybe_start_mapping` reads the flag and then releases the state lock to spawn, so a
+        // `close` landing in that gap leaves a task about to ask the gateway for a mapping on a
+        // client that is already closed; a direct caller can do the same by hand. Without this the
+        // attempt runs to completion, the router really creates the mapping, and nothing but the
+        // best-effort release in `store_mapping` takes it down again. `store_mapping` stays as the
+        // guard for the attempts that were already mid-conversation when `close` ran.
+        if self.state.lock().expect("portmap state lock").closed {
+            return Err(PortmapError::NoMapping(CLOSED_CLIENT.into()));
+        }
         if self.disable_all() {
             return Err(PortmapError::PortMappingDisabled.no_mapping());
         }
@@ -1821,6 +1858,10 @@ impl Client {
         let prefer_pcp = !self.debug.disable_pcp
             && (self.debug.disable_pmp || (!have_recent_pmp && have_recent_pcp));
 
+        // The nonce of the PCP MAP request below, if one is sent. It outlives the send because
+        // releasing a PCP mapping means repeating the nonce that created it (RFC 6887 §11.3), so
+        // the mapping has to carry it.
+        let mut pcp_nonce: Option<[u8; 12]> = None;
         if prefer_pcp {
             // Only do PCP mapping when PMP did not appear to be available recently.
             let Some(nonce) = mapping_nonce() else {
@@ -1828,6 +1869,7 @@ impl Client {
                     "reading /dev/urandom for the PCP mapping nonce failed".into(),
                 ));
             };
+            pcp_nonce = Some(nonce);
             let pkt = build_pcp_request_mapping_packet(
                 nonce,
                 my_ip,
@@ -1924,9 +1966,13 @@ impl Client {
                         renew_after: stamp + grant.lifetime / 2,
                         good_until: stamp + grant.lifetime,
                         epoch: grant.epoch,
+                        // The nonce this grant was asked for under: releasing it needs the same
+                        // one. `None` only if a gateway answered PCP to a request that was not one,
+                        // in which case there is no nonce of ours to repeat.
+                        nonce: pcp_nonce,
                     };
                     if !self.store_mapping(m) {
-                        return Err(PortmapError::NoMapping(CLOSED_MID_ATTEMPT.into()));
+                        return Err(PortmapError::NoMapping(CLOSED_CLIENT.into()));
                     }
                     return Ok(m.external);
                 }
@@ -1952,9 +1998,10 @@ impl Client {
                     renew_after,
                     good_until,
                     epoch,
+                    nonce: None,
                 };
                 if !self.store_mapping(m) {
-                    return Err(PortmapError::NoMapping(CLOSED_MID_ATTEMPT.into()));
+                    return Err(PortmapError::NoMapping(CLOSED_CLIENT.into()));
                 }
                 return Ok(m.external);
             }
@@ -1981,12 +2028,13 @@ impl Client {
     /// Record a freshly created mapping and log it the way Go's deferred summary does.
     ///
     /// Returns `false` when [`Client::close`] won the race against the attempt that obtained `m`.
-    /// This is the one place a mapping becomes ours, so it is the one place that has to consult the
-    /// closed flag: a background attempt started before the close keeps running (it is bounded by
-    /// its own five-second timeout), and without this check its mapping would be stored on a client
-    /// nobody will close again and left on the router until its two-hour lease expired. A rejected
-    /// mapping is released immediately instead, which is what `close` would have done had it seen
-    /// it. Go has the same window and does not close it (`net/portmapper`'s `createOrGetMapping`
+    /// This is the last point at which a mapping becomes ours, so it is where an attempt that was
+    /// already talking to the gateway when `close` ran is caught — [`Client::create_or_get_mapping`]
+    /// turns away the ones that had not started yet. A background attempt started before the close
+    /// keeps running (it is bounded by its own five-second timeout), and without this check its
+    /// mapping would be stored on a client nobody will close again and left on the router until its
+    /// two-hour lease expired. A rejected mapping is released immediately instead, which is what
+    /// `close` would have done had it seen it. Go has the same window and does not close it (`net/portmapper`'s `createOrGetMapping`
     /// stores under `mu` without consulting `c.closed`); this fork does, because `debug portmap`
     /// closes its client on every cancelled run and promises the run leaves nothing behind.
     #[must_use]
@@ -3318,6 +3366,7 @@ wlan0\t00000000\t01A8A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0
             renew_after: now + Duration::from_secs(3_600),
             good_until: now + Duration::from_secs(7_200),
             epoch: 7,
+            nonce: None,
         };
         c.close();
 
@@ -3334,6 +3383,159 @@ wlan0\t00000000\t01A8A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0
             logged, "released mapping obtained after close: external=192.0.2.1:45678 type=pmp",
             "the run says what became of it: releasing it is the only thing keeping it off the \
              router"
+        );
+    }
+
+    /// A PCP release has to name the mapping it is deleting. RFC 6887 §11.3 makes a gateway reject
+    /// a MAP request whose nonce does not match the mapping it otherwise identifies, and §15.1 makes
+    /// the suggested external address and port zero on any zero-lifetime request — so a release that
+    /// invents a nonce and repeats the granted external address is one the router refuses, leaving
+    /// the forwarding open for the rest of the lease.
+    ///
+    /// No socket: the packet is built by the same method the release path calls.
+    #[test]
+    fn a_pcp_release_repeats_the_nonce_the_mapping_was_granted_under() {
+        let now = SystemTime::now();
+        let nonce = [9u8, 8, 7, 6, 5, 4, 3, 2, 1, 0, 255, 254];
+        let m = Mapping {
+            kind: MappingKind::Pcp,
+            gw: "192.0.2.1:5351".parse().expect("gateway addr"),
+            internal: "192.0.2.2:41641".parse().expect("internal addr"),
+            external: "192.0.2.1:45678".parse().expect("external addr"),
+            renew_after: now,
+            good_until: now + Duration::from_secs(7_200),
+            epoch: 7,
+            nonce: Some(nonce),
+        };
+
+        let pkt = m.release_packet();
+
+        assert_eq!(pkt.len(), 60);
+        assert_eq!(pkt[0], PCP_VERSION);
+        assert_eq!(pkt[1], PCP_OP_MAP);
+        assert_eq!(
+            u32::from_be_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]),
+            MAP_LIFETIME_DELETE,
+            "a zero lifetime is what makes this a deletion"
+        );
+        assert_eq!(
+            &pkt[24..36],
+            &nonce,
+            "the gateway matches the mapping on this nonce, so it must be the granted one"
+        );
+        assert_eq!(pkt[36], PCP_UDP_MAPPING);
+        assert_eq!(
+            u16::from_be_bytes([pkt[40], pkt[41]]),
+            41641,
+            "protocol and internal port are what else identifies the mapping"
+        );
+        assert_eq!(
+            u16::from_be_bytes([pkt[42], pkt[43]]),
+            0,
+            "RFC 6887 §15.1: the suggested external port is zero on a deletion"
+        );
+        assert_eq!(
+            &pkt[44..60],
+            // 0.0.0.0 as the IPv4-mapped IPv6 address PCP carries addresses in.
+            &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0],
+            "RFC 6887 §15.1: so is the suggested external address"
+        );
+    }
+
+    /// The release the client really sends when it is closed, end to end: the fake router grants a
+    /// PCP mapping, and the deletion that follows `close` carries the nonce of the request that
+    /// created it rather than a fresh one.
+    #[tokio::test]
+    async fn closing_a_client_releases_its_pcp_mapping_under_the_granted_nonce() {
+        if !loopback_udp_works().await {
+            skipped_no_loopback_udp(
+                "closing_a_client_releases_its_pcp_mapping_under_the_granted_nonce",
+            );
+            return;
+        }
+        let mut igd = FakeIgd::start(FakeIgdConfig {
+            pmp: false,
+            pcp: true,
+            upnp: false,
+            ..Default::default()
+        })
+        .await;
+        let (logf, _lines) = collector();
+        let c = igd.client(
+            DebugKnobs {
+                disable_pmp: true,
+                ..Default::default()
+            },
+            logf,
+        );
+        c.set_local_port(41641);
+        c.create_or_get_mapping()
+            .await
+            .expect("the fake router grants a PCP mapping");
+
+        // The nonce the client asked with, taken off the wire.
+        let granted = igd
+            .next_request(Duration::from_secs(3))
+            .await
+            .expect("the router sees the MAP request");
+        assert_eq!(granted[1], PCP_OP_MAP);
+        let asked_with = granted[24..36].to_vec();
+        assert_ne!(
+            u32::from_be_bytes([granted[4], granted[5], granted[6], granted[7]]),
+            MAP_LIFETIME_DELETE,
+            "this is the request that created the mapping, not a deletion"
+        );
+
+        c.close();
+
+        let mut release = None;
+        while let Some(req) = igd.next_request(Duration::from_secs(3)).await {
+            if req.first() == Some(&PCP_VERSION)
+                && req.get(1) == Some(&PCP_OP_MAP)
+                && req.get(4..8) == Some(&MAP_LIFETIME_DELETE.to_be_bytes()[..])
+            {
+                release = Some(req);
+                break;
+            }
+        }
+        let release = release.expect("closing the client releases its mapping back to the gateway");
+        assert_eq!(
+            &release[24..36],
+            &asked_with[..],
+            "a nonce the router does not recognise is a deletion it must refuse"
+        );
+        assert_eq!(
+            u16::from_be_bytes([release[42], release[43]]),
+            0,
+            "and the suggested external port is zero on a deletion"
+        );
+        assert_eq!(
+            &release[44..60],
+            &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0],
+            "as is the suggested external address"
+        );
+    }
+
+    /// A closed client asks the gateway for nothing, even when the call comes in by hand or from a
+    /// task that was spawned before the close. The gateway lookup here finds nothing, so without the
+    /// check on entry this call reports *that* instead — which is how the test tells the two apart
+    /// without a socket.
+    #[tokio::test]
+    async fn create_or_get_mapping_refuses_a_closed_client_before_it_asks() {
+        let (logf, lines) = collector();
+        let c = Client::new(logf, DebugKnobs::default());
+        c.set_gateway_lookup(Arc::new(|| None));
+        c.close();
+
+        let err = c
+            .create_or_get_mapping()
+            .await
+            .expect_err("a closed client has nothing to offer");
+        assert_eq!(err.to_string(), "no NAT mapping available: client closed");
+        assert!(!c.have_mapping());
+        assert!(
+            lines.lock().expect("log lock").is_empty(),
+            "nothing was asked, so nothing is reported"
         );
     }
 
@@ -3365,14 +3567,21 @@ wlan0\t00000000\t01A8A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0
         );
     }
 
-    /// The same rejection end to end, against the fake router: the mapping is really granted on the
-    /// wire, and the release really goes back to the gateway. This is the path a background attempt
-    /// takes after `close` — `maybe_start_mapping`'s task is a spawned call to this same function.
+    /// What `close` does on the wire, end to end against the fake router: the mapping is really
+    /// granted, the release really goes back to the gateway naming the port it handed out, and the
+    /// closed client then asks it for nothing more.
+    ///
+    /// This is the shape the same test had before [`Client::create_or_get_mapping`] began refusing
+    /// a closed client on entry. Until then it drove the store-point rejection through the socket by
+    /// asking a closed client for a mapping; that call now returns before a packet is sent, and the
+    /// store point keeps its own no-socket test above. The genuine remainder of that race — a close
+    /// landing between the entry check and the store — cannot be forced from outside without a fake
+    /// router that stalls its reply inside the 250 ms read deadline.
     #[tokio::test]
-    async fn a_mapping_granted_after_close_is_released_back_to_the_gateway() {
+    async fn a_closed_client_releases_its_mapping_and_asks_the_gateway_for_nothing_more() {
         if !loopback_udp_works().await {
             skipped_no_loopback_udp(
-                "a_mapping_granted_after_close_is_released_back_to_the_gateway",
+                "a_closed_client_releases_its_mapping_and_asks_the_gateway_for_nothing_more",
             );
             return;
         }
@@ -3380,17 +3589,15 @@ wlan0\t00000000\t01A8A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0
         let (logf, _lines) = collector();
         let c = igd.client(DebugKnobs::default(), logf);
         c.set_local_port(41641);
-        c.close();
-
-        let err = c
-            .create_or_get_mapping()
+        c.create_or_get_mapping()
             .await
-            .expect_err("a mapping the closed client gave back is not a mapping it can return");
-        assert_eq!(err.to_string(), "no NAT mapping available: client closed");
+            .expect("the fake router grants a NAT-PMP mapping");
+
+        c.close();
         assert!(!c.have_mapping());
 
-        // What the router saw: the public-address ask, the map ask, and — only because the mapping
-        // was rejected — a zero-lifetime request releasing the port it had just granted.
+        // What the router saw: the public-address ask, the map ask, and then a zero-lifetime
+        // request releasing the port it had just granted.
         let deleted = MAP_LIFETIME_DELETE.to_be_bytes();
         let mut release = None;
         while let Some(req) = igd.next_request(Duration::from_secs(3)).await {
@@ -3402,12 +3609,23 @@ wlan0\t00000000\t01A8A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0
                 break;
             }
         }
-        let release = release
-            .expect("a mapping obtained after close must be released, not left on the router");
+        let release =
+            release.expect("a closed client must release its mapping, not leave it on the router");
         assert_eq!(
             u16::from_be_bytes([release[6], release[7]]),
             45678,
             "the release names the external port the router granted"
+        );
+
+        // And a caller still holding the client cannot make it ask again.
+        let err = c
+            .create_or_get_mapping()
+            .await
+            .expect_err("a closed client has nothing to offer");
+        assert_eq!(err.to_string(), "no NAT mapping available: client closed");
+        assert!(
+            igd.next_request(Duration::from_millis(250)).await.is_none(),
+            "a closed client sends the router nothing more"
         );
     }
 
@@ -3587,6 +3805,7 @@ wlan0\t00000000\t01A8A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0
             renew_after: base,
             good_until: base + Duration::from_secs(3_600),
             epoch: 7,
+            nonce: None,
         };
         assert_eq!(
             m.mapping_debug(),
@@ -3594,6 +3813,7 @@ wlan0\t00000000\t01A8A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0
         );
         let p = Mapping {
             kind: MappingKind::Pcp,
+            nonce: Some([0u8; 12]),
             ..m
         };
         assert_eq!(
