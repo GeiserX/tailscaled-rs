@@ -13495,6 +13495,10 @@ async fn run_configure_kubeconfig(
         // kubectl already reads, leaving every other cluster in it intact.
         None => {
             let path = kubeconfig_path()?;
+            // Go: `checkKubeconfigWritable(kubeconfig)`, here in the order Go runs it — after the
+            // FQDN is resolved, before a single byte is read or written. An unwritable kubeconfig is
+            // the operator's answer, and it is cheaper to give it before the merge than after.
+            check_kubeconfig_writable(&path)?;
             set_kubeconfig_for_peer(scheme, &fqdn, &path)?;
             // Go's closing line, verbatim (`kubeconfig configured for %q at URL %q`), plus the file
             // it edited — Go leaves that implicit, but `$KUBECONFIG` can point anywhere.
@@ -13816,9 +13820,129 @@ fn kubeconfig_path() -> Result<String> {
     kubeconfig_path_from(kubeconfig.as_deref(), home.as_deref())
 }
 
+/// Go's `kubeconfigAccessErr`: one wording for every reason the kubeconfig cannot be written, so
+/// the precheck below and a failed directory creation read the same to whoever hits them.
+///
+/// Go's sandboxed-macOS arm — which appends a pointer at the open-source distribution, because a GUI
+/// build can only reach files under its own container — has no analogue here, for the same reason
+/// [`kubeconfig_path_from`] ports only the plain arm: this daemon has no sandboxed GUI build.
+///
+/// `detail` is spelled the way Go's `%w` of an `*os.PathError` prints (`<syscall> <path>: <reason>`).
+/// The path that actually refused the write is usually an ANCESTOR of the kubeconfig — a `~/.kube`
+/// owned by root, say — so naming only the kubeconfig would send the reader to look at the one file
+/// that is not the problem.
+fn kubeconfig_access_err(path: &str, detail: &str) -> anyhow::Error {
+    anyhow!(
+        "cannot write kubeconfig at {:?}: {}",
+        sanitize_for_terminal(path),
+        sanitize_for_terminal(detail)
+    )
+}
+
+/// Go's `isWritable`: can `path` be written? Reported as `Ok(())` or the reason it cannot.
+///
+/// A directory is probed by creating and removing a file inside it, because the mode bits alone do
+/// not answer the question — a read-only mount, an ACL, or someone else's ownership all refuse a
+/// write that `0755` promises. A regular file is opened `O_WRONLY` (no `O_CREAT`, no `O_TRUNC`) and
+/// closed again, so asking whether it can be written never damages it.
+fn is_writable(path: &std::path::Path) -> std::result::Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let md = std::fs::metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+    if !md.is_dir() {
+        return std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map(drop)
+            .map_err(|e| format!("open {}: {e}", path.display()));
+    }
+    // Go's `os.CreateTemp(path, ".tailscale-kubeconfig-*")`, whose randomness only has to avoid a
+    // collision: a fresh name per attempt, `O_EXCL` so a name already taken is retried rather than
+    // truncating a file this probe does not own, and `0600` because a probe in a shared `/tmp`-like
+    // directory should not be world-readable even for the instant it exists.
+    static PROBE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let mut last = String::new();
+    for _ in 0..10 {
+        let n = PROBE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let probe = path.join(format!(".tailscale-kubeconfig-{}-{n}", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&probe)
+        {
+            Ok(f) => {
+                drop(f);
+                return std::fs::remove_file(&probe)
+                    .map_err(|e| format!("remove {}: {e}", probe.display()));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                last = format!("open {}: {e}", probe.display());
+            }
+            Err(e) => return Err(format!("open {}: {e}", probe.display())),
+        }
+    }
+    Err(last)
+}
+
+/// Go's `filepath.Dir` where [`check_kubeconfig_writable`] walks up: the next path to try, with
+/// Go's two fixed points kept, because they are what stop the walk.
+///
+/// `Path::parent` and `filepath.Dir` disagree at exactly the ends: Rust answers `""` where Go
+/// answers `"."`, and `None` both for the root — where Go returns its argument unchanged, the fixed
+/// point the walk exits on — and for the empty path, where Go answers `"."` again.
+fn kubeconfig_parent_dir(path: &std::path::Path) -> std::path::PathBuf {
+    match path.parent() {
+        Some(dir) if dir.as_os_str().is_empty() => std::path::PathBuf::from("."),
+        Some(dir) => dir.to_path_buf(),
+        None if path.as_os_str().is_empty() => std::path::PathBuf::from("."),
+        None => path.to_path_buf(),
+    }
+}
+
+/// Go's `checkKubeconfigWritable`: refuse a kubeconfig that cannot be written BEFORE anything is
+/// read, merged or created.
+///
+/// Walk up from the target to the first component that exists and probe that one, because the
+/// interesting cases are the ones where the target does not exist yet: a first run has no
+/// `~/.kube/config`, and often no `~/.kube` either, so the nearest existing ancestor is the only
+/// thing there is to ask. Reaching the filesystem root without finding anything is `nil` in Go —
+/// nothing left to ask — and the write itself then reports whatever is really wrong.
+///
+/// Without this the refusal arrives at the `open()` in [`set_kubeconfig_for_peer`], after the
+/// existing kubeconfig has been read and the merge computed, and it says "opening kubeconfig … for
+/// writing". Nothing is damaged either way; this one answers the question the operator asked, in
+/// Go's words, at the point Go answers it.
+fn check_kubeconfig_writable(path: &str) -> Result<()> {
+    let mut probe = std::path::PathBuf::from(path);
+    loop {
+        match std::fs::metadata(&probe) {
+            Ok(_) => return is_writable(&probe).map_err(|why| kubeconfig_access_err(path, &why)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            // Go's `!os.IsNotExist(err)` arm: a stat that fails for any other reason (a `~/.kube`
+            // whose parent is `0600`, say) is itself the answer, and probing further up would only
+            // replace it with a vaguer one.
+            Err(e) => {
+                return Err(kubeconfig_access_err(
+                    path,
+                    &format!("stat {}: {e}", probe.display()),
+                ));
+            }
+        }
+        let parent = kubeconfig_parent_dir(&probe);
+        if parent == probe {
+            return Ok(()); // reached the filesystem root
+        }
+        probe = parent;
+    }
+}
+
 /// Merge the triple into the kubeconfig at `path`, porting Go's `setKubeconfigForPeer`: create the
-/// parent directory if it is missing, read whatever is there (a missing file is an empty document),
-/// merge, and write the result back at mode `0600`.
+/// parent directories if they are missing, read whatever is there (a missing file is an empty
+/// document), merge, and write the result back at mode `0600`.
+///
+/// The caller runs [`check_kubeconfig_writable`] first, as Go does, so an unwritable target is
+/// refused before this reads anything.
 ///
 /// Symlinks are followed, as Go's `os.ReadFile`/`os.WriteFile` do — a `~/.kube/config` symlinked into
 /// a dotfiles checkout is a normal setup, and refusing it would break the common case this command
@@ -13829,15 +13953,28 @@ fn set_kubeconfig_for_peer(scheme: &str, fqdn: &str, path: &str) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 
     let p = std::path::Path::new(path);
-    // Go: `os.Mkdir(dir, 0755)` — one level, not MkdirAll, so a path several directories deep still
-    // reports the missing parent rather than conjuring the tree.
-    if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty())
-        && !dir.exists()
-    {
-        std::fs::DirBuilder::new()
-            .mode(0o755)
-            .create(dir)
-            .with_context(|| format!("creating {}", dir.display()))?;
+    // Go: `if _, err := os.Stat(dir); err != nil { if !os.IsNotExist(err) { return err }; ...
+    // os.MkdirAll(dir, 0755) }` — the whole missing tree, not one level, so a `$KUBECONFIG` pointing
+    // several directories deep gets its file written rather than a refusal naming a parent the user
+    // never asked about. A stat that fails for some other reason is Go's early return: the directory
+    // IS there and is unreadable, and a mkdir on top of it would only replace that reason with a
+    // worse one.
+    if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
+        match std::fs::metadata(dir) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::DirBuilder::new()
+                    .mode(0o755)
+                    .recursive(true)
+                    .create(dir)
+                    // Go wraps this one in `kubeconfigAccessErr`, which names the kubeconfig rather
+                    // than the directory — the file is what the operator asked for.
+                    .map_err(|e| {
+                        kubeconfig_access_err(path, &format!("mkdir {}: {e}", dir.display()))
+                    })?;
+            }
+            Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+        }
     }
     let existing = match std::fs::read(p) {
         Ok(b) => String::from_utf8(b).map_err(|_| {
@@ -22567,6 +22704,158 @@ users:
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Whether this test process can write into `dir` despite its mode saying otherwise — i.e.
+    /// whether it is running as root, for which `0o500` is not a refusal. The suite runs both as an
+    /// ordinary user and, in some container images, as root; asking the filesystem is more reliable
+    /// than asking for the uid and guessing what it implies.
+    fn mode_bits_are_enforced_for_us(dir: &std::path::Path) -> bool {
+        let probe = dir.join(".write-probe");
+        match std::fs::write(&probe, b"") {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&probe);
+                false
+            }
+            Err(_) => true,
+        }
+    }
+
+    #[test]
+    fn kubeconfig_precheck_ports_gos_checkkubeconfigwritable() {
+        // Go's `checkKubeconfigWritable`: walk up from the target to the first component that
+        // exists and probe THAT, so a kubeconfig that does not exist yet is fine as long as
+        // something above it takes a write — and an unwritable one is refused in Go's words before
+        // anything is read or merged.
+        let root = std::env::temp_dir().join(format!("tnet-kubeprecheck-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let s = |p: &std::path::Path| p.to_str().unwrap().to_string();
+
+        // Nothing exists below a writable directory: the nearest existing ancestor answers, both
+        // one level down and several. (Several is the case Go's MkdirAll then goes on to create.)
+        assert!(check_kubeconfig_writable(&s(&root.join("config"))).is_ok());
+        assert!(check_kubeconfig_writable(&s(&root.join("a/b/c/config"))).is_ok());
+
+        // An existing, writable kubeconfig is probed directly — and the probe must not truncate it.
+        let existing = root.join("existing");
+        std::fs::write(&existing, "apiVersion: v1\nkind: Config\n").unwrap();
+        assert!(check_kubeconfig_writable(&s(&existing)).is_ok());
+        assert_eq!(
+            std::fs::read_to_string(&existing).unwrap(),
+            "apiVersion: v1\nkind: Config\n",
+            "the writability probe must open O_WRONLY without O_TRUNC — it asks, it does not write"
+        );
+
+        // A read-only kubeconfig: refused, in Go's `cannot write kubeconfig at %q` words, naming the
+        // file the operator asked for.
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let ro = root.join("readonly");
+            std::fs::write(&ro, "apiVersion: v1\nkind: Config\n").unwrap();
+            std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o400)).unwrap();
+            if std::fs::OpenOptions::new().write(true).open(&ro).is_err() {
+                let err = check_kubeconfig_writable(&s(&ro))
+                    .expect_err("a read-only kubeconfig cannot be written");
+                let text = format!("{err:#}");
+                assert!(
+                    text.contains("cannot write kubeconfig at") && text.contains("readonly"),
+                    "the refusal should be Go's, and should name the file: {text}"
+                );
+            }
+            std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        // The case a first run actually hits: no kubeconfig yet, and the directory that would hold
+        // it does not take a write either. The nearest existing ancestor is what refuses.
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let locked = root.join("locked");
+            std::fs::create_dir(&locked).unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+            if mode_bits_are_enforced_for_us(&locked) {
+                let target = locked.join(".kube/config");
+                let err = check_kubeconfig_writable(&s(&target))
+                    .expect_err("an unwritable ancestor cannot hold a new kubeconfig");
+                let text = format!("{err:#}");
+                assert!(
+                    text.contains("cannot write kubeconfig at") && text.contains(".kube/config"),
+                    "the refusal should name the kubeconfig, not just the directory: {text}"
+                );
+                // Probing must leave nothing behind — not the directory it could not create, and
+                // not the temporary file it tried to make in the ancestor.
+                assert!(!target.exists() && !locked.join(".kube").exists());
+                assert_eq!(
+                    std::fs::read_dir(&locked).unwrap().count(),
+                    0,
+                    "the directory probe must clean up after itself"
+                );
+            }
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn kubeconfig_parent_dir_matches_go_filepath_dir() {
+        // The walk in `check_kubeconfig_writable` terminates because `filepath.Dir` has fixed
+        // points; `Path::parent` does not have the same ones, so the mapping is pinned here rather
+        // than discovered by a test that hangs.
+        let dir = |p: &str| kubeconfig_parent_dir(std::path::Path::new(p));
+        assert_eq!(
+            dir("/home/someone/.kube/config"),
+            std::path::Path::new("/home/someone/.kube")
+        );
+        assert_eq!(dir("/config"), std::path::Path::new("/"));
+        assert_eq!(
+            dir("/"),
+            std::path::Path::new("/"),
+            "the root is Go's fixed point"
+        );
+        assert_eq!(
+            dir("config"),
+            std::path::Path::new("."),
+            "Go answers `.`, not `\"\"`"
+        );
+        assert_eq!(
+            dir("."),
+            std::path::Path::new("."),
+            "`.` is Go's other fixed point"
+        );
+        assert_eq!(
+            dir(""),
+            std::path::Path::new("."),
+            "Go's `filepath.Dir(\"\")` is `.`"
+        );
+    }
+
+    #[test]
+    fn kubeconfig_merge_creates_the_whole_missing_directory_tree() {
+        // Go's `setKubeconfigForPeer` calls `os.MkdirAll(dir, 0755)`, so
+        // `KUBECONFIG=/somewhere/new/nested/config` writes the file instead of reporting the
+        // missing parent. This port created one level, which failed on exactly that.
+        let root = std::env::temp_dir().join(format!("tnet-kubetree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("new/nested/deeper/config");
+        let path_str = path.to_str().unwrap().to_string();
+
+        set_kubeconfig_for_peer("https://", "foo.tail-scale.ts.net", &path_str)
+            .expect("a missing directory TREE is created, as Go's MkdirAll does");
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("server: https://foo.tail-scale.ts.net"),
+            "the kubeconfig should have been written under the tree that was just created"
+        );
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "kubeconfig must be written 0600, got {mode:o}");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
