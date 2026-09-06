@@ -25,6 +25,15 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.55.4](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.3...v0.55.4) (2026-09-06)
+
+
+### Bug Fixes
+
+* **configure kubeconfig:** refuse unwritable targets, create nested ones ([#385](https://github.com/GeiserX/tailscaled-rs/issues/385)) ([e273fa5](https://github.com/GeiserX/tailscaled-rs/commit/e273fa5e054949fa83a2aa0c0ef25b4c2934f543))
+* **debug resolve:** report an empty hostname as "no such host", not as an empty address family ([#382](https://github.com/GeiserX/tailscaled-rs/issues/382)) ([268e12d](https://github.com/GeiserX/tailscaled-rs/commit/268e12dc7782fbff736dc4d0625e817ad7156ac0))
+* **tailnetd:** keep Go's own sentence in the --bird-socket refusal ([#383](https://github.com/GeiserX/tailscaled-rs/issues/383)) ([a998541](https://github.com/GeiserX/tailscaled-rs/commit/a998541ab20bdd2fff51bbb95ab132857b0e7982))
+
 ## [0.55.3](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.2...v0.55.3) (2026-09-06)
 
 
