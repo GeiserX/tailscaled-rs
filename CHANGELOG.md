@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.55.3](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.2...v0.55.3) (2026-09-06)
+
+
+### Bug Fixes
+
+* **localapi:** stop an older daemon reading `switch --new` as a plain switch ([#379](https://github.com/GeiserX/tailscaled-rs/issues/379)) ([8ca8cba](https://github.com/GeiserX/tailscaled-rs/commit/8ca8cba2c9ae208d9ef8c79c5997a80ad3370635))
+
 ## [0.55.2](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.1...v0.55.2) (2026-09-06)
 
 
