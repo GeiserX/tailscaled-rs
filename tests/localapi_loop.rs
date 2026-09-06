@@ -927,11 +927,25 @@ async fn profile_switch_list_and_remove_round_trip_over_the_wire() {
         other => panic!("expected Response::Profiles, got {other:?}"),
     }
 
-    // Creating it is the explicit request (`tnet switch --new work`), which activates it. The profile
+    // A stray `create` KEY on a switch is not a creation either. Nothing in a shipped release ever
+    // sent one, but a switch request is the place a mixed pair could grow an extra field, and the
+    // daemon must not read a field it does not model as consent to create: the refusal is unchanged.
+    match harness
+        .round_trip(r#"{"cmd":"switch_profile","target":"work","create":true}"#)
+        .await
+    {
+        Response::Error { message } => assert!(
+            message.contains("no profile named"),
+            "an unmodelled field must not turn a switch into a creation: {message:?}"
+        ),
+        other => panic!("expected Response::Error, got {other:?}"),
+    }
+
+    // Creating it is its own request (`tnet switch --new work`), which activates it. The profile
     // has never registered, so the reply says so (Go's post-switch `NeedsLogin` arm) rather than
     // claiming a connection.
     match harness
-        .round_trip(r#"{"cmd":"switch_profile","target":"work","create":true}"#)
+        .round_trip(r#"{"cmd":"create_profile","id":"work"}"#)
         .await
     {
         Response::Ok { message } => {
@@ -942,9 +956,11 @@ async fn profile_switch_list_and_remove_round_trip_over_the_wire() {
         }
         other => panic!("expected Response::Ok from switch, got {other:?}"),
     }
-    // Asking to create it a second time is refused — `create` never adopts an existing profile.
+    // Asking to create it a second time is refused — `create_profile` never adopts an existing
+    // profile. This is the pairing an older daemon would have got wrong had creation been a flag on
+    // `switch_profile`: dropping the flag, it would have ACTIVATED "work" instead of refusing.
     match harness
-        .round_trip(r#"{"cmd":"switch_profile","target":"work","create":true}"#)
+        .round_trip(r#"{"cmd":"create_profile","id":"work"}"#)
         .await
     {
         Response::Error { message } => assert!(

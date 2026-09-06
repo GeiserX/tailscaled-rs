@@ -1330,37 +1330,19 @@ async fn dispatch(
         // `Device::new` handshake, so holding the lock is correct and keeps the swap atomic). Does NOT
         // auto-up the target — the operator runs `up` if the new profile should connect.
         //
-        // An unknown target is refused with the device untouched (Go: `No profile named %q`); only
-        // `create` (`tnet switch --new`) makes one, which is this fork's stand-in for the
-        // interactive `tailscale login` that creates a profile upstream.
-        Request::SwitchProfile { target, create } => {
+        // An unknown target is refused with the device untouched (Go: `No profile named %q`); making
+        // one is the separate `create_profile` request below.
+        Request::SwitchProfile { target } => {
             let mut be = backend.lock().await;
-            let result = if create {
-                be.create_profile(&target).await
-            } else {
-                be.switch_profile(&target).await
-            };
-            match result {
-                // The reply distinguishes "already on it" from a real switch, and names the target's
-                // settled state — see `SwitchOutcome`. The daemon log carries the resolved id, which
-                // `target` need not be (it may have been a display name).
-                Ok(outcome) => {
-                    match &outcome {
-                        crate::ipn::SwitchOutcome::AlreadyCurrent { id } => {
-                            tracing::info!(profile = %id, "switch: already on this profile; nothing changed");
-                        }
-                        crate::ipn::SwitchOutcome::Switched { id, state } => {
-                            tracing::info!(profile = %id, state = state.as_str(), "switched profile (device torn down; run `up` to connect)");
-                        }
-                    }
-                    Response::Ok {
-                        message: outcome.report(),
-                    }
-                }
-                Err(e) => Response::Error {
-                    message: format!("{e:#}"),
-                },
-            }
+            switch_outcome_response(be.switch_profile(&target).await)
+        }
+        // `switch --new <id>` (this fork's stand-in for the interactive `tailscale login` that
+        // creates a profile upstream). Its own command rather than a flag on `switch_profile` so a
+        // daemon that predates it cannot silently degrade the request into a plain switch — see
+        // `Request::CreateProfile`.
+        Request::CreateProfile { id } => {
+            let mut be = backend.lock().await;
+            switch_outcome_response(be.create_profile(&id).await)
         }
         // `switch remove <id>` (Go `tailscale switch remove`). Refuses an unknown profile, and the
         // reserved `default` one; the CURRENT profile is left alone and reported as a success, which
@@ -1762,6 +1744,34 @@ async fn dispatch(
                 },
             }
         }
+    }
+}
+
+/// Render the reply for the two profile-activation requests — `switch_profile` and `create_profile`,
+/// which differ only in how the target id is arrived at and share `Backend::activate_profile`
+/// underneath.
+///
+/// The reply distinguishes "already on it" from a real switch, and names the target's settled state
+/// — see [`SwitchOutcome`](crate::ipn::SwitchOutcome). The daemon log carries the RESOLVED id, which
+/// the caller's argument need not be (a `switch` target may have been a display name).
+fn switch_outcome_response(result: anyhow::Result<crate::ipn::SwitchOutcome>) -> Response {
+    match result {
+        Ok(outcome) => {
+            match &outcome {
+                crate::ipn::SwitchOutcome::AlreadyCurrent { id } => {
+                    tracing::info!(profile = %id, "switch: already on this profile; nothing changed");
+                }
+                crate::ipn::SwitchOutcome::Switched { id, state } => {
+                    tracing::info!(profile = %id, state = state.as_str(), "switched profile (device torn down; run `up` to connect)");
+                }
+            }
+            Response::Ok {
+                message: outcome.report(),
+            }
+        }
+        Err(e) => Response::Error {
+            message: format!("{e:#}"),
+        },
     }
 }
 
