@@ -1827,10 +1827,28 @@ impl Backend {
     /// what makes `tnet set --nickname work-laptop` take effect across the whole `switch` surface
     /// rather than only inside `prefs.json`.
     ///
-    /// An EMPTY `name` (Go's `--nickname=` clear) removes the display name rather than storing a
-    /// blank one; both readers already fall back to the profile id, which is the closest local
-    /// analogue of Go's own fallback (Go substitutes the account's login name — a value this daemon
-    /// does not track).
+    /// Go's assignment is TWO-ARMED. `setProfilePrefs` (`ipn/ipnlocal/profiles.go:450` @
+    /// `53a0d659afa51835dd7a9283873cca44261454f8`) reads `if prefsIn.ProfileName() != "" { lp.Name =
+    /// prefsIn.ProfileName() } else { lp.Name = up.LoginName }`, where `up` is the profile's
+    /// persisted `tailcfg.UserProfile`. The first arm is ported exactly; the second arm's VALUE does
+    /// not exist on this side. An EMPTY `name` (Go's `--nickname=` clear) therefore stores an empty
+    /// display name — the map entry itself stays, so the profile is still listed and still
+    /// switchable by id — and both readers fall back to the profile id:
+    /// [`list_profiles`](Backend::list_profiles) prints the id, and
+    /// [`profile::resolve_target_to_id`] stops resolving the cleared nickname (Go stops resolving it
+    /// too: its name pass reads `lp.Name`, which the else arm has just overwritten).
+    ///
+    /// **The gap is the login name, not the branch.** The daemon tracks no account identity, and the
+    /// engine at the pinned rev surfaces none: `Device::status`'s `self_node` is a `StatusNode` with
+    /// no owning user, and `Device::whois` resolves PEERS only — the self node is not in the peer db.
+    /// The engine holds both halves internally (the control runner's self `Node.user_id`, the peer
+    /// tracker's accumulated netmap `UserProfiles` table) but joins them for peers alone, so the ask
+    /// is filed as `docs/ENGINE_ASKS.md` §42; when it lands, this function gains Go's else arm and a
+    /// cleared nickname restores the account name instead of falling back to the id. For a profile
+    /// that never logged in, Go's `up` is the zero value and Go writes the same empty name this does
+    /// (Go's `--list` then prints an empty Account column where this fork prints the id — a fork
+    /// nicety, not the divergence above). Pinned by
+    /// `clearing_the_nickname_blanks_the_name_and_cannot_restore_a_login_name`.
     ///
     /// Registers the current profile in the map if it is not there yet, including the implicit
     /// `default` — [`list_profiles`](Backend::list_profiles) already reads a `default` entry's name
@@ -7075,6 +7093,8 @@ mod tests {
         assert_eq!(be.current_profile, profile::DEFAULT_PROFILE_ID);
 
         // Clearing (Go's `--nickname=`) drops the display name; the listing falls back to the id.
+        // Where Go restores the account's login name instead — the deviation and why it stands are
+        // in `clearing_the_nickname_blanks_the_name_and_cannot_restore_a_login_name`.
         be.begin_set(SetOptions {
             nickname: Some(None),
             ..SetOptions::default()
@@ -7108,6 +7128,88 @@ mod tests {
             .find(|e| e.id == profile::DEFAULT_PROFILE_ID)
             .expect("default profile is always listed");
         assert_eq!(def.name, "renamed", "an unnamed nickname must not rename");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn clearing_the_nickname_blanks_the_name_and_cannot_restore_a_login_name() {
+        // Go assigns the profile name in TWO arms — `setProfilePrefs`, `ipn/ipnlocal/profiles.go:450`
+        // @ `53a0d659afa51835dd7a9283873cca44261454f8`:
+        //
+        //     if prefsIn.ProfileName() != "" { lp.Name = prefsIn.ProfileName() }
+        //     else                           { lp.Name = up.LoginName }
+        //
+        // This port has the first arm exactly. The second arm's VALUE — the account's login name out
+        // of the profile's persisted `tailcfg.UserProfile` — does not exist here: the daemon tracks
+        // no account identity and the engine at the pinned rev surfaces none (`Device::status`'s
+        // `self_node` carries no owning user; `Device::whois` resolves peers only). So a cleared
+        // nickname blanks the name and the readers fall back to the profile id, where Go would show
+        // the account. Filed as `docs/ENGINE_ASKS.md` §42 and pinned here, so the shape of the
+        // deviation is a decision rather than a drift — and so the day the engine can answer
+        // "who owns this node", this test is what has to change.
+        let dir = std::env::temp_dir().join(format!("tailnetd-nick-clear-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = Backend::load(&dir).await.unwrap();
+
+        // A non-default profile, so "fell back to the id" is visibly distinct from "is the default".
+        be.create_profile("work").await.expect("create work");
+        be.begin_set(SetOptions {
+            nickname: Some(Some("work-laptop".to_string())),
+            ..SetOptions::default()
+        })
+        .await
+        .expect("begin_set --nickname");
+
+        // Go's `--nickname=` clear, through the real `set` path.
+        be.begin_set(SetOptions {
+            nickname: Some(None),
+            ..SetOptions::default()
+        })
+        .await
+        .expect("begin_set --nickname=");
+        assert_eq!(be.prefs.node_nickname, None, "the pref must clear too");
+
+        // The map ENTRY survives with an empty name — the clear blanks a name, it does not delete a
+        // profile. (Go's else arm likewise overwrites `lp.Name` in place; it never drops the
+        // profile.) This is what keeps the profile listed and switchable below.
+        let meta = profile::load_profiles_file(&dir).await;
+        assert_eq!(
+            meta.profiles.get("work").map(|m| m.name.as_str()),
+            Some(""),
+            "clearing the nickname must blank the name in place, not remove the profile entry"
+        );
+
+        // The listing falls back to the id. Go prints the account's login name here.
+        let listed = be.list_profiles().await;
+        let work = listed
+            .iter()
+            .find(|e| e.id == "work")
+            .expect("the profile must still be listed after its name is cleared");
+        assert_eq!(
+            work.name, "work",
+            "with no login name to restore, the listing falls back to the profile id"
+        );
+        assert!(work.current);
+
+        // The cleared nickname stops resolving — Go's name pass reads the same field its else arm
+        // has just overwritten, so it stops resolving there too. Refused, not adopted as a new id.
+        let err = be
+            .switch_profile("work-laptop")
+            .await
+            .expect_err("a cleared nickname must no longer name a profile");
+        assert!(
+            format!("{err:#}").contains("no profile named"),
+            "unexpected error: {err:#}"
+        );
+        // And the id still does, on the profile whose name was cleared.
+        assert_eq!(
+            be.switch_profile("work").await.unwrap(),
+            SwitchOutcome::AlreadyCurrent {
+                id: "work".to_string()
+            }
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
