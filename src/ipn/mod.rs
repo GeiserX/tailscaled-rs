@@ -1859,35 +1859,70 @@ impl Backend {
         Ok(())
     }
 
-    /// Switch the active profile to `target` (the analogue of Go `tailscale switch <id>`). Tears the
-    /// current device down, repoints `prefs`/`prefs_path`/`key_path` at the target profile, reloads
-    /// that profile's persisted prefs, persists the `current-profile` pointer, registers the target in
-    /// `profiles.json` if new, and bumps the generation (so any in-flight `up` is superseded). It does
-    /// **not** auto-`up` the target — the caller decides whether to bring it up (matching Go, where
-    /// switch changes the profile and the engine reconciles to the new prefs' `WantRunning`).
+    /// Switch the active profile to `target` (the analogue of Go `tailscale switch <id>`), which must
+    /// already exist.
     ///
-    /// `target` is validated as a profile id ([`profile::is_valid_profile_id`]) so it is always a safe
-    /// single path component. Switching to the already-current profile is a no-op success, reported
-    /// as [`SwitchOutcome::AlreadyCurrent`] rather than as a switch that did not happen (Go's
+    /// `target` is resolved by id **or** display name through [`profile::resolve_target_to_id`] (Go's
+    /// `matchProfile`), and a target that matches no known profile is **refused** — Go's
+    /// `switchProfile` does exactly this: `profID, ok := matchProfile(args[0], all); if !ok { errf("No
+    /// profile named %q\n", args[0]); os.Exit(1) }`. This daemon used to treat an unmatched but
+    /// syntactically-valid target as a NEW profile id and create it, so a mistyped `tnet switch
+    /// wrok-laptop` tore a running node down into a fresh empty profile where Go refuses and leaves
+    /// the node alone. Creating a profile is now its own explicit verb — see
+    /// [`create_profile`](Backend::create_profile).
+    ///
+    /// Switching to the already-current profile is a no-op success, reported as
+    /// [`SwitchOutcome::AlreadyCurrent`] rather than as a switch that did not happen (Go's
     /// `Already on account %q`); see [`SwitchOutcome`] for why the outcome is typed.
     pub async fn switch_profile(&mut self, target: &str) -> Result<SwitchOutcome> {
         // Resolve `target` (a profile id OR a display name — Go's `switch` accepts either) to a
-        // canonical id BEFORE any teardown, so a no-match is rejected with the device untouched. An
-        // existing profile is matched by id or unique name; a syntactically-valid id that is NOT yet
-        // known falls through to the id path below (switching to a fresh id creates that profile).
+        // canonical id BEFORE any teardown, so a no-match is rejected with the device untouched.
         let meta = profile::load_profiles_file(&self.state_dir).await;
-        let resolved = profile::resolve_target_to_id(target, &meta);
-        let target: &str = match &resolved {
-            Some(id) => id,
-            // No id/name match. If it is a syntactically valid id, treat it as a NEW profile id
-            // (create-on-switch); otherwise it is neither a known name nor a usable id — reject.
-            None if profile::is_valid_profile_id(target) => target,
-            None => {
-                return Err(anyhow!(
-                    "no profile matches {target:?} by id or name (ids: letters, digits, '-' or '_')"
-                ));
-            }
-        };
+        let resolved = profile::resolve_target_to_id(target, &meta)
+            .ok_or_else(|| anyhow!("no profile named {target:?}"))?;
+        self.activate_profile(&resolved).await
+    }
+
+    /// Create profile `id` and switch to it — the explicit form of what `switch` used to do by
+    /// accident (`tnet switch --new <id>`).
+    ///
+    /// A **fork extension with no upstream counterpart**: Go creates a profile through an interactive
+    /// `tailscale login`, which this fork does not have yet (`docs/PARITY_GAP_ANALYSIS.md` §4.5, bead
+    /// `tsd-91w`), and Go's `switch` refuses an unknown target outright. Keeping creation reachable
+    /// but making it *asked for* is what separates the two cases a bare `switch <target>` used to
+    /// conflate: a typo (refused, node untouched) and a deliberate new account (created).
+    ///
+    /// Refuses an `id` that is not a usable profile id, and one that already names a profile — by id
+    /// **or** by nickname. The nickname case matters because ids win the resolver's first pass: a new
+    /// profile whose id equals another profile's nickname would shadow that profile for every later
+    /// `switch`/`switch remove`, so it is refused rather than silently created.
+    pub async fn create_profile(&mut self, id: &str) -> Result<SwitchOutcome> {
+        if !profile::is_valid_profile_id(id) {
+            return Err(anyhow!(
+                "{id:?} is not a usable profile id (letters, digits, '-' or '_'; 1-64 characters)"
+            ));
+        }
+        let meta = profile::load_profiles_file(&self.state_dir).await;
+        if let Some(existing) = profile::resolve_target_to_id(id, &meta) {
+            return Err(anyhow!(
+                "profile {existing:?} already exists; switch to it without --new"
+            ));
+        }
+        self.activate_profile(id).await
+    }
+
+    /// Make profile `target` the active one: tear the current device down, repoint
+    /// `prefs`/`prefs_path`/`key_path` at the target, reload its persisted prefs, persist the
+    /// `current-profile` pointer, register it in `profiles.json` if new, and bump the generation (so
+    /// any in-flight `up` is superseded). It does **not** auto-`up` the target — the caller decides
+    /// whether to bring it up (matching Go, where switch changes the profile and the engine
+    /// reconciles to the new prefs' `WantRunning`).
+    ///
+    /// `target` MUST already be a valid profile id ([`profile::is_valid_profile_id`]) — it is joined
+    /// as a single path component. Both callers guarantee that: [`switch_profile`](Backend::switch_profile)
+    /// passes a [`profile::resolve_target_to_id`] result (which only ever returns validated ids) and
+    /// [`create_profile`](Backend::create_profile) validates before calling.
+    async fn activate_profile(&mut self, target: &str) -> Result<SwitchOutcome> {
         if target == self.current_profile {
             // Already on it: nothing is torn down and nothing is written. Say so — reporting this as
             // a switch would claim a teardown that never happened (Go: `Already on account %q`).
@@ -5117,8 +5152,10 @@ mod tests {
         be.ever_configured = true;
         be.persist_prefs().await.unwrap();
 
-        // Switch to a new profile "work": its prefs start at default (NOT the default profile's).
-        be.switch_profile("work").await.unwrap();
+        // Create a new profile "work" and switch to it: its prefs start at default (NOT the default
+        // profile's). Creation is explicit — a bare `switch work` refuses an unknown target, as Go's
+        // `switchProfile` does.
+        be.create_profile("work").await.unwrap();
         assert_eq!(be.current_profile, "work");
         assert_eq!(
             be.prefs_path,
@@ -5183,7 +5220,7 @@ mod tests {
             .unwrap();
 
         let before = be.current_profile.clone();
-        let result = be.switch_profile("work").await;
+        let result = be.create_profile("work").await;
         assert!(
             result.is_err(),
             "a failed pointer write must surface as Err"
@@ -5219,8 +5256,8 @@ mod tests {
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let mut be = Backend::load(&dir).await.unwrap();
 
-        // Create + populate "work" (switching to an unused id creates it) and stay on it.
-        be.switch_profile("work").await.unwrap();
+        // Create + populate "work" and stay on it.
+        be.create_profile("work").await.unwrap();
         be.prefs.hostname = Some("work-host".into());
         be.persist_prefs().await.unwrap();
 
@@ -5300,7 +5337,7 @@ mod tests {
         let mut be = Backend::load(&dir).await.unwrap();
 
         // Create "work" and give it a display name, then switch away so it is removable.
-        be.switch_profile("work").await.unwrap();
+        be.create_profile("work").await.unwrap();
         be.persist_prefs().await.unwrap();
         let mut meta = profile::load_profiles_file(&dir).await;
         meta.profiles.insert(
@@ -5339,7 +5376,7 @@ mod tests {
         // Two profiles that both carry the nickname "shared" (Go's `LoginProfile.Name`, what
         // `set --nickname` writes here). `alpha` sorts first in `profiles.json`'s map.
         for id in ["alpha", "beta"] {
-            be.switch_profile(id).await.unwrap();
+            be.create_profile(id).await.unwrap();
             be.persist_prefs().await.unwrap();
         }
         let mut meta = profile::load_profiles_file(&dir).await;
@@ -5406,7 +5443,7 @@ mod tests {
         assert_eq!(be.current_profile, profile::DEFAULT_PROFILE_ID);
 
         // A real switch to a brand-new profile: never registered → NoState → "log in" wording.
-        let outcome = be.switch_profile("work").await.unwrap();
+        let outcome = be.create_profile("work").await.unwrap();
         assert_eq!(
             outcome,
             SwitchOutcome::Switched {
@@ -5434,7 +5471,7 @@ mod tests {
             .await
             .expect("mint a key file for the target profile");
 
-        let outcome = be.switch_profile("keyed").await.unwrap();
+        let outcome = be.create_profile("keyed").await.unwrap();
         assert_eq!(
             outcome,
             SwitchOutcome::Switched {
@@ -5446,6 +5483,151 @@ mod tests {
             outcome.report().contains("connect") && !outcome.report().contains("log in"),
             "a registered, downed profile must be reported as connectable: {}",
             outcome.report()
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn switch_refuses_an_unmatched_target_instead_of_creating_a_profile() {
+        // Go's `switchProfile` refuses a target that matches nothing and leaves the node alone:
+        // `profID, ok := matchProfile(args[0], all); if !ok { errf("No profile named %q\n",
+        // args[0]); os.Exit(1) }`. This daemon used to adopt any syntactically valid target as a NEW
+        // profile id, so `tnet switch wrok-laptop` — a typo for the `work-laptop` nickname — tore the
+        // live device down into a fresh empty profile and reported success. The typo is the whole
+        // point of the test: it is the case where the two behaviours differ by a disconnect.
+        let dir = std::env::temp_dir().join(format!("tailnetd-prof-typo-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = Backend::load(&dir).await.unwrap();
+
+        // A configured default profile carrying the nickname the typo aims at.
+        be.prefs.hostname = Some("default-host".into());
+        be.ever_configured = true;
+        be.persist_prefs().await.unwrap();
+        be.rename_current_profile("work-laptop").await.unwrap();
+
+        let generation_before = be.generation;
+        let err = be
+            .switch_profile("wrok-laptop")
+            .await
+            .expect_err("a target that matches no profile must be refused, not created");
+        assert!(
+            format!("{err:#}").contains("no profile named"),
+            "unexpected error: {err:#}"
+        );
+
+        // Nothing moved: not the active profile, not its prefs, not the active paths.
+        assert_eq!(be.current_profile, profile::DEFAULT_PROFILE_ID);
+        assert_eq!(be.prefs.hostname.as_deref(), Some("default-host"));
+        assert_eq!(be.prefs_path, dir.join("prefs.json"));
+        // The generation is the teardown's fingerprint (`switch` bumps it to supersede an in-flight
+        // `up`), so an unchanged one is the proof the refusal happened before any of that.
+        assert_eq!(
+            be.generation, generation_before,
+            "a refused switch must not tear the device down"
+        );
+        // And nothing was created — no per-profile directory, no listing entry.
+        assert!(
+            !tokio::fs::try_exists(dir.join("profiles").join("wrok-laptop"))
+                .await
+                .unwrap(),
+            "a refused switch must not create the target's state directory"
+        );
+        assert!(
+            !be.list_profiles()
+                .await
+                .iter()
+                .any(|e| e.id == "wrok-laptop"),
+            "a refused switch must not register the target in profiles.json"
+        );
+
+        // The nickname the typo missed still resolves through the same call — this refuses unknown
+        // targets, it does not stop resolving known ones. It is the current profile, so Go's
+        // already-current success is what comes back.
+        assert_eq!(
+            be.switch_profile("work-laptop").await.unwrap(),
+            SwitchOutcome::AlreadyCurrent {
+                id: profile::DEFAULT_PROFILE_ID.to_string()
+            }
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn create_profile_refuses_an_unusable_id_or_one_that_is_already_taken() {
+        // `create_profile` (`tnet switch --new`) is where creating a profile moved to once `switch`
+        // stopped doing it by accident. It has no upstream counterpart — Go creates profiles through
+        // an interactive `tailscale login` — so its refusals are this fork's to state: an id that is
+        // not a safe single path component, and one that already names a profile by id OR nickname
+        // (an id shadows a nickname in the resolver's first pass, so allowing that would hide the
+        // profile it collides with from every later `switch`/`switch remove`).
+        let dir = std::env::temp_dir().join(format!("tailnetd-prof-new-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = Backend::load(&dir).await.unwrap();
+
+        // The happy path: a fresh id is created, becomes current, and is listed.
+        assert_eq!(
+            be.create_profile("work").await.unwrap(),
+            SwitchOutcome::Switched {
+                id: "work".to_string(),
+                state: State::NoState,
+            }
+        );
+        assert!(be.list_profiles().await.iter().any(|e| e.id == "work"));
+
+        // Asking to create it again is refused rather than quietly switching to it.
+        let err = be
+            .create_profile("work")
+            .await
+            .expect_err("--new must not adopt an existing profile");
+        assert!(
+            format!("{err:#}").contains("already exists"),
+            "unexpected error: {err:#}"
+        );
+
+        // Give the current profile the nickname "shared": the id `shared` is now taken too, because
+        // creating it would shadow this profile for every later lookup.
+        be.rename_current_profile("shared").await.unwrap();
+        let err = be
+            .create_profile("shared")
+            .await
+            .expect_err("an id that collides with an existing nickname must be refused");
+        assert!(
+            format!("{err:#}").contains("already exists"),
+            "unexpected error: {err:#}"
+        );
+
+        // The reserved `default` profile always exists, so it can never be created.
+        assert!(
+            be.create_profile(profile::DEFAULT_PROFILE_ID)
+                .await
+                .is_err(),
+            "the always-present default profile must not be creatable"
+        );
+
+        // Ids that are not safe single path components are refused before anything is written — the
+        // same rule `is_valid_profile_id` enforces, now stated at the only place that adopts a
+        // caller-supplied id verbatim.
+        for bad in ["", "..", "a/b", "a.b", "../../etc"] {
+            let err = be
+                .create_profile(bad)
+                .await
+                .expect_err("an id that is not a safe path component must be refused");
+            assert!(
+                format!("{err:#}").contains("not a usable profile id"),
+                "unexpected error for {bad:?}: {err:#}"
+            );
+        }
+
+        // None of the refusals moved the active profile or left state behind.
+        assert_eq!(be.current_profile, "work");
+        assert!(
+            !tokio::fs::try_exists(dir.join("profiles").join("shared"))
+                .await
+                .unwrap()
         );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -6938,7 +7120,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let mut be = Backend::load(&dir).await.unwrap();
-        be.switch_profile("work").await.expect("switch work");
+        be.create_profile("work").await.expect("create work");
 
         be.begin_set(SetOptions {
             nickname: Some(Some("Work tailnet".to_string())),

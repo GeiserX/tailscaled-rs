@@ -492,9 +492,19 @@ pub enum Request {
     /// The `Ok` message distinguishes the three outcomes Go's CLI reports in words: already on this
     /// profile (nothing changed), switched to a profile that still needs a login, and switched to a
     /// registered profile that is merely down.
+    ///
+    /// A `target` that matches no known profile is **refused** (Go's `switchProfile`: `No profile
+    /// named %q`, exit 1) unless [`create`](Request::SwitchProfile::create) asks for it to be
+    /// created. Nothing is torn down on the refusal path.
     SwitchProfile {
         /// The target profile id (or name; the daemon resolves either).
         target: String,
+        /// Create `target` as a new profile instead of refusing an unknown one (`tnet switch --new`).
+        /// `target` must then be a usable profile id that does not already name a profile. `false`
+        /// (the default) is Go's behaviour and keeps the wire byte-identical to a request from a
+        /// client that predates the flag.
+        #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+        create: bool,
     },
     /// Delete a profile (Go `tailscale switch remove`). The target may be an id or a display name,
     /// like [`SwitchProfile`](Request::SwitchProfile). Refuses a target that matches no known profile
