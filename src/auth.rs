@@ -177,6 +177,7 @@ pub(crate) fn requires_write(request: &crate::localapi::Request) -> bool {
         | Request::Down { .. }
         | Request::Logout { .. }
         | Request::SwitchProfile { .. }
+        | Request::CreateProfile { .. }
         | Request::DeleteProfile { .. }
         | Request::Nc { .. }
         | Request::SetServeConfig { .. }
@@ -517,16 +518,12 @@ mod tests {
         );
         assert!(
             requires_write(&Request::SwitchProfile {
-                target: "work".into(),
-                create: false
+                target: "work".into()
             }),
             "switching profiles changes lifecycle + persisted state — a write"
         );
         assert!(
-            requires_write(&Request::SwitchProfile {
-                target: "work".into(),
-                create: true
-            }),
+            requires_write(&Request::CreateProfile { id: "work".into() }),
             "creating a profile writes even harder — still a write"
         );
         assert!(

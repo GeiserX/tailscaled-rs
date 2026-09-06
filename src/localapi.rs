@@ -494,17 +494,37 @@ pub enum Request {
     /// registered profile that is merely down.
     ///
     /// A `target` that matches no known profile is **refused** (Go's `switchProfile`: `No profile
-    /// named %q`, exit 1) unless [`create`](Request::SwitchProfile::create) asks for it to be
-    /// created. Nothing is torn down on the refusal path.
+    /// named %q`, exit 1) — nothing is torn down on the refusal path. Creating a profile is a
+    /// separate request, [`CreateProfile`](Request::CreateProfile); this one only ever *selects* one
+    /// that already exists.
     SwitchProfile {
         /// The target profile id (or name; the daemon resolves either).
         target: String,
-        /// Create `target` as a new profile instead of refusing an unknown one (`tnet switch --new`).
-        /// `target` must then be a usable profile id that does not already name a profile. `false`
-        /// (the default) is Go's behaviour and keeps the wire byte-identical to a request from a
-        /// client that predates the flag.
-        #[serde(default, skip_serializing_if = "core::ops::Not::not")]
-        create: bool,
+    },
+    /// Create a new, empty profile and switch to it (`tnet switch --new <id>`). A WRITE, gated like
+    /// [`SwitchProfile`](Request::SwitchProfile) — it registers a profile, repoints the
+    /// current-profile pointer and tears the live device down on the way.
+    ///
+    /// A **fork extension with no upstream counterpart**: Go creates a profile through the
+    /// interactive `tailscale login`, which this fork does not have yet, and Go's `switch` refuses an
+    /// unknown target outright. The daemon refuses an `id` that is not a usable profile id, and one
+    /// that already names a profile by id **or** by nickname.
+    ///
+    /// # Why this is its own command and not a flag on `SwitchProfile`
+    ///
+    /// The LocalAPI socket permits a mixed pair — a newer `tnet` against a daemon that has not been
+    /// restarted since an upgrade. Serde ignores unknown *fields*, so had "create it" travelled as a
+    /// `create: true` field on `SwitchProfile`, a daemon that predates the flag would have dropped it
+    /// and run a plain switch: for an `id` that already names a profile that silently *activates* it
+    /// — tearing the live device down and repointing the node — where the operator asked for a
+    /// creation the newer daemon refuses. An unknown *command*, by contrast, cannot be silently
+    /// reinterpreted: the older daemon's `Request` deserializer fails and it answers `bad request`,
+    /// so the older-daemon outcome is a refusal with the node untouched. The version gate is the
+    /// deserializer itself, which needs no capability table to keep in step with releases.
+    CreateProfile {
+        /// The id for the new profile. Must be a usable single-path-component profile id (letters,
+        /// digits, `-` or `_`; 1-64 characters) that does not already name a profile.
+        id: String,
     },
     /// Delete a profile (Go `tailscale switch remove`). The target may be an id or a display name,
     /// like [`SwitchProfile`](Request::SwitchProfile). Refuses a target that matches no known profile
@@ -2500,6 +2520,40 @@ mod tests {
         match serde_json::from_str::<Response>(&json).unwrap() {
             Response::Version { version } => assert_eq!(version, "0.9.0"),
             other => panic!("expected Version, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn profile_switch_and_create_are_distinct_commands_on_the_wire() {
+        // The daemon side of the `--new` guard. Creation is its own `cmd`, so a daemon that predates
+        // it fails to deserialize and answers `bad request` instead of quietly serving a switch —
+        // which, for an id that already names a profile, would tear the live device down and repoint
+        // the node. `switch_profile` keeps the shape it has always had, so an older CLI's bare switch
+        // is still understood unchanged.
+        assert_eq!(
+            serde_json::to_string(&Request::SwitchProfile {
+                target: "work".into()
+            })
+            .unwrap(),
+            r#"{"cmd":"switch_profile","target":"work"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::CreateProfile { id: "work".into() }).unwrap(),
+            r#"{"cmd":"create_profile","id":"work"}"#
+        );
+        match serde_json::from_str::<Request>(r#"{"cmd":"create_profile","id":"work"}"#).unwrap() {
+            Request::CreateProfile { id } => assert_eq!(id, "work"),
+            other => panic!("expected CreateProfile, got {other:?}"),
+        }
+        // A `create` key on a switch is NOT a creation: `SwitchProfile` models no such field, so it
+        // deserializes as the plain switch it reads as, and the daemon refuses an unknown target.
+        match serde_json::from_str::<Request>(
+            r#"{"cmd":"switch_profile","target":"work","create":true}"#,
+        )
+        .unwrap()
+        {
+            Request::SwitchProfile { target } => assert_eq!(target, "work"),
+            other => panic!("expected SwitchProfile, got {other:?}"),
         }
     }
 
