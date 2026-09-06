@@ -1679,20 +1679,26 @@ struct ServeFlags {
     /// decided at runtime by [`serve_kind_and_port`], not by clap: `--https=0 --tcp=22` names one
     /// listener under Go, and a genuine pair still gets Go's `cannot serve multiple types for a
     /// single mount point`.
+    ///
+    /// All four are typed as wide as Go's `uint`, not as the `u16` a port fits in, for the same
+    /// reason `--proxy-protocol` is: Go range-checks the value ITSELF and refuses a too-high one
+    /// with `port number %d is too high for %s flag`. Narrowing the flag would hand that command
+    /// line to clap's integer-range message and a different exit status instead — see
+    /// [`serve_kind_and_port`].
     #[arg(long, value_name = "PORT")]
-    https: Option<u16>,
+    https: Option<u64>,
     /// Serve plain HTTP on this tailnet port, reverse-proxying to `<TARGET>` (Go `--http=PORT`).
     #[arg(long, value_name = "PORT")]
-    http: Option<u16>,
+    http: Option<u64>,
     /// Forward raw TCP on this tailnet port to `<TARGET>` with no TLS (Go `--tcp=PORT`). Served by
     /// the daemon's own accept loop.
     #[arg(long, value_name = "PORT")]
-    tcp: Option<u16>,
+    tcp: Option<u64>,
     /// Terminate TLS on this tailnet port with the node's cert, then splice the plaintext stream to
     /// `<TARGET>` as raw TCP (Go `--tls-terminated-tcp=PORT`) — no HTTP parsing or reverse-proxying.
     /// Needs an issuable cert, like `--https`.
     #[arg(long = "tls-terminated-tcp", value_name = "PORT")]
-    tls_terminated_tcp: Option<u16>,
+    tls_terminated_tcp: Option<u64>,
     /// Mount the handler at this URL path prefix instead of `/` (Go `--set-path`). HTTP(S) only;
     /// with several mounts on one port the longest-matching prefix wins (unmatched = 404).
     #[arg(long = "set-path", value_name = "MOUNT")]
@@ -12577,6 +12583,23 @@ impl ServeKind {
     fn is_web(self) -> bool {
         matches!(self, ServeKind::Https | ServeKind::Http)
     }
+
+    /// The name Go's `serveType.String()` gives this type, for the one message that prints it (the
+    /// too-high-port refusal in [`serve_kind_and_port`]).
+    ///
+    /// `Tun` is `unknownServeType` because Go's `String()` has no `case serveTypeTUN` and falls to
+    /// its default arm. Nothing here can print it — the only caller reads a type the port loop
+    /// assigned, and `--tun` is counted after that loop — but the mapping is Go's, so it is written
+    /// out rather than papered over.
+    fn go_name(self) -> &'static str {
+        match self {
+            ServeKind::Https => "https",
+            ServeKind::Http => "http",
+            ServeKind::Tcp => "tcp",
+            ServeKind::TlsTerminatedTcp => "tls-terminated-tcp",
+            ServeKind::Tun => "unknownServeType",
+        }
+    }
 }
 
 /// Resolve the mutually exclusive listener flags into `(kind, port)` exactly as `serve_v2.go`'s
@@ -12588,27 +12611,58 @@ impl ServeKind {
 /// `serve --https=0 3000` contributes nothing, leaves the count at zero, and serves HTTPS on 443 —
 /// it is not an error. `--tun` is Go's fifth, port-less type and counts in the same exclusivity
 /// check, which is why the pair `--tun --https=443` is refused here rather than by clap.
+///
+/// The loop is written out rather than filtered because Go's too-high-port refusal is INSIDE it and
+/// sees its state: `if v > math.MaxUint16 { return …fmt.Errorf("port number %d is too high for %s
+/// flag", v, srvType) }` runs before `srvType = k`, so the type it names is the one a PREVIOUS
+/// iteration assigned — and with only one port flag given there is no previous iteration, leaving
+/// `srvType` at its zero value, `serveTypeHTTPS`. That is why `serve --tcp=70000 3000` is refused by
+/// Go with "too high for https flag": the message names the wrong flag, and this port keeps Go's
+/// sentence rather than improving on it, because a script matching on Go's output has to keep
+/// matching. The one thing that cannot be reproduced is Go's map iteration order, which is random:
+/// with two port flags where the second is too high, Go names either type, and the fixed order here
+/// picks one of them. Being inside the loop also means the refusal comes BEFORE the multiple-types
+/// error, which is checked after it.
 fn serve_kind_and_port(flags: &ServeFlags) -> Result<(ServeKind, u16)> {
-    let mut given: Vec<(ServeKind, u16)> = [
+    // Go's named return values, read by the refusal below before they are assigned.
+    let mut srv_type = ServeKind::Https;
+    let mut srv_port = 0u16;
+    let mut src_type_count = 0usize;
+    for (kind, value) in [
         (ServeKind::Https, flags.https),
         (ServeKind::Http, flags.http),
         (ServeKind::Tcp, flags.tcp),
         (ServeKind::TlsTerminatedTcp, flags.tls_terminated_tcp),
-    ]
-    .into_iter()
-    .filter_map(|(kind, port)| port.filter(|p| *p != 0).map(|p| (kind, p)))
-    .collect();
-    if flags.tun {
-        given.push((ServeKind::Tun, 0));
+    ] {
+        let Some(value) = value.filter(|v| *v != 0) else {
+            continue;
+        };
+        // Go's `if v > math.MaxUint16 { … }` guarding its `uint16(v)`: the conversion fails on
+        // exactly the values the comparison refuses.
+        let Ok(port) = u16::try_from(value) else {
+            anyhow::bail!(
+                "port number {value} is too high for {} flag",
+                srv_type.go_name()
+            );
+        };
+        src_type_count += 1;
+        srv_type = kind;
+        srv_port = port;
     }
-    match given.as_slice() {
-        [] => Ok((ServeKind::Https, 443)),
-        [(kind, port)] => Ok((*kind, *port)),
-        _ => anyhow::bail!(
+    if flags.tun {
+        src_type_count += 1;
+        srv_type = ServeKind::Tun;
+    }
+    if src_type_count > 1 {
+        anyhow::bail!(
             "cannot serve multiple types for a single mount point: give exactly one of --https / \
              --http / --tcp / --tls-terminated-tcp / --tun (they name the same listener)"
-        ),
+        );
     }
+    if src_type_count == 0 {
+        return Ok((ServeKind::Https, 443));
+    }
+    Ok((srv_type, srv_port))
 }
 
 /// Go's `--bg` default: unset means the FOREGROUND, except with `--service`, where Go flips the
@@ -12621,8 +12675,24 @@ fn serve_background(flags: &ServeFlags) -> bool {
 /// Whether `cap` matches Go's `validAppCap` regexp `^([\pL\pN-]+\.)+[\pL\pN-]+\/[\pL\pN-/]+$`:
 /// a `{domain}/{name}` app capability whose domain is a fully qualified name of two or more labels
 /// drawn from letters, numbers and hyphens, and whose name may also contain forward slashes.
+///
+/// `\pL` and `\pN` are Unicode general CATEGORIES, so the character test asks for the category
+/// rather than for `char::is_alphabetic`. The two are not the same set: `is_alphabetic` is the
+/// Alphabetic derived property, which is `\pL` plus `Other_Alphabetic` — some 6000 combining marks
+/// (Devanagari vowel signs, Arabic and Hebrew points, …) that are not letters. Asking it would
+/// accept a capability whose domain label carries one of those, which Go's regexp refuses; the
+/// command line would then reach this build's "not supported" refusal instead of Go's
+/// "does not match the form {domain}/{name}". `\pN` happens to coincide with `char::is_numeric`,
+/// but both halves go through the same lookup so the two cannot drift apart.
 fn is_valid_app_cap(cap: &str) -> bool {
-    let label_char = |c: char| c.is_alphabetic() || c.is_numeric() || c == '-';
+    use icu_properties::CodePointMapData;
+    use icu_properties::props::{GeneralCategory, GeneralCategoryGroup};
+
+    const LETTER_OR_NUMBER: GeneralCategoryGroup =
+        GeneralCategoryGroup::Letter.union(GeneralCategoryGroup::Number);
+    let label_char = |c: char| {
+        LETTER_OR_NUMBER.contains(CodePointMapData::<GeneralCategory>::new().get(c)) || c == '-'
+    };
     // The domain half has no slash, so the FIRST slash is the separator and everything after it is
     // the (slash-bearing) name.
     let Some((domain, name)) = cap.split_once('/') else {
@@ -18546,6 +18616,56 @@ mod tests {
     }
 
     #[test]
+    fn a_port_past_a_u16_gets_gos_refusal_not_claps() {
+        // srvTypeAndPortFromFlags range-checks the value ITSELF (`if v > math.MaxUint16`), so the
+        // four port flags are typed as wide as Go's `uint` and a too-high port reaches Go's
+        // sentence at Go's exit status instead of clap's integer-range error at exit 2. That the
+        // command line parses at all is asserted by parse_serve, which panics if it does not.
+        for flag in ["--https", "--http", "--tcp", "--tls-terminated-tcp"] {
+            let arg = format!("{flag}=70000");
+            let (_, flags) = parse_serve(&[&arg, "3000"]);
+            // Go formats `srvType` BEFORE the loop assigns it, so a lone too-high flag is always
+            // reported against the zero value, serveTypeHTTPS — even for --tcp. Go's sentence,
+            // wrong flag name and all.
+            let want = "port number 70000 is too high for https flag";
+            let err = serve_kind_and_port(&flags)
+                .expect_err("65535 is the highest port there is")
+                .to_string();
+            assert_eq!(err, want, "{arg}");
+            // And through the whole flag check, not just the resolver.
+            let err = check_serve_flags(&flags, false)
+                .expect_err("the refusal is not skipped on the way in")
+                .to_string();
+            assert_eq!(err, want, "{arg}");
+        }
+
+        // The boundary itself: 65535 is a port, 65536 is one past every port.
+        let (_, flags) = parse_serve(&["--tcp=65535", "3000"]);
+        assert_eq!(
+            serve_kind_and_port(&flags).unwrap(),
+            (ServeKind::Tcp, 65535)
+        );
+        let (_, flags) = parse_serve(&["--tcp=65536", "3000"]);
+        assert_eq!(
+            serve_kind_and_port(&flags)
+                .expect_err("65536 is not a port")
+                .to_string(),
+            "port number 65536 is too high for https flag"
+        );
+
+        // Go checks the range inside the loop and the type count after it, so the too-high refusal
+        // wins over `cannot serve multiple types` — and here it names the type the earlier
+        // iteration assigned (Go names either one, its map order being random).
+        let (_, flags) = parse_serve(&["--http=80", "--tcp=70000", "3000"]);
+        assert_eq!(
+            serve_kind_and_port(&flags)
+                .expect_err("the range check comes first")
+                .to_string(),
+            "port number 70000 is too high for http flag"
+        );
+    }
+
+    #[test]
     fn tun_is_gos_fifth_serve_type() {
         // serve_v2.go: --tun sets serveTypeTUN and counts toward the exclusivity check…
         let (_, flags) = parse_serve(&["--tun", "3000"]);
@@ -18666,12 +18786,30 @@ mod tests {
         // Go returns early on an empty value, so it asks for no capabilities at all.
         assert!(parse_accept_app_caps(&[String::new()]).unwrap().is_empty());
 
+        // \pL and \pN are the Unicode categories, not ASCII: a domain and a name written in any
+        // script parse, digits and hyphens included.
+        assert_eq!(
+            parse_accept_app_caps(&[
+                "münchen.example/café, 日本.example/資本, ex4-mple.co/c4p-2".to_string()
+            ])
+            .unwrap(),
+            vec![
+                "münchen.example/café".to_string(),
+                "日本.example/資本".to_string(),
+                "ex4-mple.co/c4p-2".to_string(),
+            ]
+        );
+
         for bad in [
             "nodomain/cap",
             "example.com",
             "example.com/",
             "/cap",
             "exa mple.com/cap",
+            // Combining marks are Alphabetic but are NOT \pL (U+093E is Mc, U+0345 is Mn), so
+            // Go's regexp refuses them in either half of the capability.
+            "exa\u{093e}mple.com/cap",
+            "example.com/ca\u{0345}p",
         ] {
             let err = parse_accept_app_caps(&[bad.to_string()])
                 .expect_err("not a {domain}/{name} capability")
