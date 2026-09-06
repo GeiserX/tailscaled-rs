@@ -144,6 +144,13 @@ not do. `--nickname` is the exception among them: like Go, it also renames the c
 so the name you pick is what `tnet switch --list` shows and what `tnet switch <name>` resolves
 against. `set` never re-authenticates and never changes whether the node is up or down.
 
+`tnet switch <target>` only ever *selects* a profile that exists: a target matching no profile by id
+or nickname is refused, exactly as Go's `tailscale switch` refuses it (`No profile named ...`), so a
+typo can no longer disconnect the node into an empty profile. Creating one is its own request —
+`tnet switch --new <id>`, a flag with no upstream counterpart, standing in for the interactive
+`tailscale login` this fork does not have yet. The new profile starts empty and logged out; run
+`tnet up` to register it.
+
 Four of Go's `set` flags are **parsed but not modelled**, so a command line ported from Go reaches a
 refusal that names the gap instead of dying at the parser. For each, the value asking for the state
 this daemon is currently in is accepted, and the other is refused: `--relay-server-port=` and
