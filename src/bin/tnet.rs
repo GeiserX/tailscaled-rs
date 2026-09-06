@@ -620,6 +620,23 @@ enum Command {
         /// message and the exit code are Go's rather than clap's.
         #[arg(long)]
         json: bool,
+        /// Create PROFILE as a new, empty profile and switch to it, instead of refusing a target
+        /// that names no existing profile.
+        ///
+        /// A fork extension with no upstream counterpart: Go creates a profile through an
+        /// interactive `tailscale login` (a verb this fork does not have yet — bead `tsd-91w`), and
+        /// its `switch` refuses an unknown name outright. Without this flag `tnet switch` refuses
+        /// too, so a typo can no longer disconnect the node into a profile nobody asked for; with
+        /// it, PROFILE must be a usable id (letters, digits, `-`, `_`) that does not already name a
+        /// profile by id or nickname. The new profile starts empty and logged out — run `tnet up`
+        /// to register it.
+        ///
+        /// It is the only mutating half of `switch`, so pairing it with a form that cannot create
+        /// anything — `--list`, or the `remove` subcommand — is refused rather than ignored; see
+        /// [`switch_usage_refusal`]. Silently dropping it beside `remove` would delete the profile
+        /// the caller asked to create.
+        #[arg(long = "new")]
+        new: bool,
         /// The profile id to switch to (omit with `--list`). Ignored when `--list` is given.
         #[arg(value_name = "PROFILE")]
         target: Option<String>,
@@ -2843,9 +2860,10 @@ async fn main() -> Result<()> {
         Command::Switch {
             list,
             json,
+            new,
             target,
             cmd,
-        } => run_switch(&socket, list, json, target, cmd).await,
+        } => run_switch(&socket, list, json, new, target, cmd).await,
         // `version` answers from the CLI's own crate version. WITHOUT `--daemon` it never contacts
         // the daemon (Go also prints the client version with no LocalAPI call) — handle it here and
         // return. WITH `--daemon` it round-trips `Request::Version` to learn the daemon's version,
@@ -4850,8 +4868,18 @@ fn build_info_json(
 ///    `--json argument cannot be used with tailscale switch NAME` and exits 1.
 /// 3. no target left → the usage line, exit 1.
 ///
-/// The `remove` subcommand is exempt: Go's ffcli dispatches the subcommand before `switch`'s own
-/// `Exec` ever runs, so `switch`'s flag rules do not apply to it (clap parses the same shape here).
+/// The `remove` subcommand is exempt from all three: Go's ffcli dispatches the subcommand before
+/// `switch`'s own `Exec` ever runs, so `switch`'s flag rules do not apply to it (clap parses the
+/// same shape here).
+///
+/// One rule is this fork's own, because the flag it guards is: `--new` (create the profile rather
+/// than refuse an unknown one — see [`Command::Switch`]) asks for a mutation, so pairing it with
+/// anything that will not create a profile is refused rather than silently ignored. That is both
+/// the read-only `--list` and the `remove` subcommand, and it is checked FIRST — before the
+/// subcommand exemption and before the list arm — because the flag is not Go's, so Go's dispatch
+/// order says nothing about it, and because `switch --new remove work` would otherwise DELETE the
+/// profile the operator asked to create. A command line with no `--new` on it still follows Go's
+/// order exactly.
 ///
 /// Both messages go to **stdout** and exit **1**, matching Go's `outln` + `os.Exit(1)` — not clap's
 /// stderr + exit 2, which is why this is a hand-rolled check and not an `#[arg(requires = ...)]`.
@@ -4859,10 +4887,24 @@ fn build_info_json(
 fn switch_usage_refusal(
     list: bool,
     json: bool,
+    new: bool,
     target: Option<&str>,
     has_subcommand: bool,
 ) -> Option<&'static str> {
-    if has_subcommand || list {
+    // Fork-only rules (see above), checked before Go's order because the flag is not Go's. `--new`
+    // creates; `--list` reads and `remove` deletes. Neither pairing can be honoured, and dropping
+    // the mutating half silently is the worse answer in both — beside `remove` it would delete the
+    // profile the operator asked to create.
+    if new && has_subcommand {
+        return Some("--new argument cannot be used with tnet switch remove");
+    }
+    if new && list {
+        return Some("--new argument cannot be used with tnet switch --list");
+    }
+    if has_subcommand {
+        return None;
+    }
+    if list {
         return None;
     }
     if json {
@@ -4878,11 +4920,12 @@ async fn run_switch(
     socket: &std::path::Path,
     list: bool,
     json: bool,
+    new: bool,
     target: Option<String>,
     cmd: Option<SwitchCmd>,
 ) -> Result<()> {
     // Go's own flag refusals first (stdout + exit 1), before any daemon round-trip.
-    if let Some(message) = switch_usage_refusal(list, json, target.as_deref(), cmd.is_some()) {
+    if let Some(message) = switch_usage_refusal(list, json, new, target.as_deref(), cmd.is_some()) {
         println!("{message}");
         std::process::exit(1);
     }
@@ -4911,7 +4954,16 @@ async fn run_switch(
         }
     }
     match target {
-        Some(target) => send_ok_or_die(socket, Request::SwitchProfile { target }).await,
+        Some(target) => {
+            send_ok_or_die(
+                socket,
+                Request::SwitchProfile {
+                    target,
+                    create: new,
+                },
+            )
+            .await
+        }
         // Unreachable: `switch_usage_refusal` above already exited on a missing target. Kept as a
         // total match (rather than an `expect`) so a future edit to the refusal table degrades into
         // the same usage line instead of a panic.
@@ -17676,38 +17728,144 @@ mod tests {
 
         // `--list` is handled first, so every flag/arg combination under it is usable: plain list,
         // JSON list, and a stray target next to `--list` (Go ignores the args entirely once listing).
-        assert_eq!(switch_usage_refusal(true, false, None, false), None);
-        assert_eq!(switch_usage_refusal(true, true, None, false), None);
-        assert_eq!(switch_usage_refusal(true, true, Some("work"), false), None);
+        assert_eq!(switch_usage_refusal(true, false, false, None, false), None);
+        assert_eq!(switch_usage_refusal(true, true, false, None, false), None);
+        assert_eq!(
+            switch_usage_refusal(true, true, false, Some("work"), false),
+            None
+        );
 
         // `--json` WITHOUT `--list` is refused — with or without a target, because `--json` only ever
         // formats the listing. Go: `--json argument cannot be used with tailscale switch NAME`.
         assert_eq!(
-            switch_usage_refusal(false, true, Some("work"), false),
+            switch_usage_refusal(false, true, false, Some("work"), false),
             Some("--json argument cannot be used with tnet switch NAME")
         );
         assert_eq!(
-            switch_usage_refusal(false, true, None, false),
+            switch_usage_refusal(false, true, false, None, false),
             Some("--json argument cannot be used with tnet switch NAME"),
             "the --json refusal precedes the usage line, as in Go"
         );
 
         // No target, no `--list`, no `--json` → the usage line.
         assert_eq!(
-            switch_usage_refusal(false, false, None, false),
+            switch_usage_refusal(false, false, false, None, false),
             Some("usage: tnet switch NAME")
         );
 
         // A plain target is usable.
         assert_eq!(
-            switch_usage_refusal(false, false, Some("work"), false),
+            switch_usage_refusal(false, false, false, Some("work"), false),
             None
         );
 
-        // The `remove` subcommand is exempt from all of it: Go's ffcli dispatches the subcommand
-        // before `switch`'s own Exec runs, so `switch`'s flag rules never apply to it.
-        assert_eq!(switch_usage_refusal(false, false, None, true), None);
-        assert_eq!(switch_usage_refusal(false, true, None, true), None);
+        // This fork's own rules: `--new` creates, `--list` reads and `remove` deletes, so both
+        // pairings are refused instead of the mutating half being ignored. They are checked before
+        // the list arm AND before the subcommand exemption, so `--list --new` is the refusal and not
+        // a listing, and `--new remove work` is the refusal and not a deletion.
+        assert_eq!(
+            switch_usage_refusal(true, false, true, Some("work"), false),
+            Some("--new argument cannot be used with tnet switch --list")
+        );
+        assert_eq!(
+            switch_usage_refusal(true, true, true, None, false),
+            Some("--new argument cannot be used with tnet switch --list")
+        );
+        // `--new` on its own is a normal switch invocation and follows Go's remaining order: a
+        // target is required, `--json` still cannot be paired with a NAME.
+        assert_eq!(
+            switch_usage_refusal(false, false, true, Some("work"), false),
+            None
+        );
+        assert_eq!(
+            switch_usage_refusal(false, false, true, None, false),
+            Some("usage: tnet switch NAME")
+        );
+        assert_eq!(
+            switch_usage_refusal(false, true, true, Some("work"), false),
+            Some("--json argument cannot be used with tnet switch NAME")
+        );
+
+        // The `remove` subcommand is exempt from all of *Go's* rules: ffcli dispatches the
+        // subcommand before `switch`'s own Exec runs, so `switch`'s flag rules never apply to it.
+        assert_eq!(switch_usage_refusal(false, false, false, None, true), None);
+        assert_eq!(switch_usage_refusal(false, true, false, None, true), None);
+        assert_eq!(switch_usage_refusal(true, false, false, None, true), None);
+        // ...but NOT from `--new`, which is not Go's, so Go's dispatch order does not excuse it.
+        // `tnet switch --new remove work` asks to create and would otherwise delete instead.
+        assert_eq!(
+            switch_usage_refusal(false, false, true, None, true),
+            Some("--new argument cannot be used with tnet switch remove")
+        );
+        assert_eq!(
+            switch_usage_refusal(true, false, true, None, true),
+            Some("--new argument cannot be used with tnet switch remove"),
+            "the subcommand refusal precedes the --list one: `remove` is what would have run"
+        );
+        assert_eq!(
+            switch_usage_refusal(false, true, true, Some("work"), true),
+            Some("--new argument cannot be used with tnet switch remove")
+        );
+    }
+
+    #[test]
+    fn switch_new_flag_parses_and_reaches_the_switch_command() {
+        // The `--new` flag has to survive clap before `switch_usage_refusal` and `run_switch` can
+        // act on it: a renamed field or a dropped `#[arg]` would leave the command line parsing
+        // fine and the flag inert. Assert the mapping from argv to `Command::Switch` itself.
+        // (`Command` deliberately has no `Debug` — see the note on the enum — so the non-matching
+        // arm names the input instead of the parse.)
+        match Cli::try_parse_from(["tnet", "switch", "--new", "work"]).expect("switch --new") {
+            Cli {
+                command:
+                    Command::Switch {
+                        list,
+                        json,
+                        new,
+                        target,
+                        cmd,
+                    },
+                ..
+            } => {
+                assert!(new, "--new must reach the Switch command");
+                assert_eq!(target.as_deref(), Some("work"));
+                assert!(!list && !json && cmd.is_none());
+            }
+            _ => panic!("expected a switch command for `tnet switch --new work`"),
+        }
+
+        // Absent, it is false — a plain `tnet switch work` is the Go-faithful refusing form.
+        match Cli::try_parse_from(["tnet", "switch", "work"]).expect("switch work") {
+            Cli {
+                command: Command::Switch { new, target, .. },
+                ..
+            } => {
+                assert!(!new, "--new must default to off");
+                assert_eq!(target.as_deref(), Some("work"));
+            }
+            _ => panic!("expected a switch command for `tnet switch work`"),
+        }
+
+        // And it parses ahead of the `remove` subcommand, which is exactly why
+        // `switch_usage_refusal` has to refuse that pair: clap accepts the line, so without the
+        // refusal the flag would be dropped on the floor and a deletion would run in its place.
+        match Cli::try_parse_from(["tnet", "switch", "--new", "remove", "work"])
+            .expect("switch --new remove work")
+        {
+            Cli {
+                command: Command::Switch { new, cmd, .. },
+                ..
+            } => {
+                assert!(new, "--new must survive being written before a subcommand");
+                assert!(matches!(cmd, Some(SwitchCmd::Remove { .. })));
+                assert_eq!(
+                    switch_usage_refusal(false, false, new, None, cmd.is_some()),
+                    Some("--new argument cannot be used with tnet switch remove"),
+                    "the parsed shape must land on the refusal, not on the deletion"
+                );
+            }
+            _ => panic!("expected a switch command for `tnet switch --new remove work`"),
+        }
     }
 
     #[test]

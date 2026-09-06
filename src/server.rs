@@ -1329,9 +1329,18 @@ async fn dispatch(
         // profile under the lock (the teardown is a bounded graceful shutdown, not the multi-second
         // `Device::new` handshake, so holding the lock is correct and keeps the swap atomic). Does NOT
         // auto-up the target — the operator runs `up` if the new profile should connect.
-        Request::SwitchProfile { target } => {
+        //
+        // An unknown target is refused with the device untouched (Go: `No profile named %q`); only
+        // `create` (`tnet switch --new`) makes one, which is this fork's stand-in for the
+        // interactive `tailscale login` that creates a profile upstream.
+        Request::SwitchProfile { target, create } => {
             let mut be = backend.lock().await;
-            match be.switch_profile(&target).await {
+            let result = if create {
+                be.create_profile(&target).await
+            } else {
+                be.switch_profile(&target).await
+            };
+            match result {
                 // The reply distinguishes "already on it" from a real switch, and names the target's
                 // settled state — see `SwitchOutcome`. The daemon log carries the resolved id, which
                 // `target` need not be (it may have been a display name).

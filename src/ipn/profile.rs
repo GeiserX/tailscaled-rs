@@ -81,9 +81,11 @@ pub(super) fn is_valid_profile_id(id: &str) -> bool {
 /// out of `profiles.json` by the name arm — so a caller may join it as a single path component.
 ///
 /// Pure over the parsed `profiles.json` (no I/O) so it is unit-testable; the caller loads the file.
-/// Note a *syntactically* valid id that is NOT yet a known profile is intentionally left to the
-/// caller (switching to a brand-new id is how a new profile is created), so this returns `None` for
-/// it and the caller falls back to its own id-validation path — see the `switch_profile` call site.
+/// `None` means "no such profile", and every caller treats it as Go does — `switch` and
+/// `switch remove` both refuse with `No profile named %q`. A *syntactically* valid id that is not a
+/// known profile is NOT a match: creating a profile is the separate, explicit
+/// [`Backend::create_profile`](super::Backend::create_profile) (`tnet switch --new`), which uses a
+/// `Some` here as its "already exists" refusal rather than as a target.
 pub(super) fn resolve_target_to_id(target: &str, meta: &ProfilesFile) -> Option<String> {
     // 1. Exact id match against a KNOWN profile (default is always known).
     if is_valid_profile_id(target)

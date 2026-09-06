@@ -880,8 +880,9 @@ async fn lifecycle_subscriber_observes_generation_advance_on_up_path() {
 /// pinned alongside the state changes.
 ///
 /// The interesting cases are the refusals and the no-op, because those are the ones a caller cannot
-/// verify for itself: a `switch` to the profile you are already on must not claim it switched, and a
-/// `switch remove` of a profile that does not exist must not claim it removed one.
+/// verify for itself: a `switch` to a profile that does not exist must refuse rather than create one,
+/// a `switch` to the profile you are already on must not claim it switched, and a `switch remove` of
+/// a profile that does not exist must not claim it removed one.
 #[tokio::test]
 async fn profile_switch_list_and_remove_round_trip_over_the_wire() {
     let harness = Harness::start().await;
@@ -900,10 +901,37 @@ async fn profile_switch_list_and_remove_round_trip_over_the_wire() {
         other => panic!("expected Response::Profiles, got {other:?}"),
     }
 
-    // Switching to a brand-new id creates and activates it. The profile has never registered, so the
-    // reply says so (Go's post-switch `NeedsLogin` arm) rather than claiming a connection.
+    // A switch to a target that names no profile is REFUSED, and creates nothing — Go's
+    // `switchProfile` prints `No profile named %q` and exits 1. This is the shape a typo takes, and
+    // the daemon used to answer it by tearing the node down into a profile nobody asked for.
     match harness
         .round_trip(r#"{"cmd":"switch_profile","target":"work"}"#)
+        .await
+    {
+        Response::Error { message } => assert!(
+            message.contains("no profile named"),
+            "unexpected refusal: {message:?}"
+        ),
+        other => panic!("expected Response::Error switching to an unknown profile, got {other:?}"),
+    }
+    // ...and the refused target really was not created: still just the default profile, still current.
+    match harness.round_trip(r#"{"cmd":"profile_list"}"#).await {
+        Response::Profiles { profiles } => {
+            assert_eq!(
+                profiles.len(),
+                1,
+                "a refused switch must not create a profile: {profiles:?}"
+            );
+            assert!(profiles[0].id == "default" && profiles[0].current);
+        }
+        other => panic!("expected Response::Profiles, got {other:?}"),
+    }
+
+    // Creating it is the explicit request (`tnet switch --new work`), which activates it. The profile
+    // has never registered, so the reply says so (Go's post-switch `NeedsLogin` arm) rather than
+    // claiming a connection.
+    match harness
+        .round_trip(r#"{"cmd":"switch_profile","target":"work","create":true}"#)
         .await
     {
         Response::Ok { message } => {
@@ -913,6 +941,17 @@ async fn profile_switch_list_and_remove_round_trip_over_the_wire() {
             );
         }
         other => panic!("expected Response::Ok from switch, got {other:?}"),
+    }
+    // Asking to create it a second time is refused — `create` never adopts an existing profile.
+    match harness
+        .round_trip(r#"{"cmd":"switch_profile","target":"work","create":true}"#)
+        .await
+    {
+        Response::Error { message } => assert!(
+            message.contains("already exists"),
+            "unexpected refusal: {message:?}"
+        ),
+        other => panic!("expected Response::Error re-creating a profile, got {other:?}"),
     }
 
     // Both profiles are now listed, with the marker moved to "work".

@@ -517,9 +517,17 @@ mod tests {
         );
         assert!(
             requires_write(&Request::SwitchProfile {
-                target: "work".into()
+                target: "work".into(),
+                create: false
             }),
             "switching profiles changes lifecycle + persisted state — a write"
+        );
+        assert!(
+            requires_write(&Request::SwitchProfile {
+                target: "work".into(),
+                create: true
+            }),
+            "creating a profile writes even harder — still a write"
         );
         assert!(
             requires_write(&Request::DeleteProfile {

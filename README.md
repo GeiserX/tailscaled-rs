@@ -156,6 +156,15 @@ bypassing the per-feature double opt-in, which this daemon's local authorization
 (`docs/THREAT_MODEL.md` §4.1) does not grant to the control plane. `--no-remote-config`, Go's
 default, is what this build always does.
 
+**Profiles: `switch` selects, `--new` creates.** `tnet switch <target>` only ever *selects* a
+profile that exists: a target matching no profile by id or nickname is refused, exactly as Go's
+`tailscale switch` refuses it (`No profile named ...`), so a typo can no longer disconnect the node
+into an empty profile. Creating one is its own request — `tnet switch --new <id>`, a flag with no
+upstream counterpart, standing in for the interactive `tailscale login` this fork does not have yet.
+The new profile starts empty and logged out; run `tnet up` to register it. Because `--new` is the
+only mutating half of `switch`, it is refused rather than ignored next to the two forms that cannot
+create anything: `tnet switch --new --list` and `tnet switch --new remove <target>`.
+
 **App connector: the advertise half only.** `tnet up/set --advertise-connector` really does reach
 control — the engine sets `Hostinfo.AppConnector` from the pref at registration and on every map
 request, so the admin console sees the node offering the role. What this build does **not** have is
