@@ -630,6 +630,10 @@ enum Command {
         /// it, PROFILE must be a usable id (letters, digits, `-`, `_`) that does not already name a
         /// profile by id or nickname. The new profile starts empty and logged out — run `tnet up`
         /// to register it.
+        ///
+        /// It travels as its own LocalAPI command rather than a flag on the switch request, so a
+        /// daemon too old to know it refuses the request (`bad request`) instead of degrading it
+        /// into a plain switch — see [`switch_request`].
         #[arg(long = "new")]
         new: bool,
         /// The profile id to switch to (omit with `--list`). Ignored when `--list` is given.
@@ -4902,6 +4906,24 @@ fn switch_usage_refusal(
     None
 }
 
+/// The request `tnet switch <target>` sends: a plain [`Request::SwitchProfile`], or — with `--new` —
+/// the distinct [`Request::CreateProfile`] command.
+///
+/// Split out so the wire shape of `--new` is testable without a daemon, because that shape is the
+/// whole guard against an older daemon. Creation must NOT ride as a flag on `switch_profile`: serde
+/// drops unknown fields, so a daemon that predates `--new` would read such a request as a bare
+/// switch and, for an id that already names a profile, *activate* it — tearing the live device down
+/// and repointing the node where this CLI asked for a creation the daemon would have refused. As its
+/// own command it is a request the older daemon cannot parse at all, so it answers `bad request`,
+/// [`send_ok_or_die`] prints it and exits 1, and nothing was torn down.
+fn switch_request(new: bool, target: String) -> Request {
+    if new {
+        Request::CreateProfile { id: target }
+    } else {
+        Request::SwitchProfile { target }
+    }
+}
+
 async fn run_switch(
     socket: &std::path::Path,
     list: bool,
@@ -4940,16 +4962,7 @@ async fn run_switch(
         }
     }
     match target {
-        Some(target) => {
-            send_ok_or_die(
-                socket,
-                Request::SwitchProfile {
-                    target,
-                    create: new,
-                },
-            )
-            .await
-        }
+        Some(target) => send_ok_or_die(socket, switch_request(new, target)).await,
         // Unreachable: `switch_usage_refusal` above already exited on a missing target. Kept as a
         // total match (rather than an `expect`) so a future edit to the refusal table degrades into
         // the same usage line instead of a panic.
@@ -17776,6 +17789,50 @@ mod tests {
         assert_eq!(switch_usage_refusal(false, false, false, None, true), None);
         assert_eq!(switch_usage_refusal(false, true, false, None, true), None);
         assert_eq!(switch_usage_refusal(true, false, true, None, true), None);
+    }
+
+    /// `switch --new` must travel as a request an older daemon cannot mistake for something else.
+    ///
+    /// The LocalAPI socket permits a mixed pair — a `tnet` newer than the daemon it is talking to.
+    /// Serde ignores unknown FIELDS, so had `--new` ridden as a `create` flag on `switch_profile`, a
+    /// daemon that predates it would have dropped the flag and served a bare switch: for a target
+    /// that already names a profile, that ACTIVATES it — the live device torn down and the node
+    /// repointed — where the operator asked for a creation the newer daemon refuses outright. An
+    /// unknown COMMAND cannot be reinterpreted like that; it fails to deserialize and comes back as
+    /// `bad request`, which [`send_ok_or_die`] prints before exiting 1, with nothing torn down.
+    #[test]
+    fn switch_new_is_its_own_command_so_an_older_daemon_cannot_read_it_as_a_switch() {
+        // Stand-in for the daemon that predates `--new`: the wire contract as of v0.55.1, reduced to
+        // the one command at issue. Serde's permissive defaults are the point — no
+        // `deny_unknown_fields`, exactly as the real `Request` is declared.
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "cmd", rename_all = "snake_case")]
+        enum OlderDaemonRequest {
+            SwitchProfile { target: String },
+        }
+
+        let create = serde_json::to_string(&switch_request(true, "work".into())).unwrap();
+        assert!(
+            serde_json::from_str::<OlderDaemonRequest>(&create).is_err(),
+            "an older daemon must refuse `switch --new` outright rather than run something else, \
+             but it read {create} as a command it already serves"
+        );
+        assert_eq!(create, r#"{"cmd":"create_profile","id":"work"}"#);
+
+        // The shape that WOULD have been misread, spelled out: an unknown field is dropped, and what
+        // is left is a plain switch to `work` — the wrong, destructive action.
+        let OlderDaemonRequest::SwitchProfile { target } =
+            serde_json::from_str(r#"{"cmd":"switch_profile","target":"work","create":true}"#)
+                .expect("an unknown field is dropped by serde, not refused");
+        assert_eq!(target, "work");
+
+        // Without `--new` the request is byte-identical to what it has always been, so an older
+        // daemon keeps serving a plain switch unchanged — the guard costs the common path nothing.
+        let switch = serde_json::to_string(&switch_request(false, "work".into())).unwrap();
+        assert_eq!(switch, r#"{"cmd":"switch_profile","target":"work"}"#);
+        let OlderDaemonRequest::SwitchProfile { target } =
+            serde_json::from_str(&switch).expect("an older daemon still understands a bare switch");
+        assert_eq!(target, "work");
     }
 
     #[test]
