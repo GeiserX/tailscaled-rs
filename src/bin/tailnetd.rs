@@ -105,8 +105,12 @@ struct Args {
     /// to. Declaring the flag anyway is the whole point: a Go-shaped command line gets a startup
     /// error that NAMES the missing integration instead of clap's generic "unexpected argument",
     /// and — unlike silently ignoring it — a subnet router is never left believing its BGP
-    /// announcements are being driven when nothing is connected to BIRD. Go refuses the same way
-    /// (`--bird-socket is not supported on %s`) on a build whose BIRD hook is not linked in.
+    /// announcements are being driven when nothing is connected to BIRD. Declaring it
+    /// unconditionally is also the closer of Go's two shapes: `buildfeatures.HasBird` is `true`
+    /// unless the binary was built with `ts_omit_bird`, so Go's *default* build registers the flag
+    /// and refuses it (`--bird-socket is not supported on %s`) when no hook is linked in. The shape
+    /// that never declares it is the `ts_omit_bird` opt-out, and it produces exactly the "flag
+    /// provided but not defined" that this refusal exists to replace.
     #[arg(long, value_name = "PATH")]
     bird_socket: Option<String>,
     /// Log verbosity: `0` (default, info), `1` (debug), `2+` (trace). Overrides the `TAILNETD_LOG`
@@ -1216,7 +1220,7 @@ fn log_resume_decision(resuming: bool, have_authkey: bool, ephemeral: bool) {
 /// The `--bird-socket` refusal decision and its message, pure so it can be unit-tested.
 ///
 /// Ported from Go `cmd/tailscaled/tailscaled.go` @ `53a0d659afa51835dd7a9283873cca44261454f8`,
-/// which registers the flag and then fatals early when the build carries no BIRD hook:
+/// which registers the flag and then fatals early when no BIRD hook is linked in:
 ///
 /// ```text
 /// if buildfeatures.HasBird && args.birdSocketPath != "" && !wgengine.HookNewBird.IsSet() {
@@ -1225,9 +1229,35 @@ fn log_resume_decision(resuming: bool, have_authkey: bool, ephemeral: bool) {
 /// }
 /// ```
 ///
-/// This fork is permanently in that "no hook linked in" case, so the refusal is unconditional —
-/// but it names the real reason (no BIRD integration in the engine) rather than blaming the OS,
-/// because unlike Go's the gap here is not platform-specific.
+/// **Why this refusal is unconditional, where Go's is guarded twice.** Go's two guards are not the
+/// same kind of thing, and only one of them has an analogue here:
+///
+/// * `buildfeatures.HasBird` is a build tag: it is `true` unless the binary was built with
+///   `ts_omit_bird` (`feature/buildfeatures/feature_bird_enabled.go`). So Go's *default* build does
+///   declare `--bird-socket` and does reach this fatal; the shape that never declares it is the
+///   opt-out build, whose command line then dies with "flag provided but not defined" — the failure
+///   this whole refusal exists to replace. There is no build-feature system here and no BIRD code
+///   to omit, so declaring the flag always is the faithful half of that pair. It is also what this
+///   file already does for Go's other feature-gated flags (`--encrypt-state` and
+///   `--hardware-attestation` are `buildfeatures.HasTPM`-gated upstream — see
+///   [`explicit_tpm_flag_refusal`]).
+/// * `!wgengine.HookNewBird.IsSet()` is the runtime hook. Upstream it is set by `feature/bird`'s
+///   `init`, empty-imported from `feature/condregister/maybe_bird.go` under
+///   `!ts_omit_bird && (linux || darwin || freebsd || openbsd)` — so in a default build the fatal is
+///   reached exactly on an OS outside that set, which is why Go's `%s` names `runtime.GOOS`. This
+///   fork has no hook on any platform, so the condition is permanently true and there is nothing to
+///   test at runtime.
+///
+/// **The message therefore keeps Go's sentence but not Go's `%s`.** It opens with Go's literal
+/// `--bird-socket is not supported on …`, so an operator or a runbook keyed to Go's wording still
+/// matches; the `%s` becomes "this platform or in this build of tailnetd" rather than a concrete
+/// GOOS, because naming one would invite the false repair of moving to another OS. That is the same
+/// split the neighbouring ported refusals make — [`can_encrypt_state`] reproduces Go's `on %s`
+/// verbatim where the platform arm is as true here as upstream, and
+/// [`can_use_hardware_attestation`] keeps Go's shape while naming the honest scope where the cause
+/// is the build. (Refusals with no Go string behind them, like `debugmode`'s `--derp` and
+/// `--portmap`, use this fork's own "is not supported by tailnetd" instead; this one has an
+/// upstream string to carry.) The paragraph that follows still names the real reason.
 ///
 /// One Go edge case ports with it: the empty path is **not** a refusal. Go's guard is
 /// `birdSocketPath != ""`, so `--bird-socket=""` means "no BIRD socket" exactly like omitting the
@@ -1238,15 +1268,17 @@ fn bird_socket_refusal(path: Option<&str>) -> Option<String> {
     // Go: `args.birdSocketPath != ""` — an unset *or* explicitly empty path is "no BIRD socket".
     let path = path.filter(|p| !p.is_empty())?;
     Some(format!(
-        "error: --bird-socket is not supported by tailnetd (given {path:?}).\n\
+        "error: --bird-socket is not supported on this platform or in this build of tailnetd \
+         (given {path:?}).\n\
          Go accepts this flag for a subnet router that hands its advertised routes to a BIRD BGP \
          daemon: it passes the socket path to its engine (`wgengine.Config.BIRDSocket`, built via \
          `wgengine.HookNewBird`), which enables BIRD's `tailscale` protocol while this node is a \
          primary subnet router and disables it otherwise.\n\
          That toggle belongs to the engine's reconfigure cycle, which this daemon does not own, and \
          the tailscale-rs engine exposes no BIRD hook — so there is nothing here to hand the socket \
-         to. tailnetd therefore refuses at startup, the way Go refuses on a build with no BIRD hook, \
-         instead of accepting the flag as a no-op: a silently ignored --bird-socket would leave a \
+         to. tailnetd therefore refuses at startup, the way Go refuses when its own BIRD hook is \
+         not registered, instead of accepting the flag as a no-op: a silently ignored \
+         --bird-socket would leave a \
          subnet router believing its BGP announcements track its primary-route status when nothing \
          was ever connected to BIRD.\n\
          Drop the flag to start tailnetd. Routes are still advertised to the tailnet with `tnet up \
@@ -1756,11 +1788,12 @@ mod tests {
 
     // --- `--bird-socket` (Go `tailscaled --bird-socket`) ---------------------------------------
     //
-    // Go registers the flag and then fatals when the build has no BIRD hook linked in. This fork is
-    // permanently in that case, so the three things worth pinning are: the flag PARSES (a Go-shaped
-    // command line must reach the refusal, not clap's "unexpected argument"), an omitted or empty
-    // path is NOT a refusal (Go's guard is `birdSocketPath != ""`), and a real path IS refused with
-    // a message that says why.
+    // Go registers the flag on any build without `ts_omit_bird` and then fatals when no BIRD hook
+    // is linked in. This fork is permanently in that case, so the things worth pinning are: the
+    // flag PARSES (a Go-shaped command line must reach the refusal, not clap's "unexpected
+    // argument"), an omitted or empty path is NOT a refusal (Go's guard is `birdSocketPath != ""`),
+    // a real path IS refused with a message that says why, and the refusal opens with Go's own
+    // sentence while deliberately declining Go's `%s`.
 
     #[test]
     fn bird_socket_flag_parses_rather_than_being_an_unknown_argument() {
@@ -1804,10 +1837,13 @@ mod tests {
     fn bird_socket_path_is_refused_and_the_message_says_why() {
         let message =
             bird_socket_refusal(Some("/run/bird.ctl")).expect("a non-empty path must be refused");
-        // Names the flag, so the operator can tell which argument stopped the daemon.
+        // Opens with Go's literal sentence, up to and including its `on`, so an operator or a
+        // runbook that greps for `tailscaled`'s wording still matches. Go's is
+        // `--bird-socket is not supported on %s`; anything that drops the `on` (an earlier
+        // "not supported by tailnetd") has stopped carrying the upstream string.
         assert!(
-            message.contains("--bird-socket is not supported"),
-            "keeps Go's refusal wording; got {message:?}"
+            message.starts_with("error: --bird-socket is not supported on "),
+            "keeps Go's refusal sentence, `on` and all; got {message:?}"
         );
         // Echoes the rejected path.
         assert!(
@@ -1823,6 +1859,41 @@ mod tests {
         assert!(
             message.contains("--advertise-routes"),
             "points at the route-advertising path that does work; got {message:?}"
+        );
+    }
+
+    /// Go fills its `%s` with `runtime.GOOS` because upstream the hook is registered per-OS
+    /// (`feature/condregister/maybe_bird.go`: `linux || darwin || freebsd || openbsd`), so the
+    /// fatal really is reached only on some platforms. Here there is no hook on any platform, so
+    /// the refusal is unconditional and naming one GOOS would invite the false repair of moving to
+    /// another OS. Pinned so a later "port Go's `%s` literally" has to argue with this: the message
+    /// is identical whatever host it is produced on, and it names no concrete platform.
+    #[test]
+    fn bird_socket_refusal_is_unconditional_and_names_no_platform() {
+        let message =
+            bird_socket_refusal(Some("/run/bird.ctl")).expect("a non-empty path must be refused");
+        // The first line is the ported sentence; it must not have a GOOS substituted into it.
+        let first_line = message
+            .lines()
+            .next()
+            .expect("the message has a first line");
+        for goos in ["linux", "darwin", "windows", "freebsd", "openbsd", "macos"] {
+            assert!(
+                !first_line.contains(goos),
+                "the refusal must not name a platform ({goos:?} found); got {first_line:?}"
+            );
+        }
+        // It says instead that no build of tailnetd has this, which is the honest scope.
+        assert!(
+            first_line.contains("this platform or in this build of tailnetd"),
+            "names the honest scope in place of Go's %s; got {first_line:?}"
+        );
+        // And the decision does not consult the host: the same input gives the same message, with
+        // no argument through which a platform could enter.
+        assert_eq!(
+            bird_socket_refusal(Some("/run/bird.ctl")),
+            Some(message),
+            "the refusal is a pure function of the path"
         );
     }
 
