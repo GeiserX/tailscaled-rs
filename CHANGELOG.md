@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.55.5](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.4...v0.55.5) (2026-09-06)
+
+
+### Bug Fixes
+
+* **serve:** keep Go's refusals for a too-high port and a non-letter app cap ([#387](https://github.com/GeiserX/tailscaled-rs/issues/387)) ([02ae9df](https://github.com/GeiserX/tailscaled-rs/commit/02ae9df37e666fe54e5eb7a0b9192ea6fc7c8af0))
+
 ## [0.55.4](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.3...v0.55.4) (2026-09-06)
 
 
