@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.55.2](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.1...v0.55.2) (2026-09-06)
+
+
+### Bug Fixes
+
+* **switch:** refuse a switch target that names no profile instead of creating it ([#376](https://github.com/GeiserX/tailscaled-rs/issues/376)) ([11b7f93](https://github.com/GeiserX/tailscaled-rs/commit/11b7f935a35f9b8c2e38256d0bf091cd565b2c6f))
+
 ## [0.55.1](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.0...v0.55.1) (2026-09-05)
 
 
