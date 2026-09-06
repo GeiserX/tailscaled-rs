@@ -4641,8 +4641,12 @@ fn resolve_report(addrs: &[std::net::IpAddr]) -> String {
 /// completion on its blocking thread and its result is dropped.
 async fn resolve_lookup(host: &str, net: ResolveNet) -> Result<Vec<std::net::IpAddr>> {
     if host.is_empty() {
-        // Go's `LookupIP` guard: `&DNSError{Err: "no suitable address found", Name: ""}`.
-        anyhow::bail!("lookup : no suitable address found");
+        // Go's `LookupIP` guard: `&DNSError{Err: errNoSuchHost.Error(), Name: host, IsNotFound:
+        // true}`, which `DNSError.Error` renders `lookup <name>: no such host` — with an empty
+        // name, `lookup : no such host`. NOT the `no suitable address found` of the family filter
+        // below: nothing resolvable and nothing in the requested family are different failures and
+        // Go words them differently.
+        anyhow::bail!("lookup : no such host");
     }
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return filter_resolve_addrs(vec![ip], net, host);
@@ -21491,12 +21495,47 @@ mod tests {
     #[tokio::test]
     async fn resolve_lookup_refuses_an_empty_host_before_querying() {
         // Go's `LookupIP` guards `host == ""` ahead of the resolver, so an empty argument is a
-        // command error, not a DNS round-trip.
-        let err = super::resolve_lookup("", ResolveNet::Ip)
+        // command error, not a DNS round-trip. The guard is a `*DNSError` carrying `errNoSuchHost`,
+        // so it renders `lookup : no such host` — every network, since the guard sits before the
+        // family filter.
+        for net in [ResolveNet::Ip, ResolveNet::Ip4, ResolveNet::Ip6] {
+            let err = super::resolve_lookup("", net)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert_eq!(err, "lookup : no such host", "for {net:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_lookup_words_an_empty_host_apart_from_an_empty_family() {
+        // Two DIFFERENT upstream failures that must not print the same sentence: nothing to resolve
+        // at all (`*DNSError` / `no such host`) versus a name that resolved but has nothing in the
+        // requested family (`*AddrError` / `no suitable address found`). Collapsing them tells a
+        // user reaching for `--net ip6` that their name is missing when it is not.
+        let empty_host = super::resolve_lookup("", ResolveNet::Ip6)
             .await
             .unwrap_err()
             .to_string();
-        assert_eq!(err, "lookup : no suitable address found");
+        let empty_family = super::resolve_lookup("192.0.2.1", ResolveNet::Ip6)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(empty_host, "lookup : no such host");
+        assert_eq!(empty_family, "address 192.0.2.1: no suitable address found");
+        assert_ne!(empty_host, empty_family);
+    }
+
+    #[tokio::test]
+    async fn run_debug_resolve_reports_an_empty_hostname_as_no_such_host() {
+        // The same guard through the real entry point: one argument, so the arity check passes and
+        // the empty string reaches the lookup. Needs no resolver and no network.
+        let args = vec![String::new()];
+        let err = super::run_debug_resolve(&args, "ip")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "lookup : no such host");
     }
 
     #[tokio::test]
