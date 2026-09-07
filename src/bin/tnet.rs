@@ -5772,9 +5772,11 @@ async fn run_whoami(socket: &std::path::Path, json: bool) -> Result<()> {
 /// filters. Inline because the filters + the optional peer lookup shape the output (and the peer
 /// case fetches Status to resolve by name/IP against the netmap).
 ///
-/// An argument that matches no peer but IS an address falls through to the Tailscale Service set
+/// An argument that matches no node but IS an address falls through to the Tailscale Service set
 /// (Go `serviceAddrsMatchingIP`): a Service is a virtual service with its own VIPs, which belong to
-/// no peer, so without that arm naming one could only fail with "no peer found".
+/// no peer, so without that arm naming one could only fail with "no peer found". Which arguments
+/// reach that fallback is [`ip_arg_matching_node`]'s answer, and it is Go's `peerMatchingIP`: any
+/// address of any peer, and this node's own, resolve a node rather than falling through.
 /// The refusal `tnet ip` owes its own flags before it looks at anything else — Go's `runIP`
 /// (`cmd/tailscale/cli/ip.go`, upstream v1.102.3 `53a0d659afa51835dd7a9283873cca44261454f8`) counts
 /// its three address selectors and rejects any two of them together:
@@ -5804,6 +5806,92 @@ fn ip_usage_refusal(v4: bool, v6: bool, first: bool) -> Option<&'static str> {
         return Some("tnet ip -1, -4, and -6 are mutually exclusive");
     }
     None
+}
+
+/// One netmap node's tailnet addresses — Go's `ipnstate.PeerStatus.TailscaleIPs`, which this fork
+/// carries as a separate field per family. An address the netmap has not filled in arrives as an
+/// empty string on the wire (`PeerReport.ipv4` is a bare `String`), so "absent" is normalised to
+/// `None` here rather than being carried around as `""`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct NodeAddrs<'a> {
+    ipv4: Option<&'a str>,
+    ipv6: Option<&'a str>,
+}
+
+impl<'a> NodeAddrs<'a> {
+    /// Go `slices.Contains(ps.TailscaleIPs, ip)`: does this node hold `want`, in EITHER family?
+    /// Compared parsed, so `fd7a:115c:a1e0:0::2` matches however the netmap spelled that address.
+    fn holds(self, want: std::net::IpAddr) -> bool {
+        self.iter()
+            .filter_map(|s| s.parse::<std::net::IpAddr>().ok())
+            .any(|ip| ip == want)
+    }
+
+    /// The addresses this node actually has, in Go's `TailscaleIPs` order (IPv4 then IPv6).
+    fn iter(self) -> impl Iterator<Item = &'a str> {
+        [self.ipv4, self.ipv6].into_iter().flatten()
+    }
+}
+
+/// A peer's addresses (Go `ps.TailscaleIPs`).
+fn peer_addrs(peer: &tailscaled_rs::localapi::PeerReport) -> NodeAddrs<'_> {
+    NodeAddrs {
+        ipv4: Some(peer.ipv4.as_str()).filter(|s| !s.is_empty()),
+        ipv6: peer.ipv6.as_deref().filter(|s| !s.is_empty()),
+    }
+}
+
+/// THIS node's own addresses (Go `st.Self.TailscaleIPs`).
+fn self_addrs(status: &tailscaled_rs::localapi::StatusReport) -> NodeAddrs<'_> {
+    NodeAddrs {
+        ipv4: status.self_ipv4.as_deref().filter(|s| !s.is_empty()),
+        ipv6: status.self_ipv6.as_deref().filter(|s| !s.is_empty()),
+    }
+}
+
+/// The netmap node `tnet ip <arg>` names, or `None` when no node holds it. Pure, so the whole
+/// decision table is unit-testable; the caller owns the status round trip and the Service fallback.
+///
+/// The address arm ports Go's `peerMatchingIP` (`cmd/tailscale/cli/ip.go`, upstream v1.102.3
+/// `53a0d659afa51835dd7a9283873cca44261454f8`) as written:
+///
+/// ```text
+/// ip, err := netip.ParseAddr(ipStr)
+/// if err != nil { return }
+/// for _, ps = range st.Peer {
+///     if slices.Contains(ps.TailscaleIPs, ip) { return ps, true }
+/// }
+/// if ps := st.Self; ps != nil {
+///     if slices.Contains(ps.TailscaleIPs, ip) { return ps, true }
+/// }
+/// ```
+///
+/// Two things follow from `slices.Contains` over the WHOLE address list, and both were missing
+/// before: a peer is found by ANY of its addresses, its IPv6 included, and this node's own
+/// addresses resolve to this node. Neither is cosmetic — the caller reports an unmatched address as
+/// `no peer or service found with IP`, so a peer's own IPv6 used to be answered by naming the wrong
+/// cause.
+///
+/// The name arm is the one Go reaches through `tailscaleIPFromArg`, which turns a name into the
+/// named peer's first address before `peerMatchingIP` scans for it; matching the name against the
+/// peer set directly is the same answer without the round trip through an address. It is left
+/// exactly as it was — a name still has to match `PeerReport.name` in full, and a name in no netmap
+/// still stops here instead of reaching Go's host-resolver fallback.
+fn ip_arg_matching_node<'a>(
+    arg: &str,
+    status: &'a tailscaled_rs::localapi::StatusReport,
+) -> Option<NodeAddrs<'a>> {
+    // Go: `netip.ParseAddr` gates the node scan, so only an address gets compared against one.
+    if let Ok(want) = arg.parse::<std::net::IpAddr>() {
+        if let Some(peer) = status.peers.iter().find(|p| peer_addrs(p).holds(want)) {
+            return Some(peer_addrs(peer));
+        }
+        // Go's second half: `st.Self`. This node answers for its own address rather than falling
+        // through to a Service lookup that cannot match it either.
+        let this_node = self_addrs(status);
+        return this_node.holds(want).then_some(this_node);
+    }
+    status.peers.iter().find(|p| p.name == arg).map(peer_addrs)
 }
 
 async fn run_ip(
@@ -5850,8 +5938,9 @@ async fn run_ip(
         std::process::exit(1);
     }
     let out = if let Some(peer) = peer {
-        // Peer address: resolve the named peer against the status peer set (by MagicDNS name
-        // or tailnet IP). We fetch Status (not whois, which is IP-only) so a NAME also works.
+        // Peer address: resolve the argument against the netmap ([`ip_arg_matching_node`]) — by
+        // name, or by any address the peer or this node holds. We fetch Status (not whois, which is
+        // IP-only) so a NAME also works.
         let status = match round_trip(socket, &Request::Status).await {
             Ok(Response::Status(s)) => s,
             Ok(other) => anyhow::bail!("unexpected response to status request: {other:?}"),
@@ -5859,16 +5948,11 @@ async fn run_ip(
                 return Err(e).with_context(|| format!("querying status at {}", socket.display()));
             }
         };
-        match status
-            .peers
-            .iter()
-            .find(|p| p.name == peer || p.ipv4 == peer)
-        {
-            // Project both families so `ip -6 <peer>` / a bare `ip <peer>` show the peer's IPv6
-            // (Go prints `peer.TailscaleIPs` filtered by family). `PeerReport.ipv6` is populated by
-            // the daemon's status projection when the peer has one.
-            Some(p) => format_ip_filtered(Some(&p.ipv4), p.ipv6.as_deref(), sel),
-            // No peer matched. Go then asks whether the address belongs to a Tailscale Service and,
+        match ip_arg_matching_node(&peer, &status) {
+            // Project both families so `ip -6 <peer>` / a bare `ip <peer>` show the node's IPv6
+            // (Go prints the matched node's `TailscaleIPs` filtered by family).
+            Some(addrs) => format_ip_filtered(addrs.ipv4, addrs.ipv6, sel),
+            // No node matched. Go then asks whether the address belongs to a Tailscale Service and,
             // if so, prints THAT Service's addresses instead of failing — a Service is not a peer,
             // so its VIP is in no peer's address list and used to be reported as "no peer found".
             // The Service set is fetched only on this miss, the way `configure kubeconfig` fetches
@@ -6202,7 +6286,7 @@ fn ping_target_from_arg(arg: &str, status: &tailscaled_rs::localapi::StatusRepor
     // leading zeros and zone suffixes.)
     if let Ok(want) = arg.parse::<std::net::IpAddr>() {
         // ADDITION (see the doc comment): Go's daemon answers this one, ours does not.
-        if self_tailnet_ips(status).any(|self_ip| self_ip == want) {
+        if self_addrs(status).holds(want) {
             return PingTarget::SelfNode(want.to_string());
         }
         return PingTarget::Literal(arg.to_string());
@@ -6227,18 +6311,6 @@ fn ping_target_from_arg(arg: &str, status: &tailscaled_rs::localapi::StatusRepor
         return PingTarget::SelfNode(ip.to_string());
     }
     PingTarget::Unresolved
-}
-
-/// This node's own tailnet addresses, parsed — the set an IP-literal argument is checked against by
-/// [`ping_target_from_arg`]. Parsing both sides means spelling variants compare equal rather than
-/// by string.
-fn self_tailnet_ips(
-    status: &tailscaled_rs::localapi::StatusReport,
-) -> impl Iterator<Item = std::net::IpAddr> + '_ {
-    [status.self_ipv4.as_deref(), status.self_ipv6.as_deref()]
-        .into_iter()
-        .flatten()
-        .filter_map(|s| s.parse::<std::net::IpAddr>().ok())
 }
 
 /// The first of a node's tailnet addresses — Go's `TailscaleIPs[0]`, which is the IPv4 whenever the
@@ -22373,6 +22445,106 @@ mod tests {
                 ..Default::default()
             }),
             "aws-s3"
+        );
+    }
+
+    #[test]
+    fn ip_arg_resolves_any_address_of_a_peer_and_of_this_node() {
+        // Go `peerMatchingIP` matches `slices.Contains(ps.TailscaleIPs, ip)` over every peer and
+        // then over `st.Self`, so ANY address of a node resolves that node — not just its IPv4,
+        // and not only peers.
+        let status = ping_status();
+        let laptop = NodeAddrs {
+            ipv4: Some("100.64.0.2"),
+            ipv6: Some("fd7a:115c:a1e0::2"),
+        };
+        let this_node = NodeAddrs {
+            ipv4: Some("100.64.0.1"),
+            ipv6: Some("fd7a:115c:a1e0::1"),
+        };
+
+        // By name, and by the peer's IPv4 — what already worked.
+        assert_eq!(
+            ip_arg_matching_node("my-laptop.tail0123.ts.net", &status),
+            Some(laptop)
+        );
+        assert_eq!(ip_arg_matching_node("100.64.0.2", &status), Some(laptop));
+        // By the peer's IPv6, however it is spelled (Go compares parsed addresses).
+        assert_eq!(
+            ip_arg_matching_node("fd7a:115c:a1e0::2", &status),
+            Some(laptop)
+        );
+        assert_eq!(
+            ip_arg_matching_node("fd7a:115c:a1e0:0::2", &status),
+            Some(laptop)
+        );
+        // A peer whose only address is IPv6 is reachable by it.
+        assert_eq!(
+            ip_arg_matching_node("fd7a:115c:a1e0::3", &status),
+            Some(NodeAddrs {
+                ipv4: None,
+                ipv6: Some("fd7a:115c:a1e0::3"),
+            })
+        );
+        // Go's `st.Self` half: this node's own addresses resolve to this node, either family.
+        assert_eq!(ip_arg_matching_node("100.64.0.1", &status), Some(this_node));
+        assert_eq!(
+            ip_arg_matching_node("fd7a:115c:a1e0::1", &status),
+            Some(this_node)
+        );
+
+        // Still a miss: an address no node in the netmap holds (the caller then tries the Service
+        // VIPs and, on a miss there too, reports `no peer or service found with IP`), and a name
+        // that names nothing.
+        assert_eq!(ip_arg_matching_node("100.64.0.99", &status), None);
+        assert_eq!(ip_arg_matching_node("fd7a:115c:a1e0::99", &status), None);
+        assert_eq!(ip_arg_matching_node("not-in-this-tailnet", &status), None);
+        // A node with no address at all cannot be matched by one, and never matches the empty
+        // string a missing address arrives as.
+        assert_eq!(
+            ip_arg_matching_node("addressless.tail0123.ts.net", &status),
+            Some(NodeAddrs::default())
+        );
+        assert_eq!(ip_arg_matching_node("", &status), None);
+    }
+
+    #[test]
+    fn ip_prints_the_whole_matched_node_whichever_address_named_it() {
+        // The output of `tnet ip <peer-IPv6>`: Go resolves the node from any one of its addresses
+        // and then prints them ALL, filtered by `-4`/`-6`/`-1`. So naming the peer by its IPv6 and
+        // asking for `-4` prints its IPv4 — it does not print nothing, and it does not report
+        // `no peer or service found with IP`.
+        let status = ping_status();
+        let addrs = ip_arg_matching_node("fd7a:115c:a1e0::2", &status)
+            .expect("a peer's IPv6 must resolve that peer");
+        assert_eq!(
+            format_ip_filtered(addrs.ipv4, addrs.ipv6, IpSelect::default()),
+            "100.64.0.2\nfd7a:115c:a1e0::2\n"
+        );
+        assert_eq!(
+            format_ip_filtered(
+                addrs.ipv4,
+                addrs.ipv6,
+                IpSelect {
+                    v4: true,
+                    ..Default::default()
+                }
+            ),
+            "100.64.0.2\n"
+        );
+        // Same for this node named by its own IPv6 (Go's `st.Self` arm).
+        let mine = ip_arg_matching_node("fd7a:115c:a1e0::1", &status)
+            .expect("this node's own IPv6 must resolve this node");
+        assert_eq!(
+            format_ip_filtered(
+                mine.ipv4,
+                mine.ipv6,
+                IpSelect {
+                    first: true,
+                    ..Default::default()
+                }
+            ),
+            "100.64.0.1\n"
         );
     }
 
