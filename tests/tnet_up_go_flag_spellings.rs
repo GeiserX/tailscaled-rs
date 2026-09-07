@@ -1,4 +1,4 @@
-//! `tnet up` must take Go's own `up` flag spellings, so a ported command line runs.
+//! `tnet up` and `tnet login` must take Go's own flag spellings, so a ported command line runs.
 //!
 //! `newUpFlagSet` (`cmd/tailscale/cli/up.go`) registers three flags on `up` that this fork spells
 //! differently, or not at all: `--auth-key` (Go's canonical name for `--authkey`/`--authkey-file`,
@@ -9,9 +9,15 @@
 //!
 //! `--nickname` is NOT one of them, and this file is careful to say so. `newUpFlagSet` builds one
 //! flag set for both `up` and `login` and registers `--nickname` inside `if cmd == "login"`, so
-//! `tailscale up --nickname` is a usage error upstream too — profile naming lives on `set` (and on
-//! Go's `login`). It is exercised here only because operators reach for it on `up` anyway, and the
+//! `tailscale up --nickname` is a usage error upstream too — profile naming lives on `login` and on
+//! `set`. It is exercised on `up` here only because operators reach for it there anyway, and the
 //! fork answers it by name instead of leaving them clap's "unexpected argument".
+//!
+//! One flag set means one flag surface to guard: because `newUpFlagSet` is shared, whatever `up`
+//! owes Go's spellings, `login` owes too — `--auth-key` and `--host-routes` from the unconditional
+//! part, `--nickname` from the `if cmd == "login"` part. So the `up` tests below have `login`
+//! counterparts, and the counterparts are the point: giving one command the flags and not the other
+//! is the divergence that hides behind a green `up` test.
 //!
 //! This file was born as a guard on the backlog entry that asked for the `up` work, cross-checking
 //! the entry's prose against the CLI. The entry is gone — the work merged — but the CLI half of the
@@ -36,6 +42,11 @@ const GO_UP_FLAGS: [&str; 3] = ["--auth-key", "--login-server", "--host-routes"]
 /// `set` but never on Go's `up`. Kept apart from [`GO_UP_FLAGS`] on purpose: calling it an `up`
 /// spelling is the mistake that sends an implementer off to build `up --nickname`.
 const GO_LOGIN_ONLY_FLAG: &str = "--nickname";
+
+/// The flags Go's shared flag set gives `login`: the two registered unconditionally that this fork
+/// spelled differently or not at all, plus the one registered only under `if cmd == "login"`.
+/// `--login-server` is absent because `tnet login` already carried it under Go's own name.
+const GO_LOGIN_FLAGS: [&str; 3] = ["--auth-key", "--host-routes", GO_LOGIN_ONLY_FLAG];
 
 fn tnet(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_tnet"))
@@ -209,5 +220,84 @@ fn nickname_is_distinguished_from_the_flags_that_are_only_renames() {
     assert!(
         accepted_flags("set").contains(&GO_LOGIN_ONLY_FLAG.to_owned()),
         "`tnet set --nickname` is where this fork's profile naming lives"
+    );
+}
+
+#[test]
+fn tnet_login_takes_each_flag_gos_shared_flag_set_gives_it() {
+    // The same defect as `tnet_up_takes_each_go_up_flag_spelling`, one command over: `login` reads
+    // its flags off `newUpFlagSet` too, so `tailscale login --auth-key=…`, `--host-routes` and
+    // `--nickname` all parse upstream and must parse here rather than exiting 2.
+    for flag in GO_LOGIN_FLAGS {
+        let argv: Vec<&str> = if flag == "--host-routes" {
+            vec!["login", flag]
+        } else {
+            vec!["login", flag, "placeholder"]
+        };
+        let out = tnet(&argv);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_ne!(
+            out.status.code(),
+            Some(2),
+            "`tnet login {flag}` should not exit 2 at argument parsing; got: {stderr}"
+        );
+        assert!(
+            !stderr.contains("unexpected argument"),
+            "`tnet login {flag}` should not hit clap's \"unexpected argument\"; got: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn login_host_routes_carries_the_same_refusal_up_does() {
+    // `notFalseVar` is registered once, for both commands, so the refusal belongs to both. Porting
+    // the flag onto `login` without it would accept an operator's explicit "no" and ignore it.
+    let out = tnet(&["login", "--host-routes=false"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "`tnet login --host-routes=false` should fail the way Go's notFalseVar does"
+    );
+    assert!(
+        stderr.contains("only 'true' is allowed"),
+        "`tnet login --host-routes=false` should carry Go's \"unsupported value; only 'true' is \
+         allowed\" refusal; got: {stderr}"
+    );
+}
+
+#[test]
+fn nickname_is_a_login_flag_here_because_it_is_one_upstream() {
+    // The other half of `nickname_is_distinguished_from_the_flags_that_are_only_renames`: `up` has
+    // no profile-naming flag, and the reason is that `newUpFlagSet` gives it to `login`. So `login`
+    // has to actually offer it — a refusal on `up` that points at a command which does not take the
+    // flag either would just move the dead end.
+    let login_flags = accepted_flags("login");
+    assert!(
+        login_flags.contains(&GO_LOGIN_ONLY_FLAG.to_owned()),
+        "`tnet login --nickname` is where Go registers profile naming for a login"
+    );
+    assert!(
+        !accepted_flags("up").contains(&GO_LOGIN_ONLY_FLAG.to_owned()),
+        "`up` must still not offer it: Go's `up` does not either"
+    );
+
+    // Go's canonical key spelling is an alias on `login` for the same reason it is one on `up`: one
+    // flag, two names, not a second flag with its own value.
+    assert!(
+        !login_flags.contains(&"--auth-key".to_owned()),
+        "`--auth-key` should be an alias of `--authkey`, not a flag of its own"
+    );
+    assert!(
+        help_text("login").contains("[alias: --auth-key]"),
+        "`tnet login --help` should show `--auth-key` as an alias of `--authkey`"
+    );
+
+    // And the `up` refusal now names a command that exists, which is what makes it a signpost
+    // rather than a dead end.
+    let refusal = String::from_utf8_lossy(&tnet(&["up", GO_LOGIN_ONLY_FLAG, "work-laptop"]).stderr)
+        .into_owned();
+    assert!(
+        refusal.contains("tnet login --nickname"),
+        "`up --nickname` should point at the login that takes it; got: {refusal}"
     );
 }
