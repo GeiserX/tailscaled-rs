@@ -928,18 +928,21 @@ enum Command {
         /// request from the CGI/1.1 environment (`REQUEST_METHOD`, `REQUEST_URI` or
         /// `SCRIPT_NAME`+`PATH_INFO`), write the response to stdout, and exit. This is the mode a
         /// web server invokes the binary in per request, so nothing else may be written to stdout —
-        /// the startup line and the browser launch are both suppressed. `--listen` is meaningless
-        /// here (no listener is bound) and is refused alongside it.
+        /// the startup line and the browser launch are both suppressed. `--listen` names an address
+        /// nothing binds in this mode and is ignored, as in Go.
         #[arg(long)]
         cgi: bool,
-        /// Absolute URL the UI is actually reached at (Go `web --origin`), when that is not the
-        /// address it bound — behind a reverse proxy, or under `--cgi`, where nothing is bound at
-        /// all. `--prefix` fixes the path the server answers on; only this fixes the scheme and
-        /// host. Must be an absolute `http`/`https` URL with a host and no query/fragment/userinfo
-        /// (e.g. `https://ts.example.com/tailscale`). Used for link generation only: the URL this
-        /// command reports and opens, and the `<link rel="canonical">` the served page states for
-        /// itself. This build's UI is read-only, so the origin gates nothing else.
-        #[arg(long, value_name = "URL")]
+        /// Where the UI is actually reached (Go `web --origin`), when that is not the address it
+        /// bound — behind a reverse proxy, or under `--cgi`, where nothing is bound at all.
+        /// `--prefix` fixes the path the server answers on; only this fixes the host (and the
+        /// scheme). Takes Go's bare `host[:port]` (`ts.example.com`, for which `http` is assumed)
+        /// or an absolute `http`/`https` URL, optionally with the outside path
+        /// (`https://ts.example.com/tailscale`); a query, a fragment or userinfo are refused.
+        /// Used for link generation only: the URL this command reports and opens, and the
+        /// `<link rel="canonical">` the served page states for itself. This build's UI is
+        /// read-only, so the origin gates nothing else (Go compares it against the `Origin` header
+        /// of a mutating request; there are none here).
+        #[arg(long, value_name = "HOST|URL")]
         origin: Option<String>,
     },
     /// Check for (and optionally install) a newer release of this client (Go `tailscale update`).
@@ -3000,8 +3003,8 @@ async fn main() -> Result<()> {
         // `web` (Go `tailscale web`): serve the read-only status UI. Reuses the same embedded HTTP
         // server as `status --web`, but with Go's command name + flags (default localhost:8088). The
         // `--readonly` flag is a no-op (this build's web UI is always read-only). `--prefix` serves
-        // the page under a URL path prefix (for reverse proxies), `--origin` states the absolute URL
-        // the UI is reached at, and `--cgi` swaps the listener for one CGI request/response.
+        // the page under a URL path prefix (for reverse proxies), `--origin` states where the UI is
+        // reached from outside, and `--cgi` swaps the listener for one CGI request/response.
         Command::Web {
             listen,
             readonly: _,
@@ -11528,51 +11531,65 @@ const WEB_NOT_FOUND_BODY: &str = "<!DOCTYPE html><html><body>not found</body></h
 /// the cause is logged to stderr, not handed to whoever loaded the page.
 const WEB_UNAVAILABLE_BODY: &str = "<!DOCTYPE html><html><body>status unavailable</body></html>";
 
-/// The refusal `tnet web` owes its own flags before it binds anything or contacts the daemon, or
-/// `None` when the invocation is usable.
+/// Validate + normalize a `web --origin` value into the base URL the UI is reached at, `Ok(None)`
+/// when no origin was given, or the refusal explaining why the value is neither.
 ///
-/// `--cgi` replaces the listener entirely: the process serves ONE request out of the CGI/1.1
-/// environment and exits, so there is no address to bind and `--listen` names a listener that will
-/// never exist. Go registers both flags on the same command and simply ignores the listen address in
-/// CGI mode; this fork refuses the combination instead, the same shape (and the same wording) it
-/// already uses for the other flag-pair refusals it ports (Go's "can only be used with" shape, as in
-/// [`up_usage_refusal`]), so an operator who thinks they are choosing a port is told the port is not
-/// used rather than silently getting no listener.
+/// Go stores `--origin` verbatim in `web.ServerOpts.OriginOverride` and validates nothing
+/// (`cmd/tailscale/cli/web.go`, which also applies it only `if webArgs.origin != ""` — so an empty
+/// value is "unset", not an error). The override has exactly one consumer: `csrfProtect`
+/// substitutes it for `r.Host` and compares it against the *host* of the request's `Origin` header
+/// (`client/web/web.go`, `host = s.originOverride` … `if origin != host`). The value Go takes is
+/// therefore a bare `host[:port]` — `client/web/web_test.go`'s `TestCSRFProtect` case
+/// `POST-no-sec-fetch-site-origin-override-allowed` passes `example.net`.
 ///
-/// The message goes to **stdout** and the caller exits **1**, matching this CLI's other usage
-/// refusals ([`switch_usage_refusal`]) rather than clap's stderr + exit 2 —
-/// which is why this is a hand-rolled check and not an `#[arg(conflicts_with = ...)]`. Pure →
-/// unit-testable.
-fn web_usage_refusal(cgi: bool, has_listen: bool) -> Option<&'static str> {
-    if cgi && has_listen {
-        return Some("--listen can only be used without --cgi (a CGI script binds no listener)");
-    }
-    None
-}
-
-/// Validate + normalize a `web --origin` value into the base URL the UI is reached at, or the
-/// refusal explaining why it is not one.
+/// This fork's UI is read-only and runs no CSRF check, so there is no `Origin` header to compare
+/// the value with; what there is instead is a link to build — the URL this command reports and
+/// opens, and the `<link rel="canonical">` the page states. Both shapes are accepted, because
+/// refusing Go's would refuse the command lines Go documents and tests:
 ///
-/// Go's `--origin` ("origin at which the web UI is served (if behind a reverse proxy or used with
-/// cgi)") feeds the web server's origin override, which exists because the address the UI *bound* is
-/// not the address a browser *reached* it at. So the value has to be an absolute URL: a scheme and a
-/// host are exactly the two things `--prefix` cannot supply. A port and a path are optional (a proxy
-/// that mounts the UI under a path names it here); a query, a fragment or userinfo are not — those
-/// belong to a request, not to the base URL a page is served at, and silently dropping them would
-/// emit links that differ from what was asked for.
+/// - `example.net`, `192.0.2.10:8088`, `example.net/tailscale` — Go's shape. It states no scheme,
+///   so `http` is assumed: the same assumption Go makes exactly where this value is used ("if
+///   Sec-Fetch-Site is not available we presume we are operating over HTTP") and the one
+///   `urlOfListenAddr` prints for the address the UI bound.
+/// - `https://ts.example.com/tailscale` — an absolute URL. Strictly more than Go's shape can say,
+///   and the only way to get `https` into a generated link rather than an assumed `http`.
+///
+/// A query, a fragment or userinfo are refused in either shape: those belong to a request, not to
+/// the base URL a page is served at, and silently dropping them would emit links that differ from
+/// what was asked for.
 ///
 /// Normalization is: keep the scheme, the host and an explicit non-default port, drop a trailing
 /// slash from the path. So `https://ts.example.com/tailscale/` and `https://ts.example.com/tailscale`
 /// are the same origin. Pure → unit-testable.
-fn parse_web_origin(origin: &str) -> Result<String, String> {
+fn parse_web_origin(origin: &str) -> Result<Option<String>, String> {
     let raw = origin.trim();
     if raw.is_empty() {
-        return Err(
-            "--origin needs an absolute URL, e.g. https://ts.example.com/tailscale".to_string(),
-        );
+        return Ok(None);
     }
-    let parsed = url::Url::parse(raw)
-        .map_err(|e| format!("--origin {raw:?} is not an absolute URL: {e}"))?;
+    // `://` is what tells the two shapes apart. With it the value states its own scheme, which has
+    // to be one this UI is served over; without it the value is Go's bare host[:port] and needs a
+    // scheme prepended before any URL parser will read it as an authority at all (`example.net:8088`
+    // parses as the *scheme* `example.net` otherwise).
+    let (states_scheme, authority) = match raw.split_once("://") {
+        Some((_, after)) => (true, after),
+        None => (false, raw),
+    };
+    // A slash where the host belongs means there is no host: `--origin /tailscale` (and
+    // `https:///tailscale`) names a path. Checked here rather than left to the parser, which skips
+    // the extra slashes and would silently read `/tailscale` as the HOST `tailscale`.
+    if authority.starts_with('/') {
+        return Err(format!(
+            "--origin {raw:?} names no host, only a path; `--prefix` is the flag for a path"
+        ));
+    }
+    let candidate = if states_scheme {
+        raw.to_string()
+    } else {
+        format!("http://{raw}")
+    };
+    let parsed = url::Url::parse(&candidate).map_err(|e| {
+        format!("--origin {raw:?} is neither a host nor a URL the web UI can be reached at: {e}")
+    })?;
     match parsed.scheme() {
         "http" | "https" => {}
         other => {
@@ -11600,7 +11617,7 @@ fn parse_web_origin(origin: &str) -> Result<String, String> {
         base.push_str(&format!(":{port}"));
     }
     base.push_str(parsed.path().trim_end_matches('/'));
-    Ok(base)
+    Ok(Some(base))
 }
 
 /// Split a [`parse_web_origin`] base into `(scheme://authority, path)` — the path is `""` when the
@@ -11709,10 +11726,17 @@ fn cgi_response(status: &str, body: &str) -> String {
 /// `tnet web` (Go `tailscale web`): resolve the flags, then serve the read-only status UI in
 /// whichever of the two modes was asked for.
 ///
-/// Order is load-bearing: the usage refusal first (it costs nothing and must not be reached only
-/// after a bind), then the `--origin` validation (a bad origin is a usage error, not a serving
-/// failure), then the mode split. `--cgi` serves exactly one request on stdout and returns; the
-/// default binds a listener and runs until interrupted.
+/// Order is load-bearing: the `--origin` validation first (a bad origin is a usage error, not a
+/// serving failure, so it must not be reached only after a bind), then the mode split. `--cgi`
+/// serves exactly one request on stdout and returns; the default binds a listener and runs until
+/// interrupted.
+///
+/// `--listen` alongside `--cgi` is accepted and ignored, as in Go: `runWeb` branches on
+/// `webArgs.cgi` before it ever reads `webArgs.listen`, so the address is simply unused (and, since
+/// Go registers `--listen` with a default, Go could not tell an explicit one from the default
+/// anyway). Refusing the pair would be worse than useless here — in CGI mode this process's stdout
+/// *is* the response body, so a refusal printed there reaches the invoking web server as a
+/// malformed CGI response instead of a page.
 async fn run_web(
     socket: &std::path::Path,
     listen: Option<String>,
@@ -11721,12 +11745,8 @@ async fn run_web(
     cgi: bool,
     origin: Option<&str>,
 ) -> Result<()> {
-    if let Some(message) = web_usage_refusal(cgi, listen.is_some()) {
-        println!("{message}");
-        std::process::exit(1);
-    }
     let origin = match origin {
-        Some(raw) => Some(parse_web_origin(raw).map_err(|e| anyhow::anyhow!(e))?),
+        Some(raw) => parse_web_origin(raw).map_err(|e| anyhow::anyhow!(e))?,
         None => None,
     };
     if cgi {
@@ -19861,55 +19881,68 @@ mod tests {
     }
 
     #[test]
-    fn web_usage_refusal_refuses_a_listen_address_that_is_never_bound() {
-        // `--cgi` serves one request out of the CGI environment and binds nothing, so a `--listen`
-        // next to it names an address that will never exist. Refused, in the same shape this CLI
-        // already uses for the flag-pair refusals it ports from Go ("can only be used with").
+    fn parse_web_origin_takes_gos_bare_host_as_well_as_a_url() {
+        // The shape Go actually takes. `--origin` is stored verbatim and compared against the HOST
+        // of a request's `Origin` header, so the value is a bare host[:port] — `example.net` is the
+        // literal value `client/web/web_test.go`'s `POST-no-sec-fetch-site-origin-override-allowed`
+        // passes, and Go's CLI validates nothing. It states no scheme, so `http` is assumed (the
+        // assumption Go itself makes where this value is read).
         assert_eq!(
-            web_usage_refusal(true, true),
-            Some("--listen can only be used without --cgi (a CGI script binds no listener)")
+            parse_web_origin("example.net"),
+            Ok(Some("http://example.net".to_string()))
         );
-        // Every usable combination stays usable: a listener with an address, a listener with the
-        // default address, and CGI with no address at all.
-        assert_eq!(web_usage_refusal(false, true), None);
-        assert_eq!(web_usage_refusal(false, false), None);
-        assert_eq!(web_usage_refusal(true, false), None);
-    }
+        // A port must survive: `example.net:8088` parses as the *scheme* `example.net` unless the
+        // bare form is given a scheme first, which is the trap this shape has to get right.
+        assert_eq!(
+            parse_web_origin("192.0.2.10:8088"),
+            Ok(Some("http://192.0.2.10:8088".to_string()))
+        );
+        // A bare host may carry the outside path too, normalized exactly like the URL shape.
+        assert_eq!(
+            parse_web_origin("  ts.example.com/tailscale/  "),
+            Ok(Some("http://ts.example.com/tailscale".to_string()))
+        );
+        // Go applies the override only `if webArgs.origin != ""`, so an empty value is "no origin",
+        // not a usage error that kills the command.
+        assert_eq!(parse_web_origin(""), Ok(None));
+        assert_eq!(parse_web_origin("   "), Ok(None));
 
-    #[test]
-    fn parse_web_origin_normalizes_a_base_url_and_refuses_anything_else() {
-        // The reverse-proxy case Go's `--origin` exists for: scheme + host + the path the proxy
-        // publishes. A trailing slash is not a different origin.
+        // The URL shape: strictly more than Go can express (it is the only way to say `https`), and
+        // the reverse-proxy case this fork generates links for. A trailing slash is not a different
+        // origin.
         assert_eq!(
             parse_web_origin("https://ts.example.com/tailscale"),
-            Ok("https://ts.example.com/tailscale".to_string())
+            Ok(Some("https://ts.example.com/tailscale".to_string()))
         );
         assert_eq!(
             parse_web_origin("  https://ts.example.com/tailscale/  "),
-            Ok("https://ts.example.com/tailscale".to_string())
+            Ok(Some("https://ts.example.com/tailscale".to_string()))
         );
-        // Scheme + host alone is the pass-through proxy case; an explicit non-default port is kept,
-        // a default one is not (both name the same origin).
+        // An explicit non-default port is kept, a default one is not (both name the same origin).
         assert_eq!(
             parse_web_origin("http://192.0.2.10:8088"),
-            Ok("http://192.0.2.10:8088".to_string())
+            Ok(Some("http://192.0.2.10:8088".to_string()))
         );
         assert_eq!(
             parse_web_origin("https://ts.example.com:443/"),
-            Ok("https://ts.example.com".to_string())
+            Ok(Some("https://ts.example.com".to_string()))
         );
-        // An IPv6 literal keeps its brackets, so the result is still a usable URL.
+        // An IPv6 literal keeps its brackets, so the result is still a usable URL — in both shapes.
         assert_eq!(
             parse_web_origin("http://[2001:db8::1]:8088/ui"),
-            Ok("http://[2001:db8::1]:8088/ui".to_string())
+            Ok(Some("http://[2001:db8::1]:8088/ui".to_string()))
+        );
+        assert_eq!(
+            parse_web_origin("[2001:db8::1]:8088"),
+            Ok(Some("http://[2001:db8::1]:8088".to_string()))
         );
 
-        // The refusals. A bare host is the mistake to expect — it is what `--prefix` habits produce
-        // — and it is precisely the input that carries no scheme, the thing `--origin` is for.
-        for bad in ["", "   ", "ts.example.com", "/tailscale"] {
+        // What is still refused. A value that names no host at all is not an origin in either
+        // shape — it cannot be compared with a request's `Origin` and cannot be linked to.
+        for bad in ["/tailscale", "http://", "https:///tailscale"] {
             assert!(
                 parse_web_origin(bad).is_err(),
-                "{bad:?} is not an absolute URL and must be refused"
+                "{bad:?} names no host and must be refused"
             );
         }
         assert!(
@@ -19918,6 +19951,7 @@ mod tests {
                 .contains("http or https"),
             "a non-http(s) scheme must be named in the refusal"
         );
+        // The request-only parts, refused in both shapes.
         assert!(
             parse_web_origin("https://ts.example.com/ui?a=1")
                 .unwrap_err()
@@ -19925,12 +19959,17 @@ mod tests {
             "a query names one request, not the base URL the UI is served at"
         );
         assert!(
-            parse_web_origin("https://ts.example.com/ui#top")
+            parse_web_origin("ts.example.com/ui#top")
                 .unwrap_err()
                 .contains("query or fragment")
         );
         assert!(
             parse_web_origin("https://user:pw@ts.example.com")
+                .unwrap_err()
+                .contains("credentials")
+        );
+        assert!(
+            parse_web_origin("user:pw@ts.example.com")
                 .unwrap_err()
                 .contains("credentials")
         );
@@ -19940,7 +19979,9 @@ mod tests {
     fn web_ui_url_prefers_the_origin_over_the_address_that_was_bound() {
         // The defect: behind a reverse proxy the bound address is not the address anyone reaches,
         // and `--prefix` fixes only the path. With an origin, the origin wins outright.
-        let origin = parse_web_origin("https://ts.example.com/tailscale").unwrap();
+        let origin = parse_web_origin("https://ts.example.com/tailscale")
+            .unwrap()
+            .expect("a non-empty origin is an origin");
         assert_eq!(
             web_ui_url(Some(&origin), Some("127.0.0.1:8088"), "/tailscale").as_deref(),
             Some("https://ts.example.com/tailscale")
@@ -19952,7 +19993,9 @@ mod tests {
             Some("https://ts.example.com/tailscale")
         );
         // An origin that names only scheme + host is the pass-through case: the served path applies.
-        let host_only = parse_web_origin("https://ts.example.com").unwrap();
+        let host_only = parse_web_origin("https://ts.example.com")
+            .unwrap()
+            .expect("a non-empty origin is an origin");
         assert_eq!(
             web_ui_url(Some(&host_only), None, "/tailscale").as_deref(),
             Some("https://ts.example.com/tailscale")
@@ -19960,6 +20003,14 @@ mod tests {
         assert_eq!(
             web_ui_url(Some(&host_only), None, "/").as_deref(),
             Some("https://ts.example.com")
+        );
+        // Go's bare-host shape is the same pass-through case, reached over the assumed scheme.
+        let bare = parse_web_origin("example.net")
+            .unwrap()
+            .expect("a non-empty origin is an origin");
+        assert_eq!(
+            web_ui_url(Some(&bare), None, "/tailscale").as_deref(),
+            Some("http://example.net/tailscale")
         );
 
         // Without an origin, nothing changes from the previous behaviour: the bound address, plus
@@ -20049,7 +20100,9 @@ mod tests {
         };
         // With a known absolute URL (from `--origin`, or the bound address), the page says so — the
         // reverse-proxy case where the address this process bound is not the address anyone reached.
-        let origin = parse_web_origin("https://ts.example.com/tailscale").unwrap();
+        let origin = parse_web_origin("https://ts.example.com/tailscale")
+            .unwrap()
+            .expect("a non-empty origin is an origin");
         let url = web_ui_url(Some(&origin), None, "/").expect("an origin always yields a URL");
         let html = render_status_html(&report, Some(&url));
         assert!(

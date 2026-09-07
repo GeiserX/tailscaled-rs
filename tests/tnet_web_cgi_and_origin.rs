@@ -7,6 +7,13 @@
 //! ("origin at which the web UI is served (if behind a reverse proxy or used with cgi)"). This fork
 //! carried the first three; the last two are what this file guards.
 //!
+//! Two of those guards were wrong about Go, and this file now pins the corrections. Go's `--origin`
+//! is stored verbatim and compared against the HOST of a request's `Origin` header
+//! (`client/web/web.go`, `csrfProtect`), so a bare `example.net` — the value
+//! `client/web/web_test.go` passes — is exactly what it takes; and Go's `runWeb` branches on
+//! `--cgi` before it ever reads `--listen`, so the two together run normally with the address
+//! unused. Neither may fail here.
+//!
 //! `--cgi` is a serving *mode*, not a flag rename: instead of binding a listener, the process serves
 //! one request out of the CGI/1.1 environment, writes the response to stdout and exits. That makes
 //! it testable end-to-end here without any daemon at all — the 404 route never reaches one, and an
@@ -136,30 +143,65 @@ fn cgi_mode_takes_gos_prefix_as_the_path_it_answers_on() {
 }
 
 #[test]
-fn listen_is_refused_next_to_cgi_and_a_bad_origin_is_refused_by_name() {
-    // `--cgi` binds nothing, so a `--listen` beside it names an address that will never exist.
-    let out = tnet(&["web", "--cgi", "--listen", "127.0.0.1:8088"], &[]);
+fn listen_is_accepted_and_ignored_next_to_cgi() {
+    // Go's `runWeb` returns from the `webArgs.cgi` branch before it looks at `webArgs.listen`, so
+    // `tailscale web --cgi --listen=…` runs normally and the address is simply unused. It has to
+    // run here too — and in this mode stdout IS the CGI response body, so a refusal printed there
+    // would reach the invoking web server as a malformed response instead of a page.
+    let out = cgi_request(&["--listen", "127.0.0.1:8088"], "/nope");
+    let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(
         out.status.code(),
-        Some(1),
-        "a usage refusal exits 1, like this CLI's others"
+        Some(0),
+        "`--listen` beside `--cgi` is unused, not fatal; stdout: {stdout}"
     );
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains("--listen can only be used without --cgi"),
-        "the refusal should say which flag is not usable; got: {:?}",
+        stdout.starts_with("Status: 404 Not Found\r\n"),
+        "the CGI response must be the whole of stdout; got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("--listen"),
+        "nothing but the response may reach a CGI script's stdout; got: {stdout}"
+    );
+}
+
+#[test]
+fn origin_takes_gos_bare_host_and_still_refuses_a_value_that_is_no_origin() {
+    // The value Go documents and tests: a bare host, which its CSRF check compares against the host
+    // of the request's `Origin` header. Go validates nothing, so this must get past argument
+    // handling and serve the request.
+    let out = cgi_request(&["--origin", "example.net"], "/nope");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a bare host is the shape Go's `--origin` takes; stdout: {stdout}, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.starts_with("Status: 404 Not Found\r\n"),
+        "a bare-host origin must serve, not refuse; got: {stdout}"
+    );
+
+    // A host and a port, which is the same shape with the parse trap in it (`example.net:8088`
+    // reads as a scheme to a URL parser).
+    let out = cgi_request(&["--origin", "192.0.2.10:8088"], "/nope");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).starts_with("Status: 404 Not Found\r\n"),
+        "`host:port` is a host, not a scheme; got: {:?}",
         String::from_utf8_lossy(&out.stdout)
     );
 
-    // `--origin` needs the two things `--prefix` cannot give: a scheme and a host. A bare hostname
-    // is the mistake to expect, and it is refused before anything binds or is contacted.
-    let out = tnet(&["web", "--origin", "ts.example.com"], &[]);
+    // What is refused is a value that names no host in either shape — it could neither be compared
+    // with an `Origin` header nor linked to. Refused before anything binds or is contacted.
+    let out = tnet(&["web", "--origin", "ftp://ts.example.com"], &[]);
     assert!(
         !out.status.success(),
-        "a `--origin` that is not an absolute URL must not be accepted"
+        "the web UI is not reached over ftp, so that origin cannot be right"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("--origin") && stderr.contains("absolute URL"),
+        stderr.contains("--origin") && stderr.contains("http or https"),
         "the refusal should name the flag and what it wants; got: {stderr}"
     );
 }
