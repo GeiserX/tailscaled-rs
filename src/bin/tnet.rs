@@ -494,24 +494,51 @@ enum Command {
         /// control of this node's prefs and LocalAPI to the tailnet admin, bypassing Tailscale's
         /// per-feature double opt-in. Refused by name — this fork's authorization model is local
         /// (THREAT_MODEL §4.1) and the control plane is not trusted to rewrite prefs or drive the
-        /// LocalAPI. `--no-remote-config` (Go's default) is what this build always does.
+        /// LocalAPI. Go's own off spelling, `--remote-config=false`, is accepted: it is what this
+        /// build always does, and `--no-remote-config` is this fork's spelling of it.
         //
         // `hide` mirrors Go, which registers both this and `--sync` with its `hidden` prefix — a
-        // faithful port keeps them off `--help` and lets the refusal do the explaining.
-        #[arg(long, hide = true, conflicts_with = "no_remote_config")]
-        remote_config: bool,
-        /// Do not delegate remote control of this node to the tailnet admin (Go
-        /// `--remote-config=false`). Accepted: it is what this build always does.
+        // faithful port keeps them off `--help` and lets the refusal do the explaining. Go registers
+        // both with `flag.BoolVar`, so a value can only arrive as `--remote-config=<v>`
+        // (`IsBoolFlag` never consumes the following argument) and its spellings are
+        // `strconv.ParseBool`'s: `num_args = 0..=1` + `require_equals` + `parse_go_bool` is that
+        // grammar, and it is what lets a command line ported from Go reach the refusal below
+        // instead of clap's "unexpected value".
+        #[arg(
+            long,
+            hide = true,
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "true",
+            value_name = "BOOL",
+            value_parser = parse_go_bool,
+            conflicts_with = "no_remote_config"
+        )]
+        remote_config: Option<bool>,
+        /// Do not delegate remote control of this node to the tailnet admin — this fork's spelling
+        /// of Go's `--remote-config=false`, which is accepted under Go's spelling too. Accepted: it
+        /// is what this build always does.
         #[arg(long, hide = true)]
         no_remote_config: bool,
         /// Actively sync configuration from the control plane (Go `--sync`, default true). Accepted:
-        /// it is what this build always does while up.
-        #[arg(long, hide = true, conflicts_with = "no_sync")]
-        sync: bool,
-        /// NOT SUPPORTED by this build (Go `--sync=false`): stop syncing configuration from the
-        /// control plane, Go's kill switch for exercising netmap caching and offline operation.
-        /// Refused by name — the pinned engine offers no way to stop the map poll while staying up
-        /// (engine ask #34).
+        /// it is what this build always does while up. Same `flag.BoolVar` grammar as
+        /// `--remote-config` above, so Go's `--sync=true` reaches the same acceptance and Go's
+        /// `--sync=false` the refusal below.
+        #[arg(
+            long,
+            hide = true,
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "true",
+            value_name = "BOOL",
+            value_parser = parse_go_bool,
+            conflicts_with = "no_sync"
+        )]
+        sync: Option<bool>,
+        /// NOT SUPPORTED by this build (Go `--sync=false`, which is accepted here as a spelling and
+        /// refused just the same): stop syncing configuration from the control plane, Go's kill
+        /// switch for exercising netmap caching and offline operation. Refused by name — the pinned
+        /// engine offers no way to stop the map poll while staying up (engine ask #34).
         #[arg(long, hide = true)]
         no_sync: bool,
         /// Pre-accept a named risk and skip its safety refusal (Go `--accept-risk`), e.g. `lose-ssh`
@@ -2726,8 +2753,8 @@ async fn main() -> Result<()> {
             let unmodelled = UnmodelledSetFlags {
                 relay_server_port,
                 relay_server_static_endpoints,
-                remote_config: resolve_tristate(remote_config, no_remote_config),
-                sync: resolve_tristate(sync, no_sync),
+                remote_config: resolve_go_bool_tristate(remote_config, no_remote_config),
+                sync: resolve_go_bool_tristate(sync, no_sync),
             };
             run_set(
                 &socket,
@@ -11377,10 +11404,13 @@ struct SetPrefFlags {
 ///
 /// They exist here so a command line ported from Go reaches a refusal that NAMES what is missing
 /// instead of clap's "unexpected argument", the same treatment `serve`'s `--service` / `--tun` /
-/// `--proxy-protocol` / `--accept-app-caps` get (see [`check_serve_flags`]). Two of the four are
-/// two-valued, and for each of those exactly ONE value asks for a state this daemon is permanently
-/// in — relay server disabled, no static endpoints advertised, no remote configuration delegated,
-/// configuration synced from control. Those values are accepted as already-satisfied rather than
+/// `--proxy-protocol` / `--accept-app-caps` get (see [`check_serve_flags`]). That has to hold for
+/// Go's own SPELLING of each value, not just for the flag name: Go registers `--remote-config` and
+/// `--sync` with `flag.BoolVar`, so a Go command line turns them off with `--remote-config=false`
+/// and `--sync=false`, and both are parsed here (see [`parse_go_bool`]) rather than dying on
+/// clap's "unexpected value". Two of the four are two-valued, and for each of those exactly ONE
+/// value asks for a state this daemon is permanently in — relay server disabled, no static
+/// endpoints advertised, no remote configuration delegated, configuration synced from control. Those values are accepted as already-satisfied rather than
 /// refused, so a ported line that merely turns the feature OFF keeps working; the other value is
 /// refused by [`check_unmodelled_set_flags`].
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -11391,9 +11421,11 @@ struct UnmodelledSetFlags {
     /// `--relay-server-static-endpoints <IP:PORT,…>`; a string for the same reason — the empty
     /// value means "advertise none".
     relay_server_static_endpoints: Option<String>,
-    /// `--remote-config` → `Some(true)`, `--no-remote-config` → `Some(false)`, absent → `None`.
+    /// `--remote-config` (or Go's `--remote-config=true`) → `Some(true)`; `--no-remote-config` or
+    /// Go's `--remote-config=false` → `Some(false)`; absent → `None`.
     remote_config: Option<bool>,
-    /// `--sync` → `Some(true)`, `--no-sync` (Go `--sync=false`) → `Some(false)`, absent → `None`.
+    /// `--sync` (or Go's `--sync=true`) → `Some(true)`; `--no-sync` or Go's `--sync=false` →
+    /// `Some(false)`; absent → `None`.
     sync: Option<bool>,
 }
 
@@ -11517,6 +11549,37 @@ fn check_unmodelled_set_flags(flags: &UnmodelledSetFlags) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Go's `strconv.ParseBool` — the value spellings behind every `flag.BoolVar`, and so the values a
+/// command line ported from Go may carry for `--sync=…` / `--remote-config=…`. clap's built-in
+/// `bool` parser takes only `true`/`false`, which would still turn Go's `--sync=0` into a parser
+/// death on a line Go accepts.
+///
+/// The error text is `strconv.ParseBool`'s own; clap wraps it with the flag and the offending value,
+/// so a mistyped value is a parse error naming the flag — Go's `invalid boolean value %q for -sync:
+/// %v` — rather than a silent "off". (`cmd/tailscaled`'s `boolFlag` gets the same treatment in
+/// `tailnetd`, which carries its own copy of this: the two binaries share no flag plumbing.)
+/// Pure → unit-testable.
+fn parse_go_bool(s: &str) -> std::result::Result<bool, String> {
+    match s {
+        "1" | "t" | "T" | "TRUE" | "true" | "True" => Ok(true),
+        "0" | "f" | "F" | "FALSE" | "false" | "False" => Ok(false),
+        _ => Err(format!("strconv.ParseBool: parsing {s:?}: invalid syntax")),
+    }
+}
+
+/// Fold the two spellings of one Go `set` boolean into the tri-state [`check_unmodelled_set_flags`]
+/// reads: Go's own `--flag[=BOOL]` (already parsed to `Option<bool>` by [`parse_go_bool`]) and this
+/// fork's `--no-flag`. Both spellings of "off" land on `Some(false)`, so `--sync=false` and
+/// `--no-sync` reach the same named refusal, and `--remote-config=false` and `--no-remote-config`
+/// the same acceptance. clap's `conflicts_with` guarantees at most one of the pair is given (and,
+/// defensively, `--no-flag` wins).
+///
+/// The [`resolve_tristate`] of a flag whose positive half carries Go's optional value — the shape
+/// [`resolve_browser`] already uses for `status --browser` / `--no-browser`. Pure → unit-testable.
+fn resolve_go_bool_tristate(flag: Option<bool>, no_flag: bool) -> Option<bool> {
+    if no_flag { Some(false) } else { flag }
 }
 
 /// Map an `--x` / `--no-x` pref flag pair to the tri-state `Option<bool>` the wire uses: enable →
@@ -21105,8 +21168,8 @@ mod tests {
             } => UnmodelledSetFlags {
                 relay_server_port,
                 relay_server_static_endpoints,
-                remote_config: resolve_tristate(remote_config, no_remote_config),
-                sync: resolve_tristate(sync, no_sync),
+                remote_config: resolve_go_bool_tristate(remote_config, no_remote_config),
+                sync: resolve_go_bool_tristate(sync, no_sync),
             },
             _ => panic!("expected Command::Set"),
         }
@@ -21161,6 +21224,130 @@ mod tests {
                 "{flag} is a set-only flag in Go"
             );
         }
+    }
+
+    #[test]
+    fn gos_own_sync_and_remote_config_spellings_reach_the_ported_refusal() {
+        // Go registers both flags with `flag.BoolVar` (`set.go`'s `newSetFlagSet`), so the way a Go
+        // command line turns one OFF is `--sync=false` / `--remote-config=false`. Those spellings
+        // have to reach this build's gate: declared as valueless flags they died at clap with
+        // "unexpected value", which is the same wall carrying the flags was meant to remove — and
+        // for `--sync` it is the one value this build has anything to say about.
+        assert_eq!(
+            parse_unmodelled_set(&["--sync=false", "--remote-config=false"]),
+            UnmodelledSetFlags {
+                sync: Some(false),
+                remote_config: Some(false),
+                ..UnmodelledSetFlags::default()
+            }
+        );
+        // Go's `=true` and its bare presence (`IsBoolFlag`) are the same "on".
+        for argv in [
+            vec!["--sync=true", "--remote-config=true"],
+            vec!["--sync", "--remote-config"],
+        ] {
+            assert_eq!(
+                parse_unmodelled_set(&argv),
+                UnmodelledSetFlags {
+                    sync: Some(true),
+                    remote_config: Some(true),
+                    ..UnmodelledSetFlags::default()
+                },
+                "{argv:?}"
+            );
+        }
+
+        // Go's off spelling must land on the SAME named refusal this fork's `--no-sync` lands on:
+        // one gap, one sentence, whichever spelling the ported line used.
+        let go = check_unmodelled_set_flags(&parse_unmodelled_set(&["--sync=false"]))
+            .expect_err("this build cannot stop the map poll while staying up")
+            .to_string();
+        let fork = check_unmodelled_set_flags(&parse_unmodelled_set(&["--no-sync"]))
+            .expect_err("same gap, this fork's spelling")
+            .to_string();
+        assert_eq!(go, fork);
+        assert!(go.contains("--sync=false"), "{go}");
+        assert!(go.contains("not supported by this build"), "{go}");
+
+        // The mirror image on `--remote-config`: Go's OFF value asks for the state this daemon is
+        // permanently in, so it is accepted, and Go's ON value reaches the by-design refusal.
+        check_unmodelled_set_flags(&parse_unmodelled_set(&["--remote-config=false"]))
+            .expect("`--remote-config=false` asks for the status quo");
+        let err = check_unmodelled_set_flags(&parse_unmodelled_set(&["--remote-config=true"]))
+            .expect_err("declined by design")
+            .to_string();
+        assert!(err.contains("--remote-config"), "{err}");
+        assert!(err.contains("not supported by this build"), "{err}");
+
+        // Every value spelling `strconv.ParseBool` takes, since that is Go's bool-flag parser.
+        for (value, expected) in [
+            ("1", true),
+            ("t", true),
+            ("T", true),
+            ("true", true),
+            ("TRUE", true),
+            ("True", true),
+            ("0", false),
+            ("f", false),
+            ("F", false),
+            ("false", false),
+            ("FALSE", false),
+            ("False", false),
+        ] {
+            assert_eq!(
+                parse_unmodelled_set(&[&format!("--sync={value}")]).sync,
+                Some(expected),
+                "--sync={value}"
+            );
+            assert_eq!(
+                parse_unmodelled_set(&[&format!("--remote-config={value}")]).remote_config,
+                Some(expected),
+                "--remote-config={value}"
+            );
+        }
+
+        // A value Go's `strconv.ParseBool` refuses is a parse error naming the flag, not a silent
+        // "off" — Go's `invalid boolean value %q for -sync: %v`. The empty value is one of them.
+        for value in ["yes", "no", "2", "", "falsey"] {
+            for flag in ["--sync", "--remote-config"] {
+                let err = Cli::try_parse_from(["tnet", "set", &format!("{flag}={value}")])
+                    .map(|_| ())
+                    .expect_err("Go's flag package rejects this value")
+                    .to_string();
+                assert!(err.contains("strconv.ParseBool"), "{flag}={value}: {err}");
+                assert!(err.contains(flag), "{flag}={value}: {err}");
+            }
+        }
+
+        // Go's flag package never lets a bool flag consume the FOLLOWING argument (`IsBoolFlag`),
+        // so a value can only arrive attached with `=`.
+        assert!(
+            Cli::try_parse_from(["tnet", "set", "--sync", "false"]).is_err(),
+            "Go's `--sync false` does not pass `false` to the flag"
+        );
+
+        // Two spellings of one switch: giving both is still refused, in either order.
+        for argv in [
+            vec!["--sync=false", "--no-sync"],
+            vec!["--no-sync", "--sync=true"],
+            vec!["--remote-config=false", "--no-remote-config"],
+            vec!["--no-remote-config", "--remote-config=true"],
+        ] {
+            let mut full = vec!["tnet", "set"];
+            full.extend_from_slice(&argv);
+            assert!(
+                Cli::try_parse_from(full).is_err(),
+                "{argv:?} spell the same switch twice"
+            );
+        }
+
+        // The fold itself: both spellings of "off" collapse to `Some(false)`, an absent flag stays
+        // absent, and `--no-flag` wins defensively if clap ever let both through.
+        assert_eq!(resolve_go_bool_tristate(Some(false), false), Some(false));
+        assert_eq!(resolve_go_bool_tristate(None, true), Some(false));
+        assert_eq!(resolve_go_bool_tristate(Some(true), false), Some(true));
+        assert_eq!(resolve_go_bool_tristate(None, false), None);
+        assert_eq!(resolve_go_bool_tristate(Some(true), true), Some(false));
     }
 
     #[test]
