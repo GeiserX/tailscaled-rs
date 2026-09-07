@@ -163,6 +163,15 @@ fn listen_is_accepted_and_ignored_next_to_cgi() {
         !stdout.contains("--listen"),
         "nothing but the response may reach a CGI script's stdout; got: {stdout}"
     );
+    // Not on stderr either. Go accepts the pair silently, and stderr here is the invoking web
+    // server's error log — a "flag ignored" warning would be a line per request in it. This route
+    // (a 404, answered without contacting the daemon) prints nothing at all today, so the whole of
+    // stderr is the assertion: a warning in any wording fails it, not just one naming the flag.
+    assert!(
+        out.stderr.is_empty(),
+        "`--listen` beside `--cgi` is ignored the way Go ignores it: silently; got stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -186,10 +195,20 @@ fn origin_takes_gos_bare_host_and_still_refuses_a_value_that_is_no_origin() {
     // A host and a port, which is the same shape with the parse trap in it (`example.net:8088`
     // reads as a scheme to a URL parser).
     let out = cgi_request(&["--origin", "192.0.2.10:8088"], "/nope");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The exit status, not only the response: a refusal that still managed to write the 404 — or a
+    // late failure after writing it — would leave stdout right and the script's status wrong, and
+    // the invoking server reads the status too.
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "`host:port` is a host Go takes, so this must serve and exit 0; stdout: {stdout}, \
+         stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(
-        String::from_utf8_lossy(&out.stdout).starts_with("Status: 404 Not Found\r\n"),
-        "`host:port` is a host, not a scheme; got: {:?}",
-        String::from_utf8_lossy(&out.stdout)
+        stdout.starts_with("Status: 404 Not Found\r\n"),
+        "`host:port` is a host, not a scheme; got: {stdout:?}"
     );
 
     // What is refused is a value that names no host in either shape — it could neither be compared
