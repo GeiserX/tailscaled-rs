@@ -25,6 +25,15 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.55.6](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.5...v0.55.6) (2026-09-07)
+
+
+### Bug Fixes
+
+* **config:** refuse advertised routes with host bits set, like Go ([#391](https://github.com/GeiserX/tailscaled-rs/issues/391)) ([310db72](https://github.com/GeiserX/tailscaled-rs/commit/310db727aed67cd66754a3bf99b951eed0883805))
+* **ip:** resolve a node by any of its addresses, not just its IPv4 ([#392](https://github.com/GeiserX/tailscaled-rs/issues/392)) ([b8e7996](https://github.com/GeiserX/tailscaled-rs/commit/b8e7996d496f7287834239af5becaf43f2960cdc))
+* **web:** take Go's --origin host, and stop refusing --listen under --cgi ([#389](https://github.com/GeiserX/tailscaled-rs/issues/389)) ([d1922fd](https://github.com/GeiserX/tailscaled-rs/commit/d1922fd260413899d25108ad0d22faadc7d83ae6))
+
 ## [0.55.5](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.4...v0.55.5) (2026-09-06)
 
 
