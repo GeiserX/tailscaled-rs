@@ -585,13 +585,21 @@ enum Command {
     /// is an **interactive login**: the node contacts control, reaches `NeedsLogin`, and the auth URL
     /// is printed for you to open in a browser; the node finishes connecting once you authorize it.
     /// With `--authkey`/`--authkey-file` (or `$TS_AUTH_KEY`) it registers non-interactively. Like Go's
-    /// `login`, this re-authenticates **without changing any prefs** — it is `up`'s auth half on its
-    /// own (use `tnet up <flags>` to also change settings). Brings the node up (sets want-running).
+    /// `login`, this re-authenticates **without changing any prefs** other than the profile name Go
+    /// gives `login` alone (`--nickname`) — it is `up`'s auth half on its own (use `tnet up <flags>`
+    /// to also change settings). Brings the node up (sets want-running).
     Login {
-        /// Pre-auth key for non-interactive login. Prefer `--authkey-file` or `$TS_AUTH_KEY` (a bare
-        /// `--authkey` is visible in `ps`/shell history). Precedence: `--authkey-file` > `--authkey` >
-        /// `$TS_AUTH_KEY`. With none of them, the login is interactive (an auth URL is printed).
-        #[arg(long, conflicts_with = "authkey_file")]
+        /// Pre-auth key for non-interactive login, or `file:<path>` to read the key from a file.
+        /// Prefer `--authkey-file` or `$TS_AUTH_KEY` (a bare `--authkey` is visible in `ps`/shell
+        /// history). Precedence: `--authkey-file` > `--authkey` > `$TS_AUTH_KEY`. With none of them,
+        /// the login is interactive (an auth URL is printed).
+        //
+        // `--auth-key` is Go's canonical spelling and it is registered for BOTH commands: `up.go`'s
+        // `newUpFlagSet` builds one flag set for `up` and `login`, and `cli.go`'s `CleanUpArgs`
+        // rewrites `--authkey` to `--auth-key` whatever the subcommand. So `tailscale login
+        // --auth-key=...` works upstream and must work here — the same alias, and the same `file:`
+        // handling (`resolve_authkey`), that `up` already carries.
+        #[arg(long, visible_alias = "auth-key", conflicts_with = "authkey_file")]
         authkey: Option<String>,
         /// Read the pre-auth key from a file (avoids argv/shell-history exposure). Takes precedence
         /// over `--authkey`.
@@ -602,6 +610,30 @@ enum Command {
         /// does, so unlike `up` this needs no `--force-reauth`.
         #[arg(long, value_name = "URL")]
         login_server: Option<String>,
+        /// Short name for this login profile (Go `login --nickname` / `ipn.Prefs.ProfileName`): the
+        /// name `tnet switch --list` prints and `tnet switch <NAME>` resolves against. Pass an EMPTY
+        /// value (`--nickname=`) to clear it; omitting the flag leaves it unchanged. This is a
+        /// `login` flag and not an `up` flag here for the reason it is upstream — `up.go` registers
+        /// it inside `if cmd == "login"`.
+        #[arg(long, value_name = "NAME")]
+        nickname: Option<String>,
+        /// Install host routes to other Tailscale nodes (Go `--host-routes`, hidden there too, and
+        /// registered for `login` as well as `up` because the flag set is shared). Accepted and
+        /// inert, exactly as on `tnet up`: `--host-routes=false` is refused with Go's own message —
+        /// see [`check_host_routes`].
+        //
+        // Same `notFalseVar` shape as `up`'s: bare `--host-routes` is the flag's presence (Go's
+        // `IsBoolFlag` never consumes the next argument) and a value can only arrive as
+        // `--host-routes=<v>`.
+        #[arg(
+            long,
+            hide = true,
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "true",
+            value_name = "true"
+        )]
+        host_routes: Option<String>,
     },
     /// Switch between profiles (separate accounts/tailnets), or list/remove them. Mirrors Go
     /// `tailscale switch`. Each profile keeps its own prefs + node key; switching tears down the
@@ -2861,7 +2893,21 @@ async fn main() -> Result<()> {
             authkey,
             authkey_file,
             login_server,
-        } => run_login(&socket, authkey, authkey_file, login_server).await,
+            nickname,
+            host_routes,
+        } => {
+            run_login(
+                &socket,
+                authkey,
+                authkey_file,
+                login_server,
+                // Go's clear-by-empty-value form (`--nickname=`), resolved into the wire sentinel by
+                // the same helper `set` uses.
+                resolve_clearable_string(nickname),
+                host_routes,
+            )
+            .await
+        }
         // `switch` (Go `tailscale switch`): --list renders a table; `remove <id>` deletes; a bare
         // `<target>` switches. Handled inline — `--list` renders the Profiles reply, and the three
         // modes map to different requests.
@@ -3785,20 +3831,31 @@ fn up_json_string(
     serde_json::to_string_pretty(&map).unwrap_or_else(|_| "{}".to_string())
 }
 
-/// `login` (Go `tailscale login`): (re)authenticate this node **without changing any prefs** — the
-/// auth half of `up` on its own. Resolves the auth key through the usual precedence
-/// (`--authkey-file` > `--authkey` > `$TS_AUTH_KEY`); with none, it is an interactive login (the
-/// control auth URL is printed). Sends an `up` request that **mentions no pref** (so the
+/// `login` (Go `tailscale login`): (re)authenticate this node, changing no pref but the one Go lets
+/// `login` change — the auth half of `up` on its own. Resolves the auth key through the usual
+/// precedence (`--authkey-file` > `--authkey` > `$TS_AUTH_KEY`); with none, it is an interactive
+/// login (the control auth URL is printed). Sends an `up` request that **mentions no pref** (so the
 /// accidental-revert guard never fires — a no-pref `up` is exempt) with `force_reauth: true` so the
 /// node re-authenticates even if it already holds a key (mirroring Go `login` →
 /// `StartLoginInteractive`). Reuses `poll_for_auth_url` to surface the URL, exactly like an
 /// interactive `up`.
+///
+/// `--nickname` is the exception, and it is Go's own: `up.go` registers it on the shared flag set
+/// when `cmd == "login"`, so naming the profile is part of logging in. It is applied first, through
+/// [`login_nickname_request`], and it is deliberately NOT folded into the `up` request below — that
+/// request has to keep mentioning no pref.
 async fn run_login(
     socket: &std::path::Path,
     authkey: Option<String>,
     authkey_file: Option<std::path::PathBuf>,
     login_server: Option<String>,
+    nickname: Option<Option<String>>,
+    host_routes: Option<String>,
 ) -> Result<()> {
+    // `--host-routes` is on `login` because Go's flag set is shared (`newUpFlagSet` registers it for
+    // both commands). Go decides it in the flag parser, before `Exec` runs, so — as on `up` — it is
+    // gated ahead of every other check, including the risk gate below.
+    check_host_routes(host_routes.as_deref())?;
     // Refuse a re-auth that could drop the very Tailscale-SSH session we're on (same gate as `up
     // --force-reauth`): `login` re-registers the node. Without an explicit accept-risk flag on
     // `login` (Go's `login` has no such flag — it always StartLoginInteractive), we mirror `up`'s
@@ -3811,9 +3868,30 @@ async fn run_login(
         );
         std::process::exit(1);
     }
-    // Resolve the secret (zeroized `SecretString`); `None` → interactive login.
+    // Resolve the secret (zeroized `SecretString`); `None` → interactive login. Before the
+    // `--nickname` half, so a `file:`/`--authkey-file` that cannot be read fails with nothing renamed.
     let authkey = resolve_authkey(authkey, authkey_file).await?;
     let interactive = authkey.is_none();
+    // Go `login --nickname`: `ipn.Prefs.ProfileName` is part of the prefs the login applies, so it
+    // lands BEFORE the node re-authenticates (as it does upstream, where the name is in the prefs
+    // handed to `Start` and survives an auth the operator never completes). A failure here aborts
+    // the login rather than half-applying it.
+    if let Some(request) = login_nickname_request(nickname) {
+        match round_trip(socket, &request)
+            .await
+            .with_context(|| format!("talking to daemon at {}", socket.display()))?
+        {
+            // The rename is a step of `login`, not a command of its own: its "preferences updated"
+            // line would only be noise before the login's own `ok:`. Go prints nothing for it either.
+            Response::Ok { .. } => {}
+            Response::Error { message } => {
+                eprintln!("error: {message}");
+                std::process::exit(1);
+            }
+            // `set --nickname` names one pref and reverts none, so the guard cannot fire on it.
+            other => anyhow::bail!("unexpected response to login --nickname: {other:?}"),
+        }
+    }
     // An `up` that mentions NO pref (every override `None`) + force_reauth: just (re)authenticate.
     // `force_reauth` is not a "mentioned pref", so the no-pref shape keeps the accidental-revert
     // guard from firing — `login` must never refuse-to-revert; it changes nothing but auth state.
@@ -11197,9 +11275,32 @@ struct PortedUpFlags {
 /// status or validates any other flag. So this runs before every other `up` check. Pure →
 /// unit-testable.
 fn check_ported_up_flags(flags: &PortedUpFlags) -> Result<()> {
+    check_host_routes(flags.host_routes.as_deref())?;
+    if flags.nickname.is_some() {
+        anyhow::bail!(
+            "--nickname is not a `tnet up` flag, and it is not a `tailscale up` flag upstream \
+             either: `up.go` builds one flag set for `up` and `login` and registers `--nickname` \
+             only when the command is `login`, so no `up` carries a profile name. Run `tnet login \
+             --nickname <NAME>` to name the profile as part of a (re)authentication, or `tnet set \
+             --nickname <NAME>` to rename the current login profile on its own — the two homes Go \
+             gives it."
+        );
+    }
+    Ok(())
+}
+
+/// Go's `--host-routes` refusal, shared by `up` and `login` because Go's flag set is: `up.go`'s
+/// `newUpFlagSet` registers `upf.Var(notFalseVar{}, "host-routes", …)` unconditionally, so BOTH
+/// commands take the flag and both refuse every value but `true`.
+///
+/// `None` = the flag was absent; `Some("true")` = its presence (Go's `IsBoolFlag` default) or an
+/// explicit `--host-routes=true`, the one value Go allows — accepted and inert, because this build's
+/// userspace netstack installs no host routes and Go has required `true` since Tailscale 1.67.
+/// Pure → unit-testable.
+fn check_host_routes(value: Option<&str>) -> Result<()> {
     // Go's `notFalseVar.Set` rejects every value but "true", and Go's flag package wraps that in
     // `invalid boolean value %q for -host-routes: %v`. Same sentence, this CLI's flag spelling.
-    if let Some(value) = flags.host_routes.as_deref()
+    if let Some(value) = value
         && value != "true"
     {
         anyhow::bail!(
@@ -11207,17 +11308,42 @@ fn check_ported_up_flags(flags: &PortedUpFlags) -> Result<()> {
              is allowed"
         );
     }
-    if flags.nickname.is_some() {
-        anyhow::bail!(
-            "--nickname is not a `tnet up` flag, and it is not a `tailscale up` flag upstream \
-             either: `up.go` builds one flag set for `up` and `login` and registers `--nickname` \
-             only when the command is `login`, so no `up` carries a profile name. This fork's \
-             profile naming lives on `tnet set --nickname <NAME>`, which renames the current login \
-             profile exactly as Go's `set --nickname` does — run that instead. (Go's other home \
-             for it, `login --nickname`, is not implemented here yet.)"
-        );
-    }
     Ok(())
+}
+
+/// Build the one-pref `set` request that carries Go `login --nickname` (`ipn.Prefs.ProfileName`), or
+/// `None` when the flag was absent — in which case `login` makes no such call at all.
+///
+/// Upstream, `--nickname` is an ordinary pref on the flag set `login` shares with `up`, applied by
+/// the same `Start`/`EditPrefs` that logs the node in. This fork keeps the login round-trip itself
+/// pref-free (see [`run_login`]: a no-pref `up` is what exempts `login` from the accidental-revert
+/// guard), so the profile name travels through the door the daemon already opens for it — the `set`
+/// path, which both persists `node_nickname` AND renames the current login profile, the two halves
+/// Go's `profileManager.SetPrefs` does. Every other field is the "leave unchanged" sentinel, so a
+/// `login --nickname` changes exactly one pref and nothing else.
+///
+/// Pure → unit-testable.
+fn login_nickname_request(nickname: Option<Option<String>>) -> Option<Request> {
+    let nickname = nickname?;
+    Some(Request::Set {
+        hostname: None,
+        accept_routes: None,
+        accept_dns: None,
+        shields_up: None,
+        exit_node: None,
+        advertise_exit_node: None,
+        advertise_routes: None,
+        advertise_tags: None,
+        ssh: None,
+        advertise_connector: None,
+        auto_update: None,
+        update_check: None,
+        operator: None,
+        nickname: Some(nickname),
+        report_posture: None,
+        webclient: None,
+        exit_node_allow_lan_access: None,
+    })
 }
 
 /// The Go pref flags `tailscale set` carries (`set.go` `newSetFlagSet`) beyond the ones this CLI
@@ -21307,8 +21433,11 @@ mod tests {
         let err = check_ported_up_flags(&flags)
             .expect_err("`up` names no profile")
             .to_string();
-        assert!(err.contains("tnet set --nickname"), "{err}");
         assert!(err.contains("`login`"), "{err}");
+        // Both homes Go gives the flag, now that `login --nickname` is one of them: the refusal
+        // sends the operator to a command that exists rather than to a gap.
+        assert!(err.contains("tnet login --nickname"), "{err}");
+        assert!(err.contains("tnet set --nickname"), "{err}");
 
         // Go decides both of these in its flag parser, and `--host-routes` is the one that can be
         // wrong on its own line — so it is answered first, whatever else the command line carries.
@@ -21320,6 +21449,169 @@ mod tests {
         .expect_err("both are refused")
         .to_string();
         assert!(err.contains("only 'true' is allowed"), "{err}");
+    }
+
+    /// Parse a `tnet login` command line down to the three flags Go's shared `up`/`login` flag set
+    /// hands `login`, with `--nickname` already resolved into its wire sentinel.
+    fn parse_login(argv: &[&str]) -> (Option<String>, Option<Option<String>>, Option<String>) {
+        let mut full = vec!["tnet", "login"];
+        full.extend_from_slice(argv);
+        match Cli::try_parse_from(&full)
+            .unwrap_or_else(|e| panic!("`tnet login {argv:?}` should parse: {e}"))
+            .command
+        {
+            Command::Login {
+                authkey,
+                nickname,
+                host_routes,
+                ..
+            } => (authkey, resolve_clearable_string(nickname), host_routes),
+            _ => panic!("expected Command::Login"),
+        }
+    }
+
+    #[test]
+    fn login_takes_the_flags_gos_shared_flag_set_gives_it() {
+        // `up.go`'s `newUpFlagSet` builds ONE flag set for `up` and `login`: `--auth-key` and
+        // `--host-routes` are registered unconditionally, `--nickname` inside `if cmd == "login"`.
+        // All three are therefore `tailscale login` flags upstream, so a command line ported from
+        // one must not die at this fork's parser.
+        let (authkey, nickname, host_routes) = parse_login(&[
+            "--auth-key",
+            "tskey-auth-example",
+            "--nickname",
+            "work-laptop",
+            "--host-routes",
+        ]);
+        assert_eq!(
+            authkey.as_deref(),
+            Some("tskey-auth-example"),
+            "`--auth-key` is Go's spelling of the key flag on `login` as much as on `up`"
+        );
+        assert_eq!(nickname, Some(Some("work-laptop".to_string())));
+        assert_eq!(host_routes.as_deref(), Some("true"));
+
+        // Go's spelling is an ALIAS of this fork's `--authkey`, not a second flag: naming both is
+        // naming one flag twice, and it still cannot be combined with `--authkey-file`.
+        for argv in [
+            vec!["--authkey", "a", "--auth-key", "b"],
+            vec!["--auth-key", "a", "--authkey-file", "/dev/null"],
+        ] {
+            let mut full = vec!["tnet", "login"];
+            full.extend_from_slice(&argv);
+            assert!(
+                Cli::try_parse_from(&full).is_err(),
+                "{argv:?} names one flag twice (or a flag it conflicts with)"
+            );
+        }
+    }
+
+    #[test]
+    fn login_host_routes_accepts_only_the_value_go_allows() {
+        // The same `notFalseVar` line registers `--host-routes` for both commands, so `login` owes
+        // the same refusal `up` does — same message, and decided in the parser before anything else.
+        let (_, _, host_routes) = parse_login(&["--host-routes=true"]);
+        assert_eq!(host_routes.as_deref(), Some("true"));
+        check_host_routes(host_routes.as_deref()).expect("'true' is the one value Go allows");
+        for value in ["false", "0", "True", ""] {
+            let arg = format!("--host-routes={value}");
+            let (_, _, host_routes) = parse_login(&[&arg]);
+            let err = check_host_routes(host_routes.as_deref())
+                .expect_err("Go allows only 'true'")
+                .to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "invalid boolean value {value:?} for --host-routes: unsupported value; only \
+                     'true' is allowed"
+                ),
+                "login --host-routes={value}"
+            );
+        }
+        // An absent flag asks for nothing, on `login` as on `up`.
+        assert_eq!(parse_login(&[]).2, None);
+        check_host_routes(None).expect("an absent flag asks for nothing");
+    }
+
+    #[test]
+    fn login_nickname_names_the_profile_and_mentions_no_other_pref() {
+        // Go's `login --nickname` sets `ipn.Prefs.ProfileName` as part of the prefs the login
+        // applies. Here it rides the `set` path — the daemon's only door to `node_nickname` AND to
+        // the login-profile rename that makes `switch <NAME>` resolve — so what has to hold is that
+        // the request names the nickname and NOTHING else: a `login` may not move a pref the
+        // operator never mentioned.
+        let (_, nickname, _) = parse_login(&["--nickname", "work-laptop"]);
+        match login_nickname_request(nickname).expect("`--nickname` is a request") {
+            Request::Set {
+                nickname,
+                hostname,
+                accept_routes,
+                accept_dns,
+                shields_up,
+                exit_node,
+                advertise_exit_node,
+                advertise_routes,
+                advertise_tags,
+                ssh,
+                advertise_connector,
+                auto_update,
+                update_check,
+                operator,
+                report_posture,
+                webclient,
+                exit_node_allow_lan_access,
+            } => {
+                assert_eq!(nickname, Some(Some("work-laptop".to_string())));
+                assert!(hostname.is_none(), "hostname must stay unchanged");
+                assert!(accept_routes.is_none(), "accept_routes must stay unchanged");
+                assert!(accept_dns.is_none(), "accept_dns must stay unchanged");
+                assert!(shields_up.is_none(), "shields_up must stay unchanged");
+                assert!(exit_node.is_none(), "exit_node must stay unchanged");
+                assert!(
+                    advertise_exit_node.is_none(),
+                    "advertise_exit_node must stay unchanged"
+                );
+                assert!(
+                    advertise_routes.is_none(),
+                    "advertise_routes must stay unchanged"
+                );
+                assert!(
+                    advertise_tags.is_none(),
+                    "advertise_tags must stay unchanged"
+                );
+                assert!(ssh.is_none(), "ssh must stay unchanged");
+                assert!(
+                    advertise_connector.is_none(),
+                    "advertise_connector must stay unchanged"
+                );
+                assert!(auto_update.is_none(), "auto_update must stay unchanged");
+                assert!(update_check.is_none(), "update_check must stay unchanged");
+                assert!(operator.is_none(), "operator must stay unchanged");
+                assert!(
+                    report_posture.is_none(),
+                    "report_posture must stay unchanged"
+                );
+                assert!(webclient.is_none(), "webclient must stay unchanged");
+                assert!(
+                    exit_node_allow_lan_access.is_none(),
+                    "exit_node_allow_lan_access must stay unchanged"
+                );
+            }
+            other => panic!("expected a `set` request, got {other:?}"),
+        }
+
+        // Go clears the profile name with an EMPTY value (`--nickname=`), the same form `set` takes.
+        let (_, cleared, _) = parse_login(&["--nickname="]);
+        match login_nickname_request(cleared).expect("`--nickname=` is a request") {
+            Request::Set { nickname, .. } => assert_eq!(nickname, Some(None), "empty → CLEAR"),
+            other => panic!("expected a `set` request, got {other:?}"),
+        }
+
+        // An absent `--nickname` is not "set it to nothing": `login` makes no such call at all.
+        assert!(
+            login_nickname_request(parse_login(&[]).1).is_none(),
+            "an absent --nickname must not send a `set` at all"
+        );
     }
 
     #[tokio::test]
