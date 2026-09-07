@@ -25,6 +25,14 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.55.8](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.7...v0.55.8) (2026-09-07)
+
+
+### Bug Fixes
+
+* **login:** take the flags Go's shared up/login flag set gives login ([#397](https://github.com/GeiserX/tailscaled-rs/issues/397)) ([9ac7ec8](https://github.com/GeiserX/tailscaled-rs/commit/9ac7ec82ec6cacb41a11290c17970e55c8e88932))
+* **set:** take Go's `--sync=false` spelling instead of dying at the parser ([#399](https://github.com/GeiserX/tailscaled-rs/issues/399)) ([4c10557](https://github.com/GeiserX/tailscaled-rs/commit/4c10557527542809180f65d3235865ba28db6924))
+
 ## [0.55.7](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.6...v0.55.7) (2026-09-07)
 
 
