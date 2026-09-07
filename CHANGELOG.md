@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.55.7](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.6...v0.55.7) (2026-09-07)
+
+
+### Bug Fixes
+
+* **ip:** fail `tnet ip -6` on a node with no IPv6 instead of exiting 0 ([#394](https://github.com/GeiserX/tailscaled-rs/issues/394)) ([ec4a7cb](https://github.com/GeiserX/tailscaled-rs/commit/ec4a7cbc6c697b1fcad93706e64a8b46fa7b2ff8))
+
 ## [0.55.6](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.5...v0.55.6) (2026-09-07)
 
 
