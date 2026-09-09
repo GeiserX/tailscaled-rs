@@ -6495,18 +6495,65 @@ fn dns_trim_suffix<'a>(name: &'a str, suffix: &str) -> &'a str {
     out.strip_suffix('.').unwrap_or(out)
 }
 
-/// Resolve `ping`'s `<hostname-or-IP>` to the address to ping, and answer the two cases that end the
-/// command before a single probe is sent.
+/// Go's `isRunningOrStarting` (cmd/tailscale/cli/status.go): the backend-state gate `runPing`
+/// applies before it does anything else, so a command that needs a live netmap says *which* local
+/// state stopped it instead of blaming the peer.
+///
+/// `None` is Go's `ok == true` — the node is `Running` or `Starting`, so the netmap is current
+/// enough to aim a probe with. `Some(description)` is Go's `ok == false` plus the exact text it
+/// prints before `os.Exit(1)`:
+///
+/// * `Stopped` → `Tailscale is stopped.`
+/// * `NeedsLogin` → `Logged out.`, and a second line `Log in at: <url>` when the daemon is offering
+///   an auth URL (Go: `if st.AuthURL != ""`).
+/// * `NeedsMachineAuth` → `Machine is not yet approved by tailnet admin.`
+/// * anything else — `NoState`, `InUseOtherUser`, or a state name this build does not know — falls
+///   into Go's `default` arm, `unexpected state: %s`.
+///
+/// Pure, so the state table is unit-testable; the caller owns the printing and the exit.
+///
+/// Both interpolated values are control-supplied, so they go through [`sanitize_for_terminal`]
+/// first, the way the state name already does in the `configure kubeconfig` pre-check. That is
+/// lossless for a real state name or URL (neither legitimately contains a control or bidi
+/// character) and keeps a hostile one from forging lines in the operator's terminal.
+fn is_running_or_starting(state: &str, auth_url: Option<&str>) -> Option<String> {
+    use tailscaled_rs::ipn::State;
+    if state == State::Running.as_str() || state == State::Starting.as_str() {
+        return None;
+    }
+    if state == State::Stopped.as_str() {
+        return Some("Tailscale is stopped.".to_string());
+    }
+    if state == State::NeedsLogin.as_str() {
+        // Go appends the login line only when there is a URL to append; an empty `AuthURL` on the
+        // wire is Go's `""`, so `Some("")` must read as "no URL" and not print a bare `Log in at:`.
+        return Some(match auth_url.filter(|url| !url.is_empty()) {
+            Some(url) => format!("Logged out.\nLog in at: {}", sanitize_for_terminal(url)),
+            None => "Logged out.".to_string(),
+        });
+    }
+    if state == State::NeedsMachineAuth.as_str() {
+        return Some("Machine is not yet approved by tailnet admin.".to_string());
+    }
+    Some(format!(
+        "unexpected state: {}",
+        sanitize_for_terminal(state)
+    ))
+}
+
+/// Apply Go's backend-state gate, then resolve `ping`'s `<hostname-or-IP>` to the address to ping —
+/// the two things that can end the command before a single probe is sent.
 ///
 /// Returns `Ok(None)` when the argument named THIS node: Go prints `%v is local Tailscale IP` and
 /// returns success, so there is nothing left for the caller to do. `Ok(Some(ip))` is the address to
 /// ping.
 ///
-/// Go's `runPing` fetches the status before anything else (for its running/starting check), and
-/// `tailscaleIPFromArg` fetches it again for the peer match; one fetch answers both here. A status
-/// round trip that fails ends the command, as it does in Go — a daemon that cannot describe its
-/// netmap is not going to answer a ping either, and saying so here names the real problem instead
-/// of letting ten attempts time out against it.
+/// Go's `runPing` fetches the status before anything else (for its `isRunningOrStarting` check),
+/// and `tailscaleIPFromArg` fetches it again for the peer match; one fetch answers both here, in
+/// Go's order — the gate first, then the argument. A status round trip that fails ends the command,
+/// as it does in Go — a daemon that cannot describe its netmap is not going to answer a ping
+/// either, and saying so here names the real problem instead of letting ten attempts time out
+/// against it.
 ///
 /// `--verbose` logs Go's `lookup %q => %q` line, and only when resolution actually moved the
 /// argument (Go: `if pingArgs.verbose && ip != hostOrIP`), so an IP literal logs nothing.
@@ -6526,6 +6573,16 @@ async fn resolve_ping_target(
             return Err(e).with_context(|| format!("querying status at {}", socket.display()));
         }
     };
+    // Go's `runPing` opens with `isRunningOrStarting(st)` and, on any other backend state, prints
+    // that state's description and exits 1 — before the argument is resolved and before a single
+    // probe is sent. Without it, a stopped or logged-out node still resolves the peer out of the
+    // stale netmap, sends the whole count into a dead data plane and ends on `no reply`: a verdict
+    // about the peer for a fault that is entirely local. `printf` in Go's CLI writes to stdout, so
+    // this line does too (unlike the `warnf` that `down` ports to stderr).
+    if let Some(description) = is_running_or_starting(&status.state, status.auth_url.as_deref()) {
+        println!("{description}");
+        std::process::exit(1);
+    }
     let ip = match ping_target_from_arg(target, &status) {
         PingTarget::Literal(ip) | PingTarget::Peer(ip) => ip,
         PingTarget::SelfNode(ip) => {
@@ -19560,6 +19617,96 @@ mod tests {
             .parse::<std::net::IpAddr>()
             .expect("the resolver's answer must be an address");
         assert!(ip.is_loopback(), "localhost resolved to {ip}, not loopback");
+    }
+
+    /// Go's `isRunningOrStarting` state table, arm by arm. The two "keep going" states are the
+    /// only ones that return `ok`; every other state carries the text Go prints before `os.Exit(1)`.
+    #[test]
+    fn is_running_or_starting_ports_gos_state_table() {
+        use tailscaled_rs::ipn::State;
+
+        // Go: `case ipn.Running.String(), ipn.Starting.String(): return "", true`. A starting node
+        // is explicitly allowed through — it is coming up, and the ping is what nudges it.
+        assert_eq!(is_running_or_starting(State::Running.as_str(), None), None);
+        assert_eq!(is_running_or_starting(State::Starting.as_str(), None), None);
+        // An auth URL left over on a running node changes nothing: the state decides.
+        assert_eq!(
+            is_running_or_starting(
+                State::Running.as_str(),
+                Some("https://login.example.com/a/x")
+            ),
+            None
+        );
+
+        assert_eq!(
+            is_running_or_starting(State::Stopped.as_str(), None).as_deref(),
+            Some("Tailscale is stopped.")
+        );
+        assert_eq!(
+            is_running_or_starting(State::NeedsMachineAuth.as_str(), None).as_deref(),
+            Some("Machine is not yet approved by tailnet admin.")
+        );
+
+        // `NeedsLogin` with nothing to click is Go's bare `Logged out.`; with an `AuthURL` it grows
+        // the second line. An empty URL is Go's `st.AuthURL == ""` — no line.
+        assert_eq!(
+            is_running_or_starting(State::NeedsLogin.as_str(), None).as_deref(),
+            Some("Logged out.")
+        );
+        assert_eq!(
+            is_running_or_starting(State::NeedsLogin.as_str(), Some("")).as_deref(),
+            Some("Logged out.")
+        );
+        assert_eq!(
+            is_running_or_starting(
+                State::NeedsLogin.as_str(),
+                Some("https://login.example.com/a/abc123")
+            )
+            .as_deref(),
+            Some("Logged out.\nLog in at: https://login.example.com/a/abc123")
+        );
+
+        // Go's `default` arm. `NoState` and `InUseOtherUser` are real `ipn.State` names with no case
+        // of their own, so they land here too — as does anything a newer daemon might report.
+        for state in [
+            State::NoState.as_str(),
+            State::InUseOtherUser.as_str(),
+            "SomethingElse",
+        ] {
+            assert_eq!(
+                is_running_or_starting(state, None).as_deref(),
+                Some(format!("unexpected state: {state}").as_str()),
+                "{state} must fall into Go's default arm"
+            );
+        }
+        // The state name is compared exactly, like Go's string switch — a case-folded spelling is
+        // not `Running` and must not open the gate.
+        assert!(is_running_or_starting("running", None).is_some());
+    }
+
+    /// Both interpolated values reach a terminal, and both come from the daemon, so a control
+    /// sequence in either is neutralised rather than emitted.
+    #[test]
+    fn is_running_or_starting_neutralises_control_supplied_text() {
+        let hostile_url = "https://login.example.com/a/x\u{1b}[2K\rLogged in.";
+        let described = is_running_or_starting(
+            tailscaled_rs::ipn::State::NeedsLogin.as_str(),
+            Some(hostile_url),
+        )
+        .expect("NeedsLogin never opens the gate");
+        assert!(
+            !described.contains('\u{1b}') && !described.contains('\r'),
+            "the auth URL must not carry escapes into the line: {described:?}"
+        );
+        // The one newline in the message is the one this function put there.
+        assert_eq!(described.matches('\n').count(), 1, "{described:?}");
+
+        let unexpected = is_running_or_starting("Weird\nTailscale is running.", None)
+            .expect("an unknown state never opens the gate");
+        assert!(
+            !unexpected.contains('\n'),
+            "a state name must not forge a second line: {unexpected:?}"
+        );
     }
 
     #[test]
