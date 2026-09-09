@@ -25,6 +25,14 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.55.10](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.9...v0.55.10) (2026-09-09)
+
+
+### Bug Fixes
+
+* **ping:** diagnose a stopped or logged-out local node instead of the peer ([#405](https://github.com/GeiserX/tailscaled-rs/issues/405)) ([b26c3e5](https://github.com/GeiserX/tailscaled-rs/commit/b26c3e59ade523be3f2ba69cd412138439ae415d))
+* **tnet:** stop `lock log --json` stamping Go's schema 1 on fork output ([#403](https://github.com/GeiserX/tailscaled-rs/issues/403)) ([cd5f1f3](https://github.com/GeiserX/tailscaled-rs/commit/cd5f1f32af5566415417e4dcbeace106d44269ab))
+
 ## [0.55.9](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.8...v0.55.9) (2026-09-09)
 
 
