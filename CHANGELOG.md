@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.55.9](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.8...v0.55.9) (2026-09-09)
+
+
+### Bug Fixes
+
+* **tun:** stop refusing `--tun` to a CAP_NET_ADMIN daemon off macOS ([#401](https://github.com/GeiserX/tailscaled-rs/issues/401)) ([c2d55d1](https://github.com/GeiserX/tailscaled-rs/commit/c2d55d106b731b95f6c3ae63d1ff6b7f8b3be959))
+
 ## [0.55.8](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.7...v0.55.8) (2026-09-07)
 
 
