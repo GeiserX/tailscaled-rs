@@ -11,8 +11,9 @@
 //!    sees success on a node where it is off.
 //! 2. `-json` is a `jsonoutput.SchemaVersion`, not a bool. `--json` and `--json=1` both select
 //!    schema version 1, `--json=false` is the human form, and every other version is refused with
-//!    `unrecognised version: %d`. The version-1 payload carries the `ResponseEnvelope`'s
-//!    `SchemaVersion` field.
+//!    `unrecognised version: %d`. The payload carries the `ResponseEnvelope`'s `SchemaVersion` field.
+//! 3. Past the JSON branch, `printTailnetLockLog` ranges over the updates and prints one stanza
+//!    each. An empty chain prints nothing at all — no header, no note, no blank line.
 //!
 //! The unit tests next to `format_lock_log` (src/bin/tnet.rs) pin the rendering and refusal decisions
 //! themselves. What they cannot see is the surface an operator hits: whether clap accepts Go's flag
@@ -20,9 +21,12 @@
 //! it fires. Each test here runs the built `tnet` against a stub daemon on a Unix socket and inspects
 //! both the process result and the requests the daemon actually received.
 //!
-//! HONEST SCOPE: the version-1 payload under the envelope is fork-specific, not Go's
-//! `Messages`/`AUM` shape — this daemon has no AUM CBOR decoder, so it cannot fill Go's expanded
-//! fields. These tests pin the envelope and the flag semantics, not upstream's field names.
+//! HONEST SCOPE: the payload under the envelope is fork-specific, not Go's `Messages`/`AUM` shape —
+//! this daemon has no AUM CBOR decoder, so it cannot fill Go's expanded fields. That is exactly why
+//! the envelope must NOT answer Go's `"1"`: it names this fork's schema
+//! (`SchemaVersion: "tailscaled-rs.1"`), so a consumer written against upstream fails its version
+//! check instead of parsing a document that only looks like the one it asked for. These tests pin the
+//! envelope value and the flag semantics, not upstream's field names.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
@@ -116,6 +120,14 @@ fn lock_off() -> Response {
     Response::LockLog(LockLogReport::default())
 }
 
+/// A log reply from a node where the lock is on but no update chain has synced yet.
+fn lock_on_no_history() -> Response {
+    Response::LockLog(LockLogReport {
+        enabled: true,
+        entries: vec![],
+    })
+}
+
 /// A log reply from a node where the lock is on and one update has synced.
 fn one_update() -> Response {
     Response::LockLog(LockLogReport {
@@ -175,8 +187,15 @@ fn json_takes_gos_schema_version_as_well_as_the_bare_flag() {
         assert!(out.status.success(), "{flag}: {}", stderr(&out));
         let v: serde_json::Value =
             serde_json::from_str(&stdout(&out)).unwrap_or_else(|e| panic!("{flag}: {e}"));
-        // Go's `jsonoutput.ResponseEnvelope`: the schema the payload below it conforms to.
-        assert_eq!(v["SchemaVersion"], serde_json::json!("1"), "{flag}");
+        // Go's `jsonoutput.ResponseEnvelope`: the schema the payload below it conforms to. It is
+        // this fork's, because the payload is this fork's — a consumer that pinned upstream's `"1"`
+        // must trip here rather than three fields later on a missing `.Messages`.
+        assert_eq!(
+            v["SchemaVersion"],
+            serde_json::json!("tailscaled-rs.1"),
+            "{flag}"
+        );
+        assert_ne!(v["SchemaVersion"], serde_json::json!("1"), "{flag}");
         assert_eq!(
             v["entries"][0]["hash"],
             serde_json::json!("AAAAQ"),
@@ -255,4 +274,20 @@ fn lock_log_help_advertises_the_versioned_json_flag() {
     let text = stdout(&out);
     assert!(text.contains("--json"), "{text}");
     assert!(text.contains("--limit"), "{text}");
+}
+
+/// The lock is on and nothing has synced: Go's printer ranges over an empty slice and returns, so
+/// stdout is empty and the exit status is zero. A note printed here would be a line a script diffing
+/// `tnet lock log` against `tailscale lock log` has to strip — and, since a lock-disabled node is
+/// already a non-zero exit, it says nothing the empty output did not already say.
+#[test]
+fn an_empty_update_chain_prints_nothing() {
+    let daemon = StubDaemon::start(vec![lock_on_no_history()]);
+    let out = daemon.tnet(&["lock", "log"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        "",
+        "Go prints no stanzas and no commentary for an empty chain"
+    );
 }
