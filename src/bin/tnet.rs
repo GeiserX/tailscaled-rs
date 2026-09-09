@@ -1903,7 +1903,9 @@ enum LockCmd {
         /// bool): bare `--json` and `--json=1` both select schema version 1, `--json=false` is the
         /// human form, and any other version is refused by number. The value is parsed by
         /// [`parse_json_schema_version`]; `require_equals` keeps `--json 1` from eating the next
-        /// argument, exactly as Go's `IsBoolFlag` does.
+        /// argument, exactly as Go's `IsBoolFlag` does. The document that comes back is this fork's,
+        /// not upstream's — it says `SchemaVersion: "tailscaled-rs.1"`, because this build has no AUM
+        /// decoder and so cannot fill Go's schema-1 fields.
         #[arg(
             long,
             value_name = "VERSION",
@@ -8956,13 +8958,19 @@ fn format_lock_status(r: &tailscaled_rs::localapi::LockReport, json: bool) -> St
 /// - **An unknown `--json` version is refused by number.** Go's `printTailnetLockLog` serves schema
 ///   version 1 and answers anything else with `unrecognised version: %d`.
 ///
-/// The version-1 payload carries Go's `jsonoutput.ResponseEnvelope` field (`SchemaVersion: "1"`) so
-/// a script can pin the schema it parses. What sits under the envelope is fork-specific and NOT Go's
-/// `Messages`/`AUM` shape: Go expands each update's decoded AUM into named fields, which needs the
-/// CBOR decoder this daemon does not have, so the object stays `enabled` + `entries` (hash, change,
-/// signing key ids, raw CBOR as hex) rather than borrowing Go's key names for something narrower
-/// than what those names mean upstream. `enabled` is always `true` now that the disabled case exits
-/// before printing; it is kept so the object does not change shape from the pre-refusal builds.
+/// The `--json` payload is NOT Go's schema 1, and no longer claims to be. Upstream
+/// `PrintTailnetLockLogJSONV1` (`cmd/tailscale/cli/jsonoutput/tailnet-lock-log.go`) emits
+/// `{"SchemaVersion": "1", "Messages": [...]}`, each message a `logMessageV1` expanding the update's
+/// decoded AUM into named fields (`MessageKind`, `PrevAUMHash`, ...). Decoding an AUM needs the CBOR
+/// decoder this daemon does not have, so what this build can honestly serve is `enabled` + `entries`
+/// (hash, change, signing key ids, raw CBOR as hex). The `jsonoutput.ResponseEnvelope` field name is
+/// kept, but its value names THIS fork's schema — `SchemaVersion: "tailscaled-rs.1"` — so a consumer
+/// written against `tailscale lock log --json=1` fails its version check on the very field it
+/// checks, rather than being told `"1"` and then reading a `.Messages` that is not there. The flag
+/// still behaves as Go's: `--json=1` selects this command's version 1 and any other version is
+/// refused by number; the envelope only says which version-1 document came back. `enabled` is always
+/// `true` now that the disabled case exits before printing; it is kept so the object does not change
+/// shape from the pre-refusal builds.
 ///
 /// Pure (returns the string incl. its trailing newline, or Go's refusal) → unit-testable.
 fn format_lock_log(
@@ -8993,8 +9001,10 @@ fn format_lock_log(
             })
             .collect();
         let mut root = Map::new();
-        // Go's `ResponseEnvelope.SchemaVersion` — a string, as upstream types it.
-        root.insert("SchemaVersion".into(), json!("1"));
+        // Go's `ResponseEnvelope.SchemaVersion` — a string, as upstream types it — but carrying this
+        // fork's schema name rather than Go's `"1"`. The document below is not Go's version 1, so it
+        // must not answer `"1"` to a script that pinned Go's.
+        root.insert("SchemaVersion".into(), json!("tailscaled-rs.1"));
         root.insert("enabled".into(), json!(r.enabled));
         root.insert("entries".into(), Value::Array(entries));
         return Ok(format!(
@@ -9002,15 +9012,10 @@ fn format_lock_log(
             serde_json::to_string_pretty(&root).unwrap_or_else(|_| "{}".to_string())
         ));
     }
-    // Nothing to list, but the lock IS on: Go's loop simply prints nothing here, which would leave an
-    // operator unable to tell "no history" from "command did nothing". Say which it is.
-    if r.entries.is_empty() {
-        return Ok(
-            "Tailnet Lock is ENABLED, but no update-chain history has synced to this node \
-                yet.\n\n"
-                .to_string(),
-        );
-    }
+    // Lock on but nothing synced: Go's `printTailnetLockLog` ranges over an empty slice and returns,
+    // so it prints nothing at all. Nothing here either — the loop below is simply empty. The silence
+    // is not ambiguous: the lock-disabled node has already exited non-zero above, so "exit 0 with no
+    // output" can only mean "lock on, no update-chain history synced to this node".
     let mut out = String::new();
     for e in &r.entries {
         // The change kind and hash are engine-produced (a fixed AUM-kind string; our own base32 of a
@@ -17282,8 +17287,20 @@ mod tests {
 
         let j = format_lock_log(&report, parse_json_schema_version("1").unwrap()).unwrap();
         let v: serde_json::Value = serde_json::from_str(&j).unwrap();
-        // Go's `jsonoutput.ResponseEnvelope` field, so a script can pin the schema it parses.
-        assert_eq!(v["SchemaVersion"], serde_json::json!("1"));
+        // Go's `jsonoutput.ResponseEnvelope` field, so a script can pin the schema it parses — but
+        // naming this fork's schema. The document below is `enabled` + `entries`, not Go's
+        // `Messages` of expanded AUMs, so claiming Go's `"1"` would hand a consumer a version string
+        // it can only misread.
+        assert_eq!(v["SchemaVersion"], serde_json::json!("tailscaled-rs.1"));
+        assert_ne!(
+            v["SchemaVersion"],
+            serde_json::json!("1"),
+            "this document is not upstream `PrintTailnetLockLogJSONV1`'s schema 1 and must not \
+             claim to be"
+        );
+        // The corollary: none of Go's schema-1 key names may appear on a document that cannot fill
+        // them.
+        assert!(v.get("Messages").is_none(), "{v}");
         assert_eq!(v["enabled"], serde_json::json!(true));
         assert_eq!(v["entries"].as_array().unwrap().len(), 2);
         assert_eq!(v["entries"][0]["hash"], serde_json::json!("AAAAQ"));
@@ -17314,25 +17331,26 @@ mod tests {
         }
     }
 
-    /// Lock on, but this node has synced no chain yet: Go's loop prints nothing at all, which reads
-    /// the same as a command that did nothing. Say which empty this is.
+    /// Lock on, but this node has synced no chain yet: Go's `printTailnetLockLog` ranges over an
+    /// empty slice and returns, printing nothing at all. Print nothing too — a node whose lock is off
+    /// has already been refused with a non-zero exit, so empty stdout on success already says "lock
+    /// on, no history" without a line Go never emits.
     #[test]
-    fn format_lock_log_enabled_but_unsynced_says_so() {
+    fn format_lock_log_enabled_but_unsynced_prints_nothing() {
         use tailscaled_rs::localapi::LockLogReport;
         let on_but_empty = LockLogReport {
             enabled: true,
             entries: vec![],
         };
         let h = format_lock_log(&on_but_empty, JsonSchemaVersion::default()).unwrap();
-        assert!(h.starts_with("Tailnet Lock is ENABLED,"), "{h}");
-        assert!(h.contains("no update-chain history has synced"), "{h}");
+        assert_eq!(h, "", "Go prints no stanzas and no commentary here");
         // JSON stays a well-formed, envelope-carrying object with an empty list (no null, no bare
         // array).
         let v: serde_json::Value = serde_json::from_str(
             &format_lock_log(&on_but_empty, parse_json_schema_version("1").unwrap()).unwrap(),
         )
         .unwrap();
-        assert_eq!(v["SchemaVersion"], serde_json::json!("1"));
+        assert_eq!(v["SchemaVersion"], serde_json::json!("tailscaled-rs.1"));
         assert_eq!(v["entries"], serde_json::json!([]));
     }
 
