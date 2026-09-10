@@ -8012,6 +8012,16 @@ enum CertDomainHint {
 /// all when the status could not be read, "not running" when it is down, and otherwise either the
 /// tailnet has no cert domains, has exactly one (name it, so the operator can copy it), or has several
 /// (list them Go-style, `%q` of a `[]string` → `["a" "b"]`). Pure → unit-testable.
+///
+/// Go writes each arm into a `bytes.Buffer` with ONE leading newline and appends the buffer to the
+/// usage line (`fmt.Errorf("Usage: tailscale cert [flags] <domain>%s", hint.Bytes())`), so the hint
+/// lands on the line directly below it — no blank line between them. This does the same.
+///
+/// DIVERGENCE, deliberate, in one sentence: Go's not-running arm reads "Tailscale is not running.".
+/// This fork's binaries are `tnet`/`tailnetd`, and it uses that name nominatively only (see
+/// `README.md`), so the arm names what the check actually tested — the backend state, not the
+/// process, since the daemon answered — the same way [`run_configure_kubeconfig`] renders Go's
+/// `errors.New("Tailscale is not running")`. The other three arms are Go's text verbatim.
 fn cert_usage_message(err: CertUsageError, hint: &CertDomainHint) -> String {
     match err {
         CertUsageError::TooManyServeDemoArgs => {
@@ -8022,17 +8032,17 @@ fn cert_usage_message(err: CertUsageError, hint: &CertDomainHint) -> String {
             match hint {
                 CertDomainHint::Unknown => {}
                 CertDomainHint::NotRunning => {
-                    msg.push_str("\n\nThe node is not running.\n");
+                    msg.push_str("\nThe node is not running.\n");
                 }
                 CertDomainHint::Domains(domains) => match domains.as_slice() {
                     [] => msg.push_str(
-                        "\n\nHTTPS cert support is not enabled/configured for your tailnet.\n",
+                        "\nHTTPS cert support is not enabled/configured for your tailnet.\n",
                     ),
-                    [only] => msg.push_str(&format!("\n\nFor domain, use {only:?}.\n")),
+                    [only] => msg.push_str(&format!("\nFor domain, use {only:?}.\n")),
                     many => {
                         let quoted: Vec<String> = many.iter().map(|d| format!("{d:?}")).collect();
                         msg.push_str(&format!(
-                            "\n\nValid domain options: [{}].\n",
+                            "\nValid domain options: [{}].\n",
                             quoted.join(" ")
                         ));
                     }
@@ -24804,30 +24814,27 @@ users:
             usage(CertDomainHint::Unknown),
             "Usage: tnet cert [flags] <domain>"
         );
-        // The four hints Go builds, in Go's words.
-        assert!(
-            usage(CertDomainHint::NotRunning).ends_with("\n\nThe node is not running.\n"),
-            "{}",
-            usage(CertDomainHint::NotRunning)
+        // The four hints Go builds, in Go's words and Go's shape: ONE newline joins the hint to the
+        // usage line, because Go writes `\n` per arm into the buffer it appends. Whole-message
+        // equality, so a blank line creeping back in between the two fails here.
+        assert_eq!(
+            usage(CertDomainHint::NotRunning),
+            "Usage: tnet cert [flags] <domain>\nThe node is not running.\n"
         );
-        assert!(
-            usage(domains(&[]))
-                .ends_with("\n\nHTTPS cert support is not enabled/configured for your tailnet.\n"),
-            "{}",
-            usage(domains(&[]))
+        assert_eq!(
+            usage(domains(&[])),
+            "Usage: tnet cert [flags] <domain>\nHTTPS cert support is not enabled/configured for \
+             your tailnet.\n"
         );
-        assert!(
-            usage(domains(&["host.user.ts.net"]))
-                .ends_with("\n\nFor domain, use \"host.user.ts.net\".\n"),
-            "{}",
-            usage(domains(&["host.user.ts.net"]))
+        assert_eq!(
+            usage(domains(&["host.user.ts.net"])),
+            "Usage: tnet cert [flags] <domain>\nFor domain, use \"host.user.ts.net\".\n"
         );
         // Go's `%q` of a []string: bracketed, space-separated, quoted.
-        assert!(
-            usage(domains(&["a.user.ts.net", "b.user.ts.net"]))
-                .ends_with("\n\nValid domain options: [\"a.user.ts.net\" \"b.user.ts.net\"].\n"),
-            "{}",
-            usage(domains(&["a.user.ts.net", "b.user.ts.net"]))
+        assert_eq!(
+            usage(domains(&["a.user.ts.net", "b.user.ts.net"])),
+            "Usage: tnet cert [flags] <domain>\nValid domain options: [\"a.user.ts.net\" \
+             \"b.user.ts.net\"].\n"
         );
         // Every hint keeps Go's usage line first.
         for hint in [
