@@ -72,19 +72,24 @@ fn is_path_relevant(addr: &IpAddr) -> bool {
         // IPv6 link-local (`fe80::/10`) is per-interface housekeeping, not a routable path signal.
         IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) == 0xfe80 => false,
         // Our own tailnet overlay address — a consequence of engine state, not a host-path change.
-        // CGNAT 100.64.0.0/10: first octet 100, second octet's top 2 bits == 0b01 (64..=127).
-        IpAddr::V4(v4) if v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 0x40 => false,
-        // Tailscale ULA fd7a:115c:a1e0::/48 — match the full /48 prefix (all three leading
-        // segments), not just /32, so an unrelated underlay ULA in fd7a:115c::/32 isn't over-filtered.
-        IpAddr::V6(v6)
-            if v6.segments()[0] == 0xfd7a
-                && v6.segments()[1] == 0x115c
-                && v6.segments()[2] == 0xa1e0 =>
-        {
-            false
-        }
+        IpAddr::V4(v4) if is_tailnet_v4(v4) => false,
+        IpAddr::V6(v6) if is_tailnet_v6(v6) => false,
         _ => true,
     }
+}
+
+/// Whether an IPv4 address is inside Tailscale's CGNAT range `100.64.0.0/10` — i.e. the engine's own
+/// overlay address rather than a host underlay one. First octet 100, second octet's top 2 bits
+/// `0b01` (64..=127).
+fn is_tailnet_v4(v4: &std::net::Ipv4Addr) -> bool {
+    v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 0x40
+}
+
+/// Whether an IPv6 address is inside Tailscale's ULA range `fd7a:115c:a1e0::/48`. Matched on the full
+/// /48 prefix (all three leading segments), not just /32, so an unrelated underlay ULA in
+/// `fd7a:115c::/32` isn't over-filtered.
+fn is_tailnet_v6(v6: &std::net::Ipv6Addr) -> bool {
+    v6.segments()[0] == 0xfd7a && v6.segments()[1] == 0x115c && v6.segments()[2] == 0xa1e0
 }
 
 /// Snapshot the host's current interface addresses (the live [`LinkSnapshot::from_addrs`] source).
@@ -97,6 +102,104 @@ pub(super) fn snapshot() -> LinkSnapshot {
         Err(e) => {
             tracing::warn!(error = %e, "linkmon: failed to enumerate interfaces; treating as empty snapshot");
             LinkSnapshot::default()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// "Is the host's network up at all?" — the input behind Go's `network-status` warnable.
+//
+// Go's health tracker is told this by the link monitor: `ipnlocal` feeds every link change to
+// `health.Tracker.SetAnyInterfaceUp` (health/health.go), which raises `NetworkStatusWarnable`
+// ("network-status", `ImpactsConnectivity: true`, health/warnings.go) while it is false. The answer
+// itself is `netmon.State.AnyInterfaceUp` (net/netmon/state.go) — `HaveV4 || HaveV6` over the
+// *usable* addresses of the host's up, non-Tailscale interfaces.
+//
+// THIS MODULE ANSWERS TWO NEIGHBOURING QUESTIONS, and they are deliberately not the same:
+//
+//   * [`is_path_relevant`] above — "did the set of addresses magicsock could bind to change?". It
+//     keeps an APIPA address, because a DHCP failure IS a host-path change worth re-binding on.
+//   * [`any_interface_up_from`] below — Go's narrower "could this address conceivably carry Internet
+//     traffic at all?", which drops APIPA and gates on the interface being up.
+//
+// [`NetworkState`]'s `HaveV4`/`HaveV6` (the `debug --ifconfig` dump and `bugreport --diagnose`) are
+// computed with the FIRST filter, so they are the looser answer; only the captive-portal trigger
+// uses the second. That is a real divergence from Go, which computes `HaveV4`/`HaveV6` with
+// `isUsableV4`/`isUsableV6` — see the note on those fields.
+// ---------------------------------------------------------------------------------------------
+
+/// Whether the host has any interface that could conceivably reach the Internet — Go
+/// `netmon.State.AnyInterfaceUp` (`net/netmon/state.go`), which is `HaveV4 || HaveV6` computed by
+/// running every non-loopback address of every **up**, non-Tailscale interface through Go's
+/// `isUsableV4`/`isUsableV6`.
+///
+/// Pure, so the whole truth table is unit-testable on a host whose real interfaces are unknown (and
+/// without opening a socket). Each item is one interface address paired with whether its interface
+/// is up; addresses on a down interface are skipped, which is Go's `if !ifUp { return }` gate before
+/// the address walk. The gate is explicit because enumeration does *not* imply it: `if_addrs` yields
+/// an entry for every address `getifaddrs` reports, down interfaces included — a `NO-CARRIER` NIC
+/// keeps its configured address, and without the gate that address would read as Internet access.
+///
+/// One honest difference in that flag, in a named direction: Go's `ni.IsUp()` is `IFF_UP` (admin
+/// state), while the only up-ness `if_addrs` exposes is `Interface::is_oper_up()`, an RFC 2863
+/// operational status it derives on POSIX from `IFF_RUNNING` (carrier). Since a kernel sets
+/// `IFF_RUNNING` only on an interface that is already `IFF_UP`, this is the *stricter* of the two:
+/// an administratively-up but carrier-down NIC counts as up for Go and as down here, and there is no
+/// case that goes the other way. So this daemon can call a network down that Go would not — which
+/// costs one probe that fails locally — and it cannot miss an outage Go would see.
+///
+/// Go's "skip the Tailscale interface" step is done here by address range instead of by interface
+/// name (the overlay's addresses are exactly the two Tailscale ranges), which reaches the same answer
+/// without depending on what the platform happens to call the tun device.
+pub(super) fn any_interface_up_from(addrs: impl IntoIterator<Item = (IpAddr, bool)>) -> bool {
+    addrs
+        .into_iter()
+        .filter(|(_, up)| *up)
+        .any(|(addr, _)| is_usable_v4(&addr) || is_usable_v6(&addr))
+}
+
+/// Go `netmon.isUsableV4`: an IPv4 address that could conceivably provide Internet connectivity.
+/// Globally routable and private addresses always count; loopback never does; link-local `169.254/16`
+/// counts only inside the two cloud environments Go names (`hostinfo.AWSLambda`,
+/// `hostinfo.AzureAppService`), and this daemon has no `hostinfo` env-type probe, so it takes Go's
+/// default arm — not usable. Our own tailnet CGNAT address is excluded here, standing in for Go's
+/// skip of the whole Tailscale interface.
+fn is_usable_v4(addr: &IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_link_local() && !is_tailnet_v4(v4),
+        IpAddr::V6(_) => false,
+    }
+}
+
+/// Go `netmon.isUsableV6`: a global-unicast IPv6 address (`2000::/3`), or a Unique Local Address
+/// (`fc00::/7`, which some environments route with address translation) that is not inside
+/// Tailscale's own ULA range. Everything else — link-local, loopback, the overlay's own ULA — is not
+/// a sign the host has Internet.
+fn is_usable_v6(addr: &IpAddr) -> bool {
+    match addr {
+        IpAddr::V6(v6) => {
+            let global_unicast = (v6.segments()[0] & 0xe000) == 0x2000;
+            let ula = (v6.segments()[0] & 0xfe00) == 0xfc00;
+            global_unicast || (ula && !is_tailnet_v6(v6))
+        }
+        IpAddr::V4(_) => false,
+    }
+}
+
+/// Snapshot whether the live host has any usable interface (the [`any_interface_up_from`] source).
+///
+/// `None` means *unknown*, not "down": an enumeration failure is not evidence that the network is
+/// gone, and Go's tracker treats an `anyInterfaceUp` it was never told about as healthy (its
+/// `anyInterfaceUp` is an `opt.Bool`, and `selfCheckLocked` raises `NetworkStatusWarnable` only for a
+/// value that was set and is false). The caller must read `None` the same way.
+pub(super) fn any_interface_up() -> Option<bool> {
+    match if_addrs::get_if_addrs() {
+        Ok(ifaces) => Some(any_interface_up_from(
+            ifaces.into_iter().map(|i| (i.ip(), i.is_oper_up())),
+        )),
+        Err(e) => {
+            tracing::warn!(error = %e, "linkmon: failed to enumerate interfaces; network status unknown");
+            None
         }
     }
 }
@@ -172,11 +275,20 @@ pub(crate) struct NetworkState {
     /// Per-interface metadata, keyed by interface name (Go's `Interface map[string]Interface`).
     #[serde(rename = "Interface")]
     interfaces: BTreeMap<String, InterfaceInfo>,
-    /// Whether the host has a usable IPv4 path — computed over the FILTERED set, like Go's, so the
+    /// Whether the host has a usable IPv4 path — computed over the [`is_path_relevant`] set, so the
     /// node's own tailnet address never makes an offline host look v4-connected.
+    ///
+    /// NOT the same predicate as Go's: upstream computes `HaveV4` with `netmon.isUsableV4` over the
+    /// host's **up** interfaces, which this module also ports, separately, as
+    /// [`any_interface_up_from`] for the captive-portal trigger. This one is the looser,
+    /// rebind-filtered answer, and it says `true` in two cases Go says `false`: an APIPA
+    /// (`169.254/16`) address, and an address on an interface that is down. Reconciling the two
+    /// changes this dump's JSON and a `bugreport --diagnose` line, so it is left to its own change
+    /// rather than smuggled into the trigger's.
     #[serde(rename = "HaveV4")]
     have_v4: bool,
-    /// Whether the host has a usable IPv6 path (filtered set, as `HaveV4`).
+    /// Whether the host has a usable IPv6 path (the [`is_path_relevant`] set, as `HaveV4`, and with
+    /// the same divergence from Go's `isUsableV6` — see [`have_v4`](Self::have_v4)).
     #[serde(rename = "HaveV6")]
     have_v6: bool,
     /// The path signal the monitor diffs. Not a Go field — see the type docs.
@@ -295,8 +407,8 @@ impl NetworkState {
         self.interfaces.keys().map(String::as_str).collect()
     }
 
-    /// Whether the host has a usable IPv4 underlay path — the FILTERED answer (see the field docs),
-    /// so the node's own overlay address never makes an offline host look connected.
+    /// Whether the host has a usable IPv4 underlay path — the rebind-filtered answer, which is
+    /// looser than Go's `HaveV4` and than [`any_interface_up_from`] (see the field docs).
     pub(crate) fn have_v4(&self) -> bool {
         self.have_v4
     }
@@ -423,6 +535,114 @@ mod tests {
         // Smoke test: enumerating the test host's interfaces returns a snapshot without panicking
         // (the result content is host-dependent, so only the no-panic + total-fn contract is asserted).
         let _ = snapshot();
+    }
+
+    // --- Go's `netmon.State.AnyInterfaceUp` (the `network-status` warnable's input) -------------
+
+    /// One address on an interface that is up — the ordinary case, so a test that is not about the
+    /// up flag does not have to spell it out.
+    fn up(addr: IpAddr) -> (IpAddr, bool) {
+        (addr, true)
+    }
+
+    #[test]
+    fn a_host_with_a_usable_address_has_its_network_up() {
+        // Go `isUsableV4`: globally routable and private IPv4 both count.
+        assert!(any_interface_up_from([up(v4(192, 0, 2, 5))]));
+        assert!(any_interface_up_from([up(v4(10, 0, 0, 7))]));
+        // Go `isUsableV6`: global unicast `2000::/3`, and a ULA outside Tailscale's own range.
+        assert!(any_interface_up_from([up("2001:db8::1".parse().unwrap())]));
+        assert!(any_interface_up_from([up("fd00::1".parse().unwrap())]));
+        // One usable address among unusable ones is enough — Go ORs across every address.
+        assert!(any_interface_up_from([
+            up(IpAddr::from([127, 0, 0, 1])),
+            up(v4(169, 254, 3, 4)),
+            up(v4(203, 0, 113, 9)),
+        ]));
+    }
+
+    #[test]
+    fn a_host_with_nothing_usable_has_its_network_down() {
+        // Each of these is a case Go's `isUsableV4`/`isUsableV6` rejects, so a host that has only
+        // these is `!AnyInterfaceUp()` — which is what raises `network-status` and, in `Running`,
+        // makes captive-portal detection worth running.
+        assert!(
+            !any_interface_up_from([]),
+            "no addresses at all: the network is down"
+        );
+        assert!(
+            !any_interface_up_from([up(IpAddr::from([127, 0, 0, 1])), up("::1".parse().unwrap())]),
+            "loopback is never evidence of Internet access"
+        );
+        assert!(
+            !any_interface_up_from([up(v4(169, 254, 12, 34))]),
+            "an APIPA address means DHCP failed; Go counts it only inside AWS Lambda / Azure App \
+             Service, and this daemon has no env-type probe, so it takes Go's default arm"
+        );
+        assert!(
+            !any_interface_up_from([up("fe80::1".parse().unwrap())]),
+            "IPv6 link-local is per-interface housekeeping, not a path"
+        );
+        assert!(
+            !any_interface_up_from([up(v4(100, 101, 102, 103))]),
+            "our own tailnet CGNAT address is the overlay, not the underlay it rides on — Go skips \
+             the whole Tailscale interface for the same reason"
+        );
+        assert!(
+            !any_interface_up_from([up("fd7a:115c:a1e0::1".parse().unwrap())]),
+            "and the same for the tailnet ULA, which Go excludes by range inside isUsableV6"
+        );
+    }
+
+    #[test]
+    fn an_address_on_a_down_interface_is_not_evidence_of_internet() {
+        // Go gates the whole interface before it looks at any address: `if !ifUp || ... { return }`
+        // (net/netmon/state.go, `getState`). Enumeration does not imply it — `if_addrs` reports an
+        // interface that still holds its configured address after `ip link set eth0 down`, and a
+        // carrier-down NIC with a static address likewise — so the flag has to be checked here.
+        let routable = v4(203, 0, 113, 9);
+        assert!(
+            !any_interface_up_from([(routable, false)]),
+            "a routable address on a down interface is not a path to the Internet"
+        );
+        assert!(
+            any_interface_up_from([(routable, true)]),
+            "the same address on an up interface is"
+        );
+        // And the gate is per interface, not all-or-nothing: one up interface with a usable address
+        // is enough however many down ones are enumerated beside it.
+        assert!(
+            any_interface_up_from([
+                (v4(192, 0, 2, 5), false),
+                (v4(198, 51, 100, 7), false),
+                (v4(10, 0, 0, 7), true),
+            ]),
+            "one up, usable interface is Go's `HaveV4 || HaveV6`"
+        );
+    }
+
+    #[test]
+    fn the_usable_address_test_is_stricter_than_the_rebind_signal() {
+        // The two filters in this module answer different questions and must not be collapsed: an
+        // APIPA address IS a host-path change worth rebinding on — and is also what
+        // `NetworkState::HaveV4` is computed over — while it is NOT a sign the host can reach the
+        // Internet. A node in exactly that state is one upstream probes for a portal.
+        let apipa = v4(169, 254, 12, 34);
+        assert!(
+            is_path_relevant(&apipa),
+            "the rebind signal keeps APIPA: the path changed"
+        );
+        assert!(
+            !any_interface_up_from([up(apipa)]),
+            "Go's usable-address test drops it: there is no Internet here"
+        );
+    }
+
+    #[test]
+    fn live_network_status_does_not_panic() {
+        // Smoke test only — the answer is host-dependent (and `None` on a host whose interfaces
+        // cannot be enumerated), so just pin that the live reader is total and opens no socket.
+        let _ = any_interface_up();
     }
 
     // --- the `tailnetd debug --ifconfig` / `--monitor` renderer -------------------------------

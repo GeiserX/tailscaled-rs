@@ -43,13 +43,12 @@
 //!   path rather than fabricating a per-interface bind the HTTP client cannot do.
 //! - **No `captiveportal_detected` client metric.** Go bumps a `clientmetric` counter; this daemon
 //!   has no client-metric registry of its own (`tnet metrics` proxies the engine's).
-//! - **One connectivity signal instead of a health tracker.** Go probes while *any* warnable with
-//!   `ImpactsConnectivity` is unhealthy. This fork has no health tracker, so
-//!   [`Backend::connectivity_impacted`](super::Backend) reads the single connectivity fact the engine
-//!   publishes — the net report names no reachable DERP region — which is what Go registers as
-//!   `no-derp-home` (`health/warnings.go`) and the warnable a portal actually trips, since the portal
-//!   answers the relay connections itself. The *state* the trigger runs in is Go's unchanged:
-//!   `Running`, and only `Running`.
+//! - **Two connectivity signals instead of a health tracker.** Go probes while *any* registered
+//!   warnable with `ImpactsConnectivity` — other than the captive-portal warnable itself — is
+//!   unhealthy. This fork has no health tracker, so [`ConnectivityWarnable`] enumerates that set
+//!   directly: the two members whose inputs this daemon can observe are `network-status` and
+//!   `no-derp-home`, and the three it cannot (or must not) observe are named there with their
+//!   reasons. The *state* the trigger runs in is Go's unchanged: `Running`, and only `Running`.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -89,14 +88,125 @@ pub(super) const DETECTION_INTERVAL: Duration = Duration::from_secs(2);
 /// (`health/warnings.go`: *"Tailscale could not connect to any relay server"*, `ImpactsConnectivity:
 /// true`, `TimeToVisible: 10 * time.Second`).
 ///
-/// That warnable is the one this fork stands in for: with no health tracker, "the engine measured no
-/// reachable DERP region" is the observable that Go turns into `no-derp-home`, and Go only feeds it
-/// to captive-portal detection once it has been unhealthy for this long. Honouring the same delay
-/// keeps a node whose *first* DERP measurement simply has not landed yet — an empty report on a
-/// freshly-`Running` node is indistinguishable from a dead one — from probing on every bring-up.
+/// That warnable is one of the two this fork observes (see [`ConnectivityWarnable`]): with no health
+/// tracker, "the engine measured no reachable DERP region" is the observable that Go turns into
+/// `no-derp-home`, and Go only feeds it to captive-portal detection once it has been unhealthy for
+/// this long. Honouring the same delay keeps a node whose *first* DERP measurement simply has not
+/// landed yet — an empty report on a freshly-`Running` node is indistinguishable from a dead one —
+/// from probing on every bring-up.
 /// Go's [`DETECTION_INTERVAL`] is then spent on top, exactly as it is upstream, where the health
 /// change arrives at the loop only after the warnable becomes visible.
 pub(super) const NO_DERP_HOME_TIME_TO_VISIBLE: Duration = Duration::from_secs(10);
+
+/// How long "the host has no interface that could reach the Internet" must persist before it counts
+/// as a connectivity problem — Go `health.NetworkStatusWarnable`'s `TimeToVisible`
+/// (`health/warnings.go`: `Code: tsconst.HealthWarnableNetworkStatus` = `"network-status"`, `Text:
+/// StaticMessage("Tailscale cannot connect because the network is down. Check your Internet
+/// connection.")`, `ImpactsConnectivity: true`, `TimeToVisible: 5 * time.Second`).
+pub(super) const NETWORK_STATUS_TIME_TO_VISIBLE: Duration = Duration::from_secs(5);
+
+/// One of Go's `ImpactsConnectivity` warnables, as an observable this daemon actually has.
+///
+/// Upstream's captive-portal extension does not watch a single fact. It walks the whole health
+/// tracker and probes while **any** registered warnable with `ImpactsConnectivity` — other than
+/// `captivePortalWarnable` itself — is unhealthy (`feature/captiveportal/captiveportal.go`,
+/// `Extension.onHealthChange`: `if w.ImpactsConnectivity && w.WarnableCode !=
+/// captivePortalWarnable.Code`). This fork has no health tracker, so the set is enumerated here
+/// instead: one variant per such warnable whose input the daemon can observe at this pin. Go's
+/// "except the captive-portal warnable" exclusion is structural — `captive-portal-detected` is this
+/// loop's *output*, so it is not a member and can never re-trigger the loop that raised it.
+///
+/// `health/warnings.go` (read at upstream `53a0d659afa51835dd7a9283873cca44261454f8`, as is every
+/// health fact quoted in this file) registers exactly five warnables with `ImpactsConnectivity: true`:
+/// `network-status`, `no-derp-home`, `no-derp-connection`, `no-udp4-bind` and `ip-forwarding-off`.
+/// Three are **not** here, each for a stated reason rather than by omission:
+///
+/// - `no-derp-connection` ("Relay server unavailable") and `no-udp4-bind` ("NAT traversal setup
+///   failure") are magicsock/DERP-client facts. The engine at this pin publishes no health signal for
+///   either — [`Device::netcheck`](tailscale::Device::netcheck) reports measured region latencies,
+///   not whether the home relay's connection is actually established, nor whether the UDP bind
+///   succeeded — so they are engine-side, and are not faked from something else.
+/// - `ip-forwarding-off` (that is the literal `Code` in `health/warnings.go`, which spells this one
+///   out rather than taking it from `tsconst`) is deliberately left out even though the daemon *can*
+///   compute it ([`crate::ipforward::forwarding_warning`]). It is a **steady** condition on a node
+///   whose network is otherwise fine: a misconfigured subnet router keeps it unhealthy indefinitely.
+///   Upstream is event-driven — it probes on a health *change* — so a permanently-unhealthy warnable
+///   costs it nothing, whereas this fork polls ([`RECHECK_INTERVAL`]) and would send real HTTP
+///   requests to tailscale.com every 30s, forever, over a working network. That second half is the
+///   part that decides it: `network-status` is steady too, but a node with no usable address fails
+///   its probe locally and instantly, so a stuck episode there costs a log line rather than
+///   outbound traffic. Including `ip-forwarding-off` would copy the letter of Go's loop and break its
+///   behaviour.
+///
+/// The declaration order is Go's dependency order, root cause first — see
+/// [`depends_on`](Self::depends_on).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum ConnectivityWarnable {
+    /// Go `health.NetworkStatusWarnable` (`"network-status"`): the host has no interface that could
+    /// carry Internet traffic. Upstream's input is `health.Tracker.SetAnyInterfaceUp`, fed from the
+    /// link monitor; here it is [`linkmon::any_interface_up`](super::linkmon::any_interface_up).
+    NetworkStatus,
+    /// Go `health.noDERPHomeWarnable` (`"no-derp-home"`): this node could not connect to any relay
+    /// server. The engine's net report naming no reachable DERP region is the same fact, and it is
+    /// the warnable a portal trips most directly, since the portal answers the relay connections
+    /// itself.
+    NoDerpHome,
+}
+
+impl ConnectivityWarnable {
+    /// Every member, in Go's dependency order (a warnable never precedes the one it depends on).
+    pub(super) const ALL: [Self; 2] = [Self::NetworkStatus, Self::NoDerpHome];
+
+    /// The warnable's Go `Code` — the stable identifier `health/warnings.go` registers it under.
+    /// Logged when the loop probes, so the daemon log names *which* connectivity fact triggered the
+    /// probe rather than only that something did.
+    pub(super) const fn code(self) -> &'static str {
+        match self {
+            Self::NetworkStatus => "network-status",
+            Self::NoDerpHome => "no-derp-home",
+        }
+    }
+
+    /// The warnable this one is suppressed by — Go's `Warnable.DependsOn`. Upstream hides a warnable
+    /// whose dependency is unhealthy, "to not spam users with multiple warnings when only the root
+    /// cause is relevant" (`health/state.go`, `isEffectivelyHealthyLocked`), and `CurrentState`
+    /// applies that filter *before* the captive-portal extension sees `state.Warnings`. So the
+    /// suppression is part of the trigger, not cosmetics: while the host network is down,
+    /// `no-derp-home` is not one of the warnings upstream's loop reacts to.
+    ///
+    /// Go's field is a slice and its check is recursive. Here the graph is one edge deep —
+    /// `noDERPHomeWarnable`'s `DependsOn` is exactly `[]*Warnable{NetworkStatusWarnable}`, and
+    /// `NetworkStatusWarnable` depends on nothing — so a single optional parent says the same thing.
+    pub(super) const fn depends_on(self) -> Option<Self> {
+        match self {
+            Self::NetworkStatus => None,
+            Self::NoDerpHome => Some(Self::NetworkStatus),
+        }
+    }
+
+    /// The warnable's Go `TimeToVisible`: how long its condition must persist before the health
+    /// tracker shows it at all — and therefore before upstream's captive loop ever hears about it
+    /// (`health.Warnable.IsVisible`, and `setUnhealthyLocked`, which delays publishing the change
+    /// until the warnable becomes visible).
+    pub(super) const fn time_to_visible(self) -> Duration {
+        match self {
+            Self::NetworkStatus => NETWORK_STATUS_TIME_TO_VISIBLE,
+            Self::NoDerpHome => NO_DERP_HOME_TIME_TO_VISIBLE,
+        }
+    }
+
+    /// How long *this* warnable must have been unhealthy before the first probe of an episode: its
+    /// [`time_to_visible`](Self::time_to_visible), then Go's [`DETECTION_INTERVAL`] on top. Upstream
+    /// spends both — the health change only reaches the loop once the warnable becomes visible, and
+    /// the loop then sits on its own timer — so a warnable that becomes visible sooner also probes
+    /// sooner, which is why this is per-warnable and not one constant.
+    pub(super) const fn settle_time(self) -> Duration {
+        // `Duration + Duration` is not a const fn; add the parts instead.
+        Duration::from_nanos(
+            self.time_to_visible().as_nanos() as u64 + DETECTION_INTERVAL.as_nanos() as u64,
+        )
+    }
+}
 
 /// How long to wait before re-probing while connectivity *stays* impacted.
 ///
@@ -105,8 +215,8 @@ pub(super) const NO_DERP_HOME_TIME_TO_VISIBLE: Duration = Duration::from_secs(10
 /// 2s timer. This fork has no health-event bus (see `crate::localapi`'s note on the reduced `Notify`),
 /// so the loop polls instead — and a bare 2s poll would mean an unreachable-control node probes
 /// tailscale.com every two seconds forever. The first pass of an episode keeps Go's settle time
-/// ([`NO_DERP_HOME_TIME_TO_VISIBLE`] + [`DETECTION_INTERVAL`]); subsequent passes back off to this,
-/// which still notices a portal that appears while the node is already stuck.
+/// (the triggering warnable's [`ConnectivityWarnable::settle_time`]); subsequent passes back off to
+/// this, which still notices a portal that appears while the node is already stuck.
 pub(super) const RECHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The captive-portal loop's tick — how often it re-reads whether connectivity is impacted. Fine
