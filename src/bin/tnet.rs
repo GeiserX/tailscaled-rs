@@ -8019,6 +8019,12 @@ enum CertDomainHint {
 /// arms carry Go's sentences verbatim, "Tailscale is not running." included: it reports the backend
 /// state the same way [`is_running_or_starting`] and the `down` verb already do, and naming the
 /// protocol this fork speaks is the nominative use `README.md` describes.
+///
+/// The TRAILING newline on each arm is Go's too, and it is why the refusal closes with a blank line:
+/// Go's `main` (`cmd/tailscale/tailscale.go`) prints the returned error with
+/// `fmt.Fprintln(os.Stderr, err)`, which appends one more newline to a string that already ends in
+/// one. The caller here prints this with `eprintln!`, which does the same, so the rendered stderr
+/// matches Go's byte for byte after the `error: ` prefix every refusal in this binary carries.
 fn cert_usage_message(err: CertUsageError, hint: &CertDomainHint) -> String {
     match err {
         CertUsageError::TooManyServeDemoArgs => {

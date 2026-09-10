@@ -228,12 +228,16 @@ fn a_missing_domain_says_tailscale_is_not_running_when_the_daemon_says_so() {
 
     let err = stderr(&out);
     assert!(!out.status.success());
-    // Go joins hint to usage line with the single `\n` it writes per arm, so the two are adjacent
-    // lines. Matched together, and in Go's own sentence, so both a blank line between them and a
-    // reworded hint fail here.
-    assert!(
-        err.contains("Usage: tnet cert [flags] <domain>\nTailscale is not running.\n"),
-        "expected Go's not-running hint on the line below the usage line; got:\n{err}"
+    // The WHOLE of stderr, not a substring: only equality can see the spacing on BOTH sides of the
+    // hint. Go's arm is `"\nTailscale is not running.\n"` written into the buffer appended to the
+    // usage line, and Go's `main` prints the returned error with `fmt.Fprintln`, which adds one more
+    // newline after that trailing one — so Go's stderr is the usage line, the hint on the line
+    // directly below it, and a single blank line to close. This reproduces that byte for byte. The
+    // `error: ` prefix and the `tnet` command name are this fork's, shared by all 57 of its refusal
+    // sites; everything after the prefix is Go's.
+    assert_eq!(
+        err, "error: Usage: tnet cert [flags] <domain>\nTailscale is not running.\n\n",
+        "expected Go's not-running hint rendered exactly as `runCert`'s error renders"
     );
 }
 
