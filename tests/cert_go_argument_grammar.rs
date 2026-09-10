@@ -198,9 +198,13 @@ fn a_missing_domain_prints_gos_usage_line_and_the_tailnets_cert_domains() {
         err.contains("Usage: tnet cert [flags] <domain>"),
         "expected Go's usage line; got:\n{err}"
     );
+    // One newline joins the two, as Go's per-arm `\n` does.
     assert!(
-        err.contains(r#"Valid domain options: ["a.user.ts.net" "b.user.ts.net"]"#),
-        "expected Go's `%q` list of cert domains; got:\n{err}"
+        err.contains(concat!(
+            "Usage: tnet cert [flags] <domain>\n",
+            "Valid domain options: [\"a.user.ts.net\" \"b.user.ts.net\"].\n"
+        )),
+        "expected Go's `%q` list of cert domains below the usage line; got:\n{err}"
     );
     assert_eq!(
         served.len(),
@@ -216,7 +220,7 @@ fn a_missing_domain_prints_gos_usage_line_and_the_tailnets_cert_domains() {
 
 /// Go's other hint branch: a node that is not running has no cert domains to name.
 #[test]
-fn a_missing_domain_says_the_node_is_not_running_when_the_daemon_says_so() {
+fn a_missing_domain_says_tailscale_is_not_running_when_the_daemon_says_so() {
     let (socket, rx) = stub_daemon("down", &[r#"{"kind":"error","message":"node is not up"}"#]);
     let out = tnet_with(&socket, &["cert"]);
     let _ = requests(&rx);
@@ -224,10 +228,12 @@ fn a_missing_domain_says_the_node_is_not_running_when_the_daemon_says_so() {
 
     let err = stderr(&out);
     assert!(!out.status.success());
+    // Go joins hint to usage line with the single `\n` it writes per arm, so the two are adjacent
+    // lines. Matched together, and in Go's own sentence, so both a blank line between them and a
+    // reworded hint fail here.
     assert!(
-        err.contains("Usage: tnet cert [flags] <domain>")
-            && err.contains("The node is not running."),
-        "expected Go's not-running hint; got:\n{err}"
+        err.contains("Usage: tnet cert [flags] <domain>\nTailscale is not running.\n"),
+        "expected Go's not-running hint on the line below the usage line; got:\n{err}"
     );
 }
 
