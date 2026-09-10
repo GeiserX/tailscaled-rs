@@ -1,10 +1,20 @@
 //! `tailnetd --bird-socket <path>` must refuse *as a named refusal*, not die as an unknown argument.
 //!
 //! Go `tailscaled` ships `--bird-socket` for a subnet router that hands its advertised routes to a
-//! BIRD BGP daemon, and on a build with no BIRD hook linked in it refuses the flag loudly at startup
+//! BIRD BGP daemon, and when no BIRD hook is linked in it refuses the flag loudly at startup
 //! (`--bird-socket is not supported on %s`) rather than ignoring it. This fork has no BIRD
 //! integration at all — the toggle lives in the engine's reconfigure cycle and the `tailscale-rs`
 //! engine exposes no hook — so it is permanently in Go's "no hook" case and refuses the same way.
+//!
+//! Go reaches that fatal only under two guards, and this fork keeps one of them.
+//! `buildfeatures.HasBird` is `true` unless the binary was built with `ts_omit_bird`, so Go's
+//! *default* build is the one that declares the flag and refuses it; the build that never declares
+//! it dies with "flag provided but not defined", which is the failure this refusal exists to
+//! replace. The second guard, `!wgengine.HookNewBird.IsSet()`, is per-OS upstream
+//! (`feature/condregister/maybe_bird.go` registers the hook on
+//! `linux || darwin || freebsd || openbsd`), which is why Go's `%s` names `runtime.GOOS`. Here
+//! there is no hook on any platform, so the refusal is unconditional and its
+//! `%s` slot names the build rather than a GOOS an operator might try to switch to.
 //!
 //! The unit tests next to [`bird_socket_refusal`](../src/bin/tailnetd.rs) pin the decision function.
 //! What they cannot see is the surface an operator actually hits: whether clap accepts the flag at
@@ -65,9 +75,12 @@ fn bird_socket_path_refuses_with_a_named_reason() {
         stderr(&out)
     );
     let err = stderr(&out);
+    // Go's sentence, `on` and all — `--bird-socket is not supported on %s`. Asserted with the `on`
+    // so a message that drifts back to "not supported by tailnetd" stops carrying the upstream
+    // string and fails here.
     assert!(
-        err.contains("--bird-socket is not supported"),
-        "should refuse by name; got:\n{err}"
+        err.contains("--bird-socket is not supported on "),
+        "should refuse in Go's own wording; got:\n{err}"
     );
     assert!(
         err.contains("/run/bird.ctl"),
@@ -103,7 +116,7 @@ fn bird_socket_refusal_precedes_cleanup() {
         stderr(&out)
     );
     assert!(
-        stderr(&out).contains("--bird-socket is not supported"),
+        stderr(&out).contains("--bird-socket is not supported on "),
         "should be the bird refusal, not a cleanup result; got:\n{}",
         stderr(&out)
     );
@@ -140,5 +153,29 @@ fn empty_bird_socket_is_not_a_refusal() {
         String::from_utf8_lossy(&out.stdout).contains("cleanup: nothing to do"),
         "startup should have continued into --cleanup; stdout:\n{}",
         String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// Where Go's `%s` names `runtime.GOOS`, this one names the build, because the hook is missing on
+/// every platform this fork runs on. Checked through the real binary — whichever host the test
+/// suite is running on, the refusal must not name a platform, since "not supported on linux" would
+/// send an operator to try FreeBSD for a gap that follows them there.
+#[test]
+fn the_refusal_names_the_build_rather_than_the_host_platform() {
+    let out = tailnetd(&["--bird-socket", "/run/bird.ctl"]);
+    let err = stderr(&out);
+    let first_line = err
+        .lines()
+        .find(|line| line.contains("--bird-socket is not supported on "))
+        .unwrap_or_else(|| panic!("the refusal should be on stderr; got:\n{err}"));
+    for goos in ["linux", "darwin", "windows", "freebsd", "openbsd", "macos"] {
+        assert!(
+            !first_line.contains(goos),
+            "the refusal must not name a platform ({goos:?} found); got:\n{first_line}"
+        );
+    }
+    assert!(
+        first_line.contains("this platform or in this build of tailnetd"),
+        "should name the honest scope in Go's %s slot; got:\n{first_line}"
     );
 }

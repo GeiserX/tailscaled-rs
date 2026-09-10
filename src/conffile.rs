@@ -139,7 +139,9 @@ pub struct ConfigVAlpha {
     /// (Go `--exit-node-allow-lan-access`).
     #[serde(rename = "allowLANWhileUsingExitNode")]
     pub allow_lan_while_using_exit_node: Option<bool>,
-    /// HONORED → [`Prefs::advertise_routes`]. Subnet routes (CIDRs) to advertise.
+    /// HONORED → [`Prefs::advertise_routes`]. Subnet routes (CIDRs) to advertise. Each must be a
+    /// masked prefix — [`Config::apply_to_prefs`] refuses one with host bits set (`192.0.2.5/24`),
+    /// as Go's `ToPrefs` does.
     pub advertise_routes: Vec<String>,
     /// HONORED → [`Prefs::advertise_exit_node`]. Go `AdvertiseExitNode` — advertise this node as an
     /// exit node. It **composes** with [`advertise_routes`](ConfigVAlpha::advertise_routes) rather
@@ -476,9 +478,31 @@ impl Config {
                 other => bail!("config: ServerURL {url:?} scheme {other:?} is not http or https"),
             }
         }
+        // Routes are checked twice over: the CIDR must parse at all (Go gets that for free — its
+        // `AdvertiseRoutes` is a `[]netip.Prefix`, so a malformed entry dies in the JSON decode),
+        // and the prefix must be MASKED. Go's `ToPrefs` walks `c.AdvertiseRoutes` and, for every
+        // `route != route.Masked()`, joins `route %s has non-address bits set; expected %s`, then
+        // returns before a single pref is written. `"192.0.2.5/24"` parses happily as an `IpNet`
+        // that keeps its host bits, so without this the typo boots and the node advertises the
+        // route exactly as written instead of the `192.0.2.0/24` the operator meant. Same rule and
+        // same message as `Backend::check_prefs` applies on the `up`/`set` path, so the declarative
+        // and interactive paths refuse the same configs. Every offender is collected (Go
+        // `errors.Join`) rather than only the first: a headless deploy should learn about all its
+        // bad routes in one boot, not one per restart.
+        let mut route_errs: Vec<String> = Vec::new();
         for s in &c.advertise_routes {
-            s.parse::<ipnet::IpNet>()
+            let net = s
+                .parse::<ipnet::IpNet>()
                 .with_context(|| format!("config: invalid advertise route {s:?}"))?;
+            let masked = net.trunc();
+            if masked != net {
+                route_errs.push(format!(
+                    "config: route {s} has non-address bits set; expected {masked}"
+                ));
+            }
+        }
+        if !route_errs.is_empty() {
+            bail!("{}", route_errs.join("\n"));
         }
         if let Some(exit) = &c.exit_node {
             // The engine's `ExitNodeSelector::FromStr` is infallible (a non-IP string → a Name that
@@ -791,6 +815,52 @@ mod tests {
         let mut p2 = Prefs::default();
         assert!(c2.apply_to_prefs(&mut p2).is_ok());
         assert_eq!(p2.exit_node.as_deref(), Some("exit-node.tailnet.ts.net"));
+    }
+
+    #[test]
+    fn apply_refuses_advertise_routes_with_host_bits_set() {
+        // Go's `ToPrefs` walks `c.AdvertiseRoutes` and refuses every prefix that is not its own
+        // masked form (`route != route.Masked()` → `route %s has non-address bits set; expected
+        // %s`), returning before it writes a pref. `"192.0.2.5/24"` parses as a perfectly good
+        // `IpNet` that keeps its host bits, so this refusal is the only thing between an operator's
+        // typo and a node that advertises the route exactly as mistyped.
+        let c = cfg(r#"{"version":"alpha0","AdvertiseRoutes":
+                ["192.0.2.5/24","198.51.100.0/24","2001:db8::1/64"]}"#);
+        let mut p = Prefs {
+            advertise_routes: vec!["203.0.113.0/24".to_string()],
+            ..Prefs::default()
+        };
+        let before = p.clone();
+        let e = match c.apply_to_prefs(&mut p) {
+            Ok(_) => panic!("an advertised route with host bits set must be refused"),
+            Err(e) => e.to_string(),
+        };
+        // Every offender is named — Go joins them all rather than stopping at the first — and each
+        // names the masked form the operator meant.
+        assert!(
+            e.contains("route 192.0.2.5/24 has non-address bits set; expected 192.0.2.0/24"),
+            "{e}"
+        );
+        assert!(
+            e.contains("route 2001:db8::1/64 has non-address bits set; expected 2001:db8::/64"),
+            "{e}"
+        );
+        // The already-masked route in the same list is not complained about.
+        assert!(!e.contains("198.51.100.0/24"), "{e}");
+        // All-or-nothing, like every other field-level refusal here: nothing was written.
+        assert_eq!(p.advertise_routes, before.advertise_routes);
+        assert_eq!(p.want_running, before.want_running);
+
+        // Not over-eager: a single-address route is its own masked form, so it is accepted (Go
+        // too), as is a genuinely masked subnet.
+        let ok = cfg(r#"{"version":"alpha0","AdvertiseRoutes":
+                ["192.0.2.5/32","2001:db8::1/128","198.51.100.0/24"]}"#);
+        let mut p2 = Prefs::default();
+        ok.apply_to_prefs(&mut p2).unwrap();
+        assert_eq!(
+            p2.advertise_routes,
+            vec!["192.0.2.5/32", "2001:db8::1/128", "198.51.100.0/24"]
+        );
     }
 
     #[test]

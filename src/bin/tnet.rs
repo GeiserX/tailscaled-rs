@@ -494,24 +494,51 @@ enum Command {
         /// control of this node's prefs and LocalAPI to the tailnet admin, bypassing Tailscale's
         /// per-feature double opt-in. Refused by name — this fork's authorization model is local
         /// (THREAT_MODEL §4.1) and the control plane is not trusted to rewrite prefs or drive the
-        /// LocalAPI. `--no-remote-config` (Go's default) is what this build always does.
+        /// LocalAPI. Go's own off spelling, `--remote-config=false`, is accepted: it is what this
+        /// build always does, and `--no-remote-config` is this fork's spelling of it.
         //
         // `hide` mirrors Go, which registers both this and `--sync` with its `hidden` prefix — a
-        // faithful port keeps them off `--help` and lets the refusal do the explaining.
-        #[arg(long, hide = true, conflicts_with = "no_remote_config")]
-        remote_config: bool,
-        /// Do not delegate remote control of this node to the tailnet admin (Go
-        /// `--remote-config=false`). Accepted: it is what this build always does.
+        // faithful port keeps them off `--help` and lets the refusal do the explaining. Go registers
+        // both with `flag.BoolVar`, so a value can only arrive as `--remote-config=<v>`
+        // (`IsBoolFlag` never consumes the following argument) and its spellings are
+        // `strconv.ParseBool`'s: `num_args = 0..=1` + `require_equals` + `parse_go_bool` is that
+        // grammar, and it is what lets a command line ported from Go reach the refusal below
+        // instead of clap's "unexpected value".
+        #[arg(
+            long,
+            hide = true,
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "true",
+            value_name = "BOOL",
+            value_parser = parse_go_bool,
+            conflicts_with = "no_remote_config"
+        )]
+        remote_config: Option<bool>,
+        /// Do not delegate remote control of this node to the tailnet admin — this fork's spelling
+        /// of Go's `--remote-config=false`, which is accepted under Go's spelling too. Accepted: it
+        /// is what this build always does.
         #[arg(long, hide = true)]
         no_remote_config: bool,
         /// Actively sync configuration from the control plane (Go `--sync`, default true). Accepted:
-        /// it is what this build always does while up.
-        #[arg(long, hide = true, conflicts_with = "no_sync")]
-        sync: bool,
-        /// NOT SUPPORTED by this build (Go `--sync=false`): stop syncing configuration from the
-        /// control plane, Go's kill switch for exercising netmap caching and offline operation.
-        /// Refused by name — the pinned engine offers no way to stop the map poll while staying up
-        /// (engine ask #34).
+        /// it is what this build always does while up. Same `flag.BoolVar` grammar as
+        /// `--remote-config` above, so Go's `--sync=true` reaches the same acceptance and Go's
+        /// `--sync=false` the refusal below.
+        #[arg(
+            long,
+            hide = true,
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "true",
+            value_name = "BOOL",
+            value_parser = parse_go_bool,
+            conflicts_with = "no_sync"
+        )]
+        sync: Option<bool>,
+        /// NOT SUPPORTED by this build (Go `--sync=false`, which is accepted here as a spelling and
+        /// refused just the same): stop syncing configuration from the control plane, Go's kill
+        /// switch for exercising netmap caching and offline operation. Refused by name — the pinned
+        /// engine offers no way to stop the map poll while staying up (engine ask #34).
         #[arg(long, hide = true)]
         no_sync: bool,
         /// Pre-accept a named risk and skip its safety refusal (Go `--accept-risk`), e.g. `lose-ssh`
@@ -585,13 +612,21 @@ enum Command {
     /// is an **interactive login**: the node contacts control, reaches `NeedsLogin`, and the auth URL
     /// is printed for you to open in a browser; the node finishes connecting once you authorize it.
     /// With `--authkey`/`--authkey-file` (or `$TS_AUTH_KEY`) it registers non-interactively. Like Go's
-    /// `login`, this re-authenticates **without changing any prefs** — it is `up`'s auth half on its
-    /// own (use `tnet up <flags>` to also change settings). Brings the node up (sets want-running).
+    /// `login`, this re-authenticates **without changing any prefs** other than the profile name Go
+    /// gives `login` alone (`--nickname`) — it is `up`'s auth half on its own (use `tnet up <flags>`
+    /// to also change settings). Brings the node up (sets want-running).
     Login {
-        /// Pre-auth key for non-interactive login. Prefer `--authkey-file` or `$TS_AUTH_KEY` (a bare
-        /// `--authkey` is visible in `ps`/shell history). Precedence: `--authkey-file` > `--authkey` >
-        /// `$TS_AUTH_KEY`. With none of them, the login is interactive (an auth URL is printed).
-        #[arg(long, conflicts_with = "authkey_file")]
+        /// Pre-auth key for non-interactive login, or `file:<path>` to read the key from a file.
+        /// Prefer `--authkey-file` or `$TS_AUTH_KEY` (a bare `--authkey` is visible in `ps`/shell
+        /// history). Precedence: `--authkey-file` > `--authkey` > `$TS_AUTH_KEY`. With none of them,
+        /// the login is interactive (an auth URL is printed).
+        //
+        // `--auth-key` is Go's canonical spelling and it is registered for BOTH commands: `up.go`'s
+        // `newUpFlagSet` builds one flag set for `up` and `login`, and `cli.go`'s `CleanUpArgs`
+        // rewrites `--authkey` to `--auth-key` whatever the subcommand. So `tailscale login
+        // --auth-key=...` works upstream and must work here — the same alias, and the same `file:`
+        // handling (`resolve_authkey`), that `up` already carries.
+        #[arg(long, visible_alias = "auth-key", conflicts_with = "authkey_file")]
         authkey: Option<String>,
         /// Read the pre-auth key from a file (avoids argv/shell-history exposure). Takes precedence
         /// over `--authkey`.
@@ -602,6 +637,30 @@ enum Command {
         /// does, so unlike `up` this needs no `--force-reauth`.
         #[arg(long, value_name = "URL")]
         login_server: Option<String>,
+        /// Short name for this login profile (Go `login --nickname` / `ipn.Prefs.ProfileName`): the
+        /// name `tnet switch --list` prints and `tnet switch <NAME>` resolves against. Pass an EMPTY
+        /// value (`--nickname=`) to clear it; omitting the flag leaves it unchanged. This is a
+        /// `login` flag and not an `up` flag here for the reason it is upstream — `up.go` registers
+        /// it inside `if cmd == "login"`.
+        #[arg(long, value_name = "NAME")]
+        nickname: Option<String>,
+        /// Install host routes to other Tailscale nodes (Go `--host-routes`, hidden there too, and
+        /// registered for `login` as well as `up` because the flag set is shared). Accepted and
+        /// inert, exactly as on `tnet up`: `--host-routes=false` is refused with Go's own message —
+        /// see [`check_host_routes`].
+        //
+        // Same `notFalseVar` shape as `up`'s: bare `--host-routes` is the flag's presence (Go's
+        // `IsBoolFlag` never consumes the next argument) and a value can only arrive as
+        // `--host-routes=<v>`.
+        #[arg(
+            long,
+            hide = true,
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "true",
+            value_name = "true"
+        )]
+        host_routes: Option<String>,
     },
     /// Switch between profiles (separate accounts/tailnets), or list/remove them. Mirrors Go
     /// `tailscale switch`. Each profile keeps its own prefs + node key; switching tears down the
@@ -620,6 +679,22 @@ enum Command {
         /// message and the exit code are Go's rather than clap's.
         #[arg(long)]
         json: bool,
+        /// Create PROFILE as a new, empty profile and switch to it, instead of refusing a target
+        /// that names no existing profile.
+        ///
+        /// A fork extension with no upstream counterpart: Go creates a profile through an
+        /// interactive `tailscale login` (a verb this fork does not have yet — bead `tsd-91w`), and
+        /// its `switch` refuses an unknown name outright. Without this flag `tnet switch` refuses
+        /// too, so a typo can no longer disconnect the node into a profile nobody asked for; with
+        /// it, PROFILE must be a usable id (letters, digits, `-`, `_`) that does not already name a
+        /// profile by id or nickname. The new profile starts empty and logged out — run `tnet up`
+        /// to register it.
+        ///
+        /// It travels as its own LocalAPI command rather than a flag on the switch request, so a
+        /// daemon too old to know it refuses the request (`bad request`) instead of degrading it
+        /// into a plain switch — see [`switch_request`].
+        #[arg(long = "new")]
+        new: bool,
         /// The profile id to switch to (omit with `--list`). Ignored when `--list` is given.
         #[arg(value_name = "PROFILE")]
         target: Option<String>,
@@ -912,18 +987,21 @@ enum Command {
         /// request from the CGI/1.1 environment (`REQUEST_METHOD`, `REQUEST_URI` or
         /// `SCRIPT_NAME`+`PATH_INFO`), write the response to stdout, and exit. This is the mode a
         /// web server invokes the binary in per request, so nothing else may be written to stdout —
-        /// the startup line and the browser launch are both suppressed. `--listen` is meaningless
-        /// here (no listener is bound) and is refused alongside it.
+        /// the startup line and the browser launch are both suppressed. `--listen` names an address
+        /// nothing binds in this mode and is ignored, as in Go.
         #[arg(long)]
         cgi: bool,
-        /// Absolute URL the UI is actually reached at (Go `web --origin`), when that is not the
-        /// address it bound — behind a reverse proxy, or under `--cgi`, where nothing is bound at
-        /// all. `--prefix` fixes the path the server answers on; only this fixes the scheme and
-        /// host. Must be an absolute `http`/`https` URL with a host and no query/fragment/userinfo
-        /// (e.g. `https://ts.example.com/tailscale`). Used for link generation only: the URL this
-        /// command reports and opens, and the `<link rel="canonical">` the served page states for
-        /// itself. This build's UI is read-only, so the origin gates nothing else.
-        #[arg(long, value_name = "URL")]
+        /// Where the UI is actually reached (Go `web --origin`), when that is not the address it
+        /// bound — behind a reverse proxy, or under `--cgi`, where nothing is bound at all.
+        /// `--prefix` fixes the path the server answers on; only this fixes the host (and the
+        /// scheme). Takes Go's bare `host[:port]` (`ts.example.com`, for which `http` is assumed)
+        /// or an absolute `http`/`https` URL, optionally with the outside path
+        /// (`https://ts.example.com/tailscale`); a query, a fragment or userinfo are refused.
+        /// Used for link generation only: the URL this command reports and opens, and the
+        /// `<link rel="canonical">` the served page states for itself. This build's UI is
+        /// read-only, so the origin gates nothing else (Go compares it against the `Origin` header
+        /// of a mutating request; there are none here).
+        #[arg(long, value_name = "HOST|URL")]
         origin: Option<String>,
     },
     /// Check for (and optionally install) a newer release of this client (Go `tailscale update`).
@@ -1494,6 +1572,43 @@ enum DebugCmd {
         #[arg(value_name = "HOSTNAME")]
         hostname: Vec<String>,
     },
+    /// Probe this network's port-mapping support and try to obtain a mapping, printing the whole
+    /// run as it happens (Go `tailscale debug portmap`). A **write** (gated root/same-uid by the
+    /// daemon): it asks the LAN gateway to forward traffic inward.
+    ///
+    /// Two peers behind NATs only get a *direct* path when a hole exists through each NAT. STUN
+    /// finds one on a well-behaved NAT; when it cannot, many home routers will open one on request
+    /// over NAT-PMP, PCP or UPnP-IGD. This command answers whether yours will, and what it gives
+    /// back: it resolves the default gateway, probes all three protocols, and — if any answers —
+    /// asks for a UDP mapping, printing `Probe: {PCP:… PMP:… UPnP:…}` and then the external
+    /// `ip:port` (or `no mapping`).
+    ///
+    /// Runs with the node up or down: the conversation is with the local router, not the tailnet.
+    /// NOTE: this build can obtain a mapping over NAT-PMP and PCP; a UPnP router is *detected* and
+    /// reported, but acquiring a mapping from it needs a SOAP/XML stack this fork does not have, and
+    /// the run says so rather than reporting UPnP as absent.
+    Portmap {
+        /// How long the whole run may take, as a Go duration (`5s`, `1500ms`, `1m`).
+        #[arg(long, value_name = "DURATION", default_value = "5s")]
+        duration: String,
+        /// Exercise only one protocol: `pmp`, `pcp` or `upnp`. Omit for all three. Deliberately a
+        /// free-form string rather than a clap value-enum: Go passes this straight to the daemon, so
+        /// a bad value is refused by the *daemon* with `unknown portmap debug type` on stderr and
+        /// exit 1 — not by the flag parser with a usage block and exit 2.
+        #[arg(long = "type", value_name = "pmp|pcp|upnp", default_value = "")]
+        ty: String,
+        /// Override gateway auto-detection with this gateway IP (must also pass `--self-addr`).
+        #[arg(long, value_name = "IP")]
+        gateway_addr: Option<String>,
+        /// Override auto-detection with this host's IP on the gateway's link (must also pass
+        /// `--gateway-addr`).
+        #[arg(long, value_name = "IP")]
+        self_addr: Option<String>,
+        /// Print all HTTP requests and responses made during the run to the log. Carried for parity
+        /// with Go; this build's UPnP leg issues no HTTP (see the note above), so it adds no output.
+        #[arg(long)]
+        log_http: bool,
+    },
     /// Print this binary's build metadata as JSON (Go `tailscale debug go-buildinfo`, which dumps
     /// Go's `runtime/debug.BuildInfo`). Purely local — no daemon round-trip. Rust has no runtime
     /// build-info reflection, so the same facts are stamped in at compile time by `build.rs`: the
@@ -1626,20 +1741,26 @@ struct ServeFlags {
     /// decided at runtime by [`serve_kind_and_port`], not by clap: `--https=0 --tcp=22` names one
     /// listener under Go, and a genuine pair still gets Go's `cannot serve multiple types for a
     /// single mount point`.
+    ///
+    /// All four are typed as wide as Go's `uint`, not as the `u16` a port fits in, for the same
+    /// reason `--proxy-protocol` is: Go range-checks the value ITSELF and refuses a too-high one
+    /// with `port number %d is too high for %s flag`. Narrowing the flag would hand that command
+    /// line to clap's integer-range message and a different exit status instead — see
+    /// [`serve_kind_and_port`].
     #[arg(long, value_name = "PORT")]
-    https: Option<u16>,
+    https: Option<u64>,
     /// Serve plain HTTP on this tailnet port, reverse-proxying to `<TARGET>` (Go `--http=PORT`).
     #[arg(long, value_name = "PORT")]
-    http: Option<u16>,
+    http: Option<u64>,
     /// Forward raw TCP on this tailnet port to `<TARGET>` with no TLS (Go `--tcp=PORT`). Served by
     /// the daemon's own accept loop.
     #[arg(long, value_name = "PORT")]
-    tcp: Option<u16>,
+    tcp: Option<u64>,
     /// Terminate TLS on this tailnet port with the node's cert, then splice the plaintext stream to
     /// `<TARGET>` as raw TCP (Go `--tls-terminated-tcp=PORT`) — no HTTP parsing or reverse-proxying.
     /// Needs an issuable cert, like `--https`.
     #[arg(long = "tls-terminated-tcp", value_name = "PORT")]
-    tls_terminated_tcp: Option<u16>,
+    tls_terminated_tcp: Option<u64>,
     /// Mount the handler at this URL path prefix instead of `/` (Go `--set-path`). HTTP(S) only;
     /// with several mounts on one port the longest-matching prefix wins (unmatched = 404).
     #[arg(long = "set-path", value_name = "MOUNT")]
@@ -1782,7 +1903,9 @@ enum LockCmd {
         /// bool): bare `--json` and `--json=1` both select schema version 1, `--json=false` is the
         /// human form, and any other version is refused by number. The value is parsed by
         /// [`parse_json_schema_version`]; `require_equals` keeps `--json 1` from eating the next
-        /// argument, exactly as Go's `IsBoolFlag` does.
+        /// argument, exactly as Go's `IsBoolFlag` does. The document that comes back is this fork's,
+        /// not upstream's — it says `SchemaVersion: "tailscaled-rs.1"`, because this build has no AUM
+        /// decoder and so cannot fill Go's schema-1 fields.
         #[arg(
             long,
             value_name = "VERSION",
@@ -2632,8 +2755,8 @@ async fn main() -> Result<()> {
             let unmodelled = UnmodelledSetFlags {
                 relay_server_port,
                 relay_server_static_endpoints,
-                remote_config: resolve_tristate(remote_config, no_remote_config),
-                sync: resolve_tristate(sync, no_sync),
+                remote_config: resolve_go_bool_tristate(remote_config, no_remote_config),
+                sync: resolve_go_bool_tristate(sync, no_sync),
             };
             run_set(
                 &socket,
@@ -2750,6 +2873,23 @@ async fn main() -> Result<()> {
             DebugCmd::Statedir { local } => run_debug_statedir(&socket, local).await,
             // `debug resolve` is a host-resolver lookup in THIS process — no socket round-trip.
             DebugCmd::Resolve { net, hostname } => run_debug_resolve(&hostname, &net).await,
+            DebugCmd::Portmap {
+                duration,
+                ty,
+                gateway_addr,
+                self_addr,
+                log_http,
+            } => {
+                run_debug_portmap(
+                    &socket,
+                    &duration,
+                    &ty,
+                    gateway_addr.as_deref(),
+                    self_addr.as_deref(),
+                    log_http,
+                )
+                .await
+            }
             // `debug build-info` prints compile-time build facts — purely local, no round-trip.
             DebugCmd::BuildInfo => {
                 run_debug_build_info();
@@ -2782,16 +2922,31 @@ async fn main() -> Result<()> {
             authkey,
             authkey_file,
             login_server,
-        } => run_login(&socket, authkey, authkey_file, login_server).await,
+            nickname,
+            host_routes,
+        } => {
+            run_login(
+                &socket,
+                authkey,
+                authkey_file,
+                login_server,
+                // Go's clear-by-empty-value form (`--nickname=`), resolved into the wire sentinel by
+                // the same helper `set` uses.
+                resolve_clearable_string(nickname),
+                host_routes,
+            )
+            .await
+        }
         // `switch` (Go `tailscale switch`): --list renders a table; `remove <id>` deletes; a bare
         // `<target>` switches. Handled inline — `--list` renders the Profiles reply, and the three
         // modes map to different requests.
         Command::Switch {
             list,
             json,
+            new,
             target,
             cmd,
-        } => run_switch(&socket, list, json, target, cmd).await,
+        } => run_switch(&socket, list, json, new, target, cmd).await,
         // `version` answers from the CLI's own crate version. WITHOUT `--daemon` it never contacts
         // the daemon (Go also prints the client version with no LocalAPI call) — handle it here and
         // return. WITH `--daemon` it round-trips `Request::Version` to learn the daemon's version,
@@ -2923,8 +3078,8 @@ async fn main() -> Result<()> {
         // `web` (Go `tailscale web`): serve the read-only status UI. Reuses the same embedded HTTP
         // server as `status --web`, but with Go's command name + flags (default localhost:8088). The
         // `--readonly` flag is a no-op (this build's web UI is always read-only). `--prefix` serves
-        // the page under a URL path prefix (for reverse proxies), `--origin` states the absolute URL
-        // the UI is reached at, and `--cgi` swaps the listener for one CGI request/response.
+        // the page under a URL path prefix (for reverse proxies), `--origin` states where the UI is
+        // reached from outside, and `--cgi` swaps the listener for one CGI request/response.
         Command::Web {
             listen,
             readonly: _,
@@ -3705,20 +3860,31 @@ fn up_json_string(
     serde_json::to_string_pretty(&map).unwrap_or_else(|_| "{}".to_string())
 }
 
-/// `login` (Go `tailscale login`): (re)authenticate this node **without changing any prefs** — the
-/// auth half of `up` on its own. Resolves the auth key through the usual precedence
-/// (`--authkey-file` > `--authkey` > `$TS_AUTH_KEY`); with none, it is an interactive login (the
-/// control auth URL is printed). Sends an `up` request that **mentions no pref** (so the
+/// `login` (Go `tailscale login`): (re)authenticate this node, changing no pref but the one Go lets
+/// `login` change — the auth half of `up` on its own. Resolves the auth key through the usual
+/// precedence (`--authkey-file` > `--authkey` > `$TS_AUTH_KEY`); with none, it is an interactive
+/// login (the control auth URL is printed). Sends an `up` request that **mentions no pref** (so the
 /// accidental-revert guard never fires — a no-pref `up` is exempt) with `force_reauth: true` so the
 /// node re-authenticates even if it already holds a key (mirroring Go `login` →
 /// `StartLoginInteractive`). Reuses `poll_for_auth_url` to surface the URL, exactly like an
 /// interactive `up`.
+///
+/// `--nickname` is the exception, and it is Go's own: `up.go` registers it on the shared flag set
+/// when `cmd == "login"`, so naming the profile is part of logging in. It is applied first, through
+/// [`login_nickname_request`], and it is deliberately NOT folded into the `up` request below — that
+/// request has to keep mentioning no pref.
 async fn run_login(
     socket: &std::path::Path,
     authkey: Option<String>,
     authkey_file: Option<std::path::PathBuf>,
     login_server: Option<String>,
+    nickname: Option<Option<String>>,
+    host_routes: Option<String>,
 ) -> Result<()> {
+    // `--host-routes` is on `login` because Go's flag set is shared (`newUpFlagSet` registers it for
+    // both commands). Go decides it in the flag parser, before `Exec` runs, so — as on `up` — it is
+    // gated ahead of every other check, including the risk gate below.
+    check_host_routes(host_routes.as_deref())?;
     // Refuse a re-auth that could drop the very Tailscale-SSH session we're on (same gate as `up
     // --force-reauth`): `login` re-registers the node. Without an explicit accept-risk flag on
     // `login` (Go's `login` has no such flag — it always StartLoginInteractive), we mirror `up`'s
@@ -3731,9 +3897,30 @@ async fn run_login(
         );
         std::process::exit(1);
     }
-    // Resolve the secret (zeroized `SecretString`); `None` → interactive login.
+    // Resolve the secret (zeroized `SecretString`); `None` → interactive login. Before the
+    // `--nickname` half, so a `file:`/`--authkey-file` that cannot be read fails with nothing renamed.
     let authkey = resolve_authkey(authkey, authkey_file).await?;
     let interactive = authkey.is_none();
+    // Go `login --nickname`: `ipn.Prefs.ProfileName` is part of the prefs the login applies, so it
+    // lands BEFORE the node re-authenticates (as it does upstream, where the name is in the prefs
+    // handed to `Start` and survives an auth the operator never completes). A failure here aborts
+    // the login rather than half-applying it.
+    if let Some(request) = login_nickname_request(nickname) {
+        match round_trip(socket, &request)
+            .await
+            .with_context(|| format!("talking to daemon at {}", socket.display()))?
+        {
+            // The rename is a step of `login`, not a command of its own: its "preferences updated"
+            // line would only be noise before the login's own `ok:`. Go prints nothing for it either.
+            Response::Ok { .. } => {}
+            Response::Error { message } => {
+                eprintln!("error: {message}");
+                std::process::exit(1);
+            }
+            // `set --nickname` names one pref and reverts none, so the guard cannot fire on it.
+            other => anyhow::bail!("unexpected response to login --nickname: {other:?}"),
+        }
+    }
     // An `up` that mentions NO pref (every override `None`) + force_reauth: just (re)authenticate.
     // `force_reauth` is not a "mentioned pref", so the no-pref shape keeps the accidental-revert
     // guard from firing — `login` must never refuse-to-revert; it changes nothing but auth state.
@@ -4084,6 +4271,152 @@ fn render_reload_config(reloaded: bool) -> (&'static str, i32) {
     }
 }
 
+/// Compose Go's `gateway_and_self` wire value from `--gateway-addr` + `--self-addr`, or say why the
+/// pair is unusable (Go `debugPortmap`'s pre-flight).
+///
+/// The two flags are meaningless apart — a gateway with no self address (or the reverse) names half
+/// a link — so Go refuses either alone with `if one of --gateway-addr and --self-addr is provided,
+/// the other must be as well`, and refuses a value that is not an IP with `invalid --gateway-addr: …`
+/// / `invalid --self-addr: …`. All three messages are Go's verbatim. `Ok(None)` means neither was
+/// given, i.e. auto-detect. Pure → unit-testable.
+fn portmap_gateway_and_self(
+    gateway_addr: Option<&str>,
+    self_addr: Option<&str>,
+) -> Result<Option<String>> {
+    match (gateway_addr, self_addr) {
+        (None, None) => Ok(None),
+        (Some(_), None) | (None, Some(_)) => anyhow::bail!(
+            "if one of --gateway-addr and --self-addr is provided, the other must be as well"
+        ),
+        (Some(gw), Some(me)) => {
+            let gw: std::net::IpAddr = gw
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid --gateway-addr: {e}"))?;
+            let me: std::net::IpAddr = me
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid --self-addr: {e}"))?;
+            // The daemon takes the pair as one `<gateway>/<self>` string, the same shape Go's client
+            // puts in its `gateway_and_self` query parameter.
+            Ok(Some(format!("{gw}/{me}")))
+        }
+    }
+}
+
+/// Turn `--duration` into the milliseconds the wire carries (Go's `fs.DurationVar` + the handler's
+/// `time.ParseDuration`).
+///
+/// A **negative** duration is clamped to zero rather than refused, which reproduces Go exactly: it
+/// parses fine there and becomes an already-expired context, so the run reports an empty probe
+/// (`Probe: {PCP:false PMP:false UPnP:false}`, then `no portmapping services available`) and stops
+/// — Go's `Probe` treats its own deadline expiring as a normal empty result, not a failure. Pure →
+/// unit-testable.
+fn portmap_duration_ms(duration: &str) -> Result<u64> {
+    let nanos = parse_go_duration(duration).map_err(|e| anyhow::anyhow!(e))?;
+    Ok((nanos.max(0) / 1_000_000) as u64)
+}
+
+/// `debug portmap` (Go `tailscale debug portmap`): ask the daemon to probe this network's
+/// port-mapping support and try to obtain a mapping, printing each line of the run as it arrives.
+///
+/// Unlike every other one-shot verb, this STREAMS: the daemon writes one [`Response::PortmapLog`]
+/// frame per line for up to the requested duration and then closes the connection, so this reads
+/// until EOF and prints each `line` (matching the plain-text body `tailscale debug portmap` copies
+/// to stdout, save for the terminal sanitization [`render_portmap_frame`] applies). A
+/// [`Response::Error`] — a refused `--type`, or a permission denial — is reported on stderr with
+/// exit 1.
+async fn run_debug_portmap(
+    socket: &std::path::Path,
+    duration: &str,
+    ty: &str,
+    gateway_addr: Option<&str>,
+    self_addr: Option<&str>,
+    log_http: bool,
+) -> Result<()> {
+    // Both refusals happen before the daemon is contacted, exactly like Go's.
+    let gateway_and_self = portmap_gateway_and_self(gateway_addr, self_addr)?;
+    let duration_ms = portmap_duration_ms(duration)?;
+
+    let stream = UnixStream::connect(socket)
+        .await
+        .context("connect (is tailnetd running?)")?;
+    let (read_half, mut write_half) = stream.into_split();
+
+    let mut line = serde_json::to_vec(&Request::DebugPortmap {
+        duration_ms,
+        ty: ty.to_string(),
+        gateway_and_self,
+        log_http,
+    })?;
+    line.push(b'\n');
+    write_half.write_all(&line).await?;
+    write_half.flush().await?;
+
+    let mut reader = BufReader::new(read_half);
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        let n = reader.read_line(&mut buf).await?;
+        if n == 0 {
+            // The daemon closed the stream: the run is over.
+            break;
+        }
+        let trimmed = buf.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let frame = serde_json::from_str::<Response>(trimmed)
+            .with_context(|| format!("parsing daemon portmap stream line: {trimmed:?}"))?;
+        match render_portmap_frame(frame) {
+            PortmapFrame::Log(line) => println!("{line}"),
+            PortmapFrame::Failed(message) => {
+                eprintln!("error: {message}");
+                std::process::exit(1);
+            }
+            PortmapFrame::Unexpected(warning) => eprintln!("warning: {warning}"),
+        }
+    }
+    Ok(())
+}
+
+/// What one frame off the `debug portmap` stream turns into on this terminal.
+#[derive(Debug, PartialEq, Eq)]
+enum PortmapFrame {
+    /// One log line for stdout; the run continues.
+    Log(String),
+    /// The run refused itself: stderr, then exit 1.
+    Failed(String),
+    /// A reply that does not belong on this stream: a stderr warning, and the run continues.
+    Unexpected(String),
+}
+
+/// Render one decoded [`Response`] from the `debug portmap` stream for the terminal.
+///
+/// **The text in these frames is not the daemon's own.** A `debug portmap` run narrates what the
+/// local network answered, and several of its lines are built straight from bytes a device on that
+/// LAN chose: an SSDP discovery reply's `LOCATION`/`SERVER` headers reach the operator through
+/// `UPnP device discovered at <location> (<server>)`, and a header line the parser rejects is
+/// echoed whole in `unrecognized UPnP discovery response; ignoring: malformed MIME header line:
+/// <line>`. Printing those verbatim would hand anything answering an M-SEARCH on the local link a
+/// write channel into the terminal of whoever is debugging their router — ANSI/OSC escapes, and an
+/// embedded newline that forges an extra, entirely fake line of the run's log.
+///
+/// So both text-bearing frames go through the same sanitizers the rest of this CLI already applies
+/// to semi-trusted, remotely-supplied strings: [`sanitize_for_terminal`] for a log line, which is
+/// one record per frame and therefore must not contain a line break, and [`sanitize_multiline`] for
+/// an error message, which is free-form prose that may legitimately wrap. Real portmapper output —
+/// `gw=…`, `Probe: {PCP:… PMP:… UPnP:…}`, `mapping: …` — is plain printable text, so this is
+/// byte-identical to Go's output for every well-behaved network. Go itself does no sanitizing here
+/// (`serveDebugPortmap` writes the lines into the HTTP response and the CLI `io.Copy`s them to
+/// stdout); this fork is deliberately stricter, as it already is for peer and control-supplied
+/// names.
+fn render_portmap_frame(frame: Response) -> PortmapFrame {
+    match frame {
+        Response::PortmapLog { line } => PortmapFrame::Log(sanitize_for_terminal(&line)),
+        Response::Error { message } => PortmapFrame::Failed(sanitize_multiline(&message)),
+        other => PortmapFrame::Unexpected(format!("unexpected reply on portmap stream: {other:?}")),
+    }
+}
+
 /// `reload-config` (Go `tailscaled`'s `reload-config`): ask the daemon to re-read its `--config` file
 /// and adopt the changes into the running node. Prints Go's line for the daemon's `ok` bool — see
 /// [`render_reload_config`] — and exits 1 on the not-in-config-mode refusal. A genuine failure (a
@@ -4424,8 +4757,12 @@ fn resolve_report(addrs: &[std::net::IpAddr]) -> String {
 /// completion on its blocking thread and its result is dropped.
 async fn resolve_lookup(host: &str, net: ResolveNet) -> Result<Vec<std::net::IpAddr>> {
     if host.is_empty() {
-        // Go's `LookupIP` guard: `&DNSError{Err: "no suitable address found", Name: ""}`.
-        anyhow::bail!("lookup : no suitable address found");
+        // Go's `LookupIP` guard: `&DNSError{Err: errNoSuchHost.Error(), Name: host, IsNotFound:
+        // true}`, which `DNSError.Error` renders `lookup <name>: no such host` — with an empty
+        // name, `lookup : no such host`. NOT the `no suitable address found` of the family filter
+        // below: nothing resolvable and nothing in the requested family are different failures and
+        // Go words them differently.
+        anyhow::bail!("lookup : no such host");
     }
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return filter_resolve_addrs(vec![ip], net, host);
@@ -4650,6 +4987,12 @@ fn build_info_json(
 ///    `--json argument cannot be used with tailscale switch NAME` and exits 1.
 /// 3. no target left → the usage line, exit 1.
 ///
+/// One rule is this fork's own, because the flag it guards is: `--new` (create the profile rather
+/// than refuse an unknown one — see [`Command::Switch`]) asks for a mutation, so pairing it with the
+/// read-only `--list` is refused rather than silently ignored the way `--list` ignores a stray
+/// target. It is checked FIRST, so it wins over the list arm; a command line with no `--new` on it
+/// still follows Go's order exactly.
+///
 /// The `remove` subcommand is exempt: Go's ffcli dispatches the subcommand before `switch`'s own
 /// `Exec` ever runs, so `switch`'s flag rules do not apply to it (clap parses the same shape here).
 ///
@@ -4659,10 +5002,19 @@ fn build_info_json(
 fn switch_usage_refusal(
     list: bool,
     json: bool,
+    new: bool,
     target: Option<&str>,
     has_subcommand: bool,
 ) -> Option<&'static str> {
-    if has_subcommand || list {
+    if has_subcommand {
+        return None;
+    }
+    // Fork-only rule (see above): `--new` mutates, `--list` reads — asking for both is a mistake,
+    // and ignoring the mutating half of it silently would be the worse answer.
+    if new && list {
+        return Some("--new argument cannot be used with tnet switch --list");
+    }
+    if list {
         return None;
     }
     if json {
@@ -4674,15 +5026,34 @@ fn switch_usage_refusal(
     None
 }
 
+/// The request `tnet switch <target>` sends: a plain [`Request::SwitchProfile`], or — with `--new` —
+/// the distinct [`Request::CreateProfile`] command.
+///
+/// Split out so the wire shape of `--new` is testable without a daemon, because that shape is the
+/// whole guard against an older daemon. Creation must NOT ride as a flag on `switch_profile`: serde
+/// drops unknown fields, so a daemon that predates `--new` would read such a request as a bare
+/// switch and, for an id that already names a profile, *activate* it — tearing the live device down
+/// and repointing the node where this CLI asked for a creation the daemon would have refused. As its
+/// own command it is a request the older daemon cannot parse at all, so it answers `bad request`,
+/// [`send_ok_or_die`] prints it and exits 1, and nothing was torn down.
+fn switch_request(new: bool, target: String) -> Request {
+    if new {
+        Request::CreateProfile { id: target }
+    } else {
+        Request::SwitchProfile { target }
+    }
+}
+
 async fn run_switch(
     socket: &std::path::Path,
     list: bool,
     json: bool,
+    new: bool,
     target: Option<String>,
     cmd: Option<SwitchCmd>,
 ) -> Result<()> {
     // Go's own flag refusals first (stdout + exit 1), before any daemon round-trip.
-    if let Some(message) = switch_usage_refusal(list, json, target.as_deref(), cmd.is_some()) {
+    if let Some(message) = switch_usage_refusal(list, json, new, target.as_deref(), cmd.is_some()) {
         println!("{message}");
         std::process::exit(1);
     }
@@ -4711,7 +5082,7 @@ async fn run_switch(
         }
     }
     match target {
-        Some(target) => send_ok_or_die(socket, Request::SwitchProfile { target }).await,
+        Some(target) => send_ok_or_die(socket, switch_request(new, target)).await,
         // Unreachable: `switch_usage_refusal` above already exited on a missing target. Kept as a
         // total match (rather than an `expect`) so a future edit to the refusal table degrades into
         // the same usage line instead of a panic.
@@ -5508,9 +5879,11 @@ async fn run_whoami(socket: &std::path::Path, json: bool) -> Result<()> {
 /// filters. Inline because the filters + the optional peer lookup shape the output (and the peer
 /// case fetches Status to resolve by name/IP against the netmap).
 ///
-/// An argument that matches no peer but IS an address falls through to the Tailscale Service set
+/// An argument that matches no node but IS an address falls through to the Tailscale Service set
 /// (Go `serviceAddrsMatchingIP`): a Service is a virtual service with its own VIPs, which belong to
-/// no peer, so without that arm naming one could only fail with "no peer found".
+/// no peer, so without that arm naming one could only fail with "no peer found". Which arguments
+/// reach that fallback is [`ip_arg_matching_node`]'s answer, and it is Go's `peerMatchingIP`: any
+/// address of any peer, and this node's own, resolve a node rather than falling through.
 /// The refusal `tnet ip` owes its own flags before it looks at anything else — Go's `runIP`
 /// (`cmd/tailscale/cli/ip.go`, upstream v1.102.3 `53a0d659afa51835dd7a9283873cca44261454f8`) counts
 /// its three address selectors and rejects any two of them together:
@@ -5540,6 +5913,92 @@ fn ip_usage_refusal(v4: bool, v6: bool, first: bool) -> Option<&'static str> {
         return Some("tnet ip -1, -4, and -6 are mutually exclusive");
     }
     None
+}
+
+/// One netmap node's tailnet addresses — Go's `ipnstate.PeerStatus.TailscaleIPs`, which this fork
+/// carries as a separate field per family. An address the netmap has not filled in arrives as an
+/// empty string on the wire (`PeerReport.ipv4` is a bare `String`), so "absent" is normalised to
+/// `None` here rather than being carried around as `""`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct NodeAddrs<'a> {
+    ipv4: Option<&'a str>,
+    ipv6: Option<&'a str>,
+}
+
+impl<'a> NodeAddrs<'a> {
+    /// Go `slices.Contains(ps.TailscaleIPs, ip)`: does this node hold `want`, in EITHER family?
+    /// Compared parsed, so `fd7a:115c:a1e0:0::2` matches however the netmap spelled that address.
+    fn holds(self, want: std::net::IpAddr) -> bool {
+        self.iter()
+            .filter_map(|s| s.parse::<std::net::IpAddr>().ok())
+            .any(|ip| ip == want)
+    }
+
+    /// The addresses this node actually has, in Go's `TailscaleIPs` order (IPv4 then IPv6).
+    fn iter(self) -> impl Iterator<Item = &'a str> {
+        [self.ipv4, self.ipv6].into_iter().flatten()
+    }
+}
+
+/// A peer's addresses (Go `ps.TailscaleIPs`).
+fn peer_addrs(peer: &tailscaled_rs::localapi::PeerReport) -> NodeAddrs<'_> {
+    NodeAddrs {
+        ipv4: Some(peer.ipv4.as_str()).filter(|s| !s.is_empty()),
+        ipv6: peer.ipv6.as_deref().filter(|s| !s.is_empty()),
+    }
+}
+
+/// THIS node's own addresses (Go `st.Self.TailscaleIPs`).
+fn self_addrs(status: &tailscaled_rs::localapi::StatusReport) -> NodeAddrs<'_> {
+    NodeAddrs {
+        ipv4: status.self_ipv4.as_deref().filter(|s| !s.is_empty()),
+        ipv6: status.self_ipv6.as_deref().filter(|s| !s.is_empty()),
+    }
+}
+
+/// The netmap node `tnet ip <arg>` names, or `None` when no node holds it. Pure, so the whole
+/// decision table is unit-testable; the caller owns the status round trip and the Service fallback.
+///
+/// The address arm ports Go's `peerMatchingIP` (`cmd/tailscale/cli/ip.go`, upstream v1.102.3
+/// `53a0d659afa51835dd7a9283873cca44261454f8`) as written:
+///
+/// ```text
+/// ip, err := netip.ParseAddr(ipStr)
+/// if err != nil { return }
+/// for _, ps = range st.Peer {
+///     if slices.Contains(ps.TailscaleIPs, ip) { return ps, true }
+/// }
+/// if ps := st.Self; ps != nil {
+///     if slices.Contains(ps.TailscaleIPs, ip) { return ps, true }
+/// }
+/// ```
+///
+/// Two things follow from `slices.Contains` over the WHOLE address list, and both were missing
+/// before: a peer is found by ANY of its addresses, its IPv6 included, and this node's own
+/// addresses resolve to this node. Neither is cosmetic — the caller reports an unmatched address as
+/// `no peer or service found with IP`, so a peer's own IPv6 used to be answered by naming the wrong
+/// cause.
+///
+/// The name arm is the one Go reaches through `tailscaleIPFromArg`, which turns a name into the
+/// named peer's first address before `peerMatchingIP` scans for it; matching the name against the
+/// peer set directly is the same answer without the round trip through an address. It is left
+/// exactly as it was — a name still has to match `PeerReport.name` in full, and a name in no netmap
+/// still stops here instead of reaching Go's host-resolver fallback.
+fn ip_arg_matching_node<'a>(
+    arg: &str,
+    status: &'a tailscaled_rs::localapi::StatusReport,
+) -> Option<NodeAddrs<'a>> {
+    // Go: `netip.ParseAddr` gates the node scan, so only an address gets compared against one.
+    if let Ok(want) = arg.parse::<std::net::IpAddr>() {
+        if let Some(peer) = status.peers.iter().find(|p| peer_addrs(p).holds(want)) {
+            return Some(peer_addrs(peer));
+        }
+        // Go's second half: `st.Self`. This node answers for its own address rather than falling
+        // through to a Service lookup that cannot match it either.
+        let this_node = self_addrs(status);
+        return this_node.holds(want).then_some(this_node);
+    }
+    status.peers.iter().find(|p| p.name == arg).map(peer_addrs)
 }
 
 async fn run_ip(
@@ -5586,8 +6045,9 @@ async fn run_ip(
         std::process::exit(1);
     }
     let out = if let Some(peer) = peer {
-        // Peer address: resolve the named peer against the status peer set (by MagicDNS name
-        // or tailnet IP). We fetch Status (not whois, which is IP-only) so a NAME also works.
+        // Peer address: resolve the argument against the netmap ([`ip_arg_matching_node`]) — by
+        // name, or by any address the peer or this node holds. We fetch Status (not whois, which is
+        // IP-only) so a NAME also works.
         let status = match round_trip(socket, &Request::Status).await {
             Ok(Response::Status(s)) => s,
             Ok(other) => anyhow::bail!("unexpected response to status request: {other:?}"),
@@ -5595,16 +6055,11 @@ async fn run_ip(
                 return Err(e).with_context(|| format!("querying status at {}", socket.display()));
             }
         };
-        match status
-            .peers
-            .iter()
-            .find(|p| p.name == peer || p.ipv4 == peer)
-        {
-            // Project both families so `ip -6 <peer>` / a bare `ip <peer>` show the peer's IPv6
-            // (Go prints `peer.TailscaleIPs` filtered by family). `PeerReport.ipv6` is populated by
-            // the daemon's status projection when the peer has one.
-            Some(p) => format_ip_filtered(Some(&p.ipv4), p.ipv6.as_deref(), sel),
-            // No peer matched. Go then asks whether the address belongs to a Tailscale Service and,
+        match ip_arg_matching_node(&peer, &status) {
+            // Project both families so `ip -6 <peer>` / a bare `ip <peer>` show the node's IPv6
+            // (Go prints the matched node's `TailscaleIPs` filtered by family).
+            Some(addrs) => format_ip_filtered(addrs.ipv4, addrs.ipv6, sel),
+            // No node matched. Go then asks whether the address belongs to a Tailscale Service and,
             // if so, prints THAT Service's addresses instead of failing — a Service is not a peer,
             // so its VIP is in no peer's address list and used to be reported as "no peer found".
             // The Service set is fetched only on this miss, the way `configure kubeconfig` fetches
@@ -5666,8 +6121,18 @@ async fn run_ip(
             }
         }
     };
-    print!("{out}");
-    Ok(())
+    match out {
+        Ok(out) => {
+            print!("{out}");
+            Ok(())
+        }
+        // Go's `runIP` RETURNS here instead of printing: the match loop selected nothing and `-4`
+        // or `-6` was set, so the caller asked for a family this target holds no address in. An
+        // error is a stderr message and a non-zero exit, which is the whole reason Go wrote it as
+        // an error and not as an `outln` — `tnet ip -6 host` is meant to be testable by its exit
+        // status.
+        Err(message) => anyhow::bail!(message),
+    }
 }
 
 /// `ping` (Go `tailscale ping [-c N] [--until-direct]`): the engine pings one-at-a-time, so the
@@ -5938,7 +6403,7 @@ fn ping_target_from_arg(arg: &str, status: &tailscaled_rs::localapi::StatusRepor
     // leading zeros and zone suffixes.)
     if let Ok(want) = arg.parse::<std::net::IpAddr>() {
         // ADDITION (see the doc comment): Go's daemon answers this one, ours does not.
-        if self_tailnet_ips(status).any(|self_ip| self_ip == want) {
+        if self_addrs(status).holds(want) {
             return PingTarget::SelfNode(want.to_string());
         }
         return PingTarget::Literal(arg.to_string());
@@ -5963,18 +6428,6 @@ fn ping_target_from_arg(arg: &str, status: &tailscaled_rs::localapi::StatusRepor
         return PingTarget::SelfNode(ip.to_string());
     }
     PingTarget::Unresolved
-}
-
-/// This node's own tailnet addresses, parsed — the set an IP-literal argument is checked against by
-/// [`ping_target_from_arg`]. Parsing both sides means spelling variants compare equal rather than
-/// by string.
-fn self_tailnet_ips(
-    status: &tailscaled_rs::localapi::StatusReport,
-) -> impl Iterator<Item = std::net::IpAddr> + '_ {
-    [status.self_ipv4.as_deref(), status.self_ipv6.as_deref()]
-        .into_iter()
-        .flatten()
-        .filter_map(|s| s.parse::<std::net::IpAddr>().ok())
 }
 
 /// The first of a node's tailnet addresses — Go's `TailscaleIPs[0]`, which is the IPv4 whenever the
@@ -6044,18 +6497,65 @@ fn dns_trim_suffix<'a>(name: &'a str, suffix: &str) -> &'a str {
     out.strip_suffix('.').unwrap_or(out)
 }
 
-/// Resolve `ping`'s `<hostname-or-IP>` to the address to ping, and answer the two cases that end the
-/// command before a single probe is sent.
+/// Go's `isRunningOrStarting` (cmd/tailscale/cli/status.go): the backend-state gate `runPing`
+/// applies before it does anything else, so a command that needs a live netmap says *which* local
+/// state stopped it instead of blaming the peer.
+///
+/// `None` is Go's `ok == true` — the node is `Running` or `Starting`, so the netmap is current
+/// enough to aim a probe with. `Some(description)` is Go's `ok == false` plus the exact text it
+/// prints before `os.Exit(1)`:
+///
+/// * `Stopped` → `Tailscale is stopped.`
+/// * `NeedsLogin` → `Logged out.`, and a second line `Log in at: <url>` when the daemon is offering
+///   an auth URL (Go: `if st.AuthURL != ""`).
+/// * `NeedsMachineAuth` → `Machine is not yet approved by tailnet admin.`
+/// * anything else — `NoState`, `InUseOtherUser`, or a state name this build does not know — falls
+///   into Go's `default` arm, `unexpected state: %s`.
+///
+/// Pure, so the state table is unit-testable; the caller owns the printing and the exit.
+///
+/// Both interpolated values are control-supplied, so they go through [`sanitize_for_terminal`]
+/// first, the way the state name already does in the `configure kubeconfig` pre-check. That is
+/// lossless for a real state name or URL (neither legitimately contains a control or bidi
+/// character) and keeps a hostile one from forging lines in the operator's terminal.
+fn is_running_or_starting(state: &str, auth_url: Option<&str>) -> Option<String> {
+    use tailscaled_rs::ipn::State;
+    if state == State::Running.as_str() || state == State::Starting.as_str() {
+        return None;
+    }
+    if state == State::Stopped.as_str() {
+        return Some("Tailscale is stopped.".to_string());
+    }
+    if state == State::NeedsLogin.as_str() {
+        // Go appends the login line only when there is a URL to append; an empty `AuthURL` on the
+        // wire is Go's `""`, so `Some("")` must read as "no URL" and not print a bare `Log in at:`.
+        return Some(match auth_url.filter(|url| !url.is_empty()) {
+            Some(url) => format!("Logged out.\nLog in at: {}", sanitize_for_terminal(url)),
+            None => "Logged out.".to_string(),
+        });
+    }
+    if state == State::NeedsMachineAuth.as_str() {
+        return Some("Machine is not yet approved by tailnet admin.".to_string());
+    }
+    Some(format!(
+        "unexpected state: {}",
+        sanitize_for_terminal(state)
+    ))
+}
+
+/// Apply Go's backend-state gate, then resolve `ping`'s `<hostname-or-IP>` to the address to ping —
+/// the two things that can end the command before a single probe is sent.
 ///
 /// Returns `Ok(None)` when the argument named THIS node: Go prints `%v is local Tailscale IP` and
 /// returns success, so there is nothing left for the caller to do. `Ok(Some(ip))` is the address to
 /// ping.
 ///
-/// Go's `runPing` fetches the status before anything else (for its running/starting check), and
-/// `tailscaleIPFromArg` fetches it again for the peer match; one fetch answers both here. A status
-/// round trip that fails ends the command, as it does in Go — a daemon that cannot describe its
-/// netmap is not going to answer a ping either, and saying so here names the real problem instead
-/// of letting ten attempts time out against it.
+/// Go's `runPing` fetches the status before anything else (for its `isRunningOrStarting` check),
+/// and `tailscaleIPFromArg` fetches it again for the peer match; one fetch answers both here, in
+/// Go's order — the gate first, then the argument. A status round trip that fails ends the command,
+/// as it does in Go — a daemon that cannot describe its netmap is not going to answer a ping
+/// either, and saying so here names the real problem instead of letting ten attempts time out
+/// against it.
 ///
 /// `--verbose` logs Go's `lookup %q => %q` line, and only when resolution actually moved the
 /// argument (Go: `if pingArgs.verbose && ip != hostOrIP`), so an IP literal logs nothing.
@@ -6075,6 +6575,16 @@ async fn resolve_ping_target(
             return Err(e).with_context(|| format!("querying status at {}", socket.display()));
         }
     };
+    // Go's `runPing` opens with `isRunningOrStarting(st)` and, on any other backend state, prints
+    // that state's description and exits 1 — before the argument is resolved and before a single
+    // probe is sent. Without it, a stopped or logged-out node still resolves the peer out of the
+    // stale netmap, sends the whole count into a dead data plane and ends on `no reply`: a verdict
+    // about the peer for a fault that is entirely local. `printf` in Go's CLI writes to stdout, so
+    // this line does too (unlike the `warnf` that `down` ports to stderr).
+    if let Some(description) = is_running_or_starting(&status.state, status.auth_url.as_deref()) {
+        println!("{description}");
+        std::process::exit(1);
+    }
     let ip = match ping_target_from_arg(target, &status) {
         PingTarget::Literal(ip) | PingTarget::Peer(ip) => ip,
         PingTarget::SelfNode(ip) => {
@@ -7390,7 +7900,10 @@ fn service_addrs_matching_ip(
 /// A peer has exactly one address per family, so [`format_ip_filtered`] can take them positionally;
 /// a Service carries a list, so the family of each address is determined by parsing it. An address
 /// that does not parse is dropped rather than mis-filed under a family it may not belong to.
-fn format_service_ips(addrs: &[String], sel: IpSelect) -> String {
+///
+/// `Err` carries Go's error return for a `-4`/`-6` that selects nothing ([`ip_no_match_error`]):
+/// the same tail, because Go runs one match loop over whichever `ips` slice was resolved.
+fn format_service_ips(addrs: &[String], sel: IpSelect) -> Result<String, &'static str> {
     // Go truncates to the first address BEFORE the family filter — `ips = ips[:1]`, then its match
     // loop. Because Go refuses `-1` alongside `-4`/`-6` ([`ip_usage_refusal`] ports that check), the
     // two never narrow the same call, so the order is unobservable; it is kept as Go writes it so
@@ -7412,9 +7925,12 @@ fn format_service_ips(addrs: &[String], sel: IpSelect) -> String {
         }
     }
     if out.is_empty() {
-        return "(no matching tailnet address)\n".to_string();
+        if let Some(message) = ip_no_match_error(sel) {
+            return Err(message);
+        }
+        return Ok("(no matching tailnet address)\n".to_string());
     }
-    out
+    Ok(out)
 }
 
 /// clap value parser for `cert --min-validity`: Go's duration grammar, verbatim — including its error
@@ -7496,6 +8012,13 @@ enum CertDomainHint {
 /// all when the status could not be read, "not running" when it is down, and otherwise either the
 /// tailnet has no cert domains, has exactly one (name it, so the operator can copy it), or has several
 /// (list them Go-style, `%q` of a `[]string` → `["a" "b"]`). Pure → unit-testable.
+///
+/// Go writes each arm into a `bytes.Buffer` with ONE leading newline and appends the buffer to the
+/// usage line (`fmt.Errorf("Usage: tailscale cert [flags] <domain>%s", hint.Bytes())`), so the hint
+/// lands on the line directly below it — no blank line between them. This does the same, and the
+/// arms carry Go's sentences verbatim, "Tailscale is not running." included: it reports the backend
+/// state the same way [`is_running_or_starting`] and the `down` verb already do, and naming the
+/// protocol this fork speaks is the nominative use `README.md` describes.
 fn cert_usage_message(err: CertUsageError, hint: &CertDomainHint) -> String {
     match err {
         CertUsageError::TooManyServeDemoArgs => {
@@ -7506,17 +8029,17 @@ fn cert_usage_message(err: CertUsageError, hint: &CertDomainHint) -> String {
             match hint {
                 CertDomainHint::Unknown => {}
                 CertDomainHint::NotRunning => {
-                    msg.push_str("\n\nThe node is not running.\n");
+                    msg.push_str("\nTailscale is not running.\n");
                 }
                 CertDomainHint::Domains(domains) => match domains.as_slice() {
                     [] => msg.push_str(
-                        "\n\nHTTPS cert support is not enabled/configured for your tailnet.\n",
+                        "\nHTTPS cert support is not enabled/configured for your tailnet.\n",
                     ),
-                    [only] => msg.push_str(&format!("\n\nFor domain, use {only:?}.\n")),
+                    [only] => msg.push_str(&format!("\nFor domain, use {only:?}.\n")),
                     many => {
                         let quoted: Vec<String> = many.iter().map(|d| format!("{d:?}")).collect();
                         msg.push_str(&format!(
-                            "\n\nValid domain options: [{}].\n",
+                            "\nValid domain options: [{}].\n",
                             quoted.join(" ")
                         ));
                     }
@@ -8499,13 +9022,19 @@ fn format_lock_status(r: &tailscaled_rs::localapi::LockReport, json: bool) -> St
 /// - **An unknown `--json` version is refused by number.** Go's `printTailnetLockLog` serves schema
 ///   version 1 and answers anything else with `unrecognised version: %d`.
 ///
-/// The version-1 payload carries Go's `jsonoutput.ResponseEnvelope` field (`SchemaVersion: "1"`) so
-/// a script can pin the schema it parses. What sits under the envelope is fork-specific and NOT Go's
-/// `Messages`/`AUM` shape: Go expands each update's decoded AUM into named fields, which needs the
-/// CBOR decoder this daemon does not have, so the object stays `enabled` + `entries` (hash, change,
-/// signing key ids, raw CBOR as hex) rather than borrowing Go's key names for something narrower
-/// than what those names mean upstream. `enabled` is always `true` now that the disabled case exits
-/// before printing; it is kept so the object does not change shape from the pre-refusal builds.
+/// The `--json` payload is NOT Go's schema 1, and no longer claims to be. Upstream
+/// `PrintTailnetLockLogJSONV1` (`cmd/tailscale/cli/jsonoutput/tailnet-lock-log.go`) emits
+/// `{"SchemaVersion": "1", "Messages": [...]}`, each message a `logMessageV1` expanding the update's
+/// decoded AUM into named fields (`MessageKind`, `PrevAUMHash`, ...). Decoding an AUM needs the CBOR
+/// decoder this daemon does not have, so what this build can honestly serve is `enabled` + `entries`
+/// (hash, change, signing key ids, raw CBOR as hex). The `jsonoutput.ResponseEnvelope` field name is
+/// kept, but its value names THIS fork's schema — `SchemaVersion: "tailscaled-rs.1"` — so a consumer
+/// written against `tailscale lock log --json=1` fails its version check on the very field it
+/// checks, rather than being told `"1"` and then reading a `.Messages` that is not there. The flag
+/// still behaves as Go's: `--json=1` selects this command's version 1 and any other version is
+/// refused by number; the envelope only says which version-1 document came back. `enabled` is always
+/// `true` now that the disabled case exits before printing; it is kept so the object does not change
+/// shape from the pre-refusal builds.
 ///
 /// Pure (returns the string incl. its trailing newline, or Go's refusal) → unit-testable.
 fn format_lock_log(
@@ -8536,8 +9065,10 @@ fn format_lock_log(
             })
             .collect();
         let mut root = Map::new();
-        // Go's `ResponseEnvelope.SchemaVersion` — a string, as upstream types it.
-        root.insert("SchemaVersion".into(), json!("1"));
+        // Go's `ResponseEnvelope.SchemaVersion` — a string, as upstream types it — but carrying this
+        // fork's schema name rather than Go's `"1"`. The document below is not Go's version 1, so it
+        // must not answer `"1"` to a script that pinned Go's.
+        root.insert("SchemaVersion".into(), json!("tailscaled-rs.1"));
         root.insert("enabled".into(), json!(r.enabled));
         root.insert("entries".into(), Value::Array(entries));
         return Ok(format!(
@@ -8545,15 +9076,10 @@ fn format_lock_log(
             serde_json::to_string_pretty(&root).unwrap_or_else(|_| "{}".to_string())
         ));
     }
-    // Nothing to list, but the lock IS on: Go's loop simply prints nothing here, which would leave an
-    // operator unable to tell "no history" from "command did nothing". Say which it is.
-    if r.entries.is_empty() {
-        return Ok(
-            "Tailnet Lock is ENABLED, but no update-chain history has synced to this node \
-                yet.\n\n"
-                .to_string(),
-        );
-    }
+    // Lock on but nothing synced: Go's `printTailnetLockLog` ranges over an empty slice and returns,
+    // so it prints nothing at all. Nothing here either — the loop below is simply empty. The silence
+    // is not ambiguous: the lock-disabled node has already exited non-zero above, so "exit 0 with no
+    // output" can only mean "lock on, no update-chain history synced to this node".
     let mut out = String::new();
     for e in &r.entries {
         // The change kind and hash are engine-produced (a fixed AUM-kind string; our own base32 of a
@@ -9715,15 +10241,45 @@ struct IpSelect {
     first: bool,
 }
 
+/// Go `ip.go`'s `if !match` tail: the match loop printed nothing. `-4` and `-6` each name the
+/// family that came up empty and Go RETURNS that as an error — `no Tailscale IPv4 address` /
+/// `no Tailscale IPv6 address` — so the command exits non-zero with the text on stderr. With
+/// neither flag set both families are wanted, so an empty answer means the target had no address
+/// at all: Go covers that case earlier (`no current Tailscale IPs; state: %v`) and its `!match`
+/// tail has nothing left to say, hence `None` here and the caller's placeholder.
+///
+/// Shared by [`format_ip_filtered`] and [`format_service_ips`] because Go shares it: `runIP`
+/// resolves this node, a peer or a Service into ONE `ips` slice and runs a single match loop over
+/// it, so all three answer an unsatisfiable `-4`/`-6` the same way.
+fn ip_no_match_error(sel: IpSelect) -> Option<&'static str> {
+    if sel.v4 {
+        Some("no Tailscale IPv4 address")
+    } else if sel.v6 {
+        Some("no Tailscale IPv6 address")
+    } else {
+        None
+    }
+}
+
 /// Format `tnet ip` output applying an [`IpSelect`]: `-4` keeps only IPv4, `-6` only IPv6, `-1` only
 /// the first address (Go's quad-one). With no flags, both families print (IPv4 then IPv6), one per
-/// line. A placeholder is printed only when nothing is selectable. Pure → unit-testable.
+/// line. Pure → unit-testable.
+///
+/// `Err` is Go's error return, not a line of output: an explicit `-4`/`-6` that selects nothing is
+/// `no Tailscale IPv4 address` / `no Tailscale IPv6 address` on stderr and a non-zero exit (see
+/// [`ip_no_match_error`]). The placeholder survives only for the unflagged empty answer, which is
+/// a node holding no address at all — Go reports THAT as `no current Tailscale IPs; state: %v`,
+/// a message built from `BackendState`, which this wire response does not carry.
 ///
 /// The two narrowings run in Go's order — `-1` truncates the address list, and only then does the
 /// family filter run over what survived — so this and [`format_service_ips`] answer the same
 /// question the same way. [`ip_usage_refusal`] refuses `-1` alongside `-4`/`-6` exactly as Go does,
 /// so in practice at most one of the two ever narrows a call.
-fn format_ip_filtered(ipv4: Option<&str>, ipv6: Option<&str>, sel: IpSelect) -> String {
+fn format_ip_filtered(
+    ipv4: Option<&str>,
+    ipv6: Option<&str>,
+    sel: IpSelect,
+) -> Result<String, &'static str> {
     // Go's `ips`, in netmap order: IPv4 then IPv6. A node has at most one address per family here,
     // so each one's family is positional — unlike a Service's list, nothing needs parsing.
     let all: Vec<(&str, bool)> = [(ipv4, true), (ipv6, false)]
@@ -9749,9 +10305,12 @@ fn format_ip_filtered(ipv4: Option<&str>, ipv6: Option<&str>, sel: IpSelect) -> 
         }
     }
     if out.is_empty() {
-        return "(no matching tailnet address)\n".to_string();
+        if let Some(message) = ip_no_match_error(sel) {
+            return Err(message);
+        }
+        return Ok("(no matching tailnet address)\n".to_string());
     }
-    out
+    Ok(out)
 }
 
 /// Format the `tnet file list` output: one `"{name}  ({size} bytes)"` line per waiting file, or a
@@ -10812,9 +11371,32 @@ struct PortedUpFlags {
 /// status or validates any other flag. So this runs before every other `up` check. Pure →
 /// unit-testable.
 fn check_ported_up_flags(flags: &PortedUpFlags) -> Result<()> {
+    check_host_routes(flags.host_routes.as_deref())?;
+    if flags.nickname.is_some() {
+        anyhow::bail!(
+            "--nickname is not a `tnet up` flag, and it is not a `tailscale up` flag upstream \
+             either: `up.go` builds one flag set for `up` and `login` and registers `--nickname` \
+             only when the command is `login`, so no `up` carries a profile name. Run `tnet login \
+             --nickname <NAME>` to name the profile as part of a (re)authentication, or `tnet set \
+             --nickname <NAME>` to rename the current login profile on its own — the two homes Go \
+             gives it."
+        );
+    }
+    Ok(())
+}
+
+/// Go's `--host-routes` refusal, shared by `up` and `login` because Go's flag set is: `up.go`'s
+/// `newUpFlagSet` registers `upf.Var(notFalseVar{}, "host-routes", …)` unconditionally, so BOTH
+/// commands take the flag and both refuse every value but `true`.
+///
+/// `None` = the flag was absent; `Some("true")` = its presence (Go's `IsBoolFlag` default) or an
+/// explicit `--host-routes=true`, the one value Go allows — accepted and inert, because this build's
+/// userspace netstack installs no host routes and Go has required `true` since Tailscale 1.67.
+/// Pure → unit-testable.
+fn check_host_routes(value: Option<&str>) -> Result<()> {
     // Go's `notFalseVar.Set` rejects every value but "true", and Go's flag package wraps that in
     // `invalid boolean value %q for -host-routes: %v`. Same sentence, this CLI's flag spelling.
-    if let Some(value) = flags.host_routes.as_deref()
+    if let Some(value) = value
         && value != "true"
     {
         anyhow::bail!(
@@ -10822,17 +11404,42 @@ fn check_ported_up_flags(flags: &PortedUpFlags) -> Result<()> {
              is allowed"
         );
     }
-    if flags.nickname.is_some() {
-        anyhow::bail!(
-            "--nickname is not a `tnet up` flag, and it is not a `tailscale up` flag upstream \
-             either: `up.go` builds one flag set for `up` and `login` and registers `--nickname` \
-             only when the command is `login`, so no `up` carries a profile name. This fork's \
-             profile naming lives on `tnet set --nickname <NAME>`, which renames the current login \
-             profile exactly as Go's `set --nickname` does — run that instead. (Go's other home \
-             for it, `login --nickname`, is not implemented here yet.)"
-        );
-    }
     Ok(())
+}
+
+/// Build the one-pref `set` request that carries Go `login --nickname` (`ipn.Prefs.ProfileName`), or
+/// `None` when the flag was absent — in which case `login` makes no such call at all.
+///
+/// Upstream, `--nickname` is an ordinary pref on the flag set `login` shares with `up`, applied by
+/// the same `Start`/`EditPrefs` that logs the node in. This fork keeps the login round-trip itself
+/// pref-free (see [`run_login`]: a no-pref `up` is what exempts `login` from the accidental-revert
+/// guard), so the profile name travels through the door the daemon already opens for it — the `set`
+/// path, which both persists `node_nickname` AND renames the current login profile, the two halves
+/// Go's `profileManager.SetPrefs` does. Every other field is the "leave unchanged" sentinel, so a
+/// `login --nickname` changes exactly one pref and nothing else.
+///
+/// Pure → unit-testable.
+fn login_nickname_request(nickname: Option<Option<String>>) -> Option<Request> {
+    let nickname = nickname?;
+    Some(Request::Set {
+        hostname: None,
+        accept_routes: None,
+        accept_dns: None,
+        shields_up: None,
+        exit_node: None,
+        advertise_exit_node: None,
+        advertise_routes: None,
+        advertise_tags: None,
+        ssh: None,
+        advertise_connector: None,
+        auto_update: None,
+        update_check: None,
+        operator: None,
+        nickname: Some(nickname),
+        report_posture: None,
+        webclient: None,
+        exit_node_allow_lan_access: None,
+    })
 }
 
 /// The Go pref flags `tailscale set` carries (`set.go` `newSetFlagSet`) beyond the ones this CLI
@@ -10866,10 +11473,13 @@ struct SetPrefFlags {
 ///
 /// They exist here so a command line ported from Go reaches a refusal that NAMES what is missing
 /// instead of clap's "unexpected argument", the same treatment `serve`'s `--service` / `--tun` /
-/// `--proxy-protocol` / `--accept-app-caps` get (see [`check_serve_flags`]). Two of the four are
-/// two-valued, and for each of those exactly ONE value asks for a state this daemon is permanently
-/// in — relay server disabled, no static endpoints advertised, no remote configuration delegated,
-/// configuration synced from control. Those values are accepted as already-satisfied rather than
+/// `--proxy-protocol` / `--accept-app-caps` get (see [`check_serve_flags`]). That has to hold for
+/// Go's own SPELLING of each value, not just for the flag name: Go registers `--remote-config` and
+/// `--sync` with `flag.BoolVar`, so a Go command line turns them off with `--remote-config=false`
+/// and `--sync=false`, and both are parsed here (see [`parse_go_bool`]) rather than dying on
+/// clap's "unexpected value". Two of the four are two-valued, and for each of those exactly ONE
+/// value asks for a state this daemon is permanently in — relay server disabled, no static
+/// endpoints advertised, no remote configuration delegated, configuration synced from control. Those values are accepted as already-satisfied rather than
 /// refused, so a ported line that merely turns the feature OFF keeps working; the other value is
 /// refused by [`check_unmodelled_set_flags`].
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -10880,9 +11490,11 @@ struct UnmodelledSetFlags {
     /// `--relay-server-static-endpoints <IP:PORT,…>`; a string for the same reason — the empty
     /// value means "advertise none".
     relay_server_static_endpoints: Option<String>,
-    /// `--remote-config` → `Some(true)`, `--no-remote-config` → `Some(false)`, absent → `None`.
+    /// `--remote-config` (or Go's `--remote-config=true`) → `Some(true)`; `--no-remote-config` or
+    /// Go's `--remote-config=false` → `Some(false)`; absent → `None`.
     remote_config: Option<bool>,
-    /// `--sync` → `Some(true)`, `--no-sync` (Go `--sync=false`) → `Some(false)`, absent → `None`.
+    /// `--sync` (or Go's `--sync=true`) → `Some(true)`; `--no-sync` or Go's `--sync=false` →
+    /// `Some(false)`; absent → `None`.
     sync: Option<bool>,
 }
 
@@ -11006,6 +11618,37 @@ fn check_unmodelled_set_flags(flags: &UnmodelledSetFlags) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Go's `strconv.ParseBool` — the value spellings behind every `flag.BoolVar`, and so the values a
+/// command line ported from Go may carry for `--sync=…` / `--remote-config=…`. clap's built-in
+/// `bool` parser takes only `true`/`false`, which would still turn Go's `--sync=0` into a parser
+/// death on a line Go accepts.
+///
+/// The error text is `strconv.ParseBool`'s own; clap wraps it with the flag and the offending value,
+/// so a mistyped value is a parse error naming the flag — Go's `invalid boolean value %q for -sync:
+/// %v` — rather than a silent "off". (`cmd/tailscaled`'s `boolFlag` gets the same treatment in
+/// `tailnetd`, which carries its own copy of this: the two binaries share no flag plumbing.)
+/// Pure → unit-testable.
+fn parse_go_bool(s: &str) -> std::result::Result<bool, String> {
+    match s {
+        "1" | "t" | "T" | "TRUE" | "true" | "True" => Ok(true),
+        "0" | "f" | "F" | "FALSE" | "false" | "False" => Ok(false),
+        _ => Err(format!("strconv.ParseBool: parsing {s:?}: invalid syntax")),
+    }
+}
+
+/// Fold the two spellings of one Go `set` boolean into the tri-state [`check_unmodelled_set_flags`]
+/// reads: Go's own `--flag[=BOOL]` (already parsed to `Option<bool>` by [`parse_go_bool`]) and this
+/// fork's `--no-flag`. Both spellings of "off" land on `Some(false)`, so `--sync=false` and
+/// `--no-sync` reach the same named refusal, and `--remote-config=false` and `--no-remote-config`
+/// the same acceptance. clap's `conflicts_with` guarantees at most one of the pair is given (and,
+/// defensively, `--no-flag` wins).
+///
+/// The [`resolve_tristate`] of a flag whose positive half carries Go's optional value — the shape
+/// [`resolve_browser`] already uses for `status --browser` / `--no-browser`. Pure → unit-testable.
+fn resolve_go_bool_tristate(flag: Option<bool>, no_flag: bool) -> Option<bool> {
+    if no_flag { Some(false) } else { flag }
 }
 
 /// Map an `--x` / `--no-x` pref flag pair to the tri-state `Option<bool>` the wire uses: enable →
@@ -11267,51 +11910,65 @@ const WEB_NOT_FOUND_BODY: &str = "<!DOCTYPE html><html><body>not found</body></h
 /// the cause is logged to stderr, not handed to whoever loaded the page.
 const WEB_UNAVAILABLE_BODY: &str = "<!DOCTYPE html><html><body>status unavailable</body></html>";
 
-/// The refusal `tnet web` owes its own flags before it binds anything or contacts the daemon, or
-/// `None` when the invocation is usable.
+/// Validate + normalize a `web --origin` value into the base URL the UI is reached at, `Ok(None)`
+/// when no origin was given, or the refusal explaining why the value is neither.
 ///
-/// `--cgi` replaces the listener entirely: the process serves ONE request out of the CGI/1.1
-/// environment and exits, so there is no address to bind and `--listen` names a listener that will
-/// never exist. Go registers both flags on the same command and simply ignores the listen address in
-/// CGI mode; this fork refuses the combination instead, the same shape (and the same wording) it
-/// already uses for the other flag-pair refusals it ports (Go's "can only be used with" shape, as in
-/// [`up_usage_refusal`]), so an operator who thinks they are choosing a port is told the port is not
-/// used rather than silently getting no listener.
+/// Go stores `--origin` verbatim in `web.ServerOpts.OriginOverride` and validates nothing
+/// (`cmd/tailscale/cli/web.go`, which also applies it only `if webArgs.origin != ""` — so an empty
+/// value is "unset", not an error). The override has exactly one consumer: `csrfProtect`
+/// substitutes it for `r.Host` and compares it against the *host* of the request's `Origin` header
+/// (`client/web/web.go`, `host = s.originOverride` … `if origin != host`). The value Go takes is
+/// therefore a bare `host[:port]` — `client/web/web_test.go`'s `TestCSRFProtect` case
+/// `POST-no-sec-fetch-site-origin-override-allowed` passes `example.net`.
 ///
-/// The message goes to **stdout** and the caller exits **1**, matching this CLI's other usage
-/// refusals ([`switch_usage_refusal`]) rather than clap's stderr + exit 2 —
-/// which is why this is a hand-rolled check and not an `#[arg(conflicts_with = ...)]`. Pure →
-/// unit-testable.
-fn web_usage_refusal(cgi: bool, has_listen: bool) -> Option<&'static str> {
-    if cgi && has_listen {
-        return Some("--listen can only be used without --cgi (a CGI script binds no listener)");
-    }
-    None
-}
-
-/// Validate + normalize a `web --origin` value into the base URL the UI is reached at, or the
-/// refusal explaining why it is not one.
+/// This fork's UI is read-only and runs no CSRF check, so there is no `Origin` header to compare
+/// the value with; what there is instead is a link to build — the URL this command reports and
+/// opens, and the `<link rel="canonical">` the page states. Both shapes are accepted, because
+/// refusing Go's would refuse the command lines Go documents and tests:
 ///
-/// Go's `--origin` ("origin at which the web UI is served (if behind a reverse proxy or used with
-/// cgi)") feeds the web server's origin override, which exists because the address the UI *bound* is
-/// not the address a browser *reached* it at. So the value has to be an absolute URL: a scheme and a
-/// host are exactly the two things `--prefix` cannot supply. A port and a path are optional (a proxy
-/// that mounts the UI under a path names it here); a query, a fragment or userinfo are not — those
-/// belong to a request, not to the base URL a page is served at, and silently dropping them would
-/// emit links that differ from what was asked for.
+/// - `example.net`, `192.0.2.10:8088`, `example.net/tailscale` — Go's shape. It states no scheme,
+///   so `http` is assumed: the same assumption Go makes exactly where this value is used ("if
+///   Sec-Fetch-Site is not available we presume we are operating over HTTP") and the one
+///   `urlOfListenAddr` prints for the address the UI bound.
+/// - `https://ts.example.com/tailscale` — an absolute URL. Strictly more than Go's shape can say,
+///   and the only way to get `https` into a generated link rather than an assumed `http`.
+///
+/// A query, a fragment or userinfo are refused in either shape: those belong to a request, not to
+/// the base URL a page is served at, and silently dropping them would emit links that differ from
+/// what was asked for.
 ///
 /// Normalization is: keep the scheme, the host and an explicit non-default port, drop a trailing
 /// slash from the path. So `https://ts.example.com/tailscale/` and `https://ts.example.com/tailscale`
 /// are the same origin. Pure → unit-testable.
-fn parse_web_origin(origin: &str) -> Result<String, String> {
+fn parse_web_origin(origin: &str) -> Result<Option<String>, String> {
     let raw = origin.trim();
     if raw.is_empty() {
-        return Err(
-            "--origin needs an absolute URL, e.g. https://ts.example.com/tailscale".to_string(),
-        );
+        return Ok(None);
     }
-    let parsed = url::Url::parse(raw)
-        .map_err(|e| format!("--origin {raw:?} is not an absolute URL: {e}"))?;
+    // `://` is what tells the two shapes apart. With it the value states its own scheme, which has
+    // to be one this UI is served over; without it the value is Go's bare host[:port] and needs a
+    // scheme prepended before any URL parser will read it as an authority at all (`example.net:8088`
+    // parses as the *scheme* `example.net` otherwise).
+    let (states_scheme, authority) = match raw.split_once("://") {
+        Some((_, after)) => (true, after),
+        None => (false, raw),
+    };
+    // A slash where the host belongs means there is no host: `--origin /tailscale` (and
+    // `https:///tailscale`) names a path. Checked here rather than left to the parser, which skips
+    // the extra slashes and would silently read `/tailscale` as the HOST `tailscale`.
+    if authority.starts_with('/') {
+        return Err(format!(
+            "--origin {raw:?} names no host, only a path; `--prefix` is the flag for a path"
+        ));
+    }
+    let candidate = if states_scheme {
+        raw.to_string()
+    } else {
+        format!("http://{raw}")
+    };
+    let parsed = url::Url::parse(&candidate).map_err(|e| {
+        format!("--origin {raw:?} is neither a host nor a URL the web UI can be reached at: {e}")
+    })?;
     match parsed.scheme() {
         "http" | "https" => {}
         other => {
@@ -11339,7 +11996,7 @@ fn parse_web_origin(origin: &str) -> Result<String, String> {
         base.push_str(&format!(":{port}"));
     }
     base.push_str(parsed.path().trim_end_matches('/'));
-    Ok(base)
+    Ok(Some(base))
 }
 
 /// Split a [`parse_web_origin`] base into `(scheme://authority, path)` — the path is `""` when the
@@ -11448,10 +12105,17 @@ fn cgi_response(status: &str, body: &str) -> String {
 /// `tnet web` (Go `tailscale web`): resolve the flags, then serve the read-only status UI in
 /// whichever of the two modes was asked for.
 ///
-/// Order is load-bearing: the usage refusal first (it costs nothing and must not be reached only
-/// after a bind), then the `--origin` validation (a bad origin is a usage error, not a serving
-/// failure), then the mode split. `--cgi` serves exactly one request on stdout and returns; the
-/// default binds a listener and runs until interrupted.
+/// Order is load-bearing: the `--origin` validation first (a bad origin is a usage error, not a
+/// serving failure, so it must not be reached only after a bind), then the mode split. `--cgi`
+/// serves exactly one request on stdout and returns; the default binds a listener and runs until
+/// interrupted.
+///
+/// `--listen` alongside `--cgi` is accepted and ignored, as in Go: `runWeb` branches on
+/// `webArgs.cgi` before it ever reads `webArgs.listen`, so the address is simply unused (and, since
+/// Go registers `--listen` with a default, Go could not tell an explicit one from the default
+/// anyway). Refusing the pair would be worse than useless here — in CGI mode this process's stdout
+/// *is* the response body, so a refusal printed there reaches the invoking web server as a
+/// malformed CGI response instead of a page.
 async fn run_web(
     socket: &std::path::Path,
     listen: Option<String>,
@@ -11460,12 +12124,8 @@ async fn run_web(
     cgi: bool,
     origin: Option<&str>,
 ) -> Result<()> {
-    if let Some(message) = web_usage_refusal(cgi, listen.is_some()) {
-        println!("{message}");
-        std::process::exit(1);
-    }
     let origin = match origin {
-        Some(raw) => Some(parse_web_origin(raw).map_err(|e| anyhow::anyhow!(e))?),
+        Some(raw) => parse_web_origin(raw).map_err(|e| anyhow::anyhow!(e))?,
         None => None,
     };
     if cgi {
@@ -12322,6 +12982,23 @@ impl ServeKind {
     fn is_web(self) -> bool {
         matches!(self, ServeKind::Https | ServeKind::Http)
     }
+
+    /// The name Go's `serveType.String()` gives this type, for the one message that prints it (the
+    /// too-high-port refusal in [`serve_kind_and_port`]).
+    ///
+    /// `Tun` is `unknownServeType` because Go's `String()` has no `case serveTypeTUN` and falls to
+    /// its default arm. Nothing here can print it — the only caller reads a type the port loop
+    /// assigned, and `--tun` is counted after that loop — but the mapping is Go's, so it is written
+    /// out rather than papered over.
+    fn go_name(self) -> &'static str {
+        match self {
+            ServeKind::Https => "https",
+            ServeKind::Http => "http",
+            ServeKind::Tcp => "tcp",
+            ServeKind::TlsTerminatedTcp => "tls-terminated-tcp",
+            ServeKind::Tun => "unknownServeType",
+        }
+    }
 }
 
 /// Resolve the mutually exclusive listener flags into `(kind, port)` exactly as `serve_v2.go`'s
@@ -12333,27 +13010,58 @@ impl ServeKind {
 /// `serve --https=0 3000` contributes nothing, leaves the count at zero, and serves HTTPS on 443 —
 /// it is not an error. `--tun` is Go's fifth, port-less type and counts in the same exclusivity
 /// check, which is why the pair `--tun --https=443` is refused here rather than by clap.
+///
+/// The loop is written out rather than filtered because Go's too-high-port refusal is INSIDE it and
+/// sees its state: `if v > math.MaxUint16 { return …fmt.Errorf("port number %d is too high for %s
+/// flag", v, srvType) }` runs before `srvType = k`, so the type it names is the one a PREVIOUS
+/// iteration assigned — and with only one port flag given there is no previous iteration, leaving
+/// `srvType` at its zero value, `serveTypeHTTPS`. That is why `serve --tcp=70000 3000` is refused by
+/// Go with "too high for https flag": the message names the wrong flag, and this port keeps Go's
+/// sentence rather than improving on it, because a script matching on Go's output has to keep
+/// matching. The one thing that cannot be reproduced is Go's map iteration order, which is random:
+/// with two port flags where the second is too high, Go names either type, and the fixed order here
+/// picks one of them. Being inside the loop also means the refusal comes BEFORE the multiple-types
+/// error, which is checked after it.
 fn serve_kind_and_port(flags: &ServeFlags) -> Result<(ServeKind, u16)> {
-    let mut given: Vec<(ServeKind, u16)> = [
+    // Go's named return values, read by the refusal below before they are assigned.
+    let mut srv_type = ServeKind::Https;
+    let mut srv_port = 0u16;
+    let mut src_type_count = 0usize;
+    for (kind, value) in [
         (ServeKind::Https, flags.https),
         (ServeKind::Http, flags.http),
         (ServeKind::Tcp, flags.tcp),
         (ServeKind::TlsTerminatedTcp, flags.tls_terminated_tcp),
-    ]
-    .into_iter()
-    .filter_map(|(kind, port)| port.filter(|p| *p != 0).map(|p| (kind, p)))
-    .collect();
-    if flags.tun {
-        given.push((ServeKind::Tun, 0));
+    ] {
+        let Some(value) = value.filter(|v| *v != 0) else {
+            continue;
+        };
+        // Go's `if v > math.MaxUint16 { … }` guarding its `uint16(v)`: the conversion fails on
+        // exactly the values the comparison refuses.
+        let Ok(port) = u16::try_from(value) else {
+            anyhow::bail!(
+                "port number {value} is too high for {} flag",
+                srv_type.go_name()
+            );
+        };
+        src_type_count += 1;
+        srv_type = kind;
+        srv_port = port;
     }
-    match given.as_slice() {
-        [] => Ok((ServeKind::Https, 443)),
-        [(kind, port)] => Ok((*kind, *port)),
-        _ => anyhow::bail!(
+    if flags.tun {
+        src_type_count += 1;
+        srv_type = ServeKind::Tun;
+    }
+    if src_type_count > 1 {
+        anyhow::bail!(
             "cannot serve multiple types for a single mount point: give exactly one of --https / \
              --http / --tcp / --tls-terminated-tcp / --tun (they name the same listener)"
-        ),
+        );
     }
+    if src_type_count == 0 {
+        return Ok((ServeKind::Https, 443));
+    }
+    Ok((srv_type, srv_port))
 }
 
 /// Go's `--bg` default: unset means the FOREGROUND, except with `--service`, where Go flips the
@@ -12366,8 +13074,24 @@ fn serve_background(flags: &ServeFlags) -> bool {
 /// Whether `cap` matches Go's `validAppCap` regexp `^([\pL\pN-]+\.)+[\pL\pN-]+\/[\pL\pN-/]+$`:
 /// a `{domain}/{name}` app capability whose domain is a fully qualified name of two or more labels
 /// drawn from letters, numbers and hyphens, and whose name may also contain forward slashes.
+///
+/// `\pL` and `\pN` are Unicode general CATEGORIES, so the character test asks for the category
+/// rather than for `char::is_alphabetic`. The two are not the same set: `is_alphabetic` is the
+/// Alphabetic derived property, which is `\pL` plus `Other_Alphabetic` — some 6000 combining marks
+/// (Devanagari vowel signs, Arabic and Hebrew points, …) that are not letters. Asking it would
+/// accept a capability whose domain label carries one of those, which Go's regexp refuses; the
+/// command line would then reach this build's "not supported" refusal instead of Go's
+/// "does not match the form {domain}/{name}". `\pN` happens to coincide with `char::is_numeric`,
+/// but both halves go through the same lookup so the two cannot drift apart.
 fn is_valid_app_cap(cap: &str) -> bool {
-    let label_char = |c: char| c.is_alphabetic() || c.is_numeric() || c == '-';
+    use icu_properties::CodePointMapData;
+    use icu_properties::props::{GeneralCategory, GeneralCategoryGroup};
+
+    const LETTER_OR_NUMBER: GeneralCategoryGroup =
+        GeneralCategoryGroup::Letter.union(GeneralCategoryGroup::Number);
+    let label_char = |c: char| {
+        LETTER_OR_NUMBER.contains(CodePointMapData::<GeneralCategory>::new().get(c)) || c == '-'
+    };
     // The domain half has no slash, so the FIRST slash is the separator and everything after it is
     // the (slash-bearing) name.
     let Some((domain, name)) = cap.split_once('/') else {
@@ -13240,6 +13964,10 @@ async fn run_configure_kubeconfig(
         // kubectl already reads, leaving every other cluster in it intact.
         None => {
             let path = kubeconfig_path()?;
+            // Go: `checkKubeconfigWritable(kubeconfig)`, here in the order Go runs it — after the
+            // FQDN is resolved, before a single byte is read or written. An unwritable kubeconfig is
+            // the operator's answer, and it is cheaper to give it before the merge than after.
+            check_kubeconfig_writable(&path)?;
             set_kubeconfig_for_peer(scheme, &fqdn, &path)?;
             // Go's closing line, verbatim (`kubeconfig configured for %q at URL %q`), plus the file
             // it edited — Go leaves that implicit, but `$KUBECONFIG` can point anywhere.
@@ -13561,9 +14289,129 @@ fn kubeconfig_path() -> Result<String> {
     kubeconfig_path_from(kubeconfig.as_deref(), home.as_deref())
 }
 
+/// Go's `kubeconfigAccessErr`: one wording for every reason the kubeconfig cannot be written, so
+/// the precheck below and a failed directory creation read the same to whoever hits them.
+///
+/// Go's sandboxed-macOS arm — which appends a pointer at the open-source distribution, because a GUI
+/// build can only reach files under its own container — has no analogue here, for the same reason
+/// [`kubeconfig_path_from`] ports only the plain arm: this daemon has no sandboxed GUI build.
+///
+/// `detail` is spelled the way Go's `%w` of an `*os.PathError` prints (`<syscall> <path>: <reason>`).
+/// The path that actually refused the write is usually an ANCESTOR of the kubeconfig — a `~/.kube`
+/// owned by root, say — so naming only the kubeconfig would send the reader to look at the one file
+/// that is not the problem.
+fn kubeconfig_access_err(path: &str, detail: &str) -> anyhow::Error {
+    anyhow!(
+        "cannot write kubeconfig at {:?}: {}",
+        sanitize_for_terminal(path),
+        sanitize_for_terminal(detail)
+    )
+}
+
+/// Go's `isWritable`: can `path` be written? Reported as `Ok(())` or the reason it cannot.
+///
+/// A directory is probed by creating and removing a file inside it, because the mode bits alone do
+/// not answer the question — a read-only mount, an ACL, or someone else's ownership all refuse a
+/// write that `0755` promises. A regular file is opened `O_WRONLY` (no `O_CREAT`, no `O_TRUNC`) and
+/// closed again, so asking whether it can be written never damages it.
+fn is_writable(path: &std::path::Path) -> std::result::Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let md = std::fs::metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+    if !md.is_dir() {
+        return std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map(drop)
+            .map_err(|e| format!("open {}: {e}", path.display()));
+    }
+    // Go's `os.CreateTemp(path, ".tailscale-kubeconfig-*")`, whose randomness only has to avoid a
+    // collision: a fresh name per attempt, `O_EXCL` so a name already taken is retried rather than
+    // truncating a file this probe does not own, and `0600` because a probe in a shared `/tmp`-like
+    // directory should not be world-readable even for the instant it exists.
+    static PROBE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let mut last = String::new();
+    for _ in 0..10 {
+        let n = PROBE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let probe = path.join(format!(".tailscale-kubeconfig-{}-{n}", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&probe)
+        {
+            Ok(f) => {
+                drop(f);
+                return std::fs::remove_file(&probe)
+                    .map_err(|e| format!("remove {}: {e}", probe.display()));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                last = format!("open {}: {e}", probe.display());
+            }
+            Err(e) => return Err(format!("open {}: {e}", probe.display())),
+        }
+    }
+    Err(last)
+}
+
+/// Go's `filepath.Dir` where [`check_kubeconfig_writable`] walks up: the next path to try, with
+/// Go's two fixed points kept, because they are what stop the walk.
+///
+/// `Path::parent` and `filepath.Dir` disagree at exactly the ends: Rust answers `""` where Go
+/// answers `"."`, and `None` both for the root — where Go returns its argument unchanged, the fixed
+/// point the walk exits on — and for the empty path, where Go answers `"."` again.
+fn kubeconfig_parent_dir(path: &std::path::Path) -> std::path::PathBuf {
+    match path.parent() {
+        Some(dir) if dir.as_os_str().is_empty() => std::path::PathBuf::from("."),
+        Some(dir) => dir.to_path_buf(),
+        None if path.as_os_str().is_empty() => std::path::PathBuf::from("."),
+        None => path.to_path_buf(),
+    }
+}
+
+/// Go's `checkKubeconfigWritable`: refuse a kubeconfig that cannot be written BEFORE anything is
+/// read, merged or created.
+///
+/// Walk up from the target to the first component that exists and probe that one, because the
+/// interesting cases are the ones where the target does not exist yet: a first run has no
+/// `~/.kube/config`, and often no `~/.kube` either, so the nearest existing ancestor is the only
+/// thing there is to ask. Reaching the filesystem root without finding anything is `nil` in Go —
+/// nothing left to ask — and the write itself then reports whatever is really wrong.
+///
+/// Without this the refusal arrives at the `open()` in [`set_kubeconfig_for_peer`], after the
+/// existing kubeconfig has been read and the merge computed, and it says "opening kubeconfig … for
+/// writing". Nothing is damaged either way; this one answers the question the operator asked, in
+/// Go's words, at the point Go answers it.
+fn check_kubeconfig_writable(path: &str) -> Result<()> {
+    let mut probe = std::path::PathBuf::from(path);
+    loop {
+        match std::fs::metadata(&probe) {
+            Ok(_) => return is_writable(&probe).map_err(|why| kubeconfig_access_err(path, &why)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            // Go's `!os.IsNotExist(err)` arm: a stat that fails for any other reason (a `~/.kube`
+            // whose parent is `0600`, say) is itself the answer, and probing further up would only
+            // replace it with a vaguer one.
+            Err(e) => {
+                return Err(kubeconfig_access_err(
+                    path,
+                    &format!("stat {}: {e}", probe.display()),
+                ));
+            }
+        }
+        let parent = kubeconfig_parent_dir(&probe);
+        if parent == probe {
+            return Ok(()); // reached the filesystem root
+        }
+        probe = parent;
+    }
+}
+
 /// Merge the triple into the kubeconfig at `path`, porting Go's `setKubeconfigForPeer`: create the
-/// parent directory if it is missing, read whatever is there (a missing file is an empty document),
-/// merge, and write the result back at mode `0600`.
+/// parent directories if they are missing, read whatever is there (a missing file is an empty
+/// document), merge, and write the result back at mode `0600`.
+///
+/// The caller runs [`check_kubeconfig_writable`] first, as Go does, so an unwritable target is
+/// refused before this reads anything.
 ///
 /// Symlinks are followed, as Go's `os.ReadFile`/`os.WriteFile` do — a `~/.kube/config` symlinked into
 /// a dotfiles checkout is a normal setup, and refusing it would break the common case this command
@@ -13574,15 +14422,28 @@ fn set_kubeconfig_for_peer(scheme: &str, fqdn: &str, path: &str) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 
     let p = std::path::Path::new(path);
-    // Go: `os.Mkdir(dir, 0755)` — one level, not MkdirAll, so a path several directories deep still
-    // reports the missing parent rather than conjuring the tree.
-    if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty())
-        && !dir.exists()
-    {
-        std::fs::DirBuilder::new()
-            .mode(0o755)
-            .create(dir)
-            .with_context(|| format!("creating {}", dir.display()))?;
+    // Go: `if _, err := os.Stat(dir); err != nil { if !os.IsNotExist(err) { return err }; ...
+    // os.MkdirAll(dir, 0755) }` — the whole missing tree, not one level, so a `$KUBECONFIG` pointing
+    // several directories deep gets its file written rather than a refusal naming a parent the user
+    // never asked about. A stat that fails for some other reason is Go's early return: the directory
+    // IS there and is unreadable, and a mkdir on top of it would only replace that reason with a
+    // worse one.
+    if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
+        match std::fs::metadata(dir) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::DirBuilder::new()
+                    .mode(0o755)
+                    .recursive(true)
+                    .create(dir)
+                    // Go wraps this one in `kubeconfigAccessErr`, which names the kubeconfig rather
+                    // than the directory — the file is what the operator asked for.
+                    .map_err(|e| {
+                        kubeconfig_access_err(path, &format!("mkdir {}: {e}", dir.display()))
+                    })?;
+            }
+            Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+        }
     }
     let existing = match std::fs::read(p) {
         Ok(b) => String::from_utf8(b).map_err(|_| {
@@ -16490,8 +17351,20 @@ mod tests {
 
         let j = format_lock_log(&report, parse_json_schema_version("1").unwrap()).unwrap();
         let v: serde_json::Value = serde_json::from_str(&j).unwrap();
-        // Go's `jsonoutput.ResponseEnvelope` field, so a script can pin the schema it parses.
-        assert_eq!(v["SchemaVersion"], serde_json::json!("1"));
+        // Go's `jsonoutput.ResponseEnvelope` field, so a script can pin the schema it parses — but
+        // naming this fork's schema. The document below is `enabled` + `entries`, not Go's
+        // `Messages` of expanded AUMs, so claiming Go's `"1"` would hand a consumer a version string
+        // it can only misread.
+        assert_eq!(v["SchemaVersion"], serde_json::json!("tailscaled-rs.1"));
+        assert_ne!(
+            v["SchemaVersion"],
+            serde_json::json!("1"),
+            "this document is not upstream `PrintTailnetLockLogJSONV1`'s schema 1 and must not \
+             claim to be"
+        );
+        // The corollary: none of Go's schema-1 key names may appear on a document that cannot fill
+        // them.
+        assert!(v.get("Messages").is_none(), "{v}");
         assert_eq!(v["enabled"], serde_json::json!(true));
         assert_eq!(v["entries"].as_array().unwrap().len(), 2);
         assert_eq!(v["entries"][0]["hash"], serde_json::json!("AAAAQ"));
@@ -16522,25 +17395,26 @@ mod tests {
         }
     }
 
-    /// Lock on, but this node has synced no chain yet: Go's loop prints nothing at all, which reads
-    /// the same as a command that did nothing. Say which empty this is.
+    /// Lock on, but this node has synced no chain yet: Go's `printTailnetLockLog` ranges over an
+    /// empty slice and returns, printing nothing at all. Print nothing too — a node whose lock is off
+    /// has already been refused with a non-zero exit, so empty stdout on success already says "lock
+    /// on, no history" without a line Go never emits.
     #[test]
-    fn format_lock_log_enabled_but_unsynced_says_so() {
+    fn format_lock_log_enabled_but_unsynced_prints_nothing() {
         use tailscaled_rs::localapi::LockLogReport;
         let on_but_empty = LockLogReport {
             enabled: true,
             entries: vec![],
         };
         let h = format_lock_log(&on_but_empty, JsonSchemaVersion::default()).unwrap();
-        assert!(h.starts_with("Tailnet Lock is ENABLED,"), "{h}");
-        assert!(h.contains("no update-chain history has synced"), "{h}");
+        assert_eq!(h, "", "Go prints no stanzas and no commentary here");
         // JSON stays a well-formed, envelope-carrying object with an empty list (no null, no bare
         // array).
         let v: serde_json::Value = serde_json::from_str(
             &format_lock_log(&on_but_empty, parse_json_schema_version("1").unwrap()).unwrap(),
         )
         .unwrap();
-        assert_eq!(v["SchemaVersion"], serde_json::json!("1"));
+        assert_eq!(v["SchemaVersion"], serde_json::json!("tailscaled-rs.1"));
         assert_eq!(v["entries"], serde_json::json!([]));
     }
 
@@ -17476,38 +18350,112 @@ mod tests {
 
         // `--list` is handled first, so every flag/arg combination under it is usable: plain list,
         // JSON list, and a stray target next to `--list` (Go ignores the args entirely once listing).
-        assert_eq!(switch_usage_refusal(true, false, None, false), None);
-        assert_eq!(switch_usage_refusal(true, true, None, false), None);
-        assert_eq!(switch_usage_refusal(true, true, Some("work"), false), None);
+        assert_eq!(switch_usage_refusal(true, false, false, None, false), None);
+        assert_eq!(switch_usage_refusal(true, true, false, None, false), None);
+        assert_eq!(
+            switch_usage_refusal(true, true, false, Some("work"), false),
+            None
+        );
 
         // `--json` WITHOUT `--list` is refused — with or without a target, because `--json` only ever
         // formats the listing. Go: `--json argument cannot be used with tailscale switch NAME`.
         assert_eq!(
-            switch_usage_refusal(false, true, Some("work"), false),
+            switch_usage_refusal(false, true, false, Some("work"), false),
             Some("--json argument cannot be used with tnet switch NAME")
         );
         assert_eq!(
-            switch_usage_refusal(false, true, None, false),
+            switch_usage_refusal(false, true, false, None, false),
             Some("--json argument cannot be used with tnet switch NAME"),
             "the --json refusal precedes the usage line, as in Go"
         );
 
         // No target, no `--list`, no `--json` → the usage line.
         assert_eq!(
-            switch_usage_refusal(false, false, None, false),
+            switch_usage_refusal(false, false, false, None, false),
             Some("usage: tnet switch NAME")
         );
 
         // A plain target is usable.
         assert_eq!(
-            switch_usage_refusal(false, false, Some("work"), false),
+            switch_usage_refusal(false, false, false, Some("work"), false),
             None
+        );
+
+        // This fork's own rule: `--new` creates, `--list` reads, so the pair is refused instead of
+        // the mutating half being ignored. It is checked before the list arm, so `--list --new` is
+        // the refusal and not a listing.
+        assert_eq!(
+            switch_usage_refusal(true, false, true, Some("work"), false),
+            Some("--new argument cannot be used with tnet switch --list")
+        );
+        assert_eq!(
+            switch_usage_refusal(true, true, true, None, false),
+            Some("--new argument cannot be used with tnet switch --list")
+        );
+        // `--new` on its own is a normal switch invocation and follows Go's remaining order: a
+        // target is required, `--json` still cannot be paired with a NAME.
+        assert_eq!(
+            switch_usage_refusal(false, false, true, Some("work"), false),
+            None
+        );
+        assert_eq!(
+            switch_usage_refusal(false, false, true, None, false),
+            Some("usage: tnet switch NAME")
+        );
+        assert_eq!(
+            switch_usage_refusal(false, true, true, Some("work"), false),
+            Some("--json argument cannot be used with tnet switch NAME")
         );
 
         // The `remove` subcommand is exempt from all of it: Go's ffcli dispatches the subcommand
         // before `switch`'s own Exec runs, so `switch`'s flag rules never apply to it.
-        assert_eq!(switch_usage_refusal(false, false, None, true), None);
-        assert_eq!(switch_usage_refusal(false, true, None, true), None);
+        assert_eq!(switch_usage_refusal(false, false, false, None, true), None);
+        assert_eq!(switch_usage_refusal(false, true, false, None, true), None);
+        assert_eq!(switch_usage_refusal(true, false, true, None, true), None);
+    }
+
+    /// `switch --new` must travel as a request an older daemon cannot mistake for something else.
+    ///
+    /// The LocalAPI socket permits a mixed pair — a `tnet` newer than the daemon it is talking to.
+    /// Serde ignores unknown FIELDS, so had `--new` ridden as a `create` flag on `switch_profile`, a
+    /// daemon that predates it would have dropped the flag and served a bare switch: for a target
+    /// that already names a profile, that ACTIVATES it — the live device torn down and the node
+    /// repointed — where the operator asked for a creation the newer daemon refuses outright. An
+    /// unknown COMMAND cannot be reinterpreted like that; it fails to deserialize and comes back as
+    /// `bad request`, which [`send_ok_or_die`] prints before exiting 1, with nothing torn down.
+    #[test]
+    fn switch_new_is_its_own_command_so_an_older_daemon_cannot_read_it_as_a_switch() {
+        // Stand-in for the daemon that predates `--new`: the wire contract as of v0.55.1, reduced to
+        // the one command at issue. Serde's permissive defaults are the point — no
+        // `deny_unknown_fields`, exactly as the real `Request` is declared.
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "cmd", rename_all = "snake_case")]
+        enum OlderDaemonRequest {
+            SwitchProfile { target: String },
+        }
+
+        let create = serde_json::to_string(&switch_request(true, "work".into())).unwrap();
+        assert!(
+            serde_json::from_str::<OlderDaemonRequest>(&create).is_err(),
+            "an older daemon must refuse `switch --new` outright rather than run something else, \
+             but it read {create} as a command it already serves"
+        );
+        assert_eq!(create, r#"{"cmd":"create_profile","id":"work"}"#);
+
+        // The shape that WOULD have been misread, spelled out: an unknown field is dropped, and what
+        // is left is a plain switch to `work` — the wrong, destructive action.
+        let OlderDaemonRequest::SwitchProfile { target } =
+            serde_json::from_str(r#"{"cmd":"switch_profile","target":"work","create":true}"#)
+                .expect("an unknown field is dropped by serde, not refused");
+        assert_eq!(target, "work");
+
+        // Without `--new` the request is byte-identical to what it has always been, so an older
+        // daemon keeps serving a plain switch unchanged — the guard costs the common path nothing.
+        let switch = serde_json::to_string(&switch_request(false, "work".into())).unwrap();
+        assert_eq!(switch, r#"{"cmd":"switch_profile","target":"work"}"#);
+        let OlderDaemonRequest::SwitchProfile { target } =
+            serde_json::from_str(&switch).expect("an older daemon still understands a bare switch");
+        assert_eq!(target, "work");
     }
 
     #[test]
@@ -18080,6 +19028,56 @@ mod tests {
     }
 
     #[test]
+    fn a_port_past_a_u16_gets_gos_refusal_not_claps() {
+        // srvTypeAndPortFromFlags range-checks the value ITSELF (`if v > math.MaxUint16`), so the
+        // four port flags are typed as wide as Go's `uint` and a too-high port reaches Go's
+        // sentence at Go's exit status instead of clap's integer-range error at exit 2. That the
+        // command line parses at all is asserted by parse_serve, which panics if it does not.
+        for flag in ["--https", "--http", "--tcp", "--tls-terminated-tcp"] {
+            let arg = format!("{flag}=70000");
+            let (_, flags) = parse_serve(&[&arg, "3000"]);
+            // Go formats `srvType` BEFORE the loop assigns it, so a lone too-high flag is always
+            // reported against the zero value, serveTypeHTTPS — even for --tcp. Go's sentence,
+            // wrong flag name and all.
+            let want = "port number 70000 is too high for https flag";
+            let err = serve_kind_and_port(&flags)
+                .expect_err("65535 is the highest port there is")
+                .to_string();
+            assert_eq!(err, want, "{arg}");
+            // And through the whole flag check, not just the resolver.
+            let err = check_serve_flags(&flags, false)
+                .expect_err("the refusal is not skipped on the way in")
+                .to_string();
+            assert_eq!(err, want, "{arg}");
+        }
+
+        // The boundary itself: 65535 is a port, 65536 is one past every port.
+        let (_, flags) = parse_serve(&["--tcp=65535", "3000"]);
+        assert_eq!(
+            serve_kind_and_port(&flags).unwrap(),
+            (ServeKind::Tcp, 65535)
+        );
+        let (_, flags) = parse_serve(&["--tcp=65536", "3000"]);
+        assert_eq!(
+            serve_kind_and_port(&flags)
+                .expect_err("65536 is not a port")
+                .to_string(),
+            "port number 65536 is too high for https flag"
+        );
+
+        // Go checks the range inside the loop and the type count after it, so the too-high refusal
+        // wins over `cannot serve multiple types` — and here it names the type the earlier
+        // iteration assigned (Go names either one, its map order being random).
+        let (_, flags) = parse_serve(&["--http=80", "--tcp=70000", "3000"]);
+        assert_eq!(
+            serve_kind_and_port(&flags)
+                .expect_err("the range check comes first")
+                .to_string(),
+            "port number 70000 is too high for http flag"
+        );
+    }
+
+    #[test]
     fn tun_is_gos_fifth_serve_type() {
         // serve_v2.go: --tun sets serveTypeTUN and counts toward the exclusivity check…
         let (_, flags) = parse_serve(&["--tun", "3000"]);
@@ -18200,12 +19198,30 @@ mod tests {
         // Go returns early on an empty value, so it asks for no capabilities at all.
         assert!(parse_accept_app_caps(&[String::new()]).unwrap().is_empty());
 
+        // \pL and \pN are the Unicode categories, not ASCII: a domain and a name written in any
+        // script parse, digits and hyphens included.
+        assert_eq!(
+            parse_accept_app_caps(&[
+                "münchen.example/café, 日本.example/資本, ex4-mple.co/c4p-2".to_string()
+            ])
+            .unwrap(),
+            vec![
+                "münchen.example/café".to_string(),
+                "日本.example/資本".to_string(),
+                "ex4-mple.co/c4p-2".to_string(),
+            ]
+        );
+
         for bad in [
             "nodomain/cap",
             "example.com",
             "example.com/",
             "/cap",
             "exa mple.com/cap",
+            // Combining marks are Alphabetic but are NOT \pL (U+093E is Mc, U+0345 is Mn), so
+            // Go's regexp refuses them in either half of the capability.
+            "exa\u{093e}mple.com/cap",
+            "example.com/ca\u{0345}p",
         ] {
             let err = parse_accept_app_caps(&[bad.to_string()])
                 .expect_err("not a {domain}/{name} capability")
@@ -18628,6 +19644,96 @@ mod tests {
         assert!(ip.is_loopback(), "localhost resolved to {ip}, not loopback");
     }
 
+    /// Go's `isRunningOrStarting` state table, arm by arm. The two "keep going" states are the
+    /// only ones that return `ok`; every other state carries the text Go prints before `os.Exit(1)`.
+    #[test]
+    fn is_running_or_starting_ports_gos_state_table() {
+        use tailscaled_rs::ipn::State;
+
+        // Go: `case ipn.Running.String(), ipn.Starting.String(): return "", true`. A starting node
+        // is explicitly allowed through — it is coming up, and the ping is what nudges it.
+        assert_eq!(is_running_or_starting(State::Running.as_str(), None), None);
+        assert_eq!(is_running_or_starting(State::Starting.as_str(), None), None);
+        // An auth URL left over on a running node changes nothing: the state decides.
+        assert_eq!(
+            is_running_or_starting(
+                State::Running.as_str(),
+                Some("https://login.example.com/a/x")
+            ),
+            None
+        );
+
+        assert_eq!(
+            is_running_or_starting(State::Stopped.as_str(), None).as_deref(),
+            Some("Tailscale is stopped.")
+        );
+        assert_eq!(
+            is_running_or_starting(State::NeedsMachineAuth.as_str(), None).as_deref(),
+            Some("Machine is not yet approved by tailnet admin.")
+        );
+
+        // `NeedsLogin` with nothing to click is Go's bare `Logged out.`; with an `AuthURL` it grows
+        // the second line. An empty URL is Go's `st.AuthURL == ""` — no line.
+        assert_eq!(
+            is_running_or_starting(State::NeedsLogin.as_str(), None).as_deref(),
+            Some("Logged out.")
+        );
+        assert_eq!(
+            is_running_or_starting(State::NeedsLogin.as_str(), Some("")).as_deref(),
+            Some("Logged out.")
+        );
+        assert_eq!(
+            is_running_or_starting(
+                State::NeedsLogin.as_str(),
+                Some("https://login.example.com/a/abc123")
+            )
+            .as_deref(),
+            Some("Logged out.\nLog in at: https://login.example.com/a/abc123")
+        );
+
+        // Go's `default` arm. `NoState` and `InUseOtherUser` are real `ipn.State` names with no case
+        // of their own, so they land here too — as does anything a newer daemon might report.
+        for state in [
+            State::NoState.as_str(),
+            State::InUseOtherUser.as_str(),
+            "SomethingElse",
+        ] {
+            assert_eq!(
+                is_running_or_starting(state, None).as_deref(),
+                Some(format!("unexpected state: {state}").as_str()),
+                "{state} must fall into Go's default arm"
+            );
+        }
+        // The state name is compared exactly, like Go's string switch — a case-folded spelling is
+        // not `Running` and must not open the gate.
+        assert!(is_running_or_starting("running", None).is_some());
+    }
+
+    /// Both interpolated values reach a terminal, and both come from the daemon, so a control
+    /// sequence in either is neutralised rather than emitted.
+    #[test]
+    fn is_running_or_starting_neutralises_control_supplied_text() {
+        let hostile_url = "https://login.example.com/a/x\u{1b}[2K\rLogged in.";
+        let described = is_running_or_starting(
+            tailscaled_rs::ipn::State::NeedsLogin.as_str(),
+            Some(hostile_url),
+        )
+        .expect("NeedsLogin never opens the gate");
+        assert!(
+            !described.contains('\u{1b}') && !described.contains('\r'),
+            "the auth URL must not carry escapes into the line: {described:?}"
+        );
+        // The one newline in the message is the one this function put there.
+        assert_eq!(described.matches('\n').count(), 1, "{described:?}");
+
+        let unexpected = is_running_or_starting("Weird\nTailscale is running.", None)
+            .expect("an unknown state never opens the gate");
+        assert!(
+            !unexpected.contains('\n'),
+            "a state name must not forge a second line: {unexpected:?}"
+        );
+    }
+
     #[test]
     fn ping_probe_refusal_covers_only_what_the_engine_cannot_send() {
         // The default disco-less invocation, and Go's `--size 0` ("minimum size"), ask for the
@@ -18719,7 +19825,7 @@ mod tests {
         // No flags → both, v4 then v6.
         assert_eq!(
             format_ip_filtered(v4, v6, IpSelect::default()),
-            "100.64.0.1\nfd7a::1\n"
+            Ok("100.64.0.1\nfd7a::1\n".to_string())
         );
         // -4 → only v4.
         assert_eq!(
@@ -18731,7 +19837,7 @@ mod tests {
                     ..Default::default()
                 }
             ),
-            "100.64.0.1\n"
+            Ok("100.64.0.1\n".to_string())
         );
         // -6 → only v6.
         assert_eq!(
@@ -18743,7 +19849,7 @@ mod tests {
                     ..Default::default()
                 }
             ),
-            "fd7a::1\n"
+            Ok("fd7a::1\n".to_string())
         );
         // -1 → only the first (v4, since both present).
         assert_eq!(
@@ -18755,7 +19861,7 @@ mod tests {
                     ..Default::default()
                 }
             ),
-            "100.64.0.1\n"
+            Ok("100.64.0.1\n".to_string())
         );
         // -6 -1 → Go truncates to the first address (the v4 one) and only then filters for v6, so
         // the combination selects NOTHING on a dual-stack node. That empty answer is exactly why Go
@@ -18772,7 +19878,7 @@ mod tests {
                     ..Default::default()
                 }
             ),
-            "(no matching tailnet address)\n"
+            Err("no Tailscale IPv6 address")
         );
         assert_eq!(
             ip_usage_refusal(false, true, true),
@@ -18789,7 +19895,75 @@ mod tests {
                     ..Default::default()
                 }
             ),
-            "(no matching tailnet address)\n"
+            Err("no Tailscale IPv4 address")
+        );
+    }
+
+    #[test]
+    fn ip_family_filter_that_selects_nothing_is_an_error_not_a_line() {
+        // Go's `runIP` tail: the match loop sets `match` only when it printed an address, and
+        // `if !match` returns `no Tailscale IPv4 address` / `no Tailscale IPv6 address`. Those are
+        // ERRORS — stderr and a non-zero exit — and not `outln` calls, precisely so that
+        // `tailscale ip -6 host` can be tested by its exit status. Printing a placeholder on stdout
+        // and exiting 0 tells such a script the opposite of the truth.
+
+        // The case from the field: `-6` on a node whose tailnet is IPv4-only.
+        assert_eq!(
+            format_ip_filtered(
+                Some("100.64.0.1"),
+                None,
+                IpSelect {
+                    v6: true,
+                    ..Default::default()
+                }
+            ),
+            Err("no Tailscale IPv6 address")
+        );
+        // And its mirror: `-4` on an IPv6-only node.
+        assert_eq!(
+            format_ip_filtered(
+                None,
+                Some("fd7a:115c:a1e0::1"),
+                IpSelect {
+                    v4: true,
+                    ..Default::default()
+                }
+            ),
+            Err("no Tailscale IPv4 address")
+        );
+        // A node with no address at all and no family flag is Go's OTHER branch — the earlier
+        // `no current Tailscale IPs; state: %v`, which needs a `BackendState` this wire response
+        // does not carry. Left as the placeholder rather than answered with the wrong message.
+        assert_eq!(
+            format_ip_filtered(None, None, IpSelect::default()),
+            Ok("(no matching tailnet address)\n".to_string())
+        );
+        // The message names the family that was ASKED for, not the one the node happens to hold:
+        // Go branches on `ipArgs.want4`/`want6`, not on what was in `ips`.
+        assert_eq!(
+            ip_no_match_error(IpSelect {
+                v4: true,
+                ..Default::default()
+            }),
+            Some("no Tailscale IPv4 address")
+        );
+        assert_eq!(
+            ip_no_match_error(IpSelect {
+                v6: true,
+                ..Default::default()
+            }),
+            Some("no Tailscale IPv6 address")
+        );
+        // With neither flag both families are wanted, so Go's `!match` tail returns nil: there is
+        // no third error, and an empty answer here can only be an empty address list.
+        assert_eq!(ip_no_match_error(IpSelect::default()), None);
+        assert_eq!(
+            ip_no_match_error(IpSelect {
+                first: true,
+                ..Default::default()
+            }),
+            None,
+            "-1 alone never names a family"
         );
     }
 
@@ -18833,7 +20007,7 @@ mod tests {
                     ..Default::default()
                 }
             ),
-            "(no matching tailnet address)\n",
+            Err("no Tailscale IPv6 address"),
             "Go's order: -1 truncates to the v4 address, then -6 filters it away"
         );
         assert_eq!(
@@ -18851,7 +20025,7 @@ mod tests {
                     ..Default::default()
                 }
             ),
-            "100.64.0.10\n"
+            Ok("100.64.0.10\n".to_string())
         );
     }
 
@@ -19257,55 +20431,68 @@ mod tests {
     }
 
     #[test]
-    fn web_usage_refusal_refuses_a_listen_address_that_is_never_bound() {
-        // `--cgi` serves one request out of the CGI environment and binds nothing, so a `--listen`
-        // next to it names an address that will never exist. Refused, in the same shape this CLI
-        // already uses for the flag-pair refusals it ports from Go ("can only be used with").
+    fn parse_web_origin_takes_gos_bare_host_as_well_as_a_url() {
+        // The shape Go actually takes. `--origin` is stored verbatim and compared against the HOST
+        // of a request's `Origin` header, so the value is a bare host[:port] — `example.net` is the
+        // literal value `client/web/web_test.go`'s `POST-no-sec-fetch-site-origin-override-allowed`
+        // passes, and Go's CLI validates nothing. It states no scheme, so `http` is assumed (the
+        // assumption Go itself makes where this value is read).
         assert_eq!(
-            web_usage_refusal(true, true),
-            Some("--listen can only be used without --cgi (a CGI script binds no listener)")
+            parse_web_origin("example.net"),
+            Ok(Some("http://example.net".to_string()))
         );
-        // Every usable combination stays usable: a listener with an address, a listener with the
-        // default address, and CGI with no address at all.
-        assert_eq!(web_usage_refusal(false, true), None);
-        assert_eq!(web_usage_refusal(false, false), None);
-        assert_eq!(web_usage_refusal(true, false), None);
-    }
+        // A port must survive: `example.net:8088` parses as the *scheme* `example.net` unless the
+        // bare form is given a scheme first, which is the trap this shape has to get right.
+        assert_eq!(
+            parse_web_origin("192.0.2.10:8088"),
+            Ok(Some("http://192.0.2.10:8088".to_string()))
+        );
+        // A bare host may carry the outside path too, normalized exactly like the URL shape.
+        assert_eq!(
+            parse_web_origin("  ts.example.com/tailscale/  "),
+            Ok(Some("http://ts.example.com/tailscale".to_string()))
+        );
+        // Go applies the override only `if webArgs.origin != ""`, so an empty value is "no origin",
+        // not a usage error that kills the command.
+        assert_eq!(parse_web_origin(""), Ok(None));
+        assert_eq!(parse_web_origin("   "), Ok(None));
 
-    #[test]
-    fn parse_web_origin_normalizes_a_base_url_and_refuses_anything_else() {
-        // The reverse-proxy case Go's `--origin` exists for: scheme + host + the path the proxy
-        // publishes. A trailing slash is not a different origin.
+        // The URL shape: strictly more than Go can express (it is the only way to say `https`), and
+        // the reverse-proxy case this fork generates links for. A trailing slash is not a different
+        // origin.
         assert_eq!(
             parse_web_origin("https://ts.example.com/tailscale"),
-            Ok("https://ts.example.com/tailscale".to_string())
+            Ok(Some("https://ts.example.com/tailscale".to_string()))
         );
         assert_eq!(
             parse_web_origin("  https://ts.example.com/tailscale/  "),
-            Ok("https://ts.example.com/tailscale".to_string())
+            Ok(Some("https://ts.example.com/tailscale".to_string()))
         );
-        // Scheme + host alone is the pass-through proxy case; an explicit non-default port is kept,
-        // a default one is not (both name the same origin).
+        // An explicit non-default port is kept, a default one is not (both name the same origin).
         assert_eq!(
             parse_web_origin("http://192.0.2.10:8088"),
-            Ok("http://192.0.2.10:8088".to_string())
+            Ok(Some("http://192.0.2.10:8088".to_string()))
         );
         assert_eq!(
             parse_web_origin("https://ts.example.com:443/"),
-            Ok("https://ts.example.com".to_string())
+            Ok(Some("https://ts.example.com".to_string()))
         );
-        // An IPv6 literal keeps its brackets, so the result is still a usable URL.
+        // An IPv6 literal keeps its brackets, so the result is still a usable URL — in both shapes.
         assert_eq!(
             parse_web_origin("http://[2001:db8::1]:8088/ui"),
-            Ok("http://[2001:db8::1]:8088/ui".to_string())
+            Ok(Some("http://[2001:db8::1]:8088/ui".to_string()))
+        );
+        assert_eq!(
+            parse_web_origin("[2001:db8::1]:8088"),
+            Ok(Some("http://[2001:db8::1]:8088".to_string()))
         );
 
-        // The refusals. A bare host is the mistake to expect — it is what `--prefix` habits produce
-        // — and it is precisely the input that carries no scheme, the thing `--origin` is for.
-        for bad in ["", "   ", "ts.example.com", "/tailscale"] {
+        // What is still refused. A value that names no host at all is not an origin in either
+        // shape — it cannot be compared with a request's `Origin` and cannot be linked to.
+        for bad in ["/tailscale", "http://", "https:///tailscale"] {
             assert!(
                 parse_web_origin(bad).is_err(),
-                "{bad:?} is not an absolute URL and must be refused"
+                "{bad:?} names no host and must be refused"
             );
         }
         assert!(
@@ -19314,6 +20501,7 @@ mod tests {
                 .contains("http or https"),
             "a non-http(s) scheme must be named in the refusal"
         );
+        // The request-only parts, refused in both shapes.
         assert!(
             parse_web_origin("https://ts.example.com/ui?a=1")
                 .unwrap_err()
@@ -19321,12 +20509,17 @@ mod tests {
             "a query names one request, not the base URL the UI is served at"
         );
         assert!(
-            parse_web_origin("https://ts.example.com/ui#top")
+            parse_web_origin("ts.example.com/ui#top")
                 .unwrap_err()
                 .contains("query or fragment")
         );
         assert!(
             parse_web_origin("https://user:pw@ts.example.com")
+                .unwrap_err()
+                .contains("credentials")
+        );
+        assert!(
+            parse_web_origin("user:pw@ts.example.com")
                 .unwrap_err()
                 .contains("credentials")
         );
@@ -19336,7 +20529,9 @@ mod tests {
     fn web_ui_url_prefers_the_origin_over_the_address_that_was_bound() {
         // The defect: behind a reverse proxy the bound address is not the address anyone reaches,
         // and `--prefix` fixes only the path. With an origin, the origin wins outright.
-        let origin = parse_web_origin("https://ts.example.com/tailscale").unwrap();
+        let origin = parse_web_origin("https://ts.example.com/tailscale")
+            .unwrap()
+            .expect("a non-empty origin is an origin");
         assert_eq!(
             web_ui_url(Some(&origin), Some("127.0.0.1:8088"), "/tailscale").as_deref(),
             Some("https://ts.example.com/tailscale")
@@ -19348,7 +20543,9 @@ mod tests {
             Some("https://ts.example.com/tailscale")
         );
         // An origin that names only scheme + host is the pass-through case: the served path applies.
-        let host_only = parse_web_origin("https://ts.example.com").unwrap();
+        let host_only = parse_web_origin("https://ts.example.com")
+            .unwrap()
+            .expect("a non-empty origin is an origin");
         assert_eq!(
             web_ui_url(Some(&host_only), None, "/tailscale").as_deref(),
             Some("https://ts.example.com/tailscale")
@@ -19356,6 +20553,14 @@ mod tests {
         assert_eq!(
             web_ui_url(Some(&host_only), None, "/").as_deref(),
             Some("https://ts.example.com")
+        );
+        // Go's bare-host shape is the same pass-through case, reached over the assumed scheme.
+        let bare = parse_web_origin("example.net")
+            .unwrap()
+            .expect("a non-empty origin is an origin");
+        assert_eq!(
+            web_ui_url(Some(&bare), None, "/tailscale").as_deref(),
+            Some("http://example.net/tailscale")
         );
 
         // Without an origin, nothing changes from the previous behaviour: the bound address, plus
@@ -19445,7 +20650,9 @@ mod tests {
         };
         // With a known absolute URL (from `--origin`, or the bound address), the page says so — the
         // reverse-proxy case where the address this process bound is not the address anyone reached.
-        let origin = parse_web_origin("https://ts.example.com/tailscale").unwrap();
+        let origin = parse_web_origin("https://ts.example.com/tailscale")
+            .unwrap()
+            .expect("a non-empty origin is an origin");
         let url = web_ui_url(Some(&origin), None, "/").expect("an origin always yields a URL");
         let html = render_status_html(&report, Some(&url));
         assert!(
@@ -20133,8 +21340,8 @@ mod tests {
             } => UnmodelledSetFlags {
                 relay_server_port,
                 relay_server_static_endpoints,
-                remote_config: resolve_tristate(remote_config, no_remote_config),
-                sync: resolve_tristate(sync, no_sync),
+                remote_config: resolve_go_bool_tristate(remote_config, no_remote_config),
+                sync: resolve_go_bool_tristate(sync, no_sync),
             },
             _ => panic!("expected Command::Set"),
         }
@@ -20189,6 +21396,130 @@ mod tests {
                 "{flag} is a set-only flag in Go"
             );
         }
+    }
+
+    #[test]
+    fn gos_own_sync_and_remote_config_spellings_reach_the_ported_refusal() {
+        // Go registers both flags with `flag.BoolVar` (`set.go`'s `newSetFlagSet`), so the way a Go
+        // command line turns one OFF is `--sync=false` / `--remote-config=false`. Those spellings
+        // have to reach this build's gate: declared as valueless flags they died at clap with
+        // "unexpected value", which is the same wall carrying the flags was meant to remove — and
+        // for `--sync` it is the one value this build has anything to say about.
+        assert_eq!(
+            parse_unmodelled_set(&["--sync=false", "--remote-config=false"]),
+            UnmodelledSetFlags {
+                sync: Some(false),
+                remote_config: Some(false),
+                ..UnmodelledSetFlags::default()
+            }
+        );
+        // Go's `=true` and its bare presence (`IsBoolFlag`) are the same "on".
+        for argv in [
+            vec!["--sync=true", "--remote-config=true"],
+            vec!["--sync", "--remote-config"],
+        ] {
+            assert_eq!(
+                parse_unmodelled_set(&argv),
+                UnmodelledSetFlags {
+                    sync: Some(true),
+                    remote_config: Some(true),
+                    ..UnmodelledSetFlags::default()
+                },
+                "{argv:?}"
+            );
+        }
+
+        // Go's off spelling must land on the SAME named refusal this fork's `--no-sync` lands on:
+        // one gap, one sentence, whichever spelling the ported line used.
+        let go = check_unmodelled_set_flags(&parse_unmodelled_set(&["--sync=false"]))
+            .expect_err("this build cannot stop the map poll while staying up")
+            .to_string();
+        let fork = check_unmodelled_set_flags(&parse_unmodelled_set(&["--no-sync"]))
+            .expect_err("same gap, this fork's spelling")
+            .to_string();
+        assert_eq!(go, fork);
+        assert!(go.contains("--sync=false"), "{go}");
+        assert!(go.contains("not supported by this build"), "{go}");
+
+        // The mirror image on `--remote-config`: Go's OFF value asks for the state this daemon is
+        // permanently in, so it is accepted, and Go's ON value reaches the by-design refusal.
+        check_unmodelled_set_flags(&parse_unmodelled_set(&["--remote-config=false"]))
+            .expect("`--remote-config=false` asks for the status quo");
+        let err = check_unmodelled_set_flags(&parse_unmodelled_set(&["--remote-config=true"]))
+            .expect_err("declined by design")
+            .to_string();
+        assert!(err.contains("--remote-config"), "{err}");
+        assert!(err.contains("not supported by this build"), "{err}");
+
+        // Every value spelling `strconv.ParseBool` takes, since that is Go's bool-flag parser.
+        for (value, expected) in [
+            ("1", true),
+            ("t", true),
+            ("T", true),
+            ("true", true),
+            ("TRUE", true),
+            ("True", true),
+            ("0", false),
+            ("f", false),
+            ("F", false),
+            ("false", false),
+            ("FALSE", false),
+            ("False", false),
+        ] {
+            assert_eq!(
+                parse_unmodelled_set(&[&format!("--sync={value}")]).sync,
+                Some(expected),
+                "--sync={value}"
+            );
+            assert_eq!(
+                parse_unmodelled_set(&[&format!("--remote-config={value}")]).remote_config,
+                Some(expected),
+                "--remote-config={value}"
+            );
+        }
+
+        // A value Go's `strconv.ParseBool` refuses is a parse error naming the flag, not a silent
+        // "off" — Go's `invalid boolean value %q for -sync: %v`. The empty value is one of them.
+        for value in ["yes", "no", "2", "", "falsey"] {
+            for flag in ["--sync", "--remote-config"] {
+                let err = Cli::try_parse_from(["tnet", "set", &format!("{flag}={value}")])
+                    .map(|_| ())
+                    .expect_err("Go's flag package rejects this value")
+                    .to_string();
+                assert!(err.contains("strconv.ParseBool"), "{flag}={value}: {err}");
+                assert!(err.contains(flag), "{flag}={value}: {err}");
+            }
+        }
+
+        // Go's flag package never lets a bool flag consume the FOLLOWING argument (`IsBoolFlag`),
+        // so a value can only arrive attached with `=`.
+        assert!(
+            Cli::try_parse_from(["tnet", "set", "--sync", "false"]).is_err(),
+            "Go's `--sync false` does not pass `false` to the flag"
+        );
+
+        // Two spellings of one switch: giving both is still refused, in either order.
+        for argv in [
+            vec!["--sync=false", "--no-sync"],
+            vec!["--no-sync", "--sync=true"],
+            vec!["--remote-config=false", "--no-remote-config"],
+            vec!["--no-remote-config", "--remote-config=true"],
+        ] {
+            let mut full = vec!["tnet", "set"];
+            full.extend_from_slice(&argv);
+            assert!(
+                Cli::try_parse_from(full).is_err(),
+                "{argv:?} spell the same switch twice"
+            );
+        }
+
+        // The fold itself: both spellings of "off" collapse to `Some(false)`, an absent flag stays
+        // absent, and `--no-flag` wins defensively if clap ever let both through.
+        assert_eq!(resolve_go_bool_tristate(Some(false), false), Some(false));
+        assert_eq!(resolve_go_bool_tristate(None, true), Some(false));
+        assert_eq!(resolve_go_bool_tristate(Some(true), false), Some(true));
+        assert_eq!(resolve_go_bool_tristate(None, false), None);
+        assert_eq!(resolve_go_bool_tristate(Some(true), true), Some(false));
     }
 
     #[test]
@@ -20461,8 +21792,11 @@ mod tests {
         let err = check_ported_up_flags(&flags)
             .expect_err("`up` names no profile")
             .to_string();
-        assert!(err.contains("tnet set --nickname"), "{err}");
         assert!(err.contains("`login`"), "{err}");
+        // Both homes Go gives the flag, now that `login --nickname` is one of them: the refusal
+        // sends the operator to a command that exists rather than to a gap.
+        assert!(err.contains("tnet login --nickname"), "{err}");
+        assert!(err.contains("tnet set --nickname"), "{err}");
 
         // Go decides both of these in its flag parser, and `--host-routes` is the one that can be
         // wrong on its own line — so it is answered first, whatever else the command line carries.
@@ -20474,6 +21808,169 @@ mod tests {
         .expect_err("both are refused")
         .to_string();
         assert!(err.contains("only 'true' is allowed"), "{err}");
+    }
+
+    /// Parse a `tnet login` command line down to the three flags Go's shared `up`/`login` flag set
+    /// hands `login`, with `--nickname` already resolved into its wire sentinel.
+    fn parse_login(argv: &[&str]) -> (Option<String>, Option<Option<String>>, Option<String>) {
+        let mut full = vec!["tnet", "login"];
+        full.extend_from_slice(argv);
+        match Cli::try_parse_from(&full)
+            .unwrap_or_else(|e| panic!("`tnet login {argv:?}` should parse: {e}"))
+            .command
+        {
+            Command::Login {
+                authkey,
+                nickname,
+                host_routes,
+                ..
+            } => (authkey, resolve_clearable_string(nickname), host_routes),
+            _ => panic!("expected Command::Login"),
+        }
+    }
+
+    #[test]
+    fn login_takes_the_flags_gos_shared_flag_set_gives_it() {
+        // `up.go`'s `newUpFlagSet` builds ONE flag set for `up` and `login`: `--auth-key` and
+        // `--host-routes` are registered unconditionally, `--nickname` inside `if cmd == "login"`.
+        // All three are therefore `tailscale login` flags upstream, so a command line ported from
+        // one must not die at this fork's parser.
+        let (authkey, nickname, host_routes) = parse_login(&[
+            "--auth-key",
+            "tskey-auth-example",
+            "--nickname",
+            "work-laptop",
+            "--host-routes",
+        ]);
+        assert_eq!(
+            authkey.as_deref(),
+            Some("tskey-auth-example"),
+            "`--auth-key` is Go's spelling of the key flag on `login` as much as on `up`"
+        );
+        assert_eq!(nickname, Some(Some("work-laptop".to_string())));
+        assert_eq!(host_routes.as_deref(), Some("true"));
+
+        // Go's spelling is an ALIAS of this fork's `--authkey`, not a second flag: naming both is
+        // naming one flag twice, and it still cannot be combined with `--authkey-file`.
+        for argv in [
+            vec!["--authkey", "a", "--auth-key", "b"],
+            vec!["--auth-key", "a", "--authkey-file", "/dev/null"],
+        ] {
+            let mut full = vec!["tnet", "login"];
+            full.extend_from_slice(&argv);
+            assert!(
+                Cli::try_parse_from(&full).is_err(),
+                "{argv:?} names one flag twice (or a flag it conflicts with)"
+            );
+        }
+    }
+
+    #[test]
+    fn login_host_routes_accepts_only_the_value_go_allows() {
+        // The same `notFalseVar` line registers `--host-routes` for both commands, so `login` owes
+        // the same refusal `up` does — same message, and decided in the parser before anything else.
+        let (_, _, host_routes) = parse_login(&["--host-routes=true"]);
+        assert_eq!(host_routes.as_deref(), Some("true"));
+        check_host_routes(host_routes.as_deref()).expect("'true' is the one value Go allows");
+        for value in ["false", "0", "True", ""] {
+            let arg = format!("--host-routes={value}");
+            let (_, _, host_routes) = parse_login(&[&arg]);
+            let err = check_host_routes(host_routes.as_deref())
+                .expect_err("Go allows only 'true'")
+                .to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "invalid boolean value {value:?} for --host-routes: unsupported value; only \
+                     'true' is allowed"
+                ),
+                "login --host-routes={value}"
+            );
+        }
+        // An absent flag asks for nothing, on `login` as on `up`.
+        assert_eq!(parse_login(&[]).2, None);
+        check_host_routes(None).expect("an absent flag asks for nothing");
+    }
+
+    #[test]
+    fn login_nickname_names_the_profile_and_mentions_no_other_pref() {
+        // Go's `login --nickname` sets `ipn.Prefs.ProfileName` as part of the prefs the login
+        // applies. Here it rides the `set` path — the daemon's only door to `node_nickname` AND to
+        // the login-profile rename that makes `switch <NAME>` resolve — so what has to hold is that
+        // the request names the nickname and NOTHING else: a `login` may not move a pref the
+        // operator never mentioned.
+        let (_, nickname, _) = parse_login(&["--nickname", "work-laptop"]);
+        match login_nickname_request(nickname).expect("`--nickname` is a request") {
+            Request::Set {
+                nickname,
+                hostname,
+                accept_routes,
+                accept_dns,
+                shields_up,
+                exit_node,
+                advertise_exit_node,
+                advertise_routes,
+                advertise_tags,
+                ssh,
+                advertise_connector,
+                auto_update,
+                update_check,
+                operator,
+                report_posture,
+                webclient,
+                exit_node_allow_lan_access,
+            } => {
+                assert_eq!(nickname, Some(Some("work-laptop".to_string())));
+                assert!(hostname.is_none(), "hostname must stay unchanged");
+                assert!(accept_routes.is_none(), "accept_routes must stay unchanged");
+                assert!(accept_dns.is_none(), "accept_dns must stay unchanged");
+                assert!(shields_up.is_none(), "shields_up must stay unchanged");
+                assert!(exit_node.is_none(), "exit_node must stay unchanged");
+                assert!(
+                    advertise_exit_node.is_none(),
+                    "advertise_exit_node must stay unchanged"
+                );
+                assert!(
+                    advertise_routes.is_none(),
+                    "advertise_routes must stay unchanged"
+                );
+                assert!(
+                    advertise_tags.is_none(),
+                    "advertise_tags must stay unchanged"
+                );
+                assert!(ssh.is_none(), "ssh must stay unchanged");
+                assert!(
+                    advertise_connector.is_none(),
+                    "advertise_connector must stay unchanged"
+                );
+                assert!(auto_update.is_none(), "auto_update must stay unchanged");
+                assert!(update_check.is_none(), "update_check must stay unchanged");
+                assert!(operator.is_none(), "operator must stay unchanged");
+                assert!(
+                    report_posture.is_none(),
+                    "report_posture must stay unchanged"
+                );
+                assert!(webclient.is_none(), "webclient must stay unchanged");
+                assert!(
+                    exit_node_allow_lan_access.is_none(),
+                    "exit_node_allow_lan_access must stay unchanged"
+                );
+            }
+            other => panic!("expected a `set` request, got {other:?}"),
+        }
+
+        // Go clears the profile name with an EMPTY value (`--nickname=`), the same form `set` takes.
+        let (_, cleared, _) = parse_login(&["--nickname="]);
+        match login_nickname_request(cleared).expect("`--nickname=` is a request") {
+            Request::Set { nickname, .. } => assert_eq!(nickname, Some(None), "empty → CLEAR"),
+            other => panic!("expected a `set` request, got {other:?}"),
+        }
+
+        // An absent `--nickname` is not "set it to nothing": `login` makes no such call at all.
+        assert!(
+            login_nickname_request(parse_login(&[]).1).is_none(),
+            "an absent --nickname must not send a `set` at all"
+        );
     }
 
     #[tokio::test]
@@ -21166,12 +22663,47 @@ mod tests {
     #[tokio::test]
     async fn resolve_lookup_refuses_an_empty_host_before_querying() {
         // Go's `LookupIP` guards `host == ""` ahead of the resolver, so an empty argument is a
-        // command error, not a DNS round-trip.
-        let err = super::resolve_lookup("", ResolveNet::Ip)
+        // command error, not a DNS round-trip. The guard is a `*DNSError` carrying `errNoSuchHost`,
+        // so it renders `lookup : no such host` — every network, since the guard sits before the
+        // family filter.
+        for net in [ResolveNet::Ip, ResolveNet::Ip4, ResolveNet::Ip6] {
+            let err = super::resolve_lookup("", net)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert_eq!(err, "lookup : no such host", "for {net:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_lookup_words_an_empty_host_apart_from_an_empty_family() {
+        // Two DIFFERENT upstream failures that must not print the same sentence: nothing to resolve
+        // at all (`*DNSError` / `no such host`) versus a name that resolved but has nothing in the
+        // requested family (`*AddrError` / `no suitable address found`). Collapsing them tells a
+        // user reaching for `--net ip6` that their name is missing when it is not.
+        let empty_host = super::resolve_lookup("", ResolveNet::Ip6)
             .await
             .unwrap_err()
             .to_string();
-        assert_eq!(err, "lookup : no suitable address found");
+        let empty_family = super::resolve_lookup("192.0.2.1", ResolveNet::Ip6)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(empty_host, "lookup : no such host");
+        assert_eq!(empty_family, "address 192.0.2.1: no suitable address found");
+        assert_ne!(empty_host, empty_family);
+    }
+
+    #[tokio::test]
+    async fn run_debug_resolve_reports_an_empty_hostname_as_no_such_host() {
+        // The same guard through the real entry point: one argument, so the arity check passes and
+        // the empty string reaches the lookup. Needs no resolver and no network.
+        let args = vec![String::new()];
+        let err = super::run_debug_resolve(&args, "ip")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "lookup : no such host");
     }
 
     #[tokio::test]
@@ -21685,6 +23217,126 @@ mod tests {
     }
 
     #[test]
+    fn ip_arg_resolves_any_address_of_a_peer_and_of_this_node() {
+        // Go `peerMatchingIP` matches `slices.Contains(ps.TailscaleIPs, ip)` over every peer and
+        // then over `st.Self`, so ANY address of a node resolves that node — not just its IPv4,
+        // and not only peers.
+        let status = ping_status();
+        let laptop = NodeAddrs {
+            ipv4: Some("100.64.0.2"),
+            ipv6: Some("fd7a:115c:a1e0::2"),
+        };
+        let this_node = NodeAddrs {
+            ipv4: Some("100.64.0.1"),
+            ipv6: Some("fd7a:115c:a1e0::1"),
+        };
+
+        // By name, and by the peer's IPv4 — what already worked.
+        assert_eq!(
+            ip_arg_matching_node("my-laptop.tail0123.ts.net", &status),
+            Some(laptop)
+        );
+        assert_eq!(ip_arg_matching_node("100.64.0.2", &status), Some(laptop));
+        // By the peer's IPv6, however it is spelled (Go compares parsed addresses).
+        assert_eq!(
+            ip_arg_matching_node("fd7a:115c:a1e0::2", &status),
+            Some(laptop)
+        );
+        assert_eq!(
+            ip_arg_matching_node("fd7a:115c:a1e0:0::2", &status),
+            Some(laptop)
+        );
+        // A peer whose only address is IPv6 is reachable by it.
+        assert_eq!(
+            ip_arg_matching_node("fd7a:115c:a1e0::3", &status),
+            Some(NodeAddrs {
+                ipv4: None,
+                ipv6: Some("fd7a:115c:a1e0::3"),
+            })
+        );
+        // Go's `st.Self` half: this node's own addresses resolve to this node, either family.
+        assert_eq!(ip_arg_matching_node("100.64.0.1", &status), Some(this_node));
+        assert_eq!(
+            ip_arg_matching_node("fd7a:115c:a1e0::1", &status),
+            Some(this_node)
+        );
+
+        // Still a miss: an address no node in the netmap holds (the caller then tries the Service
+        // VIPs and, on a miss there too, reports `no peer or service found with IP`), and a name
+        // that names nothing.
+        assert_eq!(ip_arg_matching_node("100.64.0.99", &status), None);
+        assert_eq!(ip_arg_matching_node("fd7a:115c:a1e0::99", &status), None);
+        assert_eq!(ip_arg_matching_node("not-in-this-tailnet", &status), None);
+        // A node with no address at all cannot be matched by one, and never matches the empty
+        // string a missing address arrives as.
+        assert_eq!(
+            ip_arg_matching_node("addressless.tail0123.ts.net", &status),
+            Some(NodeAddrs::default())
+        );
+        assert_eq!(ip_arg_matching_node("", &status), None);
+    }
+
+    #[test]
+    fn ip_prints_the_whole_matched_node_whichever_address_named_it() {
+        // The output of `tnet ip <peer-IPv6>`: Go resolves the node from any one of its addresses
+        // and then prints them ALL, filtered by `-4`/`-6`/`-1`. So naming the peer by its IPv6 and
+        // asking for `-4` prints its IPv4 — it does not print nothing, and it does not report
+        // `no peer or service found with IP`.
+        let status = ping_status();
+        let addrs = ip_arg_matching_node("fd7a:115c:a1e0::2", &status)
+            .expect("a peer's IPv6 must resolve that peer");
+        assert_eq!(
+            format_ip_filtered(addrs.ipv4, addrs.ipv6, IpSelect::default()),
+            Ok("100.64.0.2\nfd7a:115c:a1e0::2\n".to_string())
+        );
+        assert_eq!(
+            format_ip_filtered(
+                addrs.ipv4,
+                addrs.ipv6,
+                IpSelect {
+                    v4: true,
+                    ..Default::default()
+                }
+            ),
+            Ok("100.64.0.2\n".to_string())
+        );
+        // Same for this node named by its own IPv6 (Go's `st.Self` arm).
+        let mine = ip_arg_matching_node("fd7a:115c:a1e0::1", &status)
+            .expect("this node's own IPv6 must resolve this node");
+        assert_eq!(
+            format_ip_filtered(
+                mine.ipv4,
+                mine.ipv6,
+                IpSelect {
+                    first: true,
+                    ..Default::default()
+                }
+            ),
+            Ok("100.64.0.1\n".to_string())
+        );
+        // A peer that resolves but holds no address in the family asked for is Go's `!match`
+        // error — `tnet ip -4 v6-only-peer` exits non-zero with that on stderr, and prints nothing.
+        let v6_only = ip_arg_matching_node("v6-only.tail0123.ts.net", &status)
+            .expect("the fixture carries an IPv6-only peer");
+        assert_eq!(
+            format_ip_filtered(
+                v6_only.ipv4,
+                v6_only.ipv6,
+                IpSelect {
+                    v4: true,
+                    ..Default::default()
+                }
+            ),
+            Err("no Tailscale IPv4 address")
+        );
+        assert_eq!(
+            format_ip_filtered(v6_only.ipv4, v6_only.ipv6, IpSelect::default()),
+            Ok("fd7a:115c:a1e0::3\n".to_string()),
+            "and without the flag it still prints the address it does have"
+        );
+    }
+
+    #[test]
     fn ip_falls_back_to_a_service_vip() {
         // Go `ip.go`: a peer miss is retried against the Service VIPs, and a hit prints THAT
         // Service's addresses. The lookup compares parsed addresses, so an abbreviated IPv6 literal
@@ -21715,7 +23367,7 @@ mod tests {
         let addrs = vec!["100.64.0.10".to_string(), "fd7a:115c:a1e0::a".to_string()];
         assert_eq!(
             format_service_ips(&addrs, IpSelect::default()),
-            "100.64.0.10\nfd7a:115c:a1e0::a\n"
+            Ok("100.64.0.10\nfd7a:115c:a1e0::a\n".to_string())
         );
         assert_eq!(
             format_service_ips(
@@ -21725,7 +23377,7 @@ mod tests {
                     ..Default::default()
                 }
             ),
-            "100.64.0.10\n"
+            Ok("100.64.0.10\n".to_string())
         );
         assert_eq!(
             format_service_ips(
@@ -21735,7 +23387,7 @@ mod tests {
                     ..Default::default()
                 }
             ),
-            "fd7a:115c:a1e0::a\n"
+            Ok("fd7a:115c:a1e0::a\n".to_string())
         );
         assert_eq!(
             format_service_ips(
@@ -21745,10 +23397,11 @@ mod tests {
                     ..Default::default()
                 }
             ),
-            "100.64.0.10\n"
+            Ok("100.64.0.10\n".to_string())
         );
-        // A Service with only a v6 address (an IPv4-disabled tailnet) and `-4` selects nothing —
-        // reported as such, never as a fabricated address.
+        // A Service with only a v6 address (an IPv4-disabled tailnet) and `-4` selects nothing.
+        // Go resolves a Service into the same `ips` slice as a peer and runs the same match loop
+        // over it, so this is the same error the other arms give — not a line on stdout.
         assert_eq!(
             format_service_ips(
                 &["fd7a:115c:a1e0::a".to_string()],
@@ -21757,7 +23410,13 @@ mod tests {
                     ..Default::default()
                 }
             ),
-            "(no matching tailnet address)\n"
+            Err("no Tailscale IPv4 address")
+        );
+        // Unparseable addresses are dropped, so a Service carrying only those answers empty; with
+        // no family flag that is not Go's `!match` error, and the placeholder still stands in.
+        assert_eq!(
+            format_service_ips(&["not-an-address".to_string()], IpSelect::default()),
+            Ok("(no matching tailnet address)\n".to_string())
         );
     }
 
@@ -22203,6 +23862,158 @@ users:
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Whether this test process can write into `dir` despite its mode saying otherwise — i.e.
+    /// whether it is running as root, for which `0o500` is not a refusal. The suite runs both as an
+    /// ordinary user and, in some container images, as root; asking the filesystem is more reliable
+    /// than asking for the uid and guessing what it implies.
+    fn mode_bits_are_enforced_for_us(dir: &std::path::Path) -> bool {
+        let probe = dir.join(".write-probe");
+        match std::fs::write(&probe, b"") {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&probe);
+                false
+            }
+            Err(_) => true,
+        }
+    }
+
+    #[test]
+    fn kubeconfig_precheck_ports_gos_checkkubeconfigwritable() {
+        // Go's `checkKubeconfigWritable`: walk up from the target to the first component that
+        // exists and probe THAT, so a kubeconfig that does not exist yet is fine as long as
+        // something above it takes a write — and an unwritable one is refused in Go's words before
+        // anything is read or merged.
+        let root = std::env::temp_dir().join(format!("tnet-kubeprecheck-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let s = |p: &std::path::Path| p.to_str().unwrap().to_string();
+
+        // Nothing exists below a writable directory: the nearest existing ancestor answers, both
+        // one level down and several. (Several is the case Go's MkdirAll then goes on to create.)
+        assert!(check_kubeconfig_writable(&s(&root.join("config"))).is_ok());
+        assert!(check_kubeconfig_writable(&s(&root.join("a/b/c/config"))).is_ok());
+
+        // An existing, writable kubeconfig is probed directly — and the probe must not truncate it.
+        let existing = root.join("existing");
+        std::fs::write(&existing, "apiVersion: v1\nkind: Config\n").unwrap();
+        assert!(check_kubeconfig_writable(&s(&existing)).is_ok());
+        assert_eq!(
+            std::fs::read_to_string(&existing).unwrap(),
+            "apiVersion: v1\nkind: Config\n",
+            "the writability probe must open O_WRONLY without O_TRUNC — it asks, it does not write"
+        );
+
+        // A read-only kubeconfig: refused, in Go's `cannot write kubeconfig at %q` words, naming the
+        // file the operator asked for.
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let ro = root.join("readonly");
+            std::fs::write(&ro, "apiVersion: v1\nkind: Config\n").unwrap();
+            std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o400)).unwrap();
+            if std::fs::OpenOptions::new().write(true).open(&ro).is_err() {
+                let err = check_kubeconfig_writable(&s(&ro))
+                    .expect_err("a read-only kubeconfig cannot be written");
+                let text = format!("{err:#}");
+                assert!(
+                    text.contains("cannot write kubeconfig at") && text.contains("readonly"),
+                    "the refusal should be Go's, and should name the file: {text}"
+                );
+            }
+            std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        // The case a first run actually hits: no kubeconfig yet, and the directory that would hold
+        // it does not take a write either. The nearest existing ancestor is what refuses.
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let locked = root.join("locked");
+            std::fs::create_dir(&locked).unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+            if mode_bits_are_enforced_for_us(&locked) {
+                let target = locked.join(".kube/config");
+                let err = check_kubeconfig_writable(&s(&target))
+                    .expect_err("an unwritable ancestor cannot hold a new kubeconfig");
+                let text = format!("{err:#}");
+                assert!(
+                    text.contains("cannot write kubeconfig at") && text.contains(".kube/config"),
+                    "the refusal should name the kubeconfig, not just the directory: {text}"
+                );
+                // Probing must leave nothing behind — not the directory it could not create, and
+                // not the temporary file it tried to make in the ancestor.
+                assert!(!target.exists() && !locked.join(".kube").exists());
+                assert_eq!(
+                    std::fs::read_dir(&locked).unwrap().count(),
+                    0,
+                    "the directory probe must clean up after itself"
+                );
+            }
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn kubeconfig_parent_dir_matches_go_filepath_dir() {
+        // The walk in `check_kubeconfig_writable` terminates because `filepath.Dir` has fixed
+        // points; `Path::parent` does not have the same ones, so the mapping is pinned here rather
+        // than discovered by a test that hangs.
+        let dir = |p: &str| kubeconfig_parent_dir(std::path::Path::new(p));
+        assert_eq!(
+            dir("/home/someone/.kube/config"),
+            std::path::Path::new("/home/someone/.kube")
+        );
+        assert_eq!(dir("/config"), std::path::Path::new("/"));
+        assert_eq!(
+            dir("/"),
+            std::path::Path::new("/"),
+            "the root is Go's fixed point"
+        );
+        assert_eq!(
+            dir("config"),
+            std::path::Path::new("."),
+            "Go answers `.`, not `\"\"`"
+        );
+        assert_eq!(
+            dir("."),
+            std::path::Path::new("."),
+            "`.` is Go's other fixed point"
+        );
+        assert_eq!(
+            dir(""),
+            std::path::Path::new("."),
+            "Go's `filepath.Dir(\"\")` is `.`"
+        );
+    }
+
+    #[test]
+    fn kubeconfig_merge_creates_the_whole_missing_directory_tree() {
+        // Go's `setKubeconfigForPeer` calls `os.MkdirAll(dir, 0755)`, so
+        // `KUBECONFIG=/somewhere/new/nested/config` writes the file instead of reporting the
+        // missing parent. This port created one level, which failed on exactly that.
+        let root = std::env::temp_dir().join(format!("tnet-kubetree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("new/nested/deeper/config");
+        let path_str = path.to_str().unwrap().to_string();
+
+        set_kubeconfig_for_peer("https://", "foo.tail-scale.ts.net", &path_str)
+            .expect("a missing directory TREE is created, as Go's MkdirAll does");
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("server: https://foo.tail-scale.ts.net"),
+            "the kubeconfig should have been written under the tree that was just created"
+        );
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "kubeconfig must be written 0600, got {mode:o}");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -23000,43 +24811,207 @@ users:
             usage(CertDomainHint::Unknown),
             "Usage: tnet cert [flags] <domain>"
         );
-        // The four hints Go builds, in Go's words.
-        assert!(
-            usage(CertDomainHint::NotRunning).ends_with("\n\nThe node is not running.\n"),
-            "{}",
-            usage(CertDomainHint::NotRunning)
+        // The four hints Go builds, in Go's words and Go's shape: ONE newline joins the hint to the
+        // usage line, because Go writes `\n` per arm into the buffer it appends. Whole-message
+        // equality, so both a blank line creeping back in between the two and a reworded sentence
+        // fail here.
+        assert_eq!(
+            usage(CertDomainHint::NotRunning),
+            "Usage: tnet cert [flags] <domain>\nTailscale is not running.\n"
         );
-        assert!(
-            usage(domains(&[]))
-                .ends_with("\n\nHTTPS cert support is not enabled/configured for your tailnet.\n"),
-            "{}",
-            usage(domains(&[]))
+        assert_eq!(
+            usage(domains(&[])),
+            "Usage: tnet cert [flags] <domain>\nHTTPS cert support is not enabled/configured for \
+             your tailnet.\n"
         );
-        assert!(
-            usage(domains(&["host.user.ts.net"]))
-                .ends_with("\n\nFor domain, use \"host.user.ts.net\".\n"),
-            "{}",
-            usage(domains(&["host.user.ts.net"]))
+        assert_eq!(
+            usage(domains(&["host.user.ts.net"])),
+            "Usage: tnet cert [flags] <domain>\nFor domain, use \"host.user.ts.net\".\n"
         );
         // Go's `%q` of a []string: bracketed, space-separated, quoted.
-        assert!(
-            usage(domains(&["a.user.ts.net", "b.user.ts.net"]))
-                .ends_with("\n\nValid domain options: [\"a.user.ts.net\" \"b.user.ts.net\"].\n"),
-            "{}",
-            usage(domains(&["a.user.ts.net", "b.user.ts.net"]))
+        assert_eq!(
+            usage(domains(&["a.user.ts.net", "b.user.ts.net"])),
+            "Usage: tnet cert [flags] <domain>\nValid domain options: [\"a.user.ts.net\" \
+             \"b.user.ts.net\"].\n"
         );
-        // Every hint keeps Go's usage line first.
-        for hint in [
-            CertDomainHint::Unknown,
-            CertDomainHint::NotRunning,
-            domains(&[]),
-            domains(&["host.user.ts.net"]),
+    }
+
+    #[test]
+    fn portmap_refuses_half_a_gateway_pair() {
+        // Neither flag: auto-detect, which is the bare `tnet debug portmap`.
+        assert_eq!(portmap_gateway_and_self(None, None).expect("usable"), None);
+        // The pair is meaningless apart — a gateway with no self address (or the reverse) names
+        // half a link — so either alone is refused with Go's message, before the daemon is asked.
+        for half in [
+            portmap_gateway_and_self(Some("192.0.2.1"), None),
+            portmap_gateway_and_self(None, Some("192.0.2.2")),
         ] {
-            assert!(
-                usage(hint).starts_with("Usage: tnet cert [flags] <domain>"),
-                "the usage line comes first"
+            assert_eq!(
+                half.expect_err("half a pair is refused").to_string(),
+                "if one of --gateway-addr and --self-addr is provided, the other must be as well"
             );
         }
+        // Both, and valid: they travel as one `<gateway>/<self>` string.
+        assert_eq!(
+            portmap_gateway_and_self(Some("192.0.2.1"), Some("192.0.2.2")).expect("usable"),
+            Some("192.0.2.1/192.0.2.2".to_string())
+        );
+        // Either one not being an IP is refused by name, so the operator knows which to fix.
+        assert!(
+            portmap_gateway_and_self(Some("not-an-ip"), Some("192.0.2.2"))
+                .expect_err("refused")
+                .to_string()
+                .starts_with("invalid --gateway-addr: ")
+        );
+        assert!(
+            portmap_gateway_and_self(Some("192.0.2.1"), Some("not-an-ip"))
+                .expect_err("refused")
+                .to_string()
+                .starts_with("invalid --self-addr: ")
+        );
+    }
+
+    #[test]
+    fn portmap_duration_uses_gos_grammar() {
+        assert_eq!(portmap_duration_ms("5s").expect("Go's default"), 5_000);
+        assert_eq!(portmap_duration_ms("1500ms").expect("sub-second"), 1_500);
+        assert_eq!(portmap_duration_ms("1m").expect("minutes"), 60_000);
+        // A negative duration is clamped to zero rather than refused, reproducing Go: it parses
+        // there and becomes an already-expired context, so the run reports an empty probe and
+        // stops (Go's `Probe` treats its own expired deadline as a normal empty result).
+        assert_eq!(portmap_duration_ms("-5s").expect("clamped"), 0);
+        // A bad duration explains itself in Go's words.
+        assert_eq!(
+            portmap_duration_ms("1d")
+                .expect_err("no day unit")
+                .to_string(),
+            r#"time: unknown unit "d" in duration "1d""#
+        );
+    }
+
+    #[test]
+    fn portmap_log_lines_cannot_carry_escapes_into_the_terminal() {
+        // A `debug portmap` line is not the daemon's own text: this one is the shape the run emits
+        // for a discovered UPnP device, whose LOCATION and SERVER come straight out of an SSDP
+        // reply that anything on the local link can send. Decode it off the wire exactly as the
+        // stream loop does, so the frame under test is a real one.
+        let wire = serde_json::to_string(&Response::PortmapLog {
+            line: "portmapper: UPnP device discovered at \u{1b}]8;;http://evil/\u{7}http://192.0.2.1:5000/rootDesc.xml (\u{1b}[2mMiniUPnPd/2.1\nmapping: 192.0.2.9:41641)".to_string(),
+        })
+        .expect("serialize a portmap log frame");
+        let frame = serde_json::from_str::<Response>(&wire).expect("decode a portmap log frame");
+
+        let PortmapFrame::Log(rendered) = render_portmap_frame(frame) else {
+            panic!("a portmap_log frame renders as a log line");
+        };
+        // No escape introducer, no OSC terminator: the hyperlink/colour injection is defused.
+        assert!(
+            !rendered.contains('\u{1b}') && !rendered.contains('\u{7}'),
+            "terminal escapes must not survive to stdout: {rendered:?}"
+        );
+        // No newline either — one frame is one line, so an embedded '\n' would forge a whole extra
+        // line of the run's log (here, a `mapping:` line reporting an address never obtained).
+        assert!(
+            !rendered.contains('\n'),
+            "a log line must not be able to forge a second line: {rendered:?}"
+        );
+        // The readable part is preserved, so the operator still sees which device answered.
+        assert!(
+            rendered.contains("http://192.0.2.1:5000/rootDesc.xml")
+                && rendered.contains("MiniUPnPd/2.1"),
+            "sanitizing must not eat the diagnostic itself: {rendered:?}"
+        );
+
+        // An ordinary line — everything a well-behaved network produces — is passed through
+        // unchanged, so this stays byte-identical to `tailscale debug portmap`.
+        let plain = "Probe: {PCP:false PMP:true UPnP:true}";
+        assert_eq!(
+            render_portmap_frame(Response::PortmapLog {
+                line: plain.to_string()
+            }),
+            PortmapFrame::Log(plain.to_string())
+        );
+
+        // The stream's error frame gets the free-form treatment: escapes neutralized, but a
+        // multi-line message still wraps.
+        assert_eq!(
+            render_portmap_frame(Response::Error {
+                message: "unknown portmap debug type\n\u{1b}[2Jwiped".to_string()
+            }),
+            PortmapFrame::Failed("unknown portmap debug type\n\u{FFFD}[2Jwiped".to_string())
+        );
+    }
+
+    #[test]
+    fn debug_portmap_command_line_matches_gos_flags() {
+        // Go's defaults: five seconds, every protocol, auto-detected gateway, no HTTP logging.
+        match Cli::try_parse_from(["tnet", "debug", "portmap"])
+            .expect("parses")
+            .command
+        {
+            Command::Debug {
+                cmd:
+                    DebugCmd::Portmap {
+                        duration,
+                        ty,
+                        gateway_addr,
+                        self_addr,
+                        log_http,
+                    },
+            } => {
+                assert_eq!(duration, "5s");
+                assert_eq!(ty, "");
+                assert_eq!(gateway_addr, None);
+                assert_eq!(self_addr, None);
+                assert!(!log_http);
+            }
+            // `Command` derives no Debug (it can hold an auth key), so name the miss directly.
+            _ => panic!("expected a `debug portmap` command"),
+        }
+        // Every flag Go takes, by Go's spelling.
+        match Cli::try_parse_from([
+            "tnet",
+            "debug",
+            "portmap",
+            "--duration",
+            "1s",
+            "--type",
+            "upnp",
+            "--gateway-addr",
+            "192.0.2.1",
+            "--self-addr",
+            "192.0.2.2",
+            "--log-http",
+        ])
+        .expect("parses")
+        .command
+        {
+            Command::Debug {
+                cmd:
+                    DebugCmd::Portmap {
+                        duration,
+                        ty,
+                        gateway_addr,
+                        self_addr,
+                        log_http,
+                    },
+            } => {
+                assert_eq!(duration, "1s");
+                assert_eq!(ty, "upnp");
+                assert_eq!(gateway_addr.as_deref(), Some("192.0.2.1"));
+                assert_eq!(self_addr.as_deref(), Some("192.0.2.2"));
+                assert!(log_http);
+            }
+            // `Command` derives no Debug (it can hold an auth key), so name the miss directly.
+            _ => panic!("expected a `debug portmap` command"),
+        }
+        // `--type` is deliberately free-form (Go passes it straight through), so an unknown value
+        // parses here and is refused by the DAEMON with `unknown portmap debug type` — not by clap
+        // with a usage block and exit 2.
+        assert!(
+            Cli::try_parse_from(["tnet", "debug", "portmap", "--type", "natpmp"]).is_ok(),
+            "a bad --type is the daemon's refusal to make, not the flag parser's"
+        );
     }
 
     #[test]

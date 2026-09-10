@@ -25,6 +25,108 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.55.10](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.9...v0.55.10) (2026-09-09)
+
+
+### Bug Fixes
+
+* **ping:** diagnose a stopped or logged-out local node instead of the peer ([#405](https://github.com/GeiserX/tailscaled-rs/issues/405)) ([b26c3e5](https://github.com/GeiserX/tailscaled-rs/commit/b26c3e59ade523be3f2ba69cd412138439ae415d))
+* **tnet:** stop `lock log --json` stamping Go's schema 1 on fork output ([#403](https://github.com/GeiserX/tailscaled-rs/issues/403)) ([cd5f1f3](https://github.com/GeiserX/tailscaled-rs/commit/cd5f1f32af5566415417e4dcbeace106d44269ab))
+
+## [0.55.9](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.8...v0.55.9) (2026-09-09)
+
+
+### Bug Fixes
+
+* **tun:** stop refusing `--tun` to a CAP_NET_ADMIN daemon off macOS ([#401](https://github.com/GeiserX/tailscaled-rs/issues/401)) ([c2d55d1](https://github.com/GeiserX/tailscaled-rs/commit/c2d55d106b731b95f6c3ae63d1ff6b7f8b3be959))
+
+## [0.55.8](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.7...v0.55.8) (2026-09-07)
+
+
+### Bug Fixes
+
+* **login:** take the flags Go's shared up/login flag set gives login ([#397](https://github.com/GeiserX/tailscaled-rs/issues/397)) ([9ac7ec8](https://github.com/GeiserX/tailscaled-rs/commit/9ac7ec82ec6cacb41a11290c17970e55c8e88932))
+* **set:** take Go's `--sync=false` spelling instead of dying at the parser ([#399](https://github.com/GeiserX/tailscaled-rs/issues/399)) ([4c10557](https://github.com/GeiserX/tailscaled-rs/commit/4c10557527542809180f65d3235865ba28db6924))
+
+## [0.55.7](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.6...v0.55.7) (2026-09-07)
+
+
+### Bug Fixes
+
+* **ip:** fail `tnet ip -6` on a node with no IPv6 instead of exiting 0 ([#394](https://github.com/GeiserX/tailscaled-rs/issues/394)) ([ec4a7cb](https://github.com/GeiserX/tailscaled-rs/commit/ec4a7cbc6c697b1fcad93706e64a8b46fa7b2ff8))
+
+## [0.55.6](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.5...v0.55.6) (2026-09-07)
+
+
+### Bug Fixes
+
+* **config:** refuse advertised routes with host bits set, like Go ([#391](https://github.com/GeiserX/tailscaled-rs/issues/391)) ([310db72](https://github.com/GeiserX/tailscaled-rs/commit/310db727aed67cd66754a3bf99b951eed0883805))
+* **ip:** resolve a node by any of its addresses, not just its IPv4 ([#392](https://github.com/GeiserX/tailscaled-rs/issues/392)) ([b8e7996](https://github.com/GeiserX/tailscaled-rs/commit/b8e7996d496f7287834239af5becaf43f2960cdc))
+* **web:** take Go's --origin host, and stop refusing --listen under --cgi ([#389](https://github.com/GeiserX/tailscaled-rs/issues/389)) ([d1922fd](https://github.com/GeiserX/tailscaled-rs/commit/d1922fd260413899d25108ad0d22faadc7d83ae6))
+
+## [0.55.5](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.4...v0.55.5) (2026-09-06)
+
+
+### Bug Fixes
+
+* **serve:** keep Go's refusals for a too-high port and a non-letter app cap ([#387](https://github.com/GeiserX/tailscaled-rs/issues/387)) ([02ae9df](https://github.com/GeiserX/tailscaled-rs/commit/02ae9df37e666fe54e5eb7a0b9192ea6fc7c8af0))
+
+## [0.55.4](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.3...v0.55.4) (2026-09-06)
+
+
+### Bug Fixes
+
+* **configure kubeconfig:** refuse unwritable targets, create nested ones ([#385](https://github.com/GeiserX/tailscaled-rs/issues/385)) ([e273fa5](https://github.com/GeiserX/tailscaled-rs/commit/e273fa5e054949fa83a2aa0c0ef25b4c2934f543))
+* **debug resolve:** report an empty hostname as "no such host", not as an empty address family ([#382](https://github.com/GeiserX/tailscaled-rs/issues/382)) ([268e12d](https://github.com/GeiserX/tailscaled-rs/commit/268e12dc7782fbff736dc4d0625e817ad7156ac0))
+* **tailnetd:** keep Go's own sentence in the --bird-socket refusal ([#383](https://github.com/GeiserX/tailscaled-rs/issues/383)) ([a998541](https://github.com/GeiserX/tailscaled-rs/commit/a998541ab20bdd2fff51bbb95ab132857b0e7982))
+
+## [0.55.3](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.2...v0.55.3) (2026-09-06)
+
+
+### Bug Fixes
+
+* **localapi:** stop an older daemon reading `switch --new` as a plain switch ([#379](https://github.com/GeiserX/tailscaled-rs/issues/379)) ([8ca8cba](https://github.com/GeiserX/tailscaled-rs/commit/8ca8cba2c9ae208d9ef8c79c5997a80ad3370635))
+
+## [0.55.2](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.1...v0.55.2) (2026-09-06)
+
+
+### Bug Fixes
+
+* **switch:** refuse a switch target that names no profile instead of creating it ([#376](https://github.com/GeiserX/tailscaled-rs/issues/376)) ([11b7f93](https://github.com/GeiserX/tailscaled-rs/commit/11b7f935a35f9b8c2e38256d0bf091cd565b2c6f))
+
+## [0.55.1](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.0...v0.55.1) (2026-09-05)
+
+
+### Bug Fixes
+
+* **portmap:** release a PCP mapping the gateway still recognises ([#373](https://github.com/GeiserX/tailscaled-rs/issues/373)) ([5131774](https://github.com/GeiserX/tailscaled-rs/commit/5131774b534642253a896066d7ede7e4b1a41a90))
+
+## [0.55.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.54.3...v0.55.0) (2026-09-05)
+
+
+### Features
+
+* **portmap:** ask the router for a port when STUN cannot punch through ([#372](https://github.com/GeiserX/tailscaled-rs/issues/372)) ([45d85c3](https://github.com/GeiserX/tailscaled-rs/commit/45d85c3089c2496a6616610826aec60224e42449))
+
+
+### Bug Fixes
+
+* **portmap:** stop a closed client from leaving a mapping on the router ([#370](https://github.com/GeiserX/tailscaled-rs/issues/370)) ([86c4055](https://github.com/GeiserX/tailscaled-rs/commit/86c40558718ac9cb075fb5b9858dc42f699e7bb9))
+
+## [0.54.3](https://github.com/GeiserX/tailscaled-rs/compare/v0.54.2...v0.54.3) (2026-09-05)
+
+
+### Bug Fixes
+
+* **portmap:** stop an abandoned debug run and defuse its log lines ([#368](https://github.com/GeiserX/tailscaled-rs/issues/368)) ([566984a](https://github.com/GeiserX/tailscaled-rs/commit/566984ae1dabc2e0a62592b4cfda396abb9dd09e))
+
+## [0.54.2](https://github.com/GeiserX/tailscaled-rs/compare/v0.54.1...v0.54.2) (2026-09-05)
+
+
+### Bug Fixes
+
+* **audit:** restate the totals the re-derived parity audit dropped ([#364](https://github.com/GeiserX/tailscaled-rs/issues/364)) ([1cda69d](https://github.com/GeiserX/tailscaled-rs/commit/1cda69dcde2ca5bf5fc4bdcebddc15f8c13b6f8b))
+
 ## [0.54.1](https://github.com/GeiserX/tailscaled-rs/compare/v0.54.0...v0.54.1) (2026-09-03)
 
 

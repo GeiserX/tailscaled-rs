@@ -1,6 +1,6 @@
 [package]
 name = "tailscaled-rs"
-version = "0.54.1"
+version = "0.55.10"
 edition = "2024"
 rust-version = "1.95"
 license = "BSD-3-Clause"
@@ -175,6 +175,15 @@ tar = "0.4"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 rustls-pemfile = "2"
+# Unicode general categories, for the one place a ported Go regexp needs them: `serve
+# --accept-app-caps` validates each capability against `^([\pL\pN-]+\.)+[\pL\pN-]+\/[\pL\pN-/]+$`,
+# and `\pL` is the Letter general CATEGORY. `char::is_alphabetic` is the Alphabetic derived
+# PROPERTY, a superset that also admits ~6k combining marks (Other_Alphabetic), so it accepts
+# capability names Go refuses. This crate is already in the graph — idna (via url, via ureq) pulls
+# it through idna_adapter — so naming it here adds a dependency EDGE, not a crate; the alternative,
+# a direct `regex` dependency for one pattern, would add five (regex, regex-automata with its
+# Unicode tables, regex-syntax, aho-corasick, memchr).
+icu_properties = "2"
 # RNG for generating the Tailscale SSH server's host key (`russh::keys::PrivateKey::random`). Must
 # be `rand 0.10` — russh 0.61's `ssh-key` bounds `random` on `rand_core 0.10`'s `CryptoRng`, which
 # `rand 0.9`'s `ThreadRng` does NOT implement (verified: build fails with a CryptoRng trait-bound

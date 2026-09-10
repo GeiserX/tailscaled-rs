@@ -1594,3 +1594,82 @@ engine instead of only logging it, and the "recorded locally, not forwarded to c
 both flags (`src/bin/tnet.rs`, `src/server.rs`) goes away. `down` gets there only through option 2's
 `send_audit_log` (`logout` can ride either shape), so option 1 on its own retires half the note.
 Consumed via a pin bump. — daemon lane
+
+## 42. The self node's owning user — a login name on `Status` (for Go's `--nickname=` restore and the profile `Account` column)
+
+**Why:** Go names a login profile in TWO arms. `profileManager.setProfilePrefs`
+(`ipn/ipnlocal/profiles.go:450` @ `53a0d659afa51835dd7a9283873cca44261454f8`):
+
+```go
+if prefsIn.ProfileName() != "" {
+	lp.Name = prefsIn.ProfileName()
+} else {
+	lp.Name = up.LoginName
+}
+```
+
+`up` is the profile's persisted `tailcfg.UserProfile` — the account that logged the node in. So
+clearing the nickname (`tailscale set --nickname=`) never leaves a profile nameless: the name falls
+back to the account. The same value is what Go's `switch --list --json` reports as `Account`
+(`cmd/tailscale/cli/switch.go`: `Account: prof.UserProfile.LoginName`).
+
+The daemon ports the first arm — `Backend::rename_current_profile` (`src/ipn/mod.rs`) writes
+`profiles.json` so `tnet switch --list`/`tnet switch <name>` see the nickname — and **cannot port the
+second**, because it has no account identity to restore. `tnet set --nickname=` therefore blanks the
+name and both readers fall back to the profile **id** where Go shows the account. `ProfileEntry`
+(`src/localapi.rs`) has no `account` field for the same reason, so `tnet switch --list` cannot print
+Go's Account column either. Same missing value, two symptoms.
+
+Verified at pin `9d847a6`/v0.43.0: **no engine surface answers "who owns this node".**
+
+- `Device::status()` (`ts_runtime/src/lib.rs`) returns `Status { self_node: Option<StatusNode>, .. }`,
+  and `StatusNode` (`ts_runtime/src/status.rs`) carries no user/login field at all — the module doc
+  states the gap outright ("Capability / user / online surfacing (do not fabricate)").
+- `Device::whois()` *does* resolve an owning login, but only for **peers**: `whois_opt`
+  (`ts_runtime/src/peer_tracker/mod.rs`) starts at `peer_by_tailnet_ip_opt`, an index over `peer_db`,
+  and the tracker's own comment records that "the self node never enters `peer_db` — it is routed to
+  the control runner's `self_node` cell". A whois of one's own tailnet address answers `None`.
+- The daemon has no other route: it holds a `Device`, not the control runner or the peer tracker.
+
+Both halves of the join already exist **inside** the engine, and are already wired to each other for
+peers: the control runner holds the self `Node` (with its `user_id`) — `Device::status` asks it for
+`SelfNode` on every call — and the peer tracker accumulates the netmap's `UserProfiles` table keyed by
+`UserId` (`for profile in &msg.user_profiles { self.user_profiles.insert(..) }`), which
+`resolve_user` + `UserProfile::best_label` turn into `WhoIs.user`. Only the *self*-side join is
+missing.
+
+**Ask (either shape; (a) is the smaller change):**
+
+1. Put the resolved user on the self node in the snapshot that already exists:
+
+```rust
+pub struct StatusNode {
+    // …
+    /// The login (else display) name of the user that owns this node, when the netmap's
+    /// `UserProfiles` table has a profile for its `user_id`. `None` when control sent none.
+    pub user: Option<String>,
+}
+```
+
+   filled for `Status::self_node` by the same `UserId` → `UserProfile::best_label` join `WhoIs`
+   already performs. Filling it for peers too would be welcome but is not what this ask needs — the
+   self node is.
+
+2. Or a dedicated accessor, if `StatusNode` should stay a pure node view:
+
+```rust
+/// The account this node is logged in as, from the netmap's `UserProfiles` table
+/// (Go `persist.Persist.UserProfile`). `None` before the first netmap, or when control
+/// sent no profile for the self node's user (e.g. a tagged node with no human owner).
+pub async fn self_user_profile(&self) -> Result<Option<ts_control::UserProfile>, Error>;
+```
+
+   The owned `ts_control::UserProfile` (`id` + `login_name` + `display_name`) is already public, so
+   this can hand the profile back whole and let the caller pick a label.
+
+**Daemon impact once landed:** the daemon records the login name alongside the profile in
+`profiles.json` when the node registers; `rename_current_profile` gains Go's else arm, so a cleared
+nickname restores the account name instead of falling back to the id; `ProfileEntry` gains the
+`Account` column Go prints. No command line changes. The deviation notes on `rename_current_profile`
+and the `clearing_the_nickname_blanks_the_name_and_cannot_restore_a_login_name` test
+(`src/ipn/mod.rs`) are what retire when it does. Consumed via a pin bump. — daemon lane

@@ -880,8 +880,9 @@ async fn lifecycle_subscriber_observes_generation_advance_on_up_path() {
 /// pinned alongside the state changes.
 ///
 /// The interesting cases are the refusals and the no-op, because those are the ones a caller cannot
-/// verify for itself: a `switch` to the profile you are already on must not claim it switched, and a
-/// `switch remove` of a profile that does not exist must not claim it removed one.
+/// verify for itself: a `switch` to a profile that does not exist must refuse rather than create one,
+/// a `switch` to the profile you are already on must not claim it switched, and a `switch remove` of
+/// a profile that does not exist must not claim it removed one.
 #[tokio::test]
 async fn profile_switch_list_and_remove_round_trip_over_the_wire() {
     let harness = Harness::start().await;
@@ -900,10 +901,51 @@ async fn profile_switch_list_and_remove_round_trip_over_the_wire() {
         other => panic!("expected Response::Profiles, got {other:?}"),
     }
 
-    // Switching to a brand-new id creates and activates it. The profile has never registered, so the
-    // reply says so (Go's post-switch `NeedsLogin` arm) rather than claiming a connection.
+    // A switch to a target that names no profile is REFUSED, and creates nothing — Go's
+    // `switchProfile` prints `No profile named %q` and exits 1. This is the shape a typo takes, and
+    // the daemon used to answer it by tearing the node down into a profile nobody asked for.
     match harness
         .round_trip(r#"{"cmd":"switch_profile","target":"work"}"#)
+        .await
+    {
+        Response::Error { message } => assert!(
+            message.contains("no profile named"),
+            "unexpected refusal: {message:?}"
+        ),
+        other => panic!("expected Response::Error switching to an unknown profile, got {other:?}"),
+    }
+    // ...and the refused target really was not created: still just the default profile, still current.
+    match harness.round_trip(r#"{"cmd":"profile_list"}"#).await {
+        Response::Profiles { profiles } => {
+            assert_eq!(
+                profiles.len(),
+                1,
+                "a refused switch must not create a profile: {profiles:?}"
+            );
+            assert!(profiles[0].id == "default" && profiles[0].current);
+        }
+        other => panic!("expected Response::Profiles, got {other:?}"),
+    }
+
+    // A stray `create` KEY on a switch is not a creation either. Nothing in a shipped release ever
+    // sent one, but a switch request is the place a mixed pair could grow an extra field, and the
+    // daemon must not read a field it does not model as consent to create: the refusal is unchanged.
+    match harness
+        .round_trip(r#"{"cmd":"switch_profile","target":"work","create":true}"#)
+        .await
+    {
+        Response::Error { message } => assert!(
+            message.contains("no profile named"),
+            "an unmodelled field must not turn a switch into a creation: {message:?}"
+        ),
+        other => panic!("expected Response::Error, got {other:?}"),
+    }
+
+    // Creating it is its own request (`tnet switch --new work`), which activates it. The profile
+    // has never registered, so the reply says so (Go's post-switch `NeedsLogin` arm) rather than
+    // claiming a connection.
+    match harness
+        .round_trip(r#"{"cmd":"create_profile","id":"work"}"#)
         .await
     {
         Response::Ok { message } => {
@@ -913,6 +955,19 @@ async fn profile_switch_list_and_remove_round_trip_over_the_wire() {
             );
         }
         other => panic!("expected Response::Ok from switch, got {other:?}"),
+    }
+    // Asking to create it a second time is refused — `create_profile` never adopts an existing
+    // profile. This is the pairing an older daemon would have got wrong had creation been a flag on
+    // `switch_profile`: dropping the flag, it would have ACTIVATED "work" instead of refusing.
+    match harness
+        .round_trip(r#"{"cmd":"create_profile","id":"work"}"#)
+        .await
+    {
+        Response::Error { message } => assert!(
+            message.contains("already exists"),
+            "unexpected refusal: {message:?}"
+        ),
+        other => panic!("expected Response::Error re-creating a profile, got {other:?}"),
     }
 
     // Both profiles are now listed, with the marker moved to "work".
@@ -1101,6 +1156,87 @@ async fn debug_statedir_answers_from_the_daemon_not_the_cli_environment() {
         !tokio::fs::try_exists(&decoy).await.unwrap(),
         "`debug statedir` must never create the dir it reports"
     );
+
+    harness.shutdown_and_verify().await;
+}
+
+/// `debug portmap` STREAMS its log over the connection and then closes it — unlike every other
+/// one-shot verb, which answers with a single line. This drives the real server branch end to end:
+/// send the request, read frames until EOF, and check the run narrated itself the way Go's does.
+///
+/// The gateway is pinned to a documentation-range address (RFC 5737 TEST-NET-1) that nothing can
+/// answer on, and `"ty":"pmp"` keeps the run to NAT-PMP alone. That second half matters: the UPnP
+/// leg discovers over the SSDP *multicast* group on port 1900, which the gateway override does
+/// not constrain, so on a LAN with a real IGD it would find one and the run would narrate a fourth
+/// line. Restricted to NAT-PMP, the only packet that leaves is addressed to the unroutable gateway,
+/// so the run is deterministic wherever it executes: it reports the gateway it used, reports that
+/// nothing answered, and stops.
+#[tokio::test]
+async fn debug_portmap_streams_its_log_then_closes_the_connection() {
+    let harness = Harness::start().await;
+
+    let stream = UnixStream::connect(&harness.socket_path)
+        .await
+        .expect("CLI connect to LocalAPI socket for debug portmap");
+    let (read_half, mut write_half) = stream.into_split();
+    write_half
+        .write_all(
+            b"{\"cmd\":\"debug_portmap\",\"duration_ms\":500,\"ty\":\"pmp\",\"gateway_and_self\":\"192.0.2.1/192.0.2.2\"}\n",
+        )
+        .await
+        .expect("write debug portmap request");
+    write_half.flush().await.expect("flush request");
+
+    let mut reader = BufReader::new(read_half);
+    let mut lines = Vec::new();
+    loop {
+        let mut buf = String::new();
+        let n = tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut buf))
+            .await
+            .expect("the run is bounded by its own duration, so the stream must end")
+            .expect("read portmap stream line");
+        if n == 0 {
+            // The daemon closed the connection: the run is over. That EOF is what the CLI stops on.
+            break;
+        }
+        let trimmed = buf.trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Response>(trimmed).expect("portmap frame is Response JSON") {
+            Response::PortmapLog { line } => lines.push(line),
+            other => panic!("expected PortmapLog frames, got {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        lines,
+        vec![
+            "gw=192.0.2.1; self=192.0.2.2".to_string(),
+            "Probe: {PCP:false PMP:false UPnP:false}".to_string(),
+            "no portmapping services available".to_string(),
+        ],
+        "the streamed run must read exactly like `tailscale debug portmap` on a network with no \
+         port-mapping service"
+    );
+
+    harness.shutdown_and_verify().await;
+}
+
+/// A `--type` the port mapper does not know is refused with Go's message — the daemon's 400 —
+/// before anything is probed, and it arrives as a single `Response::Error` rather than a log frame,
+/// so the CLI can exit non-zero.
+#[tokio::test]
+async fn debug_portmap_refuses_an_unknown_type() {
+    let harness = Harness::start().await;
+
+    match harness
+        .round_trip(r#"{"cmd":"debug_portmap","duration_ms":500,"ty":"natpmp"}"#)
+        .await
+    {
+        Response::Error { message } => assert_eq!(message, "unknown portmap debug type"),
+        other => panic!("expected Response::Error for a bad --type, got {other:?}"),
+    }
 
     harness.shutdown_and_verify().await;
 }

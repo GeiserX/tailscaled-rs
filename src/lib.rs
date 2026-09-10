@@ -24,6 +24,8 @@
 //!   (the engine's graceful teardown never ran), so a crash cannot outlive the daemon.
 //! - [`tunflag`] — `tailnetd --tun`, Go's tunnel-interface flag, resolved onto this fork's TUN
 //!   prefs so a `tailscaled` command line copied from a unit file or a container image starts.
+//! - [`portmap`] — the NAT-PMP / PCP / UPnP-IGD port-mapping client: ask the LAN router to open a
+//!   hole so peers can reach this node directly instead of through a relay.
 //!
 //! Two binaries consume it: `tailnetd` (the daemon) and `tnet` (the thin CLI client).
 
@@ -38,6 +40,7 @@ pub mod httpproxy;
 pub mod ipforward;
 pub mod ipn;
 pub mod localapi;
+pub mod portmap;
 pub mod prefs;
 pub mod server;
 pub mod socks5;

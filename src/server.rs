@@ -319,6 +319,43 @@ async fn handle_conn(
                             break;
                         }
                     }
+                    // `debug portmap` is terminal for this connection like `Watch`: it takes over
+                    // the socket and streams one log line per frame until the run ends. It is a
+                    // WRITE (it asks the LAN gateway to forward traffic inward), so it is authorized
+                    // here before anything is sent, exactly like `nc`.
+                    Ok(req @ Request::DebugPortmap { .. }) => {
+                        if auth::authorize(&req, access).is_err() {
+                            tracing::warn!(peer_uid = ?peer_uid, "denied LocalAPI debug portmap: caller lacks write permission");
+                            write_response(
+                                &mut write_half,
+                                &Response::Error {
+                                    message: "permission denied: debug portmap requires root or the same user that owns the daemon".into(),
+                                },
+                            )
+                            .await?;
+                            continue;
+                        }
+                        // A long-lived stream (up to the requested duration): take a permit from the
+                        // SEPARATE stream budget, after the auth check so a denied run never consumes
+                        // one. If exhausted, refuse cleanly and keep serving this peer.
+                        let Ok(_stream_permit) = Arc::clone(&stream_limit).try_acquire_owned()
+                        else {
+                            tracing::warn!("LocalAPI: stream cap reached; refusing debug portmap");
+                            write_response(
+                                &mut write_half,
+                                &Response::Error {
+                                    message: "too many concurrent watch/nc streams; try again"
+                                        .into(),
+                                },
+                            )
+                            .await?;
+                            continue;
+                        };
+                        // Audit the GRANT of a sensitive op (asking the router to open a hole).
+                        tracing::info!(peer_uid = ?peer_uid, "debug portmap started");
+                        stream_debug_portmap(&mut write_half, req).await?;
+                        break;
+                    }
                     Ok(req) => {
                         let response = dispatch(req, access, peer_uid, &backend).await;
                         write_response(&mut write_half, &response).await?;
@@ -762,6 +799,118 @@ async fn stream_nc(
     Ok(true)
 }
 
+/// Stream a `debug portmap` run over this connection (the daemon half of Go's `serveDebugPortmap`).
+///
+/// The port-mapping client narrates itself through a synchronous log sink, while the socket write is
+/// async, so the two are joined by an unbounded channel: the sink pushes a line, and
+/// [`pump_debug_portmap`] forwards it as one [`Response::PortmapLog`] frame and flushes. When the
+/// run ends it drops its sender, the channel closes, and the pump returns — which closes the
+/// connection, exactly the EOF the CLI stops reading on.
+///
+/// A `--type` the run refuses (Go's 400 `unknown portmap debug type`) is reported as a single
+/// [`Response::Error`] frame instead, before any log line, so the CLI can exit non-zero.
+async fn stream_debug_portmap(
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    req: Request,
+) -> Result<()> {
+    let Request::DebugPortmap {
+        duration_ms,
+        ty,
+        gateway_and_self,
+        log_http,
+    } = req
+    else {
+        // Unreachable: the caller matched this variant to get here.
+        return Ok(());
+    };
+    let opts = crate::portmap::DebugPortmapOpts {
+        duration: std::time::Duration::from_millis(duration_ms),
+        ty,
+        gateway_and_self,
+        log_http,
+    };
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let logf: crate::portmap::LogSink = Arc::new(move |line: &str| {
+        // A send failure means the reader is gone (client disconnected); the pump cancels the run
+        // on its way out, so dropping the line is the whole response.
+        let _ = tx.send(line.to_string());
+    });
+
+    // Run the diagnostic on its own task so log lines are forwarded to the socket WHILE it runs
+    // rather than after it finishes (the operator is watching a live probe).
+    let run = tokio::spawn(async move { crate::portmap::debug_portmap(logf, &opts).await });
+
+    pump_debug_portmap(write_half, &mut rx, run).await
+}
+
+/// Forward one `debug portmap` run's log lines to the client until the run ends, then report its
+/// verdict. The streaming half of [`stream_debug_portmap`], split out so the cancellation contract
+/// below can be exercised with a task that would otherwise outlive the connection.
+///
+/// **The run is cancelled when this returns**, however it returns. Dropping a `JoinHandle` only
+/// *detaches* the task — it keeps running to completion with nothing left to read it — so without
+/// the guard a client that hangs up mid-run (every `write_response` below then fails with EPIPE,
+/// and `?` returns) would leave the probe holding its UDP socket and re-trying mappings for the
+/// whole client-chosen `--duration`, which has no upper bound. Go has this for free: its handler
+/// derives the run's context from the HTTP request, so a disconnect cancels the run and the
+/// handler's defers close the portmapper (`feature/debugportmapper/debugportmapper.go`,
+/// `serveDebugPortmap`). The abort guard is that context, and
+/// [`crate::portmap::debug_portmap`]'s own close-on-drop guard is those defers.
+async fn pump_debug_portmap(
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    mut run: tokio::task::JoinHandle<Result<(), String>>,
+) -> Result<()> {
+    /// Cancels the run it names when it goes out of scope, including on the `?` early returns
+    /// below. Aborting an already-finished task is a no-op, so the normal path pays nothing.
+    struct CancelOnDrop(tokio::task::AbortHandle);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _cancel = CancelOnDrop(run.abort_handle());
+
+    // Stop on whichever comes first: the sink closing, or the run returning. Both are needed. The
+    // run's own deadline is the operator's bound, but a background mapping attempt it kicked off can
+    // briefly outlive it while still holding a clone of the sink — so waiting for the channel alone
+    // could hold the connection open past the requested duration.
+    let outcome = loop {
+        tokio::select! {
+            biased;
+            line = rx.recv() => match line {
+                Some(line) => write_response(write_half, &Response::PortmapLog { line }).await?,
+                None => break run.await,
+            },
+            finished = &mut run => {
+                // Flush whatever the run queued before it returned, then stop.
+                while let Ok(line) = rx.try_recv() {
+                    write_response(write_half, &Response::PortmapLog { line }).await?;
+                }
+                break finished;
+            }
+        }
+    };
+
+    // The run is done: report its verdict. A refused `--type` is the only error it returns, and it
+    // produced no log lines, so that frame is the whole reply.
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(message)) => write_response(write_half, &Response::Error { message }).await?,
+        Err(e) => {
+            write_response(
+                write_half,
+                &Response::Error {
+                    message: format!("debug portmap run failed: {e}"),
+                },
+            )
+            .await?
+        }
+    }
+    Ok(())
+}
+
 /// Serialize one [`Response`] as a single newline-terminated JSON line and flush it.
 async fn write_response(
     write_half: &mut tokio::net::unix::OwnedWriteHalf,
@@ -872,6 +1021,11 @@ async fn dispatch(
         // `dispatch`; this arm exists only for match exhaustiveness.
         Request::Nc { .. } => Response::Error {
             message: "internal error: nc must be handled by the connection splicer".into(),
+        },
+        // `debug portmap` is intercepted in `handle_conn` (it takes over the connection to stream its
+        // log) and never reaches `dispatch`; this arm exists only for match exhaustiveness.
+        Request::DebugPortmap { .. } => Response::Error {
+            message: "internal error: debug portmap must be handled by the log streamer".into(),
         },
         // `version` (Go `tailscale version --daemon` reads `Status.Version`). The daemon's version is
         // its own compile-time crate version — a constant, needing no backend lock or engine.
@@ -1175,29 +1329,20 @@ async fn dispatch(
         // profile under the lock (the teardown is a bounded graceful shutdown, not the multi-second
         // `Device::new` handshake, so holding the lock is correct and keeps the swap atomic). Does NOT
         // auto-up the target — the operator runs `up` if the new profile should connect.
+        //
+        // An unknown target is refused with the device untouched (Go: `No profile named %q`); making
+        // one is the separate `create_profile` request below.
         Request::SwitchProfile { target } => {
             let mut be = backend.lock().await;
-            match be.switch_profile(&target).await {
-                // The reply distinguishes "already on it" from a real switch, and names the target's
-                // settled state — see `SwitchOutcome`. The daemon log carries the resolved id, which
-                // `target` need not be (it may have been a display name).
-                Ok(outcome) => {
-                    match &outcome {
-                        crate::ipn::SwitchOutcome::AlreadyCurrent { id } => {
-                            tracing::info!(profile = %id, "switch: already on this profile; nothing changed");
-                        }
-                        crate::ipn::SwitchOutcome::Switched { id, state } => {
-                            tracing::info!(profile = %id, state = state.as_str(), "switched profile (device torn down; run `up` to connect)");
-                        }
-                    }
-                    Response::Ok {
-                        message: outcome.report(),
-                    }
-                }
-                Err(e) => Response::Error {
-                    message: format!("{e:#}"),
-                },
-            }
+            switch_outcome_response(be.switch_profile(&target).await)
+        }
+        // `switch --new <id>` (this fork's stand-in for the interactive `tailscale login` that
+        // creates a profile upstream). Its own command rather than a flag on `switch_profile` so a
+        // daemon that predates it cannot silently degrade the request into a plain switch — see
+        // `Request::CreateProfile`.
+        Request::CreateProfile { id } => {
+            let mut be = backend.lock().await;
+            switch_outcome_response(be.create_profile(&id).await)
         }
         // `switch remove <id>` (Go `tailscale switch remove`). Refuses an unknown profile, and the
         // reserved `default` one; the CURRENT profile is left alone and reported as a success, which
@@ -1602,6 +1747,34 @@ async fn dispatch(
     }
 }
 
+/// Render the reply for the two profile-activation requests — `switch_profile` and `create_profile`,
+/// which differ only in how the target id is arrived at and share `Backend::activate_profile`
+/// underneath.
+///
+/// The reply distinguishes "already on it" from a real switch, and names the target's settled state
+/// — see [`SwitchOutcome`](crate::ipn::SwitchOutcome). The daemon log carries the RESOLVED id, which
+/// the caller's argument need not be (a `switch` target may have been a display name).
+fn switch_outcome_response(result: anyhow::Result<crate::ipn::SwitchOutcome>) -> Response {
+    match result {
+        Ok(outcome) => {
+            match &outcome {
+                crate::ipn::SwitchOutcome::AlreadyCurrent { id } => {
+                    tracing::info!(profile = %id, "switch: already on this profile; nothing changed");
+                }
+                crate::ipn::SwitchOutcome::Switched { id, state } => {
+                    tracing::info!(profile = %id, state = state.as_str(), "switched profile (device torn down; run `up` to connect)");
+                }
+            }
+            Response::Ok {
+                message: outcome.report(),
+            }
+        }
+        Err(e) => Response::Error {
+            message: format!("{e:#}"),
+        },
+    }
+}
+
 /// Harden an operator-supplied `--reason` text (Go's LocalAPI `RequestReason`, carried by both
 /// `logout` and `down`) for the daemon log. The reason is free text typed by whoever ran the
 /// command, and it lands in a log a human (or a log shipper) reads later,
@@ -1659,6 +1832,52 @@ mod tests {
             .expect("read_capped_line");
         writer.await.expect("writer task");
         (result, out)
+    }
+
+    /// A `debug portmap` run must not outlive the client that asked for it. When the connection
+    /// breaks mid-run every write fails and the pump returns early — at which point it has to
+    /// *cancel* the run, because dropping a `JoinHandle` only detaches the task and it would keep
+    /// probing (and holding its UDP socket) for the whole client-chosen `--duration`, which is
+    /// unbounded.
+    #[tokio::test]
+    async fn portmap_run_is_cancelled_when_the_client_hangs_up() {
+        let (client, server) = UnixStream::pair().expect("UnixStream::pair");
+        // The operator hit ^C: the reading end is gone before the first line goes out, so every
+        // write below fails with EPIPE.
+        drop(client);
+        let (_read_half, mut write_half) = server.into_split();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        // Stand in for a long run: `tnet debug portmap --duration 1h` is a legal request, and this
+        // task never finishes on its own inside the test's patience.
+        let run = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            Ok(())
+        });
+        let cancelled = run.abort_handle();
+        tx.send("gw=192.0.2.1; self=192.0.2.2".to_string())
+            .expect("queue the run's first log line");
+
+        let err = pump_debug_portmap(&mut write_half, &mut rx, run)
+            .await
+            .expect_err("writing to a hung-up client must fail");
+        // It failed on the write itself — the peer is gone, so the send never blocks — and not by
+        // sitting in `write_response`'s stalled-client timeout.
+        let err = format!("{err:#}");
+        assert!(
+            !err.contains("timed out"),
+            "a hung-up client fails the write immediately, not by timeout: {err}"
+        );
+
+        // The abort lands the next time the runtime polls the task, so allow a bounded moment for
+        // it — but only a moment: without the cancellation this never becomes true.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !cancelled.is_finished() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the run must be cancelled when the client hangs up, not left detached");
     }
 
     #[tokio::test]

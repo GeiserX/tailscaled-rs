@@ -492,9 +492,39 @@ pub enum Request {
     /// The `Ok` message distinguishes the three outcomes Go's CLI reports in words: already on this
     /// profile (nothing changed), switched to a profile that still needs a login, and switched to a
     /// registered profile that is merely down.
+    ///
+    /// A `target` that matches no known profile is **refused** (Go's `switchProfile`: `No profile
+    /// named %q`, exit 1) — nothing is torn down on the refusal path. Creating a profile is a
+    /// separate request, [`CreateProfile`](Request::CreateProfile); this one only ever *selects* one
+    /// that already exists.
     SwitchProfile {
         /// The target profile id (or name; the daemon resolves either).
         target: String,
+    },
+    /// Create a new, empty profile and switch to it (`tnet switch --new <id>`). A WRITE, gated like
+    /// [`SwitchProfile`](Request::SwitchProfile) — it registers a profile, repoints the
+    /// current-profile pointer and tears the live device down on the way.
+    ///
+    /// A **fork extension with no upstream counterpart**: Go creates a profile through the
+    /// interactive `tailscale login`, which this fork does not have yet, and Go's `switch` refuses an
+    /// unknown target outright. The daemon refuses an `id` that is not a usable profile id, and one
+    /// that already names a profile by id **or** by nickname.
+    ///
+    /// # Why this is its own command and not a flag on `SwitchProfile`
+    ///
+    /// The LocalAPI socket permits a mixed pair — a newer `tnet` against a daemon that has not been
+    /// restarted since an upgrade. Serde ignores unknown *fields*, so had "create it" travelled as a
+    /// `create: true` field on `SwitchProfile`, a daemon that predates the flag would have dropped it
+    /// and run a plain switch: for an `id` that already names a profile that silently *activates* it
+    /// — tearing the live device down and repointing the node — where the operator asked for a
+    /// creation the newer daemon refuses. An unknown *command*, by contrast, cannot be silently
+    /// reinterpreted: the older daemon's `Request` deserializer fails and it answers `bad request`,
+    /// so the older-daemon outcome is a refusal with the node untouched. The version gate is the
+    /// deserializer itself, which needs no capability table to keep in step with releases.
+    CreateProfile {
+        /// The id for the new profile. Must be a usable single-path-component profile id (letters,
+        /// digits, `-` or `_`; 1-64 characters) that does not already name a profile.
+        id: String,
     },
     /// Delete a profile (Go `tailscale switch remove`). The target may be an id or a display name,
     /// like [`SwitchProfile`](Request::SwitchProfile). Refuses a target that matches no known profile
@@ -704,6 +734,41 @@ pub enum Request {
     /// [`DebugRebind`](Self::DebugRebind). Needs no engine — it answers with the node down, like Go's.
     /// Replies with [`Response::StateDir`].
     DebugStateDir,
+    /// Run a port-mapping diagnostic and stream its log back, one [`Response::PortmapLog`] frame
+    /// per line (Go `tailscale debug portmap` → the `debug-portmap` LocalAPI route, served by
+    /// `feature/debugportmapper`), rendered by `tnet debug portmap`.
+    ///
+    /// The daemon probes the LAN gateway for NAT-PMP / PCP / UPnP-IGD support and, if any answers,
+    /// asks for a UDP mapping — reporting each step as it happens. This is the one verb on this fork
+    /// that STREAMS a reply per line rather than answering once, because the run takes up to
+    /// [`duration_ms`](Request::DebugPortmap::duration_ms) and its value is in watching it unfold;
+    /// Go streams the same text over a flushed `text/plain` body. The daemon closes the connection
+    /// when the run ends.
+    ///
+    /// A **write** for authorization: Go gates `serveDebugPortmap` on `PermitWrite` ("debug access
+    /// denied" otherwise), and the run sends packets to the LAN gateway asking it to open a hole, so
+    /// it is gated like `up`/`down` (root/same-uid). Node-up independent — the probe talks to the
+    /// local router, not through the tailnet, so it answers with the node down.
+    DebugPortmap {
+        /// How long the whole run may take, in milliseconds. The CLI parses Go's `--duration`
+        /// duration string (`5s`) and sends the resolved milliseconds, so the wire carries a plain
+        /// number rather than a Go-specific grammar the daemon would have to re-parse.
+        duration_ms: u64,
+        /// Which protocol to exercise: `""` (all — the default), `"pmp"`, `"pcp"` or `"upnp"`.
+        /// Anything else is refused with [`Response::Error`] carrying Go's `unknown portmap debug
+        /// type` (Go answers 400 with that same text).
+        #[serde(default)]
+        ty: String,
+        /// `"<gateway>/<self>"` — override gateway auto-detection with an explicit pair (Go's
+        /// `gateway_and_self` query parameter, which its CLI builds from `--gateway-addr` +
+        /// `--self-addr`). `None` auto-detects from the host routing table.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gateway_and_self: Option<String>,
+        /// Log raw HTTP for the UPnP leg (Go's `--log-http`). Carried for parity; this fork's UPnP
+        /// leg is discovery-only, so it currently adds no output.
+        #[serde(default)]
+        log_http: bool,
+    },
     /// Re-read the daemon's `--config` file and adopt the changed fields into the running node (Go
     /// `tailscaled`'s `reload-config` LocalAPI route → `LocalBackend.ReloadConfig` → `setConfigLocked`,
     /// v1.100.0). Rendered by `tnet reload-config`. The daemon re-loads the same declarative config it
@@ -912,6 +977,15 @@ pub enum Response {
         /// found) and there was therefore nothing to reload. `false` is a REFUSAL, not a failure —
         /// nothing was mutated, and no error occurred.
         reloaded: bool,
+    },
+    /// One line of a `debug portmap` run's log (a streamed reply to [`Request::DebugPortmap`]).
+    /// The daemon emits these as the run narrates itself and then closes the connection; the CLI
+    /// prints each `line` after neutralizing control characters (parts of a line are built from
+    /// what a device on the local network answered), so the output is byte-identical to what
+    /// `tailscale debug portmap` writes to stdout for any line of plain printable text.
+    PortmapLog {
+        /// One log line, without its trailing newline.
+        line: String,
     },
     /// A command succeeded.
     Ok {
@@ -2366,6 +2440,68 @@ mod tests {
     }
 
     #[test]
+    fn request_debug_portmap_wire_format_and_streamed_reply() {
+        // Pin the `debug_portmap` discriminant + field names so daemon + CLI agree. An absent
+        // gateway override stays off the wire (auto-detect), which is what a bare
+        // `tnet debug portmap` sends.
+        assert_eq!(
+            serde_json::to_string(&Request::DebugPortmap {
+                duration_ms: 5_000,
+                ty: String::new(),
+                gateway_and_self: None,
+                log_http: false,
+            })
+            .unwrap(),
+            r#"{"cmd":"debug_portmap","duration_ms":5000,"ty":"","log_http":false}"#
+        );
+        // With `--gateway-addr`/`--self-addr` the pair travels as one `<gateway>/<self>` string,
+        // the same shape Go's client puts in its `gateway_and_self` query parameter.
+        assert_eq!(
+            serde_json::to_string(&Request::DebugPortmap {
+                duration_ms: 1_500,
+                ty: "pmp".into(),
+                gateway_and_self: Some("192.0.2.1/192.0.2.2".into()),
+                log_http: true,
+            })
+            .unwrap(),
+            r#"{"cmd":"debug_portmap","duration_ms":1500,"ty":"pmp","gateway_and_self":"192.0.2.1/192.0.2.2","log_http":true}"#
+        );
+        // Every optional field defaults, so a minimal raw-client line still parses.
+        match serde_json::from_str::<Request>(r#"{"cmd":"debug_portmap","duration_ms":250}"#)
+            .unwrap()
+        {
+            Request::DebugPortmap {
+                duration_ms,
+                ty,
+                gateway_and_self,
+                log_http,
+            } => {
+                assert_eq!(duration_ms, 250);
+                assert_eq!(ty, "");
+                assert_eq!(gateway_and_self, None);
+                assert!(!log_http);
+            }
+            other => panic!("expected DebugPortmap, got {other:?}"),
+        }
+        // The reply is a stream of log lines; each frame must survive the process boundary intact,
+        // because the CLI prints `line` (control characters neutralized) as one line of output.
+        let json = serde_json::to_string(&Response::PortmapLog {
+            line: "Probe: {PCP:false PMP:true UPnP:true}".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"portmap_log","line":"Probe: {PCP:false PMP:true UPnP:true}"}"#
+        );
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::PortmapLog { line } => {
+                assert_eq!(line, "Probe: {PCP:false PMP:true UPnP:true}")
+            }
+            other => panic!("expected PortmapLog, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn version_request_response_round_trip() {
         // The `version` discriminant + the daemon's reply shape must be stable across the CLI/daemon
         // process boundary (they agree only on this JSON wire format).
@@ -2384,6 +2520,40 @@ mod tests {
         match serde_json::from_str::<Response>(&json).unwrap() {
             Response::Version { version } => assert_eq!(version, "0.9.0"),
             other => panic!("expected Version, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn profile_switch_and_create_are_distinct_commands_on_the_wire() {
+        // The daemon side of the `--new` guard. Creation is its own `cmd`, so a daemon that predates
+        // it fails to deserialize and answers `bad request` instead of quietly serving a switch —
+        // which, for an id that already names a profile, would tear the live device down and repoint
+        // the node. `switch_profile` keeps the shape it has always had, so an older CLI's bare switch
+        // is still understood unchanged.
+        assert_eq!(
+            serde_json::to_string(&Request::SwitchProfile {
+                target: "work".into()
+            })
+            .unwrap(),
+            r#"{"cmd":"switch_profile","target":"work"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::CreateProfile { id: "work".into() }).unwrap(),
+            r#"{"cmd":"create_profile","id":"work"}"#
+        );
+        match serde_json::from_str::<Request>(r#"{"cmd":"create_profile","id":"work"}"#).unwrap() {
+            Request::CreateProfile { id } => assert_eq!(id, "work"),
+            other => panic!("expected CreateProfile, got {other:?}"),
+        }
+        // A `create` key on a switch is NOT a creation: `SwitchProfile` models no such field, so it
+        // deserializes as the plain switch it reads as, and the daemon refuses an unknown target.
+        match serde_json::from_str::<Request>(
+            r#"{"cmd":"switch_profile","target":"work","create":true}"#,
+        )
+        .unwrap()
+        {
+            Request::SwitchProfile { target } => assert_eq!(target, "work"),
+            other => panic!("expected SwitchProfile, got {other:?}"),
         }
     }
 
