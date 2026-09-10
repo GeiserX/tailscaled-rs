@@ -1538,7 +1538,8 @@ enum DebugCmd {
     /// environment never enters the answer, so a root `tailnetd` and an unprivileged `tnet` agree.
     ///
     /// Errors if the daemon is not reachable, and prints Go's `no statedir is set` if it reports
-    /// none. Nothing is created or mutated.
+    /// none. Takes no arguments — a stray positional is refused with Go's `unexpected arguments`.
+    /// Nothing is created or mutated.
     Statedir {
         /// Report what THIS CLI would resolve — the state dir, the rule in the cascade that chose
         /// it, and the socket derived from it — instead of asking the daemon.
@@ -1551,6 +1552,11 @@ enum DebugCmd {
         /// bare `debug statedir` is how the classic root-daemon/unprivileged-CLI split is spotted.
         #[arg(long)]
         local: bool,
+        /// Go's leftover non-flag arguments. `statedir` takes none; they are collected here only so
+        /// the refusal is Go's own `unexpected arguments` (stderr, exit 1) instead of clap's
+        /// "unexpected argument" usage block (exit 2).
+        #[arg(value_name = "ARG", hide = true)]
+        args: Vec<String>,
     },
     /// Resolve a hostname to its IP addresses, one per line (Go `tailscale debug resolve`). Purely
     /// local — a **host-resolver** lookup inside this CLI process (Go's `net.DefaultResolver`, i.e.
@@ -2870,7 +2876,7 @@ async fn main() -> Result<()> {
             }
             // `debug statedir` asks the daemon which state dir IT is using (Go round-trips this);
             // `--local` is the fork's no-daemon-needed report of the CLI's own resolution.
-            DebugCmd::Statedir { local } => run_debug_statedir(&socket, local).await,
+            DebugCmd::Statedir { local, args } => run_debug_statedir(&socket, local, &args).await,
             // `debug resolve` is a host-resolver lookup in THIS process — no socket round-trip.
             DebugCmd::Resolve { net, hostname } => run_debug_resolve(&hostname, &net).await,
             DebugCmd::Portmap {
@@ -4809,7 +4815,16 @@ async fn run_debug_resolve(hostname: &[String], net: &str) -> Result<()> {
 /// reflected, not re-derived). It stays useful with no daemon running, and never creates the state dir
 /// — a diagnostic that created the thing it is diagnosing would mask the very "wrong dir" it exists to
 /// reveal.
-async fn run_debug_statedir(socket: &std::path::Path, local: bool) -> Result<()> {
+///
+/// Go's leftover-argument refusal comes first, before either form: `runPrintStateDir` opens with
+/// `if len(args) > 0 { return errors.New("unexpected arguments") }` — see
+/// [`statedir_positional_refusal`]. It is checked ahead of `--local` too, because the flag only
+/// chooses *which* answer to give and neither answer takes an operand.
+async fn run_debug_statedir(socket: &std::path::Path, local: bool, args: &[String]) -> Result<()> {
+    // Go's first check, before the LocalAPI call — and here, before the local report as well.
+    if let Some(message) = statedir_positional_refusal(args) {
+        anyhow::bail!(message);
+    }
     if local {
         let (dir, source) = tailscaled_rs::state_dir_with_source();
         print!("{}", statedir_report(&dir, source, socket));
@@ -4839,6 +4854,21 @@ async fn run_debug_statedir(socket: &std::path::Path, local: bool) -> Result<()>
                 socket.display()
             )
         }),
+    }
+}
+
+/// Go's leftover-argument refusal for `debug statedir`, verbatim. `runPrintStateDir`
+/// (cmd/tailscale/cli/debug.go) opens with
+/// `if len(args) > 0 { return errors.New("unexpected arguments") }` — `statedir` is a bare verb that
+/// asks the daemon one question, so any positional is a typo (most often a path the operator meant
+/// to *set*, which this command cannot do). Unlike Go's `down`, the message does not quote the
+/// offending arguments: it is a fixed string, so it is returned as one. `None` when the invocation
+/// carried no non-flag argument, which is the only shape Go accepts. Pure → unit-testable.
+fn statedir_positional_refusal(args: &[String]) -> Option<&'static str> {
+    if args.is_empty() {
+        None
+    } else {
+        Some("unexpected arguments")
     }
 }
 
@@ -22749,6 +22779,49 @@ mod tests {
     }
 
     // --- `debug statedir` / `debug build-info` --------------------------------------------------
+
+    #[test]
+    fn statedir_refuses_leftover_arguments_with_go_s_message() {
+        // Go `runPrintStateDir`: `if len(args) > 0 { return errors.New("unexpected arguments") }`.
+        // No argument is the only accepted shape, and the message is a fixed string — it does not
+        // echo the offending arguments the way `down`'s `%q` refusal does.
+        assert_eq!(super::statedir_positional_refusal(&[]), None);
+        assert_eq!(
+            super::statedir_positional_refusal(&["/var/lib".to_string()]),
+            Some("unexpected arguments"),
+            "one positional is already `len(args) > 0`"
+        );
+        assert_eq!(
+            super::statedir_positional_refusal(&["a".to_string(), "b c".to_string()]),
+            Some("unexpected arguments"),
+            "the message is fixed, so more arguments do not change it"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_debug_statedir_checks_the_arguments_before_anything_else() {
+        // The refusal is the command's FIRST act, ahead of both the daemon round trip and the
+        // fork's `--local` report: the socket here is never created, and `--local` would otherwise
+        // print a report and exit 0, so either form reaching its body would be visible as a
+        // different outcome than this error.
+        let socket = std::path::Path::new("/nonexistent/tnet-statedir-refusal.sock");
+        let args = vec!["/var/lib".to_string()];
+        for local in [false, true] {
+            let err = super::run_debug_statedir(socket, local, &args)
+                .await
+                .expect_err("a positional argument must be refused");
+            assert_eq!(
+                err.to_string(),
+                "unexpected arguments",
+                "the refusal must be Go's message alone (local = {local})"
+            );
+        }
+        // ...and with no arguments the refusal is out of the way: `--local` answers without a
+        // daemon, so this is the same call succeeding on the shape Go accepts.
+        super::run_debug_statedir(socket, true, &[])
+            .await
+            .expect("`--local` answers with no daemon and no arguments");
+    }
 
     #[test]
     fn statedir_line_prints_the_daemons_path_and_nothing_else() {
