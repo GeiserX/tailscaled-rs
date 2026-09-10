@@ -20,7 +20,8 @@
 //! control plane — this fork registers no policy store that could *require* a justification and the
 //! engine has no audit-log transport. That is the same scope `logout --reason` already documents.
 //!
-//! Upstream: `cmd/tailscale/cli/down.go` @ `53a0d659afa51835dd7a9283873cca44261454f8`.
+//! Upstream: `cmd/tailscale/cli/down.go` and `cmd/tailscale/cli/risks.go` @
+//! `53a0d659afa51835dd7a9283873cca44261454f8`.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
@@ -59,6 +60,10 @@ fn tnet(name: &str, args: &[&str]) -> Output {
 
 fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+fn stdout(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 /// A stand-in daemon: it serves exactly `replies.len()` connections of the LocalAPI's one-line JSON
@@ -331,20 +336,46 @@ fn down_ports_gos_leftover_argument_refusal() {
 
 /// The risk gate: a `down` typed into a Tailscale SSH session disconnects it, so it is refused —
 /// locally, before the node is touched — unless `lose-ssh` was pre-accepted.
+///
+/// The refusal is Go's `presentRiskToUser` (cmd/tailscale/cli/risks.go) declined, so all three of
+/// its parts are checked: `outln(riskMessage)` and `printf("To skip this warning, use
+/// --accept-risk=%s\n", ...)` on **stdout**, and `errAborted` — `aborted, no changes made` — as the
+/// error upstream `main` prints on stderr before exiting 1. The abort line is the only part that
+/// states the outcome; a refusal that just warns leaves the operator guessing whether the node went
+/// down anyway.
 #[test]
 fn down_over_tailscale_ssh_is_refused_unless_the_risk_is_accepted() {
     let watch = SocketWatch::bind("risk");
     let refused = tnet_with(watch.path(), Some("100.64.0.7 12345 22"), &["down"]);
     let refused_connections = watch.connections();
-    assert!(!refused.status.success(), "the refusal must be non-zero");
+    // Go's `main` exits 1 on any error returned by a command, this one included.
+    assert_eq!(
+        refused.status.code(),
+        Some(1),
+        "the refusal must exit 1, like Go's: {refused:?}"
+    );
     let err = stderr(&refused);
+    let out = stdout(&refused);
     assert!(
-        err.contains("your session disconnecting"),
-        "expected Go's riskLoseSSH wording: {err}"
+        out.contains(
+            "You are connected over Tailscale; this action will disable Tailscale and result in \
+             your session disconnecting."
+        ),
+        "expected Go's riskLoseSSH wording on stdout, where `outln` puts it; stdout:\n{out}\nstderr:\n{err}"
     );
     assert!(
-        err.contains("--accept-risk=lose-ssh"),
-        "the refusal must name the override: {err}"
+        out.contains("To skip this warning, use --accept-risk=lose-ssh"),
+        "expected Go's own hint sentence, on stdout: {out}"
+    );
+    assert!(
+        err.contains("aborted, no changes made"),
+        "a declined risk must end in Go's errAborted, so the operator reads that nothing changed: {err}"
+    );
+    // The warning is the command's output, not a diagnostic: `tnet down 2>/dev/null` must still
+    // show it, and `> /dev/null` must not swallow the failure.
+    assert!(
+        !err.contains("your session disconnecting"),
+        "the warning belongs on stdout only: {err}"
     );
     assert_eq!(
         refused_connections, 0,

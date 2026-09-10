@@ -2461,6 +2461,38 @@ fn risk_accepted(accepted: &str, risk: &str) -> bool {
     accepted.split(',').any(|r| r == risk || r == "all")
 }
 
+/// Go's `errAborted` (`cmd/tailscale/cli/risks.go`), verbatim: the error `presentRiskToUser` returns
+/// when the operator did not accept the risk. Upstream `main` prints a returned error with
+/// `fmt.Fprintln(os.Stderr, err)` and exits 1, so this sentence is the LAST thing an operator reads
+/// after a refused risk — and the only part of the exchange that says the node was not touched.
+const RISK_ABORTED: &str = "aborted, no changes made";
+
+/// Go's `presentRiskToUser` (`cmd/tailscale/cli/risks.go`) for a risk the caller has already found
+/// unaccepted: write the risk message and the escape hatch, then hand back Go's `errAborted` for the
+/// caller to `return` (so it reaches the operator on stderr, through the same path as every other
+/// command error).
+///
+/// Faithful in three ways that are easy to get wrong:
+/// - **Stream.** Go's `outln(riskMessage)` and `printf("To skip this warning, use --accept-risk=%s\n",
+///   riskType)` both write to `Stdout`. The warning is the command's *output*, not a diagnostic.
+/// - **Wording.** `To skip this warning, use --accept-risk=<risk>` is Go's sentence, verbatim; the
+///   operator can paste it out of the terminal and it names the risk that fired.
+/// - **The abort error.** Go's decline path returns `errAborted`; without it a refusal ends with the
+///   warning as its last word and nothing that states the outcome.
+///
+/// What is NOT ported is the prompt: Go follows the two lines with `prompt.YesNo("Continue?", false)`.
+/// That helper returns its `false` default whenever stdin and stdout are not BOTH terminals, so on any
+/// non-interactive run — a script, a CI job, a pipe — Go itself takes exactly this path and aborts.
+/// This CLI has no TTY-prompt path, so it always takes it: fail-closed, and never more permissive than
+/// upstream. Callers keep Go's acceptance check (`isRiskAccepted`, here [`risk_accepted`]) themselves,
+/// because they fold it into a wider gate — `down`'s [`down_ssh_refusal`] also has to be over a
+/// Tailscale SSH session before a risk exists at all.
+fn present_risk_to_user(risk_type: &str, risk_message: &str) -> anyhow::Error {
+    println!("{risk_message}");
+    println!("To skip this warning, use --accept-risk={risk_type}");
+    anyhow::anyhow!(RISK_ABORTED)
+}
+
 /// The pure decision behind the SSH-server-toggle `lose-ssh` risk — the Rust analogue of Go's
 /// `presentSSHToggleRisk` (`up.go`). Returns the *direction* of a refusal, or `None` to allow:
 /// - `None` (allow) when the toggle isn't mentioned (`want` is `None`), or we're not over a Tailscale
@@ -3307,14 +3339,22 @@ fn down_already_stopped(state: &str) -> bool {
     state == tailscaled_rs::ipn::State::Stopped.as_str()
 }
 
+/// Go's `riskLoseSSH` message for `down` (`runDown`, cmd/tailscale/cli/down.go), verbatim — the
+/// string upstream hands to `presentRiskToUser`.
+const DOWN_LOSE_SSH_RISK: &str = "You are connected over Tailscale; this action will disable \
+     Tailscale and result in your session disconnecting.";
+
 /// `down` (Go `tailscale down`): clear `WantRunning` without logging out — ported from
 /// `runDown` (cmd/tailscale/cli/down.go), in Go's order.
 ///
 /// 1. **Leftover arguments** — `down` takes none; [`down_positional_refusal`] carries Go's message.
 /// 2. **The `lose-ssh` risk** — refuse over a Tailscale SSH session unless `--accept-risk=lose-ssh`
 ///    (or `all`). Decided entirely CLI-side from `$SSH_CLIENT`, like Go's `isSSHOverTailscale`, and
-///    before anything reaches the daemon. Go prompts interactively here; this CLI has no TTY-prompt
-///    path, so — as everywhere else in this fork — it refuses fail-closed and names the override.
+///    before anything reaches the daemon. [`present_risk_to_user`] then renders it exactly as Go
+///    does on a declined risk: warning + `To skip this warning, use --accept-risk=lose-ssh` on
+///    stdout, and Go's `errAborted` (`aborted, no changes made`) as the command's error. Go would
+///    prompt first on a terminal; this CLI has no TTY-prompt path and so always takes Go's own
+///    non-interactive answer, which is to abort.
 /// 3. **Already stopped** — one read-only `status` round-trip; if the node is `Stopped`, say so on
 ///    stderr and exit 0 without a redundant edit (Go's `warnf` + `return nil`).
 /// 4. **The edit** — `Request::Down`, carrying `--reason` for the daemon to record (Go attaches it
@@ -3330,14 +3370,9 @@ async fn run_down(
         anyhow::bail!(message);
     }
     if down_ssh_refusal(is_ssh_over_tailscale(), accept_risk.unwrap_or("")) {
-        // Go's `presentRiskToUser(riskLoseSSH, ...)` wording for `down`, plus the override hint this
-        // CLI owes in place of Go's interactive y/N prompt.
-        eprintln!(
-            "You are connected over Tailscale; this action will disable Tailscale and result in \
-             your session disconnecting."
-        );
-        eprintln!("To override, re-run with --accept-risk=lose-ssh");
-        std::process::exit(1);
+        // Go: `presentRiskToUser(riskLoseSSH, <message>, downArgs.acceptedRisks)` — warning and hint
+        // on stdout, then `errAborted` returned as the command's error. See [`present_risk_to_user`].
+        return Err(present_risk_to_user("lose-ssh", DOWN_LOSE_SSH_RISK));
     }
     // Go's `localClient.Status(ctx)` pre-check. A transport failure is Go's `error fetching current
     // status` — surfaced here with the same "talking to daemon" context every other verb uses, so a
@@ -15140,6 +15175,21 @@ mod tests {
         // Not over Tailscale SSH → nothing to lose, no refusal whatever the flag says.
         assert!(!down_ssh_refusal(false, ""));
         assert!(!down_ssh_refusal(false, "lose-ssh"));
+    }
+
+    #[test]
+    fn a_declined_risk_ends_in_gos_abort_error() {
+        // Go `presentRiskToUser`: the decline path returns `errAborted`, and upstream `main` prints
+        // the returned error before exiting 1 — so `aborted, no changes made` is the sentence that
+        // actually tells the operator nothing was changed. A refusal that only warns loses it.
+        let err = present_risk_to_user("lose-ssh", DOWN_LOSE_SSH_RISK);
+        assert_eq!(err.to_string(), "aborted, no changes made");
+        // The message `down` hands it is Go's, verbatim: one sentence, single-spaced (the source
+        // literal is written with a line continuation, which is easy to get wrong by a space).
+        assert_eq!(
+            DOWN_LOSE_SSH_RISK,
+            "You are connected over Tailscale; this action will disable Tailscale and result in your session disconnecting."
+        );
     }
 
     #[test]
