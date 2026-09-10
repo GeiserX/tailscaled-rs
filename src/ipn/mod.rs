@@ -125,16 +125,67 @@ async fn link_monitor_loop(device: std::sync::Arc<tailscale::Device>) {
     }
 }
 
-/// The captive-portal trigger, as a pure decision — extracted from
-/// [`Backend::connectivity_impacted`] so the "which state does this run in" question is testable
-/// without a live engine (the same split [`derive_state_from`] gets).
+/// What this daemon can observe of Go's `ImpactsConnectivity` warnables — one field per member of
+/// [`captive::ConnectivityWarnable`], carrying the raw fact rather than the verdict.
 ///
-/// `state` is the node's current [`State`]; `derp_home` is whether the engine's net report names a
-/// reachable DERP region. Impacted means Go's pair: the loop is alive (upstream runs it **only**
-/// between entering and leaving `ipn.Running`) *and* something that impacts connectivity is unhealthy
-/// (here: no relay is reachable — Go's `no-derp-home`).
-fn connectivity_impacted_from(state: State, derp_home: bool) -> bool {
-    state == State::Running && !derp_home
+/// Every field is a three-valued answer, because "we could not read this signal" is not the same as
+/// "this signal is bad". `None` is *unknown* and never makes the node impacted, which is how Go's
+/// tracker behaves too: a warnable it was never told about is healthy, not unhealthy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ConnectivityHealth {
+    /// Whether any host interface could carry Internet traffic (Go `netmon.State.AnyInterfaceUp`,
+    /// fed to `health.Tracker.SetAnyInterfaceUp`). `false` is Go's `network-status` warnable.
+    any_interface_up: Option<bool>,
+    /// Whether the engine's net report names a reachable DERP region. `false` is Go's `no-derp-home`
+    /// warnable.
+    derp_home: Option<bool>,
+}
+
+impl ConnectivityHealth {
+    /// Nothing observed — every signal unknown, so nothing is unhealthy. Used outside `Running`,
+    /// where upstream's loop is not even alive and neither observation is worth paying for.
+    const UNKNOWN: Self = Self {
+        any_interface_up: None,
+        derp_home: None,
+    };
+}
+
+/// The captive-portal trigger, as a pure decision — extracted from
+/// [`Backend::connectivity_impacted`] so the "which state does this run in, and off which signals"
+/// question is testable without a live engine (the same split [`derive_state_from`] gets).
+///
+/// Returns the warnable that makes the node impacted, or `None` when it is not. Impacted means Go's
+/// pair: the loop is alive (upstream runs it **only** between entering and leaving `ipn.Running`)
+/// *and* at least one `ImpactsConnectivity` warnable is unhealthy — upstream's
+/// `for _, w := range state.Warnings { if w.ImpactsConnectivity && w.WarnableCode !=
+/// captivePortalWarnable.Code }` (`feature/captiveportal/captiveportal.go`), over the members of that
+/// set this daemon can observe.
+///
+/// When more than one is unhealthy the one with the shortest
+/// [`time_to_visible`](captive::ConnectivityWarnable::time_to_visible) wins. Go breaks on whichever
+/// warning its map iteration reaches first — order it does not care about, because the *event* that
+/// wakes its loop is the first warnable to become visible. Picking the soonest-visible reproduces
+/// that timing and is deterministic, which the map order is not.
+fn connectivity_impacted_from(
+    state: State,
+    health: ConnectivityHealth,
+) -> Option<captive::ConnectivityWarnable> {
+    if state != State::Running {
+        return None;
+    }
+    // Go's `for _, w := range state.Warnings`, over the members this daemon observes: one row per
+    // warnable, paired with the signal that decides it. Adding a member is one row.
+    [
+        (
+            captive::ConnectivityWarnable::NetworkStatus,
+            health.any_interface_up,
+        ),
+        (captive::ConnectivityWarnable::NoDerpHome, health.derp_home),
+    ]
+    .into_iter()
+    .filter(|(_, healthy)| *healthy == Some(false))
+    .map(|(warnable, _)| warnable)
+    .min_by_key(|w| w.time_to_visible())
 }
 
 /// The captive-portal detection loop — Go `ipn/ipnlocal/captiveportal.go`, its
@@ -151,18 +202,19 @@ fn connectivity_impacted_from(state: State, derp_home: bool) -> bool {
 /// ## The trigger
 ///
 /// Detection is not periodic background chatter: it runs only while
-/// [`connectivity_impacted`](Backend::connectivity_impacted) holds — the node is `Running` and has no
-/// reachable relay (Go's `no-derp-home`) — and
+/// [`connectivity_impacted`](Backend::connectivity_impacted) names a warnable — the node is `Running`
+/// and one of Go's `ImpactsConnectivity` warnables this daemon can observe
+/// ([`captive::ConnectivityWarnable`]) is unhealthy — and
 /// [`should_run_captive_portal_detection`](Backend::should_run_captive_portal_detection) allows it
 /// (the operator wants the node up). A healthy `Running` node, a node still coming up, and a
 /// deliberately-`down` node all probe **zero** times.
 ///
-/// The first pass of an episode waits
-/// [`NO_DERP_HOME_TIME_TO_VISIBLE`](captive::NO_DERP_HOME_TIME_TO_VISIBLE) +
-/// [`DETECTION_INTERVAL`](captive::DETECTION_INTERVAL): upstream's health tracker only makes
-/// `no-derp-home` visible after the former, and its captive loop then spends the latter on its timer
-/// before probing. The sum is why a node whose first DERP measurement is merely still in flight does
-/// not probe on every bring-up.
+/// The first pass of an episode waits the triggering warnable's
+/// [`settle_time`](captive::ConnectivityWarnable::settle_time) — its Go `TimeToVisible` plus
+/// [`DETECTION_INTERVAL`](captive::DETECTION_INTERVAL). Upstream spends both: its health tracker only
+/// makes a warnable visible after the former, and its captive loop then spends the latter on its
+/// timer before probing. The sum is why a node whose first DERP measurement is merely still in flight
+/// does not probe on every bring-up.
 ///
 /// While connectivity stays impacted the pass repeats every
 /// [`RECHECK_INTERVAL`](captive::RECHECK_INTERVAL). Go instead re-arms its 2s timer off health-tracker
@@ -191,9 +243,12 @@ pub async fn captive_portal_loop(backend: std::sync::Arc<tokio::sync::Mutex<Back
         // acquisition. Never hold it across the probe below.
         let impacted = {
             let mut be = backend.lock().await;
-            let impacted =
-                be.should_run_captive_portal_detection() && be.connectivity_impacted().await;
-            if !impacted {
+            let impacted = if be.should_run_captive_portal_detection() {
+                be.connectivity_impacted().await
+            } else {
+                None
+            };
+            if impacted.is_none() {
                 // Go's healthy branch: connectivity is fine, so we know for sure there is no portal
                 // in the way — drop any warning. `set_captive_portal_detected` is a no-op (and
                 // silent) when nothing was raised, so a healthy node's tick costs one uncontended
@@ -203,21 +258,24 @@ pub async fn captive_portal_loop(backend: std::sync::Arc<tokio::sync::Mutex<Back
             impacted
         };
 
-        if !impacted {
+        let Some(warnable) = impacted else {
             impacted_since = None;
             last_run = None;
             continue;
-        }
+        };
 
-        let since = *impacted_since.get_or_insert_with(tokio::time::Instant::now);
+        let since = *impacted_since.get_or_insert_with(|| {
+            tracing::debug!(
+                code = warnable.code(),
+                "captive: connectivity impacted; waiting out the settle time before probing"
+            );
+            tokio::time::Instant::now()
+        });
         let due = match last_run {
-            // First pass of this episode: the settle time Go spends before its first probe —
-            // `no-derp-home`'s `TimeToVisible` (the health tracker's), then the captive loop's own
-            // `captivePortalDetectionInterval` on top.
-            None => {
-                since.elapsed()
-                    >= captive::NO_DERP_HOME_TIME_TO_VISIBLE + captive::DETECTION_INTERVAL
-            }
+            // First pass of this episode: the settle time Go spends before its first probe — the
+            // triggering warnable's `TimeToVisible` (the health tracker's), then the captive loop's
+            // own `captivePortalDetectionInterval` on top.
+            None => since.elapsed() >= warnable.settle_time(),
             // Still impacted after a pass: re-probe on the backoff.
             Some(ran) => ran.elapsed() >= captive::RECHECK_INTERVAL,
         };
@@ -236,7 +294,7 @@ pub async fn captive_portal_loop(backend: std::sync::Arc<tokio::sync::Mutex<Back
         // `Running` altogether) while we were probing, in which case Go's healthy branch owns the
         // verdict, not a stale one.
         let mut be = backend.lock().await;
-        if be.should_run_captive_portal_detection() && be.connectivity_impacted().await {
+        if be.should_run_captive_portal_detection() && be.connectivity_impacted().await.is_some() {
             be.set_captive_portal_detected(found);
         } else {
             be.set_captive_portal_detected(false);
@@ -3538,20 +3596,31 @@ impl Backend {
     /// its path — the ordinary hotel-Wi-Fi case, where a portal appears mid-session — and nothing
     /// else.
     ///
-    /// This daemon has no health tracker, so the "some warnable impacts connectivity" half is read off
-    /// the one connectivity fact the engine does publish: the net-report
-    /// ([`netcheck`](tailscale::Device::netcheck)) has no reachable DERP region. That is precisely
-    /// what Go turns into `no-derp-home` (`health/warnings.go`: *"Tailscale could not connect to any
-    /// relay server"*, `ImpactsConnectivity: true`) — the warnable that actually fires when a portal
-    /// swallows a live node's traffic, since the portal answers the DERP connections instead of the
-    /// relay. The daemon's own state machine cannot supply this: the engine keeps publishing
-    /// `DeviceState::Running` once its netmap stream has attached, so a mid-session portal never
-    /// shows up as a state change.
+    /// This daemon has no health tracker, so [`captive::ConnectivityWarnable`] enumerates that set
+    /// instead, and this method observes each member it has substrate for:
+    ///
+    /// - `network-status` — the host has no interface that could carry Internet traffic. Go computes
+    ///   it in the link monitor (`netmon.State.AnyInterfaceUp`) and pushes it into the tracker via
+    ///   `health.Tracker.SetAnyInterfaceUp`; here the daemon's own link monitor answers the same
+    ///   question ([`linkmon::any_interface_up`]).
+    /// - `no-derp-home` — the net-report ([`netcheck`](tailscale::Device::netcheck)) names no
+    ///   reachable DERP region. That is what Go registers as `no-derp-home` (`health/warnings.go`:
+    ///   *"Tailscale could not connect to any relay server"*), and the warnable that fires when a
+    ///   portal swallows a live node's traffic, since the portal answers the DERP connections instead
+    ///   of the relay.
+    ///
+    /// Reading both matters, and not only for tidiness: the engine's net report is the node's
+    /// **last** measurement, so a path that dies under a live session keeps naming its old home
+    /// region until something re-measures. On that node `no-derp-home` says nothing is wrong while
+    /// the host has plainly lost the network — exactly the case upstream still probes, through
+    /// `network-status`. The daemon's own state machine cannot supply either: the engine keeps
+    /// publishing `DeviceState::Running` once its netmap stream has attached, so a mid-session portal
+    /// never shows up as a state change.
     ///
     /// Deliberately **not** impacted:
     /// - a node that is `Starting`/`NeedsLogin`/`Stopped`/`NoState` — upstream's loop is cancelled
     ///   outside `Running`, so a node still coming up probes zero times;
-    /// - a `Running` node with a home relay — Go's healthy branch;
+    /// - a `Running` node with a home relay and a live host network — Go's healthy branch;
     /// - a deliberately-`down` node (`want_running == false`), which
     ///   [`should_run_captive_portal_detection`](Backend::should_run_captive_portal_detection)
     ///   already excludes.
@@ -3559,37 +3628,41 @@ impl Backend {
     /// The net-report read is an engine actor round-trip made under the backend lock, so it is
     /// bounded by [`STATUS_QUERY_TIMEOUT`] exactly like [`status`](Backend::status)'s netmap query,
     /// and is only ever issued in `Running` (where the control runner is past its auth loop and
-    /// answers its mailbox). A timeout or engine error reports *not* impacted: an unreadable signal is
-    /// not evidence of a broken path, and the next tick asks again.
-    async fn connectivity_impacted(&self) -> bool {
+    /// answers its mailbox). The interface enumeration beside it is the same cheap `if_addrs` call
+    /// the link monitor already makes every [`linkmon::POLL_INTERVAL`], with no engine involved. A
+    /// timeout, an engine error or a failed enumeration leaves that signal *unknown*, which never
+    /// makes the node impacted: an unreadable signal is not evidence of a broken path, and the next
+    /// tick asks again.
+    async fn connectivity_impacted(&self) -> Option<captive::ConnectivityWarnable> {
         if !self.prefs.want_running {
-            return false;
+            return None;
         }
         let state = match self.device.as_ref() {
             Some(dev) => state_from_device(dev.device_state()).0,
             // No engine at all: not `Running`, so upstream's loop would not be alive here.
             None => self.derive_state(false),
         };
-        // Ask the engine only in `Running` — the one state where the answer can change the verdict,
-        // and the one state where the control runner is past its auth-retry loop and answering its
-        // mailbox (see `status`'s note on why it does the same).
-        let derp_home = match (state, self.device.as_ref()) {
-            (State::Running, Some(dev)) => {
-                match tokio::time::timeout(STATUS_QUERY_TIMEOUT, dev.netcheck()).await {
-                    Ok(Ok(report)) => report.preferred_derp.is_some(),
+        // Observe only in `Running` — the one state where the answers can change the verdict, and the
+        // one state where the control runner is past its auth-retry loop and answering its mailbox
+        // (see `status`'s note on why it does the same).
+        let health = match (state, self.device.as_ref()) {
+            (State::Running, Some(dev)) => ConnectivityHealth {
+                any_interface_up: linkmon::any_interface_up(),
+                derp_home: match tokio::time::timeout(STATUS_QUERY_TIMEOUT, dev.netcheck()).await {
+                    Ok(Ok(report)) => Some(report.preferred_derp.is_some()),
                     Ok(Err(e)) => {
-                        tracing::debug!(error = %e, "captive: no net report; not probing this tick");
-                        true
+                        tracing::debug!(error = %e, "captive: no net report; relay health unknown");
+                        None
                     }
                     Err(_) => {
-                        tracing::debug!("captive: net report timed out; not probing this tick");
-                        true
+                        tracing::debug!("captive: net report timed out; relay health unknown");
+                        None
                     }
-                }
-            }
-            _ => true,
+                },
+            },
+            _ => ConnectivityHealth::UNKNOWN,
         };
-        connectivity_impacted_from(state, derp_home)
+        connectivity_impacted_from(state, health)
     }
 
     /// Record the verdict of a captive-portal detection pass (Go's
@@ -4476,8 +4549,9 @@ mod tests {
             !be.should_run_captive_portal_detection(),
             "a node that does not want to be running must never probe"
         );
-        assert!(
-            !be.connectivity_impacted().await,
+        assert_eq!(
+            be.connectivity_impacted().await,
+            None,
             "a deliberately-down node is not 'impacted'; it is doing what was asked"
         );
 
@@ -4485,19 +4559,30 @@ mod tests {
         assert!(be.should_run_captive_portal_detection());
     }
 
+    /// A `ConnectivityHealth` with every signal observed: `true` = healthy, `false` = the warnable
+    /// that watches it is unhealthy.
+    fn health(any_interface_up: bool, derp_home: bool) -> ConnectivityHealth {
+        ConnectivityHealth {
+            any_interface_up: Some(any_interface_up),
+            derp_home: Some(derp_home),
+        }
+    }
+
     #[test]
     fn captive_detection_triggers_in_the_state_go_triggers_it_in() {
         // Go starts `checkCaptivePortalLoop` on entry to `ipn.Running` and cancels it on the way out
         // (`ipn/ipnlocal/local.go`, `enterStateLocked`), then probes only while a warnable that
-        // impacts connectivity is unhealthy — here, no reachable relay (`no-derp-home`). So the one
-        // node that probes is the connected one that lost its path.
-        assert!(
-            connectivity_impacted_from(State::Running, false),
+        // impacts connectivity is unhealthy. So the one node that probes is the connected one that
+        // lost its path.
+        assert_eq!(
+            connectivity_impacted_from(State::Running, health(true, false)),
+            Some(captive::ConnectivityWarnable::NoDerpHome),
             "a Running node with no reachable relay is exactly what Go probes: a portal appeared \
              under a live session"
         );
-        assert!(
-            !connectivity_impacted_from(State::Running, true),
+        assert_eq!(
+            connectivity_impacted_from(State::Running, health(true, true)),
+            None,
             "a Running node that reaches a relay is healthy; Go's healthy branch clears the warning"
         );
         for state in [
@@ -4508,12 +4593,84 @@ mod tests {
             State::Starting,
             State::Stopped,
         ] {
-            assert!(
-                !connectivity_impacted_from(state, false),
-                "{}: upstream's loop is cancelled outside Running, so this state probes zero times",
+            assert_eq!(
+                connectivity_impacted_from(state, health(false, false)),
+                None,
+                "{}: upstream's loop is cancelled outside Running, so this state probes zero times \
+                 however broken the network is",
                 state.as_str()
             );
         }
+    }
+
+    #[test]
+    fn captive_detection_triggers_on_any_connectivity_warnable_not_only_no_derp_home() {
+        // Go walks the whole health tracker: `for _, w := range state.Warnings { if
+        // w.ImpactsConnectivity && w.WarnableCode != captivePortalWarnable.Code }`
+        // (feature/captiveportal/captiveportal.go, `Extension.onHealthChange`). `no-derp-home` is one
+        // member of that set, not the set.
+        //
+        // The case that makes this more than tidiness: the engine's net report is the node's LAST
+        // measurement, so a host that loses the network mid-session keeps naming the home region it
+        // measured before. `no-derp-home` then says nothing is wrong while the host has no usable
+        // interface at all — and that node is one upstream probes, via `network-status`.
+        assert_eq!(
+            connectivity_impacted_from(State::Running, health(false, true)),
+            Some(captive::ConnectivityWarnable::NetworkStatus),
+            "a Running node whose host network is down is impacted even while the stale net report \
+             still names a home relay"
+        );
+
+        // Both unhealthy: the one that becomes visible soonest is the one whose settle time the loop
+        // owes, which is the health change that would have reached Go's loop first.
+        assert_eq!(
+            connectivity_impacted_from(State::Running, health(false, false)),
+            Some(captive::ConnectivityWarnable::NetworkStatus),
+            "network-status becomes visible in 5s and no-derp-home in 10s, so the first probe of \
+             this episode is owed the shorter wait"
+        );
+
+        // An unobserved signal is not an unhealthy one. Go's tracker only raises
+        // `NetworkStatusWarnable` for an `anyInterfaceUp` it was actually told about, and a net
+        // report the engine could not produce says nothing about the relay.
+        assert_eq!(
+            connectivity_impacted_from(State::Running, ConnectivityHealth::UNKNOWN),
+            None,
+            "signals we could not read are unknown, not broken; an unreadable signal must never \
+             raise a captive-portal probe"
+        );
+        assert_eq!(
+            connectivity_impacted_from(
+                State::Running,
+                ConnectivityHealth {
+                    any_interface_up: Some(false),
+                    derp_home: None,
+                },
+            ),
+            Some(captive::ConnectivityWarnable::NetworkStatus),
+            "one observed-unhealthy signal is enough, whatever the others could not tell us"
+        );
+    }
+
+    #[test]
+    fn each_connectivity_warnable_carries_gos_settle_time() {
+        // The first pass of an episode waits the triggering warnable's own `TimeToVisible` plus Go's
+        // `captivePortalDetectionInterval` — per warnable, because upstream hears about a warnable
+        // only once the tracker makes it visible, and the two do not become visible at the same time
+        // (health/warnings.go: `network-status` 5s, `no-derp-home` 10s).
+        use captive::ConnectivityWarnable::{NetworkStatus, NoDerpHome};
+        assert_eq!(NetworkStatus.code(), "network-status");
+        assert_eq!(NoDerpHome.code(), "no-derp-home");
+        assert_eq!(
+            NetworkStatus.settle_time(),
+            std::time::Duration::from_secs(7),
+            "network-status: 5s TimeToVisible + Go's 2s detection interval"
+        );
+        assert_eq!(
+            NoDerpHome.settle_time(),
+            std::time::Duration::from_secs(12),
+            "no-derp-home: 10s TimeToVisible + Go's 2s detection interval"
+        );
     }
 
     #[tokio::test]
@@ -4531,8 +4688,9 @@ mod tests {
             State::Running,
             "no device installed, so the node cannot be Running"
         );
-        assert!(
-            !be.connectivity_impacted().await,
+        assert_eq!(
+            be.connectivity_impacted().await,
+            None,
             "a node still coming up is not the node upstream probes"
         );
     }
