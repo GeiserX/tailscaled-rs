@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.55.11](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.10...v0.55.11) (2026-09-10)
+
+
+### Bug Fixes
+
+* **cert:** restore Go's cert usage hint wording and line placement ([#406](https://github.com/GeiserX/tailscaled-rs/issues/406)) ([1f4f61e](https://github.com/GeiserX/tailscaled-rs/commit/1f4f61ec66f8c245590ad3a9865f696ae5851ace))
+
 ## [0.55.10](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.9...v0.55.10) (2026-09-09)
 
 
