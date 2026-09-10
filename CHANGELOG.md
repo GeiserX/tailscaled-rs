@@ -25,6 +25,14 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.55.12](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.11...v0.55.12) (2026-09-10)
+
+
+### Bug Fixes
+
+* **captive:** a down link's leftover address is not a live network ([#414](https://github.com/GeiserX/tailscaled-rs/issues/414)) ([3508d32](https://github.com/GeiserX/tailscaled-rs/commit/3508d327c1693cf9e1ebe148bb909edc65250ce8))
+* **captive:** probe the node whose host network died, not only its relay ([#411](https://github.com/GeiserX/tailscaled-rs/issues/411)) ([3b13091](https://github.com/GeiserX/tailscaled-rs/commit/3b13091fc2de711c929d95f935cf91890f3d4ab3))
+
 ## [0.55.11](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.10...v0.55.11) (2026-09-10)
 
 
