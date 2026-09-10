@@ -214,7 +214,9 @@ fn connectivity_impacted_from(
 /// [`DETECTION_INTERVAL`](captive::DETECTION_INTERVAL). Upstream spends both: its health tracker only
 /// makes a warnable visible after the former, and its captive loop then spends the latter on its
 /// timer before probing. The sum is why a node whose first DERP measurement is merely still in flight
-/// does not probe on every bring-up.
+/// does not probe on every bring-up. The wait is measured from the moment *that* warnable became the
+/// unhealthy one, so a warnable taking over mid-episode gets its own wait rather than inheriting the
+/// previous one's clock ([`captive::EpisodeTimer`]).
 ///
 /// While connectivity stays impacted the pass repeats every
 /// [`RECHECK_INTERVAL`](captive::RECHECK_INTERVAL). Go instead re-arms its 2s timer off health-tracker
@@ -229,12 +231,11 @@ fn connectivity_impacted_from(
 /// probe can never head-of-line block a concurrent `status`/`up`/`down`. The lock is retaken only to
 /// read the gate and to write the verdict.
 pub async fn captive_portal_loop(backend: std::sync::Arc<tokio::sync::Mutex<Backend>>) {
-    // When the last pass ran, so the recheck backoff is measured from the probe, not from the tick.
-    let mut last_run: Option<tokio::time::Instant> = None;
-    // When connectivity first became impacted in the current unhealthy episode, so the FIRST pass
-    // honours Go's `captivePortalDetectionInterval`. Cleared whenever connectivity recovers, so a
-    // later episode waits out the interval again rather than probing instantly.
-    let mut impacted_since: Option<tokio::time::Instant> = None;
+    // The episode's schedule: which warnable is being waited out and since when, plus when this
+    // episode last probed. Cleared whenever connectivity recovers, so a later episode waits out the
+    // settle time again rather than probing instantly. See [`captive::EpisodeTimer`] for why the
+    // wait is bound to the warnable rather than to the episode.
+    let mut timer = captive::EpisodeTimer::default();
 
     loop {
         tokio::time::sleep(captive::POLL_INTERVAL).await;
@@ -259,30 +260,13 @@ pub async fn captive_portal_loop(backend: std::sync::Arc<tokio::sync::Mutex<Back
         };
 
         let Some(warnable) = impacted else {
-            impacted_since = None;
-            last_run = None;
+            timer.recovered();
             continue;
         };
 
-        let since = *impacted_since.get_or_insert_with(|| {
-            tracing::debug!(
-                code = warnable.code(),
-                "captive: connectivity impacted; waiting out the settle time before probing"
-            );
-            tokio::time::Instant::now()
-        });
-        let due = match last_run {
-            // First pass of this episode: the settle time Go spends before its first probe — the
-            // triggering warnable's `TimeToVisible` (the health tracker's), then the captive loop's
-            // own `captivePortalDetectionInterval` on top.
-            None => since.elapsed() >= warnable.settle_time(),
-            // Still impacted after a pass: re-probe on the backoff.
-            Some(ran) => ran.elapsed() >= captive::RECHECK_INTERVAL,
-        };
-        if !due {
+        if !timer.probe_due(warnable, tokio::time::Instant::now()) {
             continue;
         }
-        last_run = Some(tokio::time::Instant::now());
 
         // OFF-LOCK. The endpoint set is empty because the engine exposes no DERP map to the daemon —
         // see `captive`'s module docs and engine ask #33; `available_endpoints` then yields the two

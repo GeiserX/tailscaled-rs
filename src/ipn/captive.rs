@@ -191,6 +191,78 @@ pub(super) const RECHECK_INTERVAL: Duration = Duration::from_secs(30);
 /// enough to honour [`DETECTION_INTERVAL`] without a timer per state edge.
 pub(super) const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// When the next detection pass of an unhealthy episode is due — the schedule half of
+/// [`captive_portal_loop`](super::captive_portal_loop), split out so it is a pure decision a test
+/// can drive at any instant instead of a shape only a live loop can reach.
+///
+/// The wait is bound to **the warnable being waited out**, not to the episode. Go's warnables become
+/// visible on their own clocks (`network-status` after 5s, `no-derp-home` after 10s;
+/// health/warnings.go), so time that passed while one of them was unhealthy is not a wait the other
+/// has served. A node whose relay went quiet at t=0 and whose host network then died at t=6 must
+/// still owe `network-status` its own [`settle_time`](ConnectivityWarnable::settle_time) from t=6 —
+/// where an episode-scoped clock would have it probing at t=7, one second after the condition it is
+/// probing about began. Upstream cannot make that mistake: each warnable is timed from its own
+/// onset, and a warnable that recovers before it becomes visible never reaches the loop at all. So
+/// the wait here restarts whenever the warnable changes.
+///
+/// The recheck backoff is episode-scoped on purpose, and is not restarted the same way: once a pass
+/// has run, what governs the next one is [`RECHECK_INTERVAL`] since that pass. Go is in the same
+/// position — after its first probe it is on a timer, not on a fresh visibility wait — and a
+/// warnable that changes under an already-probing episode is not new evidence worth a new probe.
+#[derive(Debug, Default)]
+pub(super) struct EpisodeTimer {
+    /// The warnable currently being waited out and when it became the reported one. `None` between
+    /// episodes.
+    impacted: Option<(ConnectivityWarnable, tokio::time::Instant)>,
+    /// When this episode last probed. `None` until its first pass — which is exactly what makes that
+    /// pass owe the settle time rather than the recheck backoff.
+    last_run: Option<tokio::time::Instant>,
+}
+
+impl EpisodeTimer {
+    /// Connectivity is healthy: the episode is over. A later one waits out its settle time from
+    /// scratch rather than probing instantly on the strength of this one's clock.
+    pub(super) fn recovered(&mut self) {
+        self.impacted = None;
+        self.last_run = None;
+    }
+
+    /// Whether a detection pass is due at `now`, given the warnable that is unhealthy. Records the
+    /// pass when it answers `true`, so a caller must probe exactly when it does.
+    pub(super) fn probe_due(
+        &mut self,
+        warnable: ConnectivityWarnable,
+        now: tokio::time::Instant,
+    ) -> bool {
+        let since = match self.impacted {
+            Some((waiting_on, since)) if waiting_on == warnable => since,
+            // A new episode, or a different warnable took over inside one. Either way the wait
+            // starts now, because it is THIS warnable's onset that the settle time is measured from.
+            _ => {
+                tracing::debug!(
+                    code = warnable.code(),
+                    settle_secs = warnable.settle_time().as_secs(),
+                    "captive: connectivity impacted; waiting out the settle time before probing"
+                );
+                self.impacted = Some((warnable, now));
+                now
+            }
+        };
+        let due = match self.last_run {
+            // First pass of this episode: the settle time Go spends before its first probe — the
+            // triggering warnable's `TimeToVisible` (the health tracker's), then the captive loop's
+            // own `captivePortalDetectionInterval` on top.
+            None => now.duration_since(since) >= warnable.settle_time(),
+            // Still impacted after a pass: re-probe on the backoff, measured from the probe.
+            Some(ran) => now.duration_since(ran) >= RECHECK_INTERVAL,
+        };
+        if due {
+            self.last_run = Some(now);
+        }
+        due
+    }
+}
+
 /// Where an [`Endpoint`] came from (Go `captivedetection.EndpointProvider`). The declaration order
 /// **is** the preference order: [`available_endpoints`] sorts on it, so a DERP node in the node's own
 /// preferred region is probed before a DERP node elsewhere, which is probed before the generic
@@ -1275,6 +1347,92 @@ mod tests {
             ),
         );
         assert!(!seen.into_inner().unwrap().wants_body);
+    }
+
+    // --- the episode timer: which warnable's clock the first probe of an episode owes -----------
+
+    /// Drive [`EpisodeTimer`] at a fabricated instant: `probe_due` takes the clock as an argument,
+    /// so the whole schedule is exercised without sleeping or a paused runtime.
+    fn at(base: tokio::time::Instant, secs: u64) -> tokio::time::Instant {
+        base + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn the_settle_wait_belongs_to_the_warnable_that_started_it() {
+        use ConnectivityWarnable::{NetworkStatus, NoDerpHome};
+        let t = tokio::time::Instant::now();
+        let mut timer = EpisodeTimer::default();
+
+        // The relay goes quiet at t+0. `no-derp-home` owes 12s (10s TimeToVisible + 2s).
+        assert!(!timer.probe_due(NoDerpHome, at(t, 0)));
+        assert!(!timer.probe_due(NoDerpHome, at(t, 6)));
+
+        // At t+6 the host network dies too, and `network-status` — visible in 5s, so owed 7s — is
+        // the warnable now reported. Its condition is six seconds younger than the episode.
+        assert!(!timer.probe_due(NetworkStatus, at(t, 6)));
+        assert!(
+            !timer.probe_due(NetworkStatus, at(t, 7)),
+            "seven seconds into the EPISODE is one second into network-status: the elapsed time \
+             belongs to the warnable that spent it, and probing here would probe a condition that \
+             has not yet lasted long enough for Go's tracker to show it at all"
+        );
+        assert!(!timer.probe_due(NetworkStatus, at(t, 12)));
+        assert!(
+            timer.probe_due(NetworkStatus, at(t, 13)),
+            "seven seconds after ITS onset, network-status has served its own wait"
+        );
+    }
+
+    #[test]
+    fn an_unchanging_warnable_probes_once_its_settle_time_is_served() {
+        use ConnectivityWarnable::NoDerpHome;
+        let t = tokio::time::Instant::now();
+        let mut timer = EpisodeTimer::default();
+
+        assert!(!timer.probe_due(NoDerpHome, at(t, 0)));
+        assert!(
+            !timer.probe_due(NoDerpHome, at(t, 11)),
+            "11s: `no-derp-home` is visible at 10s and the loop then spends its own 2s"
+        );
+        assert!(timer.probe_due(NoDerpHome, at(t, 12)));
+
+        // Past the first pass the episode is on the recheck backoff, measured from that pass.
+        assert!(!timer.probe_due(NoDerpHome, at(t, 41)));
+        assert!(timer.probe_due(NoDerpHome, at(t, 42)));
+    }
+
+    #[test]
+    fn a_warnable_change_after_a_pass_does_not_re_probe_early() {
+        use ConnectivityWarnable::{NetworkStatus, NoDerpHome};
+        let t = tokio::time::Instant::now();
+        let mut timer = EpisodeTimer::default();
+
+        assert!(!timer.probe_due(NetworkStatus, at(t, 0)));
+        assert!(timer.probe_due(NetworkStatus, at(t, 7)), "its settle time");
+
+        // The network comes back but the relay is still unreachable: a different warnable, inside an
+        // episode that has already probed. What governs the next pass is the backoff since that
+        // probe — a fresh settle wait here would let a flapping pair probe far more often than Go's
+        // loop, which is on a timer once it has started.
+        assert!(!timer.probe_due(NoDerpHome, at(t, 8)));
+        assert!(!timer.probe_due(NoDerpHome, at(t, 36)));
+        assert!(timer.probe_due(NoDerpHome, at(t, 37)), "30s after the pass");
+    }
+
+    #[test]
+    fn recovery_ends_the_episode_and_the_next_one_waits_again() {
+        use ConnectivityWarnable::NetworkStatus;
+        let t = tokio::time::Instant::now();
+        let mut timer = EpisodeTimer::default();
+
+        assert!(!timer.probe_due(NetworkStatus, at(t, 0)));
+        timer.recovered();
+        assert!(
+            !timer.probe_due(NetworkStatus, at(t, 6)),
+            "a healthy poll ended the episode, so the next one starts its own wait: six seconds of \
+             the old episode do not carry over"
+        );
+        assert!(timer.probe_due(NetworkStatus, at(t, 13)));
     }
 
     #[test]
