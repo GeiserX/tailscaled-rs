@@ -1673,3 +1673,169 @@ nickname restores the account name instead of falling back to the id; `ProfileEn
 `Account` column Go prints. No command line changes. The deviation notes on `rename_current_profile`
 and the `clearing_the_nickname_blanks_the_name_and_cannot_restore_a_login_name` test
 (`src/ipn/mod.rs`) are what retire when it does. Consumed via a pin bump. — daemon lane
+
+## 43. A c2n request hook — so control can ask this node for something (Go `ipn/ipnlocal/c2n.go`)
+
+**Why:** control-to-node ("c2n") is the mechanism by which an admin console *acts on* a node rather
+than merely reading about it, and a node built on this stack can answer exactly the two paths the
+engine hardcodes. Upstream registers around twenty handlers on it: `/echo`, `POST /logtail/flush`, `POST /sockstats`, the `/debug/*` family and
+`POST /netfilter-kind` in `ipn/ipnlocal/c2n.go` itself, plus `GET`+`POST /update`
+(`feature/clientupdate/clientupdate.go`), `GET /posture/identity` (`feature/posture/posture.go`),
+`GET /appconnector/routes` (`feature/appconnectors/appconnectors.go`), `POST /wol`
+(`feature/wakeonlan/wakeonlan.go`), `GET /vip-services` (`ipn/ipnlocal/serve.go`),
+`GET /tls-cert-status` (`ipn/ipnlocal/cert.go`) and `/ssh/usernames` (`ssh/tailssh/tailssh.go`).
+
+The absence is already documented here three times, one symptom at a time, without the cause being
+named: `Prefs::posture_checking` (`src/prefs.rs`) records that posture is a c2n *pull* nothing
+answers, so the pref's on-the-wire behaviour is byte-for-byte the disabled case;
+`Prefs::auto_update_apply` records that the node advertises `Hostinfo.AllowsUpdate` while nothing
+here acts on a trigger; and ask #39's app-connector readback is the LocalAPI half of a readback
+control performs over `GET /appconnector/routes`. Three reductions, one missing mechanism.
+
+How the request arrives, at upstream `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8` (v1.102.4):
+
+1. Control puts a `PingRequest` with `Types: ["c2n"]` into a `MapResponse`. Its `Payload` is a whole
+   serialized HTTP/1 request; `URL` is where the answer goes, over noise (`URLIsNoise`).
+2. The node parses that payload as an HTTP request, serves it locally, records the entire HTTP
+   *response*, and POSTs it as the body of a request to `PingRequest.URL`
+   (`feature/c2n/c2n.go` `answerC2NPing`, reached from `control/controlclient/direct.go`).
+3. Dispatch (`LocalBackend.handleC2N`) tries method+path, then path alone, then registered prefixes.
+   A path it knows under a method it does not gets `405 bad method`; anything else gets
+   `400 unknown c2n path`.
+
+Verified at pin `9d847a6e`/v0.43.0: **the engine already does all three steps, and its dispatch table
+is a hardcoded `match` with no way in.** `handle_ping` (`ts_control/src/tokio/ping.rs`) parses the
+c2n payload, answers `/echo` and `GET /vip-services` out of `Config`, returns
+`HTTP/1.1 400 Bad Request` + `unknown c2n path` for everything else, and POSTs the response back;
+`PingType::C2N` and `MapResponse::ping_request` are already modelled in `ts_control_serde`. So this
+is not an ask to build c2n. It is one hole in a dispatcher that already runs.
+
+The daemon cannot fill it from outside, which is why this is an engine ask and not a bead: the
+request arrives inside the control noise session, `handle_ping` is awaited inline in the control
+runner's map-poll frame loop (`ts_control/src/tokio/client.rs`), and the daemon holds a
+`tailscale::Device` — not the runner, not the session. A handler the engine will not dispatch to
+cannot be served, whichever side writes it. Equally, the engine cannot simply implement the handlers
+itself: the answers for the paths this fork wants are *daemon* state (prefs, serve config, posture),
+which is why the minimum useful primitive is a registration hook and not more engine-side handlers.
+
+**Ask (either shape; (a) is the one this daemon would rather consume):**
+
+1. A request stream and a responder, mirroring the `watch_ipn_bus` surface the daemon already runs a
+   task against:
+
+```rust
+pub async fn watch_c2n(&self) -> Result<C2nRequests, Error>;
+
+impl C2nRequests {
+    /// The next c2n request control sent that the engine did not answer itself. `None` once the
+    /// runtime is shutting down — the same end-of-stream signal `IpnBusWatcher::next` gives.
+    pub async fn next(&mut self) -> Option<(C2nRequest, C2nResponder)>;
+}
+
+pub struct C2nRequest {
+    pub method: String,                     // "GET", "POST": Go keys its table on method AND path
+    pub path: String,                       // URL path, no query string
+    pub query: String,                      // raw query; Go's handlers read it with r.FormValue
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+    /// How long the engine will wait for `respond` before answering for itself. Go's
+    /// `C2n-Handler-Timeout` request header, default one minute (`feature/c2n/c2n.go`).
+    pub timeout: Duration,
+}
+
+pub struct C2nResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl C2nResponder {
+    /// Answer this request; the engine serializes the HTTP response and POSTs it to control.
+    pub fn respond(self, res: C2nResponse);
+    /// Not ours — fall back to the engine's own refusal, so Go's two verdicts stay in one place.
+    pub fn decline(self);
+    /// Ours, but not under this method — the engine answers Go's `405 bad method`.
+    pub fn decline_method(self);
+}
+```
+
+2. Or a registered callback, if a stream is the wrong grain:
+   `Device::set_c2n_handler(Arc<dyn Fn(C2nRequest) -> BoxFuture<'static, Option<C2nResponse>> + Send + Sync>)`,
+   with `None` meaning the same as `decline`. It is the smaller surface, but it invokes daemon code
+   from inside the control runner, so a handler that wants to read `Device` state can re-enter the
+   engine; the stream shape has no such edge.
+
+Four things the shape must get right either way:
+
+- **Not on `Config`.** `ts_control::Config` derives `Clone + Serialize + Deserialize` and the daemon
+  persists prefs through it; a handler field breaks all three. The registration belongs on `Device`,
+  next to the live-set surface (ask #9).
+- **Carry the method.** The engine matches on `c2n_request.uri().path()` alone today. Go keys on
+  method+path, and the two handlers this fork wants first are `GET /update` and `POST /update` — one
+  path, two different answers, one of them a mutation. A path-only hook cannot express them.
+- **Never stall the map poll.** `handle_ping` is awaited in the frame loop that feeds the netmap, so
+  a wedged handler is a wedged control session. Bound it the way Go does — `C2n-Handler-Timeout`,
+  one minute by default, cancelled on expiry — and have the engine answer `500` itself on overrun.
+- **Keep the refusals engine-side, and make them Go's two.** Every unmatched path is
+  `400 unknown c2n path` today; Go distinguishes a known path under an unknown method (`405 bad
+  method`) from an unknown path (`400`). Once the table is dynamic the engine can no longer derive
+  that split on its own, which is what `decline` and `decline_method` above are for. Porting the
+  405 arm at the same time is the error path this ask brings with it.
+
+### The handlers this fork would answer first
+
+Two, and both turn a pref this daemon already carries into something with a wire effect:
+
+- **`GET /posture/identity`** → `tailcfg.C2NPostureIdentityResponse` (`SerialNumbers`,
+  `IfaceHardwareAddrs`, `PostureDisabled`). `Prefs::posture_checking` is persisted, threaded into
+  `Config.posture_checking` and reported by `tnet get`, and means nothing on the wire because
+  nothing answers the pull. With the hook, the `false` case becomes a real `{"PostureDisabled":
+  true}` — Go's own answer for a node that opted out, sent because the operator opted out rather
+  than because the fork is silent. The `true` case additionally needs serial-number and MAC
+  collection (Go's `posture.GetSerialNumbers` / `GetHardwareAddrs`, behind Go's `hwaddrs=true` query
+  gate); that is local OS work on the daemon side and a separate piece, so the honest first shape
+  reports what it can collect and omits what it cannot.
+- **`GET /update` and `POST /update`** → `tailcfg.C2NUpdateResponse` (`Err`, `Enabled`, `Supported`,
+  `Started`). `Prefs::auto_update_apply` already crosses the wire as `Hostinfo.AllowsUpdate`: an
+  advertisement that the console may act on this node, which nothing then honours. `Enabled` is that
+  pref (Go: `envknob.AllowsRemoteUpdate() || upPref.Apply.EqualBool(true)`). `Supported` is
+  `feature.CanAutoUpdate()` upstream and is honestly `false` here — `tnet update` is a manual,
+  operator-invoked command and there is no updater to trigger — so `POST /update` answers
+  `Err: "not supported"`, which is Go's own string for exactly that state in `handleC2NUpdatePost`,
+  not a fork invention. A node that advertises `AllowsUpdate` and then declines the trigger in
+  upstream's words is strictly better than one that advertises it and never answers at all. Running
+  an actual update from the trigger is its own piece of work.
+
+`/echo` and `GET /vip-services` need nothing from this ask: the engine answers both already, and
+should keep them — they are engine state, and `/echo` in particular is how control probes which of
+several high-availability subnet routers is alive.
+
+### The handlers it declines until they have their own security answer
+
+The `/debug/*` family — `/debug/prefs`, `/debug/metrics`, `/debug/netmap`, `/debug/health`,
+`/debug/goroutines`, `/debug/component-logging`, `/debug/logheap`, `/debug/pprof/heap`,
+`/debug/pprof/allocs` — together with `POST /sockstats`, is a **remote read of daemon internals by
+the control plane**. This fork should not start answering it on the same day it gains the ability
+to, and the hook does not require it to.
+
+Upstream's exposure is a judgement made under upstream's assumptions: the family is behind a build
+feature (`buildfeatures.HasDebug`), the prefs it serves are stripped of key material
+(`LocalBackend.Prefs()` → `sanitizedPrefsLocked` → `stripKeysFromPrefs`), and only two pprof
+profiles are registered, "for security" in the source's own words. This fork's assumptions are
+written down and are weaker: `docs/THREAT_MODEL.md` §3 lists a malicious or compromised control
+plane as adversary **(d)**, and §5.4 records that it is **not** mitigated, because Tailnet Lock is
+inert here. Handing (d) a goroutine dump, a heap profile, the full netmap, or `Prefs` — which
+carries `operator_user`, `taildrop_dir` and `control_url`, an OS account name and local filesystem
+paths — is a new capability for the one adversary this fork cannot refuse, in exchange for no
+feature it has. Each of those paths is therefore its own decision, with its own threat-model
+paragraph, taken after the hook exists rather than bundled into it.
+
+The rest are declined for plainer reasons: `POST /logtail/flush` (no logtail client here),
+`POST /netfilter-kind` (no netfilter layer at all — ask #21, bead `tsd-m8s`),
+`GET /appconnector/routes` (the c2n half of ask #39, and blocked on the route learning that ask
+asks for), `POST /wol`, `/ssh/usernames` and `GET /tls-cert-status`.
+
+**Daemon impact once landed:** one `watch_c2n` task in the daemon's IPN layer with a method+path
+dispatch of its own, and the two handlers above, reading prefs the daemon already holds. The
+reduction notes on `Prefs::posture_checking` and `Prefs::auto_update_apply` (`src/prefs.rs`) are
+what retire when it does; until then they point here. Consumed via a pin bump. — engine lane
