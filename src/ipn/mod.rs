@@ -82,6 +82,7 @@ pub mod install;
 pub(crate) mod linkmon;
 mod profile;
 mod revert_guard;
+pub mod selfupdate;
 pub mod serve;
 mod state;
 pub mod syspolicy;
@@ -2392,6 +2393,19 @@ impl Backend {
         if let Some(Some(sel)) = opts.exit_node.as_ref() {
             validate_exit_node_selector(Some(sel))?;
         }
+        // Refuse an auto-update OPT-IN this installation could never honour (Go
+        // `checkAutoUpdatePrefsLocked`, the fifth child of `checkPrefsLocked` — which in Go guards
+        // every prefs write, so the same rule `check_prefs` reports on the dry-run path has to fire
+        // on the real one). `--auto-update` is not a local preference: the engine advertises it as
+        // `Hostinfo.AllowsUpdate` on registration and on every map request, so setting it tells the
+        // tailnet admin that a remote update trigger will be honoured. Same "before a single pref is
+        // mutated" discipline as the checks above — a refused `set` leaves prefs.json untouched.
+        if let Some(e) = selfupdate::check_auto_update_pref(
+            opts.auto_update,
+            selfupdate::auto_update_refusal().as_deref(),
+        ) {
+            return Err(anyhow!(e));
+        }
 
         // The login-profile rename `--nickname` owes beyond the pref (see the `opts.nickname` arm
         // below): captured here as `Some(name)` / `Some(cleared)` and applied after the prefs persist.
@@ -3927,15 +3941,18 @@ impl Backend {
     /// conflict** — cannot use an exit node and advertise as one simultaneously (Go
     /// `checkExitNodePrefsLocked`); (3) every advertised route is a masked CIDR (Go
     /// `checkAdvertiseRoutes`); (4) SSH-server enable requires the `ssh` build feature (the local
-    /// analogue of Go's `checkSSHPrefsLocked` capability gate — a faithful, build-time check). Go's
-    /// operator/auto-update/profile-name/config-lock/Funnel-shields rules reference prefs this fork
-    /// does not model, so they are correctly N/A.
+    /// analogue of Go's `checkSSHPrefsLocked` capability gate — a faithful, build-time check);
+    /// (5) an auto-update **opt-in** requires an installation that can replace its own binary (Go
+    /// `checkAutoUpdatePrefsLocked` → `feature.CanAutoUpdate()`, decided here by
+    /// [`selfupdate::auto_update_refusal`]). Go's operator/profile-name/config-lock/Funnel-shields
+    /// rules reference prefs this fork does not model, so they are correctly N/A.
     pub fn check_prefs(
         &self,
         exit_node: Option<Option<String>>,
         advertise_exit_node: Option<bool>,
         advertise_routes: Option<Vec<String>>,
         ssh: Option<bool>,
+        auto_update: Option<bool>,
     ) -> Result<()> {
         // Compose the prospective posture: the named override wins, else the current pref.
         let prospective_exit_node = match &exit_node {
@@ -3948,6 +3965,10 @@ impl Backend {
             .clone()
             .unwrap_or_else(|| self.prefs.advertise_routes.clone());
         let prospective_ssh = ssh.unwrap_or(self.prefs.ssh_enabled);
+        let prospective_auto_update = match auto_update {
+            Some(v) => Some(v),
+            None => self.prefs.auto_update_apply,
+        };
 
         let mut errors: Vec<String> = Vec::new();
 
@@ -3984,6 +4005,17 @@ impl Backend {
                  feature."
                     .into(),
             );
+        }
+
+        // (5) an auto-update opt-in on an installation that can never apply one (Go
+        // `checkAutoUpdatePrefsLocked`). `AutoUpdate.Apply` is advertised to control as
+        // `Hostinfo.AllowsUpdate`, so accepting it here would let the node tell the tailnet admin
+        // that a remote update trigger will be honoured when nothing could honour it.
+        if let Some(e) = selfupdate::check_auto_update_pref(
+            prospective_auto_update,
+            selfupdate::auto_update_refusal().as_deref(),
+        ) {
+            errors.push(e);
         }
 
         if errors.is_empty() {
@@ -4715,14 +4747,26 @@ mod tests {
 
         // Clean prospective change → Ok.
         assert!(
-            be.check_prefs(Some(Some("100.64.0.9".into())), Some(false), None, None)
-                .is_ok(),
+            be.check_prefs(
+                Some(Some("100.64.0.9".into())),
+                Some(false),
+                None,
+                None,
+                None
+            )
+            .is_ok(),
             "a concrete exit node with advertise-exit off is valid"
         );
 
         // Exit-node-vs-advertise conflict → error naming the Go message.
         let err = be
-            .check_prefs(Some(Some("100.64.0.9".into())), Some(true), None, None)
+            .check_prefs(
+                Some(Some("100.64.0.9".into())),
+                Some(true),
+                None,
+                None,
+                None,
+            )
             .expect_err("using + advertising an exit node must conflict");
         assert!(
             err.to_string()
@@ -4732,7 +4776,7 @@ mod tests {
 
         // An unmasked advertised route → error naming the masked form.
         let err = be
-            .check_prefs(None, None, Some(vec!["10.0.0.5/24".into()]), None)
+            .check_prefs(None, None, Some(vec!["10.0.0.5/24".into()]), None, None)
             .expect_err("an unmasked CIDR must be rejected");
         assert!(
             err.to_string().contains("has non-address bits set")
@@ -4742,9 +4786,34 @@ mod tests {
 
         // `auto:` exit node → rejected (reuses the bring-up validator).
         assert!(
-            be.check_prefs(Some(Some("auto:any".into())), None, None, None)
+            be.check_prefs(Some(Some("auto:any".into())), None, None, None, None)
                 .is_err(),
             "auto: exit-node selection is not supported"
+        );
+
+        // An auto-update OPT-IN is refused on an installation that could never apply an update (Go
+        // `checkAutoUpdatePrefsLocked`), and a DECLINE is legal everywhere. Which branch this host
+        // takes is a property of the host, so assert against the same predicate the rule consults;
+        // the rule's own two outcomes are pinned, host-independently, in `ipn::selfupdate`'s tests.
+        let opt_in = be.check_prefs(None, None, None, None, Some(true));
+        match selfupdate::auto_update_refusal() {
+            None => assert!(
+                opt_in.is_ok(),
+                "this installation can replace its own binary, so opting in is valid: {opt_in:?}"
+            ),
+            Some(_) => {
+                let err = opt_in.expect_err("an installation that can never update must refuse");
+                let msg = format!("{err:#}");
+                assert!(msg.contains("Auto-updates are not supported"), "got {msg}");
+                assert!(
+                    msg.contains("Hostinfo.AllowsUpdate"),
+                    "the refusal must say what the pref claims to the tailnet: {msg}"
+                );
+            }
+        }
+        assert!(
+            be.check_prefs(None, None, None, None, Some(false)).is_ok(),
+            "declining auto-update is legal on every installation"
         );
 
         // The check must not have persisted or mutated prefs — the backend's exit_node is still unset.
@@ -7492,6 +7561,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_auto_update_opt_in_needs_an_installation_that_can_update() {
+        // Go `checkAutoUpdatePrefsLocked` on the WRITE path. `AutoUpdate.Apply` is not a local
+        // preference: the engine advertises it as `Hostinfo.AllowsUpdate` on registration and on
+        // every map request, so opting in tells the tailnet admin a remote update trigger will be
+        // honoured. A node whose binary can never be replaced must not be allowed to say that.
+        //
+        // Whether THIS host can update is a host property, so the test asks the same predicate
+        // `begin_set` consults and checks the branch that applies — both branches assert durable
+        // state, and the rule's own two outcomes are pinned host-independently in `ipn::selfupdate`.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-set-autoupdate-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+
+        let opt_in = be
+            .begin_set(SetOptions {
+                auto_update: Some(true),
+                ..SetOptions::default()
+            })
+            .await;
+        match selfupdate::auto_update_refusal() {
+            None => {
+                opt_in.expect("an installation that can replace its own binary may opt in");
+                assert_eq!(be.prefs.auto_update_apply, Some(true));
+            }
+            Some(_) => {
+                let err = opt_in.expect_err(
+                    "opting in on an installation that can never apply an update must be refused",
+                );
+                let msg = format!("{err:#}");
+                assert!(msg.contains("Auto-updates are not supported"), "got {msg}");
+                assert!(
+                    msg.contains("Hostinfo.AllowsUpdate"),
+                    "the refusal must say what the pref claims to the tailnet: {msg}"
+                );
+                // Refused BEFORE a single pref is mutated or persisted — a rejected `set` must not
+                // leave prefs.json carrying the claim it just refused.
+                assert_eq!(
+                    be.prefs.auto_update_apply, None,
+                    "a refused set must leave the pref never-stated"
+                );
+                assert!(
+                    !tokio::fs::try_exists(&be.prefs_path).await.unwrap(),
+                    "a refused set must not have persisted anything"
+                );
+            }
+        }
+
+        // Declining, and never stating one, are legal on every installation — neither claims
+        // anything to the tailnet (Go acts on `Apply.EqualBool(true)` alone).
+        be.begin_set(SetOptions {
+            auto_update: Some(false),
+            ..SetOptions::default()
+        })
+        .await
+        .expect("declining auto-update is legal on every installation");
+        assert_eq!(be.prefs.auto_update_apply, Some(false));
+        be.begin_set(SetOptions {
+            hostname: Some("unrelated".to_string()),
+            ..SetOptions::default()
+        })
+        .await
+        .expect("a set that never names auto-update is unaffected by the rule");
+        assert_eq!(be.prefs.auto_update_apply, Some(false));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
     async fn begin_set_applies_the_go_parity_pref_flags() {
         // The eight Go `set` pref flags added alongside their engine `Config` fields, end to end
         // through `begin_set`: each named flag lands on its OWN pref, an unnamed one is untouched,
@@ -7505,7 +7644,13 @@ mod tests {
 
         be.begin_set(SetOptions {
             advertise_connector: Some(true),
-            auto_update: Some(true),
+            // The DECLINE, not the opt-in: `--auto-update` claims `Hostinfo.AllowsUpdate` and is
+            // refused on an installation that could never apply an update, which is a property of
+            // whatever host runs this test (see
+            // `set_auto_update_opt_in_needs_an_installation_that_can_update`). Declining is legal
+            // everywhere and still proves the flag lands on its OWN pref, distinct from the
+            // never-stated default.
+            auto_update: Some(false),
             update_check: Some(false),
             operator: Some(Some("alice".to_string())),
             nickname: Some(Some("laptop".to_string())),
@@ -7518,7 +7663,7 @@ mod tests {
         .expect("begin_set");
 
         assert!(be.prefs.advertise_app_connector);
-        assert_eq!(be.prefs.auto_update_apply, Some(true));
+        assert_eq!(be.prefs.auto_update_apply, Some(false));
         assert!(!be.prefs.auto_update_check);
         assert_eq!(be.prefs.operator_user.as_deref(), Some("alice"));
         assert_eq!(be.prefs.node_nickname.as_deref(), Some("laptop"));

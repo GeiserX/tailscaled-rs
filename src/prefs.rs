@@ -110,8 +110,24 @@ pub struct Prefs {
     /// registration and on every map request when this is `Some(true)`, so the admin console knows
     /// the node accepts remote update triggers. It advertises the bool ONLY: this daemon runs no
     /// background updater — `tnet update` is a manual, operator-invoked command — so nothing here
-    /// acts on a trigger. Setting it is therefore an explicit operator statement of intent, not a
-    /// capability claim the daemon fulfils on its own.
+    /// acts on a trigger. Setting it is therefore an explicit operator statement of intent: *if* a
+    /// trigger arrives, an operator will run the update on this node.
+    ///
+    /// Which is exactly why the opt-in is **refused where that promise is impossible to keep**.
+    /// `Some(true)` is accepted only on an installation that can replace its own binary — the same
+    /// two conditions `tnet update --yes` refuses on (a package manager owns the binary; this host
+    /// has no published release artifact), which together are this fork's
+    /// [`feature::CanAutoUpdate`](crate::ipn::selfupdate::can_auto_update). Go's
+    /// `checkAutoUpdatePrefsLocked` refuses the same opt-in with "Auto-updates are not supported on
+    /// this platform."; the rule lives in
+    /// [`selfupdate::check_auto_update_pref`](crate::ipn::selfupdate::check_auto_update_pref) and
+    /// fires on both the `set` write path and `check-prefs`. `Some(false)` and `None` are legal
+    /// everywhere — neither claims anything to the tailnet.
+    ///
+    /// The deliberate narrowing versus Go: a literal port would refuse the opt-in on EVERY host,
+    /// since this daemon has no background updater to honour a trigger with. That would delete a
+    /// pref the fork carries on purpose, so the line is drawn at what can be checked rather than
+    /// argued — whether an update could physically be applied here at all.
     pub auto_update_apply: Option<bool>,
     /// Whether a background updater should *check* for available updates (Go `tailscale set
     /// --update-check` / `ipn.Prefs.AutoUpdate.Check`). **Default `true`**, matching Go's
