@@ -7,19 +7,20 @@ trees (the upstream `cmd/tailscaled`, `cmd/tailscale/cli`, `ipn/`, `net/`, `wgen
 this crate's `src/bin/{tailnetd,tnet}.rs`, `src/localapi.rs`, `src/ipn/`, `Cargo.toml`,
 `docs/ENGINE_ASKS.md`).
 
-- **The pin moved one patch release, and the release delta was empty for this repo.** v1.102.4 is
-  upstream's newest *stable* tag (`git ls-remote --tags`, 2026-09-11); the only newer ref is
-  `v1.103.0-pre`, the marker for the unstable branch, and this ledger tracks stable. The whole
-  `v1.102.3..v1.102.4` delta is 20 files, and outside tests it touches five. Three of them —
-  `control/controlclient/map.go`, `ipn/ipnlocal/local.go` and `ipn/ipnlocal/node_backend.go` — are
-  one piece of work: netmap-delta index correctness (`deleteIfOwned`, `netmapDeltaResult.
-  RemovedPeers`, `handleNetmapExpiry`, and a user-profile replay for peers returning by upsert). The
-  fourth is `cmd/k8s-operator/operator.go`, a component this repo does not port, and the fifth is a
-  test helper in `envknob/envknob.go`. In this project's split the netmap client and the node index
-  are **engine** code, so none of it lands on the daemon side. Everything new below therefore came
-  from sweeping in **depth** again:
-  the daemon's own pref-validation chain (`checkPrefsLocked` and its five children) and the CLI's
-  argument grammar, rather than from the release delta.
+- **The pin did not move, because there is nowhere to move it to.** `git ls-remote --tags`
+  (2026-09-11) still puts **v1.102.4** at the top of the stable list; the only newer ref is
+  `v1.103.0-pre`, the marker for the unstable branch, and this ledger tracks stable. So this pass has
+  no release delta at all — it re-reads the same tree the last refresh read, at a different **depth**.
+  The last refresh swept the daemon's pref-validation chain (`checkPrefsLocked` and its children) and
+  the CLI's argument grammar; this one swept the layer under both: the daemon's **serve-config**
+  validation (`setServeConfigLocked`, `validateServeConfigUpdate`), the CLI's client-side **value
+  resolution** (`exitNodeIPOfArg`, `dnsname.ValidHostname` — the code that decides whether what the
+  operator typed names anything real), and the two platform/environment predicates the prefs chain
+  delegates to (`featureknob.CanRunTailscaleSSH`, `feature.CanAutoUpdate`). Seven gaps came back, and
+  one of them **corrects** the pass before it: that pass recorded that Go "re-checks nothing" when
+  Funnel is turned on under shields-up, and Go does re-check — in `setServeConfigLocked`, with its own
+  message. The sweep also found the first subsystem this ledger had never carried a row for at all:
+  the control-to-node (**c2n**) RPC channel (§4.1).
 - **This crate:** `tailscaled-rs` v0.55.13 — daemon `tailnetd` + CLI `tnet`, over the
   `geiserx_tailscale` engine.
 - **Engine pin:** `9d847a6e` — unchanged since the last refresh. The engine tree *after* the
@@ -46,8 +47,8 @@ this crate's `src/bin/{tailnetd,tnet}.rs`, `src/localapi.rs`, `src/ipn/`, `Cargo
 ```mermaid
 pie showData
     title Remaining work by gating factor (§4 rows)
-    "Engine-gated (needs a new engine primitive)" : 24
-    "Small CLI / daemon-flag gaps (buildable)" : 16
+    "Engine-gated (needs a new engine primitive)" : 25
+    "Small CLI / daemon-flag gaps (buildable)" : 22
     "Large multi-day subsystem" : 6
     "Distribution / packaging" : 5
     "Live-box verification (real tailnet)" : 5
@@ -80,8 +81,10 @@ Taildrop file-arrival signal, the DERP map that would bring captive-portal detec
 `routecheck` reachability probing, app-connector route readback, peer **Location** for `exit-node list
 --filter`, and the magicsock endpoint injection that would turn the new port mapper from a diagnostic
 into a NAT-traversal win); **distribution** (crates.io, `.deb`/`.rpm`); **live-tailnet verification**
-of paths CI can't reach; and a basket of **small CLI/daemon gaps**, most of which are command lines a
-Go user would reasonably type and this fork rejects.
+of paths CI can't reach; and a basket of **small CLI/daemon gaps**, in two flavours: command lines a
+Go user would reasonably type and this fork rejects, and — the flavour this pass turned up — command
+lines this fork accepts and then does nothing with, because the value was never checked against
+anything real.
 
 **What moved in this repo since the last refresh (2026-09-01 → 2026-09-11).** Twelve of the thirteen
 gaps the previous regeneration handed to the tracker have merged: `down`'s `--reason` and its
@@ -100,16 +103,24 @@ Of the six gaps the last restock handed over, `login`'s shared `up`/`login` flag
 outright and Go's `isRunningOrStarting` gate merged **in part** (`#405` ported the state table
 faithfully but wired it to `ping` alone, where Go gates six commands); the rest are carried below.
 
-**What this deeper sweep found.** Seven gaps no bead covered. Four of them are in the daemon's
-**pref-validation chain**, which the previous ledger declared N/A on the strength of a claim that has
-since rotted: `--config`'s `Locked` field defaults to **true** upstream and gates every `set`, where
-this fork treats absent as unlocked and enforces nothing; `set --shields-up` is accepted with Funnel
-running, where Go refuses; a `--nickname` that another profile already holds is accepted, where Go
-refuses; and `--exit-node=auto:any` is refused by name, where Go re-resolves it to a live suggestion.
-The other three are **argument grammar**: Go's `flag` package accepts every long flag with a single
-dash and this fork accepts none of them, the `--posture-checking` legacy spelling Go rewrites in
-`CleanUpArgs` dies at the parser, and the `mac-app-connector` risk — the second of Go's two real risk
-types — has no counterpart here, so `--advertise-connector` on macOS proceeds with no prompt.
+**What the previous pass handed over.** Seven gaps, none of them merged since and all carried in
+§4.5 below:
+Go's single-dash long-flag spelling, the `--posture-checking` legacy spelling, the missing
+`mac-app-connector` risk, `--exit-node=auto:any`, `--config`'s unenforced and inverted `Locked`
+default, `set --shields-up` while Funnel is on, and a `--nickname` another profile already holds.
+
+**What this sweep found.** Seven more, and they share a shape: this fork validates the *form* of what
+the operator types and almost never the *substance*. `--exit-node` is checked for an `auto:` prefix
+and then handed to the engine unresolved, so naming your own address, a mistyped peer, or a peer that
+advertises no exit is accepted in silence — Go resolves the argument against the netmap and has six
+refusals for it. `--hostname` takes any bytes at all, where Go runs `dnsname.ValidHostname` before it
+builds the prefs. On the serve side, turning Funnel on under shields-up is accepted where Go refuses,
+and a second `serve` on a busy port silently **replaces** the first where Go refuses by name. Two more
+are predicates the prefs chain calls out to and this fork never ported: `set --auto-update` is
+accepted on an installation that cannot update itself, and the SSH gate is a build-feature check only,
+so `TS_DISABLE_SSH_SERVER` does not disable anything. The seventh is the missing mechanism behind
+three reductions this fork already documents one at a time — there is no c2n channel, so control can
+ask this node for nothing.
 
 ---
 
@@ -235,6 +246,7 @@ would violate the honest-omission rule). Each rides the next pin bump once its a
 | `whois --proto`'s flow lookup (the response half) | `tsd-efv` (residual) | **#35** | The request half shipped (`#327`): `whois --proto=tcp <ip>:<port>` parses and reaches the daemon. The engine resolves a bare address only, so the proxied-flow distinction Go's `WhoIsProto` exists for is not yet honoured. |
 | `down --reason` / `logout --reason` reaching control | — | **#41** | Both flags ship and the reason is recorded locally, but Go submits it as a client audit log to control. The engine has no audit-log submission path. |
 | `switch --list`'s `Tailnet`/`Account` columns, and Go's `--nickname=` login-name restore | `tsd-91w` (residual) | **#42** | The engine joins user profiles for PEERS only; the self node carries no owning user, so a cleared nickname falls back to the profile id where Go restores the login name. |
+| The control-to-node (**c2n**) RPC channel — control can ask this node for nothing | *(new — filed by this pass)* | *(ask to file)* | Upstream registers ~20 handlers on an HTTP surface the control plane reaches over the existing noise session: `ipn/ipnlocal/c2n.go` (`RegisterC2N`/`handleC2N`, the `/debug/*` family, `/echo`, logtail flush, sockstats, netfilter-kind) plus `GET`+`POST /update`, `GET /posture/identity`, `GET /appconnector/routes`, `POST /wol`, `GET /vip-services`, `GET /tls-cert-status` and `/ssh/usernames`. The session is engine-owned end to end, so no daemon-side handler can be reached until the engine offers a registration hook — the ask this row exists to file. It is the missing mechanism behind three reductions this fork already documents one at a time: `--report-posture` is a carried pref because nothing answers the posture pull, `--auto-update` advertises `Hostinfo.AllowsUpdate` while nothing acts on a trigger, and ask #39's app-connector readback is the LocalAPI half of a readback control performs here. |
 
 ### 4.2 Large multi-day subsystems (daemon-buildable, but each is a significant project)
 
@@ -271,13 +283,19 @@ would violate the honest-omission rule). Each rides the next pin bump once its a
 
 | Item | Bead | Note |
 | --- | --- | --- |
-| Every long flag dies unless it is spelled with two dashes | *(new — filed by this pass)* | Go's CLI is built on the standard `flag` package, which treats `-hostname` and `--hostname` as the same flag; `cli.go`'s `CleanUpArgs` rewrites both `-authkey` and `--authkey`, which is upstream stating outright that the one-dash form reaches the parser. `tnet` is `Cli::parse()` with no pre-pass, and clap reads `-hostname` as a cluster of short flags, so every single-dash command line copied from Go's own docs fails. Most fail loudly — `tnet up -authkey=x` exits 2 with `unexpected argument '-a' found` — but `-hostname` does not: clap takes the leading `-h` as its own help flag, prints `up`'s help and **exits 0**, so a script that checks the status is told the node came up when nothing ran. |
-| `--posture-checking` is an unknown argument, not the old spelling of `--report-posture` | *(new — filed by this pass)* | The other half of `CleanUpArgs`: Go rewrites `--posture-checking` and `--posture-checking=<v>` (and their one-dash forms) to `--report-posture`, so the flag's former name keeps working. This fork carries `--report-posture` alone, so a runbook written before the rename dies at the parser — the same failure `#313` fixed for Go's four other `up` spellings. |
-| The `mac-app-connector` risk has no counterpart, so macOS app-connector setup never warns | *(new — filed by this pass)* | `risks.go` registers exactly two real risk types, `lose-ssh` and `mac-app-connector` (plus `all`). Both `up` and `set` present the second one when `goos == "darwin"` and `--advertise-connector` is set, with a specific message: macOS app connectors are not officially supported and should not carry anything mission-critical. This fork ports `lose-ssh` and `all` and ships `--advertise-connector` on both commands, and this daemon builds and runs on macOS — so the one platform Go warns about is the one where the warning is missing. |
-| `--exit-node=auto:any` is refused by name where Go re-resolves it continuously | *(new — filed by this pass)* | Go's `ipn.Prefs.AutoExitNode` holds an expression (`any` today); `resolveAutoExitNodeLocked` turns it into a concrete `ExitNodeID` from the current suggestion and re-runs it whenever a netcheck report or a rebind suggests the pick has gone stale. This fork rejects the `auto:` prefix up front (honestly — the alternative was a silent match against a peer named `auto:any`), but the primitive it would need is already consumed: `exit-node suggest` ships over `Device::suggest_exit_node()`. |
-| `tailnetd --config`'s `Locked` defaults to **true** upstream and is enforced; here it is neither | *(new — filed by this pass)* | Go's `ipn.ConfigVAlpha.Locked` is an `opt.Bool` documented as defaulting to true, and `isConfigLocked_Locked()` reads it as locked *unless* explicitly false — so with any config file in use, `checkPrefsLocked` refuses every prefs edit with "can't reconfigure tailscaled when using a config file; config file is locked". `src/conffile.rs` parses the field, warns only when it is explicitly `true`, and enforces nothing — so a config-driven node accepts `tnet set` silently, and the code comment asserting "absent is the default (no lock)" has the default backwards. |
-| `set --shields-up` is accepted while Funnel is running | *(new — filed by this pass)* | `checkFunnelEnabledLocked` refuses "Cannot enable shields-up when Funnel is enabled." — shields-up drops the inbound connections Funnel exists to accept, so the pair is a silent outage. Both halves are already modelled here: `shields_up` is a pref and `serve::funnel_ports` is the exact "is Funnel on" signal, so this is one check on the `up`/`set` path. |
-| A `--nickname` another profile already holds is accepted | *(new — filed by this pass)* | `checkProfileNameLocked` refuses `profile name %q already in use` when the name resolves to a different profile, which is what keeps Go's name→profile lookup unambiguous. `rename_current_profile` writes the name unconditionally, so two profiles can share one — and `switch <name>` then resolves to whichever comes first, a behaviour this fork documents as "first-hit matching" but which Go makes unreachable. |
+| `--exit-node` is never resolved, so none of Go's six refusals fire | *(new — filed by this pass)* | Go resolves the argument CLI-side against the status it has just fetched (`SetExitNodeIP` → `exitNodeIPOfArg`, `ipn/prefs.go`). Your own address is `ExitNodeLocalIPError`, which `up` and `set` re-wrap as "did you mean --advertise-exit-node?"; on a Running node an IP with no peer behind it is "no node found in netmap with IP", and a peer not offering exit is "node %v is not advertising an exit node"; a non-IP argument is matched against every peer in three spellings and yields a starting-up refusal, "invalid value %q for --exit-node; must be IP or peer hostname", or "ambiguous exit node name %q". `validate_exit_node_selector` (`src/ipn/mod.rs`) checks the `auto:` prefix and nothing else, so every other wrong value is accepted and exit routing silently does nothing. The inputs are here: `PeerReport.is_exit_node` carries the advertisement and `exit-node list` already builds its table from it. |
+| `--hostname` accepts any bytes, where Go validates it as a DNS name | *(new — filed by this pass)* | `prefsFromUpArgs` runs `dnsname.ValidHostname` before it builds the prefs: at most 254 bytes overall, every dot-separated label non-empty and at most 63 bytes, first and last byte alphanumeric, interior bytes letters, digits or `-`. Nothing between `tnet`'s flag and the engine `Config.hostname` looks at the value, so `--hostname "my laptop"`, a leading dash and a 300-character name are all accepted — and the value becomes this node's MagicDNS name. `--config` can set it without the CLI running, which argues for the check landing daemon-side rather than where Go puts it. |
+| Funnel can be turned on while shields-up is set | *(new — filed by this pass)* | `setServeConfigLocked` refuses "Unable to turn on Funnel while shields-up is enabled" — the serve-side half of an exclusion whose prefs-side half is the `set --shields-up` row further down this table, and the correction to that filing's claim that Go re-checks nothing when the order is reversed. `Backend::set_serve_config` validates no prefs at all; both inputs are already at that call site (`self.prefs.shields_up`, and `serve::funnel_ports` as this fork's `IsFunnelOn`). |
+| A second `serve` on a busy port replaces the first instead of being refused | *(new — filed by this pass)* | `validateServeConfigUpdate` refuses a serve-type change on a port already in use ("want to serve %q, but port %d is already serving %q"), plus two foreground-listener rules and the same check per Service. This fork writes the port map with a plain `BTreeMap::insert` at every serve and funnel call site, so `serve --tcp` aimed at a port already terminating HTTPS reports success and the previous serve is gone with no diagnostic. The two foreground rules have no state to run against here yet — a foreground serve is torn down by `tnet`, not the daemon (§6). |
+| `set --auto-update` is accepted where the installation cannot update itself | *(new — filed by this pass)* | `checkAutoUpdatePrefsLocked` refuses `Apply=true` with "Auto-updates are not supported on this platform." or "Auto-update support is disabled in this build". The pref is not local: the engine advertises `Hostinfo.AllowsUpdate` from it, so accepting it tells the tailnet admin a remote trigger will be honoured. This fork already computes the predicate and never consults it: `run_update`'s install path refuses `--yes` when a Homebrew formula owns the binary, and again when `host_release_triple` finds no published artifact for the host (Linux x86_64/aarch64 tarballs only) — so on macOS this binary provably cannot replace itself while the pref still advertises that it can. Choosing which of those conditions gates the pref is the substance of the fix, since no background updater runs here at all. |
+| `TS_DISABLE_SSH_SERVER` does not disable the SSH server | *(new — filed by this pass)* | `checkSSHPrefsLocked` delegates to `featureknob.CanRunTailscaleSSH`, whose final arm refuses "The Tailscale SSH server has been administratively disabled." whenever that envknob is set, on every OS — it is the operator's off switch for an image or a managed host. This fork's gate is the `ssh` Cargo feature alone (`Backend::check_prefs`), so on an ssh-enabled build the knob does nothing and `set --ssh` starts the server. `TS_DISABLE_PORTMAPPER` (`src/portmap.rs`) is the precedent for reading one. The unsupported-OS arm and the Synology/QNAP arms want an explicit port-or-decline rather than silence. |
+| Every long flag dies unless it is spelled with two dashes | *(previous pass, filed)* | Go's CLI is built on the standard `flag` package, which treats `-hostname` and `--hostname` as the same flag; `cli.go`'s `CleanUpArgs` rewrites both `-authkey` and `--authkey`, which is upstream stating outright that the one-dash form reaches the parser. `tnet` is `Cli::parse()` with no pre-pass, and clap reads `-hostname` as a cluster of short flags, so every single-dash command line copied from Go's own docs fails. Most fail loudly — `tnet up -authkey=x` exits 2 with `unexpected argument '-a' found` — but `-hostname` does not: clap takes the leading `-h` as its own help flag, prints `up`'s help and **exits 0**, so a script that checks the status is told the node came up when nothing ran. |
+| `--posture-checking` is an unknown argument, not the old spelling of `--report-posture` | *(previous pass, filed)* | The other half of `CleanUpArgs`: Go rewrites `--posture-checking` and `--posture-checking=<v>` (and their one-dash forms) to `--report-posture`, so the flag's former name keeps working. This fork carries `--report-posture` alone, so a runbook written before the rename dies at the parser — the same failure `#313` fixed for Go's four other `up` spellings. |
+| The `mac-app-connector` risk has no counterpart, so macOS app-connector setup never warns | *(previous pass, filed)* | `risks.go` registers exactly two real risk types, `lose-ssh` and `mac-app-connector` (plus `all`). Both `up` and `set` present the second one when `goos == "darwin"` and `--advertise-connector` is set, with a specific message: macOS app connectors are not officially supported and should not carry anything mission-critical. This fork ports `lose-ssh` and `all` and ships `--advertise-connector` on both commands, and this daemon builds and runs on macOS — so the one platform Go warns about is the one where the warning is missing. |
+| `--exit-node=auto:any` is refused by name where Go re-resolves it continuously | *(previous pass, filed)* | Go's `ipn.Prefs.AutoExitNode` holds an expression (`any` today); `resolveAutoExitNodeLocked` turns it into a concrete `ExitNodeID` from the current suggestion and re-runs it whenever a netcheck report or a rebind suggests the pick has gone stale. This fork rejects the `auto:` prefix up front (honestly — the alternative was a silent match against a peer named `auto:any`), but the primitive it would need is already consumed: `exit-node suggest` ships over `Device::suggest_exit_node()`. |
+| `tailnetd --config`'s `Locked` defaults to **true** upstream and is enforced; here it is neither | *(previous pass, filed)* | Go's `ipn.ConfigVAlpha.Locked` is an `opt.Bool` documented as defaulting to true, and `isConfigLocked_Locked()` reads it as locked *unless* explicitly false — so with any config file in use, `checkPrefsLocked` refuses every prefs edit with "can't reconfigure tailscaled when using a config file; config file is locked". `src/conffile.rs` parses the field, warns only when it is explicitly `true`, and enforces nothing — so a config-driven node accepts `tnet set` silently, and the code comment asserting "absent is the default (no lock)" has the default backwards. |
+| `set --shields-up` is accepted while Funnel is running | *(previous pass, filed)* | `checkFunnelEnabledLocked` refuses "Cannot enable shields-up when Funnel is enabled." — shields-up drops the inbound connections Funnel exists to accept, so the pair is a silent outage. Both halves are already modelled here: `shields_up` is a pref and `serve::funnel_ports` is the exact "is Funnel on" signal, so this is one check on the `up`/`set` path. |
+| A `--nickname` another profile already holds is accepted | *(previous pass, filed)* | `checkProfileNameLocked` refuses `profile name %q already in use` when the name resolves to a different profile, which is what keeps Go's name→profile lookup unambiguous. `rename_current_profile` writes the name unconditionally, so two profiles can share one — and `switch <name>` then resolves to whichever comes first, a behaviour this fork documents as "first-hit matching" but which Go makes unreachable. |
 | Go's `isRunningOrStarting` gate reaches one command of six | *(previous pass, residual)* | `#405` ported the state table exactly — `Tailscale is stopped.`, `Logged out.` plus the `Log in at:` line, `Machine is not yet approved by tailnet admin.`, and the `unexpected state:` default — and `is_running_or_starting` is called from `resolve_ping_target` and nowhere else. Go gates six: `status` (human path only), `ping`, `nc`, `switch`, `serve` and two `debug` verbs, each exiting 1. So `tnet status` on a stopped node still prints an empty peer table and exits 0. `nc`'s two argument refusals (`usage: tailscale nc <hostname-or-IP> <port>`, `invalid port number %q`) belong to the same call site and are also still missing. |
 | `tnet` has no `completion` subcommand, so no shell can tab-complete it | *(previous pass)* | `ffcomplete.Inject` adds a `completion` command (`bash`/`zsh`/`fish`/`powershell`) plus a hidden `__complete` verb, and commands register dynamic completers so `tailscale nc <TAB>` offers live peer names. The static half is `clap_complete` over the existing derive; the dynamic half needs the hidden verb and a status round-trip. |
 | `up`/`set` never run Go's advertise-routes warnings | *(previous pass)* | `warnOnAdvertiseRoutes` runs after every `up`/`set` that advertises routes or a connector, calling `CheckIPForwarding` and — on Linux — `CheckUDPGROForwarding`. This fork has the first check and reaches it only through `tnet debug check-ip-forwarding`, whose own rustdoc already claims `up`/`set` run it. The GRO half has no counterpart. |
@@ -434,6 +452,11 @@ umbrella trackers.
   `up`/`set` · the four bare-integer duration flags · the health tracker · the residual five call
   sites of Go's `isRunningOrStarting` gate, plus `nc`'s two argument refusals (`#405` wired the
   ported state table to `ping` only). `login`'s shared flag set merged outright (`#397`).
+- **Handed to the tracker by the previous regeneration**, with nothing merged against them in this
+  repo since: Go's single-dash long-flag spelling · the `--posture-checking` legacy spelling · the
+  `mac-app-connector` risk · `--exit-node=auto:any` · `--config`'s unenforced and inverted `Locked`
+  default · `set --shields-up` while Funnel is on · a `--nickname` another profile already holds. All
+  seven are rows in §4.5.
 - **Closed since the last regeneration:** `down --reason` + lose-SSH refusal (`#336`, `#416`) ·
   `bugreport --diagnose`/`--record` (`#330`) · `exit-node list` grammar (`#331`) · `lock init` grammar
   (`#329`) · `ping`'s hostname target (`#337`) · `whois` flow arguments (`#327`) · `dns status --all`
@@ -444,11 +467,12 @@ umbrella trackers.
 
 ### Filed by this pass (not yet in the list above)
 The gaps this sweep found that no open bead covered are handed to the tracker in
-[`restock-beads.json`](restock-beads.json), each cited to its upstream file at
-`bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`: Go's single-dash long-flag spelling, the
-`--posture-checking` legacy spelling, the missing `mac-app-connector` risk, `--exit-node=auto:any`,
-`--config`'s unenforced and inverted `Locked` default, `set --shields-up` while Funnel is on, and a
-`--nickname` another profile already holds.
+[`restock-beads.json`](restock-beads.json), each cited to the one upstream file it was verified in, at
+`bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`: the unresolved `--exit-node` argument (`ipn/prefs.go`), the
+unvalidated `--hostname` (`cmd/tailscale/cli/up.go`), Funnel turned on under shields-up and the serve
+that replaces a busy port (both `ipn/ipnlocal/serve.go`), `set --auto-update` on an installation that
+cannot update itself (`ipn/ipnlocal/local.go`), the missing c2n channel (`ipn/ipnlocal/c2n.go`), and
+the SSH gate that ignores `TS_DISABLE_SSH_SERVER` (`envknob/featureknob/featureknob.go`).
 
 > The authoritative live backlog is the bead set (`bd list --status open`) + `docs/ENGINE_ASKS.md`. This
 > doc is the orienting map; regenerate it after a batch of merges.
@@ -465,18 +489,29 @@ can't reach. None of it is a redesign; it is breadth and polish on a working cor
 highest-leverage item is **Windows support** (`tsd-1yw`); the highest-frequency unblock is the **engine
 pin bump** (each release has converted a filed ask into a shipped feature).
 
-What this refresh changes about that picture is *where* the sweep has to look next. The last pass swept
-flag-by-flag across the commands this fork already ships and found twelve gaps; twelve of those have
-merged, and the same sweep run again over the same surface now comes back almost empty. What it did not
-cover was the layer underneath the flags — the daemon's own `checkPrefsLocked` chain, which decides
-whether a prefs edit is *allowed* rather than what it means. Four of the seven gaps below live there,
-and the previous ledger had written that whole chain off as "rules this fork does not model", a claim
-that was true when it was written and is not true now: `shields_up`, Funnel, profile names and the
-config file all arrived since. The lesson generalises — the rows in this document that say a Go rule is
-N/A are the rows most likely to rot, because they are the ones nothing re-checks. The other three gaps
-are the CLI's argument grammar, where Go accepts spellings this fork does not, and the pattern there is
-the old one: a command line a Go user would reasonably type, and this fork exits 2.
+What this refresh changes about that picture is again *where* to sweep, and the answer moved one layer
+down. The pass before this one read the daemon's `checkPrefsLocked` chain and the CLI's argument
+grammar — the code that decides whether an edit is *allowed* and how a command line is *spelled* — and
+found seven gaps. This one read what those two layers hand a value to: the serve-config setter, the
+exit-node and hostname resolvers, and the platform predicates the prefs chain delegates to. Seven more.
+The common shape is worth stating plainly, because it predicts where the next seven are: this fork
+checks the **form** of an argument and rarely its **substance**. `--exit-node` is tested for one prefix
+and then never resolved against the netmap; `--hostname` is not tested at all; a `serve` aimed at a busy
+port takes it by overwriting what was there. Each of those is a command that reports success and does
+nothing, which is strictly worse than the exit-2 the earlier flag-by-flag sweeps kept finding — a
+refusal at least tells the operator something.
 
-*Generated 2026-09-11 against upstream v1.102.4 (`bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`, the newest
-stable tag), engine pin `9d847a6e`, daemon v0.55.13. Regenerate from `bd list` +
-`docs/ENGINE_ASKS.md` + a fresh upstream sweep.*
+Two of the seven also say something about this document's own hygiene, and both are worth acting on.
+The first corrects a claim the previous pass filed: it recorded that Go re-checks nothing when Funnel is
+turned on under shields-up, and Go does re-check, in `setServeConfigLocked`. That is two consecutive
+passes finding that a confident "Go does not do this" had rotted, so treat every such sentence here as
+the least trustworthy kind of row. The second is the c2n channel, which had no row at all even though
+two rustdoc comments in `src/prefs.rs` (on `posture_checking` and `auto_update_apply`) and engine ask
+#39 each describe one of its consequences without naming the thing they have in common.
+A whole subsystem can stay invisible to this ledger by being documented only in pieces, and the way to
+catch the next one is to sweep by upstream *mechanism* now and then, not only by command and flag.
+
+*Re-derived 2026-09-11 against upstream v1.102.4 (`bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`, still the
+newest stable tag — the only newer ref, `v1.103.0-pre`, marks the unstable branch), engine pin
+`9d847a6e`, daemon v0.55.13. Regenerate from `bd list` + `docs/ENGINE_ASKS.md` + a fresh upstream
+sweep; when the pin cannot move, sweep deeper instead of reporting no change.*
