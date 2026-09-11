@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.55.13](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.12...v0.55.13) (2026-09-10)
+
+
+### Bug Fixes
+
+* **down:** a refused lose-ssh `down` must end in Go's abort error ([#416](https://github.com/GeiserX/tailscaled-rs/issues/416)) ([733b905](https://github.com/GeiserX/tailscaled-rs/commit/733b9056e84976e2ef3993e9033bc8cacfc69952))
+
 ## [0.55.12](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.11...v0.55.12) (2026-09-10)
 
 
