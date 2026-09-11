@@ -112,6 +112,11 @@ pub struct Prefs {
     /// background updater — `tnet update` is a manual, operator-invoked command — so nothing here
     /// acts on a trigger. Setting it is therefore an explicit operator statement of intent, not a
     /// capability claim the daemon fulfils on its own.
+    ///
+    /// The trigger itself is a control-to-node (c2n) call — Go's `GET`/`POST /update`
+    /// (`feature/clientupdate/clientupdate.go`), which reads this pref as its `Enabled` field. The
+    /// engine owns the c2n session and offers no way to register a handler, so there is nothing to
+    /// receive it. Filed as ask #43 in `docs/ENGINE_ASKS.md`.
     pub auto_update_apply: Option<bool>,
     /// Whether a background updater should *check* for available updates (Go `tailscale set
     /// --update-check` / `ipn.Prefs.AutoUpdate.Check`). **Default `true`**, matching Go's
@@ -156,6 +161,10 @@ pub struct Prefs {
     /// responder, so control never pulls and the on-the-wire behavior is byte-for-byte the
     /// posture-disabled case. There is deliberately no `Hostinfo` field to advertise it. Persisted
     /// and threaded through so the pref state is faithful and a future c2n responder has its input.
+    ///
+    /// The pull is Go's `GET /posture/identity` (`feature/posture/posture.go`). The engine owns the
+    /// c2n session and offers no way to register a handler, so the responder cannot live here until
+    /// it does. Filed as ask #43 in `docs/ENGINE_ASKS.md`.
     pub posture_checking: bool,
     /// Run a local web client for managing this node (Go `tailscale set --webclient` /
     /// `ipn.Prefs.RunWebClient`). Default `false`. Maps to the engine `Config.run_web_client`.
