@@ -2392,6 +2392,15 @@ impl Backend {
         if let Some(Some(sel)) = opts.exit_node.as_ref() {
             validate_exit_node_selector(Some(sel))?;
         }
+        // And refuse an SSH-server enable the host or the operator has ruled out (Go
+        // `checkSSHPrefsLocked` → `featureknob.CanRunTailscaleSSH`, run whenever `RunSSH` is being
+        // SET). This is the one gate that MUST live here rather than in `build_config`: on a node
+        // that is down, `set` is persist-only and never reaches `build_config` at all, so without
+        // this `TS_DISABLE_SSH_SERVER=1 tnet set --ssh` would report success and write the pref,
+        // and the operator would learn the server is administratively off only at the next `up`.
+        if opts.ssh == Some(true) {
+            crate::featureknob::can_run_tailscale_ssh()?;
+        }
 
         // The login-profile rename `--nickname` owes beyond the pref (see the `opts.nickname` arm
         // below): captured here as `Some(name)` / `Some(cleared)` and applied after the prefs persist.
@@ -2708,6 +2717,16 @@ impl Backend {
         // build; a silent fall-through to `Name("auto:any")` would break exit routing with no error).
         if let Some(Some(sel)) = opts.exit_node.as_ref() {
             validate_exit_node_selector(Some(sel))?;
+        }
+        // Same discipline for an SSH-server enable: Go's `checkSSHPrefsLocked` runs
+        // `featureknob.CanRunTailscaleSSH()` whenever `RunSSH` is being SET, so a host whose
+        // operator disabled the server with `TS_DISABLE_SSH_SERVER` (or an OS upstream does not
+        // support) refuses the pref rather than accepting it and quietly running no server. Checked
+        // here, before teardown/persist, so the refusal costs neither the live device nor a written
+        // pref; `build_config` re-checks the MERGED pref (it is the final authority, and it also
+        // catches an already-persisted `ssh_enabled` on a host where the knob appeared later).
+        if opts.ssh == Some(true) {
+            crate::featureknob::can_run_tailscale_ssh()?;
         }
 
         // Tear down any existing device first so `up` is idempotent / reconfiguring.
@@ -3927,15 +3946,44 @@ impl Backend {
     /// conflict** — cannot use an exit node and advertise as one simultaneously (Go
     /// `checkExitNodePrefsLocked`); (3) every advertised route is a masked CIDR (Go
     /// `checkAdvertiseRoutes`); (4) SSH-server enable requires the `ssh` build feature (the local
-    /// analogue of Go's `checkSSHPrefsLocked` capability gate — a faithful, build-time check). Go's
-    /// operator/auto-update/profile-name/config-lock/Funnel-shields rules reference prefs this fork
-    /// does not model, so they are correctly N/A.
+    /// analogue of Go's capability gate — a faithful, build-time check) **and** must clear the
+    /// host/operator gate Go's `checkSSHPrefsLocked` applies,
+    /// [`featureknob::can_run_tailscale_ssh`](crate::featureknob::can_run_tailscale_ssh) — chiefly
+    /// its `TS_DISABLE_SSH_SERVER` administrative off-switch, which is how an image build or a
+    /// configuration-managed host holds the SSH server down whatever the tailnet or the user asks
+    /// for. Go's operator/auto-update/profile-name/config-lock/Funnel-shields rules reference prefs
+    /// this fork does not model, so they are correctly N/A.
     pub fn check_prefs(
         &self,
         exit_node: Option<Option<String>>,
         advertise_exit_node: Option<bool>,
         advertise_routes: Option<Vec<String>>,
         ssh: Option<bool>,
+    ) -> Result<()> {
+        self.check_prefs_gated(
+            exit_node,
+            advertise_exit_node,
+            advertise_routes,
+            ssh,
+            crate::featureknob::can_run_tailscale_ssh(),
+        )
+    }
+
+    /// [`check_prefs`](Self::check_prefs) with the host/operator SSH gate passed IN rather than read
+    /// from the process environment, so the refusal it contributes is unit-testable without
+    /// `set_var` (`unsafe` in edition 2024, and it races the parallel test harness — the same reason
+    /// [`state_dir_with_source`](crate::state_dir_with_source) resolves its cascade through an
+    /// injectable environment lookup).
+    /// `ssh_gate` is [`featureknob::can_run_tailscale_ssh`](crate::featureknob::can_run_tailscale_ssh)'s
+    /// verdict for this host; it is only consulted when the prospective posture actually runs SSH,
+    /// matching Go, which calls it from `checkSSHPrefsLocked` only once `RunSSH` is set.
+    fn check_prefs_gated(
+        &self,
+        exit_node: Option<Option<String>>,
+        advertise_exit_node: Option<bool>,
+        advertise_routes: Option<Vec<String>>,
+        ssh: Option<bool>,
+        ssh_gate: Result<()>,
     ) -> Result<()> {
         // Compose the prospective posture: the named override wins, else the current pref.
         let prospective_exit_node = match &exit_node {
@@ -3977,13 +4025,22 @@ impl Backend {
             }
         }
         // (4) SSH-server enable requires the `ssh` build feature (local analogue of Go's
-        // capability gate — a faithful build-time check; the netmap-capability check is engine-gated).
-        if prospective_ssh && cfg!(not(feature = "ssh")) {
-            errors.push(
-                "Unable to enable Tailscale SSH server: this build was compiled without the `ssh` \
-                 feature."
-                    .into(),
-            );
+        // capability gate — a faithful build-time check; the netmap-capability check is engine-gated)
+        // AND must clear the host/operator gate (Go `checkSSHPrefsLocked` → `CanRunTailscaleSSH`).
+        // Both are reported when both fail: this call exists to tell the caller everything that is
+        // wrong with the posture in one answer, and "rebuild with the feature" alone would send an
+        // operator off to rebuild a daemon that the administrative knob would still refuse.
+        if prospective_ssh {
+            if cfg!(not(feature = "ssh")) {
+                errors.push(
+                    "Unable to enable Tailscale SSH server: this build was compiled without the \
+                     `ssh` feature."
+                        .into(),
+                );
+            }
+            if let Err(e) = ssh_gate {
+                errors.push(e.to_string());
+            }
         }
 
         if errors.is_empty() {
@@ -4752,6 +4809,57 @@ mod tests {
             be.prefs.exit_node.is_none() && be.prefs.advertise_routes.is_empty(),
             "check_prefs must mutate nothing"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_prefs_reports_an_administratively_disabled_ssh_server() {
+        // Go's `checkSSHPrefsLocked` gate: with `TS_DISABLE_SSH_SERVER` set, enabling the SSH server
+        // is refused with the upstream sentence, and the refusal comes from the production gate —
+        // the verdict handed in below is `featureknob`'s own, not one this test writes out.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-checkprefs-ssh-{}", std::process::id()));
+        let be = backend_for(&dir);
+        let disabled = || crate::featureknob::can_run_tailscale_ssh_in("linux", Some("1"));
+        let allowed = || crate::featureknob::can_run_tailscale_ssh_in("linux", None);
+
+        // Asking for the SSH server on a host that has it disabled → refused, in Go's words.
+        let err = be
+            .check_prefs_gated(None, None, None, Some(true), disabled())
+            .expect_err("TS_DISABLE_SSH_SERVER must refuse an SSH-server enable");
+        assert!(
+            err.to_string()
+                .contains("The Tailscale SSH server has been administratively disabled."),
+            "got {err:#}"
+        );
+
+        // The gate is consulted only for a posture that actually runs SSH: turning it OFF (and
+        // leaving it alone, which on a fresh backend means off) stays valid on the same host, so a
+        // disabled machine can still edit every other pref. Go refuses only when `RunSSH` is set.
+        assert!(
+            be.check_prefs_gated(None, None, None, Some(false), disabled())
+                .is_ok(),
+            "disabling SSH on a host with the knob set must still be a valid posture"
+        );
+        assert!(
+            be.check_prefs_gated(None, None, None, None, disabled())
+                .is_ok(),
+            "an unrelated prefs check must not be refused by the SSH knob"
+        );
+
+        // And with the knob clear, the same request is valid on an `ssh`-feature build. (Without the
+        // feature the build-time gate refuses it on its own — that arm is asserted below.)
+        let ok = be.check_prefs_gated(None, None, None, Some(true), allowed());
+        if cfg!(feature = "ssh") {
+            assert!(ok.is_ok(), "an unrestricted host must accept --ssh: {ok:?}");
+        } else {
+            let err = ok.expect_err("a build without the `ssh` feature cannot enable the server");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("`ssh` feature") && !msg.contains("administratively disabled"),
+                "only the build-feature refusal applies when the knob is clear, got {msg:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
