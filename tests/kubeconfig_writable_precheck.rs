@@ -36,6 +36,12 @@ fn status_reply() -> String {
     )
 }
 
+/// Kubeconfig content that is readable but cannot be parsed: the flow sequence is never closed.
+///
+/// The precheck test needs content the merge chokes on, so that a run which reads before it checks
+/// fails with a *different* error than the one that test asserts.
+const MALFORMED: &str = "apiVersion: v1\nclusters: [\n";
+
 /// A scratch directory owned by this test alone, keyed by name + pid.
 fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("tnet-kubeprecheck-{name}-{}", std::process::id()));
@@ -103,11 +109,16 @@ fn an_unwritable_kubeconfig_is_refused_before_the_merge() {
     let dir = scratch("unwritable");
     let kube = dir.join("kube");
     std::fs::create_dir(&kube).unwrap();
-    // A kubeconfig that already exists and that the user cannot write. It has real content, so a
-    // run that got as far as the merge would have had to read it — and the merge is exactly what
-    // must not happen.
+    // A kubeconfig that already exists and that the user cannot write. Its content is readable but
+    // NOT parseable — an unterminated flow sequence — and that is what makes this an ordering test
+    // rather than a writability test. Valid content would let a regression that reads and merges
+    // before the precheck still end in `cannot write kubeconfig at`: the merge would succeed and the
+    // open would fail, so the assertions below would pass over the very reordering they exist to
+    // catch. With MALFORMED content the merge cannot succeed, so any run that reads the file before
+    // the precheck dies in `update_kubeconfig` with `invalid kubeconfig` instead.
+    // `a_readable_but_malformed_kubeconfig_is_refused_by_the_merge` pins that second half.
     let path = kube.join("config");
-    let before = "apiVersion: v1\nkind: Config\nclusters: []\ncontexts: []\nusers: []\n";
+    let before = MALFORMED;
     std::fs::write(&path, before).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
     if std::fs::OpenOptions::new().write(true).open(&path).is_ok() {
@@ -132,6 +143,11 @@ fn an_unwritable_kubeconfig_is_refused_before_the_merge() {
     assert!(
         !err.contains("opening kubeconfig"),
         "the failure must come from the precheck, not from the open after the merge:\n{err}"
+    );
+    assert!(
+        !err.contains("invalid kubeconfig"),
+        "the precheck must run BEFORE the file is read — this is the merge's refusal, so the read \
+         happened first:\n{err}"
     );
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     assert_eq!(
@@ -169,6 +185,43 @@ fn a_kubeconfig_several_directories_deep_is_written() {
     );
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "kubeconfig must be written 0600, got {mode:o}");
+    let _ = std::fs::remove_file(&socket);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_readable_but_malformed_kubeconfig_is_refused_by_the_merge() {
+    // The other half of `an_unwritable_kubeconfig_is_refused_before_the_merge`: that test only
+    // distinguishes precheck-then-merge from merge-then-precheck because `MALFORMED` is content the
+    // merge genuinely refuses. Pin that here, through the same binary and the same code path, with
+    // the only difference being that this kubeconfig IS writable. If the parser ever grows lenient
+    // enough to accept `MALFORMED`, this fails and says so instead of quietly hollowing out the
+    // ordering assertion next door.
+    let dir = scratch("malformed");
+    let path = dir.join("config");
+    std::fs::write(&path, MALFORMED).unwrap();
+
+    let socket = stub_daemon("malformed", status_reply());
+    let out = configure_kubeconfig(&socket, &path);
+    let err = stderr(&out);
+
+    assert!(
+        !out.status.success(),
+        "a kubeconfig that cannot be parsed must not be merged into:\n{err}"
+    );
+    assert!(
+        err.contains("invalid kubeconfig"),
+        "the merge must be what refuses it, in Go's `errInvalidKubeconfig` words; got:\n{err}"
+    );
+    assert!(
+        !err.contains("cannot write kubeconfig at"),
+        "this file is writable, so the precheck must have passed it:\n{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        MALFORMED,
+        "a refused merge must leave the kubeconfig byte-identical"
+    );
     let _ = std::fs::remove_file(&socket);
     let _ = std::fs::remove_dir_all(&dir);
 }
