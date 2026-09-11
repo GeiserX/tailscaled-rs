@@ -26,8 +26,10 @@
 //! something firmer than the next editor's eye — each of its table rows is split the way the
 //! renderer will split it, and every header is counted against the delimiter row beneath it.
 //!
-//! One row is a recorded exception rather than a fix; [`KNOWN_SPLIT_ROWS`] says which and why, and
-//! [`the_recorded_exception_is_still_needed`] deletes itself by failing once that row is repaired.
+//! A row may be recorded as an exception rather than fixed; [`KNOWN_SPLIT_ROWS`] says which and
+//! why, and [`the_recorded_exception_is_still_needed`] fails once a recorded row is repaired, so
+//! the deferral cannot outlive the defect. The list is empty today — the whois row it was written
+//! for was repaired by the ledger rewrite that owns §4.5.
 
 /// Every prose document in the repository, by repository-relative path.
 ///
@@ -145,19 +147,18 @@ fn tracked_markdown() -> Vec<String> {
 /// their first cell starts with (a line number would be stale within a week — §4.5 of the parity
 /// ledger is rewritten by nearly every pass).
 ///
-/// `docs/PARITY_GAP_ANALYSIS.md`'s whois row is deferred, not defended. Two things are true about
-/// it: the unescaped pipe truncates the rendered cell, *and* the row is stale — its first cell
-/// still asserts "`tnet whois` has no `--proto`, and no `ip[:port]` form", which stopped being true
-/// when `whois` grew both (`tests/whois_flow_arguments.rs`). That first cell renders today,
-/// unaffected by the pipe, so escaping the pipe would not mislead anyone who is not already misled;
-/// the reason to wait is that the real repair is a rewrite of the row, and rewrites of §4.5 belong
-/// to the pass that owns the ledger, which cannot take a second concurrent branch on the same
-/// lines. The escape lands with that rewrite. Until then the row is recorded here so it cannot be
-/// quietly forgotten.
-const KNOWN_SPLIT_ROWS: &[(&str, &str)] = &[(
-    "docs/PARITY_GAP_ANALYSIS.md",
-    "`tnet whois` has no `--proto`, and no `ip[:port]` form",
-)];
+/// Empty today, and that is the intended resting state — every table in the repository renders
+/// with all the text its source holds.
+///
+/// The one entry this list ever carried was `docs/PARITY_GAP_ANALYSIS.md`'s whois row, whose
+/// `` `--proto tcp|udp` `` truncated the rendered cell. It was deferred rather than defended: the
+/// row was *also* stale (it asserted `whois` had no `--proto` and no `ip[:port]` form, which
+/// stopped being true in `tests/whois_flow_arguments.rs`), so the real repair was a rewrite of the
+/// row, and rewrites of §4.5 belong to the pass that owns the ledger. That pass has now run: the
+/// row is gone, replaced by one about the response half of the same gap, and it carries no pipe.
+/// The list stays because the next such row should be recorded here rather than silently tolerated,
+/// and [`the_recorded_exception_is_still_needed`] deletes any entry that stops being needed.
+const KNOWN_SPLIT_ROWS: &[(&str, &str)] = &[];
 
 /// What went wrong with one line of one table.
 #[derive(Debug, PartialEq, Eq)]
@@ -512,10 +513,12 @@ fn the_inventory_excludes_only_the_vendored_and_the_named() {
     );
 }
 
-/// The self-retiring half. `KNOWN_SPLIT_ROWS` is a deferral, not a licence: once the ledger pass
-/// rewrites the whois row, this fails and the entry has to go with it — which is the only way a
-/// recorded exception stays honest. Each entry is checked against the row it names, not against
-/// "some surviving defect in that document", so a second entry cannot hide behind the first.
+/// The self-retiring half. `KNOWN_SPLIT_ROWS` is a deferral, not a licence: once a recorded row is
+/// repaired, this fails and the entry has to go with it — which is the only way a recorded
+/// exception stays honest. It is what retired the whois entry when the ledger pass rewrote that
+/// row. Each entry is checked against the row it names, not against "some surviving defect in that
+/// document", so a second entry cannot hide behind the first. With the list empty it passes
+/// vacuously, which is the correct reading: nothing is deferred, so nothing is owed.
 #[test]
 fn the_recorded_exception_is_still_needed() {
     let defects = all_table_defects();
