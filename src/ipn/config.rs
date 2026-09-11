@@ -205,13 +205,24 @@ pub(super) async fn build_config(
     }
     // Tailscale SSH server preflight. Unlike TUN, SSH is NOT an engine `Config` knob — the server
     // is a daemon-spawned task (see `spawn_ssh_task`), so `ssh_enabled` sets NO field on
-    // `config`. It only gates the spawn, plus these two fail-loud preflights mirroring TUN's, so
+    // `config`. It only gates the spawn, plus these three fail-loud preflights mirroring TUN's, so
     // an impossible `--ssh` fails the bring-up here rather than silently doing nothing:
-    // (a) built without the `ssh` cargo feature → there is no server to spawn; and
-    // (b) running as non-root → the engine's `listen_ssh` must drop privileges to the
+    // (a) the host or its operator has ruled the server out — Go's `featureknob.CanRunTailscaleSSH`,
+    //     chiefly `TS_DISABLE_SSH_SERVER`, the administrative off-switch an image build or a
+    //     configuration-managed host uses to hold the SSH server down regardless of the prefs;
+    // (b) built without the `ssh` cargo feature → there is no server to spawn; and
+    // (c) running as non-root → the engine's `listen_ssh` must drop privileges to the
     //     policy-mapped local user, which requires root, so the session would fail closed.
-    // Both fail loudly here (never a silent no-SSH node when SSH was explicitly requested).
+    // All three fail loudly here (never a silent no-SSH node when SSH was explicitly requested).
+    //
+    // (a) is checked FIRST, matching Go, where `checkSSHPrefsLocked` calls `CanRunTailscaleSSH()`
+    // before anything else: on a host that is administratively barred from running SSH at all, that
+    // is the sentence the operator needs, not an invitation to rebuild with another cargo feature.
+    // The `up`/`set` paths run the same gate BEFORE persisting, so this is the merged-pref backstop —
+    // it catches an `ssh_enabled` that was persisted before the knob was set on the host, including
+    // one that arrived through the config file (`RunSSHServer`) or the daemon's auto-start.
     if prefs.ssh_enabled {
+        crate::featureknob::can_run_tailscale_ssh()?;
         #[cfg(not(feature = "ssh"))]
         {
             return Err(anyhow!(
