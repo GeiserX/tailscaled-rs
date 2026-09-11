@@ -110,8 +110,9 @@ pub struct Prefs {
     /// registration and on every map request when this is `Some(true)`, so the admin console knows
     /// the node accepts remote update triggers. It advertises the bool ONLY: this daemon runs no
     /// background updater — `tnet update` is a manual, operator-invoked command — so nothing here
-    /// acts on a trigger. Setting it is therefore an explicit operator statement of intent: *if* a
-    /// trigger arrives, an operator will run the update on this node.
+    /// acts on a trigger. Setting it is therefore an explicit operator statement of intent, not a
+    /// capability claim the daemon fulfils on its own: *if* a trigger arrives, an operator will run
+    /// the update on this node.
     ///
     /// Which is exactly why the opt-in is **refused where that promise is impossible to keep**.
     /// `Some(true)` is accepted only on an installation that can replace its own binary — the same
@@ -128,6 +129,12 @@ pub struct Prefs {
     /// since this daemon has no background updater to honour a trigger with. That would delete a
     /// pref the fork carries on purpose, so the line is drawn at what can be checked rather than
     /// argued — whether an update could physically be applied here at all.
+    ///
+    /// The trigger itself is a control-to-node (c2n) call — Go's `GET`/`POST /update`
+    /// (`feature/clientupdate/clientupdate.go`), which reads this pref as its `Enabled` field. The
+    /// engine owns the c2n session and offers no way to register a handler, so there is nothing to
+    /// receive it — which is why the promise above is an operator's to keep, not the daemon's.
+    /// Filed as ask #43 in `docs/ENGINE_ASKS.md`.
     pub auto_update_apply: Option<bool>,
     /// Whether a background updater should *check* for available updates (Go `tailscale set
     /// --update-check` / `ipn.Prefs.AutoUpdate.Check`). **Default `true`**, matching Go's
@@ -172,6 +179,10 @@ pub struct Prefs {
     /// responder, so control never pulls and the on-the-wire behavior is byte-for-byte the
     /// posture-disabled case. There is deliberately no `Hostinfo` field to advertise it. Persisted
     /// and threaded through so the pref state is faithful and a future c2n responder has its input.
+    ///
+    /// The pull is Go's `GET /posture/identity` (`feature/posture/posture.go`). The engine owns the
+    /// c2n session and offers no way to register a handler, so the responder cannot live here until
+    /// it does. Filed as ask #43 in `docs/ENGINE_ASKS.md`.
     pub posture_checking: bool,
     /// Run a local web client for managing this node (Go `tailscale set --webclient` /
     /// `ipn.Prefs.RunWebClient`). Default `false`. Maps to the engine `Config.run_web_client`.

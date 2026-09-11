@@ -24,6 +24,9 @@
 //!   (the engine's graceful teardown never ran), so a crash cannot outlive the daemon.
 //! - [`tunflag`] — `tailnetd --tun`, Go's tunnel-interface flag, resolved onto this fork's TUN
 //!   prefs so a `tailscaled` command line copied from a unit file or a container image starts.
+//! - [`featureknob`] — the host/operator gates on optional features: whether this machine may run
+//!   the Tailscale SSH server at all, including the `TS_DISABLE_SSH_SERVER` administrative
+//!   off-switch an image build or a configuration-managed host uses to hold it down.
 //! - [`portmap`] — the NAT-PMP / PCP / UPnP-IGD port-mapping client: ask the LAN router to open a
 //!   hole so peers can reach this node directly instead of through a relay.
 //!
@@ -33,6 +36,7 @@ pub mod auth;
 pub mod conffile;
 pub mod debugmode;
 pub mod debugserver;
+pub mod featureknob;
 pub mod goduration;
 pub mod hardening;
 pub mod hostreap;
