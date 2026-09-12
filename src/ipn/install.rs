@@ -445,6 +445,24 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_plist_documents_the_operator_env_file() {
+        // The plist this installer writes is the macOS counterpart of the systemd unit's
+        // `EnvironmentFile=-/etc/default/tailnetd`, except launchd has no such directive: the daemon
+        // reads the file itself (`crate::envknob`). The plist is therefore the only place an operator
+        // looking for "where do I set an envknob" will look, so it must NAME that file — and it must
+        // name the one the daemon actually reads, which is why this asserts the constant rather than
+        // a literal. `tnet install` rewrites this plist verbatim, so a dict edit does not survive;
+        // the pointer to the file that does is what keeps that from being a silent trap.
+        let p = plan().expect("macos plan");
+        assert!(
+            p.unit_content.contains(crate::envknob::MACOS_ENV_FILE),
+            "embedded plist must point operators at {} for their own environment",
+            crate::envknob::MACOS_ENV_FILE
+        );
+    }
+
     // On an unsupported OS, `plan()` must surface a clear error rather than a bogus plan. This arm
     // only compiles off Linux/macOS, so it is a no-op on the CI targets — present for completeness.
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]

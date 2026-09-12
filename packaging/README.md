@@ -136,6 +136,49 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/cloud.tailscaled-rs.tailn
 State lives under `/usr/local/var/tailnetd`; logs are written to
 `/var/log/tailnetd.log` and `/var/log/tailnetd.err.log`.
 
+## 2c. Setting the daemon's environment (envknobs)
+
+`tailnetd` reads administrative environment variables at the moment it decides — for example
+`TS_DISABLE_SSH_SERVER=1` (never run the Tailscale SSH server on this host) and
+`TS_DISABLE_PORTMAPPER=1` (never ask the router for a port mapping), plus `TAILNETD_LOG`,
+`TAILNETD_STATE_DIR`, `PORT` and `TS_AUTH_KEY`. A daemon you do not launch by hand needs a file
+to put those in, and each platform has exactly one:
+
+| Platform | File | Read by |
+| --- | --- | --- |
+| Linux (systemd) | `/etc/default/tailnetd` | systemd, via the unit's `EnvironmentFile=-/etc/default/tailnetd` |
+| macOS (launchd) | `/etc/tailnetd/tailnetd-env.txt` | `tailnetd` itself, before it parses a flag |
+
+Both are optional; an absent file simply means no extra environment.
+
+> [!IMPORTANT]
+> On macOS, do **not** add your keys to the plist's `EnvironmentVariables` dict. That plist is
+> embedded in the `tailnetd` binary and rewritten verbatim by `tnet install` (and by
+> `packaging/macos/install.sh`), so your additions are lost on the next install.
+> `/etc/tailnetd/tailnetd-env.txt` is yours; nothing the installer runs touches it.
+
+```bash
+sudo mkdir -p /etc/tailnetd
+sudo tee /etc/tailnetd/tailnetd-env.txt >/dev/null <<'EOF'
+# Administrative envknobs for this host.
+TS_DISABLE_SSH_SERVER=1
+TS_DISABLE_PORTMAPPER=1
+TAILNETD_LOG=debug
+EOF
+# It is read by the root daemon and may hold secrets: keep it root-only.
+sudo chown root:wheel /etc/tailnetd/tailnetd-env.txt
+sudo chmod 0600 /etc/tailnetd/tailnetd-env.txt
+sudo launchctl kickstart -k system/cloud.tailscaled-rs.tailnetd   # restart to pick it up
+```
+
+Format (the same one Go's `tailscaled-env.txt` uses): one `KEY=value` per line, cut at the
+**first** `=`; blank lines and lines starting with `#` are ignored; both halves are trimmed; a
+value that starts with `"` is unquoted as a Go string literal, so `TS_X="  keep  spaces  "` and
+`TS_X="a # not a comment"` work. A value that starts with a quote but is not a valid literal
+(e.g. an unterminated one) **refuses the whole file**, and the daemon exits at startup naming the
+file, the line number and the line — a half-applied environment would be worse than a daemon that
+does not start.
+
 ## Talking to the daemon: `tnet` and the LocalAPI socket
 
 The daemon serves its LocalAPI on a Unix socket inside its state directory
@@ -195,12 +238,14 @@ disk:
   Environment=TS_AUTH_KEY=tskey-auth-XXXXXXXX
   ```
   which is stored at `/etc/systemd/system/tailnetd.service.d/override.conf`.
-- **launchd:** add a `TS_AUTH_KEY` entry to the plist's `EnvironmentVariables` dict.
+- **launchd:** add `TS_AUTH_KEY=tskey-auth-XXXXXXXX` to `/etc/tailnetd/tailnetd-env.txt`
+  (see [2c](#2c-setting-the-daemons-environment-envknobs)) — **not** to the plist's
+  `EnvironmentVariables` dict, which `tnet install` rewrites.
 
 > [!CAUTION]
-> The drop-in / plist approach leaves the auth key in plaintext in a unit/override file (and it
-> can leak via `systemctl show`). Prefer `tnet up --authkey-file`. If you do use a drop-in,
-> `chmod 0600` the override file and rotate/revoke the key after first use.
+> The drop-in / env-file approach leaves the auth key in plaintext in a file on disk (and on
+> Linux it can leak via `systemctl show`). Prefer `tnet up --authkey-file`. If you do use one,
+> `chmod 0600` the file and rotate/revoke the key after first use.
 
 ## 4. View logs
 
