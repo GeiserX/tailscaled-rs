@@ -4092,10 +4092,30 @@ impl Backend {
     /// web serve is full-replaced (an emptied web config is cleared) — all without disturbing the
     /// device.
     ///
-    /// **Refuses** (before persisting, leaving the live serve untouched) an incoming config that
-    /// would change the serve type of a port the current config already serves — Go
-    /// `validateServeConfigUpdate`; see [`serve::validate_serve_config_update`].
+    /// **Refuses** (before persisting, leaving the live serve untouched), in Go's order:
+    ///
+    /// 1. an incoming config that turns Funnel on while `shields_up` is set — Go
+    ///    `setServeConfigLocked`'s first statement (`config.IsFunnelOn() && prefs.ShieldsUp()`);
+    /// 2. an incoming config that would change the serve type of a port the current config already
+    ///    serves — Go `validateServeConfigUpdate`; see [`serve::validate_serve_config_update`].
     pub async fn set_serve_config(&mut self, cfg: &serve::ServeConfig) -> Result<()> {
+        // Funnel publishes a port to the PUBLIC internet; shields-up blocks every inbound connection
+        // (it is `Config.block_incoming`). A node with both accepts nothing on the endpoint it just
+        // advertised, and neither `tnet serve status` nor `tnet status` shows the contradiction — so
+        // the only honest answer is a refusal at the moment the pair would be created. Go refuses it
+        // as the FIRST statement of `setServeConfigLocked`, ahead of its own serve-type validation,
+        // and this guard keeps that order: under shields-up, a funnel-enabled config is refused for
+        // being funnel-enabled, whatever else is also wrong with it. The message is Go's verbatim —
+        // it reaches the operator as the `SetServeConfig` error body.
+        //
+        // `serve::funnel_ports` is the analogue of Go's `ServeConfig.IsFunnelOn` (the ports with a
+        // `true` AllowFunnel entry), so this fires for EVERY road into the daemon's single setter:
+        // the `set-serve-config` LocalAPI verb, `tnet funnel <port> on`, the `funnel --https=…` flag
+        // grammar, and the foreground serve path restoring a previous config on exit — a restore
+        // that would re-arm Funnel under shields-up fails exactly like a fresh `funnel` would.
+        if !serve::funnel_ports(cfg).is_empty() && self.prefs.shields_up {
+            anyhow::bail!("Unable to turn on Funnel while shields-up is enabled");
+        }
         // Refuse a change that would silently destroy a live serve BEFORE anything is written: an
         // incoming config may not change the serve type of a port the current config already serves
         // (Go `validateServeConfigUpdate`). Every CLI write is a read-modify-write of the current
@@ -5249,6 +5269,132 @@ mod tests {
         serve::set_tcp_forward(&mut tcp, 443, "127.0.0.1:8000".into());
         be.set_serve_config(&tcp).await.expect("tcp after off");
         assert_eq!(be.serve_config().await, tcp);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn funnel_under_shields_up_is_refused_on_every_road() {
+        // Shields-up blocks every inbound connection; Funnel publishes a port to the public
+        // internet. A node with both advertises an endpoint that accepts nothing, and no status
+        // output says so — so the setter refuses the pair at the moment it would be created, with
+        // Go's message (`setServeConfigLocked`'s first statement). Every road into the daemon (the
+        // LocalAPI verb, `tnet funnel`, the flag grammar, the foreground restore) lands on this one
+        // function, so one guard covers them all — including the restore, exercised below.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-funnel-shields-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+        be.prefs.shields_up = true;
+
+        // Port 443 terminates HTTPS to a local backend, with Funnel on — what `tnet funnel
+        // --https=443 http://127.0.0.1:3000` (or `tnet funnel 443 on`) writes.
+        let mut funnel = serve::ServeConfig::default();
+        funnel.tcp.insert(
+            "443".into(),
+            crate::localapi::TcpPortHandler {
+                https: true,
+                tcp_forward: "127.0.0.1:3000".into(),
+                ..Default::default()
+            },
+        );
+        serve::set_funnel(&mut funnel, "host.example.ts.net", 443, true);
+
+        let err = be
+            .set_serve_config(&funnel)
+            .await
+            .expect_err("funnel-on under shields-up must be refused");
+        assert_eq!(
+            format!("{err:#}"),
+            "Unable to turn on Funnel while shields-up is enabled",
+            "Go's message verbatim — it is what the operator is shown"
+        );
+        assert_eq!(
+            be.serve_config().await,
+            serve::ServeConfig::default(),
+            "a refused update must not have been persisted"
+        );
+
+        // The guard is Funnel-specific: a funnel-free serve is tailnet-only, so shields-up does not
+        // refuse it (Go gates on `IsFunnelOn`, not on serving at all).
+        let mut plain = serve::ServeConfig::default();
+        serve::set_tcp_forward(&mut plain, 8443, "127.0.0.1:5000".into());
+        be.set_serve_config(&plain)
+            .await
+            .expect("a funnel-free serve is untouched by the guard");
+        assert_eq!(be.serve_config().await, plain);
+
+        // Shields down → the same funnel config goes through.
+        be.prefs.shields_up = false;
+        be.set_serve_config(&funnel)
+            .await
+            .expect("funnel with shields down");
+        assert_eq!(
+            serve::funnel_ports(&be.serve_config().await),
+            std::collections::BTreeSet::from([443])
+        );
+
+        // Enabling shields-up behind the daemon's back must not trap the operator: turning Funnel
+        // OFF is a config with no funnel port, so it still goes through and the bad pair can be
+        // undone from either side.
+        be.prefs.shields_up = true;
+        let mut off = funnel.clone();
+        serve::set_funnel(&mut off, "host.example.ts.net", 443, false);
+        be.set_serve_config(&off)
+            .await
+            .expect("turning funnel off under shields-up must still be allowed");
+        assert!(
+            serve::funnel_ports(&be.serve_config().await).is_empty(),
+            "funnel must actually be off"
+        );
+
+        // The restore road: a foreground serve re-sends the config it captured on entry when it
+        // exits. If shields-up arrived in between, that restore would re-arm Funnel — and it is
+        // refused exactly like a fresh `funnel` is, leaving the persisted config alone.
+        let err = be
+            .set_serve_config(&funnel)
+            .await
+            .expect_err("a restore that re-arms funnel under shields-up must be refused too");
+        assert_eq!(
+            format!("{err:#}"),
+            "Unable to turn on Funnel while shields-up is enabled"
+        );
+        assert_eq!(
+            be.serve_config().await,
+            off,
+            "the refused restore left the live config untouched"
+        );
+
+        // Go's ORDER: the shields-up refusal is the first statement of the setter, ahead of the
+        // serve-type validation. A config that is wrong in both ways is refused for the Funnel, …
+        let mut both_wrong = off.clone();
+        both_wrong.tcp.insert(
+            "443".into(),
+            crate::localapi::TcpPortHandler {
+                tcp_forward: "127.0.0.1:8000".into(),
+                ..Default::default()
+            },
+        );
+        serve::set_funnel(&mut both_wrong, "host.example.ts.net", 443, true);
+        let err = be
+            .set_serve_config(&both_wrong)
+            .await
+            .expect_err("refused for the funnel, ahead of the serve-type conflict");
+        assert_eq!(
+            format!("{err:#}"),
+            "Unable to turn on Funnel while shields-up is enabled"
+        );
+        // … and the serve-type conflict really was there, which is what makes the order observable.
+        be.prefs.shields_up = false;
+        let err = be
+            .set_serve_config(&both_wrong)
+            .await
+            .expect_err("the same config still trips the serve-type rule with shields down");
+        assert_eq!(
+            format!("{err:#}"),
+            r#"want to serve "tcp", but port 443 is already serving "https""#
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
