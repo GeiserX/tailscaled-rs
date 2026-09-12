@@ -443,7 +443,8 @@ pub fn serve_type(h: &TcpPortHandler) -> ServeType {
 /// gone with no diagnostic. Go refuses it. The rule is Go's: **for every port the incoming config
 /// serves that the existing config already serves, the two handlers must classify to the same
 /// [`ServeType`]** ([`serve_type`]); otherwise the port must be taken down first (`tnet serve
-/// --https=443 off`) and re-served.
+/// --https=443 off`) and re-served. Ports are matched by PARSED value, so an alias spelling of a
+/// busy port (`"0443"`, `"+443"`) is the same port as `"443"` and is refused the same way.
 ///
 /// The returned message is Go's format string verbatim — `want to serve %q, but port %d is already
 /// serving %q` — because Go's own comment on this function says its errors are shown to CLI users
@@ -478,23 +479,39 @@ pub fn validate_serve_config_update(
     existing: &ServeConfig,
     incoming: &ServeConfig,
 ) -> Result<(), String> {
-    // Incoming configuration cannot change the serve type in use by a port.
+    // Incoming configuration cannot change the serve type in use by a port. Ports are matched by
+    // their PARSED value, never by the raw map key: this fork keys
+    // [`ServeConfig::tcp`](crate::localapi::ServeConfig::tcp) by string (see that field for why),
+    // and `u16::from_str` accepts leading zeros and a leading `+`, so `"443"`, `"0443"` and
+    // `"+443"` are three distinct keys naming ONE tailnet port. They all arm it, too — every reader
+    // of the map parses the key ([`build_web_serve_state`], the lane dispatch in the backend's
+    // `spawn_serve`). Comparing raw keys therefore skipped the refusal for any spelling that did
+    // not match character-for-character, which is exactly the hole this function exists to close.
+    // Go has no such alias: its `ServeConfig.TCP` is keyed `uint16`, so `encoding/json` parses the
+    // key at decode time and both spellings are already the same map entry before its check runs.
     for (port_str, incoming_handler) in &incoming.tcp {
-        let Some(existing_handler) = existing.tcp.get(port_str) else {
-            continue; // A port nothing serves yet is free.
-        };
         let Ok(port) = port_str.parse::<u16>() else {
             // Not a tailnet port at all; the rest of the serve code skips such a key rather than
             // serving it, so there is no live serve to protect and nothing to name in the message.
             continue;
         };
-        let existing_type = serve_type(existing_handler);
         let incoming_type = serve_type(incoming_handler);
-        if incoming_type != existing_type {
-            return Err(format!(
-                "want to serve \"{incoming_type}\", but port {port} is already serving \
-                 \"{existing_type}\""
-            ));
+        // Every existing key that names this port, not just the identically spelled one (a port
+        // nothing serves yet matches none of them and is free). An existing config holding two
+        // aliases of one port arms both handlers, so a conflict with EITHER is a conflict.
+        for existing_handler in existing
+            .tcp
+            .iter()
+            .filter(|(k, _)| k.parse::<u16>().is_ok_and(|p| p == port))
+            .map(|(_, h)| h)
+        {
+            let existing_type = serve_type(existing_handler);
+            if incoming_type != existing_type {
+                return Err(format!(
+                    "want to serve \"{incoming_type}\", but port {port} is already serving \
+                     \"{existing_type}\""
+                ));
+            }
         }
     }
     Ok(())
@@ -1525,6 +1542,94 @@ mod tests {
             Err(r#"want to serve "tcp", but port 443 is already serving "https""#.to_string()),
             "Go's message verbatim — it is what the operator is shown"
         );
+    }
+
+    #[test]
+    fn an_alias_spelling_of_a_busy_port_is_refused_like_the_port_itself() {
+        // `ServeConfig::tcp` is keyed by string, so `"443"` and `"0443"` are two map keys — but
+        // every reader of the map parses the key, so both arm tailnet port 443. Matching raw keys
+        // let the second one straight through: the https serve stayed under `"443"` while `"0443"`
+        // armed a plain TCP forward on the same port, which is the silent replacement this check
+        // exists to refuse, reached by spelling the port differently.
+        let tcp = TcpPortHandler {
+            tcp_forward: "127.0.0.1:8000".into(),
+            ..Default::default()
+        };
+
+        let mut existing = ServeConfig::default();
+        go_web(
+            &mut existing,
+            "host.example.ts.net",
+            443,
+            true,
+            "127.0.0.1:3000",
+        );
+
+        // A read-modify-write that keeps the live `"443"` entry and adds the alias beside it.
+        let mut incoming = existing.clone();
+        incoming.tcp.insert("0443".into(), tcp.clone());
+        assert_eq!(
+            validate_serve_config_update(&existing, &incoming),
+            Err(r#"want to serve "tcp", but port 443 is already serving "https""#.to_string()),
+            "an alias key names the same tailnet port, and the message names the parsed port"
+        );
+
+        // The same with the alias alone (the existing entry dropped in the same write), and with
+        // the `+` sign `u16::from_str` also accepts.
+        let mut incoming = ServeConfig::default();
+        incoming.tcp.insert("0443".into(), tcp.clone());
+        assert_eq!(
+            validate_serve_config_update(&existing, &incoming),
+            Err(r#"want to serve "tcp", but port 443 is already serving "https""#.to_string())
+        );
+        let mut incoming = ServeConfig::default();
+        incoming.tcp.insert("+443".into(), tcp.clone());
+        assert_eq!(
+            validate_serve_config_update(&existing, &incoming),
+            Err(r#"want to serve "tcp", but port 443 is already serving "https""#.to_string())
+        );
+
+        // …and the other direction: the alias is what is in force, the canonical spelling arrives.
+        let mut existing = ServeConfig::default();
+        existing.tcp.insert(
+            "08443".into(),
+            TcpPortHandler {
+                terminate_tls: "host.example.ts.net".into(),
+                tcp_forward: "127.0.0.1:3000".into(),
+                ..Default::default()
+            },
+        );
+        let mut incoming = ServeConfig::default();
+        incoming.tcp.insert("8443".into(), tcp.clone());
+        assert_eq!(
+            validate_serve_config_update(&existing, &incoming),
+            Err(
+                r#"want to serve "tcp", but port 8443 is already serving "tls-terminated-tcp""#
+                    .to_string()
+            )
+        );
+
+        // Matching by parsed port only ADDS refusals for the same serve type: re-targeting port
+        // 8443's forward under an alias key is still a re-target, not a conflict.
+        let mut existing = ServeConfig::default();
+        set_tcp_forward(&mut existing, 8443, "127.0.0.1:22".into());
+        let mut incoming = ServeConfig::default();
+        incoming.tcp.insert("08443".into(), tcp.clone());
+        assert_eq!(validate_serve_config_update(&existing, &incoming), Ok(()));
+
+        // A non-numeric key is still not a port: no parse, no live serve to protect, no refusal —
+        // and it never collides with a numeric one.
+        let mut existing = ServeConfig::default();
+        existing.tcp.insert(
+            "https".into(),
+            TcpPortHandler {
+                https: true,
+                ..Default::default()
+            },
+        );
+        let mut incoming = ServeConfig::default();
+        incoming.tcp.insert("443".into(), tcp);
+        assert_eq!(validate_serve_config_update(&existing, &incoming), Ok(()));
     }
 
     #[test]
