@@ -8,10 +8,12 @@
 //!
 //! 1. **default deny.** A daemon with no policy file refuses `shutdown` from its own owner and KEEPS
 //!    SERVING. The refusal is not a rejected frame on a dying daemon — the next request still works.
-//! 2. **the stop itself.** With `AllowTailscaledRestart` set, the caller is acknowledged *first* and
-//!    only then does `serve` unwind: the reply arrives, the accept loop ends, and the socket is
-//!    unlinked on the way out, exactly as it is on SIGINT/SIGTERM. No `process::exit` — which is
-//!    what lets the daemon's own teardown (state file, live device) run at all.
+//! 2. **the stop itself.** With `AllowTailscaledRestart` set, the caller is acknowledged and the
+//!    daemon then stops on the verb alone — no signal is ever sent: the reply is delivered, the
+//!    accept loop ends, and the socket is unlinked on the way out, exactly as it is on
+//!    SIGINT/SIGTERM. No `process::exit` — which is what lets the daemon's own teardown (state
+//!    file, live device) run at all. The write-then-notify ORDER inside the handler is not pinned
+//!    here; see the note at the end of the test for why it cannot be, from outside the process.
 //!
 //! The refusal *ladder* — which rung answers, in which order — is unit-tested against the production
 //! predicate in `src/server.rs` (`shutdown_verdict`), where both rungs are reachable. Here the peer
@@ -62,8 +64,12 @@ impl Harness {
     /// no auth key) and spawn the real `server::serve` on a unique socket inside it.
     async fn start() -> Harness {
         let n = UNIQUE.fetch_add(1, Ordering::Relaxed);
+        // Kept as short as the existing integration harness's (`tailnetd-it-<pid>-<n>` in
+        // `tests/localapi_loop.rs`): the socket goes INSIDE this directory, and `sun_path` is 104
+        // bytes including the NUL, so every byte spent on a prefix is a byte of `TMPDIR` budget a
+        // developer with a long temp directory no longer has.
         let state_dir =
-            std::env::temp_dir().join(format!("tailnetd-shutdown-{}-{}", std::process::id(), n));
+            std::env::temp_dir().join(format!("tailnetd-sd-{}-{}", std::process::id(), n));
         let _ = tokio::fs::remove_dir_all(&state_dir).await;
         tokio::fs::create_dir_all(&state_dir)
             .await
@@ -201,9 +207,13 @@ async fn shutdown_is_refused_by_default_and_stops_the_daemon_once_the_policy_all
          {accepted:?}"
     );
 
-    // The acknowledgement above arrived BEFORE the stop — that ordering is the port (Go writes and
-    // flushes its 200 before publishing the event), and reading it is what proves the caller is not
-    // left guessing whether a daemon that vanished ever accepted the request.
+    // What the wait below pins is that the reply was DELIVERED and the daemon then stopped on the
+    // verb alone, with no signal sent. It deliberately does not claim to prove the write-then-notify
+    // ORDER: a handler that notified first would still get its reply out inside `serve`'s drain
+    // window (`DRAIN_TIMEOUT`, `src/server.rs`), so this test passes either way. That ordering is
+    // held structurally instead, by the shape of the `Request::Shutdown` arm in `handle_conn`
+    // (`src/server.rs`) — acknowledge, flush, then notify — and there is no non-racy way to observe
+    // it from outside the process, so nothing here tries to.
     let Harness {
         state_dir,
         socket_path,
