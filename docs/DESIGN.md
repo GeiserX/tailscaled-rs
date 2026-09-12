@@ -126,9 +126,12 @@ of it off.)
   release/update feed for this fork's artifacts (the GitHub releases the CI already publishes are a
   candidate source) + an in-daemon updater. *Not-yet-built* (needs an update-feed decision, then
   wire it — no longer "there is no server, so never").
-- **`syspolicy`** — the MDM / device-management policy store (Windows registry / Apple managed-prefs /
-  Group Policy). To match: read the platform policy store and apply it over prefs. *Blocked* on the
-  per-OS policy-store readers (and most useful once Windows lands).
+- **`syspolicy`** — the MDM / device-management policy store. The `--syspolicy-file` JSON source is
+  *shipped*: it is resolved, reported (`tnet syspolicy list`/`reload`) and **applied over prefs** at
+  profile load and on every prefs write, so policy outranks `tnet set`, `tnet up` and `--config`
+  alike. The PLATFORM stores (Windows registry / Apple managed-prefs / Group Policy) are still
+  *blocked* on the per-OS policy-store readers (and most useful once Windows lands); they register as
+  additional sources under the same merge, so adding one is a registration call, not a redesign.
 - **`systray`** — Go's desktop system-tray GUI. To match: a tray app driving the LocalAPI. A real
   target when a desktop UX is wanted; *not-yet-built* (a separate UI surface, not daemon-internal).
 - **`configure` (synology / sysext / jetkvm / kubeconfig)** — host-specific setup glue. Each is a

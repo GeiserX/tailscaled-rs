@@ -12,7 +12,8 @@
 //!
 //! 1. the flag exists on `tailnetd`'s own command line, with Go's default path in `--help`;
 //! 2. a loaded file reaches the LocalAPI reply `tnet syspolicy list` renders — i.e. registration and
-//!    reporting are actually connected;
+//!    reporting are actually connected — and is APPLIED to the prefs a `Backend::load` comes up
+//!    with, over a persisted `prefs.json` that says the opposite;
 //! 3. a *broken* file is logged and the daemon still comes up and serves.
 //!
 //! Case 2 registers into a process-global registry (Go's `rsop` store list is global too), so it is
@@ -63,12 +64,15 @@ fn syspolicy_file_is_a_declared_flag_with_gos_default() {
 }
 
 /// A policy file the daemon loads must show up in the LocalAPI reply that `tnet syspolicy list`
-/// renders — the whole point of the bead, since the consuming side already existed and had nothing
-/// to report.
+/// renders — and then actually change the node.
 ///
 /// This drives the real production path end to end: [`syspolicy::load_json_policy_file`] (the body
-/// of the flag) followed by [`Backend::syspolicy_list`] / [`Backend::syspolicy_reload`] (the
-/// LocalAPI handlers `server::serve` dispatches to).
+/// of the flag), then [`Backend::syspolicy_list`] / [`Backend::syspolicy_reload`] (the LocalAPI
+/// handlers `server::serve` dispatches to), then [`Backend::load`] (the profile load a daemon start
+/// performs, which reconciles the policy into prefs).
+///
+/// The two halves are one test because registration is process-global (Go's `rsop` store list is
+/// too), and this is deliberately the only test in this binary that registers a source.
 #[test]
 fn a_loaded_policy_file_reaches_the_localapi_report() {
     let path = temp_path("loaded.json");
@@ -124,6 +128,58 @@ fn a_loaded_policy_file_reaches_the_localapi_report() {
         panic!("syspolicy_reload must reply with a policy report");
     };
     assert_eq!(reloaded, report);
+
+    // ---------------------------------------------------------------------------------------
+    // ...and is APPLIED to the node's prefs, not merely reported.
+    //
+    // Go does this in `ipnlocal.applySysPolicy`, reached from every prefs write and every profile
+    // load. `Backend::load` IS a profile load, so a daemon starting under this policy file must come
+    // up with the administrator's hostname, the administrator's exit node and the node wanting to
+    // run — over a persisted `prefs.json` that says the opposite on all three.
+    // ---------------------------------------------------------------------------------------
+    let state_dir = temp_path("applied-statedir");
+    let _ = std::fs::remove_dir_all(&state_dir);
+    std::fs::create_dir_all(&state_dir).expect("the temp state dir should be creatable");
+    let prefs_path = state_dir.join("prefs.json");
+    std::fs::write(
+        &prefs_path,
+        br#"{"want_running": false, "hostname": "operator-chose-this",
+             "exit_node": "some-other-peer", "has_logged_in": true}"#,
+    )
+    .expect("the temp prefs file should be writable");
+
+    let backend = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a current-thread runtime should build")
+        .block_on(Backend::load(&state_dir))
+        .expect("the backend should load the seeded profile");
+    let view = backend.prefs_view();
+    assert_eq!(
+        view.hostname.as_deref(),
+        Some("documented-node"),
+        "the policy's Hostname must beat the persisted one"
+    );
+    assert_eq!(
+        view.exit_node.as_deref(),
+        Some("192.0.2.10"),
+        "the policy's ExitNodeIP must beat the operator's exit node"
+    );
+    assert!(
+        backend.wants_running(),
+        "AlwaysOn.Enabled must force want_running back to true"
+    );
+
+    // A profile load applies in memory and writes NOTHING: this daemon derives "has this node ever
+    // been configured?" from the existence of `prefs.json`, so a policy file must never be able to
+    // create or rewrite one just by being present.
+    let on_disk =
+        std::fs::read_to_string(&prefs_path).expect("prefs.json should still be readable");
+    assert!(
+        on_disk.contains("operator-chose-this"),
+        "a profile load must not persist the policy's values:\n{on_disk}"
+    );
+    let _ = std::fs::remove_dir_all(&state_dir);
 }
 
 /// A policy file with a mistake in it is *logged* and the daemon **still comes up** — Go's hook is
