@@ -7,29 +7,34 @@ trees (the upstream `cmd/tailscaled`, `cmd/tailscale/cli`, `ipn/`, `net/`, `wgen
 this crate's `src/bin/{tailnetd,tnet}.rs`, `src/localapi.rs`, `src/ipn/`, `Cargo.toml`,
 `docs/ENGINE_ASKS.md`).
 
-- **The pin still cannot move, so this pass swept deeper again.** A fresh `git ls-remote --tags`
-  (2026-09-12) puts **v1.102.4** at the top of the stable list at the same commit; the only newer ref
-  is still `v1.103.0-pre`, the marker for the unstable branch, and this ledger tracks stable. That is
-  two consecutive refreshes with no release delta, so this one followed the footer's standing
-  instruction and read a layer the document had never read. The last two passes read the code that
-  decides whether a **command line** is well formed (`checkPrefsLocked` and the CLI's argument
-  grammar) and whether an **argument value** names something real (`exitNodeIPOfArg`,
-  `dnsname.ValidHostname`, `setServeConfigLocked`). This one read the layer above both — **who is
-  allowed to ask, and what an administrator can impose**: `applySysPolicyLocked` /
-  `applyExitNodeSysPolicyLocked` (`ipn/ipnlocal/local.go`), the always-on disconnect rule
-  (`ipn/ipnauth/policy.go`), the LocalAPI write-permission matrix (`IsReadonlyConn` in `ipn/ipnauth`,
-  `Permissions` in `ipn/ipnserver`), and the on-disk environment file that configures a daemon nobody
-  can pass flags to (`envknob.ApplyDiskConfig`).
-- **Five of the six gaps it found share one shape:** this fork carries the *inputs* of an upstream
-  administrative decision and never runs the decision. The syspolicy snapshot is parsed, typed and
-  printed but never applied to prefs; `--operator` is persisted but grants nobody anything;
-  `down --reason` is logged but gates nothing; `--advertise-routes` is checked route-by-route without
-  the rules Go applies to the route *set*; and the daemon honours administrative envknobs an operator
-  cannot durably set on a launchd host. The sixth is one the sweep tripped over on the way — a bare
-  `--advertise-tags server` that Go completes to `tag:server` and this fork refuses. None of them
-  needs an engine primitive: every one is daemon-buildable today.
-- **This crate:** `tailscaled-rs` v0.56.2 — daemon `tailnetd` + CLI `tnet`, over the
-  `geiserx_tailscale` engine. Six of the seven gaps the last refresh handed over have already merged
+- **Third refresh in a row where the pin cannot move, so this pass swept deeper again.** A fresh
+  `git ls-remote --tags` (2026-09-12) still puts **v1.102.4** at the top of the stable list at the same
+  commit; the only newer ref is still `v1.103.0-pre`, the marker for the unstable branch, and this
+  ledger tracks stable. The last pass read **who is allowed to ask, and what an administrator can
+  impose**, and the repo answered it fast: five of its six gaps merged inside a day, including the whole
+  of syspolicy *application* (`#445`) and the always-on disconnect gate (`#442`). That answer is what
+  made this pass possible, because it left one question standing that could not be asked before it.
+- **The layer this pass read: the policy client is more than `applySysPolicy`.** Nine upstream files
+  read the policy client at the pin, and the prefs table is only one of the things they ask it. The
+  rest have nothing to do with a pref: may this caller stop the daemon, may this user override
+  the administrator's exit node, how long may a permitted disconnect last, which exit nodes may be
+  *suggested*, is there an enrolment credential in the policy file, and what does a watcher on the
+  notify bus get told when the policy changes. So the exhaustive question this pass asked was not
+  "which keys does this fork parse" — it parses all of them — but **"which keys have a consumer, and
+  does this fork run it."**
+- **Six gaps, and they are the whole of the remainder.** Key by key: `AuthKey`, `ExitNode.AllowOverride`
+  (with the `managed by policy` refusal it relaxes), `ReconnectAfter` (with the `overrideAlwaysOn` flag
+  it needs), `AllowTailscaledRestart` (with the LocalAPI `shutdown` verb it gates),
+  `AllowedSuggestedExitNodes`, and the `NotifySysPolicyChanges` watch bit that pushes the snapshot to a
+  watcher. Every one of them is defined, typed and reported by `src/ipn/syspolicy.rs` today and read by
+  nothing. The rest of upstream's key set is accounted for and needs no bead: `Tailnet` and
+  `MachineCertificateSubject` are consumed inside the control session (engine-owned), `PostureChecking`
+  and `DeviceSerialNumber` answer a c2n pull (ask **#43**), `LogTarget` configures a log uploader this
+  fork does not have, `EnableDNSRegistration` belongs to the Windows DNS manager, and the
+  `ManagedBy*`/visibility/`KeyExpirationNotice` family drives a GUI this repo does not ship. Five of the
+  six are daemon-buildable today; one has a daemon-buildable half and an engine ask behind it.
+- **This crate:** `tailscaled-rs` v0.59.0 — daemon `tailnetd` + CLI `tnet`, over the
+  `geiserx_tailscale` engine. Five of the six gaps the last refresh handed over have already merged
   (§1).
 - **Engine pin:** `9d847a6e` — set 2026-08-12 and unchanged through every refresh since. The engine tree *after* the
   released **v0.43.0** (the release cut from this tree is `0.43.1`; the pin exists for a russh
@@ -56,7 +61,7 @@ this crate's `src/bin/{tailnetd,tnet}.rs`, `src/localapi.rs`, `src/ipn/`, `Cargo
 pie showData
     title Remaining work by gating factor (§4 rows)
     "Engine-gated (needs a new engine primitive)" : 25
-    "Small CLI / daemon-flag gaps (buildable)" : 23
+    "Small CLI / daemon-flag gaps (buildable)" : 24
     "Large multi-day subsystem" : 6
     "Distribution / packaging" : 5
     "Live-box verification (real tailnet)" : 5
@@ -70,11 +75,13 @@ diagnostics (`ip`/`whois`/`ping`/`netcheck`/`dns`/`metrics`/`bugreport`), Taildr
 Tailscale SSH **server** *and* host-key-pinned SSH **client**, serve/funnel (TCP + web) in Go's v2 flag
 grammar, exit-node use/advertise + **suggest**, subnet routes, TUN data path (feature-gated), TLS cert
 provisioning, tailnet-lock (init/status/log/sign/disable/disablement-kdf) in Go's own `lock init`
-argument grammar, profiles/switch, syspolicy *reporting* (over an admin-supplied `--syspolicy-file`
-source; the enforcement half is §4.5), a prefs-validation chain that now resolves a named
+argument grammar, profiles/switch, syspolicy *enforcement* (an admin-supplied `--syspolicy-file`
+source, resolved, reported **and applied to prefs** on every profile load and every prefs write, with
+an always-on gate that can refuse a `down`), a prefs-validation chain that now resolves a named
 `--exit-node` against the netmap and refuses an unhonourable auto-update opt-in or an
-administratively-disabled SSH server, a serve/funnel setter that refuses Funnel under shields-up and
-a second serve on a busy port, captive-portal detection, a **port-mapping client** (NAT-PMP + PCP
+administratively-disabled SSH server, an advertised-route **set** validated as a set (a lone default
+route and a malformed 4via6 prefix are both refused), a serve/funnel setter that refuses Funnel under
+shields-up and a second serve on a busy port, captive-portal detection, a **port-mapping client** (NAT-PMP + PCP
 mapping, UPnP-IGD discovery)
 behind `tnet debug portmap`, a SOCKS5 + HTTP outbound proxy, a debug-metrics HTTP server,
 systemd/launchd install with `sd_notify(READY=1)` (`Type=notify`), `configure kubeconfig` (with Go's
@@ -95,49 +102,62 @@ Taildrop file-arrival signal, the DERP map that would bring captive-portal detec
 into a NAT-traversal win); **distribution** (crates.io, `.deb`/`.rpm`); **live-tailnet verification**
 of paths CI can't reach; and a basket of **small CLI/daemon gaps**, in three flavours: command lines a
 Go user would reasonably type and this fork rejects; command lines this fork accepts and then does
-nothing with, because the value was never checked against anything real; and — the flavour this pass
-turned up — settings an *administrator* configures that this daemon stores, reports, and never acts
-on.
+nothing with, because the value was never checked against anything real; and settings an
+*administrator* configures that this daemon stores, reports, and never acts on. The third flavour is
+the one this pass worked, and it is now down to the keys whose consumer is something other than a
+pref.
 
-**What moved in this repo since the last refresh (2026-09-11 → 2026-09-12).** Six of the seven gaps
-the previous regeneration handed to the tracker merged inside a day, and the crate went 0.55.13 →
-0.56.2 on them alone. In merge order: the SSH server's administrative off switch, so
-`TS_DISABLE_SSH_SERVER=1` now refuses `set --ssh` instead of being ignored (`#426`); the second
-`serve` on a busy port, refused rather than silently replacing the first (`#429`, extended by `#431`
-to every spelling of the port key, because the first cut compared the key as written and a port
-reached by another spelling still slipped past); the auto-update opt-in an installation could never
-honour (`#430`); Funnel turned on under shields-up (`#433`); and the `--exit-node` argument, now
-resolved against the netmap with Go's refusals (`#435`). The seventh, the **c2n** channel, became
-engine ask **#43** rather than code (`#425`) — the right outcome, since the control session is
-engine-owned end to end. Only `--hostname` validation is still open from that batch, and it is still
-in §4.5. (The 2026-09-11 revision of this document records the twelve merges of the window before
-this one.)
+**What moved in this repo since the last refresh (2026-09-12, earlier the same day).** Five of the six
+gaps the previous regeneration handed to the tracker merged, and the crate went 0.56.2 → 0.59.0 on them
+alone. In merge order: the macOS operator seam, so a launchd-managed daemon reads
+`/etc/tailnetd/tailnetd-env.txt` for the administrative envknobs it already obeys (`#437`, Go's
+`envknob.ApplyDiskConfig`, refusing at startup with a line number rather than stashing the error for a
+health tracker this fork does not have); the advertised-route **set**, validated as a set, so a lone
+`0.0.0.0/0` and a malformed 4via6 prefix are both refused in Go's own words (`#439`, `src/routes.rs`);
+the `tag:` prefix Go completes for the operator, now completed daemon-side so `up` and `set` keep one
+notion of what a tag is (`#441`); the always-on disconnect gate, so `down`/`logout` are refused when the
+administrator set `AlwaysOn.Enabled` and the reason is required and audited when
+`AlwaysOn.OverrideWithReason` is set (`#442`, `src/ipn/alwayson.rs`); and syspolicy **application**, the
+largest of them, so `LoginURL`, `Hostname`, `ExitNodeIP`, `AlwaysOn.Enabled` and seven of Go's eight
+`preferencePolicies` rows now reach prefs at every point Go's `reconcilePrefs` runs (`#445`). Only
+`--operator` is still open from that batch, and it is still in §4.5. Two deliberate deviations came out
+of those merges and are recorded in §6 rather than re-filed as gaps: the route pairing rule is asked of
+the **composed** set here (Go asks it of the flag's literal argument, so
+`--advertise-routes=0.0.0.0/0 --advertise-exit-node` is an upstream error and an accepted command line
+here), and policy `ExitNodeID` is refused rather than applied, because this fork's exit node is a
+selector with no stable-node-id form and a selector that matches no peer egresses directly — the exact
+leak Go's blackhole id exists to prevent.
 
-**What the previous passes handed over and is still open.** Eight rows, all carried in §4.5 below:
-Go's single-dash long-flag spelling, the `--posture-checking` legacy spelling, the missing
-`mac-app-connector` risk, `--exit-node=auto:any`, `--config`'s unenforced and inverted `Locked`
-default, `set --shields-up` while Funnel is on, a `--nickname` another profile already holds, and
-`--hostname` accepted as any bytes at all.
+**What the previous passes handed over and is still open.** Nine rows, all carried in §4.5 below: Go's
+single-dash long-flag spelling, the `--posture-checking` legacy spelling, the missing
+`mac-app-connector` risk, `--exit-node=auto:any`, `--config`'s unenforced and inverted `Locked` default
+(now ruled on — if it is ever honoured it must sit *below* policy, see `#445`), `set --shields-up` while
+Funnel is on, a `--nickname` another profile already holds, `--hostname` accepted as any bytes at all,
+and `--operator`, which is persisted and grants nobody anything.
 
-**What this sweep found.** Six gaps, and they share a shape the last two passes did not turn up: this
-fork carries the **inputs** of an upstream administrative decision and never runs the decision. The
-biggest is the whole of syspolicy enforcement — `tnet syspolicy list` parses, types and prints every
-key `applySysPolicyLocked` reads, and not one of them reaches prefs, so an MDM `Hostname` or
-`ExitNodeID` or `AlwaysOn.Enabled` is visible and inert. `--operator` is persisted and handed to the
-engine while the LocalAPI write gate stays root-or-owner-uid, so the remedy Go's own access-denied
-message recommends changes nothing here. `down --reason` is sanitized and logged, but the policy the
-reason exists to satisfy — always-on mode with `AlwaysOn.OverrideWithReason` — is not enforced, so
-the reason is decoration. Below those, two narrower ones in the same family:
-`--advertise-routes` is checked route-by-route and never as a set, so a lone `0.0.0.0/0` is accepted
-where Go demands its IPv6 counterpart and a malformed 4via6 prefix is never validated; and
-`envknob.ApplyDiskConfig` has no counterpart, so the administrative envknobs this daemon now honours
-have a durable operator seam on systemd and none on launchd. The sixth belongs to an older flavour and
-was found on the way: Go completes a bare `--advertise-tags server` to `tag:server` before validating
-it, and this fork refuses it. Two other things the sweep expected to find were already ported, and are
-worth recording so the next pass does not re-derive them — Go's one cross-flag usage refusal
-(`--exit-node-allow-lan-access can only be used with --exit-node`) ships in `tnet`, and the LocalAPI's
-read/write split is already mapped verb by verb against Go's `PermitRead`/`PermitWrite` in
-`src/auth.rs`.
+**What this sweep found.** Six gaps, one layer, and — unusually for this document — an exhaustive
+answer rather than a sample. Now that `applySysPolicy` is ported, the honest question is what *else*
+upstream asks its policy client, and the answer is finite: nine Go files read it at the pin, and every
+key with a daemon-side consumer this fork does not run is listed below. `AuthKey` is the enrolment
+credential an administrator ships in the policy file so a fleet registers itself; Go reads it in `Start`
+behind two guards (no config file, no existing login profiles or state `NeedsLogin`) and this fork reads
+it nowhere, so the one key that gets a node onto the tailnet is inert. A policy-pinned exit node is
+*applied* here but not *locked*: Go refuses the edit outright with `exit node cannot be changed: managed
+by policy` unless `ExitNode.AllowOverride` says otherwise, where this fork accepts `tnet set
+--exit-node=<peer>`, reports success and silently persists the administrator's node instead — and the
+override key is read by nothing, so setting it changes nothing either. `ReconnectAfter` is the duration
+a permitted always-on disconnect is allowed to last; without it, and without the `overrideAlwaysOn` flag
+it pairs with, a disconnect the new gate allowed holds until the next reconcile point and is then undone
+at an arbitrary moment. `AllowTailscaledRestart` gates a LocalAPI `shutdown` verb that has no
+counterpart here at all. `AllowedSuggestedExitNodes` is the allow-list Go applies to suggestion
+candidates *before* ranking them, so `tnet exit-node suggest` can recommend a node the administrator
+excluded. And `NotifySysPolicyChanges` is the watch-mask bit that puts the effective snapshot on the
+notify bus, initially and on every change — this fork's snapshot is readable only by asking, which
+matters more here than upstream now that policy outranks a local `tnet set` on every write. Two things
+the sweep expected to find and did not are worth recording so the next pass does not re-derive them: the
+`envknob.CanSSHD()` arm of Go's `checkEditPrefsAccessLocked` is already ported (`#426`), and every
+remaining policy key either belongs to the control session, to c2n (ask **#43**), to Windows DNS, to a
+log uploader this fork does not have, or to a GUI this repo does not ship.
 
 ---
 
@@ -183,15 +203,20 @@ The consumed engine capabilities and shipped daemon features:
   `up`, `set` and `check-prefs` share ONE validation chain (Go's `checkPrefsLocked` and its children):
   a named `--exit-node` is resolved against the netmap with Go's own refusals (`#435`), an
   `--advertise-exit-node`/`--exit-node` conflict is refused, advertise-route CIDRs must be masked,
-  `--ssh` must clear both the build feature and `TS_DISABLE_SSH_SERVER` (`#426`), and an
+  `--ssh` must clear both the build feature and `TS_DISABLE_SSH_SERVER` (`#426`), an
   `--auto-update` opt-in must come from an installation that can actually replace its own binary
-  (`#430`).
+  (`#430`), a bare `--advertise-tags server` is completed to `tag:server` before `CheckTag` runs
+  (`#441`), and the advertised-route **set** is validated as a set — Go's `netutil.CalcAdvertiseRoutes`
+  pairing rule, `ValidateViaPrefix`, de-duplication and sort (`#439`, `src/routes.rs`). A `down` or
+  `logout` that would disconnect a node under `AlwaysOn.Enabled` is refused first of all (`#442`,
+  `src/ipn/alwayson.rs`).
 - **Status / observability:** `status` (+`--json`/`--watch`/filters/`--web`/`--browser`, behind Go's
   `isRunningOrStarting` gate), WatchNotifications (masked IPN-bus notify stream), `metrics`,
   `bugreport` (incl. `--diagnose`/`--record`), `netcheck` (DERP-latency scope, `--format`/`--every`/
   `--verbose`), `dns status` (incl. `--all`)/`query`, `syspolicy` (`list`/`reload`, over an
-  admin-supplied `tailnetd --syspolicy-file` device-scope source — **reporting only**; nothing is
-  applied to prefs, see §4.5), `ip`/`whois` (Go's `ip[:port]` +
+  admin-supplied `tailnetd --syspolicy-file` device-scope source — resolved, reported **and applied to
+  prefs** at profile load and on every prefs write (`#445`); the keys whose consumer is not a pref are
+  §4.5), `ip`/`whois` (Go's `ip[:port]` +
   `--proto` flow arguments)/`ping` (hostname or IP), `licenses`, **captive-portal detection** (Go's
   prober + the `captive-portal-detected` health warnable).
 - **Connectivity:** exit-node use/advertise + **suggest**, advertise-routes, accept-routes/dns,
@@ -227,7 +252,9 @@ The consumed engine capabilities and shipped daemon features:
 - **Daemon plumbing:** systemd + launchd install (`ExecStopPost=--cleanup`, `EnvironmentFile`,
   feature-aware TUN-vs-userspace unit, `Type=notify` via `sd_notify(READY=1)`), SOCKS5 proxy, outbound
   HTTP proxy (CONNECT), debug-metrics HTTP server, `--cleanup`, `--config` as a declarative *source*
-  (a path, `vm:user-data`, or either behind `optional:`), `--tun` in Go's own grammar, `--bird-socket`
+  (a path, `vm:user-data`, or either behind `optional:`), `--tun` in Go's own grammar, an
+  `/etc/tailnetd/tailnetd-env.txt` operator seam read before the runtime exists (`#437`, Go's
+  `envknob.ApplyDiskConfig`), `--bird-socket`
   and Go's two TPM flags accepted and refused by name, a `tailnetd debug` subcommand that diagnoses a
   node that never comes up without a running daemon, process hardening, IP-forwarding readiness check,
   link-change auto-rebind, macOS startup route/DNS reaper, `is_ssh_over_tailscale` `/proc`
@@ -274,7 +301,7 @@ would violate the honest-omission rule). Each rides the next pin bump once its a
 | `whois --proto`'s flow lookup (the response half) | `tsd-efv` (residual) | **#35** | The request half shipped (`#327`): `whois --proto=tcp <ip>:<port>` parses and reaches the daemon. The engine resolves a bare address only, so the proxied-flow distinction Go's `WhoIsProto` exists for is not yet honoured. |
 | `down --reason` / `logout --reason` reaching control | — | **#41** | Both flags ship and the reason is recorded locally, but Go submits it as a client audit log to control. The engine has no audit-log submission path. |
 | `switch --list`'s `Tailnet`/`Account` columns, and Go's `--nickname=` login-name restore | `tsd-91w` (residual) | **#42** | The engine joins user profiles for PEERS only; the self node carries no owning user, so a cleared nickname falls back to the profile id where Go restores the login name. |
-| The control-to-node (**c2n**) RPC channel — control can ask this node for nothing | *(previous pass)* | **#43** | Upstream registers ~20 handlers on an HTTP surface the control plane reaches over the existing noise session: `ipn/ipnlocal/c2n.go` (`RegisterC2N`/`handleC2N`, the `/debug/*` family, `/echo`, logtail flush, sockstats, netfilter-kind) plus `GET`+`POST /update`, `GET /posture/identity`, `GET /appconnector/routes`, `POST /wol`, `GET /vip-services`, `GET /tls-cert-status` and `/ssh/usernames`. The engine already runs the c2n dispatcher and answers `/echo` and `GET /vip-services` itself; what is missing is a way IN, so no daemon-side handler can be reached until the engine offers one. That is ask **#43** (`#425`). It is the missing mechanism behind three reductions this fork already documents one at a time: `--report-posture` is a carried pref because nothing answers the posture pull, `--auto-update` advertises `Hostinfo.AllowsUpdate` while nothing acts on a trigger, and ask #39's app-connector readback is the LocalAPI half of a readback control performs here. |
+| The control-to-node (**c2n**) RPC channel — control can ask this node for nothing | *(previous pass)* | **#43** | Upstream registers ~20 handlers on an HTTP surface the control plane reaches over the existing noise session: `ipn/ipnlocal/c2n.go` (`RegisterC2N`/`handleC2N`, the `/debug/*` family, `/echo`, logtail flush, sockstats, netfilter-kind) plus `GET`+`POST /update`, `GET /posture/identity`, `GET /appconnector/routes`, `POST /wol`, `GET /vip-services`, `GET /tls-cert-status` and `/ssh/usernames`. The engine already runs the c2n dispatcher and answers `/echo` and `GET /vip-services` itself; what is missing is a way IN, so no daemon-side handler can be reached until the engine offers one. That is ask **#43** (`#425`). It is the missing mechanism behind three reductions this fork already documents one at a time: `--report-posture` is a carried pref because nothing answers the posture pull — and with it the two policy keys that pull reads, `PostureChecking` (which overrides the pref) and `DeviceSerialNumber` — `--auto-update` advertises `Hostinfo.AllowsUpdate` while nothing acts on a trigger, and ask #39's app-connector readback is the LocalAPI half of a readback control performs here. |
 
 ### 4.2 Large multi-day subsystems (daemon-buildable, but each is a significant project)
 
@@ -311,12 +338,13 @@ would violate the honest-omission rule). Each rides the next pin bump once its a
 
 | Item | Bead | Note |
 | --- | --- | --- |
-| Syspolicy is **reported but never applied**, so every MDM setting is inert | *(new — filed by this pass)* | Go's `applySysPolicyLocked` overwrites prefs from the effective policy on every profile load and again whenever the policy changes (`registerSysPolicyWatch` → `reconcilePrefs` → `sysPolicyChanged`): `LoginURL` replaces `ControlURL`; `Hostname` sets it, or — when the key is present and empty — *clears* it, with a sentinel that distinguishes "unset" from "set to empty"; `applyExitNodeSysPolicyLocked` pins `ExitNodeID`/`ExitNodeIP` and parks an unresolved `auto:` expression on a blackhole id so traffic cannot leak past a policy that is still resolving; `AlwaysOn.Enabled` forces `WantRunning` back to true; and eight `preferencePolicies` keys drive shields-up, unattended mode, LAN access through an exit node, accept-dns, accept-routes, update checking, update installation and exit-node advertisement. `src/ipn/syspolicy.rs` already defines, types and merges every one of those keys, and its own module doc says the snapshot "is *reported*; it is not yet *applied* to prefs". `tailnetd` reads exactly two keys by name (`EncryptState`, `HardwareAttestation`) for its own startup refusals; nothing else in the daemon consults the snapshot. So an administrator can ship a policy file, watch `tnet syspolicy list` echo it back in full, and change nothing at all about the node. |
-| `--operator` is persisted but grants nobody anything | *(new — filed by this pass)* | Go's LocalAPI write gate is `ipnauth.ConnIdentity.IsReadonlyConn`: root writes; a non-root daemon whose uid matches the caller writes; **the uid named by `Prefs.OperatorUser`** writes; a local admin writes (`isLocalAdmin` — the `admin` group on darwin, `administrators` on QNAP); everyone else is read-only, and every arm logs the uid that decided it. `ipnserver`'s `Permissions` feeds that into `PermitRead`/`PermitWrite`, and `userIDFromString` accepts either a username or a numeric uid. `AuthPolicy::access_for_uid` (`src/auth.rs`) implements the first two arms only, and `Prefs::operator_user`'s own rustdoc says setting it "neither widens nor narrows who may drive the daemon". So `sudo tnet set --operator=$USER` — the remedy Go's own access-denied message tells people to run — does nothing, and this daemon's refusal text ("requires root or the same user that owns the daemon") does not mention the pref that is meant to fix it. Not `tsd-euv` (§4.2), which is about the LocalAPI *transport* rather than who may write over it. The local-admin arm *widens* access and wants its own ruling rather than a silent port. |
-| Always-on mode is not enforced, so `down --reason` gates nothing | *(new — filed by this pass)* | `ipnauth.CheckDisconnectPolicy` is the rule `--reason` exists for: with `AlwaysOn.Enabled` set, a disconnect is refused outright ("disconnect not allowed: always-on mode is enabled") unless `AlwaysOn.OverrideWithReason` is also set — in which case an empty reason is refused ("disconnect not allowed: reason required") and a non-empty one is written to the audit log. `onEditPrefsLocked` then records the override and arms the `ReconnectAfter` timer that brings the node back up, and `applySysPolicyLocked` forces `WantRunning` true again for as long as no override stands. This fork has both inputs and neither rule: `Down`/`Logout` sanitize the reason into the daemon log (`src/server.rs`), and `src/ipn/syspolicy.rs` already defines all three keys. Distinct from ask **#41**, which is the reason *reaching control* as a client audit log; this half is local and daemon-buildable. |
-| A Go command line that omits the `tag:` prefix is refused | *(new — filed by this pass)* | `prefsFromUpArgs` completes a bare `--advertise-tags` value before it validates it — "Allow users to omit the `tag:` prefix; if the tag has no colon at all, add it for them" — so `--advertise-tags server,ci` becomes `tag:server,tag:ci`, while a value that DOES contain a colon is passed through untouched and refused by `tailcfg.CheckTag` as written. This fork ports `CheckTag` faithfully (`validate_advertise_tags`, src/ipn/mod.rs) and skips the completion, so `tnet up --advertise-tags server` is refused where the same Go command line succeeds. Found while checking Go's one cross-flag usage refusal three lines above it (`--exit-node-allow-lan-access can only be used with --exit-node`), which this fork already ports. |
-| `--advertise-routes` is validated route-by-route, never as a set | *(new — filed by this pass)* | `netutil.CalcAdvertiseRoutes` is where Go turns the flag into a route set, and three of its rules have no counterpart here. A default route advertised in one family only is refused ("0.0.0.0/0 advertised without its IPv6 counterpart, please also advertise ::/0", and its mirror) — the check that stops a half-working exit node. A 4via6 prefix is validated by `ValidateViaPrefix` (inside the via range, at least a /96, site id no greater than 0xffff). And the set is deduplicated and sorted, with `--advertise-exit-node` folded in as the two default routes rather than carried as a separate flag. `tnet debug via` already carries the 4via6 bit-math and Go's "at least a /96" rule, and nothing applies it to an advertised route; the prefs path parses each route and checks only that it is masked (`Backend::check_prefs_gated`, and again in `src/conffile.rs`), so `tnet up --advertise-routes 0.0.0.0/0` is accepted and advertises half an exit node. |
-| `envknob.ApplyDiskConfig` has no counterpart, so a launchd host has no operator seam | *(new — filed by this pass)* | Go reads a `tailscaled-env.txt` of `KEY=value` lines at startup and applies it to its own environment: `/etc/tailscale/tailscaled-env.txt` for a non-sandboxed macOS daemon — the homebrew/`tailscaled`-on-macOS shape this fork ships — `%ProgramData%\Tailscale\tailscaled-env.txt` on Windows, and nothing on ordinary Linux, because `/etc/default/tailscaled` already covers it. Blank and `#` lines are skipped, a double-quoted value is `strconv.Unquote`d, and a parse failure is stashed for the health tracker (`ApplyDiskConfigError`). This fork ships the Linux equivalent in its systemd unit (`EnvironmentFile=-/etc/default/tailnetd`); on macOS its launchd plist has an `EnvironmentVariables` dict, but the plist is embedded with `include_str!` and rewritten by `tnet install`, so anything an operator adds to it is lost on the next install and there is no file the daemon reads that the installer does not own — and the daemon now honours administrative envknobs (`TS_DISABLE_SSH_SERVER`, `TS_DISABLE_PORTMAPPER`) that a macOS operator has no supported way to set. The health-warnable half is already named in the health-tracker row below; the mechanism that would populate it is not. |
+| An MDM `AuthKey` never reaches the login path, so a policy file cannot enrol a node | *(new — filed by this pass)* | Go's `Start` (`ipn/ipnlocal/local.go`) resolves an auth key from three sources in order, and the third has no counterpart here: after `opts.AuthKey` and the `--config` file's `AuthKey` (with its `file:<path>` indirection) have both come up empty, and only when the node is not `Running` and no config file is in use, it reads `sysak, _ := b.polc.GetString(pkey.AuthKey, "")`. Two guards travel with it — a non-empty policy key is used only when there are no existing login profiles or the state is `NeedsLogin` (otherwise it logs "not setting opts.AuthKey from syspolicy; login profiles exist"), and the value is `strings.TrimSpace`d, because an MDM payload that round-trips through a plist or a registry string arrives with a trailing newline more often than not. This is the key that makes a policy file self-sufficient: the same file that pins `Hostname` and `ExitNodeIP` also carries the credential that gets the node onto the tailnet. `src/ipn/syspolicy.rs` defines `AuthKey` as a `String`, types it, merges it and reports it, and no code path reads it — the auth key still has to arrive by `tnet up --auth-key`, `TS_AUTH_KEY` or `--config`. Note the precedence inversion to decide deliberately: Go ranks policy LAST here, behind the flag and the config file, the opposite of how policy ranks for prefs. And `tnet syspolicy list` prints configured values, so applying this key means deciding where a credential may be rendered. |
+| A policy-pinned exit node is silently overwritten instead of refused, and `ExitNode.AllowOverride` does nothing | *(new — filed by this pass)* | Applying `ExitNodeIP` is half of Go's exit-node policy; the other half is a refusal. `checkEditPrefsAccessLocked` (`ipn/ipnlocal/local.go`) runs before any edit is applied: when the edit touches `ExitNodeID`/`ExitNodeIP`/`AutoExitNode` and `polc.HasAnyOf(pkey.ExitNodeID, pkey.ExitNodeIP)` says the exit node is managed, the edit is rejected with `exit node cannot be changed: managed by policy` (`errManagedByPolicy`). The one escape is `pkey.AllowExitNodeOverride` (`ExitNode.AllowOverride`, default false): with it set a user may pick a *different* exit node, but `changeDisablesExitNodeLocked` still refuses any edit that would leave `ExitNodeID` empty, so an override can move the egress and never turn it off. A taken override is remembered in `overrideExitNodePolicy`, which suppresses the re-apply, and is cleared both when the node connects or disconnects and when `sysPolicyChanged` sees either exit-node key or the override key change. Here `reconcile_sys_policy` runs *after* the caller's overrides on every prefs write, so `tnet set --exit-node=<peer>` under a pinning policy is accepted, reports success, and persists the administrator's node — indistinguishable from an edit that took effect. `ExitNode.AllowOverride` is defined in `src/ipn/syspolicy.rs` and read by nothing. What counts as "managed" needs a ruling, since this fork refuses policy `ExitNodeID` rather than applying it (§6). |
+| A permitted always-on disconnect has no bounded window, because `ReconnectAfter` is never armed | *(new — filed by this pass)* | Always-on upstream is a loop with three parts, and this fork ships two of them: the refusal gate (`#442`) and the `WantRunning` re-assert (`#445`). The part between them is `onEditPrefsLocked` (`ipn/ipnlocal/local.go`), which fires whenever an edit takes `WantRunning` from true to false, sets `overrideAlwaysOn` so the re-assert stops fighting a disconnect the gate already permitted, then reads `pkey.ReconnectAfter` and arms `startReconnectTimerLocked` when it is greater than zero. That timer stops any predecessor, captures the current profile id, and on firing re-checks both that it is still the live timer and that the profile has not changed before setting `WantRunning` back to true as `ipnauth.Self` (`automatically reconnected as %q after %v`). `sysPolicyChanged` clears the override whenever either always-on key changes. So the administrator's contract is exact: a user with a reason may take the node down for `ReconnectAfter` and no longer. `src/ipn/syspolicy.rs` defines `ReconnectAfter` as a Go-duration key, renders it, and nothing reads it; both `syspolicy.rs` and `alwayson.rs` already say in their own docs that a permitted disconnect instead stands until the next reconcile point and is undone there. The override flag is the prerequisite and is worth landing alone — without it the timer is pointless, because the re-assert can undo the disconnect first. |
+| There is no LocalAPI `shutdown` verb, so `AllowTailscaledRestart` gates nothing | *(new — filed by this pass)* | `ipn/localapi/localapi.go` routes `shutdown` to `serveShutdown`: non-`POST` gets `only POST allowed`; a caller without write access gets `shutdown access denied`; a caller with write access still gets `shutdown access denied by policy` unless `polc.GetBoolean(pkey.AllowTailscaledRestart, false)` is true; only then does it write 200, flush, and publish a `localapi.Shutdown` event. `ipn/ipnserver/server.go` is the sole subscriber and closes the LocalAPI listener, which unwinds `Run` and ends the process so the service manager restarts it — which is why the key is named for a restart rather than a shutdown. The client half is `LocalClient.ShutdownTailscaled`. Default false, so it is opt-in: an administrator handing a management agent one specific, auditable power over the daemon without handing it root. This fork has neither end — no `shutdown` in `Request` (`src/localapi.rs`), no dispatch arm, and `AllowTailscaledRestart` defined in `src/ipn/syspolicy.rs` and read by nothing. The refusal ORDER is the part to port exactly (method, then write access, then policy), so a caller can tell "you may not" from "nobody may" and an unauthorized caller cannot read the policy state. Either port it or decline it in writing next to the key, because silence is what makes the next sweep re-find it. |
+| `exit-node suggest` ignores the administrator's `AllowedSuggestedExitNodes` list | *(new — filed by this pass)* | `fillAllowedSuggestions` (`ipn/ipnlocal/local.go`) reads the key as a string array, turns it into a set of stable node ids, and `refreshAllowedSuggestions` rebuilds it at backend start and again from `sysPolicyChanged` — which then immediately re-runs `SuggestExitNode`, so a policy edit re-picks rather than waiting to be asked. `getAllowedSuggestions` hands the set to both ranking strategies, and the filter runs on CANDIDATES before ranking (`if allowList != nil && !allowList.Contains(peer.StableID()) { continue }`), so the answer is the best node the administrator permits rather than the best node overall filtered afterwards to nothing. The nil-versus-empty distinction is load bearing: an unset key means no restriction, a configured empty array means nothing is allowed. `src/ipn/syspolicy.rs` defines and element-wise validates the key and reports it; `Backend::suggest_exit_node` is a thin shim over the engine's `Device::suggest_exit_node()`, which returns one already-chosen node. Splits cleanly: the daemon holds the returned stable id and the policy set, so refusing a suggestion outside the allow-list (an honest empty result, which is what Go returns when no candidate passes) is buildable today; re-ranking to the best ALLOWED node needs candidates and DERP latencies the engine does not expose, which is an ask to file. |
+| The policy snapshot never reaches the notify bus, so a watcher cannot see policy change | *(new — filed by this pass)* | `ipn/backend.go` declares `NotifySysPolicyChanges` (`1 << 17`): the first Notify, sent immediately, carries the current effective snapshot in `Notify.Policy`, and `Notify.Policy` is included again whenever the effective policy changes — a full snapshot every time, never a delta. The backend half is in `ipn/ipnlocal/local.go`: the initial-state assembly fills `ini.Policy` from `GetPolicySnapshot("")` when the bit is set, and the same watch registers a policy change callback for the life of the session, whose handler sends a fresh snapshot to that one session. It is part of the mask a LocalAPI `WatchIPNBus` caller may request, so a GUI or a management agent learns of an administrative change at the moment it happens. This fork's `Request::Watch` carries `initial_state`, `initial_netmap` and a prefs flag, and `NotifyView` has no policy field; the snapshot is readable only by asking (`tnet syspolicy list`, `syspolicy reload`). That matters more here than upstream now that policy outranks a local `tnet set` on every write: a `set` that appears to do nothing is explained by a policy the watcher cannot see. The honest MVP is the initial snapshot plus a push on `syspolicy reload` — a real change signal, just a coarser one, since the only source is a file read at startup — with the mask bit's doc saying so rather than promising a watch this build cannot perform. |
+| `--operator` is persisted but grants nobody anything | *(previous pass, filed)* | Go's LocalAPI write gate is `ipnauth.ConnIdentity.IsReadonlyConn`: root writes; a non-root daemon whose uid matches the caller writes; **the uid named by `Prefs.OperatorUser`** writes; a local admin writes (`isLocalAdmin` — the `admin` group on darwin, `administrators` on QNAP); everyone else is read-only, and every arm logs the uid that decided it. `ipnserver`'s `Permissions` feeds that into `PermitRead`/`PermitWrite`, and `userIDFromString` accepts either a username or a numeric uid. `AuthPolicy::access_for_uid` (`src/auth.rs`) implements the first two arms only, and `Prefs::operator_user`'s own rustdoc says setting it "neither widens nor narrows who may drive the daemon". So `sudo tnet set --operator=$USER` — the remedy Go's own access-denied message tells people to run — does nothing, and this daemon's refusal text ("requires root or the same user that owns the daemon") does not mention the pref that is meant to fix it. Not `tsd-euv` (§4.2), which is about the LocalAPI *transport* rather than who may write over it. The local-admin arm *widens* access and wants its own ruling rather than a silent port. |
 | `--hostname` accepts any bytes, where Go validates it as a DNS name | *(previous pass, filed)* | `prefsFromUpArgs` runs `dnsname.ValidHostname` before it builds the prefs: at most 254 bytes overall, every dot-separated label non-empty and at most 63 bytes, first and last byte alphanumeric, interior bytes letters, digits or `-`. Nothing between `tnet`'s flag and the engine `Config.hostname` looks at the value, so `--hostname "my laptop"`, a leading dash and a 300-character name are all accepted — and the value becomes this node's MagicDNS name. `--config` can set it without the CLI running, which argues for the check landing daemon-side rather than where Go puts it. |
 | Every long flag dies unless it is spelled with two dashes | *(previous pass, filed)* | Go's CLI is built on the standard `flag` package, which treats `-hostname` and `--hostname` as the same flag; `cli.go`'s `CleanUpArgs` rewrites both `-authkey` and `--authkey`, which is upstream stating outright that the one-dash form reaches the parser. `tnet` is `Cli::parse()` with no pre-pass, and clap reads `-hostname` as a cluster of short flags, so every single-dash command line copied from Go's own docs fails. Most fail loudly — `tnet up -authkey=x` exits 2 with `unexpected argument '-a' found` — but `-hostname` does not: clap takes the leading `-h` as its own help flag, prints `up`'s help and **exits 0**, so a script that checks the status is told the node came up when nothing ran. |
 | `--posture-checking` is an unknown argument, not the old spelling of `--report-posture` | *(previous pass, filed)* | The other half of `CleanUpArgs`: Go rewrites `--posture-checking` and `--posture-checking=<v>` (and their one-dash forms) to `--report-posture`, so the flag's former name keeps working. This fork carries `--report-posture` alone, so a runbook written before the rename dies at the parser — the same failure `#313` fixed for Go's four other `up` spellings. |
@@ -383,9 +411,12 @@ and the ask turns it into something the engine lane can schedule. Two §4 rows s
 magicsock. The engine is an actively-developed sibling lane and each release has reliably unblocked
 daemon work (v0.40.0 unblocked #22/#23/#26; v0.41.0 unblocked #24), so the cadence holds: engine ships
 an ask → bump the pin → small consuming change. The engine pin has not moved since 2026-08-12, so no
-ask changed status this pass either. Worth noting what this sweep did **not** add to this list: all six of
-its gaps are daemon-buildable, so the administrative layer is a lane that can move without waiting on
-the engine at all.
+ask changed status this pass either, and no ask was filed. Worth noting what this sweep did **not** add
+to this list: five of its six gaps are daemon-buildable outright, and the sixth
+(`AllowedSuggestedExitNodes`) has a daemon-buildable half — refusing a suggestion the administrator
+excluded — with only the *re-ranking* half behind an ask that is not yet written. That would make three
+§4 rows with no ask; whoever takes that row should file it rather than re-implement the engine's
+latency ranking daemon-side.
 
 ---
 
@@ -407,7 +438,8 @@ not silently weaker than Go. They are surfaced to the user where relevant.
 - **`dns status`** omits the "Use Tailscale DNS" accept-dns line + the system-DNS section.
 - **Notify stream (`watch`)** carries `state`/`error`/`browse_to_url`/`net_map`/`prefs`; `net_map` is
   always the **full** peer set (no incremental `PeerChangedPatch` — ask #28); Go's
-  Health/Engine/FilesWaiting/SuggestedExitNode notify fields are absent.
+  Health/Engine/FilesWaiting/SuggestedExitNode notify fields are absent, and so is the
+  `NotifySysPolicyChanges` mask bit that carries `Notify.Policy` (§4.5).
 - **`status --json` peer key:** keyed by **StableNodeID**, where Go keys by the node public key
   (`nodekey:…`).
 - **`up --json`** has no `QR` field (Go gates QR on the `HasQRCodes` build feature).
@@ -444,6 +476,30 @@ not silently weaker than Go. They are surfaced to the user where relevant.
   8443 publicly exposed; `funnel --https=443 off` spells Go's reading explicitly.
 - **TUN is a pref as well as a daemon flag** — `tnet up --tun` is this fork's own spelling and stays;
   `tailnetd --tun=<name>` is Go's and now works too (`#344`, `#401`).
+
+- **Policy `ExitNodeID` is refused, not applied** (`#445`). Go pins a `tailcfg.StableNodeID` and parks
+  the pref on a deliberately invalid id while an `auto:` expression resolves, so traffic blackholes
+  rather than leaking past the policy. This fork's exit node is one selector resolved by tailnet IP or
+  MagicDNS name, with no stable-node-id form — storing the id would match no peer, and a selector that
+  matches no peer egresses **directly**, the exact leak the blackhole exists to prevent. Go's mutual
+  exclusion is kept: a configured `ExitNodeID` suppresses `ExitNodeIP` here too, so a file naming both
+  pins neither and says so once. `ExitNodeIP` alone is applied.
+- **The advertised-route pairing rule is asked of the composed set** (`#439`), where Go asks it of the
+  flag's literal argument before folding `--advertise-exit-node` in. So
+  `--advertise-routes=0.0.0.0/0 --advertise-exit-node` is an error upstream and an accepted command
+  line here — both defaults end up advertised, which is what was asked for — while every genuinely lone
+  default route is still refused in Go's own words.
+- **Two policy keys are reported as unenforced rather than silently ignored** (`#445`):
+  `UnattendedMode` (Go's `ForceDaemon` — a system daemon with no user session is unattended by
+  construction, so there is no pref to move) and `AlwaysOn.OverrideWithReason` as an *applied* key
+  (there is no signed-in user session to grant a standing exemption to; the disconnect gate reads it by
+  name and does enforce it). Refusals are logged at WARN on every reconcile, not once.
+- **`tnet syspolicy reload` re-reads but does not re-apply**, and stays a read-only LocalAPI verb: the
+  only registered store is the JSON file, and the reconcile runs on every prefs write, so there is no
+  drift for a re-apply to correct.
+- **`down`/`logout` are not reconcile points** (`#445`): `AlwaysOn.Enabled` re-asserts `want_running` at
+  the next daemon start, `up`, `set` or config apply, but a disconnect the gate has just permitted still
+  stops the node now. §4.5's `ReconnectAfter` row is what would bound that window.
 
 These are the subject of `tsd-efv` (document the Go-tooling-compatibility boundary cleanly).
 
@@ -485,24 +541,27 @@ umbrella trackers.
   `up`/`set` · the four bare-integer duration flags · the health tracker · the residual five call
   sites of Go's `isRunningOrStarting` gate, plus `nc`'s two argument refusals (`#405` wired the
   ported state table to `ping` only). `login`'s shared flag set merged outright (`#397`).
-- **Handed to the tracker by the two previous regenerations and still open**, with nothing merged
+- **Handed to the tracker by the three previous regenerations and still open**, with nothing merged
   against them in this repo since: Go's single-dash long-flag spelling · the `--posture-checking`
   legacy spelling · the `mac-app-connector` risk · `--exit-node=auto:any` · `--config`'s unenforced and
   inverted `Locked` default · `set --shields-up` while Funnel is on · a `--nickname` another profile
-  already holds · `--hostname` accepted as any bytes. All eight are rows in §4.5.
-- **Closed since the last regeneration:** the SSH server's `TS_DISABLE_SSH_SERVER` off switch
-  (`#426`) · the busy-port serve refusal (`#429`, `#431`) · the auto-update opt-in refusal (`#430`) ·
-  Funnel under shields-up (`#433`) · `--exit-node` argument resolution (`#435`). The c2n channel was
-  answered by filing engine ask **#43** (`#425`) rather than by code, and stays an open §4.1 row.
+  already holds · `--hostname` accepted as any bytes · `--operator`, persisted and granting nobody
+  anything. All nine are rows in §4.5.
+- **Closed since the last regeneration:** the macOS `tailnetd-env.txt` operator seam (`#437`) · the
+  advertised-route set rules (`#439`) · the `tag:` prefix completion (`#441`) · the always-on
+  disconnect gate (`#442`) · syspolicy application to prefs (`#445`). That is five of the six gaps the
+  last pass filed, merged the same day it filed them; the sixth, `--operator`, is still open.
 
 ### Filed by this pass (not yet in the list above)
 The gaps this sweep found that no open bead covered are handed to the tracker in
 [`restock-beads.json`](restock-beads.json), each cited to the one upstream file it was verified in, at
-`bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`: syspolicy reported but never applied and the always-on
-disconnect rule (`ipn/ipnlocal/local.go`, `ipn/ipnauth/policy.go`), the `--operator` pref that grants
-nobody anything (`ipn/ipnauth/ipnauth.go`), the `tag:` prefix Go completes and this fork requires
-(`cmd/tailscale/cli/up.go`), the route-set rules `--advertise-routes` never runs
-(`net/netutil/routes.go`), and the missing `tailscaled-env.txt` operator seam (`envknob/envknob.go`).
+`bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`: the `AuthKey` policy key that never reaches the login path,
+the policy-pinned exit node that is overwritten instead of refused (with `ExitNode.AllowOverride`), the
+`ReconnectAfter` window a permitted always-on disconnect never gets, and the
+`AllowedSuggestedExitNodes` allow-list `exit-node suggest` ignores (all four `ipn/ipnlocal/local.go`);
+the `shutdown` verb `AllowTailscaledRestart` gates (`ipn/localapi/localapi.go`); and the
+`NotifySysPolicyChanges` watch bit that puts the effective snapshot on the notify bus
+(`ipn/backend.go`).
 
 > The authoritative live backlog is the bead set (`bd list --status open`) + `docs/ENGINE_ASKS.md`. This
 > doc is the orienting map; regenerate it after a batch of merges.
@@ -519,32 +578,40 @@ can't reach. None of it is a redesign; it is breadth and polish on a working cor
 highest-leverage item is **Windows support** (`tsd-1yw`); the highest-frequency unblock is the **engine
 pin bump** (each release has converted a filed ask into a shipped feature).
 
-What this refresh changes about that picture is again *where* to sweep, and the answer moved up a
-layer rather than down. The last two passes read the code that decides whether a command line is
-*spelled* correctly and whether its values name anything *real*; between them they found fourteen gaps,
-and the repo closed six of the last seven inside a day. So this pass read the layer above: the one that
-decides **who may ask, and what an administrator can impose**. Six gaps, and the common shape is worth
-stating plainly because it predicts where the next ones are: this fork carries the **inputs** of an
-administrative decision and never runs the **decision**. `tnet syspolicy list` parses and prints every
-key Go's `applySysPolicyLocked` reads, and not one of them reaches prefs. `--operator` is persisted,
-threaded to the engine, and consulted by no permission check. `down --reason` is sanitized and logged,
-and the always-on policy it exists to satisfy is not enforced. These are not commands that fail; they
-are commands that succeed while an administrator's intent quietly evaporates, which is the worst of the
-three flavours in §4.5 — worse than a refusal (which teaches) and worse than a value that routes
-nothing (which at least only affects the person who typed it). The sixth gap is an ordinary member of
-the oldest flavour, found on the way: a bare `--advertise-tags server` that Go completes and this fork
-refuses.
+What this refresh changes about that picture is, once again, *where* to sweep — and this time the
+answer is that a layer has been finished rather than opened. The last three passes climbed: whether a
+command line is spelled correctly, whether its values name anything real, and who is allowed to ask.
+The third of those found that this fork carried the **inputs** of every administrative decision and ran
+none of the decisions, and the repo closed five of its six gaps the same day, including the whole of
+`applySysPolicy`. That left one question that could not have been asked before: now that the policy
+keys which are prefs are applied, what does upstream do with the keys that are **not** prefs?
 
-There is a hygiene lesson here too, and it is the same one the c2n row taught last time. Every one of
-the five administrative ones is already documented *somewhere in this tree*, one piece at a time: `src/ipn/syspolicy.rs`'s
-module doc says the snapshot is reported and not applied; `Prefs::operator_user`'s rustdoc says setting
-it "neither widens nor narrows who may drive the daemon"; `src/auth.rs` calls the operator tier "a
-later phase"; `Request::Down::reason`'s doc says the reason is recorded locally. Four honest admissions,
-one absent layer, and no row in this document for any of it until now. The rule that keeps falling out
-of these sweeps: when several rustdocs each apologise for a small reduction, look for the single
-mechanism they are all apologising for, and give *it* the row.
+The answer is finite, which is why this pass is an inventory rather than a sample. Nine Go files read
+the policy client at the pin, and they sort cleanly. Two are the prefs path — `ipn/ipnlocal/local.go`'s
+`applySysPolicy` and `ipn/prefs.go`'s `ControlURLOrDefault`, both ported by `#445`. Two are inside the
+control session (`control/controlclient/direct.go` for `Tailnet`, `sign_supported.go` for
+`MachineCertificateSubject`) and two answer a c2n pull (`feature/posture/posture.go`,
+`posture/serialnumber_syspolicy.go`), so all four sit behind the engine boundary and ask **#43**. One is
+the Windows DNS manager and one configures a log uploader this fork does not have, and the whole
+`ManagedBy*`/visibility/`KeyExpirationNotice` family drives a GUI this repo does not ship. What is left
+is six keys with a daemon-side consumer that this daemon does not run, and they are §4.5's six new rows:
+`AuthKey`, `ExitNode.AllowOverride`, `ReconnectAfter`, `AllowTailscaledRestart`,
+`AllowedSuggestedExitNodes`, and the `NotifySysPolicyChanges` watch bit. Land those and the policy client
+is ported, not approximately but exhaustively — which is a thing this document has rarely been able to
+say about anything.
+
+The shape worth naming is a variant of last pass's, one step in. Last time the failure was carrying an
+administrator's **inputs** and never running the **decision**. This time it is running the decision in
+the one place it is cheapest to run — the pref — and not in the places where it has to *refuse*
+something. A policy-pinned exit node that is applied but not locked is the clearest case: `tnet set
+--exit-node=<peer>` succeeds, prints nothing, and persists the administrator's node instead of the
+operator's. That is not a missing feature; it is a command that lies about what it did. The always-on
+gate that merged alongside it is the counter-example and the model — it refuses, by name, at the one place
+`want_running` goes from true to false — and each of the six new §4.5 rows wants the same
+treatment: find the single place the decision is made, and make it refuse there.
 
 *Re-derived 2026-09-12 against upstream v1.102.4 (`bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`, still the
-newest stable tag — the only newer ref, `v1.103.0-pre`, marks the unstable branch), engine pin
-`9d847a6e`, daemon v0.56.2. Regenerate from `bd list` + `docs/ENGINE_ASKS.md` + a fresh upstream
-sweep; when the pin cannot move, sweep deeper instead of reporting no change.*
+newest stable tag for the third refresh running — the only newer ref, `v1.103.0-pre`, marks the unstable
+branch), engine pin `9d847a6e`, daemon v0.59.0. Regenerate from `bd list` + `docs/ENGINE_ASKS.md` + a
+fresh upstream sweep; when the pin cannot move, sweep deeper instead of reporting no change — and when a
+layer turns out to be finite, enumerate it and say so, so the next pass can start above it.*
