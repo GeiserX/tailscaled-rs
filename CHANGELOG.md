@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.60.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.59.0...v0.60.0) (2026-09-12)
+
+
+### Features
+
+* **watch:** let a watcher see the effective policy, not just poll for it ([#448](https://github.com/GeiserX/tailscaled-rs/issues/448)) ([358b0bf](https://github.com/GeiserX/tailscaled-rs/commit/358b0bf5ebf6aa4623b10e26283cc5b92e914d90))
+
 ## [0.59.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.58.0...v0.59.0) (2026-09-12)
 
 
