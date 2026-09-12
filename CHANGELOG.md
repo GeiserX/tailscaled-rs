@@ -25,6 +25,18 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.58.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.57.0...v0.58.0) (2026-09-12)
+
+
+### Features
+
+* **ipn:** enforce always-on mode so a disconnect can be refused ([#442](https://github.com/GeiserX/tailscaled-rs/issues/442)) ([38f962b](https://github.com/GeiserX/tailscaled-rs/commit/38f962b352a0d1dda9c9f4b4588fda80ae8f474a))
+
+
+### Bug Fixes
+
+* **up,set:** accept --advertise-tags values without the tag: prefix ([#441](https://github.com/GeiserX/tailscaled-rs/issues/441)) ([2b5ff4e](https://github.com/GeiserX/tailscaled-rs/commit/2b5ff4e11c37c066a28a3eab9e4d06175f27ad81))
+
 ## [0.57.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.56.2...v0.57.0) (2026-09-12)
 
 
