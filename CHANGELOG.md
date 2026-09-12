@@ -25,6 +25,20 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.61.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.60.0...v0.61.0) (2026-09-12)
+
+
+### Features
+
+* **ipn:** bound a permitted always-on disconnect by ReconnectAfter ([#454](https://github.com/GeiserX/tailscaled-rs/issues/454)) ([093e570](https://github.com/GeiserX/tailscaled-rs/commit/093e57053c5619a4da4a7709fd5c349992fb9996))
+* **ipn:** refuse a policy-pinned exit node instead of overwriting it ([#457](https://github.com/GeiserX/tailscaled-rs/issues/457)) ([fed5cd4](https://github.com/GeiserX/tailscaled-rs/commit/fed5cd429787b3ea3264c01039525518f03be8f0))
+* **localapi:** give AllowTailscaledRestart an operation to permit ([#455](https://github.com/GeiserX/tailscaled-rs/issues/455)) ([7fbd94c](https://github.com/GeiserX/tailscaled-rs/commit/7fbd94c1e1f2fdd1c5a9b7eb83bc263e24c801d7))
+
+
+### Bug Fixes
+
+* **ipn:** stop exit-node suggest recommending nodes policy excludes ([#451](https://github.com/GeiserX/tailscaled-rs/issues/451)) ([561e2cb](https://github.com/GeiserX/tailscaled-rs/commit/561e2cb94547f45b2b266669fa68bdd9ad79450d))
+
 ## [0.60.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.59.0...v0.60.0) (2026-09-12)
 
 
