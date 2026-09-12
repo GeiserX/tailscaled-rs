@@ -485,7 +485,9 @@ pub enum Request {
     GetServeConfig,
     /// Replace the node's serve configuration (Go `SetServeConfig`; `tnet serve --tcp` / `reset`).
     /// The daemon persists it and re-arms its serve accept loops to match. A WRITE — gated like
-    /// `up`/`down`.
+    /// `up`/`down`. May be REFUSED with [`Response::Error`] and nothing persisted: a config that
+    /// turns Funnel on while the `shields_up` pref is set, or one that changes the serve type of a
+    /// port already being served (see `Backend::set_serve_config` for both rules).
     SetServeConfig {
         /// The new serve config (replaces the current one wholesale).
         config: ServeConfig,
