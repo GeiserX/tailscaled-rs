@@ -73,6 +73,7 @@ use anyhow::{Context, Result, anyhow};
 use crate::localapi::{PeerReport, StatusReport};
 use crate::prefs::Prefs;
 
+pub mod alwayson;
 mod captive;
 mod config;
 mod control_url;
@@ -1365,7 +1366,10 @@ pub async fn drive_reload_config(
         // (idempotent — `apply_config` already set it). No off-lock build needed for a teardown.
         ReloadAction::BringDown => {
             let mut be = backend.lock().await;
-            be.down().await?;
+            // `Actor::Daemon`: the daemon reconciling intent `reload_config` has already persisted,
+            // not an operator asking to disconnect — so the always-on gate does not apply (see
+            // `alwayson::Actor::Daemon` for why refusing here would be the wrong shape).
+            be.down(alwayson::Actor::Daemon).await?;
         }
         // Node up, reloaded config keeps it up → rebuild from the now-updated prefs. The
         // preflight → begin_up → (off-lock) build_device → finish_up → off-lock orphan settle
@@ -3570,8 +3574,65 @@ impl Backend {
         config::build_config(&self.prefs, &self.key_path, self.listen_port).await
     }
 
+    /// The current profile's display NAME — what `tnet switch --list` shows, and Go's
+    /// `LoginProfile.Name()`. Falls back to the profile id when the profile has no display name (the
+    /// usual case for `default`), which is exactly what [`list_profiles`](Backend::list_profiles)
+    /// already decides, so the name in an audit record and the name in `switch --list` cannot drift.
+    async fn current_profile_name(&self) -> String {
+        self.list_profiles()
+            .await
+            .into_iter()
+            .find(|p| p.current)
+            .map(|p| p.name)
+            .unwrap_or_else(|| self.current_profile.clone())
+    }
+
+    /// The always-on disconnect gate — Go's `checkEditPrefsAccessLocked` calling
+    /// `actor.CheckProfileAccess(…, ipnauth.Disconnect, …)`, which lands in
+    /// [`alwayson::check_disconnect_policy`].
+    ///
+    /// Called by [`down`](Backend::down) and [`logout`](Backend::logout) as their first act, so the
+    /// two commands that take `WantRunning` from true to false share one rule and neither can be the
+    /// only gate. It refuses before any teardown or persist, so a refusal costs nothing.
+    ///
+    /// Go gates a **transition**, not a state: `mp.WantRunningSet && !mp.WantRunning &&
+    /// b.pm.CurrentPrefs().WantRunning()`. A `down` on a node that is already down is therefore not
+    /// a disconnect and is not refused — which matters, because the alternative would wedge an
+    /// always-on node's operator out of the idempotent `down` that Go lets through.
+    ///
+    /// A permitted disconnect that the policy *required a reason for* leaves Go's audit record. This
+    /// daemon has no transport to ship it to control (engine ask #41), so it goes to the daemon log
+    /// under Go's action name — written before the teardown, so a disconnect that then fails is
+    /// still explained.
+    async fn check_disconnect_policy(&self, actor: alwayson::Actor<'_>) -> Result<()> {
+        if !self.prefs.want_running {
+            return Ok(());
+        }
+        // Go's `actor.Username()` is best-effort and, outside Windows, has no implementation — so
+        // Go itself takes the no-username branch on every platform this daemon runs on. The LocalAPI
+        // peer is identified here by uid rather than by name (see `crate::auth`); resolving that uid
+        // to a passwd entry is the one thing a username branch would need, and it is a call-site
+        // change when it arrives, not a reshaping of the record.
+        let username = None;
+        let profile = self.current_profile_name().await;
+        if let Some(details) = alwayson::check_disconnect_policy(actor, &profile, username)? {
+            tracing::info!(
+                action = alwayson::AUDIT_NODE_DISCONNECT,
+                details = %details,
+                "audit: always-on disconnect permitted by policy"
+            );
+        }
+        Ok(())
+    }
+
     /// Bring the node down (`WantRunning = false`) without logging out; tears down the engine.
-    pub async fn down(&mut self) -> Result<()> {
+    ///
+    /// `actor` says who asked, which is what decides whether the always-on policy is consulted — see
+    /// [`check_disconnect_policy`](Backend::check_disconnect_policy). A refused disconnect returns
+    /// the refusal **before** anything is torn down or persisted, so the node is left exactly as it
+    /// was.
+    pub async fn down(&mut self, actor: alwayson::Actor<'_>) -> Result<()> {
+        self.check_disconnect_policy(actor).await?;
         self.stop_device().await;
         // Bump the generation so an `up` whose `Device::new` is still in flight (lock released) is
         // recognized as stale by `finish_up` and its device discarded — `down` wins. The bump also
@@ -3640,7 +3701,12 @@ impl Backend {
     ///    login). This is the daemon's responsibility because the engine's `logout` intentionally
     ///    leaves the key on disk (re-`new` with the same key is its *re-login* path — the opposite of
     ///    what `tailscale logout` means). A missing key file is fine (already fresh).
-    pub async fn logout(&mut self) -> Result<()> {
+    pub async fn logout(&mut self, actor: alwayson::Actor<'_>) -> Result<()> {
+        // 0. The always-on gate, before the control-plane call and before anything is torn down: a
+        // logout is a disconnect (Go routes it through the same `editPrefsLocked` with
+        // `WantRunning:false`, so the same `ipnauth.Disconnect` check applies), and a refusal must
+        // leave the registration intact.
+        self.check_disconnect_policy(actor).await?;
         // 1. Best-effort control-plane deregistration while the device is still alive. (Let-chain
         // rather than nested `if let` — clippy::collapsible_if; mirrors the `&&`-let style this
         // module already uses, e.g. the revert-guard arms.)
@@ -5539,7 +5605,9 @@ mod tests {
         tokio::fs::write(&be.key_path, b"{\"key_state\":{}}")
             .await
             .unwrap();
-        be.down().await.expect("down");
+        be.down(alwayson::Actor::Operator { reason: None })
+            .await
+            .expect("down");
         assert!(!be.prefs.want_running, "down clears want_running");
         assert!(!be.prefs.logged_out, "down must NOT set logged_out");
         assert!(
@@ -5557,7 +5625,9 @@ mod tests {
         be.prefs.has_logged_in = true; // a registered node
         // key file still present from the `down` case above.
         assert!(tokio::fs::try_exists(&be.key_path).await.unwrap());
-        be.logout().await.expect("logout");
+        be.logout(alwayson::Actor::Operator { reason: None })
+            .await
+            .expect("logout");
         assert!(!be.prefs.want_running, "logout clears want_running");
         assert!(
             be.prefs.logged_out,
@@ -5866,7 +5936,7 @@ mod tests {
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let mut be = backend_for(&dir);
         assert!(!tokio::fs::try_exists(&be.key_path).await.unwrap());
-        be.logout()
+        be.logout(alwayson::Actor::Operator { reason: None })
             .await
             .expect("logout with no key file must succeed");
         assert!(be.prefs.logged_out);
@@ -6634,7 +6704,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = be.logout().await;
+        let result = be.logout(alwayson::Actor::Operator { reason: None }).await;
         assert!(
             result.is_err(),
             "a key-wipe failure must make logout fail, not silently half-complete"
@@ -6815,7 +6885,9 @@ mod tests {
         assert!(be.prefs.want_running, "begin_up sets want_running");
 
         // A `down` lands while the (hypothetical) handshake is still in flight → supersedes.
-        be.down().await.expect("down");
+        be.down(alwayson::Actor::Operator { reason: None })
+            .await
+            .expect("down");
         assert!(!be.prefs.want_running, "down clears want_running");
         assert!(
             be.generation > pending.generation,
