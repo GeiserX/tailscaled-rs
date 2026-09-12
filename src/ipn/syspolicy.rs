@@ -90,6 +90,24 @@
 //!   loudly instead of appearing to honour it. Go's mutual exclusion is kept: a configured
 //!   `ExitNodeID` suppresses `ExitNodeIP` here too, so the refusal is one message rather than a
 //!   silent downgrade to the key the admin de-prioritised. `ExitNodeIP` alone is applied.
+//! - Applying the exit node is, like `AlwaysOn.Enabled`, only half of the key's effect. The other
+//!   half is the **edit gate** ([`exitnodepolicy`](super::exitnodepolicy)): an `up`/`set` that names
+//!   an exit node while the policy pins one is refused outright (*exit node cannot be changed:
+//!   managed by policy*) unless [`PKEY_ALLOW_EXIT_NODE_OVERRIDE`] is set, and even then it may only
+//!   move the egress to another node, never turn it off. Without the gate the re-apply below is the
+//!   only thing standing between the administrator's node and the operator's, which makes
+//!   `tnet set --exit-node=<peer>` report success and silently store the administrator's value.
+//!   **What counts as "managed" here is the fork's one deviation**: Go asks
+//!   `HasAnyOf(pkey.ExitNodeID, pkey.ExitNodeIP)`, so a file naming only `ExitNodeID` locks the pref
+//!   upstream — but this build *refuses* that key (see the bullet above), so locking on it would
+//!   refuse the operator's exit node in the name of a value that pins nothing, leaving the node with
+//!   no exit node and no way to choose one. The lock is therefore on what is actually applied: a
+//!   non-empty, parseable `ExitNodeIP` that no configured `ExitNodeID` suppresses — exactly the
+//!   condition under which [`pinned_prefs`] already reports `exit_node` as pinned.
+//!   Go's `overrideExitNodePolicy` — the flag that remembers a permitted override so the re-apply
+//!   below does not immediately undo it — is ported as
+//!   [`Backend::override_exit_node_policy`](super::Backend::override_exit_node_policy) and passed
+//!   back in through [`PolicyOverrides`], the same way `overrideAlwaysOn` is.
 //!
 //! Refusals are returned, not swallowed: [`PolicyApplication::refused`] names every configured key
 //! this build cannot enforce, and the daemon logs it at WARN every time the policy is reconciled. A
@@ -190,9 +208,28 @@ pub const PKEY_RECONNECT_AFTER: &str = "ReconnectAfter";
 /// Shared with [`DEFINITIONS`] so there is exactly one definition of it.
 const PKEY_AUTH_KEY: &str = "AuthKey";
 
+/// Go `pkey.ExitNodeID` — the policy key that pins the exit node by stable node id. Named because
+/// three call sites read it by name: the apply path below, the gate that refuses an operator's
+/// exit-node edit ([`exitnodepolicy`](super::exitnodepolicy)) and the snapshot that revokes a
+/// standing override ([`exit_node_keys`]). Shared with [`DEFINITIONS`], like [`PKEY_ALWAYS_ON`].
+pub const PKEY_EXIT_NODE_ID: &str = "ExitNodeID";
+
+/// Go `pkey.ExitNodeIP` — the policy key that pins the exit node by IP address, and the only one of
+/// the pair this build can honour (see the module docs). Read by name for the same three reasons as
+/// [`PKEY_EXIT_NODE_ID`].
+pub const PKEY_EXIT_NODE_IP: &str = "ExitNodeIP";
+
+/// Go `pkey.AllowExitNodeOverride` — the policy key that lets a user pick a *different* exit node
+/// than the pinned one. Read by name by [`exitnodepolicy`](super::exitnodepolicy), which is the only
+/// thing it can affect: it moves no pref of its own, it decides whether the refusal above happens.
+///
+/// Default **false**, like Go's, so an administrator who pins an exit node and says nothing else
+/// gets the pin they asked for and not a suggestion.
+pub const PKEY_ALLOW_EXIT_NODE_OVERRIDE: &str = "ExitNode.AllowOverride";
+
 /// Go `pkey.AllowedSuggestedExitNodes` — the policy key naming the exit nodes a managed node may be
 /// steered onto. Read by name by [`allowed_suggested_exit_nodes`], which is the only consumer, so —
-/// unlike the four keys above — it stays private to this module; what leaves is the decoded set, not
+/// unlike the keys above — it stays private to this module; what leaves is the decoded set, not
 /// the spelling. Shared with [`DEFINITIONS`] so there is exactly one definition of it.
 const PKEY_ALLOWED_SUGGESTED_EXIT_NODES: &str = "AllowedSuggestedExitNodes";
 
@@ -522,7 +559,7 @@ const fn def(key: &'static str, ty: ValueType) -> Definition {
 const DEFINITIONS: &[Definition] = &[
     // Device policy settings (configurable only on a per-device basis in Go).
     def(PKEY_ALLOWED_SUGGESTED_EXIT_NODES, ValueType::StringList),
-    def("ExitNode.AllowOverride", ValueType::Boolean),
+    def(PKEY_ALLOW_EXIT_NODE_OVERRIDE, ValueType::Boolean),
     def(PKEY_ALLOW_TAILSCALED_RESTART, ValueType::Boolean),
     def(PKEY_ALWAYS_ON, ValueType::Boolean),
     def(PKEY_ALWAYS_ON_OVERRIDE_WITH_REASON, ValueType::Boolean),
@@ -538,8 +575,8 @@ const DEFINITIONS: &[Definition] = &[
     def("UseTailscaleDNSSettings", ValueType::PreferenceOption),
     def("UseTailscaleSubnets", ValueType::PreferenceOption),
     def("ExitNodeAllowLANAccess", ValueType::PreferenceOption),
-    def("ExitNodeID", ValueType::String),
-    def("ExitNodeIP", ValueType::String),
+    def(PKEY_EXIT_NODE_ID, ValueType::String),
+    def(PKEY_EXIT_NODE_IP, ValueType::String),
     def("FlushDNSOnSessionUnlock", ValueType::Boolean),
     def(PKEY_ENCRYPT_STATE, ValueType::Boolean),
     def("Hostname", ValueType::String),
@@ -1363,19 +1400,34 @@ impl PolicyApplication {
     }
 }
 
+/// The exemptions the backend is currently standing on — the two flags Go keeps on `LocalBackend`
+/// and consults from `applySysPolicy`, passed in by the caller because they are backend state and
+/// not policy.
+///
+/// One struct rather than two `bool` parameters, because they travel together and a pair of
+/// positional booleans at a call site is a bug waiting to be typed in the wrong order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct PolicyOverrides {
+    /// Go `b.overrideAlwaysOn`: a disconnect the gate already permitted is standing, so the
+    /// `AlwaysOn.Enabled` re-assert must leave it alone. See
+    /// [`Backend::override_always_on`](super::Backend::override_always_on) for its lifecycle.
+    pub always_on: bool,
+    /// Go `b.overrideExitNodePolicy`: the operator picked a different exit node under an
+    /// `ExitNode.AllowOverride` policy, so the exit-node re-apply must leave that choice alone. See
+    /// [`Backend::override_exit_node_policy`](super::Backend::override_exit_node_policy).
+    pub exit_node: bool,
+}
+
 /// Apply the effective device-scope policy to `prefs` — Go `ipnlocal.applySysPolicy`, called from
 /// the daemon wherever Go's `reconcilePrefs` runs (profile load, `up`, `set`, `--config`).
 ///
-/// `override_always_on` is Go's `b.overrideAlwaysOn`, passed in by the caller because it is backend
-/// state, not policy: while it stands, a disconnect the gate already permitted is left alone and the
-/// `AlwaysOn.Enabled` re-assert below does nothing. See
-/// [`Backend::override_always_on`](super::Backend::override_always_on) for its lifecycle.
+/// `overrides` carries the backend's standing exemptions; see [`PolicyOverrides`].
 ///
 /// Side-effect-free apart from `prefs`: it reads the registered stores exactly as
 /// [`effective_policy`] does (see the invariant on [`registered_store_settings`]) and touches no
 /// file. Persisting the result is the caller's job.
-pub(super) fn apply_to_prefs(prefs: &mut Prefs, override_always_on: bool) -> PolicyApplication {
-    apply_settings_to_prefs(&registered_store_settings(), prefs, override_always_on)
+pub(super) fn apply_to_prefs(prefs: &mut Prefs, overrides: PolicyOverrides) -> PolicyApplication {
+    apply_settings_to_prefs(&registered_store_settings(), prefs, overrides)
 }
 
 /// The decision behind [`apply_to_prefs`], over an already-merged setting list so the whole of Go's
@@ -1398,7 +1450,7 @@ pub(super) fn apply_to_prefs(prefs: &mut Prefs, override_always_on: bool) -> Pol
 fn apply_settings_to_prefs(
     settings: &[PolicySetting],
     prefs: &mut Prefs,
-    override_always_on: bool,
+    overrides: PolicyOverrides,
 ) -> PolicyApplication {
     let mut out = PolicyApplication::default();
 
@@ -1432,7 +1484,7 @@ fn apply_settings_to_prefs(
         }
     }
 
-    apply_exit_node_policy(settings, prefs, &mut out);
+    apply_exit_node_policy(settings, prefs, &mut out, overrides.exit_node);
 
     // `AlwaysOn.Enabled` → force the node back to "should be connected". One-way: the policy can
     // only turn want-running ON (Go's `alwaysOn && !prefs.WantRunning`), never off.
@@ -1444,7 +1496,7 @@ fn apply_settings_to_prefs(
     // `override_always_on` is Go's `alwaysOn && !b.overrideAlwaysOn && !prefs.WantRunning`: a
     // disconnect this same policy already permitted is not something to fight.
     if configured_boolean(settings, PKEY_ALWAYS_ON) == Some(true)
-        && !override_always_on
+        && !overrides.always_on
         && !prefs.want_running
     {
         prefs.want_running = true;
@@ -1491,12 +1543,19 @@ fn apply_settings_to_prefs(
 /// `ExitNodeIP` is never consulted. Since the id cannot be honoured here (see the module docs), that
 /// means a file naming both pins neither, and says so once — rather than silently falling through to
 /// the key the administrator ranked second.
+///
+/// `override_exit_node_policy` is Go's `b.overrideExitNodePolicy`: while a permitted override
+/// stands, the pinned value is **not** re-applied, because re-applying it here is exactly how an
+/// override that the administrator opted into would be undone a moment after it was granted. The
+/// refusals are still reported while it stands — an unenforceable key is unenforceable either way,
+/// and an override can only ever stand against a key this build does apply.
 fn apply_exit_node_policy(
     settings: &[PolicySetting],
     prefs: &mut Prefs,
     out: &mut PolicyApplication,
+    override_exit_node_policy: bool,
 ) {
-    if let Some(id) = configured_string(settings, "ExitNodeID").filter(|id| !id.is_empty()) {
+    if let Some(id) = configured_string(settings, PKEY_EXIT_NODE_ID).filter(|id| !id.is_empty()) {
         // Go turns an `auto:`-prefixed id into an `ExitNodeExpression` and parks `ExitNodeID` on a
         // deliberately invalid id until the pick resolves, so traffic blackholes rather than leaking
         // outside the policy. Both halves need machinery this build does not have — it refuses
@@ -1517,13 +1576,14 @@ fn apply_exit_node_policy(
             )
         };
         out.refused.push(PolicyRefusal {
-            key: "ExitNodeID",
+            key: PKEY_EXIT_NODE_ID,
             reason,
         });
         return;
     }
 
-    let Some(raw) = configured_string(settings, "ExitNodeIP").filter(|ip| !ip.is_empty()) else {
+    let Some(raw) = configured_string(settings, PKEY_EXIT_NODE_IP).filter(|ip| !ip.is_empty())
+    else {
         return;
     };
     // Go ignores a value `netip.ParseAddr` rejects (its `err == nil` guard). Ignoring it is right —
@@ -1531,21 +1591,110 @@ fn apply_exit_node_policy(
     // not, so the refusal is reported.
     let Ok(addr) = raw.parse::<std::net::IpAddr>() else {
         out.refused.push(PolicyRefusal {
-            key: "ExitNodeIP",
+            key: PKEY_EXIT_NODE_IP,
             reason: format!("{raw:?} is not an IP address"),
         });
         return;
     };
+    // The operator's own pick stands (see the parameter's doc): the policy pinned a node, the
+    // administrator allowed an override, and one was taken.
+    if override_exit_node_policy {
+        return;
+    }
     // Stored in the address's canonical form, which is what `resolve_exit_node_arg` and the engine's
     // selector both parse back.
     let want = addr.to_string();
     if prefs.exit_node.as_deref() != Some(want.as_str()) {
         prefs.exit_node = Some(want.clone());
         out.changed.push(PolicyChange {
-            key: "ExitNodeIP",
+            key: PKEY_EXIT_NODE_IP,
             pref: "exit_node",
             value: want,
         });
+    }
+}
+
+/// The exit node the effective policy actually **pins**, in the canonical form
+/// [`apply_exit_node_policy`] stores — `None` when the policy pins nothing this build can apply.
+///
+/// This is the fork's reading of Go's `HasAnyOf(pkey.ExitNodeID, pkey.ExitNodeIP)`, and the one
+/// place it is decided: a configured `ExitNodeID` suppresses the pair (Go's mutual exclusion) and is
+/// itself refused here, and an `ExitNodeIP` that is empty or unparseable applies nothing either. See
+/// the module docs for why "managed" is the applied value rather than Go's "any of the two keys is
+/// configured".
+fn policy_exit_node_in(settings: &[PolicySetting]) -> Option<String> {
+    if configured_string(settings, PKEY_EXIT_NODE_ID).is_some_and(|id| !id.is_empty()) {
+        return None;
+    }
+    let raw = configured_string(settings, PKEY_EXIT_NODE_IP).filter(|ip| !ip.is_empty())?;
+    Some(raw.parse::<std::net::IpAddr>().ok()?.to_string())
+}
+
+/// The exit-node policy as the edit gate needs it: what is pinned, and whether the administrator
+/// allowed the user to pick something else.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct ExitNodePolicy {
+    /// The pinned selector ([`policy_exit_node_in`]), or `None` when nothing is pinned — in which
+    /// case the gate has nothing to refuse and the other field does not matter.
+    pub pinned: Option<String>,
+    /// [`PKEY_ALLOW_EXIT_NODE_OVERRIDE`], defaulting to false exactly as Go's
+    /// `GetBoolean(pkey.AllowExitNodeOverride, false)` does.
+    pub allow_override: bool,
+}
+
+/// Read the current [`ExitNodePolicy`] from the registered stores — the input to the edit gate
+/// ([`exitnodepolicy::check_exit_node_edit`](super::exitnodepolicy::check_exit_node_edit)).
+///
+/// Side-effect-free, like every other read of the registered stores — see the invariant on
+/// [`registered_store_settings`].
+pub(super) fn exit_node_policy() -> ExitNodePolicy {
+    exit_node_policy_in(&registered_store_settings())
+}
+
+/// The decision behind [`exit_node_policy`], over an already-merged setting list so it is testable
+/// without the process-global registry (the same split [`get_boolean`] uses).
+fn exit_node_policy_in(settings: &[PolicySetting]) -> ExitNodePolicy {
+    ExitNodePolicy {
+        pinned: policy_exit_node_in(settings),
+        allow_override: boolean_setting(settings, PKEY_ALLOW_EXIT_NODE_OVERRIDE, false),
+    }
+}
+
+/// The three exit-node policy keys as they are currently configured — the snapshot Go compares in
+/// `sysPolicyChanged` (`policy.HasChangedAnyOf(pkey.ExitNodeID, pkey.ExitNodeIP,
+/// pkey.AllowExitNodeOverride)`) to decide whether a standing exit-node override is still one the
+/// administrator would grant.
+///
+/// The raw configured values, not the resolved [`ExitNodePolicy`]: an administrator who swaps a
+/// pinned `ExitNodeIP` for an equally unusable `ExitNodeID` has changed the policy, and Go revokes
+/// the override on the *key* moving rather than on its effect moving. Tri-state per key (`None` =
+/// not configured) for the same reason [`AlwaysOnKeys`] is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct ExitNodeKeys {
+    /// [`PKEY_EXIT_NODE_ID`] as configured, or `None` when no source sets it.
+    pub id: Option<String>,
+    /// [`PKEY_EXIT_NODE_IP`] as configured, or `None` when no source sets it.
+    pub ip: Option<String>,
+    /// [`PKEY_ALLOW_EXIT_NODE_OVERRIDE`] as configured, or `None` when no source sets it.
+    pub allow_override: Option<bool>,
+}
+
+/// Read the current [`ExitNodeKeys`] from the registered stores — the input to
+/// [`Backend::exit_node_policy_changed`](super::Backend::exit_node_policy_changed).
+///
+/// Side-effect-free, like every other read of the registered stores — see the invariant on
+/// [`registered_store_settings`].
+pub(super) fn exit_node_keys() -> ExitNodeKeys {
+    exit_node_keys_in(&registered_store_settings())
+}
+
+/// The decision behind [`exit_node_keys`], over an already-merged setting list so it is testable
+/// without the process-global registry.
+fn exit_node_keys_in(settings: &[PolicySetting]) -> ExitNodeKeys {
+    ExitNodeKeys {
+        id: configured_string(settings, PKEY_EXIT_NODE_ID).map(str::to_string),
+        ip: configured_string(settings, PKEY_EXIT_NODE_IP).map(str::to_string),
+        allow_override: configured_boolean(settings, PKEY_ALLOW_EXIT_NODE_OVERRIDE),
     }
 }
 
@@ -1577,14 +1726,10 @@ fn pinned_prefs_in(settings: &[PolicySetting]) -> Vec<&'static str> {
         pinned.push("hostname");
     }
     // Only a value that is actually applied pins the pref: a refused `ExitNodeID` changes nothing,
-    // so the operator's own exit node is still theirs to lose and still worth guarding.
-    if configured_string(settings, "ExitNodeID")
-        .filter(|id| !id.is_empty())
-        .is_none()
-        && configured_string(settings, "ExitNodeIP")
-            .filter(|ip| !ip.is_empty())
-            .is_some_and(|ip| ip.parse::<std::net::IpAddr>().is_ok())
-    {
+    // so the operator's own exit node is still theirs to lose and still worth guarding. Same
+    // decision the edit gate locks on, read from the same place so the guard and the refusal can
+    // never disagree about whether the exit node is policy-managed.
+    if policy_exit_node_in(settings).is_some() {
         pinned.push("exit_node");
     }
     for policy in PREFERENCE_POLICIES {
@@ -2003,7 +2148,7 @@ mod tests {
     /// via the production [`apply_settings_to_prefs`], not a re-derivation — while staying off the
     /// process-global registry (see [`resolve`]).
     fn apply(json: &str, prefs: &mut Prefs) -> PolicyApplication {
-        apply_with_override(json, prefs, false)
+        apply_with_overrides(json, prefs, PolicyOverrides::default())
     }
 
     /// The same, with Go's `overrideAlwaysOn` standing — the state a permitted disconnect leaves the
@@ -2013,8 +2158,25 @@ mod tests {
         prefs: &mut Prefs,
         override_always_on: bool,
     ) -> PolicyApplication {
+        apply_with_overrides(
+            json,
+            prefs,
+            PolicyOverrides {
+                always_on: override_always_on,
+                exit_node: false,
+            },
+        )
+    }
+
+    /// The same again, with whichever of the backend's exemptions the test is about — the general
+    /// form both helpers above are a spelling of.
+    fn apply_with_overrides(
+        json: &str,
+        prefs: &mut Prefs,
+        overrides: PolicyOverrides,
+    ) -> PolicyApplication {
         let settings = resolve(json).expect("the policy document should load");
-        apply_settings_to_prefs(&settings, prefs, override_always_on)
+        apply_settings_to_prefs(&settings, prefs, overrides)
     }
 
     /// The keys the apply path spells as literals must all be registered definitions of the type it
@@ -2022,7 +2184,7 @@ mod tests {
     /// unknown key, so the setting would simply never apply and nothing would say why.
     #[test]
     fn every_key_the_apply_path_names_is_a_registered_definition_of_the_right_type() {
-        for key in ["LoginURL", "Hostname", "ExitNodeID", "ExitNodeIP"] {
+        for key in ["LoginURL", "Hostname", PKEY_EXIT_NODE_ID, PKEY_EXIT_NODE_IP] {
             let def = definition_of(key).unwrap_or_else(|| panic!("{key} must be defined"));
             assert_eq!(def.ty, ValueType::String, "{key}");
         }
@@ -2035,6 +2197,10 @@ mod tests {
             PKEY_ALWAYS_ON,
             PKEY_ALWAYS_ON_OVERRIDE_WITH_REASON,
             PKEY_ALLOW_TAILSCALED_RESTART,
+            // Named by the exit-node edit gate, which reads it through the same store: defined as
+            // anything but `Boolean` it would resolve to the `false` default forever, and an
+            // administrator who opted into user overrides would never get one.
+            PKEY_ALLOW_EXIT_NODE_OVERRIDE,
         ] {
             let def = definition_of(key).unwrap_or_else(|| panic!("{key} must be defined"));
             assert_eq!(def.ty, ValueType::Boolean, "{key}");
@@ -2429,6 +2595,117 @@ mod tests {
     }
 
     #[test]
+    fn a_standing_exit_node_override_suppresses_the_re_apply() {
+        // The window Go's `overrideExitNodePolicy` buys: the administrator allowed the operator to
+        // pick a different node, so the re-apply that runs after every prefs write must leave that
+        // pick alone. Without this the permitted override would be undone by the very command that
+        // made it — the bug this pair exists to close, one reconcile point later.
+        let doc = r#"{"ExitNodeIP": "100.64.0.9", "ExitNode.AllowOverride": true}"#;
+        let mut prefs = Prefs {
+            exit_node: Some("100.64.0.3".into()),
+            ..Prefs::default()
+        };
+        let applied = apply_with_overrides(
+            doc,
+            &mut prefs,
+            PolicyOverrides {
+                always_on: false,
+                exit_node: true,
+            },
+        );
+        assert_eq!(
+            prefs.exit_node.as_deref(),
+            Some("100.64.0.3"),
+            "a permitted override must survive the reconcile that follows it"
+        );
+        assert!(applied.changed.is_empty(), "{applied:?}");
+        assert!(applied.refused.is_empty(), "{applied:?}");
+
+        // And with no override standing — the same document, the administrator's node.
+        let applied = apply(doc, &mut prefs);
+        assert_eq!(prefs.exit_node.as_deref(), Some("100.64.0.9"));
+        assert_eq!(applied.changed.len(), 1, "{applied:?}");
+    }
+
+    #[test]
+    fn the_gate_locks_on_the_exit_node_the_policy_actually_applies() {
+        // The fork's ruling on Go's `HasAnyOf(ExitNodeID, ExitNodeIP)` (see the module docs): the
+        // lock is what `apply_exit_node_policy` writes, so a key this build refuses cannot be used
+        // to refuse the operator's exit node while pinning nothing in its place.
+        let pinned =
+            exit_node_policy_in(&resolve(r#"{"ExitNodeIP": "100.64.0.9"}"#).expect("load"));
+        assert_eq!(pinned.pinned.as_deref(), Some("100.64.0.9"));
+        assert!(
+            !pinned.allow_override,
+            "ExitNode.AllowOverride defaults to false, exactly as Go's GetBoolean(..., false) does"
+        );
+
+        for doc in [
+            // Refused: a stable node id pins nothing here, and it suppresses ExitNodeIP.
+            r#"{"ExitNodeID": "nABC123CNTRL"}"#,
+            r#"{"ExitNodeID": "nABC123CNTRL", "ExitNodeIP": "100.64.0.9"}"#,
+            r#"{"ExitNodeID": "auto:any"}"#,
+            // Ignored: an address the apply path drops, and an empty value.
+            r#"{"ExitNodeIP": "192.0.2.999"}"#,
+            r#"{"ExitNodeIP": ""}"#,
+            // No exit-node key at all, with the override key set to prove it pins nothing by itself.
+            r#"{"ExitNode.AllowOverride": true}"#,
+            "{}",
+        ] {
+            let policy = exit_node_policy_in(&resolve(doc).expect("load"));
+            assert_eq!(
+                policy.pinned, None,
+                "{doc} pins nothing this build applies, so it must lock nothing either"
+            );
+            // Cross-check against the apply path itself, so the two cannot drift: what is locked is
+            // exactly what is written.
+            let mut prefs = Prefs::default();
+            apply(doc, &mut prefs);
+            assert_eq!(prefs.exit_node, None, "{doc}");
+        }
+
+        let allowed = exit_node_policy_in(
+            &resolve(r#"{"ExitNodeIP": "100.64.0.9", "ExitNode.AllowOverride": true}"#)
+                .expect("load"),
+        );
+        assert!(allowed.allow_override);
+    }
+
+    #[test]
+    fn the_exit_node_snapshot_carries_the_raw_keys_tri_state() {
+        // Go revokes a standing override when a KEY moves, not when its effect moves — an admin who
+        // swaps a pinned IP for an (unusable) stable id has still changed the policy. So the
+        // snapshot holds the configured values, and "unset" differs from "set to empty"/"false".
+        assert_eq!(
+            exit_node_keys_in(&resolve("{}").expect("load")),
+            ExitNodeKeys::default()
+        );
+        let keys = exit_node_keys_in(
+            &resolve(
+                r#"{"ExitNodeID": "nABC123CNTRL", "ExitNodeIP": "",
+                    "ExitNode.AllowOverride": false}"#,
+            )
+            .expect("load"),
+        );
+        assert_eq!(
+            keys,
+            ExitNodeKeys {
+                id: Some("nABC123CNTRL".to_string()),
+                ip: Some(String::new()),
+                allow_override: Some(false),
+            }
+        );
+        assert_ne!(
+            keys,
+            ExitNodeKeys {
+                allow_override: None,
+                ..keys.clone()
+            },
+            "an administrator writing `false` where nothing was configured is a change"
+        );
+    }
+
+    #[test]
     fn the_key_with_no_pref_to_move_is_reported_unenforced() {
         // `UnattendedMode` has no counterpart in this daemon; reporting it is what keeps the policy
         // file from looking enforced when it is not.
@@ -2491,7 +2768,7 @@ mod tests {
         let pinned = pinned_prefs_in(&settings);
         // Applied against defaults, every one of those keys moves its pref.
         let mut prefs = Prefs::default();
-        let applied = apply_settings_to_prefs(&settings, &mut prefs, false);
+        let applied = apply_settings_to_prefs(&settings, &mut prefs, PolicyOverrides::default());
         let mut changed: Vec<&str> = applied.changed.iter().map(|c| c.pref).collect();
         changed.sort_unstable();
         let mut pinned_sorted = pinned.clone();
