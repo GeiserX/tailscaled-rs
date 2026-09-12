@@ -38,13 +38,21 @@
 //! ### Precedence inversion: `AuthKey` ranks LAST, not first
 //!
 //! One key does not follow that rule, and the next reader should not file it as a bug.
-//! [`auth_key`] — the registration credential, the only policy setting whose consumer is not a pref
-//! — is consulted **only after** an explicit `tnet up --auth-key` / `TS_AUTH_KEY` and the
+//! [`auth_key`] — the only policy setting whose VALUE is a credential; several others are read by
+//! name rather than applied to a pref — is consulted **only after** an explicit
+//! `tnet up --auth-key` / `TS_AUTH_KEY` and the
 //! `--config` file's `AuthKey` have both come up empty. That is Go's order (`Start` reads
 //! `pkey.AuthKey` last, behind `opts.AuthKey` and `b.conf`), and it is the right one for a
 //! credential: an operator who typed a key meant *that* key, and silently registering with a
 //! different one would be a worse surprise than ignoring the policy. Everything else here stays as
 //! above — the administrator wins.
+//!
+//! It also ranks last in a second sense Go never has to state: only a bring-up that is a
+//! **registration somebody asked for** may consult it at all
+//! ([`UpOptions::allow_policy_auth_key`](super::UpOptions::allow_policy_auth_key)). Go's read lives
+//! in `Start`, so its always-on auto-reconnect — an `EditPrefs(WantRunning: true)` — cannot reach
+//! it; here the reconnect timer and the operator's `up` share one code path, and only the second is
+//! allowed to turn an MDM key into a brand-new device.
 //!
 //! ### Reporting a credential
 //!
@@ -154,7 +162,9 @@
 //! `util/syspolicy/source/json_policy_store.go`, `util/syspolicy/source/policy_reader.go` and
 //! `util/syspolicy/policy_keys.go` @ `53a0d659afa51835dd7a9283873cca44261454f8`; the apply half is
 //! `ipn/ipnlocal/local.go` (`applySysPolicy`, `applyExitNodeSysPolicyLocked`,
-//! `preferencePolicies`) @ `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`.
+//! `preferencePolicies`) and the registration half is `ipn/ipnlocal/local.go` (`Start`, the
+//! `pkey.AuthKey` block quoted on [`auth_key`]), both @
+//! `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -254,8 +264,17 @@ const REDACTED: &str = "<redacted>";
 /// A newtype rather than a bare `String` so the enclosing [`PolicySource`] can keep its derived
 /// `Debug` (used by tests and by any future diagnostic) without that `Debug` being the leak this
 /// whole change exists to prevent. It renders as [`REDACTED`], exactly like the report row.
+///
+/// The inner [`Zeroizing`](secrecy::zeroize::Zeroizing) wipes the bytes on drop, so a credential
+/// this daemon has finished with does not linger in freed memory — the property
+/// [`secrecy::SecretString`] carries, which every other auth key here uses. `SecretString` itself
+/// cannot be used: it is `SecretBox<str>`, which is neither `Clone` nor `PartialEq`, and
+/// [`PolicySource`] needs both (a source is cloned out of the registry and compared in tests).
+/// `Zeroizing<String>` gives the zeroize-on-drop half without giving that up. The half it does not
+/// give is lifetime: a registered source lives as long as the process, by design — the credential
+/// must still be there when a slow first bring-up finally asks for it.
 #[derive(Clone, PartialEq, Eq)]
-struct Secret(String);
+struct Secret(secrecy::zeroize::Zeroizing<String>);
 
 impl std::fmt::Debug for Secret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1004,7 +1023,9 @@ fn read_source(store: &Map<String, Value>, source_name: &str) -> PolicySource {
 /// inventing a credential out of a malformed value is the one thing this must never do.
 /// [`validate`] refuses such a document outright before this runs.
 fn read_auth_key(store: &Map<String, Value>) -> Option<Secret> {
-    Some(Secret(store.get(PKEY_AUTH_KEY)?.as_str()?.to_string()))
+    Some(Secret(
+        store.get(PKEY_AUTH_KEY)?.as_str()?.to_string().into(),
+    ))
 }
 
 /// Decode every configured `StringList` key — the typed half of [`read_source`].
@@ -1120,7 +1141,9 @@ pub(super) enum AuthKeyDecision {
 }
 
 /// The administrator's registration credential, for a bring-up that has no other key — Go's third
-/// and last `AuthKey` source in `Start` (`ipn/ipnlocal/local.go`):
+/// and last `AuthKey` source in `Start` (`ipn/ipnlocal/local.go` @
+/// `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`, the same ref this module's apply half is ported
+/// from):
 ///
 /// ```text
 /// if opts.AuthKey == "" && b.state != ipn.Running && b.conf == nil {

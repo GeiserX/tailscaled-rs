@@ -275,6 +275,10 @@ mod tests {
             ephemeral: _,
             taildrop_dir: _, // configured out-of-band (engine Config), not an `up` flag.
             has_logged_in: _, // registration signal — the guard's own fresh-node INPUT, never a guarded setting (tsd-i7c).
+            // Load-time bookkeeping about the FILE, not a setting: it says whether `has_logged_in`
+            // above was read or defaulted (see `Prefs::migrate_has_logged_in`). Never persisted,
+            // so an `up` can neither mention nor revert it.
+            has_logged_in_absent_from_file: _,
             // EXEMPT: Go registers these four on `tailscale set` but NOT on `tailscale up`
             // (`set.go` `newSetFlagSet` vs `up.go` `newUpFlagSet`). An `up` therefore has no flag
             // that could mention them, so it can never revert them and `up --reset` must not clear
@@ -444,6 +448,9 @@ mod tests {
             // --- DIRECTIVE: not a pref; bypasses or is exempt from the guard, NOT in mentions_any_pref ---
             reset: _,        // its own guard-BYPASS path (caller skips the guard when set).
             force_reauth: _, // re-key lifecycle action; excluded from mentions_any_pref + the guard.
+            // whether this bring-up may enrol from the `AuthKey` system policy; mutates no pref, so
+            // it is excluded from mentions_any_pref + the guard for the same reason as the two above.
+            allow_policy_auth_key: _,
             // --- REGISTRATION-TIME: up-settable but never reverts (PATCH merge + honored only on a
             //     fresh register), so it IS in mentions_any_pref (mentioning it makes up non-bare, Go-
             //     faithfully checking the OTHER prefs) but is NOT a guard arm and NOT in --reset. ---

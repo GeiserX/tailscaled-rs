@@ -390,6 +390,15 @@ async fn sleep_until_armed(armed: Option<&ReconnectTimer>) {
 /// node resumes from the registration it still holds. A profile whose key a `logout` discarded has
 /// nothing to resume, so this reaches `NeedsLogin` and takes the failure line — the honest report,
 /// and the same terminal state Go's edit leaves that profile in.
+///
+/// "No auth key" includes the administrator's: the default
+/// [`UpOptions::allow_policy_auth_key`] (`false`) is what keeps an `AuthKey` system policy out of
+/// this path. It has to be said explicitly here because Go gets it for free — Go reads
+/// `pkey.AuthKey` in `Start`, and its auto-reconnect is an `EditPrefs`, a different code path
+/// entirely — whereas this timer and the operator's `up` share [`drive_up`]. Without the guard, a
+/// managed host with `AlwaysOn` + `ReconnectAfter` + a policy `AuthKey` would answer a permitted
+/// `logout` by registering a **brand-new device** off the MDM key when the timer elapsed, instead
+/// of reaching the documented `NeedsLogin`.
 async fn reconnect_now(
     backend: &std::sync::Arc<tokio::sync::Mutex<Backend>>,
     armed: &ReconnectTimer,
@@ -1222,10 +1231,7 @@ pub async fn drive_up(
     let mut authkey = authkey;
     let pending = {
         let mut be = backend.lock().await;
-        // Go `Start`'s auth-key precedence, last step: policy only when nothing else supplied a key.
-        if authkey.is_none() {
-            authkey = be.policy_auth_key();
-        }
+        authkey = be.registration_auth_key(authkey, wif.as_ref(), &opts);
         be.begin_up(opts, wif.as_ref()).await
     }?;
 
@@ -1685,6 +1691,27 @@ pub struct UpOptions {
     /// accidental-revert guard / `--reset` lockstep (changing it on an already-registered node is a
     /// no-op until a fresh register). Default for a fresh node is `false` (persistent).
     pub ephemeral: Option<bool>,
+    /// Whether this bring-up may **register the node** with the administrator's `AuthKey` system
+    /// policy when it carries no auth key of its own (see
+    /// [`registration_auth_key`](Backend::registration_auth_key)). A **lifecycle directive, not a
+    /// pref** — like [`reset`](Self::reset) and [`force_reauth`](Self::force_reauth) it mutates
+    /// nothing persisted and is deliberately absent from
+    /// [`mentions_any_pref`](Self::mentions_any_pref).
+    ///
+    /// Set by exactly the three entry points that mean "enrol this node if it is not enrolled": the
+    /// LocalAPI `up` handler (an operator asked), and the daemon's boot auto-start and its SIGHUP
+    /// retry (the host asked, which is the whole fleet-enrolment case the policy key exists for).
+    ///
+    /// **Default `false`, and that default is load-bearing.** The always-on `ReconnectAfter` timer
+    /// ([`reconnect_now`]) brings the node up with `UpOptions::default()`, and its contract is
+    /// "resume from the registration the node still holds" — a profile whose key a `logout`
+    /// discarded must reach `NeedsLogin`, not silently register as a **brand-new device** off an MDM
+    /// key on a timer. Go cannot hit this because its policy read lives in `Start` while its
+    /// auto-reconnect is an `EditPrefs(WantRunning: true)`, which never goes near it; here the two
+    /// share `drive_up`, so the distinction has to be said out loud. Any future caller of
+    /// [`drive_up`]/[`Backend::up`] that is not an operator- or host-initiated *registration* must
+    /// leave this `false`.
+    pub allow_policy_auth_key: bool,
 }
 
 impl UpOptions {
@@ -2337,6 +2364,11 @@ impl Backend {
             exit_node_keys: syspolicy::exit_node_keys(),
         };
         backend.has_node_key = backend.has_persisted_node_key().await;
+        // Resolve a `has_logged_in` an older build's prefs.json never wrote, now that the node-key
+        // fact is known. Without this an enrolled host that upgrades reads as "never enrolled" and
+        // the `AuthKey` policy gate would re-register it as a new device (see
+        // `Prefs::migrate_has_logged_in`).
+        backend.prefs.migrate_has_logged_in(backend.has_node_key);
         // Go reconciles system policy on every profile load, and this is one (the daemon's own, at
         // boot). IN MEMORY ONLY — see `reconcile_sys_policy` for why loading must not write.
         backend.reconcile_sys_policy("profile load");
@@ -2870,9 +2902,11 @@ impl Backend {
         // its key file). Computed here, into a local, alongside the other target state so it is only
         // committed to `self` after every fallible write succeeds (the D1 ordering above).
         let has_node_key = key_file_has_node_key(&key_path).await;
-        let prefs = Prefs::load(&prefs_path)
+        let mut prefs = Prefs::load(&prefs_path)
             .await
             .with_context(|| format!("loading prefs for profile {target:?}"))?;
+        // Same migration the boot load does, for a profile whose prefs.json predates the field.
+        prefs.migrate_has_logged_in(has_node_key);
 
         // (1) Register the target in profiles.json (so `--list` shows it) if it is a new named
         // profile — before the pointer, so a crash between them only leaves a harmless extra entry.
@@ -3107,6 +3141,18 @@ impl Backend {
     ///   port of Go's `Persist.UserProfile.LoginName != ""` — it is set when the node actually
     ///   registers and cleared by `logout` — so it answers "is this node already enrolled", which is
     ///   the intent the guard carries.
+    ///
+    ///   `has_logged_in` is `#[serde(default)]`, so a `prefs.json` written before the field existed
+    ///   would deserialize to `false` on a host that IS enrolled — and this gate, unlike the revert
+    ///   guard, cannot shrug that off: it would register the host afresh from the administrator's
+    ///   key after an upgrade. [`Prefs::migrate_has_logged_in`](crate::prefs::Prefs::migrate_has_logged_in)
+    ///   closes that at load time by seeding the field from the node key file when, and only when,
+    ///   the file omitted it. The remaining window is a crash between
+    ///   [`finish_up`](Backend::finish_up) flipping the flag in memory and `persist_prefs` writing
+    ///   it: that node reboots with a key file and an explicit `has_logged_in: false`, so the
+    ///   migration does not fire and the next bring-up may take the policy key once. It re-registers
+    ///   a node whose registration was seconds old, which is the same thing its interrupted `up` was
+    ///   doing, so it is left alone rather than papered over with a second heuristic.
     fn auth_key_gate(&self) -> syspolicy::AuthKeyGate {
         // The engine's authoritative view, when an engine exists. A cheap, non-blocking `watch`
         // borrow — the same source `status` and `up_control_url_guard` read.
@@ -3122,14 +3168,47 @@ impl Backend {
         }
     }
 
+    /// The credential this bring-up will register with: the one it was handed, or — for a bring-up
+    /// that is a **registration** and carries none — the administrator's `AuthKey` system policy.
+    /// Go `Start`'s auth-key precedence in one place, so both bring-up entry points
+    /// ([`up`](Backend::up) and [`drive_up`]) make the same decision and neither can drift.
+    ///
+    /// Three things close the policy branch, and each is a guard in its own right:
+    ///
+    /// * **`authkey` is `Some`.** Go's `opts.AuthKey == ""`. An operator who typed a key meant
+    ///   *that* key.
+    /// * **`wif` is `Some`.** No Go counterpart, because in Go an OAuth client secret simply *is*
+    ///   `opts.AuthKey` and so trips the guard above. Here a workload-identity exchange arrives on
+    ///   its own parameter, and the engine's `resolve_auth_key` prefers it over a plain key — so
+    ///   without this arm a `tnet up --client-id … --client-secret …` would resolve a policy key it
+    ///   then does not use, and log that it registered with one. A credential was supplied; policy
+    ///   ranks behind it.
+    /// * **`opts.allow_policy_auth_key` is `false`.** The caller is not a registration. See that
+    ///   field: the always-on `ReconnectAfter` timer shares `drive_up` with the operator's `up`, and
+    ///   only the latter may enrol a node.
+    ///
+    /// Everything past those is [`auth_key_gate`](Backend::auth_key_gate) + [`syspolicy::auth_key`],
+    /// logged the way Go logs it.
+    fn registration_auth_key(
+        &self,
+        authkey: Option<secrecy::SecretString>,
+        wif: Option<&WifCreds>,
+        opts: &UpOptions,
+    ) -> Option<secrecy::SecretString> {
+        if authkey.is_some() || wif.is_some() || !opts.allow_policy_auth_key {
+            return authkey;
+        }
+        self.policy_auth_key()
+    }
+
     /// The administrator's `AuthKey`, for a bring-up that has no key of its own — Go `Start`'s third
     /// and last auth-key source, resolved through [`syspolicy::auth_key`] and logged the way Go logs
     /// it.
     ///
-    /// Called by [`up`](Backend::up) and [`drive_up`] — the two entry points that carry a
-    /// registration credential — and by nothing else: a `set`/`reload-config` rebuild deliberately
-    /// resumes from the persisted node key and must never (re)authenticate, which is also why Go
-    /// reads this in `Start` and nowhere else.
+    /// Reached only through [`registration_auth_key`](Backend::registration_auth_key), which is the
+    /// one place the "may this caller register?" question is answered: a `set`/`reload-config`
+    /// rebuild and the always-on reconnect timer deliberately resume from the persisted node key and
+    /// must never (re)authenticate, which is also why Go reads this in `Start` and nowhere else.
     fn policy_auth_key(&self) -> Option<secrecy::SecretString> {
         match syspolicy::auth_key(self.auth_key_gate()) {
             // The overwhelmingly common case: no policy file, or one that configures no key.
@@ -3173,17 +3252,19 @@ impl Backend {
     /// `finish_up` phases so the slow handshake runs *without* the backend lock and a concurrent
     /// `status` is not head-of-line blocked.
     ///
-    /// With **no** `authkey` — the caller had no `--config` key and no `TS_AUTH_KEY` — the
-    /// administrator's `AuthKey` policy is consulted last ([`policy_auth_key`](Backend::policy_auth_key)),
-    /// which is what lets an MDM payload enrol a node nobody logs into. A key the caller *did* pass
-    /// always wins.
+    /// With **no** `authkey` and [`UpOptions::allow_policy_auth_key`] set — the caller had no
+    /// `--config` key and no `TS_AUTH_KEY`, and this bring-up is a registration the operator or the
+    /// host asked for — the administrator's `AuthKey` policy is consulted last
+    /// ([`registration_auth_key`](Backend::registration_auth_key)), which is what lets an MDM
+    /// payload enrol a node nobody logs into. A key the caller *did* pass always wins.
     pub async fn up(
         &mut self,
         authkey: Option<secrecy::SecretString>,
         opts: UpOptions,
     ) -> Result<()> {
-        // Go `Start`'s auth-key precedence, last step: policy only when nothing else supplied a key.
-        let authkey = authkey.or_else(|| self.policy_auth_key());
+        // Go `Start`'s auth-key precedence, last step: policy only when nothing else supplied a key
+        // AND this caller is a registration. The single-owner `up` carries no WIF creds (below).
+        let authkey = self.registration_auth_key(authkey, None, &opts);
         // The single-owner `up` (daemon auto-start / resume at boot) carries no workload-identity
         // creds — it resumes from the persisted node key or a config auth key. WIF registration is
         // driven only through the LocalAPI `up` path (`drive_up`).
@@ -11317,6 +11398,116 @@ mod tests {
         assert!(
             !be.auth_key_gate().needs_login,
             "only the engine may say the control plane wants a fresh login"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Register a device-scope policy file carrying ONLY `AuthKey`, for the wiring tests below.
+    ///
+    /// The registry is process-global (Go's `rsop` store list is too) and has no unregister, so this
+    /// is a one-way change to the whole lib test binary. It is safe precisely because the key it
+    /// registers is not a pref: `apply_to_prefs` never looks at `AuthKey`, no other test in this
+    /// binary reads the registered sources (the `syspolicy` unit tests all pass explicit source
+    /// slices to `auth_key_in`/`merge`), and `policy_auth_key` — the only reader — is reached from
+    /// nowhere but the two bring-up entry points, which no unit test drives.
+    fn register_policy_auth_key(key: &str) {
+        let dir = std::env::temp_dir().join(format!(
+            "tailnetd-policy-authkey-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).expect("policy dir");
+        let path = dir.join("syspolicy.json");
+        std::fs::write(&path, format!(r#"{{"AuthKey": "{key}"}}"#)).expect("policy file");
+        let outcome = syspolicy::load_json_policy_file(syspolicy::JSON_FILE_SOURCE_NAME, &path)
+            .expect("a policy file carrying only an AuthKey is valid");
+        assert_eq!(outcome, syspolicy::LoadOutcome::Registered { settings: 1 });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The whole registration path for the administrator's key, from a real policy file on disk to
+    /// the credential a bring-up would hand the engine — and, just as load-bearing, the callers that
+    /// must NOT get it. Deleting any one of the three guards in `registration_auth_key`, or the
+    /// `policy_auth_key` call behind them, fails here.
+    #[test]
+    fn the_policy_auth_key_reaches_a_registration_and_nothing_else() {
+        use secrecy::ExposeSecret;
+
+        register_policy_auth_key("tskey-auth-mdm-wiring");
+        let dir = std::env::temp_dir().join(format!(
+            "tailnetd-registration-authkey-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let mut be = backend_for(&dir);
+
+        // What the three registration entry points pass (the LocalAPI `up` handler, the boot
+        // auto-start and its SIGHUP retry).
+        let registration = UpOptions {
+            allow_policy_auth_key: true,
+            ..Default::default()
+        };
+        let exposed =
+            |key: Option<secrecy::SecretString>| key.map(|k| k.expose_secret().to_string());
+
+        // A never-enrolled node asked to come up: this is the fleet-enrolment case, and the key the
+        // administrator put in the policy file is what the engine gets.
+        assert_eq!(
+            exposed(be.registration_auth_key(None, None, &registration)),
+            Some("tskey-auth-mdm-wiring".to_string()),
+            "an unenrolled node brought up on purpose must enrol from the policy key"
+        );
+
+        // The always-on `ReconnectAfter` timer (`reconnect_now`) brings the node up with
+        // `UpOptions::default()` and no key, and its contract is to RESUME from the registration the
+        // node still holds. A profile whose key a permitted `logout` discarded must reach NeedsLogin,
+        // not register as a brand-new device off the administrator's key on a timer.
+        assert_eq!(
+            exposed(be.registration_auth_key(None, None, &UpOptions::default())),
+            None,
+            "a bring-up that is not a registration must never take the policy key"
+        );
+        assert!(
+            !UpOptions::default().allow_policy_auth_key,
+            "the default must stay closed: `reconnect_now` relies on it"
+        );
+
+        // A key the caller supplied always wins — Go's `opts.AuthKey == ""`.
+        assert_eq!(
+            exposed(be.registration_auth_key(
+                Some(secrecy::SecretString::from("tskey-auth-typed".to_string())),
+                None,
+                &registration,
+            )),
+            Some("tskey-auth-typed".to_string()),
+            "an operator who typed a key meant that key"
+        );
+
+        // So do workload-identity creds. In Go the OAuth client secret IS `opts.AuthKey` and so
+        // trips the guard above; here it arrives on its own parameter, and the engine's
+        // `resolve_auth_key` prefers the exchange over a plain key — so resolving a policy key here
+        // would log a registration with a credential the engine then does not use.
+        let wif = WifCreds::from_wire(
+            Some("client-id".to_string()),
+            Some("client-secret".to_string()),
+            None,
+            None,
+        )
+        .expect("client id + secret are workload-identity creds");
+        assert_eq!(
+            exposed(be.registration_auth_key(None, Some(&wif), &registration)),
+            None,
+            "a workload-identity exchange is a supplied credential; policy ranks behind it"
+        );
+
+        // And an already-enrolled node refuses it however it was asked — the gate, reached through
+        // the real `policy_auth_key`.
+        be.prefs.has_logged_in = true;
+        assert_eq!(
+            exposed(be.registration_auth_key(None, None, &registration)),
+            None,
+            "dropping a policy file next to an enrolled node must not re-register it"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

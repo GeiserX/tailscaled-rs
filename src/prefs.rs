@@ -232,11 +232,28 @@ pub struct Prefs {
     /// prefs.json. Set `true` when the node registers (see the bring-up path); never reset by `set`;
     /// **reset to `false` by `logout`** (logout ends the registration → no longer logged in, matching
     /// Go clearing `Persist.UserProfile.LoginName`); **preserved across `down`** (down keeps the
-    /// registration). `#[serde(default)]` (container-level) migrates an old prefs.json with no key → `false`, so the
-    /// first `up` after a daemon upgrade is unguarded once (acceptable — it cannot lose a setting the
-    /// operator didn't just then decline to re-mention on an already-running node).
+    /// registration). The container-level `#[serde(default)]` would migrate an old prefs.json with no
+    /// key → `false`, which reads as "never enrolled" on a node that in fact is. For the revert
+    /// guard that is harmless (the first `up` after a daemon upgrade is unguarded once — it cannot
+    /// lose a setting the operator didn't just then decline to re-mention on an already-running
+    /// node). For the `AuthKey` policy gate it is NOT: that gate would hand an already-enrolled host
+    /// the administrator's key and re-register it as a brand-new device. So the absence is detected
+    /// at load and seeded from the node key file instead — see
+    /// [`has_logged_in_absent_from_file`](Prefs::has_logged_in_absent_from_file) and
+    /// [`migrate_has_logged_in`](Prefs::migrate_has_logged_in).
     #[serde(default)]
     pub has_logged_in: bool,
+    /// Whether the `prefs.json` this was loaded from **omitted** `has_logged_in` entirely — i.e. it
+    /// was written by a build from before the field existed, and the `false` above is serde's
+    /// default rather than the node's own answer. `false` for a file that carries the key (whatever
+    /// its value), for a fresh node with no file at all, and for a plain [`Prefs::default`].
+    ///
+    /// Not persisted (`#[serde(skip)]`): it describes the *file that was read*, not the node, and
+    /// the next prefs write emits `has_logged_in` explicitly, after which the question can never
+    /// arise for this profile again. Consumed by
+    /// [`migrate_has_logged_in`](Prefs::migrate_has_logged_in).
+    #[serde(skip)]
+    pub has_logged_in_absent_from_file: bool,
 }
 
 impl Default for Prefs {
@@ -269,6 +286,8 @@ impl Default for Prefs {
             tun_name: None,
             tun_mtu: None,
             has_logged_in: false,
+            // A `Prefs::default()` was not read from a file, so there is no absent key to migrate.
+            has_logged_in_absent_from_file: false,
         }
     }
 }
@@ -276,21 +295,69 @@ impl Default for Prefs {
 impl Prefs {
     /// Load prefs from `path`. A missing file yields [`Prefs::default`]; a malformed file is
     /// treated as default rather than failing the daemon (the node simply starts unconfigured).
+    ///
+    /// Also records whether the file omitted `has_logged_in`
+    /// ([`has_logged_in_absent_from_file`](Prefs::has_logged_in_absent_from_file)), which a caller
+    /// that knows whether a node key exists resolves with
+    /// [`migrate_has_logged_in`](Prefs::migrate_has_logged_in).
     pub async fn load(path: &Path) -> std::io::Result<Self> {
         match tokio::fs::read(path).await {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-                // Fail safe but not silent: a corrupted prefs file is otherwise
-                // indistinguishable from a fresh node. Log it (the node still boots on
-                // defaults — a parse error must not stop startup) so the fallback is visible.
-                tracing::warn!(
-                    error = %e,
-                    path = %path.display(),
-                    "prefs: file is malformed; falling back to default prefs (node starts unconfigured)"
-                );
-                Self::default()
-            })),
+            Ok(bytes) => Ok(Self::from_file_bytes(&bytes, path)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e),
+        }
+    }
+
+    /// Decode one `prefs.json`'s bytes, the body of [`load`](Prefs::load).
+    ///
+    /// Decodes through a [`serde_json::Value`] rather than straight off the bytes so the object's
+    /// KEYS are visible: "the file said `has_logged_in: false`" and "the file is older than the
+    /// field" are the same `false` after deserialization, and only the second may be overridden by
+    /// [`migrate_has_logged_in`](Prefs::migrate_has_logged_in). One parse either way.
+    fn from_file_bytes(bytes: &[u8], path: &Path) -> Self {
+        // Fail safe but not silent: a corrupted prefs file is otherwise indistinguishable from a
+        // fresh node. Log it (the node still boots on defaults — a parse error must not stop
+        // startup) so the fallback is visible.
+        let warn = |e: serde_json::Error| {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "prefs: file is malformed; falling back to default prefs (node starts unconfigured)"
+            );
+            Self::default()
+        };
+        let value: serde_json::Value = match serde_json::from_slice(bytes) {
+            Ok(value) => value,
+            Err(e) => return warn(e),
+        };
+        // Only a JSON OBJECT can omit a key; anything else is malformed and falls back below.
+        let absent = value
+            .as_object()
+            .is_some_and(|obj| !obj.contains_key("has_logged_in"));
+        match serde_json::from_value::<Self>(value) {
+            Ok(mut prefs) => {
+                prefs.has_logged_in_absent_from_file = absent;
+                prefs
+            }
+            Err(e) => warn(e),
+        }
+    }
+
+    /// Resolve a `has_logged_in` that the on-disk file never carried, given whether this profile has
+    /// a **persisted node key**. A no-op unless
+    /// [`has_logged_in_absent_from_file`](Prefs::has_logged_in_absent_from_file) — a file that
+    /// states the field is believed, whatever it says.
+    ///
+    /// A node key file is the best evidence available that this node completed a registration under
+    /// the older build, which is exactly what `has_logged_in` records. It is deliberately NOT used
+    /// as a general substitute for the field: `build_config`'s create-on-missing writes a node key
+    /// before the first registration is attempted, so a node whose very first `up` FAILED has a key
+    /// file and has never logged in. That node runs the new build, so it writes `has_logged_in:
+    /// false` explicitly and never reaches this path — the two cases stay distinguishable precisely
+    /// because this only fires for a file that predates the field.
+    pub fn migrate_has_logged_in(&mut self, has_node_key: bool) {
+        if self.has_logged_in_absent_from_file {
+            self.has_logged_in = has_node_key;
         }
     }
 
@@ -562,6 +629,93 @@ mod tests {
             !loaded.want_running,
             "malformed prefs must not leave a node connected"
         );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// A `prefs.json` older than `has_logged_in` must not read as "this node has never enrolled":
+    /// the `AuthKey` system-policy gate would take that at face value and register an
+    /// already-enrolled host afresh from the administrator's key after a daemon upgrade.
+    #[tokio::test]
+    async fn an_old_prefs_file_takes_has_logged_in_from_the_node_key() {
+        let dir = std::env::temp_dir().join(format!(
+            "tailnetd-prefs-migrate-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("prefs.json");
+
+        // What a build from before the field wrote: no `has_logged_in` key at all.
+        tokio::fs::write(&path, br#"{"want_running": true, "accept_dns": true}"#)
+            .await
+            .unwrap();
+        let mut old = Prefs::load(&path).await.expect("load old prefs");
+        assert!(
+            old.has_logged_in_absent_from_file,
+            "the file omitted the key, and the loader has to say so"
+        );
+        assert!(!old.has_logged_in, "serde's default, before the migration");
+        old.migrate_has_logged_in(true);
+        assert!(
+            old.has_logged_in,
+            "a node with a persisted node key completed a registration under the old build"
+        );
+
+        // The same file on a node with no key file: nothing to infer an enrolment from.
+        let mut never = Prefs::load(&path).await.expect("load old prefs");
+        never.migrate_has_logged_in(false);
+        assert!(!never.has_logged_in);
+
+        // A file that STATES the field is believed, whatever it says and whatever keys exist. This
+        // is what keeps a node whose first `up` failed distinguishable: `build_config` writes a node
+        // key before the first registration is attempted, so it has a key file and an explicit
+        // `false`, and it must stay eligible for the very key meant to enrol it.
+        tokio::fs::write(&path, br#"{"want_running": true, "has_logged_in": false}"#)
+            .await
+            .unwrap();
+        let mut explicit = Prefs::load(&path).await.expect("load new prefs");
+        assert!(!explicit.has_logged_in_absent_from_file);
+        explicit.migrate_has_logged_in(true);
+        assert!(
+            !explicit.has_logged_in,
+            "an explicit false is the node's own answer and must survive the migration"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// `has_logged_in_absent_from_file` describes the file that was read and is never written back,
+    /// so a round-trip through the on-disk form leaves it `false` — the migration is a one-shot at
+    /// the upgrade, not a standing property of the profile.
+    #[tokio::test]
+    async fn the_absence_marker_is_not_persisted() {
+        let dir = std::env::temp_dir().join(format!(
+            "tailnetd-prefs-marker-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("prefs.json");
+        tokio::fs::write(&path, br#"{"want_running": true}"#)
+            .await
+            .unwrap();
+
+        let mut loaded = Prefs::load(&path).await.expect("load old prefs");
+        loaded.migrate_has_logged_in(true);
+        let written = serde_json::to_vec(&loaded).expect("prefs serialize");
+        assert!(
+            !String::from_utf8_lossy(&written).contains("has_logged_in_absent_from_file"),
+            "the marker must not reach the on-disk form"
+        );
+        tokio::fs::write(&path, &written).await.unwrap();
+
+        let reloaded = Prefs::load(&path).await.expect("reload prefs");
+        assert!(
+            !reloaded.has_logged_in_absent_from_file,
+            "the rewritten file carries the key explicitly, so there is nothing left to migrate"
+        );
+        assert!(reloaded.has_logged_in, "and it carries the migrated value");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

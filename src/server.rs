@@ -1805,6 +1805,10 @@ async fn dispatch(
                 reset,
                 force_reauth,
                 ephemeral,
+                // An operator asked this node to come up, so it may enrol from the administrator's
+                // `AuthKey` policy if it has never enrolled and carries no key of its own (Go
+                // `Start`'s `pkey.AuthKey`). Only a *requested* bring-up gets that; see the field.
+                allow_policy_auth_key: true,
             };
             // Accidental-revert guard (Go `checkForAccidentalSettingReverts`): unless this is a
             // `--reset` up, refuse an `up` that would silently revert a non-default pref it didn't

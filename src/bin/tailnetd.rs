@@ -239,8 +239,10 @@ struct Args {
     /// `--config`), so policy outranks anything an operator sets locally. A key this build cannot
     /// enforce is logged at WARN each time rather than silently reported as if it took effect.
     /// One key inverts that precedence, deliberately: `AuthKey` — the credential that enrols the
-    /// node — is used only when no auth key was given on the command line, in `TS_AUTH_KEY` or in a
-    /// `--config` file, and never on a node that is already enrolled. Its value is redacted out of
+    /// node — is used only when no auth key was given on the command line, in `TS_AUTH_KEY`, in a
+    /// `--config` file or as workload-identity creds; never on a node that is already enrolled; and
+    /// only on a bring-up that is a *registration* somebody asked for (an operator's `tnet up`, or
+    /// this daemon's own boot), never on the always-on reconnect timer. Its value is redacted out of
     /// `tnet syspolicy list`. See `ipn::syspolicy` for both rulings.
     #[arg(long, value_name = "PATH", default_value_t = default_syspolicy_file())]
     syspolicy_file: String,
@@ -1176,6 +1178,10 @@ async fn reconcile_on_reload(backend: &Arc<Mutex<Backend>>, prefs_path: &std::pa
 /// its persisted key on every reboot and only ever *registers* from policy while it is unenrolled.
 /// That is the fleet-enrolment case the key exists for, and it is why the "cannot resume or
 /// authenticate" warning below is not the end of the story on an MDM-managed host.
+///
+/// The policy key is **opt-in per bring-up** ([`ipn::UpOptions::allow_policy_auth_key`]), and this
+/// path opts in because booting the daemon is the host asking for a registration. The always-on
+/// reconnect timer, which shares the same `up` plumbing, deliberately does not.
 async fn auto_start(backend: &mut Backend, config_authkey: Option<secrecy::SecretString>) {
     if !backend.wants_running() {
         return;
@@ -1195,7 +1201,14 @@ async fn auto_start(backend: &mut Backend, config_authkey: Option<secrecy::Secre
     // Auto-start uses persisted prefs as-is (no overrides) — TUN/hostname/control-url all come from
     // the stored prefs the user set via `tnet up`, not from the boot path. No external lock is held
     // at boot (this runs before `serve`), so the inline `up` is fine here.
-    match backend.up(authkey, ipn::UpOptions::default()).await {
+    // The host asked for this bring-up (the daemon's own boot path), so it may enrol from the
+    // administrator's `AuthKey` policy when it has no key of its own — the fleet-enrolment case the
+    // key exists for. The gate inside still refuses it for an already-enrolled node.
+    let up_opts = ipn::UpOptions {
+        allow_policy_auth_key: true,
+        ..Default::default()
+    };
+    match backend.up(authkey, up_opts).await {
         // Boot success was previously silent — log it so an operator tailing the log sees the node
         // came up at boot (the node then converges to Running once the netmap arrives).
         Ok(()) => tracing::info!("auto-start: node is up"),
@@ -1230,7 +1243,13 @@ async fn auto_start_arc(backend: &Arc<Mutex<Backend>>) {
 
     // The SIGHUP reload resume carries no workload-identity creds (it resumes from the persisted key
     // or the env auth key) → `None`.
-    if let Err(e) = ipn::drive_up(backend, authkey, None, ipn::UpOptions::default()).await {
+    // Same registration intent as the boot path this retries (see `auto_start`): an unenrolled
+    // managed host may take the administrator's `AuthKey`.
+    let up_opts = ipn::UpOptions {
+        allow_policy_auth_key: true,
+        ..Default::default()
+    };
+    if let Err(e) = ipn::drive_up(backend, authkey, None, up_opts).await {
         tracing::warn!(error = %format!("{e:#}"), "SIGHUP auto-start retry failed; awaiting `tnet up`");
     }
 }
