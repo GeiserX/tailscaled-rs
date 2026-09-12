@@ -1240,3 +1240,99 @@ async fn debug_portmap_refuses_an_unknown_type() {
 
     harness.shutdown_and_verify().await;
 }
+
+/// The `policy` mask bit (Go `ipn.NotifySysPolicyChanges`, `1 << 17`) end to end over the real
+/// socket: a masked `Watch` asking only for policy must get the effective snapshot as its FIRST
+/// frame, and a fresh snapshot pushed to it whenever the policy may have moved.
+///
+/// Why this matters here more than upstream: policy outranks local prefs on every write in this
+/// fork, so a `tnet set` that appears to do nothing is explained by a policy row. Before this bit the
+/// only way to see that row was to ask for it (`syspolicy list`), which cannot distinguish "policy
+/// unchanged" from "policy changed and I have not asked again".
+///
+/// Honest scope. This harness registers no `--syspolicy-file`, so the snapshot is the empty-but-valid
+/// device-scope report a daemon without a policy source resolves — which is the point being pinned:
+/// the frame is *present*, carrying a scope and an (empty) row list, rather than absent. The rows a
+/// real file produces are pinned where a source is actually registered (tests/syspolicy_file.rs),
+/// and they are the same rows by construction: both come from `Backend::policy_snapshot`.
+///
+/// The `syspolicy reload` that drives the change edge is invoked on the backend API rather than over
+/// a second socket connection purely so the assertion is about the notify path and nothing else; it
+/// is the identical call `server::serve` dispatches the `syspolicy_reload` verb to.
+#[tokio::test]
+async fn a_policy_masked_watch_front_loads_the_snapshot_and_is_pushed_on_reload() {
+    let harness = Harness::start().await;
+
+    let stream = UnixStream::connect(&harness.socket_path)
+        .await
+        .expect("CLI connect to LocalAPI socket for a policy watch");
+    let (read_half, mut write_half) = stream.into_split();
+    // Only the `policy` bit: a management agent that just wants to know when the administrator
+    // changed something asks for nothing else. Any mask bit selects the Notify path.
+    write_half
+        .write_all(b"{\"cmd\":\"watch\",\"policy\":true}\n")
+        .await
+        .expect("write masked watch request");
+    write_half.flush().await.expect("flush watch request");
+    let mut reader = BufReader::new(read_half);
+
+    // Go documents `NotifySysPolicyChanges` as causing "the first Notify message, which is sent
+    // immediately, to contain the current effective snapshot" — so the front-load is part of the
+    // bit's contract, not an optimisation. A bounded read, so a regression FAILS instead of hanging.
+    let first = try_read_watch_status(&mut reader, Duration::from_secs(5))
+        .await
+        .expect("a policy-masked watch must send its snapshot immediately, before any change");
+    let Response::Notify(first) = first else {
+        panic!("a masked watch streams Notify frames, got {first:?}");
+    };
+    let snapshot = first
+        .policy
+        .as_ref()
+        .expect("the first frame of a policy-masked watch carries the policy");
+    assert_eq!(
+        snapshot.scope, "Device",
+        "the daemon resolves the device scope, as Go's `setting.DefaultScope()` does"
+    );
+    assert!(
+        snapshot.settings.is_empty(),
+        "this harness registers no policy source, so the snapshot is empty-but-present"
+    );
+    assert!(
+        first.state.is_none() && first.net_map.is_none() && first.prefs.is_none(),
+        "a policy-only watch must not be sent fields it did not ask for: {first:?}"
+    );
+
+    // Nothing has changed, so nothing more may arrive: this is what makes the push below meaningful
+    // (it is the reload that produces the frame, not a chatty stream).
+    assert!(
+        try_read_watch_status(&mut reader, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "a parked policy watcher must stay quiet while the policy does not move"
+    );
+
+    // The change edge. `syspolicy reload` is the operator saying "the policy may have moved", and the
+    // only such moment this build can observe (the JSON source is captured at startup and never
+    // re-read), so it is the signal the bit is built on.
+    let Response::Policy(reloaded) = Backend::syspolicy_reload() else {
+        panic!("syspolicy_reload must reply with a policy report");
+    };
+
+    let second = try_read_watch_status(&mut reader, Duration::from_secs(5))
+        .await
+        .expect(
+            "a `syspolicy reload` must push a fresh snapshot to a parked policy watcher — without \
+             it a watcher cannot tell 'unchanged' from 'changed and I have not asked again'",
+        );
+    let Response::Notify(second) = second else {
+        panic!("a masked watch streams Notify frames, got {second:?}");
+    };
+    assert_eq!(
+        second.policy.as_ref(),
+        Some(&reloaded),
+        "the pushed frame carries the SAME report the `syspolicy reload` verb answered with — one \
+         producer, so the notify stream cannot drift from the one-shot read"
+    );
+
+    harness.shutdown_and_verify().await;
+}

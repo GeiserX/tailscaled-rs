@@ -449,6 +449,7 @@ mod tests {
                 initial_state: false,
                 initial_netmap: false,
                 prefs: false,
+                policy: false,
             }),
             "bare watch only streams status snapshots — a read, gated exactly like status"
         );
@@ -459,6 +460,7 @@ mod tests {
                 initial_state: true,
                 initial_netmap: true,
                 prefs: true,
+                policy: true,
             }),
             "masked watch only streams notifications — still a read"
         );

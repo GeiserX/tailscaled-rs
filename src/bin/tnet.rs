@@ -1531,10 +1531,11 @@ enum DebugCmd {
         auto_update: Option<bool>,
     },
     /// Stream the daemon's IPN notification bus as JSON, one object per line (Go `tailscale debug
-    /// watch-ipn-bus`). Subscribes to the **masked** `watch` path with both initial snapshots
-    /// requested, so the first line is the current state + peer set and each subsequent line carries
-    /// only what changed (state transitions, the full peer set on a netmap change, interactive-login /
-    /// consent URLs). Read-only and long-lived — it runs until interrupted (Ctrl-C) or the daemon
+    /// watch-ipn-bus`). Subscribes to the **masked** `watch` path with every initial snapshot
+    /// requested, so the first lines are the current state + peer set + prefs + effective system
+    /// policy, and each subsequent line carries only what changed (state transitions, the full peer set
+    /// on a netmap change, interactive-login / consent URLs, a fresh prefs snapshot on every prefs
+    /// write, and a fresh policy snapshot on every `syspolicy reload`). Read-only and long-lived — it runs until interrupted (Ctrl-C) or the daemon
     /// closes the stream (node torn down / shutdown). Distinct from `tnet status --watch`, which stays
     /// on the bare status-stream path.
     WatchIpn,
@@ -10970,6 +10971,7 @@ async fn watch_status(socket: &std::path::Path, json: bool, filter: StatusFilter
         initial_state: false,
         initial_netmap: false,
         prefs: false,
+        policy: false,
     })?;
     line.push(b'\n');
     write_half.write_all(&line).await?;
@@ -11029,8 +11031,9 @@ async fn watch_status(socket: &std::path::Path, json: bool, filter: StatusFilter
 
 /// `debug watch-ipn` (Go `tailscale debug watch-ipn-bus`): stream the daemon's IPN notification bus,
 /// printing one JSON [`NotifyView`](tailscaled_rs::localapi::NotifyView) per line. Sends the **masked**
-/// `watch` request (`initial_state` + `initial_netmap` both set) so the first frame is the current
-/// state + peer set and each later frame carries only what changed. Reuses `watch_status`'s
+/// `watch` request with every mask bit set (`initial_state`, `initial_netmap`, `prefs`, `policy`) so
+/// the first frames are the current state + peer set + prefs + effective policy, and each later frame
+/// carries only what changed. Reuses `watch_status`'s
 /// streaming-read shape — connect, write the one request line, then read [`Response`] lines until the
 /// daemon closes the stream — but on the Notify path: `Notify` frames print as JSON, an `Error` frame
 /// exits non-zero, and any other reply (impossible on this connection) is noted and skipped.
@@ -11041,12 +11044,14 @@ async fn run_debug_watch_ipn(socket: &std::path::Path) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
 
     // The MASKED watch: all snapshots requested → the daemon streams `Response::Notify` frames (not
-    // `Response::Status`), front-loading the current state + peer set + prefs, then streaming each
-    // change (incl. a fresh prefs frame on every up/set/logout/switch/reload-config).
+    // `Response::Status`), front-loading the current state + peer set + prefs + effective policy, then
+    // streaming each change (a fresh prefs frame on every up/set/logout/switch/reload-config, and a
+    // fresh policy snapshot on every `syspolicy reload`).
     let mut line = serde_json::to_vec(&Request::Watch {
         initial_state: true,
         initial_netmap: true,
         prefs: true,
+        policy: true,
     })?;
     line.push(b'\n');
     write_half.write_all(&line).await?;

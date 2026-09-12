@@ -186,6 +186,49 @@ struct PolicySource {
 /// [`Backend::syspolicy_list`]: crate::ipn::Backend::syspolicy_list
 static REGISTERED: RwLock<Vec<PolicySource>> = RwLock::new(Vec::new());
 
+/// Wakes policy watchers (a masked `Watch` with the `policy` bit) whenever the effective policy may
+/// have moved — Go's `policyclient.RegisterChangeCallback`, which `ipnlocal` hooks per watch session
+/// so `sysPolicyChangedForSession` can push a fresh snapshot into that session's `Notify.Policy`.
+///
+/// A tick channel (`()` payload), not the snapshot itself: a receiver re-reads
+/// [`effective_policy`] on each tick, the same "tick, then re-read the source" pattern the prefs
+/// feed ([`Backend::watch_prefs`]) uses. Re-reading is what makes the notify field carry *exactly*
+/// the rows `syspolicy list` returns — there is one renderer of the snapshot, not two, so any rule
+/// the report later adopts (redaction of a credential-bearing key, say) reaches the notify stream
+/// without a second edit.
+///
+/// Process-global for the same reason [`REGISTERED`] is: the policy registry has no backend
+/// receiver to hang off, and the LocalAPI policy handlers are static.
+///
+/// **What actually ticks it, honestly.** Go registers real change sources (a Windows registry
+/// watcher, a `ReadWriteHandle` a management agent pokes) and its callback fires whenever one of
+/// them moves. This build has exactly one source, a JSON file captured at startup and never
+/// re-read, so the only points at which the effective policy can differ from what a watcher last
+/// saw are [`load_json_policy_file`] (a source appears) and [`reload_effective_policy`] (the
+/// operator asked for a forced re-read). Those are the two send sites. That is a coarser signal
+/// than Go's — a hand edit of `syspolicy.json` is not seen until someone runs `syspolicy reload` —
+/// and the mask bit's documentation says so rather than promising a watch this build cannot
+/// perform. A file watcher would narrow the gap and is deliberately not smuggled in here.
+///
+/// [`Backend::watch_prefs`]: crate::ipn::Backend::watch_prefs
+static POLICY_CHANGED: std::sync::LazyLock<tokio::sync::watch::Sender<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::watch::channel(()).0);
+
+/// Subscribe to policy-change ticks (a masked `Watch` with the `policy` bit). The receiver re-reads
+/// [`effective_policy`] on each tick. `subscribe()` starts synced (no spurious initial tick), so a
+/// watcher emits its first policy frame from its own initial snapshot, not from this channel —
+/// matching Go, where `NotifySysPolicyChanges` front-loads the snapshot from the initial-state
+/// assembly and the registered callback only carries *subsequent* changes.
+pub fn watch_policy() -> tokio::sync::watch::Receiver<()> {
+    POLICY_CHANGED.subscribe()
+}
+
+/// Tell every policy watcher to re-read the snapshot. A failed send (zero receivers) is the common
+/// case — nobody is watching policy — and is not an error.
+fn notify_policy_changed() {
+    let _ = POLICY_CHANGED.send(());
+}
+
 /// What [`load_json_policy_file`] did, so the caller can log it honestly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadOutcome {
@@ -244,6 +287,11 @@ pub fn load_json_policy_file(source_name: &str, path: &Path) -> Result<LoadOutco
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .push(source);
+    // A source appeared: the effective policy just moved for anyone holding an older snapshot.
+    // Nothing is watching at daemon start (this runs from `main` before the LocalAPI is served), so
+    // this is for the sake of the invariant rather than any current caller — every mutation of
+    // `REGISTERED` ticks, so a watcher can never silently miss one.
+    notify_policy_changed();
     Ok(LoadOutcome::Registered { settings: count })
 }
 
@@ -269,9 +317,15 @@ pub(super) fn effective_policy() -> PolicyReport {
 /// re-reads them, so `tailscale syspolicy reload` does **not** pick up an edit made to
 /// `syspolicy.json` after the daemon started — only a restart does. Kept a distinct verb (faithful
 /// to Go, and the place a genuinely re-readable source would be re-read). Never errors.
+///
+/// It also pushes the re-read snapshot to every policy watcher (see [`POLICY_CHANGED`]). A reload is
+/// the operator saying "the policy may have moved", and it is the only such moment this build can
+/// observe, so it is the change edge the `policy` notify bit is built on — even though, for the JSON
+/// file source, the re-read necessarily resolves to the same rows a watcher already holds.
 pub(super) fn reload_effective_policy() -> PolicyReport {
     // The forced re-read re-merges the registered sources; none of them can have changed underneath
     // us, because each captured its settings at registration (see `PolicySource`).
+    notify_policy_changed();
     PolicyReport {
         scope: DEVICE_SCOPE.to_string(),
         settings: registered_store_settings(),
@@ -1233,6 +1287,12 @@ fn pinned_prefs_in(settings: &[PolicySetting]) -> Vec<&'static str> {
 mod tests {
     use super::*;
 
+    /// Serializes the tests that call [`reload_effective_policy`], because it ticks the
+    /// process-global policy-change channel and cargo runs these as parallel threads in one process:
+    /// one test's reload is visible on another test's receiver, so "no tick arrived" is only a
+    /// meaningful assertion while this is held.
+    static POLICY_TICK_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Parse + validate + resolve a document the way [`load_json_policy_file`] does, without
     /// touching the process-global registry — so these tests stay independent of each other and of
     /// whatever a daemon would have registered.
@@ -1265,12 +1325,46 @@ mod tests {
 
     #[test]
     fn reload_matches_list_with_no_sources() {
+        let _serialized = POLICY_TICK_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         // With zero sources the forced re-read yields the same empty snapshot as `list`.
         assert_eq!(reload_effective_policy(), effective_policy());
     }
 
     #[test]
+    fn a_reload_pushes_the_snapshot_to_a_policy_watcher() {
+        let _serialized = POLICY_TICK_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        // The change edge the `policy` notify bit is built on. A watcher that subscribed before the
+        // reload must see the tick, and the snapshot it then re-reads must be the one `list` returns —
+        // there is one producer, so the notify stream cannot drift from the report.
+        let mut rx = watch_policy();
+        assert!(
+            !rx.has_changed().unwrap(),
+            "`subscribe()` starts synced: a fresh watcher must not see a spurious initial tick, \
+             because it front-loads its own snapshot instead"
+        );
+
+        let pushed = reload_effective_policy();
+        assert!(
+            rx.has_changed().unwrap(),
+            "a `syspolicy reload` is the one change signal this build can observe; it must reach \
+             the notify bus"
+        );
+        rx.borrow_and_update();
+        assert_eq!(
+            effective_policy(),
+            pushed,
+            "the pushed snapshot and the `list` snapshot are the same rows"
+        );
+
+        // Ticks are edges, not a queue: after consuming one, a second reload is seen again.
+        assert!(!rx.has_changed().unwrap());
+        let _ = reload_effective_policy();
+        assert!(rx.has_changed().unwrap());
+    }
+
+    #[test]
     fn reload_is_device_scoped_and_empty() {
+        let _serialized = POLICY_TICK_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let r = reload_effective_policy();
         assert_eq!(r.scope, "Device");
         assert!(r.settings.is_empty());
