@@ -75,6 +75,15 @@
 //! Two more keys act without ever touching prefs, because their effect is a refusal rather than a
 //! rewritten pref: `tailnetd` reads [`PKEY_ENCRYPT_STATE`] and [`PKEY_HARDWARE_ATTESTATION`] by name
 //! for two startup refusals.
+
+//! A further key acts on an *answer* rather than on a pref: `AllowedSuggestedExitNodes` is the
+//! administrator's allow-list for exit-node suggestions, resolved as a set by
+//! [`allowed_suggested_exit_nodes`] and applied by [`diag::suggest_exit_node`](super::diag), which
+//! withholds a suggestion the list excludes rather than recommending a node the administrator ruled
+//! out. Go filters *candidates* before the latency ranking and so answers with the best permitted
+//! node; this daemon is handed the engine's already-chosen one, so it can refuse but not re-rank.
+//! The missing half — an allow-list that excludes only the engine's top pick, where Go would answer
+//! with the runner-up — is engine ask #44 in `docs/ENGINE_ASKS.md`.
 //!
 //! Two consequences worth stating. The applied values are **persisted** into `prefs.json` by
 //! whichever write follows (a profile load applies in memory only and writes nothing, so merely
@@ -96,7 +105,7 @@
 //! `ipn/ipnlocal/local.go` (`applySysPolicy`, `applyExitNodeSysPolicyLocked`,
 //! `preferencePolicies`) @ `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::RwLock;
 
@@ -125,6 +134,12 @@ pub const PKEY_ALWAYS_ON: &str = "AlwaysOn.Enabled";
 /// always-on node by saying why. Read by name for the same reason as [`PKEY_ALWAYS_ON`].
 pub const PKEY_ALWAYS_ON_OVERRIDE_WITH_REASON: &str = "AlwaysOn.OverrideWithReason";
 
+/// Go `pkey.AllowedSuggestedExitNodes` — the policy key naming the exit nodes a managed node may be
+/// steered onto. Read by name by [`allowed_suggested_exit_nodes`], which is the only consumer, so —
+/// unlike the four keys above — it stays private to this module; what leaves is the decoded set, not
+/// the spelling. Shared with [`DEFINITIONS`] so there is exactly one definition of it.
+const PKEY_ALLOWED_SUGGESTED_EXIT_NODES: &str = "AllowedSuggestedExitNodes";
+
 /// The scope name the CLI resolves, matching Go `setting.DefaultScope().String()` on non-Windows
 /// hosts (`"Device"`). Centralized so the report and any future scope plumbing agree on the spelling.
 const DEVICE_SCOPE: &str = "Device";
@@ -152,6 +167,14 @@ pub const JSON_FILE_SOURCE_NAME: &str = "JSONFile";
 struct PolicySource {
     /// The settings this source resolved, one per configured policy key.
     settings: Vec<PolicySetting>,
+    /// The **decoded** value of every `StringList` key this source configured, keyed by policy key.
+    ///
+    /// Carried beside the rendered rows because a consumer of a list policy cannot recover the list
+    /// from the row: [`PolicySetting::value`] holds Go's `%v` rendering (`[a b c]`), in which an
+    /// element containing a space is indistinguishable from two elements. For an allow-list that
+    /// difference decides whether a node id the administrator never wrote is admitted, so the
+    /// decoded form is kept rather than re-parsed — see [`configured_string_list`].
+    string_lists: BTreeMap<&'static str, Vec<String>>,
 }
 
 /// Every registered device-scope policy source, in registration order (Go's `rsop` store list).
@@ -215,12 +238,12 @@ pub fn load_json_policy_file(source_name: &str, path: &Path) -> Result<LoadOutco
     // Validation passed, so every key is known and every value decodes; read the snapshot once and
     // register it. (Go's `rsop.RegisterStore` can fail; ours cannot — there is no reader to
     // construct and no store to lock — so there is no third error shape to port here.)
-    let settings = read_settings(&store, source_name);
-    let count = settings.len();
+    let source = read_source(&store, source_name);
+    let count = source.settings.len();
     REGISTERED
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .push(PolicySource { settings });
+        .push(source);
     Ok(LoadOutcome::Registered { settings: count })
 }
 
@@ -360,7 +383,7 @@ const fn def(key: &'static str, ty: ValueType) -> Definition {
 /// output.
 const DEFINITIONS: &[Definition] = &[
     // Device policy settings (configurable only on a per-device basis in Go).
-    def("AllowedSuggestedExitNodes", ValueType::StringList),
+    def(PKEY_ALLOWED_SUGGESTED_EXIT_NODES, ValueType::StringList),
     def("ExitNode.AllowOverride", ValueType::Boolean),
     def("AllowTailscaledRestart", ValueType::Boolean),
     def(PKEY_ALWAYS_ON, ValueType::Boolean),
@@ -705,6 +728,92 @@ fn read_settings(store: &Map<String, Value>, source_name: &str) -> Vec<PolicySet
         });
     }
     out
+}
+
+/// Resolve a validated store into the source this daemon registers: the rendered rows
+/// [`effective_policy`] reports, plus the decoded lists a policy *consumer* reads (see
+/// [`PolicySource::string_lists`]).
+fn read_source(store: &Map<String, Value>, source_name: &str) -> PolicySource {
+    PolicySource {
+        settings: read_settings(store, source_name),
+        string_lists: read_string_lists(store),
+    }
+}
+
+/// Decode every configured `StringList` key — the typed half of [`read_source`].
+///
+/// A key the document does not mention is absent from the map (Go's `ErrNotConfigured`), and a key
+/// whose value is not an array of strings is **skipped** rather than recorded as an empty list: Go's
+/// `GetStringArray` hands its caller an error, and `fillAllowedSuggestions` turns that into a nil
+/// set — i.e. *no restriction*, not *nothing is allowed*. Recording an empty list here would invert
+/// that, so an undecodable value must read as unset. [`validate`] refuses such a document outright
+/// before this runs, so the skip is unreachable through the load path; it is kept because it is the
+/// behaviour Go falls back to.
+fn read_string_lists(store: &Map<String, Value>) -> BTreeMap<&'static str, Vec<String>> {
+    let mut out = BTreeMap::new();
+    for def in DEFINITIONS.iter().filter(|d| d.ty == ValueType::StringList) {
+        let Some(Value::Array(items)) = store.get(def.key) else {
+            continue;
+        };
+        let decoded: Option<Vec<String>> = items
+            .iter()
+            .map(|item| item.as_str().map(str::to_string))
+            .collect();
+        if let Some(values) = decoded {
+            out.insert(def.key, values);
+        }
+    }
+    out
+}
+
+/// The exit nodes the administrator permits this node to be **steered onto** — Go
+/// `LocalBackend.getAllowedSuggestions()`, over the set `fillAllowedSuggestions` builds from
+/// `AllowedSuggestedExitNodes` (`ipn/ipnlocal/local.go`).
+///
+/// `None` is **no restriction**; `Some(set)` is *only* these stable node ids, and that includes
+/// `Some(empty)` — a configured empty array, which permits nothing. The distinction is load bearing
+/// and it is Go's: `fillAllowedSuggestions` returns a nil set when the key is unset (and when
+/// reading it fails), and the candidate filter is written `if allowList != nil &&
+/// !allowList.Contains(peer.StableID())`, so nil means allow-all while an empty set means deny-all.
+/// Collapsing the two would make every node with no policy file one that can never be suggested an
+/// exit node.
+///
+/// Read by [`diag::suggest_exit_node`](super::diag), which refuses to hand back a suggestion outside
+/// the set. Side-effect-free, like every other read of the registered stores — see the invariant on
+/// [`registered_store_settings`].
+pub(super) fn allowed_suggested_exit_nodes() -> Option<BTreeSet<String>> {
+    allowed_suggestions_in(
+        &REGISTERED
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    )
+}
+
+/// The decision behind [`allowed_suggested_exit_nodes`], over a source list so it is testable
+/// without touching the process-global registry.
+///
+/// Go stores the set on the backend and rebuilds it from `sysPolicyChanged`; there is nothing to
+/// cache here because this daemon's only policy source captures its contents at registration and can
+/// never change underneath us (see [`PolicySource`]), so the set is derived on each read.
+fn allowed_suggestions_in(sources: &[PolicySource]) -> Option<BTreeSet<String>> {
+    Some(
+        configured_string_list(sources, PKEY_ALLOWED_SUGGESTED_EXIT_NODES)?
+            .iter()
+            .cloned()
+            .collect(),
+    )
+}
+
+/// The decoded value of string-list policy `key`, or `None` when no registered source configures it
+/// — Go `syspolicy.GetStringArray`'s configured branch, with the same last-registration-wins
+/// layering [`merge`] gives the report (hence the reverse scan: the newest source that configured
+/// the key answers).
+fn configured_string_list<'a>(sources: &'a [PolicySource], key: &str) -> Option<&'a [String]> {
+    sources
+        .iter()
+        .rev()
+        .find_map(|source| source.string_lists.get(key))
+        .map(Vec::as_slice)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1133,6 +1242,15 @@ mod tests {
         Ok(read_settings(&store, JSON_FILE_SOURCE_NAME))
     }
 
+    /// The same, but resolving the whole source (rendered rows + decoded lists) the way
+    /// [`load_json_policy_file`] does — so the list-policy tests below drive the real decode path
+    /// and not a hand-built map.
+    fn resolve_source(json: &str) -> Result<PolicySource, String> {
+        let store = parse_json_store(json.as_bytes())?;
+        validate(&store)?;
+        Ok(read_source(&store, JSON_FILE_SOURCE_NAME))
+    }
+
     #[test]
     fn list_is_empty_device_scoped_with_no_registered_source() {
         // A daemon that registered no policy file resolves an empty-but-valid snapshot: device
@@ -1377,6 +1495,9 @@ mod tests {
                     error: None,
                 },
             ],
+            // This case is about the rendered rows the report merges; the decoded-list layering has
+            // its own test (`the_last_registered_source_wins_the_allow_list`).
+            string_lists: BTreeMap::new(),
         };
         let later = PolicySource {
             settings: vec![PolicySetting {
@@ -1385,6 +1506,7 @@ mod tests {
                 value: Some("from-file".to_string()),
                 error: None,
             }],
+            string_lists: BTreeMap::new(),
         };
 
         let merged = merge(&[earlier, later]);
@@ -1847,5 +1969,71 @@ mod tests {
     fn pinned_prefs_is_empty_with_no_registered_source() {
         // The entry point over the process-global registry, which no unit test registers into.
         assert!(pinned_prefs().is_empty());
+    }
+
+    #[test]
+    fn an_unset_allow_list_is_no_restriction_not_an_empty_one() {
+        // Go's `fillAllowedSuggestions` returns a nil set for an unconfigured key, and its filter is
+        // `allowList != nil && !allowList.Contains(...)` — so nil is allow-all. Collapsing unset into
+        // an empty set would stop every node with no policy file from ever being suggested an exit
+        // node, which is the inversion this test exists to catch.
+        let source = resolve_source("{}").expect("an empty document should load");
+        assert_eq!(allowed_suggestions_in(&[source]), None);
+        // A policy file that configures *other* keys is still no restriction on suggestions.
+        let source = resolve_source(r#"{"Hostname": "documented-node"}"#)
+            .expect("an unrelated key should load");
+        assert_eq!(allowed_suggestions_in(&[source]), None);
+        // And with no source registered at all — an unmanaged node — the public reader agrees.
+        assert_eq!(allowed_suggested_exit_nodes(), None);
+    }
+
+    #[test]
+    fn a_configured_allow_list_is_exactly_the_ids_the_administrator_wrote() {
+        let source = resolve_source(r#"{"AllowedSuggestedExitNodes": ["nodeA", "nodeB"]}"#)
+            .expect("a well-formed list should load");
+        assert_eq!(
+            allowed_suggestions_in(&[source]),
+            Some(BTreeSet::from(["nodeA".to_string(), "nodeB".to_string()]))
+        );
+    }
+
+    #[test]
+    fn a_configured_empty_allow_list_permits_nothing() {
+        // The other half of the nil-versus-empty rule: `[]` is configured, so it IS a restriction —
+        // one that no node satisfies. `Some(empty)`, never `None`.
+        let source = resolve_source(r#"{"AllowedSuggestedExitNodes": []}"#)
+            .expect("an empty list is a valid value");
+        assert_eq!(allowed_suggestions_in(&[source]), Some(BTreeSet::new()));
+    }
+
+    #[test]
+    fn an_allow_list_entry_is_never_split_on_whitespace() {
+        // The rendered row for this value is Go's `%v`: `[node A]` — from which "one id containing a
+        // space" and "two ids" are indistinguishable. The decoded list is read instead, so the set
+        // holds the one id the administrator actually wrote and `nodeA`/`A` are NOT admitted.
+        let source = resolve_source(r#"{"AllowedSuggestedExitNodes": ["node A"]}"#)
+            .expect("a list with a space in an element should load");
+        assert_eq!(
+            allowed_suggestions_in(&[source]),
+            Some(BTreeSet::from(["node A".to_string()]))
+        );
+    }
+
+    #[test]
+    fn the_last_registered_source_wins_the_allow_list() {
+        // Same layering the report gets (`merge`, last writer wins per key): a later source's list
+        // replaces an earlier one wholesale rather than being unioned with it, and a later source
+        // that does not configure the key leaves the earlier list standing.
+        let first = resolve_source(r#"{"AllowedSuggestedExitNodes": ["nodeA"]}"#).unwrap();
+        let second = resolve_source(r#"{"AllowedSuggestedExitNodes": ["nodeB"]}"#).unwrap();
+        let silent = resolve_source(r#"{"Hostname": "documented-node"}"#).unwrap();
+        assert_eq!(
+            allowed_suggestions_in(&[first.clone(), second]),
+            Some(BTreeSet::from(["nodeB".to_string()]))
+        );
+        assert_eq!(
+            allowed_suggestions_in(&[first, silent]),
+            Some(BTreeSet::from(["nodeA".to_string()]))
+        );
     }
 }
