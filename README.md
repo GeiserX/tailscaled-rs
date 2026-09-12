@@ -137,6 +137,11 @@ is refused with Go's own "only 'true' is allowed". `up --nickname` is refused by
 applies **live** — in place, with no reconnect (matching Go's `set`). `--shields-up`, `--ssh`,
 `--advertise-tags`, `--advertise-connector` and `--auto-update` briefly rebuild the connection (they
 have no in-place engine setter, and the last two are re-advertised to control on every map request).
+`--auto-update` is additionally **refused** on an installation that could never apply an update — one
+a package manager owns (`brew upgrade` is the update path there), or a platform with no published
+release artifact — because the pref is advertised to control as `Hostinfo.AllowsUpdate`, so accepting
+it would tell the tailnet admin that a remote update trigger will be honoured by a node that cannot
+honour one. Declining (`--no-auto-update`) is accepted everywhere.
 `--operator`, `--report-posture`, `--webclient`, `--update-check` and
 `--exit-node-allow-lan-access` are **carried prefs**: they are persisted and reported (`tnet get`),
 but nothing in this build acts on them yet — each flag's `--help` says exactly what it does and does
