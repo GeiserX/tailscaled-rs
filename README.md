@@ -149,6 +149,20 @@ not do. `--nickname` is the exception among them: like Go, it also renames the c
 so the name you pick is what `tnet switch --list` shows and what `tnet switch <name>` resolves
 against. `set` never re-authenticates and never changes whether the node is up or down.
 
+`--exit-node` is **resolved before it is stored**, on `up`, `set` and `check-prefs` alike, the way Go
+resolves the argument in its CLI (`exitNodeIPOfArg`). This machine's own tailnet address is refused
+("cannot use … as an exit node as it is a local IP address to this machine; did you mean
+`--advertise-exit-node`?"), and once the node is `Running`, so are an IP no peer holds ("no node found
+in netmap with IP …") and a peer that never advertised a default route ("node … is not advertising an
+exit node"). A name is matched against every peer's base name and FQDN, case-insensitively, and is
+refused when no peer answers to it ("invalid value … must be IP or peer hostname") or when more than
+one does ("ambiguous exit node name …"); before the first netmap a name is refused outright ("cannot
+resolve exit node by hostname while Tailscale is starting up; please use its Tailscale IP address
+instead"), because there is no peer list to resolve it against — pass the exit node's tailnet IP
+there. Without this the engine's selector parse accepts *every* string, so a typo, this node's own
+address, or a peer that offers no exit was stored as a working pref and then routed nothing, with no
+command saying why.
+
 `tnet switch <target>` only ever *selects* a profile that exists: a target matching no profile by id
 or nickname is refused, exactly as Go's `tailscale switch` refuses it (`No profile named ...`), so a
 typo can no longer disconnect the node into an empty profile. Creating one is its own request —

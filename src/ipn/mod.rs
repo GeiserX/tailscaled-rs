@@ -571,6 +571,220 @@ fn validate_exit_node_selector(exit_node: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// The netmap facts an operator-supplied `--exit-node` VALUE is resolved against: this fork's
+/// stand-in for the `ipnstate.Status` Go's CLI fetches and hands to `Prefs.SetExitNodeIP`
+/// (`ipn/prefs.go`) before any pref is written. Projected out of one [`Backend::status`] snapshot by
+/// [`ExitNodeFacts::from_status`], so the resolution sees exactly what `tnet status` and
+/// `tnet exit-node list` show — one netmap view, no second source of truth.
+///
+/// [`Default`] is the "nothing known" view (not running, no addresses, no peers), which is what a
+/// node that has never come up honestly has; [`resolve_exit_node_arg`] stages its refusals around
+/// that, exactly as Go does.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ExitNodeFacts {
+    /// Whether the node is [`State::Running`] — i.e. whether `peers` is an authoritative netmap
+    /// view. Go gates its two netmap-backed refusals on `BackendState == "Running"` for the same
+    /// reason: before that, "no peer has this IP" only means "no netmap yet".
+    running: bool,
+    /// This node's own tailnet addresses (v4 and v6, when a netmap has assigned them).
+    self_ips: Vec<std::net::IpAddr>,
+    /// The tailnet's MagicDNS suffix (e.g. `tail0123.ts.net`), used to derive a peer's *base* name
+    /// from its FQDN — Go's `dnsname.TrimSuffix(ps.DNSName, st.MagicDNSSuffix)`.
+    magic_dns_suffix: Option<String>,
+    /// The netmap peers, each carrying `is_exit_node` (Go `ipnstate.PeerStatus.ExitNodeOption`) —
+    /// the same field `tnet exit-node list` builds its table from.
+    peers: Vec<PeerReport>,
+}
+
+impl ExitNodeFacts {
+    /// Project a [`StatusReport`] into the subset the resolution reads. Consumes the report: it is
+    /// built for this call and the peer list is the expensive part, so move rather than clone.
+    fn from_status(st: StatusReport) -> Self {
+        let self_ips = [st.self_ipv4.as_deref(), st.self_ipv6.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter_map(|s| s.parse::<std::net::IpAddr>().ok())
+            .collect();
+        Self {
+            running: st.state == State::Running.as_str(),
+            self_ips,
+            magic_dns_suffix: st.magic_dns_suffix,
+            peers: st.peers,
+        }
+    }
+}
+
+/// The host-derived inputs [`Backend::check_prefs_gated`] consults, passed IN rather than read from
+/// the process environment so every refusal they contribute is unit-testable (`set_var` is `unsafe`
+/// in edition 2024 and races the parallel test harness — the same reason
+/// [`state_dir_with_source`](crate::state_dir_with_source) takes an injectable environment lookup).
+/// One struct rather than two more parameters: they travel together, and the check already carries
+/// the caller's five prospective-pref overrides.
+struct CheckPrefsEnv<'a> {
+    /// [`featureknob::can_run_tailscale_ssh`](crate::featureknob::can_run_tailscale_ssh)'s verdict
+    /// for this host. Consulted only when the prospective posture actually runs SSH, matching Go,
+    /// which calls it from `checkSSHPrefsLocked` only once `RunSSH` is set.
+    ssh_gate: Result<()>,
+    /// The netmap view a NAMED exit-node selector is resolved against (see
+    /// [`resolve_exit_node_arg`]). [`ExitNodeFacts::default`] when the request names none.
+    exit_node_facts: &'a ExitNodeFacts,
+}
+
+/// Whether `arg` names `peer`, in any of the three spellings Go's `exitNodeIPOfArg` accepts: the
+/// peer's base name, its FQDN, and its FQDN without the trailing root dot — all
+/// case-insensitively. A trailing dot on the *argument* is ignored too, so the operator can paste
+/// either form of either spelling. This is deliberately the same rule the engine's
+/// `Node::matches_name` applies when it later resolves the stored selector, so a value accepted here
+/// is a value the engine will route through (and not a value that passes validation and then matches
+/// no peer).
+fn peer_matches_exit_node_name(
+    peer: &PeerReport,
+    arg: &str,
+    magic_dns_suffix: Option<&str>,
+) -> bool {
+    let want = arg.strip_suffix('.').unwrap_or(arg);
+    let fqdn = peer.name.strip_suffix('.').unwrap_or(peer.name.as_str());
+    if want.eq_ignore_ascii_case(fqdn) {
+        return true;
+    }
+    // Base name = FQDN with `.<magic-dns-suffix>` chopped off (case-insensitively, like Go's
+    // `dnsname.TrimSuffix`). `str::get` returns `None` rather than panicking if the cut would land
+    // inside a multi-byte character, so a non-ASCII peer name can never panic here.
+    let Some(suffix) = magic_dns_suffix else {
+        return false;
+    };
+    let suffix = suffix.strip_suffix('.').unwrap_or(suffix);
+    let Some(cut) = fqdn.len().checked_sub(suffix.len() + 1) else {
+        return false;
+    };
+    let (Some(base), Some(tail)) = (fqdn.get(..cut), fqdn.get(cut..)) else {
+        return false;
+    };
+    !base.is_empty()
+        && tail
+            .strip_prefix('.')
+            .is_some_and(|t| t.eq_ignore_ascii_case(suffix))
+        && want.eq_ignore_ascii_case(base)
+}
+
+/// Whether one of `peer`'s tailnet addresses is `ip` (Go compares against every
+/// `PeerStatus.TailscaleIPs` entry).
+fn peer_has_ip(peer: &PeerReport, ip: std::net::IpAddr) -> bool {
+    [Some(peer.ipv4.as_str()), peer.ipv6.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s.parse::<std::net::IpAddr>().ok())
+        .any(|peer_ip| peer_ip == ip)
+}
+
+/// Resolve an operator-supplied `--exit-node` VALUE against the netmap — the port of Go's
+/// `exitNodeIPOfArg` (`ipn/prefs.go`), which is six refusals in one function.
+///
+/// The engine's `ExitNodeSelector: FromStr` is **infallible** (a bare IP → `Ip`, anything else →
+/// `Name`), so without this every value is accepted, stored, and then silently matches no peer:
+/// traffic is not routed through an exit node and nothing ever said why. That is the same trap the
+/// `auto:` guard in [`validate_exit_node_selector`] was written to close, left open for every other
+/// value.
+///
+/// Go's refusals, in order, all reproduced here:
+///
+/// 1. a value that parses as an IP but is **this machine's own** address — `ExitNodeLocalIPError`,
+///    "cannot use %s as an exit node as it is a local IP address to this machine", which Go's `up`
+///    and `set` both re-wrap as "%w; did you mean --advertise-exit-node?";
+/// 2. once Running, an IP **no peer** holds — "no node found in netmap with IP %v";
+/// 3. a peer that is **not advertising** an exit node — "node %v is not advertising an exit node";
+/// 4. a non-IP value while the **peer list is empty** — "cannot resolve exit node by hostname while
+///    Tailscale is starting up; please use its Tailscale IP address instead" (Go refuses rather than
+///    attempting a resolution that could only fail);
+/// 5. a name **no peer** answers to — "invalid value %q for --exit-node; must be IP or peer
+///    hostname";
+/// 6. a name **more than one** peer answers to — "ambiguous exit node name %q".
+///
+/// The **staging** is Go's, not a stricter rule: the local-IP refusal (1) and the empty-value
+/// refusal apply always, because they need no netmap; the netmap-backed refusals (2) and (3) apply
+/// only once the node is Running, because before that "not in the netmap" only means "no netmap
+/// yet"; and a name is refused outright (4) rather than resolved against a peer list that does not
+/// exist.
+///
+/// Two deliberate, documented deviations from Go. (a) Go re-wraps the local-IP error with
+/// "did you mean --advertise-exit-node?" in the CLI, for `up` and `set` only; the resolution here is
+/// daemon-side and shared, so the hint is part of the one message and `check-prefs` reports it too —
+/// the hint is just as true there. (b) Go's empty-value guard returns the opaque `os.ErrInvalid`
+/// ("invalid argument"); this says what to pass instead.
+///
+/// Pure: every fact it reads arrives in `facts`, so it can run before a single pref is mutated, and
+/// it is unit-testable without an engine.
+fn resolve_exit_node_arg(arg: &str, facts: &ExitNodeFacts) -> Result<()> {
+    if arg.trim().is_empty() {
+        return Err(anyhow!(
+            "--exit-node was given an empty value; pass a tailnet IP address or a peer name, or \
+             clear the exit node instead"
+        ));
+    }
+    // The IP branch. A value that parses as an IP is never matched by name (Go returns from this
+    // branch unconditionally), so a peer that happens to be *named* after an IP cannot shadow it.
+    if let Ok(ip) = arg.parse::<std::net::IpAddr>() {
+        // (1) Our own address. Checked whatever the state: a self address we know about is a fact
+        // about this machine, not about the netmap's completeness. An operator who types it almost
+        // always meant to OFFER egress, hence Go's hint.
+        if facts.self_ips.contains(&ip) {
+            return Err(anyhow!(
+                "cannot use {arg} as an exit node as it is a local IP address to this machine; \
+                 did you mean --advertise-exit-node?"
+            ));
+        }
+        // Before Running there is no authoritative peer list, so an unknown IP is accepted (Go
+        // does the same): it may well be a peer this node has not learned about yet.
+        if !facts.running {
+            return Ok(());
+        }
+        return match facts.peers.iter().find(|p| peer_has_ip(p, ip)) {
+            // (2) Running, netmap in hand, and nobody holds this address.
+            None => Err(anyhow!("no node found in netmap with IP {ip}")),
+            // (3) The peer exists but never advertised a default route, so selecting it would
+            // route nothing.
+            Some(p) if !p.is_exit_node => Err(anyhow!("node {ip} is not advertising an exit node")),
+            Some(_) => Ok(()),
+        };
+    }
+
+    // The name branch. (4) With no peers there is nothing to resolve against: refuse with the
+    // remedy rather than guess.
+    if facts.peers.is_empty() {
+        return Err(anyhow!(
+            "cannot resolve exit node by hostname while Tailscale is starting up; please use its \
+             Tailscale IP address instead"
+        ));
+    }
+    let suffix = facts.magic_dns_suffix.as_deref();
+    let mut matched = 0usize;
+    for peer in &facts.peers {
+        if !peer_matches_exit_node_name(peer, arg, suffix) {
+            continue;
+        }
+        matched += 1;
+        // (3) again, by name. Go reports it from inside the match loop — i.e. a named peer that
+        // offers no exit is refused as such even when the name is ambiguous — and reports the
+        // peer's IP, which is the identity the operator has to act on.
+        if !peer.is_exit_node {
+            return Err(anyhow!(
+                "node {} is not advertising an exit node",
+                peer.ipv4
+            ));
+        }
+    }
+    match matched {
+        // (5) A typo, or a peer that has left the tailnet.
+        0 => Err(anyhow!(
+            "invalid value {arg:?} for --exit-node; must be IP or peer hostname"
+        )),
+        1 => Ok(()),
+        // (6) Two peers answer to the name; picking one silently would be a coin flip over which
+        // machine sees the operator's traffic.
+        _ => Err(anyhow!("ambiguous exit node name {arg:?}")),
+    }
+}
+
 /// Per-daemon-process counter that disambiguates two diagnostic markers taken in the same second
 /// ([`Backend::bugreport`]). `bugreport --record` prints one marker before the reproduction and one
 /// after; the coarse Unix-seconds stamp alone would render both identically when the operator is
@@ -2388,10 +2602,14 @@ impl Backend {
         if let Some(tags) = opts.advertise_tags.as_ref() {
             validate_advertise_tags(tags)?;
         }
-        // And reject an `auto:` exit-node selector before persisting (this build has no auto-selection;
-        // a silent fall-through to `Name("auto:any")` would break exit routing with no error).
+        // And RESOLVE a named `--exit-node` before persisting: the unsupported `auto:` form, then
+        // the netmap-backed checks Go runs on the CLI argument (`exitNodeIPOfArg`). Same reason as
+        // in `begin_up` — the engine's selector parse is infallible, so an unusable value persists
+        // and then routes nothing, with no command saying why. On a RUNNING node this is the one
+        // place the check can happen at all: `set` applies the exit node live and never reaches
+        // `build_config`.
         if let Some(Some(sel)) = opts.exit_node.as_ref() {
-            validate_exit_node_selector(Some(sel))?;
+            self.check_exit_node_arg(sel).await?;
         }
         // And refuse an SSH-server enable the host or the operator has ruled out (Go
         // `checkSSHPrefsLocked` → `featureknob.CanRunTailscaleSSH`, run whenever `RunSSH` is being
@@ -2729,10 +2947,14 @@ impl Backend {
         if let Some(tags) = opts.advertise_tags.as_ref() {
             validate_advertise_tags(tags)?;
         }
-        // And reject an `auto:` exit-node selector before teardown/persist (no auto-selection in this
-        // build; a silent fall-through to `Name("auto:any")` would break exit routing with no error).
+        // And RESOLVE a named `--exit-node` before teardown/persist: reject the unsupported `auto:`
+        // form (no auto-selection in this build), then check the value against the netmap the way Go
+        // resolves the CLI argument before writing the pref (`exitNodeIPOfArg`). Both matter for the
+        // same reason — the engine's selector parse is infallible, so an unusable value would be
+        // stored and then silently route nothing. Refused here, the live device and `prefs.json` are
+        // both untouched.
         if let Some(Some(sel)) = opts.exit_node.as_ref() {
-            validate_exit_node_selector(Some(sel))?;
+            self.check_exit_node_arg(sel).await?;
         }
         // Same discipline for an SSH-server enable: Go's `checkSSHPrefsLocked` runs
         // `featureknob.CanRunTailscaleSSH()` whenever `RunSSH` is being SET, so a host whose
@@ -3958,7 +4180,10 @@ impl Backend {
     /// would, so a CLI can fail fast before an `up`/`set`.
     ///
     /// This fork mirrors the subset of Go's `checkPrefsLocked` rule chain that maps to its pref model:
-    /// (1) the exit-node selector is concrete (no unsupported `auto:`); (2) **exit-node-vs-advertise
+    /// (1) the exit-node selector is concrete (no unsupported `auto:`) and, when the request names
+    /// one, RESOLVES against the netmap (Go `exitNodeIPOfArg`: not this machine's own address, a
+    /// peer that exists, a peer that actually advertises an exit node, an unambiguous name);
+    /// (2) **exit-node-vs-advertise
     /// conflict** — cannot use an exit node and advertise as one simultaneously (Go
     /// `checkExitNodePrefsLocked`); (3) every advertised route is a masked CIDR (Go
     /// `checkAdvertiseRoutes`); (4) SSH-server enable requires the `ssh` build feature (the local
@@ -3971,7 +4196,7 @@ impl Backend {
     /// (Go `checkAutoUpdatePrefsLocked` → `feature.CanAutoUpdate()`, decided here by
     /// [`selfupdate::auto_update_refusal`]). Go's operator/profile-name/config-lock/Funnel-shields
     /// rules reference prefs this fork does not model, so they are correctly N/A.
-    pub fn check_prefs(
+    pub async fn check_prefs(
         &self,
         exit_node: Option<Option<String>>,
         advertise_exit_node: Option<bool>,
@@ -3979,24 +4204,48 @@ impl Backend {
         ssh: Option<bool>,
         auto_update: Option<bool>,
     ) -> Result<()> {
+        // Only pay for the netmap snapshot when the request actually NAMES a selector — that is the
+        // only input rule (1b) reads, and `status` on a Running node is an engine round-trip taken
+        // under the backend lock.
+        let facts = match exit_node.as_ref() {
+            Some(Some(_)) => self.exit_node_facts().await,
+            _ => ExitNodeFacts::default(),
+        };
         self.check_prefs_gated(
             exit_node,
             advertise_exit_node,
             advertise_routes,
             ssh,
-            crate::featureknob::can_run_tailscale_ssh(),
             auto_update,
+            CheckPrefsEnv {
+                ssh_gate: crate::featureknob::can_run_tailscale_ssh(),
+                exit_node_facts: &facts,
+            },
         )
     }
 
-    /// [`check_prefs`](Self::check_prefs) with the host/operator SSH gate passed IN rather than read
-    /// from the process environment, so the refusal it contributes is unit-testable without
-    /// `set_var` (`unsafe` in edition 2024, and it races the parallel test harness — the same reason
-    /// [`state_dir_with_source`](crate::state_dir_with_source) resolves its cascade through an
-    /// injectable environment lookup).
-    /// `ssh_gate` is [`featureknob::can_run_tailscale_ssh`](crate::featureknob::can_run_tailscale_ssh)'s
-    /// verdict for this host; it is only consulted when the prospective posture actually runs SSH,
-    /// matching Go, which calls it from `checkSSHPrefsLocked` only once `RunSSH` is set.
+    /// One [`status`](Backend::status) snapshot, projected into the facts an exit-node selector is
+    /// resolved against. The single place the daemon reads the netmap for this purpose, so `up`,
+    /// `set` and `check-prefs` all resolve against the same view `tnet status` reports.
+    async fn exit_node_facts(&self) -> ExitNodeFacts {
+        ExitNodeFacts::from_status(self.status().await)
+    }
+
+    /// Full validation of an operator-supplied `--exit-node` VALUE, before any pref is mutated: the
+    /// `auto:` form this build cannot honour ([`validate_exit_node_selector`]), then Go's
+    /// `exitNodeIPOfArg` resolution against the live netmap ([`resolve_exit_node_arg`]).
+    ///
+    /// Go runs the resolution in the CLI, because that is where the status round-trip is. It runs
+    /// here instead so `up`, `set` and `check-prefs` share ONE implementation reading ONE netmap
+    /// view — the daemon already holds the netmap, and a CLI-side copy would be a second rule to
+    /// keep in step with the first. The cost is one bounded `status` query per named selector.
+    async fn check_exit_node_arg(&self, sel: &str) -> Result<()> {
+        validate_exit_node_selector(Some(sel))?;
+        resolve_exit_node_arg(sel, &self.exit_node_facts().await)
+    }
+
+    /// [`check_prefs`](Self::check_prefs) with the host-derived inputs passed IN rather than read
+    /// from the process environment or the engine — see [`CheckPrefsEnv`] for why they are injected.
     /// `auto_update` stays a plain override (rule (5) reads the host's update provenance through
     /// [`selfupdate::auto_update_refusal`], which needs no injection to be testable — its own pure
     /// predicate takes the facts as arguments).
@@ -4006,8 +4255,8 @@ impl Backend {
         advertise_exit_node: Option<bool>,
         advertise_routes: Option<Vec<String>>,
         ssh: Option<bool>,
-        ssh_gate: Result<()>,
         auto_update: Option<bool>,
+        env: CheckPrefsEnv<'_>,
     ) -> Result<()> {
         // Compose the prospective posture: the named override wins, else the current pref.
         let prospective_exit_node = match &exit_node {
@@ -4027,9 +4276,23 @@ impl Backend {
 
         let mut errors: Vec<String> = Vec::new();
 
-        // (1) exit-node selector must be concrete (reuse the bring-up validator's rule).
-        if let Err(e) = validate_exit_node_selector(prospective_exit_node.as_deref()) {
-            errors.push(e.to_string());
+        // (1) exit-node selector must be concrete (reuse the bring-up validator's rule), and
+        // (1b) a selector the request NAMES must additionally RESOLVE against the netmap, exactly as
+        // the real `up`/`set` paths now resolve it (Go `exitNodeIPOfArg`) — a dry run that cannot
+        // report the refusal the real command is about to give is not a dry run. Only the named
+        // value is resolved: an already-persisted selector is not re-litigated by a `check-prefs`
+        // about some unrelated pref, and `check_prefs` is a question about the change being
+        // proposed. (1b) runs only when (1) passed, so an `auto:` value reports once, as itself,
+        // rather than also as an unresolvable name.
+        match validate_exit_node_selector(prospective_exit_node.as_deref()) {
+            Err(e) => errors.push(e.to_string()),
+            Ok(()) => {
+                if let Some(Some(sel)) = exit_node.as_ref()
+                    && let Err(e) = resolve_exit_node_arg(sel, env.exit_node_facts)
+                {
+                    errors.push(e.to_string());
+                }
+            }
         }
         // (2) exit-node-vs-advertise conflict (Go: "Cannot advertise an exit node and use an exit
         // node at the same time."). A `Some(sel)` exit node means "use one".
@@ -4066,7 +4329,7 @@ impl Backend {
                         .into(),
                 );
             }
-            if let Err(e) = ssh_gate {
+            if let Err(e) = env.ssh_gate {
                 errors.push(e.to_string());
             }
         }
@@ -4819,8 +5082,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn check_prefs_validates_without_mutating() {
+    #[tokio::test]
+    async fn check_prefs_validates_without_mutating() {
         // check-prefs (Go CheckPrefs): validate a prospective posture, mutate NOTHING.
         let dir = std::env::temp_dir().join(format!("tailnetd-checkprefs-{}", std::process::id()));
         let be = backend_for(&dir);
@@ -4834,6 +5097,7 @@ mod tests {
                 None,
                 None
             )
+            .await
             .is_ok(),
             "a concrete exit node with advertise-exit off is valid"
         );
@@ -4847,6 +5111,7 @@ mod tests {
                 None,
                 None,
             )
+            .await
             .expect_err("using + advertising an exit node must conflict");
         assert!(
             err.to_string()
@@ -4857,6 +5122,7 @@ mod tests {
         // An unmasked advertised route → error naming the masked form.
         let err = be
             .check_prefs(None, None, Some(vec!["10.0.0.5/24".into()]), None, None)
+            .await
             .expect_err("an unmasked CIDR must be rejected");
         assert!(
             err.to_string().contains("has non-address bits set")
@@ -4867,6 +5133,7 @@ mod tests {
         // `auto:` exit node → rejected (reuses the bring-up validator).
         assert!(
             be.check_prefs(Some(Some("auto:any".into())), None, None, None, None)
+                .await
                 .is_err(),
             "auto: exit-node selection is not supported"
         );
@@ -4875,7 +5142,7 @@ mod tests {
         // `checkAutoUpdatePrefsLocked`), and a DECLINE is legal everywhere. Which branch this host
         // takes is a property of the host, so assert against the same predicate the rule consults;
         // the rule's own two outcomes are pinned, host-independently, in `ipn::selfupdate`'s tests.
-        let opt_in = be.check_prefs(None, None, None, None, Some(true));
+        let opt_in = be.check_prefs(None, None, None, None, Some(true)).await;
         match selfupdate::auto_update_refusal() {
             None => assert!(
                 opt_in.is_ok(),
@@ -4892,7 +5159,9 @@ mod tests {
             }
         }
         assert!(
-            be.check_prefs(None, None, None, None, Some(false)).is_ok(),
+            be.check_prefs(None, None, None, None, Some(false))
+                .await
+                .is_ok(),
             "declining auto-update is legal on every installation"
         );
 
@@ -4917,7 +5186,17 @@ mod tests {
 
         // Asking for the SSH server on a host that has it disabled → refused, in Go's words.
         let err = be
-            .check_prefs_gated(None, None, None, Some(true), disabled(), None)
+            .check_prefs_gated(
+                None,
+                None,
+                None,
+                Some(true),
+                None,
+                CheckPrefsEnv {
+                    ssh_gate: disabled(),
+                    exit_node_facts: &ExitNodeFacts::default(),
+                },
+            )
             .expect_err("TS_DISABLE_SSH_SERVER must refuse an SSH-server enable");
         assert!(
             err.to_string()
@@ -4929,19 +5208,49 @@ mod tests {
         // leaving it alone, which on a fresh backend means off) stays valid on the same host, so a
         // disabled machine can still edit every other pref. Go refuses only when `RunSSH` is set.
         assert!(
-            be.check_prefs_gated(None, None, None, Some(false), disabled(), None)
-                .is_ok(),
+            be.check_prefs_gated(
+                None,
+                None,
+                None,
+                Some(false),
+                None,
+                CheckPrefsEnv {
+                    ssh_gate: disabled(),
+                    exit_node_facts: &ExitNodeFacts::default(),
+                },
+            )
+            .is_ok(),
             "disabling SSH on a host with the knob set must still be a valid posture"
         );
         assert!(
-            be.check_prefs_gated(None, None, None, None, disabled(), None)
-                .is_ok(),
+            be.check_prefs_gated(
+                None,
+                None,
+                None,
+                None,
+                None,
+                CheckPrefsEnv {
+                    ssh_gate: disabled(),
+                    exit_node_facts: &ExitNodeFacts::default(),
+                },
+            )
+            .is_ok(),
             "an unrelated prefs check must not be refused by the SSH knob"
         );
 
         // And with the knob clear, the same request is valid on an `ssh`-feature build. (Without the
         // feature the build-time gate refuses it on its own — that arm is asserted below.)
-        let ok = be.check_prefs_gated(None, None, None, Some(true), allowed(), None);
+        let ok = be.check_prefs_gated(
+            None,
+            None,
+            None,
+            Some(true),
+            None,
+            CheckPrefsEnv {
+                ssh_gate: allowed(),
+                exit_node_facts: &ExitNodeFacts::default(),
+            },
+        );
         if cfg!(feature = "ssh") {
             assert!(ok.is_ok(), "an unrestricted host must accept --ssh: {ok:?}");
         } else {
@@ -6605,6 +6914,350 @@ mod tests {
         assert!(validate_exit_node_selector(None).is_ok());
     }
 
+    // --- `--exit-node` value resolution (Go `exitNodeIPOfArg`, ipn/prefs.go) ----------------------
+    //
+    // The engine's selector parse is infallible, so every one of these values would otherwise be
+    // accepted, persisted, and silently route nothing. Each test calls the production
+    // `resolve_exit_node_arg` (or a `Backend` path that calls it) — the expected refusals are Go's,
+    // reproduced, not rebuilt in the test body.
+
+    /// One netmap peer, named + addressed, advertising an exit node or not. Every other
+    /// [`PeerReport`] field is irrelevant to resolution, so it stays at its default.
+    fn exit_peer(name: &str, ipv4: &str, is_exit_node: bool) -> PeerReport {
+        PeerReport {
+            name: name.to_string(),
+            ipv4: ipv4.to_string(),
+            is_exit_node,
+            ..PeerReport::default()
+        }
+    }
+
+    /// A converged netmap: this node is `100.64.0.1` on the `tail0123.ts.net` tailnet, with `peers`
+    /// visible. The shape [`Backend::exit_node_facts`] builds from a Running `status`.
+    fn running_facts(peers: Vec<PeerReport>) -> ExitNodeFacts {
+        ExitNodeFacts {
+            running: true,
+            self_ips: vec!["100.64.0.1".parse().unwrap()],
+            magic_dns_suffix: Some("tail0123.ts.net".to_string()),
+            peers,
+        }
+    }
+
+    #[test]
+    fn resolve_exit_node_arg_refuses_this_machines_own_address() {
+        // Go `ExitNodeLocalIPError`, which `up` and `set` both re-wrap with the hint. Routing this
+        // node's traffic through this node is not a thing; the operator meant to OFFER egress.
+        let facts = running_facts(vec![exit_peer("exit.tail0123.ts.net", "100.64.0.7", true)]);
+        let err = resolve_exit_node_arg("100.64.0.1", &facts)
+            .expect_err("this machine's own address cannot be its exit node");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(
+                "cannot use 100.64.0.1 as an exit node as it is a local IP address to this machine"
+            ),
+            "the refusal must be Go's sentence, got {msg:?}"
+        );
+        assert!(
+            msg.contains("--advertise-exit-node"),
+            "the refusal must carry Go's hint, got {msg:?}"
+        );
+
+        // The check needs no netmap, so it also fires before the node is Running: a self address is
+        // a fact about this machine, not about the netmap's completeness.
+        let not_running = ExitNodeFacts {
+            running: false,
+            ..facts
+        };
+        assert!(
+            resolve_exit_node_arg("100.64.0.1", &not_running).is_err(),
+            "the local-IP refusal is not gated on Running"
+        );
+    }
+
+    #[test]
+    fn resolve_exit_node_arg_checks_the_netmap_only_once_running() {
+        // Go stages this: before `BackendState == "Running"` an unknown IP is accepted, because
+        // "no peer holds it" only means "no netmap yet". Once Running it is a real refusal.
+        let peers = vec![exit_peer("exit.tail0123.ts.net", "100.64.0.7", true)];
+        let starting = ExitNodeFacts {
+            running: false,
+            peers: peers.clone(),
+            ..ExitNodeFacts::default()
+        };
+        assert!(
+            resolve_exit_node_arg("100.64.0.42", &starting).is_ok(),
+            "a not-yet-Running node must not refuse an IP it simply has not learned about"
+        );
+
+        let err = resolve_exit_node_arg("100.64.0.42", &running_facts(peers))
+            .expect_err("a Running node with a netmap must refuse an IP no peer holds");
+        assert!(
+            format!("{err:#}").contains("no node found in netmap with IP 100.64.0.42"),
+            "got {err:#}"
+        );
+    }
+
+    #[test]
+    fn resolve_exit_node_arg_refuses_a_peer_advertising_no_exit_node() {
+        // The peer exists and is reachable — it just never advertised a default route, so selecting
+        // it would route nothing. Go refuses by IP and by name alike, naming the peer's IP.
+        let facts = running_facts(vec![exit_peer(
+            "plain.tail0123.ts.net",
+            "100.64.0.8",
+            false,
+        )]);
+        for arg in ["100.64.0.8", "plain", "plain.tail0123.ts.net"] {
+            let err = format!(
+                "{:#}",
+                resolve_exit_node_arg(arg, &facts)
+                    .expect_err("a peer that advertises no exit node must be refused")
+            );
+            assert!(
+                err.contains("node 100.64.0.8 is not advertising an exit node"),
+                "{arg:?} must be refused in Go's words, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_exit_node_arg_matches_a_peer_name_in_gos_three_spellings() {
+        // Base name, FQDN, and FQDN without the trailing root dot — case-insensitively, the same
+        // rule the engine's `Node::matches_name` applies to the stored selector afterwards.
+        let facts = running_facts(vec![
+            exit_peer("exit.tail0123.ts.net", "100.64.0.7", true),
+            exit_peer("other.tail0123.ts.net", "100.64.0.8", false),
+        ]);
+        for arg in [
+            "exit",
+            "EXIT",
+            "exit.tail0123.ts.net",
+            "exit.tail0123.ts.net.",
+            "Exit.Tail0123.TS.NET",
+        ] {
+            assert!(
+                resolve_exit_node_arg(arg, &facts).is_ok(),
+                "{arg:?} names the exit-advertising peer and must resolve"
+            );
+        }
+        // The peer's own IP resolves too, and a *different* tailnet's FQDN does not.
+        assert!(resolve_exit_node_arg("100.64.0.7", &facts).is_ok());
+        assert!(
+            resolve_exit_node_arg("exit.other.ts.net", &facts).is_err(),
+            "the suffix is part of the name: a foreign FQDN must not match"
+        );
+    }
+
+    #[test]
+    fn resolve_exit_node_arg_refuses_a_name_before_the_peer_list_exists() {
+        // Go refuses rather than attempting a resolution that could only fail, and says what to
+        // pass instead. This is also why a bring-up on a node that has never seen a netmap can only
+        // take an IP.
+        let err = resolve_exit_node_arg("exit", &ExitNodeFacts::default())
+            .expect_err("a name cannot be resolved against an empty peer list");
+        assert!(
+            format!("{err:#}").contains(
+                "cannot resolve exit node by hostname while Tailscale is starting up; please use \
+                 its Tailscale IP address instead"
+            ),
+            "got {err:#}"
+        );
+    }
+
+    #[test]
+    fn resolve_exit_node_arg_refuses_an_unknown_or_ambiguous_name() {
+        // A typo (or a peer that has left) → Go's "invalid value"; two peers answering to one name
+        // → Go's "ambiguous", because picking one would be a coin flip over which machine sees the
+        // operator's traffic.
+        let facts = running_facts(vec![exit_peer("exit.tail0123.ts.net", "100.64.0.7", true)]);
+        let err = resolve_exit_node_arg("exti", &facts).expect_err("a typo must be refused");
+        assert!(
+            format!("{err:#}")
+                .contains("invalid value \"exti\" for --exit-node; must be IP or peer hostname"),
+            "got {err:#}"
+        );
+
+        let twins = running_facts(vec![
+            exit_peer("exit.tail0123.ts.net", "100.64.0.7", true),
+            exit_peer("exit.tail0123.ts.net", "100.64.0.9", true),
+        ]);
+        let err = resolve_exit_node_arg("exit", &twins)
+            .expect_err("two peers answering to one name must be refused");
+        assert!(
+            format!("{err:#}").contains("ambiguous exit node name \"exit\""),
+            "got {err:#}"
+        );
+    }
+
+    #[test]
+    fn resolve_exit_node_arg_refuses_an_empty_value() {
+        // Go's `os.ErrInvalid` guard at the top of `exitNodeIPOfArg`, said usefully: an empty
+        // `--exit-node` would otherwise be stored as a selector matching no peer.
+        for arg in ["", "   "] {
+            let err = resolve_exit_node_arg(arg, &running_facts(vec![]))
+                .expect_err("an empty selector must be refused");
+            assert!(
+                format!("{err:#}").contains("empty value"),
+                "got {err:#} for {arg:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn begin_up_refuses_an_exit_node_it_cannot_resolve() {
+        // The `up` wiring: an unresolvable `--exit-node` is refused BEFORE teardown/persist, so the
+        // failed up leaves neither the device nor prefs.json touched. This backend has no device
+        // (not Running), so a name has no peer list to resolve against.
+        let dir = std::env::temp_dir().join(format!("tailnetd-up-badexit-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+
+        // `PendingUp` is not `Debug`, so `expect_err` would not compile — match by hand.
+        let err = match be
+            .begin_up(
+                UpOptions {
+                    exit_node: Some(Some("no-such-peer".to_string())),
+                    accept_routes: Some(true),
+                    ..UpOptions::default()
+                },
+                None,
+            )
+            .await
+        {
+            Ok(_) => panic!("an unresolvable exit node must fail begin_up"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains("cannot resolve exit node by hostname"),
+            "got {err:?}"
+        );
+        assert!(
+            be.prefs.exit_node.is_none() && !be.prefs.accept_routes,
+            "a refused up must not have applied the exit node or the co-named accept_routes"
+        );
+        assert!(
+            !tokio::fs::try_exists(dir.join("prefs.json")).await.unwrap(),
+            "a refused up must not have persisted prefs.json"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn begin_set_refuses_an_exit_node_it_cannot_resolve() {
+        // Same wiring on the `set` path, which is where it matters most on a live node: `set`
+        // applies the exit node LIVE and never reaches `build_config`, so this is the only place an
+        // unusable selector can be caught before it is persisted and silently routes nothing.
+        let dir = std::env::temp_dir().join(format!("tailnetd-set-badexit-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+        be.prefs.exit_node = Some("100.64.0.9".to_string());
+
+        let err = be
+            .begin_set(SetOptions {
+                exit_node: Some(Some("no-such-peer".to_string())),
+                accept_routes: Some(true),
+                ..SetOptions::default()
+            })
+            .await
+            .expect_err("an unresolvable exit node must fail begin_set");
+        assert!(
+            format!("{err:#}").contains("cannot resolve exit node by hostname"),
+            "got {err:#}"
+        );
+        assert_eq!(
+            be.prefs.exit_node.as_deref(),
+            Some("100.64.0.9"),
+            "a refused set must leave the previously-working exit node in place"
+        );
+        assert!(
+            !be.prefs.accept_routes,
+            "a refused set must not have applied the co-named accept_routes change"
+        );
+        assert!(
+            !tokio::fs::try_exists(dir.join("prefs.json")).await.unwrap(),
+            "a refused set must not have persisted prefs.json"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn check_prefs_reports_an_unresolvable_exit_node_once() {
+        // The dry-run verb answers with the same refusal the real `up`/`set` would give — a
+        // `check-prefs` that cannot report it is not a dry run. And an `auto:` value reports ONCE,
+        // as itself, rather than also as a name that resolves against nothing.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-checkprefs-exit-{}", std::process::id()));
+        let be = backend_for(&dir);
+        let facts = running_facts(vec![exit_peer(
+            "plain.tail0123.ts.net",
+            "100.64.0.8",
+            false,
+        )]);
+
+        let err = be
+            .check_prefs_gated(
+                Some(Some("100.64.0.8".into())),
+                None,
+                None,
+                None,
+                None,
+                CheckPrefsEnv {
+                    ssh_gate: Ok(()),
+                    exit_node_facts: &facts,
+                },
+            )
+            .expect_err("a peer advertising no exit node must be reported");
+        assert!(
+            format!("{err:#}").contains("node 100.64.0.8 is not advertising an exit node"),
+            "got {err:#}"
+        );
+
+        // A selector that resolves is accepted.
+        let ok = be.check_prefs_gated(
+            Some(Some("100.64.0.7".into())),
+            None,
+            None,
+            None,
+            None,
+            CheckPrefsEnv {
+                ssh_gate: Ok(()),
+                exit_node_facts: &running_facts(vec![exit_peer(
+                    "exit.tail0123.ts.net",
+                    "100.64.0.7",
+                    true,
+                )]),
+            },
+        );
+        assert!(ok.is_ok(), "a real exit node must be accepted: {ok:?}");
+
+        // `auto:` is refused by rule (1) alone; the resolution must not pile a second sentence on.
+        let err = format!(
+            "{:#}",
+            be.check_prefs_gated(
+                Some(Some("auto:any".into())),
+                None,
+                None,
+                None,
+                None,
+                CheckPrefsEnv {
+                    ssh_gate: Ok(()),
+                    exit_node_facts: &facts,
+                },
+            )
+            .expect_err("auto: selection is unsupported")
+        );
+        assert!(err.contains("not supported"), "got {err:?}");
+        assert!(
+            !err.contains("invalid value") && !err.contains("starting up"),
+            "an auto: value must report once, as itself, got {err:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn begin_up_rejects_auto_exit_node_without_persisting() {
         // `up --exit-node auto:any` must be rejected up-front (before teardown/persist), so a failed
@@ -6732,11 +7385,15 @@ mod tests {
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let mut be = backend_for(&dir);
 
-        // SET via overrides.
+        // SET via overrides. The exit node is given as an IP: this backend has no device, so it is
+        // not Running, and `begin_up` now refuses to resolve a *name* against a peer list that does
+        // not exist yet (Go's "cannot resolve exit node by hostname while Tailscale is starting up"
+        // — pinned by `resolve_exit_node_arg_refuses_a_name_before_the_peer_list_exists`). This test
+        // is about the override sentinels, not about resolution.
         let _ = be
             .begin_up(
                 UpOptions {
-                    exit_node: Some(Some("exit-1".to_string())),
+                    exit_node: Some(Some("100.64.0.9".to_string())),
                     advertise_exit_node: Some(true),
                     advertise_routes: Some(vec!["10.0.0.0/8".to_string()]),
                     ..UpOptions::default()
@@ -6745,7 +7402,7 @@ mod tests {
             )
             .await
             .expect("begin_up set");
-        assert_eq!(be.prefs.exit_node.as_deref(), Some("exit-1"));
+        assert_eq!(be.prefs.exit_node.as_deref(), Some("100.64.0.9"));
         assert!(be.prefs.advertise_exit_node);
         assert_eq!(be.prefs.advertise_routes, vec!["10.0.0.0/8".to_string()]);
 
@@ -6756,7 +7413,7 @@ mod tests {
             .expect("begin_up unchanged");
         assert_eq!(
             be.prefs.exit_node.as_deref(),
-            Some("exit-1"),
+            Some("100.64.0.9"),
             "an unchanged (None) override must preserve the stored exit_node"
         );
         assert!(
@@ -6804,7 +7461,7 @@ mod tests {
             .begin_up(
                 UpOptions {
                     hostname: Some("node-a".to_string()),
-                    exit_node: Some(Some("exit-1".to_string())),
+                    exit_node: Some(Some("100.64.0.9".to_string())),
                     advertise_exit_node: Some(true),
                     advertise_routes: Some(vec!["10.0.0.0/8".to_string()]),
                     accept_routes: Some(true),
