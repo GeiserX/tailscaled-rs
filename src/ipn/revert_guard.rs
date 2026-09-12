@@ -479,20 +479,80 @@ mod tests {
 
     #[test]
     fn advertise_tags_validation() {
-        use super::super::validate_advertise_tags;
-        // Valid: tag:<name> — letter-led, [A-Za-z0-9-] only.
-        assert!(validate_advertise_tags(&["tag:server".into(), "tag:ci".into()]).is_ok());
-        assert!(validate_advertise_tags(&["tag:web-1".into()]).is_ok());
-        assert!(validate_advertise_tags(&[]).is_ok());
-        // Invalid: bare name, empty tag name, wrong prefix.
-        assert!(validate_advertise_tags(&["server".into()]).is_err());
-        assert!(validate_advertise_tags(&["tag:".into()]).is_err());
-        assert!(validate_advertise_tags(&["notatag:x".into()]).is_err());
+        use super::super::complete_and_validate_advertise_tags as check;
+        // Valid: tag:<name> — letter-led, [A-Za-z0-9-] only. Passed through byte-for-byte.
+        assert_eq!(
+            check(&["tag:server".into(), "tag:ci".into()]).unwrap(),
+            vec!["tag:server".to_string(), "tag:ci".to_string()]
+        );
+        assert_eq!(
+            check(&["tag:web-1".into()]).unwrap(),
+            vec!["tag:web-1".to_string()]
+        );
+        assert!(check(&[]).unwrap().is_empty());
+        // Invalid: empty tag name, wrong prefix on a value that DOES have a colon.
+        assert!(check(&["tag:".into()]).is_err());
+        assert!(check(&["notatag:x".into()]).is_err());
         // Invalid per Go CheckTag: leading digit, underscore, space, punctuation.
-        assert!(validate_advertise_tags(&["tag:9server".into()]).is_err());
-        assert!(validate_advertise_tags(&["tag:my_tag".into()]).is_err());
-        assert!(validate_advertise_tags(&["tag:has space".into()]).is_err());
-        assert!(validate_advertise_tags(&["tag:exit!".into()]).is_err());
+        assert!(check(&["tag:9server".into()]).is_err());
+        assert!(check(&["tag:my_tag".into()]).is_err());
+        assert!(check(&["tag:has space".into()]).is_err());
+        assert!(check(&["tag:exit!".into()]).is_err());
+    }
+
+    #[test]
+    fn advertise_tags_completion_matches_go() {
+        use super::super::complete_and_validate_advertise_tags as check;
+        // Go `prefsFromUpArgs`: a value with NO colon at all gets the `tag:` prefix added for it,
+        // so the documented shorthand `--advertise-tags server,ci` means `tag:server,tag:ci`.
+        assert_eq!(
+            check(&["server".into(), "ci".into()]).unwrap(),
+            vec!["tag:server".to_string(), "tag:ci".to_string()],
+            "a colon-less value must be completed to tag:<value>"
+        );
+        // Completion is per-value: an already-prefixed tag alongside a shorthand is untouched, and
+        // the completion is NOT applied twice.
+        assert_eq!(
+            check(&["tag:server".into(), "web-1".into()]).unwrap(),
+            vec!["tag:server".to_string(), "tag:web-1".to_string()]
+        );
+        // The colon rule is the whole rule: a value that already contains a colon is passed to the
+        // CheckTag port UNTOUCHED, so a malformed `foo:bar` is refused by name rather than quietly
+        // becoming a `tag:foo:bar` nobody asked for.
+        let err = format!(
+            "{:#}",
+            check(&["foo:bar".into()]).expect_err("a non-`tag:` colon value must be refused")
+        );
+        assert!(
+            err.contains("\"foo:bar\""),
+            "the refusal must name the value as typed, not a completed one, got {err:?}"
+        );
+        assert!(
+            !err.contains("tag:foo:bar"),
+            "a colon-bearing value must never be completed, got {err:?}"
+        );
+        // Completion happens BEFORE validation, so a shorthand that is not a legal tag name is
+        // refused by the CheckTag port — and Go quotes the COMPLETED value in `tag: %q`, so the
+        // operator sees the tag as the daemon would have seen it.
+        for (typed, completed) in [("9server", "tag:9server"), ("my_tag", "tag:my_tag")] {
+            let err = format!(
+                "{:#}",
+                check(&[typed.into()]).expect_err("an illegal tag name must be refused")
+            );
+            assert!(
+                err.contains(&format!("{completed:?}")),
+                "the refusal must quote the completed value {completed:?}, got {err:?}"
+            );
+        }
+        // An empty value has no colon either: completed to `tag:`, then refused for an empty name.
+        let err = format!(
+            "{:#}",
+            check(&["".into()]).expect_err("an empty tag must be refused")
+        );
+        assert!(
+            err.contains("empty"),
+            "an empty value completes to `tag:` and is refused for an empty name, got {err:?}"
+        );
     }
 
     /// A node that already advertises routes; the canonical "non-default prefs present" fixture.

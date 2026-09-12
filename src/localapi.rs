@@ -126,7 +126,9 @@ pub enum Request {
         #[serde(default)]
         advertise_routes: Option<Vec<String>>,
         /// ACL tags this node requests (Go `--advertise-tags`, each `tag:<name>`). `None` unchanged;
-        /// `Some(vec)` replaces (`Some([])` clears). `#[serde(default)]` keeps the wire back-compatible.
+        /// `Some(vec)` replaces (`Some([])` clears). A value with no colon at all is completed to
+        /// `tag:<value>` by the daemon (Go does this in its CLI), so a caller may send either form.
+        /// `#[serde(default)]` keeps the wire back-compatible.
         #[serde(default)]
         advertise_tags: Option<Vec<String>>,
         /// Accept (and route to) subnet routes advertised by peers (Go `tailscale up
@@ -252,7 +254,7 @@ pub enum Request {
         #[serde(default)]
         advertise_routes: Option<Vec<String>>,
         /// ACL tags this node requests (`None` unchanged; `Some(vec)` replaces, `Some([])` clears;
-        /// each `tag:<name>`).
+        /// each `tag:<name>`, or a colon-less value the daemon completes to `tag:<value>`).
         #[serde(default)]
         advertise_tags: Option<Vec<String>>,
         /// Run the Tailscale SSH server (`None` unchanged; `Some(b)` sets it). Toggling SSH via

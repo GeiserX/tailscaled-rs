@@ -130,8 +130,10 @@ enum Command {
         #[arg(long = "clear-advertise-routes", alias = "advertise-routes-clear")]
         advertise_routes_clear: bool,
         /// Advertise these ACL tags (comma-separated `tag:<name>`, e.g. `tag:server,tag:ci`) at
-        /// registration (Go `--advertise-tags`). Replaces the whole set. Use `--clear-advertise-tags`
-        /// to request none; passing neither leaves the persisted set unchanged.
+        /// registration (Go `--advertise-tags`). The `tag:` prefix may be omitted on a value with no
+        /// colon in it — `server,ci` means `tag:server,tag:ci`. Replaces the whole set. Use
+        /// `--clear-advertise-tags` to request none; passing neither leaves the persisted set
+        /// unchanged.
         #[arg(long, value_name = "tag:NAME,...", value_delimiter = ',')]
         advertise_tags: Vec<String>,
         /// Stop advertising any ACL tags (clears the set). Use this instead of an empty
@@ -388,8 +390,10 @@ enum Command {
         #[arg(long = "clear-advertise-routes", alias = "advertise-routes-clear")]
         advertise_routes_clear: bool,
         /// Advertise these ACL tags (comma-separated `tag:<name>`, e.g. `tag:server,tag:ci`) at
-        /// registration (Go `--advertise-tags`). Replaces the whole set. Use `--clear-advertise-tags`
-        /// to request none; passing neither leaves the persisted set unchanged.
+        /// registration (Go `--advertise-tags`). The `tag:` prefix may be omitted on a value with no
+        /// colon in it — `server,ci` means `tag:server,tag:ci`. Replaces the whole set. Use
+        /// `--clear-advertise-tags` to request none; passing neither leaves the persisted set
+        /// unchanged.
         #[arg(long, value_name = "tag:NAME,...", value_delimiter = ',')]
         advertise_tags: Vec<String>,
         /// Stop advertising any ACL tags (clears the set). Use this instead of an empty
@@ -2601,7 +2605,8 @@ async fn refuse_ssh_toggle_risk_if_needed(
 /// unchanged). A non-empty list takes precedence over the clear flag. The name is deliberately NOT
 /// `*_routes` — it carries no route/tag-specific semantics, so reusing it for tags is correct, not a
 /// footgun. (Any value VALIDATION — CIDR parsing for routes, `tag:` form for tags — happens elsewhere,
-/// daemon-side; this only resolves the three-way replace/clear/unchanged intent.)
+/// daemon-side, as does the `tag:`-prefix completion for a colon-less tag; this only resolves the
+/// three-way replace/clear/unchanged intent.)
 fn resolve_list_or_clear(items: Vec<String>, clear: bool) -> Option<Vec<String>> {
     if !items.is_empty() {
         Some(items)
