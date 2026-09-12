@@ -13,6 +13,13 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use tailscaled_rs::goduration::{format_go_duration, parse_go_duration};
+// "Can this installation replace its own binary?" lives in the library, not here: `update --yes` is
+// no longer its only caller. The daemon consults the same predicate before it lets a node opt in to
+// `--auto-update` (Go `feature.CanAutoUpdate()` / `checkAutoUpdatePrefsLocked`), so the two can never
+// disagree about whether an update could ever be applied. See `ipn::selfupdate`.
+use tailscaled_rs::ipn::selfupdate::{
+    homebrew_update_refusal, host_release_triple, running_binary_homebrew_formula,
+};
 use tailscaled_rs::localapi::{Request, Response, RevertedPref};
 
 /// Env var consulted for the auth key when neither `--authkey` nor `--authkey-file` is given.
@@ -414,7 +421,11 @@ enum Command {
         /// Tell the admin console this node accepts remote update triggers (Go `tailscale set
         /// --auto-update`). This reaches control (`Hostinfo.AllowsUpdate`), so on a RUNNING node it
         /// rebuilds the device (a brief reconnect). It advertises the opt-in ONLY: this daemon runs
-        /// no background updater — `tnet update` is manual — so nothing here acts on a trigger.
+        /// no background updater — `tnet update` is manual — so the claim is that an operator will
+        /// apply a triggered update here. REFUSED where even that is impossible: on an installation
+        /// `tnet update --yes` could never update (a package manager owns the binary, or this host
+        /// has no published release artifact), the daemon rejects the opt-in rather than advertise a
+        /// promise it cannot keep. `--no-auto-update` is always accepted.
         /// Mutually exclusive with `--no-auto-update`; omitting both leaves the setting unchanged.
         #[arg(long, conflicts_with = "no_auto_update")]
         auto_update: bool,
@@ -1494,7 +1505,8 @@ enum DebugCmd {
     /// Validate a prospective prefs change WITHOUT applying it (Go `check-prefs`, normally the
     /// fail-fast pre-flight for `up`/`set`). Composes the named overrides over the current prefs and
     /// reports the first conflict (exit-node-vs-advertise, an unmasked advertised route, SSH without
-    /// the build feature) — or confirms the prefs are valid. Mutates nothing.
+    /// the build feature, an auto-update opt-in this installation could never apply) — or confirms
+    /// the prefs are valid. Mutates nothing.
     CheckPrefs {
         /// Prospective exit-node selector (IP / MagicDNS name / stable id). Omit to keep the current.
         #[arg(long, value_name = "NODE")]
@@ -1508,6 +1520,10 @@ enum DebugCmd {
         /// Prospective SSH-server enable intent.
         #[arg(long)]
         ssh: Option<bool>,
+        /// Prospective auto-update opt-in (Go's `AutoUpdate.Apply` tri-state): `true` opts in,
+        /// `false` declines, omitted keeps the current preference.
+        #[arg(long)]
+        auto_update: Option<bool>,
     },
     /// Stream the daemon's IPN notification bus as JSON, one object per line (Go `tailscale debug
     /// watch-ipn-bus`). Subscribes to the **masked** `watch` path with both initial snapshots
@@ -2882,6 +2898,7 @@ async fn main() -> Result<()> {
                 advertise_exit_node,
                 advertise_routes,
                 ssh,
+                auto_update,
             } => {
                 run_check_prefs(
                     &socket,
@@ -2889,6 +2906,7 @@ async fn main() -> Result<()> {
                     advertise_exit_node,
                     advertise_routes,
                     ssh,
+                    auto_update,
                 )
                 .await
             }
@@ -4515,6 +4533,7 @@ async fn run_check_prefs(
     advertise_exit_node: Option<bool>,
     advertise_routes: Option<Vec<String>>,
     ssh: Option<bool>,
+    auto_update: Option<bool>,
 ) -> Result<()> {
     // A bare `--exit-node ""` clears (Set's double-option convention); a present value sets it.
     let exit_node = exit_node.map(|s| if s.is_empty() { None } else { Some(s) });
@@ -4523,6 +4542,7 @@ async fn run_check_prefs(
         advertise_exit_node,
         advertise_routes,
         ssh,
+        auto_update,
     };
     match round_trip(socket, &req).await {
         Ok(Response::Ok { message }) => {
@@ -5221,68 +5241,6 @@ impl std::fmt::Display for SemVer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
     }
-}
-
-/// The host target triple this build's release assets are named with (`tailscaled-rs-vX.Y.Z-<triple>`,
-/// see the release workflow). The fork publishes Linux glibc assets only; `None` on a platform with no
-/// published asset (e.g. macOS) so the updater can report that honestly instead of 404-ing.
-fn host_release_triple() -> Option<&'static str> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("linux", "x86_64") => Some("x86_64-unknown-linux-gnu"),
-        ("linux", "aarch64") => Some("aarch64-unknown-linux-gnu"),
-        // Only Linux x86_64/aarch64 release assets are published today (see `.github/workflows/release.yml`).
-        _ => None,
-    }
-}
-
-/// The Homebrew formula that owns the file at `exe`, if any — the `<formula>` of a
-/// `<prefix>/Cellar/<formula>/<version>/bin/<binary>` path. Pure → unit-testable.
-///
-/// Homebrew installs every file of a package under `<prefix>/Cellar/<formula>/<version>/` and links
-/// the binaries into `<prefix>/bin` as symlinks, so a *resolved* executable path is always the Cellar
-/// one. Matching on the `Cellar` component rather than a hard-coded prefix covers every prefix
-/// Homebrew uses — `/usr/local` (Intel macOS), `/opt/homebrew` (Apple Silicon),
-/// `/home/linuxbrew/.linuxbrew` (Linux), and an operator's custom one.
-fn homebrew_formula_owning(exe: &std::path::Path) -> Option<String> {
-    let mut comps = exe.components();
-    while let Some(c) = comps.next() {
-        if c.as_os_str() != "Cellar" {
-            continue;
-        }
-        let formula = comps.next()?.as_os_str().to_str()?.to_string();
-        // `Cellar/<formula>/<version>/…`: a path that stops at the formula directory names no
-        // installed file, so it is not evidence that this binary came from Homebrew.
-        comps.next()?;
-        return Some(formula);
-    }
-    None
-}
-
-/// The Homebrew formula that owns the *running* `tnet`, if any. Resolves symlinks first, since the
-/// binary on `PATH` is `<prefix>/bin/tnet`, a symlink into the Cellar.
-fn running_binary_homebrew_formula() -> Option<String> {
-    let exe = std::env::current_exe().ok()?;
-    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
-    homebrew_formula_owning(&exe)
-}
-
-/// Why `update --yes` refuses on a Homebrew-installed binary, and what to run instead.
-///
-/// The same refusal Go makes when its binary came from a package manager rather than from a release
-/// tarball (`clientupdate/clientupdate.go`, `updateFreeBSD`: "Tailscale was not installed via pkg,
-/// binary updates on FreeBSD are not supported; please reinstall Tailscale using pkg or update
-/// manually", plus the `pkg upgrade tailscale` hint). Swapping the binary in place would overwrite a
-/// file Homebrew owns: the Cellar keeps one directory per installed version, so the next `brew`
-/// command would report a version that is no longer on disk, and the following `brew upgrade` would
-/// silently discard the update. Pure → unit-testable.
-fn homebrew_update_refusal(formula: &str) -> String {
-    format!(
-        "this `tnet` was installed by Homebrew (it is a file of the `{formula}` formula, under \
-         Homebrew's Cellar), and binary updates are not supported for a Homebrew install: replacing \
-         it in place would overwrite a file Homebrew owns and leave `brew` reporting a version that \
-         is no longer installed. Update it with `brew update && brew upgrade {formula}` instead \
-         (or install a release tarball outside the Homebrew prefix and update that)"
-    )
 }
 
 /// One GitHub release, as much of the Releases-API JSON as `update` needs.
@@ -22459,82 +22417,6 @@ mod tests {
         assert!(verify_sha256(data, b"", "x").is_err());
         assert!(verify_sha256(data, b"not-hex  f\n", "x").is_err());
         assert!(verify_sha256(data, b"abc  short\n", "x").is_err());
-    }
-
-    #[test]
-    fn host_release_triple_is_linux_or_none() {
-        // On a published-asset platform it's a Linux glibc triple; elsewhere (e.g. macOS) it's None
-        // so `update --yes` can report "no artifact for this platform" instead of 404-ing.
-        match (std::env::consts::OS, std::env::consts::ARCH) {
-            ("linux", "x86_64") => {
-                assert_eq!(host_release_triple(), Some("x86_64-unknown-linux-gnu"))
-            }
-            ("linux", "aarch64") => {
-                assert_eq!(host_release_triple(), Some("aarch64-unknown-linux-gnu"))
-            }
-            _ => assert_eq!(host_release_triple(), None),
-        }
-    }
-
-    #[test]
-    fn homebrew_formula_owning_recognises_every_cellar_prefix() {
-        // The three prefixes Homebrew ships with, plus a custom one: the formula is the component
-        // after `Cellar`, whatever the prefix is.
-        for prefix in [
-            "/usr/local",
-            "/opt/homebrew",
-            "/home/linuxbrew/.linuxbrew",
-            "/srv/brew",
-        ] {
-            let exe =
-                std::path::PathBuf::from(format!("{prefix}/Cellar/tailscaled-rs/0.52.2/bin/tnet"));
-            assert_eq!(
-                homebrew_formula_owning(&exe).as_deref(),
-                Some("tailscaled-rs"),
-                "{} should be recognised as a Homebrew-owned file",
-                exe.display()
-            );
-        }
-    }
-
-    #[test]
-    fn homebrew_formula_owning_ignores_non_homebrew_paths() {
-        // The paths a release tarball / `cargo install` / a distro package put the binary at — none
-        // of them are Homebrew's, so `update --yes` must NOT refuse for them.
-        for path in [
-            "/usr/local/bin/tnet",
-            "/usr/bin/tnet",
-            "/home/alice/.cargo/bin/tnet",
-            "/opt/tailscaled-rs/bin/tnet",
-            // A directory literally named Cellar but with nothing installed under it: `Cellar/x`
-            // alone names no file, so it is not evidence of a Homebrew install.
-            "/usr/local/Cellar/tailscaled-rs",
-        ] {
-            assert_eq!(
-                homebrew_formula_owning(std::path::Path::new(path)),
-                None,
-                "{path} is not a Homebrew-owned file"
-            );
-        }
-    }
-
-    #[test]
-    fn homebrew_update_refusal_names_the_formula_and_the_brew_command() {
-        // The refusal has to be actionable: it must say Homebrew owns the binary and give the exact
-        // command that updates it (Go's package-manager refusals do the same — see
-        // `clientupdate.updateFreeBSD`'s `pkg upgrade tailscale` hint).
-        let msg = homebrew_update_refusal("tailscaled-rs");
-        assert!(msg.contains("Homebrew"), "{msg}");
-        assert!(
-            msg.contains("brew update && brew upgrade tailscaled-rs"),
-            "the refusal must name the command that does work: {msg}"
-        );
-        // The formula name is carried through rather than hard-coded, so a renamed/forked formula
-        // still gets a command that works.
-        assert!(
-            homebrew_update_refusal("tailscaled-rs-git").contains("brew upgrade tailscaled-rs-git"),
-            "the formula name must be interpolated, not assumed"
-        );
     }
 
     #[test]
