@@ -109,15 +109,25 @@ impl ShutdownRefusal {
 /// trusted with. And an authorised caller gets the two refusals apart, which is the other half of
 /// the point: "you may not" and "nobody may" are different problems with different fixes.
 ///
+/// The policy arrives as a CLOSURE, not a `bool`, so that "never consulted" is a property of this
+/// function rather than of how carefully its callers write the call site: an eagerly evaluated
+/// argument would run [`shutdown_allowed_by_policy`] — an `RwLock` read and a merge of the
+/// registered stores — on every `shutdown` frame, including the unauthorized ones this rung exists
+/// to turn away first. It also lets the unauthorized-caller test observe the absence of the read
+/// instead of only its irrelevance to the result.
+///
 /// Authorisation goes through [`auth::authorize`] rather than `access.can_write()` so there stays
 /// exactly one authority on which verbs mutate (its match over `Request` is exhaustive, so a new
-/// verb has to make the decision explicitly). Pure — no lock, no I/O — so every rung is unit-testable
-/// without a socket, a second uid, or a policy file.
-pub fn shutdown_verdict(access: Access, allowed_by_policy: bool) -> Result<(), ShutdownRefusal> {
+/// verb has to make the decision explicitly). No lock and no I/O of its own — so every rung is
+/// unit-testable without a socket, a second uid, or a policy file.
+pub fn shutdown_verdict(
+    access: Access,
+    allowed_by_policy: impl FnOnce() -> bool,
+) -> Result<(), ShutdownRefusal> {
     if auth::authorize(&Request::Shutdown, access).is_err() {
         return Err(ShutdownRefusal::AccessDenied);
     }
-    if !allowed_by_policy {
+    if !allowed_by_policy() {
         return Err(ShutdownRefusal::DeniedByPolicy);
     }
     Ok(())
@@ -126,8 +136,9 @@ pub fn shutdown_verdict(access: Access, allowed_by_policy: bool) -> Result<(), S
 /// Whether the system policy authorises stopping the daemon — Go's
 /// `polc.GetBoolean(pkey.AllowTailscaledRestart, false)`, default **false**.
 ///
-/// Split from [`shutdown_verdict`] so the decision stays pure and the one process-global read has a
-/// single named site.
+/// Split from [`shutdown_verdict`] so the decision keeps no policy plumbing of its own and the one
+/// process-global read has a single named site — passed to the verdict as a closure, so it runs only
+/// once the caller has cleared the write-access rung.
 fn shutdown_allowed_by_policy() -> bool {
     syspolicy::get_boolean(syspolicy::PKEY_ALLOW_TAILSCALED_RESTART, false)
 }
@@ -464,8 +475,9 @@ async fn handle_conn(
                     // "no" still has a usable connection, exactly as a refused `POST` leaves Go's
                     // HTTP connection open.
                     Ok(Request::Shutdown) => {
-                        if let Err(refusal) = shutdown_verdict(access, shutdown_allowed_by_policy())
-                        {
+                        // The policy read is passed unevaluated: an unauthorized caller is turned
+                        // away by the first rung without it ever running.
+                        if let Err(refusal) = shutdown_verdict(access, shutdown_allowed_by_policy) {
                             // Audit every refused attempt to stop the daemon, naming which rung
                             // answered — an unauthorized caller probing the socket and a permitted
                             // caller hitting a policy that says no are different events.
@@ -2177,10 +2189,23 @@ mod tests {
     #[test]
     fn an_unauthorized_shutdown_is_refused_before_the_policy_is_read() {
         for allowed_by_policy in [false, true] {
+            // A counting probe in place of the real policy read. Asserting it was never called is
+            // what makes this test about the ORDER of the rungs: with the checks swapped, the
+            // refusal an unauthorized caller receives is unchanged, so the result alone cannot tell
+            // the two ladders apart — only the read can.
+            let reads = std::cell::Cell::new(0u32);
             assert_eq!(
-                shutdown_verdict(Access::ReadOnly, allowed_by_policy),
+                shutdown_verdict(Access::ReadOnly, || {
+                    reads.set(reads.get() + 1);
+                    allowed_by_policy
+                }),
                 Err(ShutdownRefusal::AccessDenied),
                 "a read-only caller must get the access refusal with policy={allowed_by_policy}"
+            );
+            assert_eq!(
+                reads.get(),
+                0,
+                "the policy must not be consulted for a caller that may not write                  (policy={allowed_by_policy})"
             );
         }
     }
@@ -2192,12 +2217,12 @@ mod tests {
     #[test]
     fn a_writer_is_refused_until_the_policy_allows_it() {
         assert_eq!(
-            shutdown_verdict(Access::ReadWrite, false),
+            shutdown_verdict(Access::ReadWrite, || false),
             Err(ShutdownRefusal::DeniedByPolicy),
             "write access alone must NOT be enough to stop the daemon"
         );
         assert_eq!(
-            shutdown_verdict(Access::ReadWrite, true),
+            shutdown_verdict(Access::ReadWrite, || true),
             Ok(()),
             "write access AND the policy must together permit the shutdown"
         );
@@ -2257,7 +2282,7 @@ mod tests {
             "with no policy source registered, `AllowTailscaledRestart` must read false"
         );
         assert_eq!(
-            shutdown_verdict(Access::ReadWrite, shutdown_allowed_by_policy()),
+            shutdown_verdict(Access::ReadWrite, shutdown_allowed_by_policy),
             Err(ShutdownRefusal::DeniedByPolicy),
             "an unconfigured daemon must refuse `shutdown` even from its owner"
         );
