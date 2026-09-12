@@ -48,11 +48,13 @@
 //!   `down`/`logout` outright unless the override key is set and the operator gave a reason. Go
 //!   splits it the same way (`applySysPolicy` re-asserts the intent, `ipnauth.CheckDisconnectPolicy`
 //!   refuses the disconnect), so both keys are enforced here and neither is reported as unenforced.
-//!   What is **not** ported is the window between the two: Go's `overrideAlwaysOn` flag and
-//!   `ReconnectAfter` timer, which suppress the re-assert for as long as a permitted override
-//!   stands. Without them a disconnect the gate allowed holds until the next reconcile point
-//!   (daemon start, `up`, `set`, `--config` reload) and is undone there — see the note on
-//!   [`apply_settings_to_prefs`].
+//!   The window between the two is Go's `overrideAlwaysOn` flag, which suppresses the re-assert for
+//!   as long as a permitted disconnect stands, and its `ReconnectAfter` timer, which ends that
+//!   window on the administrator's schedule. Both are ported: the flag is
+//!   [`Backend::override_always_on`](super::Backend::override_always_on) (passed into
+//!   [`apply_to_prefs`] by the caller, because it is backend state rather than policy) and the timer
+//!   is armed from [`reconnect_after`] and fired by
+//!   [`reconnect_loop`](super::reconnect_loop) — see the note on [`apply_settings_to_prefs`].
 //! - Seven of Go's eight `preferencePolicies` map onto one bool pref each. The eighth,
 //!   `UnattendedMode` (Go `ForceDaemon`), asks a GUI client to keep the daemon connected while no
 //!   user is logged in; a system daemon with no user session is unattended by construction, which is
@@ -146,6 +148,12 @@ pub const PKEY_ALWAYS_ON: &str = "AlwaysOn.Enabled";
 /// Go `pkey.AlwaysOnOverrideWithReason` — the policy key that lets an operator disconnect an
 /// always-on node by saying why. Read by name for the same reason as [`PKEY_ALWAYS_ON`].
 pub const PKEY_ALWAYS_ON_OVERRIDE_WITH_REASON: &str = "AlwaysOn.OverrideWithReason";
+
+/// Go `pkey.ReconnectAfter` — how long a permitted disconnect may last before the daemon connects
+/// the node again on its own. Read by name by [`reconnect_after`], which is what
+/// [`Backend::down`](super::Backend::down)/[`logout`](super::Backend::logout) arm their reconnect
+/// timer from, so the spelling has exactly one definition, shared with [`DEFINITIONS`].
+pub const PKEY_RECONNECT_AFTER: &str = "ReconnectAfter";
 
 /// Go `pkey.AllowedSuggestedExitNodes` — the policy key naming the exit nodes a managed node may be
 /// steered onto. Read by name by [`allowed_suggested_exit_nodes`], which is the only consumer, so —
@@ -476,7 +484,7 @@ const DEFINITIONS: &[Definition] = &[
     def("LogTarget", ValueType::String),
     def("MachineCertificateSubject", ValueType::String),
     def("PostureChecking", ValueType::PreferenceOption),
-    def("ReconnectAfter", ValueType::Duration),
+    def(PKEY_RECONNECT_AFTER, ValueType::Duration),
     def("Tailnet", ValueType::String),
     def(PKEY_HARDWARE_ATTESTATION, ValueType::Boolean),
     // User policy settings (configurable on a user- or device-basis; all of them are configurable
@@ -574,6 +582,81 @@ fn configured_preference(settings: &[PolicySetting], key: &str) -> Option<Prefer
     Some(PreferenceOption::parse(
         settings.iter().find(|s| s.key == key)?.value.as_deref()?,
     ))
+}
+
+/// The value of duration policy `key` in **nanoseconds** (Go's `time.Duration` representation), or
+/// `None` when it is not configured, is not a registered *duration* definition, or resolved to an
+/// error — Go `syspolicy.GetDuration`'s configured branch.
+///
+/// The row's value is already the canonical `Duration.String()` rendering (`"60m"` in the file is
+/// stored as `1h0m0s` — see [`read_value`]), which is itself in `time.ParseDuration`'s grammar, so
+/// parsing it back is exact. It cannot fail for a row that loaded, because [`validate`] parsed the
+/// same text at load time; a failure would mean the renderer and the parser disagree, and folding it
+/// into `None` keeps that a silent default rather than a panic.
+fn configured_duration(settings: &[PolicySetting], key: &str) -> Option<i64> {
+    if !matches!(definition_of(key), Some(d) if d.ty == ValueType::Duration) {
+        return None;
+    }
+    let value = settings.iter().find(|s| s.key == key)?.value.as_deref()?;
+    parse_go_duration(value).ok()
+}
+
+/// How long a permitted disconnect may last before the node reconnects itself, or `None` when the
+/// administrator configured no bound — Go's `b.polc.GetDuration(pkey.ReconnectAfter, 0)` together
+/// with the `reconnectAfter > 0` guard `onEditPrefsLocked` applies to it
+/// (`ipn/ipnlocal/local.go`).
+///
+/// The guard is folded in here rather than left to the caller because the answer a caller wants is
+/// "is there a bound, and what is it" — and `0` (the Go default) and a negative duration are the
+/// same answer: no. That also makes the return a [`std::time::Duration`], which cannot represent the
+/// negative value the policy file is free to contain.
+///
+/// Side-effect-free, like every other read of the registered stores — see the invariant on
+/// [`registered_store_settings`].
+pub(super) fn reconnect_after() -> Option<std::time::Duration> {
+    reconnect_after_in(&registered_store_settings())
+}
+
+/// The decision behind [`reconnect_after`], over an already-merged setting list so it is testable
+/// without the process-global registry (the same split [`get_boolean`] uses).
+fn reconnect_after_in(settings: &[PolicySetting]) -> Option<std::time::Duration> {
+    let ns = configured_duration(settings, PKEY_RECONNECT_AFTER)?;
+    // Go: `if reconnectAfter > 0`. A zero or negative `ReconnectAfter` is not a bound.
+    let ns = u64::try_from(ns).ok().filter(|ns| *ns > 0)?;
+    Some(std::time::Duration::from_nanos(ns))
+}
+
+/// The two always-on policy keys as they are currently configured — the snapshot Go compares in
+/// `sysPolicyChanged` (`policy.HasChangedAnyOf(pkey.AlwaysOn, pkey.AlwaysOnOverrideWithReason)`)
+/// to decide whether an outstanding always-on override is still the one the administrator granted.
+///
+/// Tri-state per key (`None` = not configured), because "unset" and "set to false" are different
+/// policies: going from unset to `false` is a change an administrator made, and Go's change
+/// notification carries it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct AlwaysOnKeys {
+    /// [`PKEY_ALWAYS_ON`] as configured, or `None` when no source sets it.
+    pub enabled: Option<bool>,
+    /// [`PKEY_ALWAYS_ON_OVERRIDE_WITH_REASON`] as configured, or `None` when no source sets it.
+    pub override_with_reason: Option<bool>,
+}
+
+/// Read the current [`AlwaysOnKeys`] from the registered stores — the input to
+/// [`Backend::sys_policy_changed`](super::Backend::sys_policy_changed).
+///
+/// Side-effect-free, like every other read of the registered stores — see the invariant on
+/// [`registered_store_settings`].
+pub(super) fn always_on_keys() -> AlwaysOnKeys {
+    always_on_keys_in(&registered_store_settings())
+}
+
+/// The decision behind [`always_on_keys`], over an already-merged setting list so it is testable
+/// without the process-global registry.
+fn always_on_keys_in(settings: &[PolicySetting]) -> AlwaysOnKeys {
+    AlwaysOnKeys {
+        enabled: configured_boolean(settings, PKEY_ALWAYS_ON),
+        override_with_reason: configured_boolean(settings, PKEY_ALWAYS_ON_OVERRIDE_WITH_REASON),
+    }
 }
 
 /// Parse the policy file's bytes into its top-level object — Go
@@ -1078,11 +1161,16 @@ impl PolicyApplication {
 /// Apply the effective device-scope policy to `prefs` — Go `ipnlocal.applySysPolicy`, called from
 /// the daemon wherever Go's `reconcilePrefs` runs (profile load, `up`, `set`, `--config`).
 ///
+/// `override_always_on` is Go's `b.overrideAlwaysOn`, passed in by the caller because it is backend
+/// state, not policy: while it stands, a disconnect the gate already permitted is left alone and the
+/// `AlwaysOn.Enabled` re-assert below does nothing. See
+/// [`Backend::override_always_on`](super::Backend::override_always_on) for its lifecycle.
+///
 /// Side-effect-free apart from `prefs`: it reads the registered stores exactly as
 /// [`effective_policy`] does (see the invariant on [`registered_store_settings`]) and touches no
 /// file. Persisting the result is the caller's job.
-pub(super) fn apply_to_prefs(prefs: &mut Prefs) -> PolicyApplication {
-    apply_settings_to_prefs(&registered_store_settings(), prefs)
+pub(super) fn apply_to_prefs(prefs: &mut Prefs, override_always_on: bool) -> PolicyApplication {
+    apply_settings_to_prefs(&registered_store_settings(), prefs, override_always_on)
 }
 
 /// The decision behind [`apply_to_prefs`], over an already-merged setting list so the whole of Go's
@@ -1094,16 +1182,19 @@ pub(super) fn apply_to_prefs(prefs: &mut Prefs) -> PolicyApplication {
 ///
 /// **`down` and `logout` are deliberately not reconcile points.** `AlwaysOn.Enabled` re-asserts
 /// `want_running` wherever this runs, which means a node under an always-on policy comes back up at
-/// the next daemon start, `up`, `set` or config reload — but a disconnect the gate has just let
-/// through still stops the node now, and stays stopped until one of those points comes round.
-/// Re-asserting inside `down` itself would make the permitted disconnect a lie: the gate
-/// ([`alwayson`](super::alwayson)) is where the policy decides whether the operator may stop the
-/// node, and a `down` that is allowed and then immediately undone is worse than one that is refused,
-/// because nothing tells the operator which happened. Go bridges the same gap with the
-/// `overrideAlwaysOn` flag and its `ReconnectAfter` timer — a permitted override suppresses the
-/// re-assert for a bounded window, then the node reconnects. Neither is ported yet, so the window
-/// here is "until the next reconcile point" rather than a duration the administrator sets.
-fn apply_settings_to_prefs(settings: &[PolicySetting], prefs: &mut Prefs) -> PolicyApplication {
+/// the next daemon start, `up`, `set` or config reload. Re-asserting inside `down` itself would make
+/// a permitted disconnect a lie: the gate ([`alwayson`](super::alwayson)) is where the policy decides
+/// whether the operator may stop the node, and a `down` that is allowed and then immediately undone
+/// is worse than one that is refused, because nothing tells the operator which happened. Go bridges
+/// the gap between the two with `overrideAlwaysOn` — and so does this fork now: while the override
+/// stands, the re-assert below is skipped, so the disconnect survives every reconcile point until
+/// the node's own `ReconnectAfter` timer fires (or the operator connects, switches profile, or the
+/// administrator changes an always-on key).
+fn apply_settings_to_prefs(
+    settings: &[PolicySetting],
+    prefs: &mut Prefs,
+    override_always_on: bool,
+) -> PolicyApplication {
     let mut out = PolicyApplication::default();
 
     // `LoginURL` → the control server. Go compares against the current value and writes on
@@ -1144,7 +1235,13 @@ fn apply_settings_to_prefs(settings: &[PolicySetting], prefs: &mut Prefs) -> Pol
     // `AlwaysOn.OverrideWithReason` has no pref to move and is therefore absent here, but it is NOT
     // unenforced: the disconnect gate reads it by name to decide whether `down`/`logout` may proceed
     // at all (see the module docs), which is the whole of its effect in Go too.
-    if configured_boolean(settings, PKEY_ALWAYS_ON) == Some(true) && !prefs.want_running {
+    //
+    // `override_always_on` is Go's `alwaysOn && !b.overrideAlwaysOn && !prefs.WantRunning`: a
+    // disconnect this same policy already permitted is not something to fight.
+    if configured_boolean(settings, PKEY_ALWAYS_ON) == Some(true)
+        && !override_always_on
+        && !prefs.want_running
+    {
         prefs.want_running = true;
         out.changed.push(PolicyChange {
             key: PKEY_ALWAYS_ON,
@@ -1699,8 +1796,18 @@ mod tests {
     /// via the production [`apply_settings_to_prefs`], not a re-derivation — while staying off the
     /// process-global registry (see [`resolve`]).
     fn apply(json: &str, prefs: &mut Prefs) -> PolicyApplication {
+        apply_with_override(json, prefs, false)
+    }
+
+    /// The same, with Go's `overrideAlwaysOn` standing — the state a permitted disconnect leaves the
+    /// backend in until its reconnect window closes.
+    fn apply_with_override(
+        json: &str,
+        prefs: &mut Prefs,
+        override_always_on: bool,
+    ) -> PolicyApplication {
         let settings = resolve(json).expect("the policy document should load");
-        apply_settings_to_prefs(&settings, prefs)
+        apply_settings_to_prefs(&settings, prefs, override_always_on)
     }
 
     /// The keys the apply path spells as literals must all be registered definitions of the type it
@@ -1725,6 +1832,11 @@ mod tests {
             let def = definition_of(key).unwrap_or_else(|| panic!("{key} must be defined"));
             assert_eq!(def.ty, ValueType::Boolean, "{key}");
         }
+        // `ReconnectAfter` is named by `reconnect_after`, which reads it through the same store and
+        // so needs the same definition to exist with the same type: read as anything but a duration
+        // it would resolve to `None` and every permitted disconnect would silently be unbounded.
+        let def = definition_of(PKEY_RECONNECT_AFTER).expect("ReconnectAfter must be defined");
+        assert_eq!(def.ty, ValueType::Duration);
         for key in PREFERENCE_POLICIES
             .iter()
             .map(|p| p.key)
@@ -1830,6 +1942,121 @@ mod tests {
         let off = apply(r#"{"AlwaysOn.Enabled": false}"#, &mut running);
         assert!(running.want_running, "AlwaysOn: false must not stop a node");
         assert!(off.is_quiet(), "{off:?}");
+    }
+
+    #[test]
+    fn a_standing_override_suppresses_the_always_on_re_assert_and_nothing_else() {
+        // Go's `alwaysOn && !b.overrideAlwaysOn && !prefs.WantRunning`. This is the whole point of
+        // the flag: between a disconnect the gate PERMITTED and the moment its window closes, the
+        // re-assert must not fight it — otherwise the next unrelated `tnet set` puts the node back
+        // up at an arbitrary moment.
+        let mut prefs = Prefs::default();
+        let applied = apply_with_override(r#"{"AlwaysOn.Enabled": true}"#, &mut prefs, true);
+        assert!(
+            !prefs.want_running,
+            "a permitted disconnect must survive a reconcile while the override stands"
+        );
+        assert!(applied.is_quiet(), "{applied:?}");
+
+        // The override is scoped to the always-on re-assert; every other key still applies, so a
+        // disconnected node is still a managed one.
+        let mut prefs = Prefs::default();
+        let applied = apply_with_override(
+            r#"{"AlwaysOn.Enabled": true, "Hostname": "documented-node"}"#,
+            &mut prefs,
+            true,
+        );
+        assert_eq!(prefs.hostname.as_deref(), Some("documented-node"));
+        assert!(!prefs.want_running);
+        assert_eq!(applied.changed.len(), 1);
+        assert_eq!(applied.changed[0].pref, "hostname");
+
+        // And once the window closes (the flag is cleared), the very same policy re-asserts.
+        let reasserted = apply_with_override(r#"{"AlwaysOn.Enabled": true}"#, &mut prefs, false);
+        assert!(prefs.want_running);
+        assert_eq!(reasserted.changed.len(), 1);
+        assert_eq!(reasserted.changed[0].pref, "want_running");
+    }
+
+    // --- `ReconnectAfter` (Go `syspolicy.GetDuration` + `onEditPrefsLocked`'s `> 0` guard) -------
+
+    #[test]
+    fn a_configured_reconnect_after_reads_back_as_the_duration_the_admin_wrote() {
+        // The row stores Go's `Duration.String()` rendering (`30m` → `30m0s`), so this also pins
+        // that the render/parse round-trip is exact — a bound that came back short or long would
+        // silently change the administrator's contract.
+        let settings = resolve(r#"{"ReconnectAfter": "30m"}"#).expect("a registered duration key");
+        assert_eq!(
+            reconnect_after_in(&settings),
+            Some(std::time::Duration::from_secs(30 * 60))
+        );
+        let settings =
+            resolve(r#"{"ReconnectAfter": "1h30m"}"#).expect("a registered duration key");
+        assert_eq!(
+            reconnect_after_in(&settings),
+            Some(std::time::Duration::from_secs(90 * 60))
+        );
+        // Sub-second precision survives too (nanoseconds are Go's unit).
+        let settings =
+            resolve(r#"{"ReconnectAfter": "1.5ms"}"#).expect("a registered duration key");
+        assert_eq!(
+            reconnect_after_in(&settings),
+            Some(std::time::Duration::from_nanos(1_500_000))
+        );
+    }
+
+    #[test]
+    fn a_zero_absent_or_negative_reconnect_after_is_no_bound_at_all() {
+        // Go's default is `0` and its arming test is `reconnectAfter > 0`, so all three of these
+        // mean "the disconnect is not time-bounded" — and must NOT arm a timer that fires instantly.
+        assert_eq!(reconnect_after_in(&[]), None, "not configured");
+        for json in [
+            r#"{"ReconnectAfter": "0s"}"#,
+            r#"{"ReconnectAfter": "0"}"#,
+            r#"{"ReconnectAfter": "-30m"}"#,
+        ] {
+            let settings = resolve(json).expect("all three are valid Go durations");
+            assert_eq!(reconnect_after_in(&settings), None, "{json}");
+        }
+        // A file that configures only the other duration key must not be read as a bound: Go's
+        // `GetDuration` is keyed, and `KeyExpirationNotice` is a different setting entirely.
+        let settings = resolve(r#"{"KeyExpirationNotice": "30m"}"#).expect("a duration key");
+        assert_eq!(reconnect_after_in(&settings), None);
+    }
+
+    #[test]
+    fn reconnect_after_returns_no_bound_with_no_registered_source() {
+        // The public entry point over the process-global registry, which no unit test registers
+        // into (see `resolve`): a daemon started without `--syspolicy-file` must find no bound, so
+        // an ordinary `tnet down` on an unmanaged node arms nothing.
+        assert_eq!(reconnect_after(), None);
+    }
+
+    #[test]
+    fn the_always_on_snapshot_distinguishes_unset_from_false() {
+        // Go's `sysPolicyChanged` fires on `HasChangedAnyOf(AlwaysOn, AlwaysOnOverrideWithReason)`,
+        // and an administrator moving a key from unset to `false` IS a change — so the snapshot the
+        // daemon compares has to be tri-state per key, not a pair of bools.
+        assert_eq!(always_on_keys_in(&[]), AlwaysOnKeys::default());
+        let unset = always_on_keys_in(&resolve(r#"{"Hostname": "x"}"#).expect("a string key"));
+        let off = always_on_keys_in(
+            &resolve(r#"{"AlwaysOn.Enabled": false}"#).expect("a registered boolean"),
+        );
+        assert_ne!(unset, off, "unset and false must not compare equal");
+        assert_eq!(off.enabled, Some(false));
+        assert_eq!(off.override_with_reason, None);
+
+        let both = always_on_keys_in(
+            &resolve(r#"{"AlwaysOn.Enabled": true, "AlwaysOn.OverrideWithReason": true}"#)
+                .expect("two registered booleans"),
+        );
+        assert_eq!(
+            both,
+            AlwaysOnKeys {
+                enabled: Some(true),
+                override_with_reason: Some(true),
+            }
+        );
     }
 
     #[test]
@@ -2057,7 +2284,7 @@ mod tests {
         let pinned = pinned_prefs_in(&settings);
         // Applied against defaults, every one of those keys moves its pref.
         let mut prefs = Prefs::default();
-        let applied = apply_settings_to_prefs(&settings, &mut prefs);
+        let applied = apply_settings_to_prefs(&settings, &mut prefs, false);
         let mut changed: Vec<&str> = applied.changed.iter().map(|c| c.pref).collect();
         changed.sort_unstable();
         let mut pinned_sorted = pinned.clone();
