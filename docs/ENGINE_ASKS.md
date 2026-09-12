@@ -1841,3 +1841,83 @@ asks for), `POST /wol`, `/ssh/usernames` and `GET /tls-cert-status`.
 dispatch of its own, and the two handlers above, reading prefs the daemon already holds. The
 reduction notes on `Prefs::posture_checking` and `Prefs::auto_update_apply` (`src/prefs.rs`) are
 what retire when it does; until then they point here. Consumed via a pin bump. — engine lane
+
+## 44. An allow-list argument on `suggest_exit_node()` (or candidate enumeration) — so `AllowedSuggestedExitNodes` can pick the best *permitted* node
+
+**Why:** `AllowedSuggestedExitNodes` is the MDM policy key that tells a managed fleet which exit
+nodes it may be steered onto. Upstream threads it all the way into the picker
+(`ipn/ipnlocal/local.go` @ `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`): `fillAllowedSuggestions`
+reads the key as a string array and turns it into a `set.Set[tailcfg.StableNodeID]`,
+`refreshAllowedSuggestions` rebuilds it at backend start and from `sysPolicyChanged`,
+`getAllowedSuggestions` hands the set to `suggestExitNode`, and both ranking strategies apply it to
+the **candidates, before ranking**:
+
+```go
+if allowList != nil && !allowList.Contains(peer.StableID()) {
+    continue
+}
+```
+
+Because the filter runs first, Go's answer is *the best node the administrator permits*. The
+nil-versus-empty distinction is load bearing: an unset key is a nil set and means no restriction, a
+configured empty array means nothing is allowed.
+
+The daemon now enforces the half it can (`permitted_suggestion` in `src/ipn/diag.rs`, fed by
+`syspolicy::allowed_suggested_exit_nodes`): it withholds a suggestion whose stable id the allow-list
+excludes, which is the same honest empty result Go produces when no candidate passes. What it cannot
+do is **re-rank**. Verified against pin `9d847a6e`/v0.43.0: `Device::suggest_exit_node()` takes no
+arguments and returns one already-chosen `ExitNodeSuggestion { id, name }`, and the engine's own
+`ts_runtime/src/exit_node_suggest.rs` says so in as many words — "The allow-list gate is likewise
+absent (allow-all) since the fork has no such policy yet", alongside `ExitNodeCandidate::is_eligible`
+noting that Go's predicate also requires "an allow-list membership check". The candidate list
+(`ExitNodeCandidate`, built inside `Runtime::suggest_exit_node` from the peer tracker) and the
+DERP-region latencies it ranks on (the control runner's last `NetcheckReport`) are both engine-side
+and neither crosses `Device`.
+
+So the gap is precise and narrow: **an allow-list that excludes only the engine's top pick yields no
+suggestion on this side, where Go yields the runner-up.** A fleet that allow-lists three exit nodes
+gets a suggestion only while the lowest-latency candidate overall happens to be one of the three.
+
+**Why not a daemon-side facsimile.** Re-implementing the ranking here would mean re-deriving the
+candidate predicate (online, `suggest-exit-node` capability, advertises an exit route) from
+`StatusNode`, re-deriving home DERP regions, and ranking on region latencies the daemon can only get
+from `Device::netcheck` — a second, separately-timed measurement, with no access to the runtime's
+sticky `prev_suggestion`, so repeated calls would flap where Go's are stable. That is a different
+algorithm wearing `suggest_exit_node`'s name. Refused under the honest-omission rule; hence this ask.
+
+**Ask (either piece is sufficient; the first is smaller and preferred):**
+
+1. Let the caller pass the allow-list, so the existing (already correct, already sticky) algorithm
+   filters candidates before ranking — Go's shape exactly:
+
+```rust
+/// The stable ids a caller's policy permits, or `None` for no restriction (Go's nil
+/// `set.Set[tailcfg.StableNodeID]`; an EMPTY set means nothing is permitted — the two are not the
+/// same, and the engine must keep them apart).
+pub async fn suggest_exit_node_allowing(
+    &self,
+    allow_list: Option<&std::collections::BTreeSet<StableNodeId>>,
+) -> Result<Option<ExitNodeSuggestion>, Error>;
+```
+
+   Inside, this is one line in `ExitNodeCandidate::is_eligible`'s caller — the filter Go applies —
+   plus threading the argument through `Runtime::suggest_exit_node`. `suggest_exit_node()` stays as
+   `suggest_exit_node_allowing(None)`, so nothing downstream breaks.
+
+2. Or expose the candidates the daemon would rank itself — `Device::exit_node_candidates() ->
+   Result<Vec<ExitNodeCandidate>, Error>` (the struct is already `pub`) together with the region
+   latencies already available from `Device::netcheck`. This is strictly more surface for strictly
+   more duplicated logic, and it leaves stickiness inside the engine where the daemon cannot consult
+   it, which is why (1) is preferred.
+
+One behavioural note for whichever lands: the runtime remembers the returned id in
+`prev_suggestion` **including** when the result is empty (it mirrors Go clearing
+`lastSuggestedExitNode`). With the filter inside the engine, a node excluded by policy never becomes
+sticky in the first place — today's daemon-side refusal leaves it remembered, which is harmless (the
+refusal is stable rather than flapping) but is one more reason the gate belongs where Go has it.
+
+**Daemon impact once landed:** `diag::suggest_exit_node` passes
+`syspolicy::allowed_suggested_exit_nodes()` straight into the engine call and
+`permitted_suggestion`'s filter arm becomes redundant (the nil-versus-empty reading and its tests
+move with the argument). `tnet exit-node suggest` then answers with the best *allowed* exit node
+instead of withholding when the best overall is not allowed. Consumed via a pin bump. — engine lane

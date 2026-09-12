@@ -400,8 +400,9 @@ pub enum Request {
     Netcheck,
     /// Ask the daemon to suggest the best available exit node (Go `tailscale exit-node suggest` →
     /// `LocalClient.SuggestExitNode`). Replies with [`Response::ExitNodeSuggestion`] carrying the
-    /// suggested node (or `None` when there is no eligible candidate — NOT an error, mirroring Go's
-    /// empty response). Read-only — it computes a suggestion from the netmap + latency, mutating
+    /// suggested node (or `None` when there is no eligible candidate, or when the administrator's
+    /// `AllowedSuggestedExitNodes` policy excludes the one the engine picked — NOT an error,
+    /// mirroring Go's empty response). Read-only — it computes a suggestion from the netmap + latency, mutating
     /// nothing (gated like [`Status`](Request::Status)). Requires the node to be up.
     SuggestExitNode,
     /// Report the Tailscale **Services** (VIPs) this node can reach (Go `tailscale service list` →
@@ -943,8 +944,10 @@ pub enum Response {
     /// `tnet netcheck`.
     Netcheck(NetcheckReport),
     /// The suggested exit node (reply to [`Request::SuggestExitNode`]), rendered by `tnet exit-node
-    /// suggest`. `suggestion` is `None` when the engine found no eligible candidate — an honest empty
-    /// result, not an error (mirroring Go's empty `SuggestExitNode` response). A **struct** variant
+    /// suggest`. `suggestion` is `None` when the engine found no eligible candidate, and when the
+    /// administrator's `AllowedSuggestedExitNodes` allow-list excludes the node it picked — an honest
+    /// empty result either way, not an error (mirroring Go's empty `SuggestExitNode` response, which
+    /// is also what Go returns when its allow-list leaves no candidate). A **struct** variant
     /// (not a newtype over `Option`): the `Response` enum is internally tagged (`tag = "kind"`), which
     /// cannot merge its tag into a bare `Option`/`null` content, so the optional payload is carried as
     /// a named field instead.
