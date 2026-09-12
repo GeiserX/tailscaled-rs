@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.59.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.58.0...v0.59.0) (2026-09-12)
+
+
+### Features
+
+* **syspolicy:** apply the MDM policy file instead of just reporting it ([#445](https://github.com/GeiserX/tailscaled-rs/issues/445)) ([eb52bd6](https://github.com/GeiserX/tailscaled-rs/commit/eb52bd61f3ea0632f3687c09a8c10dd75044d4b8))
+
 ## [0.58.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.57.0...v0.58.0) (2026-09-12)
 
 
