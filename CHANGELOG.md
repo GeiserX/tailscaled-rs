@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.62.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.61.0...v0.62.0) (2026-09-12)
+
+
+### Features
+
+* **ipn:** enrol a node from the AuthKey its policy file carries ([#459](https://github.com/GeiserX/tailscaled-rs/issues/459)) ([7346530](https://github.com/GeiserX/tailscaled-rs/commit/73465305176161097a84905b48cb3125c56429aa))
+
 ## [0.61.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.60.0...v0.61.0) (2026-09-12)
 
 
