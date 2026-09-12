@@ -79,6 +79,7 @@ mod config;
 mod control_url;
 mod diag;
 pub mod doctor;
+pub mod exitnodepolicy;
 pub mod install;
 pub(crate) mod linkmon;
 mod profile;
@@ -352,8 +353,14 @@ pub async fn reconnect_loop(backend: std::sync::Arc<tokio::sync::Mutex<Backend>>
                     );
                     return;
                 }
-                let keys = syspolicy::always_on_keys();
-                backend.lock().await.sys_policy_changed(keys);
+                let always_on = syspolicy::always_on_keys();
+                let exit_node = syspolicy::exit_node_keys();
+                let mut be = backend.lock().await;
+                be.sys_policy_changed(always_on);
+                // The second of Go's two independent `HasChangedAnyOf` questions in
+                // `sysPolicyChanged`: an exit-node key moving revokes a standing exit-node override
+                // and says nothing about the always-on exemption (or the reverse).
+                be.exit_node_policy_changed(exit_node);
             }
             // The window elapsed.
             () = sleep_until_armed(armed.as_ref()) => {
@@ -2037,6 +2044,39 @@ pub struct Backend {
     /// Seeded at [`load`](Backend::load) and updated on every comparison, so a change is seen exactly
     /// once no matter how many times the policy ticks.
     always_on_keys: syspolicy::AlwaysOnKeys,
+    /// Whether an exit-node choice the policy PERMITTED the operator to make is currently standing —
+    /// Go's `LocalBackend.overrideExitNodePolicy` (`ipn/ipnlocal/local.go`).
+    ///
+    /// It is the exit-node twin of [`override_always_on`](Backend::override_always_on), and it
+    /// exists for the same reason: the gate ([`exitnodepolicy`]) can allow an operator to pick a
+    /// different exit node under `ExitNode.AllowOverride`, but
+    /// [`syspolicy::apply_to_prefs`] re-applies the administrator's `ExitNodeIP` at every reconcile
+    /// point, so without this flag the permitted choice would be silently undone by the same
+    /// command that made it. While it is set, the exit-node re-apply is skipped.
+    ///
+    /// Set by [`record_exit_node_edit`](Backend::record_exit_node_edit) when an edit takes the
+    /// override, and cleared on exactly the events Go clears it on:
+    /// - the operator picking the policy's own node again (the edit itself says so — Go's "switches
+    ///   back to the state required by policy");
+    /// - a **connect** or **disconnect** — [`begin_up`](Backend::begin_up),
+    ///   [`down`](Backend::down)/[`logout`](Backend::logout);
+    /// - a **profile switch** — [`activate_profile`](Backend::activate_profile), because the
+    ///   exemption was granted against the profile that asked for it;
+    /// - an exit-node **policy change** —
+    ///   [`exit_node_policy_changed`](Backend::exit_node_policy_changed), Go's `sysPolicyChanged`
+    ///   clearing it whenever `ExitNodeID`, `ExitNodeIP` or `ExitNode.AllowOverride` moves.
+    ///
+    /// **In-memory, exactly like Go's**: a daemon restart forgets the override, the profile-load
+    /// reconcile then re-applies the administrator's node, and the operator who still wants theirs
+    /// asks for it again. That is the safe direction for a pin whose whole purpose is to decide
+    /// where the node egresses.
+    override_exit_node_policy: bool,
+    /// The exit-node policy keys as they were when this backend last looked — the snapshot
+    /// [`exit_node_policy_changed`](Backend::exit_node_policy_changed) compares against, Go's
+    /// `policy.HasChangedAnyOf(pkey.ExitNodeID, pkey.ExitNodeIP, pkey.AllowExitNodeOverride)`.
+    ///
+    /// Seeded and updated exactly like [`always_on_keys`](Backend::always_on_keys).
+    exit_node_keys: syspolicy::ExitNodeKeys,
 }
 
 /// One arming of the always-on reconnect timer — the state Go's `startReconnectTimerLocked` captures
@@ -2283,6 +2323,10 @@ impl Backend {
             // Seed the always-on snapshot from the policy as it stands at boot, so the first
             // comparison reports a real change rather than "everything changed".
             always_on_keys: syspolicy::always_on_keys(),
+            // No exit-node override has been granted in THIS process either, and for the same
+            // reason it is not persisted: the reconcile below puts the administrator's node back.
+            override_exit_node_policy: false,
+            exit_node_keys: syspolicy::exit_node_keys(),
         };
         backend.has_node_key = backend.has_persisted_node_key().await;
         // Go reconciles system policy on every profile load, and this is one (the daemon's own, at
@@ -2310,9 +2354,12 @@ impl Backend {
     /// in-memory values are what `status`, `get` and the next bring-up all read, so nothing is lost
     /// by waiting for a real write.
     ///
-    /// It carries [`override_always_on`](Backend::override_always_on) into the apply, which is what
-    /// keeps a disconnect the always-on gate PERMITTED from being undone here: while the exemption
-    /// stands, the `AlwaysOn.Enabled` re-assert is skipped at every one of these call sites.
+    /// It carries the backend's standing exemptions into the apply
+    /// ([`syspolicy::PolicyOverrides`]), which is what keeps a change the policy already PERMITTED
+    /// from being undone here: while [`override_always_on`](Backend::override_always_on) stands the
+    /// `AlwaysOn.Enabled` re-assert is skipped at every one of these call sites, and while
+    /// [`override_exit_node_policy`](Backend::override_exit_node_policy) stands the `ExitNodeIP`
+    /// re-apply is.
     ///
     /// Silent when the policy is silent (the overwhelmingly common case: no `--syspolicy-file`, or
     /// one whose settings are already in force). A key this build cannot enforce is logged at WARN
@@ -2320,7 +2367,13 @@ impl Backend {
     /// log when they go looking, and the alternative — reporting intent that changes nothing — is the
     /// failure this whole path exists to remove.
     fn reconcile_sys_policy(&mut self, at: &'static str) {
-        let applied = syspolicy::apply_to_prefs(&mut self.prefs, self.override_always_on);
+        let applied = syspolicy::apply_to_prefs(
+            &mut self.prefs,
+            syspolicy::PolicyOverrides {
+                always_on: self.override_always_on,
+                exit_node: self.override_exit_node_policy,
+            },
+        );
         for change in &applied.changed {
             tracing::info!(
                 at,
@@ -2458,6 +2511,94 @@ impl Backend {
         );
         self.always_on_keys = current;
         self.reset_always_on_override("policy change");
+        true
+    }
+
+    /// Decide whether this prefs edit may change the exit node — Go's `checkEditPrefsAccessLocked`
+    /// exit-node arm, reached from [`begin_up`](Backend::begin_up) and
+    /// [`begin_set`](Backend::begin_set) **before** a single pref is mutated or persisted, exactly
+    /// where the always-on disconnect gate sits for `down`/`logout`.
+    ///
+    /// `named` is the command's `--exit-node` as its options carry it (see
+    /// [`exitnodepolicy::check_exit_node_edit`] for the double `Option`'s meaning). The verdict it
+    /// returns is the exemption bookkeeping the caller must hand to
+    /// [`record_exit_node_edit`](Backend::record_exit_node_edit) once the edit has landed — one
+    /// function decides both, so an edit can never be allowed as an override and then not
+    /// remembered as one.
+    ///
+    /// The refusal is raised as an `anyhow` error, like every other pre-validation refusal on those
+    /// paths, so it reaches the operator as the LocalAPI error of the command they ran.
+    fn check_exit_node_policy(
+        &self,
+        named: Option<Option<&str>>,
+    ) -> Result<exitnodepolicy::ExitNodeEdit> {
+        exitnodepolicy::check_exit_node_edit(named, &syspolicy::exit_node_policy())
+            .map_err(|refused| anyhow!(refused))
+    }
+
+    /// Record what a **permitted** exit-node edit means for the standing override — Go's
+    /// `onEditPrefsLocked` exit-node arm.
+    ///
+    /// Called by `begin_up`/`begin_set` after the edit has been applied to prefs and *before* the
+    /// reconcile, because the reconcile is the thing the flag has to be in place for: an
+    /// [`Override`](exitnodepolicy::ExitNodeEdit::Override) that were recorded afterwards would be
+    /// overwritten by the very re-apply it exists to suppress. `at` names the call site for the log.
+    fn record_exit_node_edit(&mut self, edit: exitnodepolicy::ExitNodeEdit, at: &'static str) {
+        match edit {
+            // The command said nothing about the exit node, so it says nothing about the exemption.
+            exitnodepolicy::ExitNodeEdit::Untouched => {}
+            exitnodepolicy::ExitNodeEdit::NoOverride => self.reset_exit_node_policy_override(at),
+            exitnodepolicy::ExitNodeEdit::Override => {
+                if !self.override_exit_node_policy {
+                    tracing::info!(
+                        at,
+                        "exit node: the policy permits a user override; the \
+                         administrator's ExitNodeIP will not be re-applied while it stands"
+                    );
+                }
+                self.override_exit_node_policy = true;
+            }
+        }
+    }
+
+    /// Clear a standing exit-node override — Go's `b.overrideExitNodePolicy = false`. `at` names the
+    /// event for the log.
+    ///
+    /// Idempotent and silent when no override stands, so the reset sites (connect, disconnect,
+    /// profile switch, exit-node policy change, and an edit that returns to the policy's own node)
+    /// can call it unconditionally.
+    fn reset_exit_node_policy_override(&mut self, at: &'static str) {
+        if self.override_exit_node_policy {
+            tracing::info!(
+                at,
+                "exit node: the permitted override no longer stands; the policy's exit \
+                 node applies again"
+            );
+        }
+        self.override_exit_node_policy = false;
+    }
+
+    /// React to the exit-node policy keys having moved — the second half of Go's `sysPolicyChanged`,
+    /// `policy.HasChangedAnyOf(pkey.ExitNodeID, pkey.ExitNodeIP, pkey.AllowExitNodeOverride)`, which
+    /// clears the exit-node override.
+    ///
+    /// A sibling of [`sys_policy_changed`](Backend::sys_policy_changed) rather than a branch inside
+    /// it, because Go asks two independent `HasChangedAnyOf` questions with two independent answers:
+    /// an administrator who edits `AlwaysOn.Enabled` has not said anything about the exit node.
+    /// `current` is [`syspolicy::exit_node_keys`]'s answer, passed in by [`reconnect_loop`] for the
+    /// same testability reason.
+    ///
+    /// Returns whether it reset anything, so a caller can log the edge.
+    fn exit_node_policy_changed(&mut self, current: syspolicy::ExitNodeKeys) -> bool {
+        if current == self.exit_node_keys {
+            return false;
+        }
+        tracing::info!(
+            "exit node: the administrator changed an exit-node policy key; revoking any \
+             outstanding override"
+        );
+        self.exit_node_keys = current;
+        self.reset_exit_node_policy_override("policy change");
         true
     }
 
@@ -2757,6 +2898,9 @@ impl Backend {
         // change). Cleared BEFORE the reconcile below, so the incoming profile is reconciled against
         // the policy as written rather than under the outgoing profile's exemption.
         self.reset_always_on_override("profile switch");
+        // An exit-node override belongs to its profile for the same reason and is cleared on the
+        // same edge in Go, so the incoming profile is reconciled under the policy as written.
+        self.reset_exit_node_policy_override("profile switch");
         // A profile load, exactly like the one in `load`: system policy applies to the newly-active
         // profile's prefs too, so a switch cannot be used to step out from under it. In memory only
         // (the swap above already persisted everything a switch owes to disk).
@@ -3118,6 +3262,13 @@ impl Backend {
         if let Some(tags) = opts.advertise_tags.as_mut() {
             *tags = complete_and_validate_advertise_tags(tags)?;
         }
+        // The same authority question `begin_up` asks, in the same place and for the same reason
+        // (Go's `checkEditPrefsAccessLocked`, which guards every prefs edit): an operator may not
+        // move an exit node the administrator pinned, and this is the path on which that used to
+        // succeed silently — `set` applied the value, the reconcile below put the policy's node
+        // back, and the command reported success.
+        let exit_node_edit =
+            self.check_exit_node_policy(opts.exit_node.as_ref().map(Option::as_deref))?;
         // And RESOLVE a named `--exit-node` before persisting: the unsupported `auto:` form, then
         // the netmap-backed checks Go runs on the CLI argument (`exitNodeIPOfArg`). Same reason as
         // in `begin_up` — the engine's selector parse is infallible, so an unusable value persists
@@ -3238,6 +3389,10 @@ impl Backend {
         // configured-at-least-once (a `set` on a never-touched node has now written prefs), matching
         // `up`/`down`, so a `set`-then-restart reads `Stopped`, not `NoState`.
         self.ever_configured = true;
+        // Record what the (permitted) exit-node edit means for the standing override, before the
+        // reconcile below — which is what the flag has to be in place for: an override recorded
+        // after it would be undone by the very re-apply it exists to suppress.
+        self.record_exit_node_edit(exit_node_edit, "set");
         // System policy has the last word, applied after this command's overrides and before the
         // persist — so `tnet set --hostname laptop` against a policy that pins `Hostname` persists
         // (and, on the live path below, PUSHES) the pinned name, not the typed one. Policy beating a
@@ -3496,6 +3651,16 @@ impl Backend {
         if let Some(tags) = opts.advertise_tags.as_mut() {
             *tags = complete_and_validate_advertise_tags(tags)?;
         }
+        // Is this operator ALLOWED to change the exit node at all? Go's `checkEditPrefsAccessLocked`
+        // asks first, before any edit is applied, and refuses when the administrator's policy pins
+        // the exit node (`exit node cannot be changed: managed by policy`) — see
+        // [`exitnodepolicy`]. Asked before the netmap resolution below, and for two reasons: the
+        // refusal is about authority rather than about the value (so a pinned node refuses a typo
+        // with "managed by policy" rather than with "no such peer"), and it costs no `status`
+        // round-trip. The verdict travels to the apply below, where a permitted override is
+        // recorded.
+        let exit_node_edit =
+            self.check_exit_node_policy(opts.exit_node.as_ref().map(Option::as_deref))?;
         // And RESOLVE a named `--exit-node` before teardown/persist: reject the unsupported `auto:`
         // form (no auto-selection in this build), then check the value against the netmap the way Go
         // resolves the CLI argument before writing the pref (`exitNodeIPOfArg`). Both matter for the
@@ -3654,6 +3819,12 @@ impl Backend {
         // spent and its reconnect timer has nothing left to do — Go resets both on the connect edge.
         // Before the reconcile below, so `AlwaysOn.Enabled` is back in force from this moment on.
         self.reset_always_on_override("up");
+        // A connect ends an exit-node override too (Go clears both on that edge) — and then THIS
+        // command's own verdict applies, so an `up --exit-node <other>` the policy permitted is
+        // still a standing override when the reconcile below runs. Order matters: recorded first,
+        // the reset would immediately throw it away.
+        self.reset_exit_node_policy_override("up");
+        self.record_exit_node_edit(exit_node_edit, "up");
         // System policy has the last word — after `--reset`, after every override this command
         // named, and before the persist. That ordering is the whole contract: an `up` cannot be used
         // to step out from under an administrator's policy, and `up --reset` (the one genuine
@@ -4136,6 +4307,11 @@ impl Backend {
         if was_running {
             self.on_permitted_disconnect(syspolicy::reconnect_after());
         }
+        // Disconnecting ends an exit-node override, on the same edge Go clears it: which node the
+        // operator egresses through is not a choice that outlives the connection. Outside the
+        // transition guard on purpose — there is no timer to re-arm, so clearing it on a `down` that
+        // changes nothing else is simply the honest state.
+        self.reset_exit_node_policy_override("down");
         self.persist_prefs().await?;
         Ok(())
     }
@@ -4267,6 +4443,8 @@ impl Backend {
         if was_running {
             self.on_permitted_disconnect(syspolicy::reconnect_after());
         }
+        // A logout is a disconnect, so it ends an exit-node override too — same edge as `down`.
+        self.reset_exit_node_policy_override("logout");
         self.persist_prefs().await?;
         Ok(())
     }
@@ -5610,6 +5788,8 @@ mod tests {
             reconnect_tx: tokio::sync::watch::channel(None).0,
             reconnect_seq: 0,
             always_on_keys: syspolicy::AlwaysOnKeys::default(),
+            override_exit_node_policy: false,
+            exit_node_keys: syspolicy::ExitNodeKeys::default(),
         }
     }
 
@@ -6487,6 +6667,161 @@ mod tests {
             enabled: Some(true),
             override_with_reason: None,
         }));
+    }
+
+    // --- the exit-node edit gate's bookkeeping (Go `onEditPrefsLocked` / `sysPolicyChanged`) -----
+
+    /// The exemption a permitted override buys, and the two ways an edit can end it — Go's
+    /// `onEditPrefsLocked` exit-node arm, driven through the production recorder.
+    #[tokio::test]
+    async fn a_permitted_exit_node_override_stands_until_an_edit_ends_it() {
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-exitnode-override-{}", std::process::id()));
+        let mut be = backend_for(&dir);
+        assert!(
+            !be.override_exit_node_policy,
+            "a fresh backend stands on no exemption, so the policy's exit node applies"
+        );
+
+        // An edit that names no exit node says nothing about the exemption, in either direction.
+        be.record_exit_node_edit(exitnodepolicy::ExitNodeEdit::Untouched, "set");
+        assert!(!be.override_exit_node_policy);
+
+        be.record_exit_node_edit(exitnodepolicy::ExitNodeEdit::Override, "set");
+        assert!(
+            be.override_exit_node_policy,
+            "an override the policy permitted must suppress the re-apply that would undo it"
+        );
+        be.record_exit_node_edit(exitnodepolicy::ExitNodeEdit::Untouched, "set");
+        assert!(
+            be.override_exit_node_policy,
+            "an unrelated `set` is not an exit-node edit and must not revoke the exemption"
+        );
+
+        // The operator picking the policy's own node again is Go's "switches back to the state
+        // required by policy": there is nothing left to exempt.
+        be.record_exit_node_edit(exitnodepolicy::ExitNodeEdit::NoOverride, "set");
+        assert!(!be.override_exit_node_policy);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// Connecting, disconnecting and switching profile all end an exit-node override — the three
+    /// lifecycle edges Go clears `overrideExitNodePolicy` on.
+    #[tokio::test]
+    async fn every_lifecycle_edge_ends_an_exit_node_override() {
+        let dir = std::env::temp_dir().join(format!(
+            "tailnetd-exitnode-lifecycle-{}",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // A disconnect: which node the operator egresses through does not outlive the connection.
+        let mut be = backend_for(&dir);
+        be.prefs.want_running = true;
+        be.record_exit_node_edit(exitnodepolicy::ExitNodeEdit::Override, "set");
+        be.down(alwayson::Actor::Operator { reason: None })
+            .await
+            .expect("an unmanaged node may always disconnect");
+        assert!(!be.override_exit_node_policy, "a `down` ends the override");
+
+        // A logout is the same edit in Go, and takes the same road here.
+        let mut be = backend_for(&dir);
+        be.prefs.want_running = true;
+        be.record_exit_node_edit(exitnodepolicy::ExitNodeEdit::Override, "set");
+        be.logout(alwayson::Actor::Operator { reason: None })
+            .await
+            .expect("logout");
+        assert!(!be.override_exit_node_policy, "a logout ends it too");
+
+        // A connect: `up` puts the administrator's policy back in force.
+        let mut be = backend_for(&dir);
+        be.record_exit_node_edit(exitnodepolicy::ExitNodeEdit::Override, "set");
+        be.begin_up(UpOptions::default(), None)
+            .await
+            .expect("a device-less begin_up mints a fresh key and prepares the config");
+        assert!(
+            !be.override_exit_node_policy,
+            "`up` re-arms the policy: from here on the pinned ExitNodeIP is back in force"
+        );
+
+        // A profile switch: the exemption was granted against the profile that asked for it.
+        let mut be = backend_for(&dir);
+        be.record_exit_node_edit(exitnodepolicy::ExitNodeEdit::Override, "set");
+        be.create_profile("work").await.expect("create + switch");
+        assert!(
+            !be.override_exit_node_policy,
+            "the exemption does not follow the switch"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// Go's second `HasChangedAnyOf` in `sysPolicyChanged`: an exit-node key moving revokes a
+    /// standing override, and a tick that moved nothing does not.
+    #[tokio::test]
+    async fn only_a_real_exit_node_policy_change_revokes_an_outstanding_override() {
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-exitnode-policy-{}", std::process::id()));
+        let mut be = backend_for(&dir);
+        let pinned_with_override = syspolicy::ExitNodeKeys {
+            id: None,
+            ip: Some("100.64.0.9".to_string()),
+            allow_override: Some(true),
+        };
+        be.exit_node_keys = pinned_with_override.clone();
+        be.record_exit_node_edit(exitnodepolicy::ExitNodeEdit::Override, "set");
+
+        assert!(
+            !be.exit_node_policy_changed(pinned_with_override),
+            "an unchanged policy is not a change — this build's source captures its file at \
+             startup, so a `syspolicy reload` ticks the bus without a value having moved"
+        );
+        assert!(be.override_exit_node_policy, "so the override still stands");
+
+        // The administrator withdraws the override key: the exemption it granted goes with it.
+        let withdrawn = syspolicy::ExitNodeKeys {
+            id: None,
+            ip: Some("100.64.0.9".to_string()),
+            allow_override: None,
+        };
+        assert!(be.exit_node_policy_changed(withdrawn.clone()));
+        assert!(!be.override_exit_node_policy);
+
+        // The snapshot is updated, so the same change is not re-reported on the next tick.
+        assert!(!be.exit_node_policy_changed(withdrawn));
+
+        // Moving the PINNED NODE is a change too, even to a value this build cannot apply: Go
+        // compares the keys, not their effect.
+        be.record_exit_node_edit(exitnodepolicy::ExitNodeEdit::Override, "set");
+        assert!(be.exit_node_policy_changed(syspolicy::ExitNodeKeys {
+            id: Some("nABC123CNTRL".to_string()),
+            ip: Some("100.64.0.9".to_string()),
+            allow_override: None,
+        }));
+        assert!(!be.override_exit_node_policy);
+    }
+
+    /// The gate itself, reached the way `up` and `set` reach it: with no policy registered in this
+    /// test process the exit node is nobody's but the operator's, and every edit is permitted.
+    #[tokio::test]
+    async fn an_unmanaged_node_reaches_the_gate_and_is_waved_through() {
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-exitnode-gate-{}", std::process::id()));
+        let be = backend_for(&dir);
+        for named in [None, Some(None), Some(Some("100.64.0.3"))] {
+            assert_eq!(
+                be.check_exit_node_policy(named).ok(),
+                Some(match named {
+                    None => exitnodepolicy::ExitNodeEdit::Untouched,
+                    Some(_) => exitnodepolicy::ExitNodeEdit::NoOverride,
+                }),
+                "{named:?}"
+            );
+        }
+        // And the refusal itself, over a registered policy file, is `tests/exit_node_policy.rs` —
+        // the registry is process-global, so it owns a test binary of its own.
     }
 
     #[tokio::test]
