@@ -141,7 +141,9 @@ pub struct ConfigVAlpha {
     pub allow_lan_while_using_exit_node: Option<bool>,
     /// HONORED → [`Prefs::advertise_routes`]. Subnet routes (CIDRs) to advertise. Each must be a
     /// masked prefix — [`Config::apply_to_prefs`] refuses one with host bits set (`192.0.2.5/24`),
-    /// as Go's `ToPrefs` does.
+    /// as Go's `ToPrefs` does — and the list is checked as a SET
+    /// ([`crate::routes::calc_advertise_routes`]): a 4via6 prefix must decode, and a default route
+    /// must appear in both families or in neither (a lone `0.0.0.0/0` is a half exit node).
     pub advertise_routes: Vec<String>,
     /// HONORED → [`Prefs::advertise_exit_node`]. Go `AdvertiseExitNode` — advertise this node as an
     /// exit node. It **composes** with [`advertise_routes`](ConfigVAlpha::advertise_routes) rather
@@ -478,31 +480,43 @@ impl Config {
                 other => bail!("config: ServerURL {url:?} scheme {other:?} is not http or https"),
             }
         }
-        // Routes are checked twice over: the CIDR must parse at all (Go gets that for free — its
-        // `AdvertiseRoutes` is a `[]netip.Prefix`, so a malformed entry dies in the JSON decode),
-        // and the prefix must be MASKED. Go's `ToPrefs` walks `c.AdvertiseRoutes` and, for every
-        // `route != route.Masked()`, joins `route %s has non-address bits set; expected %s`, then
-        // returns before a single pref is written. `"192.0.2.5/24"` parses happily as an `IpNet`
-        // that keeps its host bits, so without this the typo boots and the node advertises the
-        // route exactly as written instead of the `192.0.2.0/24` the operator meant. Same rule and
-        // same message as `Backend::check_prefs` applies on the `up`/`set` path, so the declarative
-        // and interactive paths refuse the same configs. Every offender is collected (Go
-        // `errors.Join`) rather than only the first: a headless deploy should learn about all its
-        // bad routes in one boot, not one per restart.
-        let mut route_errs: Vec<String> = Vec::new();
-        for s in &c.advertise_routes {
-            let net = s
-                .parse::<ipnet::IpNet>()
-                .with_context(|| format!("config: invalid advertise route {s:?}"))?;
-            let masked = net.trunc();
-            if masked != net {
-                route_errs.push(format!(
-                    "config: route {s} has non-address bits set; expected {masked}"
-                ));
-            }
-        }
-        if !route_errs.is_empty() {
-            bail!("{}", route_errs.join("\n"));
+        // The advertised routes are checked as a SET, by the one function the `up`/`set`/`check-prefs`
+        // paths ask (`crate::routes::calc_advertise_routes`, Go `netutil.CalcAdvertiseRoutes`): every
+        // CIDR must parse at all (Go gets that for free — its `AdvertiseRoutes` is a
+        // `[]netip.Prefix`, so a malformed entry dies in the JSON decode) and be MASKED
+        // (`"192.0.2.5/24"` parses happily as an `IpNet` that keeps its host bits, so without this the
+        // typo boots and the node advertises the route exactly as written instead of the
+        // `192.0.2.0/24` the operator meant); every 4via6 prefix must actually decode; and a default
+        // route must be advertised in BOTH families or neither, because a lone `0.0.0.0/0` is a half
+        // exit node whose clients leak their IPv6 traffic out of their own link. That last rule is
+        // asked of the routes this config COMPOSES with `AdvertiseExitNode` — the two are one field in
+        // Go and two prefs here — and of the set that will actually be persisted, so a config that
+        // names no routes is judged on the prefs it leaves in place.
+        //
+        // Go's own config loader checks only the masking rule (`ipn/conf.go` `ToPrefs`); the set-level
+        // rules live in its CLI path. They are applied here as well because a declaratively-managed
+        // subnet router is exactly the deployment where nobody reads command output: a half-advertised
+        // default route would otherwise boot silently and leak with no operator on the other end.
+        // Same rules, same messages as `Backend::check_prefs`, so the declarative and interactive
+        // paths refuse the same configs. Every offender is collected (Go `errors.Join`) rather than
+        // only the first: a headless deploy should learn about all its bad routes in one boot, not one
+        // per restart.
+        let prospective_routes = if c.advertise_routes.is_empty() {
+            prefs.advertise_routes.clone()
+        } else {
+            c.advertise_routes.clone()
+        };
+        let prospective_advertise_exit = c.advertise_exit_node.unwrap_or(prefs.advertise_exit_node);
+        if let Err(errs) =
+            crate::routes::calc_advertise_routes(&prospective_routes, prospective_advertise_exit)
+        {
+            bail!(
+                "{}",
+                errs.iter()
+                    .map(|e| format!("config: {e}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
         }
         if let Some(exit) = &c.exit_node {
             // The engine's `ExitNodeSelector::FromStr` is infallible (a non-IP string → a Name that
@@ -785,10 +799,11 @@ mod tests {
         // Malformed ServerURL.
         let e = err(r#"{"version":"alpha0","ServerURL":"not a url"}"#);
         assert!(e.to_lowercase().contains("serverurl"), "{e}");
-        // Bad advertise route CIDR.
+        // Bad advertise route CIDR — named in Go's words (`netutil.CalcAdvertiseRoutes`: "%q is not a
+        // valid IP address or CIDR prefix"), which is what the shared route-set check reports.
         let e = err(r#"{"version":"alpha0","AdvertiseRoutes":["10.0.0.0/8","garbage"]}"#);
         assert!(
-            e.contains("advertise route") && e.contains("garbage"),
+            e.contains("\"garbage\" is not a valid IP address or CIDR prefix"),
             "{e}"
         );
         // Empty exit node.
@@ -860,6 +875,100 @@ mod tests {
         assert_eq!(
             p2.advertise_routes,
             vec!["192.0.2.5/32", "2001:db8::1/128", "198.51.100.0/24"]
+        );
+    }
+
+    #[test]
+    fn apply_refuses_a_default_route_advertised_in_one_family_only() {
+        // The half-exit-node leak, from the path that most needs catching it: a declaratively managed
+        // subnet router boots with nobody reading command output. `0.0.0.0/0` alone takes its clients'
+        // v4 traffic while their v6 traffic leaves out their own link, and neither end can see it.
+        let c = cfg(r#"{"version":"alpha0","AdvertiseRoutes":["0.0.0.0/0","192.0.2.0/24"]}"#);
+        let mut p = Prefs::default();
+        let before = p.clone();
+        let e = match c.apply_to_prefs(&mut p) {
+            Ok(_) => panic!("a lone v4 default route must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert_eq!(
+            e,
+            "config: 0.0.0.0/0 advertised without its IPv6 counterpart, please also advertise ::/0"
+        );
+        // All-or-nothing: the good route in the same list was not written either.
+        assert_eq!(p.advertise_routes, before.advertise_routes);
+        assert_eq!(p.want_running, before.want_running);
+
+        // The mirror case names the other counterpart.
+        let c6 = cfg(r#"{"version":"alpha0","AdvertiseRoutes":["::/0"]}"#);
+        let mut p6 = Prefs::default();
+        let e6 = match c6.apply_to_prefs(&mut p6) {
+            Ok(_) => panic!("a lone v6 default route must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert_eq!(
+            e6,
+            "config: ::/0 advertised without its IPv4 counterpart, please also advertise 0.0.0.0/0"
+        );
+    }
+
+    #[test]
+    fn advertise_exit_node_satisfies_the_default_route_pairing() {
+        // The rule is about the SET the config composes, not about the literal list: `AdvertiseExitNode`
+        // IS the two default routes, so the same `0.0.0.0/0` that is refused above is fine beside it —
+        // both families are advertised, which is exactly what was asked for.
+        let c =
+            cfg(r#"{"version":"alpha0","AdvertiseRoutes":["0.0.0.0/0"],"AdvertiseExitNode":true}"#);
+        let mut p = Prefs::default();
+        c.apply_to_prefs(&mut p).unwrap();
+        assert_eq!(p.advertise_routes, vec!["0.0.0.0/0"]);
+        assert!(p.advertise_exit_node);
+
+        // And the reverse composition: a config that turns the exit-node advertisement OFF while the
+        // PERSISTED routes still carry a lone default is the same leak, so it is refused — the set is
+        // what is judged, and a config that names no routes is judged on the prefs it leaves in place.
+        let off = cfg(r#"{"version":"alpha0","AdvertiseExitNode":false}"#);
+        let mut p2 = Prefs {
+            advertise_routes: vec!["0.0.0.0/0".to_string()],
+            advertise_exit_node: true,
+            ..Prefs::default()
+        };
+        let e = match off.apply_to_prefs(&mut p2) {
+            Ok(_) => panic!("dropping the exit-node advertisement must not leave a lone default"),
+            Err(e) => e.to_string(),
+        };
+        assert!(e.contains("please also advertise ::/0"), "{e}");
+        assert!(
+            p2.advertise_exit_node,
+            "refused before any pref was written"
+        );
+    }
+
+    #[test]
+    fn apply_refuses_a_malformed_4via6_route() {
+        // A 4via6 prefix too short to carry the site id it is supposed to encode (Go
+        // `netutil.ValidateViaPrefix`, message verbatim). Without this it is advertised as an ordinary
+        // IPv6 route that decodes to no IPv4 CIDR at all.
+        let c = cfg(r#"{"version":"alpha0","AdvertiseRoutes":["fd7a:115c:a1e0:b1a::/64"]}"#);
+        let mut p = Prefs::default();
+        let e = match c.apply_to_prefs(&mut p) {
+            Ok(_) => panic!("a 4via6 prefix shorter than /96 must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert_eq!(
+            e,
+            "config: fd7a:115c:a1e0:b1a::/64 4-in-6 prefix must be at least a /96"
+        );
+        assert!(p.advertise_routes.is_empty());
+
+        // A well-formed one — site 7, 192.0.2.0/24 — is accepted.
+        let ok = cfg(
+            r#"{"version":"alpha0","AdvertiseRoutes":["fd7a:115c:a1e0:b1a:0:7:c000:200/120"]}"#,
+        );
+        let mut p2 = Prefs::default();
+        ok.apply_to_prefs(&mut p2).unwrap();
+        assert_eq!(
+            p2.advertise_routes,
+            vec!["fd7a:115c:a1e0:b1a:0:7:c000:200/120"]
         );
     }
 

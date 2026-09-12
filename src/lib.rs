@@ -32,6 +32,10 @@
 //!   off-switch an image build or a configuration-managed host uses to hold it down.
 //! - [`portmap`] — the NAT-PMP / PCP / UPnP-IGD port-mapping client: ask the LAN router to open a
 //!   hole so peers can reach this node directly instead of through a relay.
+//! - [`routes`] — the advertised-route SET (Go `netutil.CalcAdvertiseRoutes`): the one place
+//!   `--advertise-routes` and `--advertise-exit-node` become the prefixes this node offers to
+//!   route, so the rules that are properties of the set — a default route needs its other-family
+//!   counterpart, a 4via6 prefix must decode — are asked once, for every path that writes prefs.
 //!
 //! Two binaries consume it: `tailnetd` (the daemon) and `tnet` (the thin CLI client).
 
@@ -50,6 +54,7 @@ pub mod ipn;
 pub mod localapi;
 pub mod portmap;
 pub mod prefs;
+pub mod routes;
 pub mod server;
 pub mod socks5;
 pub mod tunflag;
