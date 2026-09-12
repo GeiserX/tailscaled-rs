@@ -1267,6 +1267,7 @@ async fn dispatch(
                     ssh,
                     auto_update,
                 )
+                .await
             };
             match result {
                 Ok(()) => Response::Ok {
