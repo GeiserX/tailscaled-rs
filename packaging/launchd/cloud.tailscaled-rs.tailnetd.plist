@@ -12,6 +12,23 @@
   explicitly: loading this daemon IS the operator choosing to run experimental software. The
   daemon deliberately does not set that var for itself. State lives under /usr/local/var/tailnetd
   (the macOS-conventional location for local daemon state); the daemon enforces 0700 on it itself.
+
+  OPERATOR ENVIRONMENT: do NOT add your own keys to the dict below. This file is embedded in the
+  tailnetd binary and rewritten verbatim by `tnet install`, so anything you add here is lost on the
+  next install. Put operator environment in
+
+      /etc/tailnetd/tailnetd-env.txt
+
+  instead — `KEY=value` lines, `#` comments, blank lines ignored, a double-quoted value unquoted as
+  a Go string literal. tailnetd reads it into its own environment before it parses a single flag
+  (the analogue of Linux's EnvironmentFile=-/etc/default/tailnetd, and of Go tailscaled's
+  tailscaled-env.txt). The file is optional; a malformed one is refused at startup with the line
+  number. It is read as root, so own it root:wheel and chmod 0600 it. Example:
+
+      # Hold the SSH server and the port mapper down on this host.
+      TS_DISABLE_SSH_SERVER=1
+      TS_DISABLE_PORTMAPPER=1
+      TAILNETD_LOG=debug
 -->
 <plist version="1.0">
 <dict>
@@ -23,6 +40,8 @@
         <string>/usr/local/bin/tailnetd</string>
     </array>
 
+    <!-- Install-owned: `tnet install` rewrites this file, so operator additions here do not
+         survive. Use /etc/tailnetd/tailnetd-env.txt (see the header) for those. -->
     <key>EnvironmentVariables</key>
     <dict>
         <!-- Required engine opt-in; without it tailnetd refuses to start. -->
