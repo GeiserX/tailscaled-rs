@@ -35,6 +35,28 @@
 //! That is the entire point of policy: a `tnet set --hostname laptop` against a policy file pinning
 //! `"Hostname"` persists the pinned name, not the typed one.
 //!
+//! ### Precedence inversion: `AuthKey` ranks LAST, not first
+//!
+//! One key does not follow that rule, and the next reader should not file it as a bug.
+//! [`auth_key`] — the registration credential, the only policy setting whose consumer is not a pref
+//! — is consulted **only after** an explicit `tnet up --auth-key` / `TS_AUTH_KEY` and the
+//! `--config` file's `AuthKey` have both come up empty. That is Go's order (`Start` reads
+//! `pkey.AuthKey` last, behind `opts.AuthKey` and `b.conf`), and it is the right one for a
+//! credential: an operator who typed a key meant *that* key, and silently registering with a
+//! different one would be a worse surprise than ignoring the policy. Everything else here stays as
+//! above — the administrator wins.
+//!
+//! ### Reporting a credential
+//!
+//! `AuthKey` is a secret, and the snapshot is a reporting surface: `tnet syspolicy list` prints
+//! every configured key with its value and origin, and the `policy` notify bit pushes the same rows
+//! to every watcher. So the value is **kept out of the snapshot entirely**: the key's row carries
+//! the literal `<redacted>` in the Value column ([`REDACTED`]), while the usable copy is held beside
+//! the rows in [`PolicySource::auth_key`] and read only on the registration path. An administrator
+//! can still confirm the key arrived and which source supplied it; nothing that leaves the daemon
+//! carries the credential. This is the one place the Value column is not Go's `%v` of the decoded
+//! value — Go prints the key.
+//!
 //! What it applies, and the rulings this fork had to make that Go did not:
 //!
 //! - `LoginURL` → `control_url`, `Hostname` → `hostname`. `Hostname` is a **tri-state**: absent
@@ -80,6 +102,12 @@
 //! to decide whether a caller that may already write is *also* permitted to stop the daemon
 //! ([`crate::server::shutdown_verdict`]). None of the three is reported as unenforced, because all
 //! three are read.
+//!
+//! And one key acts on the *registration* rather than on a pref: `AuthKey` is the credential an
+//! administrator enrols a fleet with — the only way onto the tailnet that does not mean touching
+//! each host — and it is resolved by [`auth_key`] on the bring-up path (Go's `Start`). Its two
+//! peculiarities have their own sections below: it ranks LAST among this daemon's auth-key sources,
+//! and its value is redacted out of the snapshot.
 //!
 //! A further key acts on an *answer* rather than on a pref: `AllowedSuggestedExitNodes` is the
 //! administrator's allow-list for exit-node suggestions, resolved as a set by
@@ -155,6 +183,13 @@ pub const PKEY_ALWAYS_ON_OVERRIDE_WITH_REASON: &str = "AlwaysOn.OverrideWithReas
 /// timer from, so the spelling has exactly one definition, shared with [`DEFINITIONS`].
 pub const PKEY_RECONNECT_AFTER: &str = "ReconnectAfter";
 
+/// Go `pkey.AuthKey` — the policy key carrying the pre-authorized registration credential an
+/// administrator enrols a fleet with. Read by name by [`auth_key`], which is the only consumer, so
+/// — like [`PKEY_ALLOWED_SUGGESTED_EXIT_NODES`] — it stays private to this module; what leaves is
+/// the key itself, as a [`secrecy::SecretString`], never the spelling and never a report row.
+/// Shared with [`DEFINITIONS`] so there is exactly one definition of it.
+const PKEY_AUTH_KEY: &str = "AuthKey";
+
 /// Go `pkey.AllowedSuggestedExitNodes` — the policy key naming the exit nodes a managed node may be
 /// steered onto. Read by name by [`allowed_suggested_exit_nodes`], which is the only consumer, so —
 /// unlike the four keys above — it stays private to this module; what leaves is the decoded set, not
@@ -169,6 +204,27 @@ const DEVICE_SCOPE: &str = "Device";
 /// `cmd/tailscaled` passes to `syspolicy.LoadJSONPolicyFile`. It is user-visible: the Origin column
 /// of `tnet syspolicy list` shows `JSONFile (Device)` for every setting the file supplies.
 pub const JSON_FILE_SOURCE_NAME: &str = "JSONFile";
+
+/// What the Value column shows for a policy setting whose value is a **credential** — today only
+/// `AuthKey`. It is the whole of what leaves the daemon for that key: the row still says the key is
+/// configured and which source configured it, so an administrator can confirm the policy arrived,
+/// but the key itself never reaches the LocalAPI, `tnet syspolicy list`, a `Watch` policy frame or a
+/// log line. See the Reporting a credential section of the module docs.
+const REDACTED: &str = "<redacted>";
+
+/// A policy value that must not be reported, logged or `Debug`-printed — the `AuthKey`.
+///
+/// A newtype rather than a bare `String` so the enclosing [`PolicySource`] can keep its derived
+/// `Debug` (used by tests and by any future diagnostic) without that `Debug` being the leak this
+/// whole change exists to prevent. It renders as [`REDACTED`], exactly like the report row.
+#[derive(Clone, PartialEq, Eq)]
+struct Secret(String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(REDACTED)
+    }
+}
 
 /// A registered policy store's contribution to the effective policy: the settings it resolved,
 /// already rendered into the wire shape the report carries.
@@ -196,6 +252,13 @@ struct PolicySource {
     /// difference decides whether a node id the administrator never wrote is admitted, so the
     /// decoded form is kept rather than re-parsed — see [`configured_string_list`].
     string_lists: BTreeMap<&'static str, Vec<String>>,
+    /// The **raw** `AuthKey` this source configured, if any — held here rather than in `settings`
+    /// because the row for that key carries [`REDACTED`] instead of its value (see the module docs).
+    /// Read only by [`configured_auth_key`], on the registration path.
+    ///
+    /// Raw, not trimmed: trimming is the *consumer's* rule (Go `strings.TrimSpace` at the point of
+    /// use), and this is the store, which holds what the administrator wrote.
+    auth_key: Option<Secret>,
 }
 
 /// Every registered device-scope policy source, in registration order (Go's `rsop` store list).
@@ -464,7 +527,7 @@ const DEFINITIONS: &[Definition] = &[
     def(PKEY_ALWAYS_ON, ValueType::Boolean),
     def(PKEY_ALWAYS_ON_OVERRIDE_WITH_REASON, ValueType::Boolean),
     def("InstallUpdates", ValueType::PreferenceOption),
-    def("AuthKey", ValueType::String),
+    def(PKEY_AUTH_KEY, ValueType::String),
     def("CheckUpdates", ValueType::PreferenceOption),
     def("LoginURL", ValueType::String),
     def("DeviceSerialNumber", ValueType::String),
@@ -867,6 +930,11 @@ fn read_settings(store: &Map<String, Value>, source_name: &str) -> Vec<PolicySet
             continue;
         };
         let (value, error) = match read_value(value, def.key, def.ty) {
+            // The one key whose value is a credential. It is still read (so a mistyped value
+            // produces the same Error row as any other key) and then thrown away: the row reports
+            // that the administrator configured an auth key and where it came from, never the key.
+            // The usable copy lives in `PolicySource::auth_key`, which no report can reach.
+            Ok(_) if def.key == PKEY_AUTH_KEY => (Some(REDACTED.to_string()), None),
             Ok(rendered) => (Some(rendered), None),
             Err(text) => (None, Some(text)),
         };
@@ -887,7 +955,19 @@ fn read_source(store: &Map<String, Value>, source_name: &str) -> PolicySource {
     PolicySource {
         settings: read_settings(store, source_name),
         string_lists: read_string_lists(store),
+        auth_key: read_auth_key(store),
     }
+}
+
+/// Decode the configured `AuthKey` — the typed half of [`read_source`] for the one key whose
+/// rendered row is [`REDACTED`], so the value has to be carried out of band or lost.
+///
+/// A non-string value is **skipped** (no key configured) for the same reason
+/// [`read_string_lists`] skips an undecodable list: the row already reports the type mismatch, and
+/// inventing a credential out of a malformed value is the one thing this must never do.
+/// [`validate`] refuses such a document outright before this runs.
+fn read_auth_key(store: &Map<String, Value>) -> Option<Secret> {
+    Some(Secret(store.get(PKEY_AUTH_KEY)?.as_str()?.to_string()))
 }
 
 /// Decode every configured `StringList` key — the typed half of [`read_source`].
@@ -964,6 +1044,131 @@ fn configured_string_list<'a>(sources: &'a [PolicySource], key: &str) -> Option<
         .rev()
         .find_map(|source| source.string_lists.get(key))
         .map(Vec::as_slice)
+}
+
+/// The node facts Go's `Start` tests before it will register with the administrator's `AuthKey`,
+/// gathered by the caller because they are backend state rather than policy (the same split
+/// [`apply_to_prefs`]'s `override_always_on` parameter uses).
+///
+/// Built by [`Backend::auth_key_gate`](super::Backend::auth_key_gate), which is where each field's
+/// fork-side derivation is justified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AuthKeyGate {
+    /// Go `b.state == ipn.Running`: the node is already up, so nothing is waiting to register.
+    pub running: bool,
+    /// Go `b.state == ipn.NeedsLogin`: **the control plane says this node must log in again**.
+    /// Go's escape hatch from the guard below — an enrolled node whose session has lapsed may still
+    /// take the administrator's key.
+    pub needs_login: bool,
+    /// Go `len(b.pm.Profiles()) > 0`: this node has completed a registration before, i.e. it is
+    /// already enrolled and a policy file appearing next to it must not silently re-register it.
+    pub enrolled: bool,
+    /// Go `b.conf != nil`: a `--config` file is in use, and that file is the declarative source of
+    /// truth for this node's credential — policy does not reach past it.
+    pub config_in_use: bool,
+}
+
+/// What [`auth_key`] decided, so the caller can act and log it honestly.
+#[derive(Debug)]
+pub(super) enum AuthKeyDecision {
+    /// No administrator key to offer: the policy does not configure one (or configures only
+    /// whitespace). Go's silent, overwhelmingly common case — the caller says nothing.
+    NotConfigured,
+    /// Register with this key — Go's `opts.AuthKey = strings.TrimSpace(sysak)`.
+    Use(secrecy::SecretString),
+    /// A key IS configured and this node will not use it, with the reason in words an administrator
+    /// can act on. Logged by the caller, because an MDM key that quietly does nothing is the exact
+    /// failure this port exists to remove.
+    Skipped(&'static str),
+}
+
+/// The administrator's registration credential, for a bring-up that has no other key — Go's third
+/// and last `AuthKey` source in `Start` (`ipn/ipnlocal/local.go`):
+///
+/// ```text
+/// if opts.AuthKey == "" && b.state != ipn.Running && b.conf == nil {
+///     sysak, _ := b.polc.GetString(pkey.AuthKey, "")
+///     if sysak != "" {
+///         if len(b.pm.Profiles()) == 0 || b.state == ipn.NeedsLogin {
+///             b.logf("Start: setting opts.AuthKey from syspolicy")
+///             opts.AuthKey = strings.TrimSpace(sysak)
+///         } else {
+///             b.logf("Start: not setting opts.AuthKey from syspolicy; login profiles exist, state=%v", b.state)
+///         }
+///     }
+/// }
+/// ```
+///
+/// The caller supplies the guards' inputs ([`AuthKeyGate`]) and has already established the first
+/// one — a key it was handed explicitly wins, so this is only consulted when there is none. **That
+/// makes policy the LOWEST-priority auth-key source, which is the opposite of how policy ranks for
+/// prefs** (see the Precedence inversion section of the module docs); it is Go's order and it is
+/// kept.
+///
+/// Side-effect-free, like every other read of the registered stores — see the invariant on
+/// [`registered_store_settings`].
+pub(super) fn auth_key(gate: AuthKeyGate) -> AuthKeyDecision {
+    auth_key_in(
+        &REGISTERED
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        gate,
+    )
+}
+
+/// The decision behind [`auth_key`], over a source list so it is testable without the
+/// process-global registry (the same split [`allowed_suggestions_in`] uses).
+///
+/// One deliberate divergence from Go, in the whitespace case: Go tests `sysak != ""` *before*
+/// trimming, so a value of `"\n"` passes its guard, logs "setting opts.AuthKey from syspolicy" and
+/// then assigns an EMPTY key — a node that reports it took the policy key and registers without
+/// one. Here the trim comes first and a blank value reads as not configured, matching what this
+/// daemon already does with an empty `--config` `AuthKey` and an empty `TS_AUTH_KEY`. The trim
+/// itself is Go's and is the point: an MDM payload that round-trips through a plist or a registry
+/// string arrives with a trailing newline more often than not.
+fn auth_key_in(sources: &[PolicySource], gate: AuthKeyGate) -> AuthKeyDecision {
+    let Some(configured) = configured_auth_key(sources) else {
+        return AuthKeyDecision::NotConfigured;
+    };
+    let key = configured.0.trim();
+    if key.is_empty() {
+        return AuthKeyDecision::NotConfigured;
+    }
+    // Go's `b.state != ipn.Running`.
+    if gate.running {
+        return AuthKeyDecision::Skipped(
+            "the node is already running, so it has nothing to register",
+        );
+    }
+    // Go's `b.conf == nil`. Go is silent here; this build says so, because a `--config` file and a
+    // policy file that both carry a key is precisely the arrangement an administrator would expect
+    // to work and cannot otherwise tell has not.
+    if gate.config_in_use {
+        return AuthKeyDecision::Skipped(
+            "a --config file is in use and is the declarative source for this node's credential; \
+             put the key in the config file (or its AuthKey file:<path>) instead",
+        );
+    }
+    // Go's `len(b.pm.Profiles()) == 0 || b.state == ipn.NeedsLogin`, inverted into the refusal so
+    // the reason is what gets logged. Dropping a policy file on an already-enrolled host must never
+    // silently re-register it — the escape hatch is the control plane itself asking for a login.
+    if gate.enrolled && !gate.needs_login {
+        return AuthKeyDecision::Skipped(
+            "the node is already logged in and the control plane is not asking it to log in again, \
+             so an auth key would re-register a node that is already enrolled",
+        );
+    }
+    AuthKeyDecision::Use(secrecy::SecretString::from(key.to_string()))
+}
+
+/// The raw `AuthKey` the newest registered source configures, or `None` when none does — the
+/// [`configured_string_list`] treatment for the one key whose value never reaches the report (hence
+/// the same reverse scan: last registration wins).
+fn configured_auth_key(sources: &[PolicySource]) -> Option<&Secret> {
+    sources
+        .iter()
+        .rev()
+        .find_map(|source| source.auth_key.as_ref())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1702,6 +1907,7 @@ mod tests {
             // This case is about the rendered rows the report merges; the decoded-list layering has
             // its own test (`the_last_registered_source_wins_the_allow_list`).
             string_lists: BTreeMap::new(),
+            auth_key: None,
         };
         let later = PolicySource {
             settings: vec![PolicySetting {
@@ -1711,6 +1917,7 @@ mod tests {
                 error: None,
             }],
             string_lists: BTreeMap::new(),
+            auth_key: None,
         };
 
         let merged = merge(&[earlier, later]);
@@ -2374,6 +2581,212 @@ mod tests {
         assert_eq!(
             allowed_suggestions_in(&[first, silent]),
             Some(BTreeSet::from(["nodeA".to_string()]))
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The administrator's `AuthKey` (Go `Start`'s third auth-key source).
+    // -----------------------------------------------------------------------------------------
+
+    /// The gate a never-enrolled node with no `--config` presents: the fleet-enrolment case, and the
+    /// baseline each guard test below flips exactly one field of.
+    fn unenrolled() -> AuthKeyGate {
+        AuthKeyGate {
+            running: false,
+            needs_login: false,
+            enrolled: false,
+            config_in_use: false,
+        }
+    }
+
+    /// The key [`auth_key_in`] decided to register with, or `None` for any other decision — so a
+    /// test can assert on the credential itself rather than on the discriminant alone.
+    fn decided(decision: AuthKeyDecision) -> Option<String> {
+        use secrecy::ExposeSecret;
+        match decision {
+            AuthKeyDecision::Use(key) => Some(key.expose_secret().to_string()),
+            _ => None,
+        }
+    }
+
+    /// The reason [`auth_key_in`] refused, or `None` if it did not refuse.
+    fn skipped(decision: AuthKeyDecision) -> Option<&'static str> {
+        match decision {
+            AuthKeyDecision::Skipped(reason) => Some(reason),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn an_auth_key_row_says_the_key_is_configured_without_carrying_it() {
+        // The ruling in the module docs, end to end: the administrator sees the key arrived and
+        // which source supplied it, the credential itself reaches no reporting surface, and the
+        // registration path still gets a usable key.
+        let source = resolve_source(r#"{"AuthKey": "tskey-auth-kPoLiCy", "Hostname": "kiosk-3"}"#)
+            .expect("a policy file carrying an auth key should load");
+
+        let row = source
+            .settings
+            .iter()
+            .find(|s| s.key == "AuthKey")
+            .expect("a configured AuthKey is still a row");
+        assert_eq!(
+            row.value.as_deref(),
+            Some("<redacted>"),
+            "the Value column says the key is redacted, it does not print the key"
+        );
+        assert_eq!(
+            row.origin, "JSONFile (Device)",
+            "the origin is still reported"
+        );
+        assert_eq!(row.error, None, "a redacted value is not an error");
+
+        // Nothing that leaves the daemon carries the credential: not the rows the report/notify
+        // stream is built from, not `configured_string` (the report-side reader), and not even the
+        // source's derived `Debug`.
+        assert!(
+            !format!("{:?}", source.settings).contains("tskey-auth-kPoLiCy"),
+            "the resolved rows must not carry the credential: {:?}",
+            source.settings
+        );
+        assert_eq!(
+            configured_string(&source.settings, PKEY_AUTH_KEY),
+            Some("<redacted>"),
+            "the report-side string reader sees the placeholder, never the key"
+        );
+        assert!(
+            !format!("{source:?}").contains("tskey-auth-kPoLiCy"),
+            "PolicySource's Debug must redact the key it holds for the registration path"
+        );
+
+        // ...and the registration path still gets the real key.
+        assert_eq!(
+            decided(auth_key_in(&[source], unenrolled())),
+            Some("tskey-auth-kPoLiCy".to_string())
+        );
+    }
+
+    #[test]
+    fn the_policy_key_enrols_a_node_that_has_never_registered() {
+        // The whole point of the key: an administrator drops one policy file that pins the hostname
+        // AND carries the credential, and the node gets onto the tailnet with nobody touching it.
+        let source =
+            resolve_source(r#"{"Hostname": "kiosk-3", "AuthKey": "tskey-auth-fleet"}"#).unwrap();
+        assert_eq!(
+            decided(auth_key_in(&[source], unenrolled())),
+            Some("tskey-auth-fleet".to_string())
+        );
+    }
+
+    #[test]
+    fn a_key_that_round_tripped_through_a_plist_is_trimmed_before_use() {
+        // Go's `strings.TrimSpace`: an MDM payload arrives with a trailing newline more often than
+        // not, and an untrimmed key fails registration for a reason nobody can see.
+        let source = resolve_source("{\"AuthKey\": \"  tskey-auth-padded\\n\"}").unwrap();
+        assert_eq!(
+            decided(auth_key_in(&[source], unenrolled())),
+            Some("tskey-auth-padded".to_string())
+        );
+    }
+
+    #[test]
+    fn a_blank_or_absent_key_is_no_key_at_all() {
+        // No `AuthKey` in the file — the overwhelmingly common case — and a value that is only
+        // whitespace both read as "not configured", so nothing is logged and nothing registers with
+        // an empty credential. (Go tests `sysak != ""` BEFORE trimming, so a whitespace-only value
+        // there logs that it took the policy key and then assigns an empty one; this daemon treats a
+        // blank key as absent, exactly as it already does for `--config` and `TS_AUTH_KEY`.)
+        let absent = resolve_source(r#"{"Hostname": "kiosk-3"}"#).unwrap();
+        assert!(matches!(
+            auth_key_in(&[absent], unenrolled()),
+            AuthKeyDecision::NotConfigured
+        ));
+        let blank = resolve_source("{\"AuthKey\": \" \\n \"}").unwrap();
+        assert!(matches!(
+            auth_key_in(&[blank], unenrolled()),
+            AuthKeyDecision::NotConfigured
+        ));
+        // With no registered source at all there is likewise nothing to take.
+        assert!(matches!(
+            auth_key_in(&[], unenrolled()),
+            AuthKeyDecision::NotConfigured
+        ));
+    }
+
+    #[test]
+    fn a_running_node_is_not_re_registered_from_policy() {
+        // Go's `b.state != ipn.Running` guard: the node is already up, so there is nothing waiting
+        // to register and an auth key would only churn it.
+        let source = resolve_source(r#"{"AuthKey": "tskey-auth-fleet"}"#).unwrap();
+        let gate = AuthKeyGate {
+            running: true,
+            ..unenrolled()
+        };
+        assert!(
+            skipped(auth_key_in(&[source], gate))
+                .is_some_and(|reason| reason.contains("already running")),
+            "a Running node must refuse the policy key, with a reason an admin can read"
+        );
+    }
+
+    #[test]
+    fn a_config_file_outranks_the_policy_key() {
+        // Go's `b.conf == nil` guard: with a `--config` file in use, that file is the declarative
+        // source for this node's credential and policy does not reach past it.
+        let source = resolve_source(r#"{"AuthKey": "tskey-auth-fleet"}"#).unwrap();
+        let gate = AuthKeyGate {
+            config_in_use: true,
+            ..unenrolled()
+        };
+        assert!(
+            skipped(auth_key_in(&[source], gate)).is_some_and(|reason| reason.contains("--config")),
+            "a config-driven node must refuse the policy key and say where to put it instead"
+        );
+    }
+
+    #[test]
+    fn an_already_enrolled_node_is_never_silently_re_registered() {
+        // Go's `len(b.pm.Profiles()) == 0 || b.state == ipn.NeedsLogin`. Dropping a policy file next
+        // to an enrolled node must not re-register it — but a node the control plane IS asking to
+        // log in again may still take the administrator's key, which is Go's escape hatch.
+        let source = resolve_source(r#"{"AuthKey": "tskey-auth-fleet"}"#).unwrap();
+        let enrolled = AuthKeyGate {
+            enrolled: true,
+            ..unenrolled()
+        };
+        assert!(
+            skipped(auth_key_in(std::slice::from_ref(&source), enrolled))
+                .is_some_and(|reason| reason.contains("already logged in")),
+            "an enrolled node must refuse the policy key"
+        );
+
+        let lapsed = AuthKeyGate {
+            enrolled: true,
+            needs_login: true,
+            ..unenrolled()
+        };
+        assert_eq!(
+            decided(auth_key_in(&[source], lapsed)),
+            Some("tskey-auth-fleet".to_string()),
+            "a node control is asking to log in again may take the administrator's key"
+        );
+    }
+
+    #[test]
+    fn the_last_registered_source_wins_the_auth_key() {
+        // The same layering the report and the allow-list get (`merge`, last writer wins per key),
+        // applied to the value that never appears in the merged rows.
+        let first = resolve_source(r#"{"AuthKey": "tskey-auth-first"}"#).unwrap();
+        let second = resolve_source(r#"{"AuthKey": "tskey-auth-second"}"#).unwrap();
+        let silent = resolve_source(r#"{"Hostname": "kiosk-3"}"#).unwrap();
+        assert_eq!(
+            decided(auth_key_in(&[first.clone(), second], unenrolled())),
+            Some("tskey-auth-second".to_string())
+        );
+        assert_eq!(
+            decided(auth_key_in(&[first, silent], unenrolled())),
+            Some("tskey-auth-first".to_string()),
+            "a later source that configures no key leaves the earlier one standing"
         );
     }
 }

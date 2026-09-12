@@ -13,7 +13,9 @@
 //! 1. the flag exists on `tailnetd`'s own command line, with Go's default path in `--help`;
 //! 2. a loaded file reaches the LocalAPI reply `tnet syspolicy list` renders — i.e. registration and
 //!    reporting are actually connected — and is APPLIED to the prefs a `Backend::load` comes up
-//!    with, over a persisted `prefs.json` that says the opposite;
+//!    with, over a persisted `prefs.json` that says the opposite; with the one exception the report
+//!    makes for a credential: a configured `AuthKey` is reported as `<redacted>` and its value never
+//!    crosses the LocalAPI;
 //! 3. a *broken* file is logged and the daemon still comes up and serves.
 //!
 //! Case 2 registers into a process-global registry (Go's `rsop` store list is global too), so it is
@@ -81,6 +83,7 @@ fn a_loaded_policy_file_reaches_the_localapi_report() {
         br#"{
             "Hostname": "documented-node",
             "AlwaysOn.Enabled": true,
+            "AuthKey": "tskey-auth-mdm-enrolment",
             "ExitNodeIP": "192.0.2.10",
             "KeyExpirationNotice": "48h",
             "NetworkDevices": "hide"
@@ -92,8 +95,8 @@ fn a_loaded_policy_file_reaches_the_localapi_report() {
     let _ = std::fs::remove_file(&path);
     assert_eq!(
         outcome,
-        Ok(syspolicy::LoadOutcome::Registered { settings: 5 }),
-        "all five keys should register"
+        Ok(syspolicy::LoadOutcome::Registered { settings: 6 }),
+        "all six keys should register"
     );
 
     let Response::Policy(report) = Backend::syspolicy_list() else {
@@ -111,6 +114,10 @@ fn a_loaded_policy_file_reaches_the_localapi_report() {
         rows,
         vec![
             ("AlwaysOn.Enabled", "JSONFile (Device)", Some("true")),
+            // The credential-bearing key: reported as configured, with its value redacted by the
+            // daemon (see `ipn::syspolicy`). The administrator can confirm the key arrived; the key
+            // itself does not cross the LocalAPI.
+            ("AuthKey", "JSONFile (Device)", Some("<redacted>")),
             ("ExitNodeIP", "JSONFile (Device)", Some("192.0.2.10")),
             ("Hostname", "JSONFile (Device)", Some("documented-node")),
             ("KeyExpirationNotice", "JSONFile (Device)", Some("48h0m0s")),
@@ -120,6 +127,14 @@ fn a_loaded_policy_file_reaches_the_localapi_report() {
     assert!(
         report.settings.iter().all(|s| s.error.is_none()),
         "a valid file resolves every row cleanly"
+    );
+    // Nothing in the reply carries the credential — not a value, not an origin, not an error. This
+    // is the whole reply as it goes on the wire to `tnet syspolicy list` and to every policy
+    // watcher, so serializing it is the honest check.
+    let wire = serde_json::to_string(&report).expect("the report serializes");
+    assert!(
+        !wire.contains("tskey-auth-mdm-enrolment"),
+        "the auth key must not reach the LocalAPI reply: {wire}"
     );
 
     // `reload` forces a re-read and must report the same thing: Go's JSON store captures the file at
