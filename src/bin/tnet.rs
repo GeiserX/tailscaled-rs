@@ -3000,9 +3000,16 @@ async fn main() -> Result<()> {
         // `debug rebind`.
         Command::ReloadConfig => run_reload_config(&socket).await,
         // `shutdown` (Go `LocalClient.ShutdownTailscaled` → the LocalAPI `shutdown` route): stop the
-        // daemon. A dedicated renderer (not `dispatch_simple`) because the connection is EXPECTED to
-        // die under a successful call — see `run_shutdown`.
-        Command::Shutdown => run_shutdown(&socket).await,
+        // daemon. The ordinary one-line round trip, because the daemon answers BEFORE it stops
+        // accepting (it writes and flushes the acknowledgement, then asks its own accept loop to
+        // unwind — the port of Go writing and flushing its 200 before publishing the
+        // `localapi.Shutdown` event): the reply always arrives, and the connection dying immediately
+        // afterwards is the expected outcome of a successful call, not an error to report. Both
+        // refusals — no write access, or no `AllowTailscaledRestart` in the policy — come back as the
+        // usual `Response::Error`, so `dispatch_simple`'s `error: …` + exit 1 lets a script tell a
+        // stopped daemon from a refused request by exit code alone, and read WHICH refusal it hit
+        // from the message.
+        Command::Shutdown => dispatch_simple(&socket, Request::Shutdown).await,
         // `login` (Go `tailscale login`): interactive (or authkey) (re)authentication that changes no
         // prefs — `up`'s auth half on its own. Reuses the interactive-login machinery.
         Command::Login {
@@ -4530,32 +4537,6 @@ async fn run_reload_config(socket: &std::path::Path) -> Result<()> {
         Err(e) => {
             Err(e).with_context(|| format!("requesting reload-config at {}", socket.display()))
         }
-    }
-}
-
-/// `shutdown` (Go `LocalClient.ShutdownTailscaled`): ask the daemon to stop itself.
-///
-/// The daemon answers BEFORE it stops accepting (it writes the acknowledgement and flushes, then
-/// asks its own accept loop to unwind — the port of Go writing and flushing its 200 before publishing
-/// the `localapi.Shutdown` event), so the ordinary one-line round trip is the right shape here: the
-/// reply always arrives, and the connection dying immediately afterwards is the *expected* outcome of
-/// a successful call, not an error to report.
-///
-/// Both refusals — no write access, or no `AllowTailscaledRestart` in the policy — come back as the
-/// usual `Response::Error` and take the `error: …` + exit 1 path, so a script can tell a stopped
-/// daemon from a refused request by exit code alone, and read WHICH refusal it hit from the message.
-async fn run_shutdown(socket: &std::path::Path) -> Result<()> {
-    match round_trip(socket, &Request::Shutdown).await {
-        Ok(Response::Ok { message }) => {
-            println!("{message}");
-            Ok(())
-        }
-        Ok(Response::Error { message }) => {
-            eprintln!("error: {message}");
-            std::process::exit(1);
-        }
-        Ok(other) => anyhow::bail!("unexpected response to shutdown: {other:?}"),
-        Err(e) => Err(e).with_context(|| format!("requesting shutdown at {}", socket.display())),
     }
 }
 
