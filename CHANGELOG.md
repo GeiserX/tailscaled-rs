@@ -25,6 +25,14 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.56.2](https://github.com/GeiserX/tailscaled-rs/compare/v0.56.1...v0.56.2) (2026-09-12)
+
+
+### Bug Fixes
+
+* **prefs:** refuse an exit node that could never route traffic ([#435](https://github.com/GeiserX/tailscaled-rs/issues/435)) ([c998fd3](https://github.com/GeiserX/tailscaled-rs/commit/c998fd335fbec583e967fe6ea92851f3d5996ad9))
+* **serve:** refuse Funnel while shields-up blocks all inbound ([#433](https://github.com/GeiserX/tailscaled-rs/issues/433)) ([635d210](https://github.com/GeiserX/tailscaled-rs/commit/635d2104cbefb95bb4c8adf16d74ec444e380f44))
+
 ## [0.56.1](https://github.com/GeiserX/tailscaled-rs/compare/v0.56.0...v0.56.1) (2026-09-12)
 
 
