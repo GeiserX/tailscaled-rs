@@ -623,6 +623,25 @@ enum Command {
     /// running node left untouched. A reloaded config's auth key is ignored (a reload is not a
     /// re-login).
     ReloadConfig,
+    /// Stop the daemon (Go `LocalClient.ShutdownTailscaled`, `POST /localapi/v0/shutdown`).
+    ///
+    /// OPT-IN, and refused by default. Stopping `tailnetd` otherwise means signalling the process or
+    /// asking the service manager, both of which need privileges beyond LocalAPI access; this asks
+    /// the daemon to stop itself, and it is the administrator's system policy — not the caller's
+    /// privileges alone — that decides whether it may. Two things must both be true: you are root or
+    /// the user that owns the daemon, AND the daemon's policy file sets `AllowTailscaledRestart` to
+    /// true (`tnet syspolicy list` shows whether it does). Without the policy the request is refused
+    /// and nothing happens.
+    ///
+    /// The stop is graceful and identical to a SIGTERM: in-flight requests drain, the node is taken
+    /// down cleanly and the state file and socket are closed the way they always are.
+    ///
+    /// WHETHER IT COMES BACK is the service manager's decision, not this command's — which is why the
+    /// policy key is named for a restart. The units this fork installs (`tnet install`) restart the
+    /// daemon on failure only, and a `shutdown` is a clean exit, so on a stock install this STOPS the
+    /// daemon until something starts it again. Set `Restart=always` (systemd) or `KeepAlive`
+    /// unconditionally (launchd) if you want the restart behaviour the key's name suggests.
+    Shutdown,
     /// Authenticate this node with the control plane (Go `tailscale login`). With no `--authkey`, this
     /// is an **interactive login**: the node contacts control, reaches `NeedsLogin`, and the auth URL
     /// is printed for you to open in a browser; the node finishes connecting once you authorize it.
@@ -2980,6 +2999,10 @@ async fn main() -> Result<()> {
         // success line and exits 1 on the daemon's error (no `--config` in use / malformed file), like
         // `debug rebind`.
         Command::ReloadConfig => run_reload_config(&socket).await,
+        // `shutdown` (Go `LocalClient.ShutdownTailscaled` → the LocalAPI `shutdown` route): stop the
+        // daemon. A dedicated renderer (not `dispatch_simple`) because the connection is EXPECTED to
+        // die under a successful call — see `run_shutdown`.
+        Command::Shutdown => run_shutdown(&socket).await,
         // `login` (Go `tailscale login`): interactive (or authkey) (re)authentication that changes no
         // prefs — `up`'s auth half on its own. Reuses the interactive-login machinery.
         Command::Login {
@@ -4507,6 +4530,32 @@ async fn run_reload_config(socket: &std::path::Path) -> Result<()> {
         Err(e) => {
             Err(e).with_context(|| format!("requesting reload-config at {}", socket.display()))
         }
+    }
+}
+
+/// `shutdown` (Go `LocalClient.ShutdownTailscaled`): ask the daemon to stop itself.
+///
+/// The daemon answers BEFORE it stops accepting (it writes the acknowledgement and flushes, then
+/// asks its own accept loop to unwind — the port of Go writing and flushing its 200 before publishing
+/// the `localapi.Shutdown` event), so the ordinary one-line round trip is the right shape here: the
+/// reply always arrives, and the connection dying immediately afterwards is the *expected* outcome of
+/// a successful call, not an error to report.
+///
+/// Both refusals — no write access, or no `AllowTailscaledRestart` in the policy — come back as the
+/// usual `Response::Error` and take the `error: …` + exit 1 path, so a script can tell a stopped
+/// daemon from a refused request by exit code alone, and read WHICH refusal it hit from the message.
+async fn run_shutdown(socket: &std::path::Path) -> Result<()> {
+    match round_trip(socket, &Request::Shutdown).await {
+        Ok(Response::Ok { message }) => {
+            println!("{message}");
+            Ok(())
+        }
+        Ok(Response::Error { message }) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        Ok(other) => anyhow::bail!("unexpected response to shutdown: {other:?}"),
+        Err(e) => Err(e).with_context(|| format!("requesting shutdown at {}", socket.display())),
     }
 }
 

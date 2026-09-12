@@ -234,6 +234,12 @@ pub(crate) fn requires_write(request: &crate::localapi::Request) -> bool {
         | Request::LockInit { .. }
         | Request::LockSign { .. }
         | Request::LockDisable { .. }
+        // `shutdown` STOPS THE DAEMON. Go's `serveShutdown` refuses a caller without write access
+        // with `shutdown access denied` before it looks at any policy, so it is a write here too —
+        // and it is the write-access rung of that refusal ladder, checked before the
+        // `AllowTailscaledRestart` policy rung so an unauthorized caller cannot read the policy state
+        // off which refusal it gets (see `crate::server::shutdown_verdict`).
+        | Request::Shutdown
         // `check-prefs` validates a prospective prefs change without applying it. Go gates
         // `serveCheckPrefs` on `PermitWrite` (it is the pre-flight for a write), so a socket-reachable
         // non-owner must not be able to probe it; gate like `set`. It mutates nothing.

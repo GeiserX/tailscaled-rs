@@ -828,6 +828,45 @@ pub enum Request {
     /// config's `AuthKey` is deliberately ignored (a reload is not a re-registration — see the
     /// daemon's `reload_config`).
     ReloadConfig,
+    /// Stop the daemon (Go's LocalAPI `shutdown` route → `serveShutdown`, `ipn/localapi/localapi.go`
+    /// @ `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`; the client half is
+    /// `LocalClient.ShutdownTailscaled`, `POST /localapi/v0/shutdown`). Rendered by `tnet shutdown`.
+    ///
+    /// The point of the verb is that stopping the daemon otherwise needs privileges *beyond* LocalAPI
+    /// write access — signalling the process, or asking the service manager — and neither of those
+    /// can be granted or withheld by a policy file. This one can: it is the power to stop the daemon,
+    /// handed out (or not) by the administrator who writes the policy, without handing out root.
+    ///
+    /// ## The refusal ladder, in this order
+    ///
+    /// Go refuses in four places and the ORDER is the contract, because a caller has to be able to
+    /// tell "you may not" from "nobody may":
+    ///
+    /// 1. **method** — Go answers `405 only POST allowed` on a non-`POST`. This transport has no
+    ///    methods (one JSON frame per request, no verb/route split), so there is no request this
+    ///    rung can reject and it is the one refusal with no counterpart here. Nothing is lost: the
+    ///    rung exists in Go to stop a `GET /localapi/v0/shutdown` from a browser/curl reflex, and a
+    ///    `{"cmd":"shutdown"}` frame cannot be sent by accident in that way.
+    /// 2. **write access** — a caller that may not write gets `shutdown access denied`
+    ///    ([`Response::Error`]), from the same [`crate::auth`] gate `up`/`down` use. This rung comes
+    ///    **before** the policy check on purpose: an unauthorised caller must not be able to read the
+    ///    policy state off the difference between the two messages.
+    /// 3. **policy** — a caller that MAY write is still refused, with `shutdown access denied by
+    ///    policy`, unless the system policy sets `AllowTailscaledRestart`
+    ///    ([`PKEY_ALLOW_TAILSCALED_RESTART`](crate::ipn::syspolicy::PKEY_ALLOW_TAILSCALED_RESTART))
+    ///    to true. The default is false, so the verb is opt-in: a daemon with no policy file refuses
+    ///    every `shutdown`, which is the pre-existing behaviour of this fork and stays the default.
+    /// 4. **the stop itself** — the daemon answers [`Response::Ok`] FIRST (so the caller learns it
+    ///    was accepted, exactly as Go writes and flushes its 200 before publishing the event), then
+    ///    asks its own accept loop to stop. What follows is the ordinary graceful shutdown: the
+    ///    listener is dropped, in-flight connections drain, the socket is unlinked and the backend is
+    ///    torn down — the same path a SIGTERM takes, so the state file and any live device close the
+    ///    way they always do. It is deliberately NOT a `process::exit`.
+    ///
+    /// Whether the daemon comes back up is the service manager's decision, not this verb's — which is
+    /// why Go names the key for a *restart* rather than a shutdown. See `tnet shutdown`'s help for
+    /// what the units this fork ships actually do.
+    Shutdown,
 }
 
 /// The daemon's reply to a [`Request`].
@@ -3104,6 +3143,21 @@ mod tests {
             Response::DnsStatus(r) => assert_eq!(r, DnsStatusReport::default()),
             other => panic!("expected DnsStatus, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn shutdown_request_wire_format() {
+        // `shutdown` is a bare verb: no method, no arguments, nothing for a client to get wrong
+        // except the discriminant. Pin it — the CLI and the daemon agree on this JSON alone, and a
+        // rename would turn `tnet shutdown` into `bad request` against an older daemon.
+        assert_eq!(
+            serde_json::to_string(&Request::Shutdown).unwrap(),
+            r#"{"cmd":"shutdown"}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<Request>(r#"{"cmd":"shutdown"}"#).unwrap(),
+            Request::Shutdown
+        ));
     }
 
     #[test]
