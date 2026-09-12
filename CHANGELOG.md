@@ -25,6 +25,18 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.57.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.56.2...v0.57.0) (2026-09-12)
+
+
+### Features
+
+* **envknob:** give macOS a place to set the envknobs tailnetd obeys ([#437](https://github.com/GeiserX/tailscaled-rs/issues/437)) ([e5856e2](https://github.com/GeiserX/tailscaled-rs/commit/e5856e2e647bb36d5120abb4502d67485b67cff0))
+
+
+### Bug Fixes
+
+* **prefs:** refuse a default route advertised in one family only ([#439](https://github.com/GeiserX/tailscaled-rs/issues/439)) ([b4e229e](https://github.com/GeiserX/tailscaled-rs/commit/b4e229e5cee0f324d99a97d5ee3fabaf5e2ceb7c))
+
 ## [0.56.2](https://github.com/GeiserX/tailscaled-rs/compare/v0.56.1...v0.56.2) (2026-09-12)
 
 
