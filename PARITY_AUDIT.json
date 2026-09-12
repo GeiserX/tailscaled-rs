@@ -16,17 +16,28 @@
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/376",
       "verdict": "gaps",
-      "notes": "The refusal itself is a correct port of switchProfile's matchProfile miss, and it happens before any teardown. But the resolver it makes terminal implements only two of Go's four matchProfile passes, so targets Go resolves are now hard failures; the refusal text also differs in case from Go's."
+      "notes": "The refusal itself is a correct port of switchProfile's matchProfile miss, and it happens before any teardown. But the resolver it makes terminal implements only two of Go's four matchProfile passes, so targets Go resolves are now hard failures; the refusal text also differs in case from Go's `No profile named %q`.",
+      "divergences": [
+        "matchProfile",
+        "No profile named %q"
+      ]
     },
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/381",
       "verdict": "gaps",
-      "notes": "Test-only. The central claim checks out exactly: newUpFlagSet registers --nickname inside `if cmd == \"login\"`, so Go's `up` has no such flag. The replacement loop comment overstates upstream in the other direction."
+      "notes": "Test-only. The central claim checks out exactly: newUpFlagSet registers --nickname inside `if cmd == \"login\"`, so Go's `up` has no such flag. The replacement loop comment overstates upstream in the other direction.",
+      "divergences": [
+        "loop comment"
+      ]
     },
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/383",
       "verdict": "gaps",
-      "notes": "Prefix of Go's sentence is now reproduced. The %s slot is filled with fork text rather than the OS, and the guard fires on every platform where upstream's fires only where HookNewBird is unset, so the ported refusal still does not match Go's output or Go's platform gate."
+      "notes": "Prefix of Go's sentence is now reproduced. The %s slot is filled with fork text rather than runtime.GOOS, and the guard fires on every platform where upstream's fires only where HookNewBird is unset, so the ported refusal still does not match Go's output or Go's platform gate.",
+      "divergences": [
+        "runtime.GOOS",
+        "HookNewBird"
+      ]
     },
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/385",
@@ -41,17 +52,27 @@
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/389",
       "verdict": "gaps",
-      "notes": "Removing the invented --listen-under--cgi refusal is right: runWeb returns from cgi.Serve before it reads webArgs.listen. The --origin half replaces one set of invented refusals with a smaller set that upstream still does not have."
+      "notes": "Removing the invented --listen-under--cgi refusal is right: runWeb returns from cgi.Serve before it reads webArgs.listen. The --origin half replaces one set of invented refusals with a smaller set that upstream still does not have, all of them in parse_web_origin.",
+      "divergences": [
+        "parse_web_origin"
+      ]
     },
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/391",
       "verdict": "gaps",
-      "notes": "The masking rule and the join-every-offender behaviour match ToPrefs. The block it landed in is gated on a non-empty list rather than Go's nil check, and the check is applied to routes taken from existing prefs when the config names none."
+      "notes": "The masking rule and the join-every-offender behaviour match ToPrefs. The block it landed in is gated on a non-empty list rather than Go's nil check, and calc_advertise_routes applies the check to routes taken from existing prefs when the config names none.",
+      "divergences": [
+        "nil check",
+        "calc_advertise_routes"
+      ]
     },
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/392",
       "verdict": "gaps",
-      "notes": "The address arm is a faithful port of peerMatchingIP, including the st.Self pass and parsed comparison. The name arm is left as an exact, case-sensitive match while the code's own doc claims it is equivalent to Go's resolution, which it is not."
+      "notes": "The address arm is a faithful port of peerMatchingIP, including the st.Self pass and parsed comparison. The name arm is left as an exact, case-sensitive match while the code's own doc claims it is equivalent to Go's tailscaleIPFromArg resolution, which it is not.",
+      "divergences": [
+        "tailscaleIPFromArg"
+      ]
     },
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/393",
@@ -61,13 +82,17 @@
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/394",
       "verdict": "gaps",
-      "notes": "The `if !match` tail is ported correctly, family messages and all. The check that precedes it in the same function is still absent, so the no-address case keeps diverging, and runIP's --assert arm is unported."
+      "notes": "The `if !match` tail is ported correctly, family messages and all. The `len(ips) == 0` check that precedes it in the same function is still absent, so the no-address case keeps diverging, and runIP's --assert arm is unported.",
+      "divergences": [
+        "len(ips) == 0",
+        "--assert"
+      ]
     }
   ],
   "gate": {
     "ran": true,
-    "pass": false,
-    "detail": "Run on main at 7346530 (this branch changes only PARITY_AUDIT.json), CARGO_BUILD_JOBS=4, RUST_TEST_THREADS=4, TS_RS_EXPERIMENT=this_is_unstable_software, toolchain 1.95.0 named explicitly because the box's default toolchain is a nightly with no clippy component. cargo fmt --all --check: exit 0. cargo clippy --all-targets -- -D warnings: exit 0. cargo build --release --bins: exit 0. cargo test --all-targets: FAILS, and the two causes are separate. (1) This branch's own: tests/parity_audit_ledger.rs holds this file to a contract, and its the_kubeconfig_row_writes_up_both_divergences_its_notes_name test hard-codes PR #296 from the previous edition, asserting it is still an audited row. This edition audits ten different PRs, so it fails; it cannot be satisfied without putting an unaudited verdict in the report, and the fix is a change to that test file, which this one-file branch does not make. The other five tests in that file pass, and satisfying them added the summary block and the @<commit> anchors. (2) Environmental, unrelated to this branch: tests::cleanup_refuses_live_socket in the tailnetd bin target panics at src/bin/tailnetd.rs:2311 with InvalidInput \"path must be shorter than SUN_LEN\" because it builds its UnixListener path under std::env::temp_dir(), 62 characters here, for a 107-byte path against darwin's 104-byte limit; with a short TMPDIR all four cleanup_* tests pass. Re-run with a short TMPDIR and --no-fail-fast, the whole suite is 1126 passed across 35 targets with exactly one failure, the PR #296 test above."
+    "pass": true,
+    "detail": "CARGO_BUILD_JOBS=4, RUST_TEST_THREADS=4, TS_RS_EXPERIMENT=this_is_unstable_software, toolchain 1.95.0 named explicitly because the box's default toolchain is a nightly with no clippy component. cargo fmt --all --check: exit 0. cargo clippy --all-targets -- -D warnings: exit 0. cargo test --all-targets --no-fail-fast: exit 0, 1132 passed / 0 failed / 5 ignored across 35 targets. cargo build --release --bins: exit 0. The previous edition of this block recorded a failure: tests/parity_audit_ledger.rs held this file to a contract keyed to PR #296 from the edition before, which this edition does not audit, so the_kubeconfig_row_writes_up_both_divergences_its_notes_name could not be satisfied without recording an unaudited verdict. That test is now every_divergence_a_row_names_is_written_up_in_findings, which reads the divergences out of each row's `divergences` field instead of naming a pull request, so it holds for this edition and the next. One environmental caveat, unrelated to this file: the four cleanup_* tests in the tailnetd bin target build their UnixListener path under std::env::temp_dir(), so a long TMPDIR pushes it past darwin's 104-byte sun_path limit and cleanup_refuses_live_socket panics at src/bin/tailnetd.rs:2311 with InvalidInput \"path must be shorter than SUN_LEN\". The run above used a short TMPDIR, under which all four pass. It does not reproduce on the Linux CI runner."
   },
   "findings": [
     {

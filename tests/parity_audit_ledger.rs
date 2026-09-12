@@ -12,10 +12,14 @@
 //! with at least one entry in `findings`, and a `faithful` row is one with none — because that is
 //! what makes a verdict a fact about the data rather than an assertion beside it.
 //!
-//! The last test is narrower: it holds the `#296` row's two named divergences to having a finding
-//! each. That row's notes named both the narrowed parent-directory creation and the missing
-//! `checkKubeconfigWritable` precheck, but only the first was written up, and a divergence named
-//! in a summary and absent from the list is exactly the kind of gap this file is meant to close.
+//! One test is narrower: it holds every divergence a row names to having a finding that writes it
+//! up. The `#296` row of an earlier edition named both the narrowed parent-directory creation and
+//! the missing `checkKubeconfigWritable` precheck in its notes, and only the first was written up;
+//! a divergence named in a summary and absent from the list is exactly the kind of gap this file
+//! is meant to close. Which divergences a row names is a fact about the edition, not about this
+//! test, so the rows carry it: each `gaps` row lists in `divergences` the marker its notes and its
+//! findings both call each divergence by. Pinning one edition's pull request number here made the
+//! test unsatisfiable the moment the audit moved on to a different set of merged ports.
 //!
 //! The last two tests are about evidence rather than arithmetic. The rows cite upstream by line
 //! number - `up.go:305-307`, `(line 222)` - and a line number is only checkable next to the
@@ -157,40 +161,83 @@ fn a_gaps_verdict_is_backed_by_a_finding_and_a_faithful_one_by_none() {
     }
 }
 
-#[test]
-fn the_kubeconfig_row_writes_up_both_divergences_its_notes_name() {
-    const PR: &str = "https://github.com/GeiserX/tailscaled-rs/pull/296";
-    // Both are Go symbols from `cmd/tailscale/cli/configure-kube.go`: the call the port narrowed,
-    // and the precheck it left out.
-    const NAMED: &[&str] = &["MkdirAll", "checkKubeconfigWritable"];
+/// The `divergences` markers on a row, as written. Absent means none, which is what a `faithful`
+/// row carries.
+fn divergences(row: &Value) -> Vec<String> {
+    row["divergences"]
+        .as_array()
+        .map(|ms| {
+            ms.iter()
+                .map(|m| {
+                    m.as_str()
+                        .expect("a `divergences` entry should be a string")
+                        .to_string()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
+#[test]
+fn every_divergence_a_row_names_is_written_up_in_findings() {
     let audit = audit();
-    let notes = audit["auditedPrs"]
+    let findings = findings(&audit);
+
+    for row in audit["auditedPrs"]
         .as_array()
         .expect("`auditedPrs` should be an array")
-        .iter()
-        .find(|row| row["url"].as_str() == Some(PR))
-        .map(|row| row["notes"].as_str().unwrap_or_default().to_string())
-        .unwrap_or_else(|| panic!("{PR} should still be one of the audited pull requests"));
+    {
+        let url = row["url"].as_str().expect("a row should carry a `url`");
+        let verdict = row["verdict"]
+            .as_str()
+            .expect("a row should carry a `verdict`");
+        let notes = row["notes"].as_str().unwrap_or_default();
+        let markers = divergences(row);
 
-    let written_up = findings(&audit)
-        .into_iter()
-        .filter(|(pr, _)| pr == PR)
-        .map(|(_, prose)| prose)
-        .collect::<Vec<_>>()
-        .join("\n");
+        match verdict {
+            "gaps" => assert!(
+                !markers.is_empty(),
+                "{url} is recorded as `gaps` but names no `divergences`; the notes summarise the \
+                 divergences in prose and nothing then ties that prose to the findings below"
+            ),
+            "faithful" => assert!(
+                markers.is_empty(),
+                "{url} is recorded as `faithful` but names {} divergence(s) in `divergences`",
+                markers.len()
+            ),
+            other => unreachable!("unknown verdict {other:?} on {url}"),
+        }
 
-    for symbol in NAMED {
-        assert!(
-            notes.contains(symbol),
-            "the {PR} row's notes no longer mention {symbol}; if the divergence went away, drop it \
-             from this test too"
-        );
-        assert!(
-            written_up.contains(symbol),
-            "the {PR} row's notes name a {symbol} divergence that no entry in `findings` writes \
-             up, so the summary claims a gap the list does not carry"
-        );
+        let written_up = findings
+            .iter()
+            .filter(|(pr, _)| pr == url)
+            .map(|(_, prose)| prose.as_str())
+            .collect::<Vec<_>>();
+
+        // Every divergence the summary names is written up, under the name the summary uses.
+        for marker in &markers {
+            assert!(
+                notes.contains(marker.as_str()),
+                "the {url} row lists {marker:?} in `divergences`, but its own notes never say it, \
+                 so the summary a reader reads does not name the divergence the list claims it does"
+            );
+            assert!(
+                written_up
+                    .iter()
+                    .any(|prose| prose.contains(marker.as_str())),
+                "the {url} row names a {marker:?} divergence that no entry in `findings` writes \
+                 up, so the summary claims a gap the list does not carry"
+            );
+        }
+
+        // And the other way: a finding nothing in the notes names is a gap the summary hides.
+        for prose in &written_up {
+            assert!(
+                markers.iter().any(|m| prose.contains(m.as_str())),
+                "a finding against {url} matches none of its `divergences` {markers:?}, so the \
+                 row's notes summarise a different set of divergences than the list writes up"
+            );
+        }
     }
 }
 
