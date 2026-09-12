@@ -124,10 +124,37 @@ fn a_loaded_policy_file_reaches_the_localapi_report() {
 
     // `reload` forces a re-read and must report the same thing: Go's JSON store captures the file at
     // construction and never re-reads it, so the two verbs agree for this source by construction.
+    //
+    // It must ALSO push that snapshot to anyone watching the notify bus with the `policy` mask bit —
+    // Go's `NotifySysPolicyChanges` / `sysPolicyChangedForSession`. Subscribe first: the receiver
+    // starts synced, so the tick it sees can only have come from the reload below.
+    let mut policy_rx = Backend::watch_policy();
+    assert!(
+        !policy_rx
+            .has_changed()
+            .expect("the policy channel is static and never closes"),
+        "a fresh policy watcher must start synced — it front-loads its own snapshot instead"
+    );
     let Response::Policy(reloaded) = Backend::syspolicy_reload() else {
         panic!("syspolicy_reload must reply with a policy report");
     };
     assert_eq!(reloaded, report);
+    assert!(
+        policy_rx
+            .has_changed()
+            .expect("the policy channel is static and never closes"),
+        "a `syspolicy reload` must reach a policy watcher: it is the one change edge this build \
+         can observe, and without it a watcher cannot tell 'policy unchanged' from 'policy changed \
+         and I have not asked again'"
+    );
+    policy_rx.borrow_and_update();
+    // What a watcher re-reads on that tick is the report itself, rows and all — not a second
+    // rendering of the same snapshot.
+    assert_eq!(
+        Backend::policy_snapshot(),
+        report,
+        "the pushed snapshot and the `syspolicy list` report are the same rows"
+    );
 
     // ---------------------------------------------------------------------------------------
     // ...and is APPLIED to the node's prefs, not merely reported.

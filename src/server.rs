@@ -237,6 +237,7 @@ async fn handle_conn(
                         initial_state,
                         initial_netmap,
                         prefs,
+                        policy,
                     }) => {
                         // A long-lived stream: take a permit from the SEPARATE stream budget so a
                         // flood of `Watch` connections can't starve the short-lived control pool. If
@@ -255,7 +256,7 @@ async fn handle_conn(
                             .await?;
                             break;
                         };
-                        if !initial_state && !initial_netmap && !prefs {
+                        if !initial_state && !initial_netmap && !prefs && !policy {
                             // Bare watch → the legacy status-stream path, untouched.
                             stream_watch(&mut write_half, &backend).await?;
                         } else {
@@ -266,6 +267,7 @@ async fn handle_conn(
                                 initial_state,
                                 initial_netmap,
                                 prefs,
+                                policy,
                             )
                             .await?;
                         }
@@ -500,6 +502,12 @@ async fn stream_watch(
 /// `NotifyInitialNetMap`). So each new epoch re-subscribes WITH the mask and the engine re-delivers a
 /// fresh initial snapshot for the replacement device — no manual snapshot needed here.
 ///
+/// The two DAEMON-built feeds do need a manual front-load, and get one before the first epoch: prefs
+/// (Go `NotifyInitialPrefs`) and the effective system policy (Go `NotifySysPolicyChanges`, whose
+/// documented contract is that the first notify — sent immediately — carries the current snapshot).
+/// Neither is tied to a device epoch: prefs change on a down node, and policy is resolved from the
+/// process-global registry rather than the netmap, so both are also served on the device-less arm.
+///
 /// ## Lock discipline (the load-bearing rule)
 ///
 /// The backend guard is held only for the brief `watch_lifecycle()` subscribe and the brief
@@ -514,13 +522,14 @@ async fn stream_notify(
     initial_state: bool,
     initial_netmap: bool,
     prefs: bool,
+    policy: bool,
 ) -> Result<()> {
     use tailscale::NotifyWatchOpt;
 
     // Translate the request's ENGINE mask bools into the engine's `NotifyWatchOpt` once (the same mask
     // is re-applied to every epoch's fresh subscription so a replacement device front-loads its
     // snapshot too). `empty()` carries no initial snapshot; each requested bit adds its front-load.
-    // (`prefs` is daemon-built, NOT an engine bit, so it is handled separately below.)
+    // (`prefs` and `policy` are daemon-built, NOT engine bits, so they are handled separately below.)
     let mut mask = NotifyWatchOpt::empty();
     if initial_state {
         mask = mask | NotifyWatchOpt::INITIAL_STATE;
@@ -538,10 +547,20 @@ async fn stream_notify(
         let be = backend.lock().await;
         (be.watch_lifecycle(), be.watch_prefs())
     };
+    // The policy registry is process-global (like Go's `rsop` store list), so its tick channel is
+    // subscribed WITHOUT the backend lock — but still before the first device is derived, for the same
+    // reason: a reload landing between here and the first select must not be lost.
+    let mut policy_rx = Backend::watch_policy();
 
     // `prefs` front-load: emit the current prefs as the first frame (Go `NotifyInitialPrefs`). Done
     // once up front (daemon-built, not tied to a device epoch). A write error = client gone.
     if prefs && emit_prefs_frame(write_half, backend).await.is_err() {
+        return Ok(());
+    }
+    // `policy` front-load: Go's `NotifySysPolicyChanges` explicitly makes the FIRST notify — sent
+    // immediately — carry the current effective snapshot, so this is part of the bit's contract, not
+    // an optimisation. Also daemon-built and epoch-independent.
+    if policy && emit_policy_frame(write_half).await.is_err() {
         return Ok(());
     }
 
@@ -568,6 +587,18 @@ async fn stream_notify(
                         return Ok(()); // prefs sender dropped (daemon gone)
                     }
                     if emit_prefs_frame(write_half, backend).await.is_err() {
+                        return Ok(()); // client hung up
+                    }
+                    continue; // still no device — loop back to the device-derive/wait
+                }
+                // Policy ticks are served on the device-less path too: policy is resolved from the
+                // registry, not the netmap, so a `syspolicy reload` on a down node is just as real a
+                // change as one on a running node.
+                res = policy_rx.changed(), if policy => {
+                    if res.is_err() {
+                        return Ok(()); // policy sender dropped (process gone)
+                    }
+                    if emit_policy_frame(write_half).await.is_err() {
                         return Ok(()); // client hung up
                     }
                     continue; // still no device — loop back to the device-derive/wait
@@ -638,6 +669,16 @@ async fn stream_notify(
                         return Ok(()); // client hung up
                     }
                 }
+                // Policy ticks (only armed when the `policy` bit is set): emit a fresh snapshot in
+                // place, without disturbing this device epoch's bus stream.
+                res = policy_rx.changed(), if policy => {
+                    if res.is_err() {
+                        return Ok(()); // policy sender dropped (process gone)
+                    }
+                    if emit_policy_frame(write_half).await.is_err() {
+                        return Ok(()); // client hung up
+                    }
+                }
             }
         }
     }
@@ -655,6 +696,25 @@ async fn emit_prefs_frame(
         write_half,
         &Response::Notify(crate::localapi::NotifyView {
             prefs: Some(view),
+            ..Default::default()
+        }),
+    )
+    .await
+}
+
+/// Emit one `Response::Notify { policy: Some(effective snapshot) }` frame (the daemon-built policy
+/// feed; Go's `sysPolicyChangedForSession`, which fetches a fresh snapshot and sends it to the one
+/// session whose watch asked for it).
+///
+/// Takes no backend: policy resolution reads the process-global registry, not backend/engine state,
+/// so this never touches the lock — and a `syspolicy reload` therefore cannot be head-of-line blocked
+/// by a slow `up`. Returns `Err` if the client hung up (so the caller returns `Ok(())` and ends the
+/// stream). Shared by the front-load + both policy select arms.
+async fn emit_policy_frame(write_half: &mut tokio::net::unix::OwnedWriteHalf) -> Result<()> {
+    write_response(
+        write_half,
+        &Response::Notify(crate::localapi::NotifyView {
+            policy: Some(Backend::policy_snapshot()),
             ..Default::default()
         }),
     )
@@ -693,10 +753,11 @@ fn project_notify(notify: tailscale::Notify) -> Option<crate::localapi::NotifyVi
         error,
         browse_to_url,
         net_map,
-        // `prefs` is the daemon-built field, never sourced from an engine `Notify` — `project_notify`
-        // only maps engine fields, so prefs is always `None` here (the prefs feed is emitted separately
-        // by `emit_prefs_frame`).
+        // `prefs` and `policy` are the daemon-built fields, never sourced from an engine `Notify` —
+        // `project_notify` only maps engine fields, so both are always `None` here (those feeds are
+        // emitted separately by `emit_prefs_frame`/`emit_policy_frame`).
         prefs: None,
+        policy: None,
     };
     // The engine never emits an all-`None` Notify, but guard the projection anyway: a frame with no
     // populated field carries nothing for a consumer to apply.
