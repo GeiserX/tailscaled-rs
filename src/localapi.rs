@@ -410,9 +410,10 @@ pub enum Request {
     /// [`Response::Ok`] on success or [`Response::Error`] naming the violation(s). A **write** (Go
     /// gates `serveCheckPrefs` on `PermitWrite`), but it MUTATES NOTHING — it only runs the same
     /// validation the bring-up path would. This fork mirrors the subset of Go's rule chain that maps
-    /// to its prefs: the exit-node-vs-advertise-exit-node conflict, SSH-server capability, and
-    /// advertise-route CIDR masking (Go's operator/auto-update/profile/config-lock rules reference
-    /// prefs this fork does not model). The fields are the same "leave unchanged unless named"
+    /// to its prefs: the exit-node-vs-advertise-exit-node conflict, SSH-server capability,
+    /// advertise-route CIDR masking, and the auto-update opt-in an installation that can never
+    /// replace its own binary must not make (Go's operator/profile/config-lock rules reference prefs
+    /// this fork does not model). The fields are the same "leave unchanged unless named"
     /// sentinels as [`Set`](Request::Set) — a check validates the prospective combined posture.
     CheckPrefs {
         /// Prospective exit-node selector (same double-option semantics as [`Set::exit_node`]).
@@ -431,6 +432,10 @@ pub enum Request {
         /// Prospective SSH-server enable intent.
         #[serde(default)]
         ssh: Option<bool>,
+        /// Prospective auto-update opt-in (Go's `AutoUpdate.Apply` `opt.Bool`): `Some(true)` opts
+        /// in, `Some(false)` declines, absent leaves the current preference.
+        #[serde(default)]
+        auto_update: Option<bool>,
     },
     /// Provision (or fetch) a TLS certificate + key for `domain` via the tailnet's ACME flow (Go
     /// `tailscale cert <domain>`). Replies with [`Response::Cert`] carrying the leaf+chain and the

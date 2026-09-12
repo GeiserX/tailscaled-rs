@@ -1256,10 +1256,17 @@ async fn dispatch(
             advertise_exit_node,
             advertise_routes,
             ssh,
+            auto_update,
         } => {
             let result = {
                 let be = backend.lock().await;
-                be.check_prefs(exit_node, advertise_exit_node, advertise_routes, ssh)
+                be.check_prefs(
+                    exit_node,
+                    advertise_exit_node,
+                    advertise_routes,
+                    ssh,
+                    auto_update,
+                )
             };
             match result {
                 Ok(()) => Response::Ok {
