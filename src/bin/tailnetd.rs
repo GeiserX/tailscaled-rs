@@ -284,11 +284,45 @@ fn reset_sigpipe() {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// The process entry point — and deliberately **not** the async one: the tokio runtime is built by
+/// [`run`] below, so everything here runs before any second thread exists.
+///
+/// That is the whole reason this function is split out. Applying the operator env file
+/// ([`tailscaled_rs::envknob::apply_disk_config`]) mutates *this* process's environment, and
+/// `std::env::set_var` is unsound once another thread might be calling `getenv` — which, under a
+/// multi-thread runtime, is true from the moment the runtime is constructed. Go's ordering is the
+/// same and for a related reason: `envknob.ApplyDiskConfig()` is the first statement of
+/// `tailscaled`'s `main`, ahead of flag registration, so every later environment read — including
+/// the ones inside flag defaults — sees the file.
+fn main() -> Result<()> {
     // Restore default SIGPIPE before any output (a broken `--version`/`--help` pipe should terminate
     // cleanly, not panic the print). Must run before clap, which prints help/version.
     reset_sigpipe();
+
+    // The operator env file (Go `envknob.ApplyDiskConfig`): on macOS, `/etc/tailnetd/tailnetd-env.txt`
+    // is where an operator sets the administrative envknobs this daemon reads — `TS_DISABLE_SSH_SERVER`,
+    // `TS_DISABLE_PORTMAPPER`, `TAILNETD_LOG`, `PORT`, … — because the launchd plist's own
+    // `EnvironmentVariables` dict is embedded in this binary and rewritten by `tnet install`, so an
+    // addition to it does not survive. On Linux there is no such file, exactly as in Go: the packaged
+    // unit's `EnvironmentFile=-/etc/default/tailnetd` is the seam there.
+    //
+    // A malformed file is FATAL, with the file, the line number and the line (Go stashes the error for
+    // its health tracker; this fork has none yet, and silently ignoring an administrator's typo would
+    // start the daemon under an environment nobody wrote — see the module docs). Absent file, or a
+    // platform with none: nothing happens. Bare message + exit 1 matches the flag refusals below.
+    let applied_env = match tailscaled_rs::envknob::apply_disk_config() {
+        Ok(applied) => applied,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    run(applied_env)
+}
+
+#[tokio::main]
+async fn run(applied_env: Option<tailscaled_rs::envknob::Applied>) -> Result<()> {
     // Parse flags FIRST: clap handles `--help`/`--version` (print + exit 0) and rejects unknown
     // flags before we touch the experiment gate or any state, matching how Go `tailscaled` parses its
     // flag set up front. The parsed values then override the env-derived defaults below.
@@ -407,6 +441,17 @@ async fn main() -> Result<()> {
             }
         })
         .init();
+
+    // Say that the env file was read, now that there is somewhere to say it. Names only — a value in
+    // that file can be a secret (`TS_AUTH_KEY`), and this is the same discipline the prefs logging
+    // uses. Silent when there was no file, which is the normal case on nearly every host.
+    if let Some(applied) = &applied_env {
+        tracing::info!(
+            path = %applied.path.display(),
+            keys = %applied.keys.join(","),
+            "applied operator environment file"
+        );
+    }
 
     // `--no-logs-no-support` (Go `tailscaled --no-logs-no-support`): Go flips an envknob that swaps
     // the logtail uploader for a no-op transport and prints a warning. This fork never uploads logs
