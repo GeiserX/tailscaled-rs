@@ -17,11 +17,12 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::auth::{self, Access, AuthPolicy};
 use crate::ipn::alwayson;
+use crate::ipn::syspolicy;
 use crate::ipn::{self, Backend};
 use crate::localapi::{Request, Response};
 
@@ -60,6 +61,77 @@ const NC_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 /// aborted. Bounds shutdown latency so a wedged handler can't keep the daemon from exiting.
 const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Why a [`Request::Shutdown`] was refused — one variant per rung of Go's refusal ladder in
+/// `serveShutdown` (`ipn/localapi/localapi.go`), in the order Go checks them.
+///
+/// Separate variants (rather than one pre-rendered string) because the ladder's ORDER is the
+/// contract and a test has to be able to name which rung answered. The messages keep Go's exact
+/// phrases as their leading text — an operator or a script grepping `shutdown access denied by
+/// policy` finds the same words here — with this fork's "and here is what to do about it" clause
+/// after the colon, the house style every other refusal on this socket uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownRefusal {
+    /// The caller may not write at all: not root, not the uid that owns the daemon. Go: `shutdown
+    /// access denied` (403).
+    AccessDenied,
+    /// The caller MAY write, but no system policy authorises stopping the daemon. Go: `shutdown
+    /// access denied by policy` (403), from `polc.GetBoolean(pkey.AllowTailscaledRestart, false)`.
+    DeniedByPolicy,
+}
+
+impl ShutdownRefusal {
+    /// The message the refused caller receives, verbatim.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::AccessDenied => {
+                "shutdown access denied: stopping the daemon requires root or the same user that \
+                 owns the daemon"
+            }
+            Self::DeniedByPolicy => {
+                "shutdown access denied by policy: set AllowTailscaledRestart to true in the \
+                 daemon's system policy file (see `tnet syspolicy list`) to permit it"
+            }
+        }
+    }
+}
+
+/// Decide whether a [`Request::Shutdown`] may proceed — the port of `serveShutdown`'s refusal
+/// ladder, minus the rung this transport cannot have.
+///
+/// Go checks, in order: the HTTP method; then write access; then the policy. The method rung has no
+/// counterpart here (one JSON frame per request, no methods — see [`Request::Shutdown`]), so this
+/// starts at write access.
+///
+/// **The order of the two remaining rungs is load-bearing.** Write access is checked FIRST so that a
+/// caller which may not write is refused *without the policy ever being consulted*: it always gets
+/// [`ShutdownRefusal::AccessDenied`], never the by-policy message, so the difference between the two
+/// refusals cannot be used to read the administrator's policy state off a socket the caller was not
+/// trusted with. And an authorised caller gets the two refusals apart, which is the other half of
+/// the point: "you may not" and "nobody may" are different problems with different fixes.
+///
+/// Authorisation goes through [`auth::authorize`] rather than `access.can_write()` so there stays
+/// exactly one authority on which verbs mutate (its match over `Request` is exhaustive, so a new
+/// verb has to make the decision explicitly). Pure — no lock, no I/O — so every rung is unit-testable
+/// without a socket, a second uid, or a policy file.
+pub fn shutdown_verdict(access: Access, allowed_by_policy: bool) -> Result<(), ShutdownRefusal> {
+    if auth::authorize(&Request::Shutdown, access).is_err() {
+        return Err(ShutdownRefusal::AccessDenied);
+    }
+    if !allowed_by_policy {
+        return Err(ShutdownRefusal::DeniedByPolicy);
+    }
+    Ok(())
+}
+
+/// Whether the system policy authorises stopping the daemon — Go's
+/// `polc.GetBoolean(pkey.AllowTailscaledRestart, false)`, default **false**.
+///
+/// Split from [`shutdown_verdict`] so the decision stays pure and the one process-global read has a
+/// single named site.
+fn shutdown_allowed_by_policy() -> bool {
+    syspolicy::get_boolean(syspolicy::PKEY_ALLOW_TAILSCALED_RESTART, false)
+}
+
 /// Run the LocalAPI server until `shutdown` resolves, then clean up the socket.
 pub async fn serve(
     socket_path: &Path,
@@ -97,10 +169,30 @@ pub async fn serve(
     // Track in-flight handlers so shutdown can drain them instead of dropping them mid-flight.
     let mut conns: JoinSet<()> = JoinSet::new();
 
+    // The LocalAPI `shutdown` verb's stop signal: a handler that has passed the refusal ladder
+    // notifies it AFTER acknowledging the request, and the accept loop below treats it exactly like
+    // the caller-supplied `shutdown` future (SIGINT/SIGTERM). That is the whole mechanism — no
+    // `process::exit`, no second teardown path: the listener is dropped, in-flight connections
+    // drain, the socket is unlinked, `serve` returns `Ok(())` and the daemon's own shutdown runs.
+    //
+    // `Notify::notify_one` (not `notify_waiters`) is what makes this race-free: it stores a permit
+    // when nobody is parked yet, so a stop requested while the loop is inside `accept()` is still
+    // observed by the `notified()` future the select re-polls.
+    let stop_requested = Arc::new(Notify::new());
+    let stop_waiter = Arc::clone(&stop_requested);
+    let stop_signal = async move { stop_waiter.notified().await };
+
     tokio::pin!(shutdown);
+    tokio::pin!(stop_signal);
     loop {
         tokio::select! {
             _ = &mut shutdown => break,
+            // A LocalAPI caller asked the daemon to stop and was permitted to. It has already been
+            // acknowledged on its own connection, so there is nothing left to do but stop accepting.
+            () = &mut stop_signal => {
+                tracing::info!("LocalAPI shutdown requested; stopping");
+                break;
+            }
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _addr)) => {
@@ -117,10 +209,11 @@ pub async fn serve(
                             continue;
                         };
                         let stream_limit = Arc::clone(&stream_limit);
+                        let stop_requested = Arc::clone(&stop_requested);
                         conns.spawn(async move {
                             let _permit = permit;
                             if let Err(e) =
-                                handle_conn(stream, access, peer_uid, backend, stream_limit).await
+                                handle_conn(stream, access, peer_uid, backend, stream_limit, stop_requested).await
                             {
                                 tracing::warn!(error = %e, "LocalAPI: connection error");
                             }
@@ -189,6 +282,7 @@ async fn handle_conn(
     peer_uid: Option<u32>,
     backend: Arc<Mutex<Backend>>,
     stream_limit: Arc<Semaphore>,
+    stop_requested: Arc<Notify>,
 ) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -357,6 +451,50 @@ async fn handle_conn(
                         // Audit the GRANT of a sensitive op (asking the router to open a hole).
                         tracing::info!(peer_uid = ?peer_uid, "debug portmap started");
                         stream_debug_portmap(&mut write_half, req).await?;
+                        break;
+                    }
+                    // `shutdown` is terminal for this connection AND for the daemon, so like `Watch`
+                    // and `nc` it is handled here rather than in `dispatch`: the ORDER of "answer the
+                    // caller, then stop" is the port (Go writes its 200 and FLUSHES before publishing
+                    // the `localapi.Shutdown` event), and `dispatch` cannot express it — it returns a
+                    // response that the caller of `dispatch` writes afterwards, which would stop the
+                    // daemon while its acknowledgement was still unwritten.
+                    //
+                    // Both refusals keep the request loop alive (`continue`): a caller that was told
+                    // "no" still has a usable connection, exactly as a refused `POST` leaves Go's
+                    // HTTP connection open.
+                    Ok(Request::Shutdown) => {
+                        if let Err(refusal) = shutdown_verdict(access, shutdown_allowed_by_policy())
+                        {
+                            // Audit every refused attempt to stop the daemon, naming which rung
+                            // answered — an unauthorized caller probing the socket and a permitted
+                            // caller hitting a policy that says no are different events.
+                            tracing::warn!(
+                                peer_uid = ?peer_uid,
+                                refusal = ?refusal,
+                                "denied LocalAPI shutdown"
+                            );
+                            write_response(
+                                &mut write_half,
+                                &Response::Error {
+                                    message: refusal.message().into(),
+                                },
+                            )
+                            .await?;
+                            continue;
+                        }
+                        // Acknowledge FIRST, so the caller learns its request was accepted even
+                        // though the daemon is about to stop answering. `write_response` flushes.
+                        write_response(
+                            &mut write_half,
+                            &Response::Ok {
+                                message: "shutdown accepted; the daemon is stopping".into(),
+                            },
+                        )
+                        .await?;
+                        // Audit the GRANT: this is the one LocalAPI verb that ends the process.
+                        tracing::info!(peer_uid = ?peer_uid, "LocalAPI shutdown accepted");
+                        stop_requested.notify_one();
                         break;
                     }
                     Ok(req) => {
@@ -1088,6 +1226,14 @@ async fn dispatch(
         // log) and never reaches `dispatch`; this arm exists only for match exhaustiveness.
         Request::DebugPortmap { .. } => Response::Error {
             message: "internal error: debug portmap must be handled by the log streamer".into(),
+        },
+        // `shutdown` is intercepted in `handle_conn` (it must answer the caller BEFORE stopping the
+        // accept loop, which `dispatch`'s answer-afterwards shape cannot express) and never reaches
+        // `dispatch`; this arm exists only for match exhaustiveness. It deliberately does NOT stop
+        // the daemon: a `shutdown` that somehow arrived here took no refusal ladder, and a verb that
+        // ends the process must never be reachable by a path that did not check the policy.
+        Request::Shutdown => Response::Error {
+            message: "internal error: shutdown must be handled by the connection loop".into(),
         },
         // `version` (Go `tailscale version --daemon` reads `Status.Version`). The daemon's version is
         // its own compile-time crate version — a constant, needing no backend lock or engine.
@@ -2016,5 +2162,104 @@ mod tests {
         // Best-effort cleanup before the assertion so a failure still removes the dir.
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(mode, 0o700, "loose socket dir must be tightened to 0700");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The `shutdown` refusal ladder (Go `serveShutdown`, `ipn/localapi/localapi.go`).
+    // ---------------------------------------------------------------------------------------
+
+    /// The rung that must come first. A caller that may not write is refused with
+    /// [`ShutdownRefusal::AccessDenied`] **whatever the policy says** — the policy is not consulted,
+    /// so the two refusals cannot be used to read the administrator's policy state off a socket the
+    /// caller was never trusted with. Both policy values are driven here precisely because the bug
+    /// this guards is invisible with only one of them: swapping the two checks still refuses an
+    /// unauthorized caller, it just tells them which policy is in force on the way out.
+    #[test]
+    fn an_unauthorized_shutdown_is_refused_before_the_policy_is_read() {
+        for allowed_by_policy in [false, true] {
+            assert_eq!(
+                shutdown_verdict(Access::ReadOnly, allowed_by_policy),
+                Err(ShutdownRefusal::AccessDenied),
+                "a read-only caller must get the access refusal with policy={allowed_by_policy}"
+            );
+        }
+    }
+
+    /// The second rung: write access is necessary and NOT sufficient. A caller that may issue
+    /// `up`/`down` still cannot stop the daemon unless the administrator opted in — which is the
+    /// whole shape of the key, an auditable power handed out on purpose rather than one that comes
+    /// free with write access.
+    #[test]
+    fn a_writer_is_refused_until_the_policy_allows_it() {
+        assert_eq!(
+            shutdown_verdict(Access::ReadWrite, false),
+            Err(ShutdownRefusal::DeniedByPolicy),
+            "write access alone must NOT be enough to stop the daemon"
+        );
+        assert_eq!(
+            shutdown_verdict(Access::ReadWrite, true),
+            Ok(()),
+            "write access AND the policy must together permit the shutdown"
+        );
+    }
+
+    /// The two refusals have to be distinguishable, because they are different problems with
+    /// different fixes ("you may not" vs "nobody may"), and each keeps Go's phrase as its leading
+    /// text so an operator or a script grepping for upstream's wording still finds it.
+    #[test]
+    fn the_two_refusals_carry_gos_distinct_phrases() {
+        let access = ShutdownRefusal::AccessDenied.message();
+        let policy = ShutdownRefusal::DeniedByPolicy.message();
+        assert!(
+            access.starts_with("shutdown access denied:"),
+            "the access refusal must lead with Go's phrase, got: {access}"
+        );
+        assert!(
+            policy.starts_with("shutdown access denied by policy:"),
+            "the policy refusal must lead with Go's phrase, got: {policy}"
+        );
+        assert_ne!(
+            access, policy,
+            "a caller must be able to tell `you may not` from `nobody may`"
+        );
+        assert!(
+            policy.contains("AllowTailscaledRestart"),
+            "the policy refusal must name the key that lifts it, got: {policy}"
+        );
+    }
+
+    /// `shutdown` is a write for the authorization gate. Pinned through the gate itself (not
+    /// re-derived), because the first rung of the ladder is exactly `auth::authorize` and a
+    /// misclassification there would silently hand the power to stop the daemon to any local user
+    /// who can reach the socket.
+    #[test]
+    fn shutdown_is_classified_as_a_write_by_the_auth_gate() {
+        assert_eq!(
+            auth::authorize(&Request::Shutdown, Access::ReadOnly),
+            Err(crate::auth::Denied),
+            "`shutdown` must be a write verb"
+        );
+        assert_eq!(
+            auth::authorize(&Request::Shutdown, Access::ReadWrite),
+            Ok(())
+        );
+    }
+
+    /// Default deny, over the real process-global policy registry: a daemon started without a
+    /// `--syspolicy-file` (which is every daemon in this test binary — no unit test registers a
+    /// source) reads `AllowTailscaledRestart` as false, so `shutdown` is refused. This is the
+    /// pre-existing behaviour of the fork and it stays the default; the verb only ever does
+    /// something when an administrator asked for it.
+    #[test]
+    fn the_policy_denies_shutdown_by_default() {
+        assert!(
+            !shutdown_allowed_by_policy(),
+            "with no policy source registered, `AllowTailscaledRestart` must read false"
+        );
+        assert_eq!(
+            shutdown_verdict(Access::ReadWrite, shutdown_allowed_by_policy()),
+            Err(ShutdownRefusal::DeniedByPolicy),
+            "an unconfigured daemon must refuse `shutdown` even from its owner"
+        );
     }
 }

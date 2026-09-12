@@ -72,9 +72,12 @@
 //! report that renders an administrator's intent while changing nothing is worse than no policy
 //! support at all, so an unenforceable key has to say so.
 //!
-//! Two more keys act without ever touching prefs, because their effect is a refusal rather than a
+//! Three more keys act without ever touching prefs, because their effect is a refusal rather than a
 //! rewritten pref: `tailnetd` reads [`PKEY_ENCRYPT_STATE`] and [`PKEY_HARDWARE_ATTESTATION`] by name
-//! for two startup refusals.
+//! for two startup refusals, and the LocalAPI server reads [`PKEY_ALLOW_TAILSCALED_RESTART`] by name
+//! to decide whether a caller that may already write is *also* permitted to stop the daemon
+//! ([`crate::server::shutdown_verdict`]). None of the three is reported as unenforced, because all
+//! three are read.
 //!
 //! Two consequences worth stating. The applied values are **persisted** into `prefs.json` by
 //! whichever write follows (a profile load applies in memory only and writes nothing, so merely
@@ -115,6 +118,16 @@ pub const PKEY_ENCRYPT_STATE: &str = "EncryptState";
 /// Go `pkey.HardwareAttestation` — the policy key that asks a daemon to bind the node identity to a
 /// hardware-backed key. Read by name for the same reason as [`PKEY_ENCRYPT_STATE`].
 pub const PKEY_HARDWARE_ATTESTATION: &str = "HardwareAttestation";
+
+/// Go `pkey.AllowTailscaledRestart` — the policy key that authorises a LocalAPI caller to stop the
+/// daemon (`shutdown`). Read by name by the server's `shutdown` arm
+/// ([`crate::server::shutdown_verdict`]), exactly as Go's `serveShutdown` reads it via
+/// `polc.GetBoolean(pkey.AllowTailscaledRestart, false)` — so, like [`PKEY_ENCRYPT_STATE`], the
+/// spelling has exactly one definition, shared with [`DEFINITIONS`].
+///
+/// Default **false**: the verb is opt-in, which is the shape the key exists for — an administrator
+/// hands a management agent one specific, auditable power over the daemon without handing it root.
+pub const PKEY_ALLOW_TAILSCALED_RESTART: &str = "AllowTailscaledRestart";
 
 /// Go `pkey.AlwaysOn` — the policy key that forbids disconnecting the node. Read by name by the
 /// disconnect gate ([`alwayson`](super::alwayson)), so — like [`PKEY_ENCRYPT_STATE`] — the spelling
@@ -416,7 +429,7 @@ const DEFINITIONS: &[Definition] = &[
     // Device policy settings (configurable only on a per-device basis in Go).
     def("AllowedSuggestedExitNodes", ValueType::StringList),
     def("ExitNode.AllowOverride", ValueType::Boolean),
-    def("AllowTailscaledRestart", ValueType::Boolean),
+    def(PKEY_ALLOW_TAILSCALED_RESTART, ValueType::Boolean),
     def(PKEY_ALWAYS_ON, ValueType::Boolean),
     def(PKEY_ALWAYS_ON_OVERRIDE_WITH_REASON, ValueType::Boolean),
     def("InstallUpdates", ValueType::PreferenceOption),
@@ -1578,9 +1591,15 @@ mod tests {
             assert_eq!(def.ty, ValueType::String, "{key}");
         }
         // `PKEY_ALWAYS_ON` is named by the apply path; `PKEY_ALWAYS_ON_OVERRIDE_WITH_REASON` is
-        // named by the disconnect gate, which reads it through the same store and so needs the same
-        // definition to exist with the same type.
-        for key in [PKEY_ALWAYS_ON, PKEY_ALWAYS_ON_OVERRIDE_WITH_REASON] {
+        // named by the disconnect gate and `PKEY_ALLOW_TAILSCALED_RESTART` by the LocalAPI
+        // `shutdown` arm, both of which read through the same store and so need the same definition
+        // to exist with the same type. `get_boolean` folds a type mismatch into the caller's
+        // default, so a key defined as anything but `Boolean` would silently deny the verb forever.
+        for key in [
+            PKEY_ALWAYS_ON,
+            PKEY_ALWAYS_ON_OVERRIDE_WITH_REASON,
+            PKEY_ALLOW_TAILSCALED_RESTART,
+        ] {
             let def = definition_of(key).unwrap_or_else(|| panic!("{key} must be defined"));
             assert_eq!(def.ty, ValueType::Boolean, "{key}");
         }
