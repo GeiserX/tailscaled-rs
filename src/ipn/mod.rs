@@ -4435,7 +4435,8 @@ impl Backend {
     /// Suggest the best available exit node (the `tnet exit-node suggest` path). Thin `pub` shim over
     /// [`diag::suggest_exit_node`], uniform with the other off-lock diagnostics. See it for the
     /// `suggest_exit_node()` → [`Response::ExitNodeSuggestion`](crate::localapi::Response) mapping
-    /// (`Ok(None)` = no eligible candidate, an honest empty result, not an error).
+    /// (`Ok(None)` = no eligible candidate, an honest empty result, not an error) and for the
+    /// `AllowedSuggestedExitNodes` allow-list the engine's answer is filtered through.
     pub async fn suggest_exit_node(dev: &tailscale::Device) -> crate::localapi::Response {
         diag::suggest_exit_node(dev).await
     }
