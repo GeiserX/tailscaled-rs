@@ -547,6 +547,35 @@ fn validate_advertise_tags(tags: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// The advertised-route SET a pending `up`/`set` would leave behind, as the pair
+/// [`crate::routes::calc_advertise_routes`] asks about: the raw routes, and whether this node
+/// advertises itself as an exit node.
+///
+/// Go needs no such composition — its `AdvertiseRoutes` is ONE pref, and `CalcAdvertiseRoutes` runs
+/// on the CLI's two flags before it is written. This fork models the exit-node intent as its own
+/// pref, so the two halves of the set can be changed one at a time (`set --advertise-routes` today,
+/// `set --advertise-exit-node=false` tomorrow) and the set can only be judged after they are put
+/// back together: a named override where the request names one, the persisted pref otherwise.
+///
+/// `reset` is `up --reset`, where an UNNAMED pref goes back to its default rather than being kept —
+/// so the set that request leaves behind is composed against [`Prefs::default`], not against the
+/// prefs on disk. Pure, so it can run in `begin_up`/`begin_set` before a single pref is mutated.
+fn prospective_route_set(
+    named_routes: Option<&Vec<String>>,
+    named_advertise_exit_node: Option<bool>,
+    current: &Prefs,
+    reset: bool,
+) -> (Vec<String>, bool) {
+    let defaults = Prefs::default();
+    let base = if reset { &defaults } else { current };
+    (
+        named_routes
+            .cloned()
+            .unwrap_or_else(|| base.advertise_routes.clone()),
+        named_advertise_exit_node.unwrap_or(base.advertise_exit_node),
+    )
+}
+
 /// Reject an `auto:`-prefixed exit-node selector (Go `tailscale up/set --exit-node auto:any`, which
 /// enables *automatic* exit-node selection via `ipn.Prefs.AutoExitNode`).
 ///
@@ -2584,20 +2613,23 @@ impl Backend {
         let opts_advertise_connector_named = opts.advertise_connector.is_some();
         let opts_auto_update_named = opts.auto_update.is_some();
 
-        // PRE-VALIDATE the advertised CIDRs BEFORE mutating/persisting prefs. `build_config` is the
-        // final authority (it re-parses the same way; see its `advertise_routes` block), but it only
-        // runs on the rebuild path AFTER `persist_prefs` here — so a malformed CIDR would otherwise
-        // be written to `prefs.json` and only rejected later, leaving the persisted prefs
-        // inconsistent with the running device (a failed `set` having corrupted state). Parse each
-        // candidate up-front as `ipnet::IpNet` (byte-identical to `build_config`'s parse) and bail on
-        // the first bad one with NOTHING yet mutated or persisted. Defense in depth, not a
-        // replacement for the build_config parse.
-        if let Some(routes) = opts.advertise_routes.as_ref() {
-            for s in routes {
-                s.parse::<ipnet::IpNet>()
-                    .map_err(|_| anyhow!("invalid advertise route {s:?}"))?;
-            }
-        }
+        // PRE-VALIDATE the advertised route SET BEFORE mutating/persisting prefs. `build_config` is
+        // the final authority on the CIDR parse (it re-parses the same way; see its
+        // `advertise_routes` block), but it only runs on the rebuild path AFTER `persist_prefs` here
+        // — so a malformed CIDR would otherwise be written to `prefs.json` and only rejected later,
+        // leaving the persisted prefs inconsistent with the running device (a failed `set` having
+        // corrupted state). Validate the set this request would leave behind — the named overrides
+        // composed with the persisted prefs, since `set` changes the two halves independently —
+        // against Go's `CalcAdvertiseRoutes` rules, and bail with NOTHING yet mutated or persisted.
+        // The set-level rules have nowhere else to run on a node that is DOWN, where `set` is
+        // persist-only and never reaches `build_config` at all.
+        let (prospective_routes, prospective_advertise_exit) = prospective_route_set(
+            opts.advertise_routes.as_ref(),
+            opts.advertise_exit_node,
+            &self.prefs,
+            false,
+        );
+        crate::routes::validate_advertise_routes(&prospective_routes, prospective_advertise_exit)?;
         // Same pre-validate-before-persist discipline for advertise-tags (tag:<name> form).
         if let Some(tags) = opts.advertise_tags.as_ref() {
             validate_advertise_tags(tags)?;
@@ -2930,19 +2962,22 @@ impl Backend {
     /// this phase is not strictly instantaneous under the lock — only the fresh-up case is. The
     /// common, head-of-line-sensitive case (no prior device) returns immediately.
     pub async fn begin_up(&mut self, opts: UpOptions, wif: Option<&WifCreds>) -> Result<PendingUp> {
-        // PRE-VALIDATE the advertised CIDRs FIRST — before tearing down the device, mutating, or
+        // PRE-VALIDATE the advertised route SET FIRST — before tearing down the device, mutating, or
         // persisting prefs. Same persist-before-validate gap as `begin_set`: `build_config` (below,
-        // the final authority) only rejects a malformed CIDR AFTER `stop_device` + `persist_prefs`
-        // have run, so a bad value would tear down a live engine AND be written to `prefs.json`
-        // before being caught. Parse each up-front as `ipnet::IpNet` (byte-identical to
-        // `build_config`'s parse) and bail on the first bad one with the device untouched and
-        // nothing persisted. Defense in depth, not a replacement for the build_config parse.
-        if let Some(routes) = opts.advertise_routes.as_ref() {
-            for s in routes {
-                s.parse::<ipnet::IpNet>()
-                    .map_err(|_| anyhow!("invalid advertise route {s:?}"))?;
-            }
-        }
+        // the final authority on the CIDR parse) only rejects a malformed CIDR AFTER `stop_device` +
+        // `persist_prefs` have run, so a bad value would tear down a live engine AND be written to
+        // `prefs.json` before being caught. Validate the set this request would leave behind
+        // (`prospective_route_set`, which honours `--reset`) with Go's `CalcAdvertiseRoutes` rules —
+        // parseable, masked, 4via6-decodable, and no default route advertised in one family only —
+        // and bail with the device untouched and nothing persisted. Defense in depth for the parse,
+        // and the ONLY place the set-level rules can run for an `up`.
+        let (prospective_routes, prospective_advertise_exit) = prospective_route_set(
+            opts.advertise_routes.as_ref(),
+            opts.advertise_exit_node,
+            &self.prefs,
+            opts.reset,
+        );
+        crate::routes::validate_advertise_routes(&prospective_routes, prospective_advertise_exit)?;
         // Same pre-validate-before-teardown discipline for advertise-tags (tag:<name> form).
         if let Some(tags) = opts.advertise_tags.as_ref() {
             validate_advertise_tags(tags)?;
@@ -4185,8 +4220,9 @@ impl Backend {
     /// peer that exists, a peer that actually advertises an exit node, an unambiguous name);
     /// (2) **exit-node-vs-advertise
     /// conflict** — cannot use an exit node and advertise as one simultaneously (Go
-    /// `checkExitNodePrefsLocked`); (3) every advertised route is a masked CIDR (Go
-    /// `checkAdvertiseRoutes`); (4) SSH-server enable requires the `ssh` build feature (the local
+    /// `checkExitNodePrefsLocked`); (3) the advertised-route SET is one Go would send: every entry a
+    /// masked CIDR, every 4via6 prefix decodable, and a default route present in both families or in
+    /// neither (Go `netutil.CalcAdvertiseRoutes`, via [`crate::routes`]); (4) SSH-server enable requires the `ssh` build feature (the local
     /// analogue of Go's capability gate — a faithful, build-time check) **and** must clear the
     /// host/operator gate Go's `checkSSHPrefsLocked` applies,
     /// [`featureknob::can_run_tailscale_ssh`](crate::featureknob::can_run_tailscale_ssh) — chiefly
@@ -4301,19 +4337,16 @@ impl Backend {
                 "Cannot advertise an exit node and use an exit node at the same time.".into(),
             );
         }
-        // (3) advertise-route CIDR masking (Go: "route %s has non-address bits set; expected %s").
-        for route in &prospective_routes {
-            match route.parse::<ipnet::IpNet>() {
-                Ok(net) => {
-                    let masked = net.trunc();
-                    if masked != net {
-                        errors.push(format!(
-                            "route {route} has non-address bits set; expected {masked}"
-                        ));
-                    }
-                }
-                Err(e) => errors.push(format!("route {route:?} is not a valid CIDR: {e}")),
-            }
+        // (3) the advertised-route SET (Go `netutil.CalcAdvertiseRoutes`): every entry is a parseable,
+        // MASKED CIDR, every 4via6 prefix actually decodes, and a default route is advertised in BOTH
+        // families or in neither. Asked of the set the two inputs COMPOSE — `prospective_advertise_exit`
+        // contributes the two default routes, exactly as Go's `advertiseDefaultRoute` argument does —
+        // because the set is what this node will offer control, and a lone default route there is a
+        // half exit node whichever input produced it. See [`crate::routes`] for each rule.
+        if let Err(errs) =
+            crate::routes::calc_advertise_routes(&prospective_routes, prospective_advertise_exit)
+        {
+            errors.extend(errs.iter().map(ToString::to_string));
         }
         // (4) SSH-server enable requires the `ssh` build feature (local analogue of Go's
         // capability gate — a faithful build-time check; the netmap-capability check is engine-gated)
@@ -7518,6 +7551,168 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn begin_up_refuses_a_lone_default_route_without_persisting() {
+        // The half-exit-node leak on the `up` path (Go `netutil.CalcAdvertiseRoutes`): advertising
+        // `0.0.0.0/0` alone takes clients' v4 traffic while their v6 leaves out their own link. Refused
+        // before the device is torn down or a pref is written, naming the counterpart to add.
+        let dir = std::env::temp_dir().join(format!("tailnetd-bu-halfexit-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+
+        let err = match be
+            .begin_up(
+                UpOptions {
+                    advertise_routes: Some(vec![
+                        "0.0.0.0/0".to_string(),
+                        "192.0.2.0/24".to_string(),
+                    ]),
+                    ..UpOptions::default()
+                },
+                None,
+            )
+            .await
+        {
+            Ok(_) => panic!("a lone v4 default route must make begin_up fail"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            format!("{err:#}"),
+            "0.0.0.0/0 advertised without its IPv6 counterpart, please also advertise ::/0"
+        );
+        assert!(
+            !be.prefs.want_running && be.prefs.advertise_routes.is_empty(),
+            "the refusal is before any pref moves"
+        );
+        assert!(
+            !tokio::fs::try_exists(dir.join("prefs.json")).await.unwrap(),
+            "an up refused for a half-advertised default route must not have persisted prefs.json"
+        );
+
+        // Naming BOTH defaults is an exit node spelled the long way, and is accepted.
+        be.begin_up(
+            UpOptions {
+                advertise_routes: Some(vec!["0.0.0.0/0".to_string(), "::/0".to_string()]),
+                ..UpOptions::default()
+            },
+            None,
+        )
+        .await
+        .expect("both default routes together are a whole exit node");
+        assert_eq!(
+            be.prefs.advertise_routes,
+            vec!["0.0.0.0/0".to_string(), "::/0".to_string()],
+            "the operator's own list is what is stored — the check is a validation, not a rewrite"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn begin_set_judges_the_route_set_the_two_prefs_compose() {
+        // `--advertise-routes` and `--advertise-exit-node` are separate prefs here, so the pairing rule
+        // has to be asked of what they produce TOGETHER — on `set`, which changes them one at a time.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-set-halfexit-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+
+        // (a) The v4 default alongside the exit-node advertisement: both families are advertised, so
+        // this is accepted — the rule is about the set, not about the flag's literal argument.
+        be.begin_set(SetOptions {
+            advertise_routes: Some(vec!["0.0.0.0/0".to_string()]),
+            advertise_exit_node: Some(true),
+            ..SetOptions::default()
+        })
+        .await
+        .expect("a v4 default plus the exit-node advertisement advertises both defaults");
+        assert!(be.prefs.advertise_exit_node);
+
+        // (b) Dropping the exit-node advertisement now LEAVES that lone v4 default behind — the same
+        // leak, arrived at from the other side — so it is refused, and nothing moves.
+        let err = be
+            .begin_set(SetOptions {
+                advertise_exit_node: Some(false),
+                ..SetOptions::default()
+            })
+            .await
+            .expect_err("dropping the exit-node advertisement must not leave a lone default route");
+        assert_eq!(
+            format!("{err:#}"),
+            "0.0.0.0/0 advertised without its IPv6 counterpart, please also advertise ::/0"
+        );
+        assert!(
+            be.prefs.advertise_exit_node,
+            "a refused set leaves the pref it was refusing to change"
+        );
+
+        // (c) Dropping BOTH together is coherent, and accepted.
+        be.begin_set(SetOptions {
+            advertise_routes: Some(vec![]),
+            advertise_exit_node: Some(false),
+            ..SetOptions::default()
+        })
+        .await
+        .expect("clearing the routes and the exit-node advertisement together is coherent");
+        assert!(!be.prefs.advertise_exit_node && be.prefs.advertise_routes.is_empty());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn check_prefs_reports_the_route_set_rules() {
+        // The dry-run verb reports exactly what `up`/`set` would refuse, including both new set-level
+        // rules, and still reports every reason in one answer.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-checkprefs-routes-{}", std::process::id()));
+        let be = backend_for(&dir);
+
+        let err = be
+            .check_prefs(None, None, Some(vec!["::/0".into()]), None, None)
+            .await
+            .expect_err("a lone v6 default route must be reported");
+        assert_eq!(
+            err.to_string(),
+            "::/0 advertised without its IPv4 counterpart, please also advertise 0.0.0.0/0"
+        );
+
+        // A 4via6 prefix that cannot carry a site id is reported as the malformed via route it is,
+        // not accepted as an ordinary IPv6 route (Go `netutil.ValidateViaPrefix`).
+        let err = be
+            .check_prefs(
+                None,
+                None,
+                Some(vec!["fd7a:115c:a1e0:b1a::/64".into()]),
+                None,
+                None,
+            )
+            .await
+            .expect_err("a 4via6 prefix shorter than /96 must be reported");
+        assert_eq!(
+            err.to_string(),
+            "fd7a:115c:a1e0:b1a::/64 4-in-6 prefix must be at least a /96"
+        );
+
+        // The exit-node advertisement supplies both defaults, so the v4 default is fine beside it —
+        // and a plain subnet route was never in question.
+        assert!(
+            be.check_prefs(None, Some(true), Some(vec!["0.0.0.0/0".into()]), None, None)
+                .await
+                .is_ok(),
+            "advertising as an exit node advertises both default routes"
+        );
+        assert!(
+            be.check_prefs(None, None, Some(vec!["192.0.2.0/24".into()]), None, None)
+                .await
+                .is_ok(),
+            "an ordinary subnet route is unaffected"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

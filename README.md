@@ -163,6 +163,21 @@ there. Without this the engine's selector parse accepts *every* string, so a typ
 address, or a peer that offers no exit was stored as a working pref and then routed nothing, with no
 command saying why.
 
+`--advertise-routes` is validated as a **set**, together with `--advertise-exit-node`, the way Go's
+`netutil.CalcAdvertiseRoutes` validates the two (on `up`, `set`, `check-prefs` and a `--config` file
+alike). Besides the long-standing masking rule ("route … has non-address bits set; expected …"), a
+**default route must be advertised in both families or in neither**: `--advertise-routes 0.0.0.0/0`
+on its own is refused with "0.0.0.0/0 advertised without its IPv6 counterpart, please also advertise
+::/0", and `::/0` on its own with the mirror of that. A node advertising only the v4 default is a
+*half* exit node — it takes its clients' IPv4 traffic while their IPv6 traffic leaves straight out
+their own link, a leak neither end can see. `--advertise-exit-node` **is** those two default routes,
+so it satisfies the rule by itself and satisfies it for a route list that names one default; turning
+it off while the routes still name one is refused for the same reason. A 4via6 prefix is also checked
+as one (Go `ValidateViaPrefix`): it must sit in `fd7a:115c:a1e0:b1a::/64`, be at least a `/96`, and
+embed a site id of `0xffff` or less — otherwise it would be advertised as an ordinary IPv6 route that
+decodes to no IPv4 CIDR at all. Use `tnet debug via <site-id> <ipv4-cidr>` to produce a well-formed
+one.
+
 `tnet switch <target>` only ever *selects* a profile that exists: a target matching no profile by id
 or nickname is refused, exactly as Go's `tailscale switch` refuses it (`No profile named ...`), so a
 typo can no longer disconnect the node into an empty profile. Creating one is its own request —

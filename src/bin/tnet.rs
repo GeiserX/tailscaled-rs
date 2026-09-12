@@ -4591,7 +4591,9 @@ fn run_debug_env() {
 /// The Tailscale 4via6 `via` range, `fd7a:115c:a1e0:b1a::/64` (Go `tsaddr.TailscaleViaRange`; "b1a"
 /// ≈ "via"). A 4via6 route encodes an IPv4 CIDR + a 32-bit site id into a /64-prefixed IPv6 route so
 /// that multiple subnet routers can advertise the *same* private IPv4 space without colliding.
-const VIA_RANGE_PREFIX: [u8; 8] = [0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 0x0b, 0x1a];
+/// Taken from the daemon's route-set validation ([`tailscaled_rs::routes`]), which refuses a
+/// malformed via prefix on `--advertise-routes` — one definition of the range, not two.
+const VIA_RANGE_PREFIX: [u8; 8] = tailscaled_rs::routes::VIA_RANGE_PREFIX;
 
 /// Encode `(site_id, v4)` into a 4via6 IPv6 `via` route (Go `tsaddr.MapVia`). Layout (16 bytes):
 /// `[0..8] = via prefix`, `[8..12] = site id big-endian`, `[12..16] = the IPv4 address`. The result
