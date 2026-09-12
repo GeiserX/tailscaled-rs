@@ -4130,7 +4130,23 @@ impl Backend {
     /// an added one starts: plain TCP-forward accept loops are torn down + respawned, and the engine
     /// web serve is full-replaced (an emptied web config is cleared) — all without disturbing the
     /// device.
+    ///
+    /// **Refuses** (before persisting, leaving the live serve untouched) an incoming config that
+    /// would change the serve type of a port the current config already serves — Go
+    /// `validateServeConfigUpdate`; see [`serve::validate_serve_config_update`].
     pub async fn set_serve_config(&mut self, cfg: &serve::ServeConfig) -> Result<()> {
+        // Refuse a change that would silently destroy a live serve BEFORE anything is written: an
+        // incoming config may not change the serve type of a port the current config already serves
+        // (Go `validateServeConfigUpdate`). Every CLI write is a read-modify-write of the current
+        // config and SetServeConfig replaces it wholesale, so `serve --tcp 443` aimed at a port
+        // already terminating HTTPS used to be a plain map insert: success reported, previous serve
+        // gone, operator told nothing. The existing config is the one on disk for this profile —
+        // exactly what the CLI fetched and mutated. See `serve::validate_serve_config_update` for
+        // the rule and for which of Go's neighbouring rules have no state here yet.
+        let existing = self.serve_config().await;
+        if let Err(conflict) = serve::validate_serve_config_update(&existing, cfg) {
+            anyhow::bail!(conflict);
+        }
         // Heads-up if a funnel-enabled port forwards to a NON-loopback backend: funnel publishes to
         // the PUBLIC internet, so a non-loopback target means inbound internet traffic is spliced to
         // something other than this host's loopback (another LAN host, a metadata endpoint, a public
@@ -5215,6 +5231,100 @@ mod tests {
             be.serve_tasks.is_empty(),
             "set_serve_config with funnel on a down node must not spawn loops"
         );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn a_second_serve_on_a_busy_port_is_refused_not_silently_swapped() {
+        // A serve config is replaced wholesale, and the CLI builds each one by fetching the current
+        // config and inserting into its port map. Aiming a `--tcp` serve at a port that already
+        // terminates HTTPS therefore used to overwrite the handler, report success, and leave the
+        // operator to discover the loss when the old backend stopped receiving traffic. Go refuses
+        // it (`validateServeConfigUpdate`), so this must too — and must leave the live serve alone.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-serve-conflict-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+
+        // Port 443 terminates HTTPS and reverse-proxies to a local backend.
+        let mut https = serve::ServeConfig::default();
+        https.tcp.insert(
+            "443".into(),
+            crate::localapi::TcpPortHandler {
+                https: true,
+                ..Default::default()
+            },
+        );
+        https.web.insert(
+            "host.example.ts.net:443".into(),
+            crate::localapi::WebServerConfig {
+                handlers: std::collections::BTreeMap::from([(
+                    "/".to_string(),
+                    crate::localapi::HttpHandler {
+                        proxy: "127.0.0.1:3000".into(),
+                        ..Default::default()
+                    },
+                )]),
+            },
+        );
+        be.set_serve_config(&https).await.expect("first serve");
+
+        // Now a plain TCP forward on the same port, the way `tnet serve --tcp 443` builds it.
+        let mut tcp = be.serve_config().await;
+        tcp.tcp.insert(
+            "443".into(),
+            crate::localapi::TcpPortHandler {
+                tcp_forward: "127.0.0.1:8000".into(),
+                ..Default::default()
+            },
+        );
+        tcp.web.retain(|k, _| !k.ends_with(":443"));
+        let err = be
+            .set_serve_config(&tcp)
+            .await
+            .expect_err("a serve-type change on a busy port must be refused");
+        assert_eq!(
+            format!("{err:#}"),
+            r#"want to serve "tcp", but port 443 is already serving "https""#,
+            "the refusal reaches the operator as the SetServeConfig error body, so it is Go's \
+             message and nothing else"
+        );
+
+        // The refusal is total: the HTTPS serve is still the persisted config.
+        assert_eq!(
+            be.serve_config().await,
+            https,
+            "a refused update must not have been written"
+        );
+
+        // Re-targeting the SAME serve type is still allowed (this is not a freeze on the port).
+        let mut retarget = https.clone();
+        retarget.web.insert(
+            "host.example.ts.net:443".into(),
+            crate::localapi::WebServerConfig {
+                handlers: std::collections::BTreeMap::from([(
+                    "/".to_string(),
+                    crate::localapi::HttpHandler {
+                        proxy: "127.0.0.1:9000".into(),
+                        ..Default::default()
+                    },
+                )]),
+            },
+        );
+        be.set_serve_config(&retarget).await.expect("re-target");
+        assert_eq!(be.serve_config().await, retarget);
+
+        // And taking the port down, then serving `--tcp` on it, is the supported way through.
+        let mut off = retarget.clone();
+        off.tcp.remove("443");
+        off.web.retain(|k, _| !k.ends_with(":443"));
+        be.set_serve_config(&off).await.expect("serve 443 off");
+        let mut tcp = off.clone();
+        serve::set_tcp_forward(&mut tcp, 443, "127.0.0.1:8000".into());
+        be.set_serve_config(&tcp).await.expect("tcp after off");
+        assert_eq!(be.serve_config().await, tcp);
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

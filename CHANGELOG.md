@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.56.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.13...v0.56.0) (2026-09-11)
+
+
+### Features
+
+* **ssh:** refuse --ssh when the operator has disabled the SSH server ([#426](https://github.com/GeiserX/tailscaled-rs/issues/426)) ([c40d488](https://github.com/GeiserX/tailscaled-rs/commit/c40d488456970825d0e6b50632a762ee8073fca9))
+
 ## [0.55.13](https://github.com/GeiserX/tailscaled-rs/compare/v0.55.12...v0.55.13) (2026-09-10)
 
 

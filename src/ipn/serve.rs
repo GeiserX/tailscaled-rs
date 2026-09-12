@@ -354,6 +354,152 @@ pub fn is_terminate_tls_serve(h: &TcpPortHandler) -> bool {
     !h.terminate_tls.is_empty() && !h.tcp_forward.is_empty() && h.proxy_protocol == 0
 }
 
+/// A high-level descriptor of the *kind* of serve one port handler performs — the Rust analogue of
+/// Go's `serveType` (`ipn/ipnlocal/serve.go`). Two handlers on the same port are "the same kind"
+/// exactly when this compares equal, which is the test
+/// [`validate_serve_config_update`] applies before letting an incoming config replace a port.
+///
+/// The rendered names are Go's `serveType.String()` **verbatim** (`http`, `https`, `tcp`,
+/// `tls-terminated-tcp`, and `unknownServeType` for Go's unnamed `-1`), because they are interpolated
+/// into an error message the operator reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServeType {
+    /// TLS-terminated HTTP, reverse-proxied to a backend (Go `serveTypeHTTPS`, `--https`).
+    Https,
+    /// Plaintext HTTP, reverse-proxied to a backend (Go `serveTypeHTTP`, `--http`).
+    Http,
+    /// A raw TCP forward with no TLS (Go `serveTypeTCP`, `--tcp`).
+    Tcp,
+    /// TLS terminated, then the plaintext spliced as raw TCP (Go `serveTypeTLSTerminatedTCP`,
+    /// `--tls-terminated-tcp`).
+    TlsTerminatedTcp,
+    /// A handler that names no servable shape at all — Go's `default: return -1`, which its
+    /// `String()` renders `unknownServeType`. Two unknowns compare EQUAL, so (as in Go) one
+    /// shapeless handler may replace another without a refusal.
+    Unknown,
+}
+
+impl std::fmt::Display for ServeType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ServeType::Https => "https",
+            ServeType::Http => "http",
+            ServeType::Tcp => "tcp",
+            ServeType::TlsTerminatedTcp => "tls-terminated-tcp",
+            ServeType::Unknown => "unknownServeType",
+        })
+    }
+}
+
+/// Classify one port handler — the Rust analogue of Go's `serveTypeFromPortHandler`
+/// (`ipn/ipnlocal/serve.go`).
+///
+/// Go's own switch, in Go's order, covers the four fields this fork's [`TcpPortHandler`] shares with
+/// Go's `ipn.TCPPortHandler`: `HTTP` → `http`, `HTTPS` → `https`, a non-empty `TerminateTLS` →
+/// `tls-terminated-tcp`, a non-empty `TCPForward` → `tcp`, else unknown. The flags come first, so an
+/// `HTTPS` web entry whose proxy backend lives in `TCPForward` (this fork's legacy web shape) is
+/// `https` and not `tcp` — which is what Go says too, since a Go `HTTPS` port never carries a
+/// `TCPForward`.
+///
+/// **One arm is this fork's, not Go's.** Go keeps every web body in the top-level `Web` map, so its
+/// TCP handler for a web port is a bare `HTTPS`/`HTTP` flag and the four fields above classify it
+/// completely. This fork also accepts the *legacy* per-handler bodies
+/// ([`text`](TcpPortHandler::text)/[`redirect`](TcpPortHandler::redirect)/[`mounts`](TcpPortHandler::mounts),
+/// kept for read-compat with configs this fork already wrote), and an older one of those can carry a
+/// body with NO `HTTPS`/`HTTP` flag set. Go has no field to express that, so a field-for-field copy
+/// of its switch would call such a handler `unknownServeType` and let a `--tcp` silently replace a
+/// live web serve — the very hole this check exists to close. [`build_web_serve_state`] serves those
+/// entries on the TLS-terminating engine lane, exactly like an `https` one, so they classify
+/// [`Https`](ServeType::Https).
+///
+/// That arm sits AFTER `TCPForward`, matching the precedence the serve runtime itself uses: the LANE
+/// dispatch in the backend's `spawn_serve` tests [`is_plain_tcp_forward`] first, so a handler
+/// carrying both a bare `tcp_forward` and a legacy body is dispatched as a plain TCP forward and is
+/// classified as one here.
+pub fn serve_type(h: &TcpPortHandler) -> ServeType {
+    if h.http {
+        ServeType::Http
+    } else if h.https {
+        ServeType::Https
+    } else if !h.terminate_tls.is_empty() {
+        ServeType::TlsTerminatedTcp
+    } else if !h.tcp_forward.is_empty() {
+        ServeType::Tcp
+    } else if h.text.is_some() || h.redirect.is_some() || !h.mounts.is_empty() {
+        // Flagless legacy web body — served TLS-terminated by the engine lane. See the doc above.
+        ServeType::Https
+    } else {
+        ServeType::Unknown
+    }
+}
+
+/// Validate an incoming serve config against the one already in force, and refuse a change that
+/// would silently destroy a live serve — the Rust analogue of Go's `validateServeConfigUpdate`
+/// (`ipn/ipnlocal/serve.go`, called from `setServeConfigLocked`).
+///
+/// `SetServeConfig` replaces the config wholesale, and every CLI write is a read-modify-write of the
+/// current config, so without this check `tnet serve --tcp 443 tcp://localhost:8000` aimed at a port
+/// already terminating HTTPS is a plain map insert: it reports success and the previous serve is
+/// gone with no diagnostic. Go refuses it. The rule is Go's: **for every port the incoming config
+/// serves that the existing config already serves, the two handlers must classify to the same
+/// [`ServeType`]** ([`serve_type`]); otherwise the port must be taken down first (`tnet serve
+/// --https=443 off`) and re-served.
+///
+/// The returned message is Go's format string verbatim — `want to serve %q, but port %d is already
+/// serving %q` — because Go's own comment on this function says its errors are shown to CLI users
+/// and must carry enough to diagnose the conflict. It reaches the operator as the
+/// [`Response::Error`](crate::localapi::Response::Error) body of the refused `SetServeConfig`.
+///
+/// Clearing is never refused: `tnet serve reset` sends an empty config, which serves no port, so the
+/// loop body never runs — the same outcome as Go's `if !incoming.Valid() { return nil }`. Likewise a
+/// first serve on a node with no existing config passes, matching Go's `if !existing.Valid()`.
+/// Removing or re-targeting a port within its own serve type is untouched.
+///
+/// # What of Go's function is NOT ported, and why
+///
+/// Go validates four more things; none of them has state to run against in this daemon, so porting
+/// them would be dead code, not parity. They are named here so that whoever adds the missing state
+/// knows where the check belongs — each is a loop over an `existing`/`incoming` field this signature
+/// already hands them:
+///
+/// - **`listener already exists for port %d`** — a NEW foreground session landing on a port some
+///   other session already serves.
+/// - **`foreground listener already exists for port %d`** — a background config overwriting a port a
+///   foreground session holds.
+///   Both need `ServeConfig.Foreground`, which this fork does not model: a foreground serve here is
+///   torn down by `tnet` itself from its own signal handler (see `hold_foreground_serve` in the CLI),
+///   not by a daemon-held session, so the daemon has no second session's ports to collide with. When
+///   the daemon owns sessions, these two go in front of the serve-type loop below, in Go's order.
+/// - **The per-service serve-type rule** (`… is already serving %q for %s`) and the **Service TUN
+///   exclusivity** rules (`cannot configure TUN mode in combination with TCP or web handlers for %s`
+///   and its two update-time variants) — both need `ServeConfig.Services`, and this fork's Tailscale
+///   Services support is read-only (no `ServeConfig` field, nothing to write a service handler with).
+pub fn validate_serve_config_update(
+    existing: &ServeConfig,
+    incoming: &ServeConfig,
+) -> Result<(), String> {
+    // Incoming configuration cannot change the serve type in use by a port.
+    for (port_str, incoming_handler) in &incoming.tcp {
+        let Some(existing_handler) = existing.tcp.get(port_str) else {
+            continue; // A port nothing serves yet is free.
+        };
+        let Ok(port) = port_str.parse::<u16>() else {
+            // Not a tailnet port at all; the rest of the serve code skips such a key rather than
+            // serving it, so there is no live serve to protect and nothing to name in the message.
+            continue;
+        };
+        let existing_type = serve_type(existing_handler);
+        let incoming_type = serve_type(incoming_handler);
+        if incoming_type != existing_type {
+            return Err(format!(
+                "want to serve \"{incoming_type}\", but port {port} is already serving \
+                 \"{existing_type}\""
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Set (or replace) the TCP forward for `port` → `forward_to` (Go `SetTCPForwarding`). `forward_to`
 /// is stored verbatim as the dial target (`IP:port`). The map key is the port rendered as a string
 /// (see [`ServeConfig::tcp`](crate::localapi::ServeConfig::tcp) for why the key is a string).
@@ -1223,6 +1369,313 @@ mod tests {
         // An entirely empty config likewise.
         let state = build_web_serve_state(&ServeConfig::default(), "host.example.ts.net");
         assert_eq!(state, tailscale::ServeState::default());
+    }
+
+    /// Build a web port handler in the Go shape: the `TCP[port]` flag plus a `Web[host:port]` body.
+    fn go_web(cfg: &mut ServeConfig, host: &str, port: u16, tls: bool, proxy: &str) {
+        cfg.tcp.insert(
+            port.to_string(),
+            TcpPortHandler {
+                https: tls,
+                http: !tls,
+                ..Default::default()
+            },
+        );
+        cfg.web.insert(
+            format!("{host}:{port}"),
+            WebServerConfig {
+                handlers: std::collections::BTreeMap::from([(
+                    "/".to_string(),
+                    HttpHandler {
+                        proxy: proxy.to_string(),
+                        ..Default::default()
+                    },
+                )]),
+            },
+        );
+    }
+
+    #[test]
+    fn serve_type_classifies_every_handler_shape() {
+        // Go's four arms, in Go's order (`serveTypeFromPortHandler`).
+        assert_eq!(
+            serve_type(&TcpPortHandler {
+                https: true,
+                ..Default::default()
+            }),
+            ServeType::Https
+        );
+        assert_eq!(
+            serve_type(&TcpPortHandler {
+                http: true,
+                ..Default::default()
+            }),
+            ServeType::Http
+        );
+        assert_eq!(
+            serve_type(&TcpPortHandler {
+                tcp_forward: "127.0.0.1:8000".into(),
+                ..Default::default()
+            }),
+            ServeType::Tcp
+        );
+        assert_eq!(
+            serve_type(&TcpPortHandler {
+                terminate_tls: "host.example.ts.net".into(),
+                tcp_forward: "127.0.0.1:8000".into(),
+                ..Default::default()
+            }),
+            ServeType::TlsTerminatedTcp,
+            "TerminateTLS outranks TCPForward, as in Go"
+        );
+        // A handler naming no servable shape is Go's `-1`.
+        assert_eq!(serve_type(&TcpPortHandler::default()), ServeType::Unknown);
+
+        // Flag before backend: this fork's legacy web shape keeps the proxy backend in TCPForward
+        // alongside the HTTPS flag, and it must still classify `https`, never `tcp`.
+        assert_eq!(
+            serve_type(&TcpPortHandler {
+                https: true,
+                tcp_forward: "127.0.0.1:3000".into(),
+                ..Default::default()
+            }),
+            ServeType::Https
+        );
+
+        // The one arm that is this fork's and not Go's: a legacy web BODY with no HTTPS/HTTP flag.
+        // `build_web_serve_state` serves these on the TLS-terminating engine lane, so they are https.
+        for h in [
+            TcpPortHandler {
+                text: Some("hi".into()),
+                ..Default::default()
+            },
+            TcpPortHandler {
+                redirect: Some(RedirectSpec {
+                    to: "https://example.com/".into(),
+                    status: 302,
+                }),
+                ..Default::default()
+            },
+            TcpPortHandler {
+                mounts: std::collections::BTreeMap::from([(
+                    "/".to_string(),
+                    WebMount::Text { body: "hi".into() },
+                )]),
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                is_web_serve(&h),
+                "fixture must be a web serve for the classification to be the honest one: {h:?}"
+            );
+            assert_eq!(serve_type(&h), ServeType::Https, "for {h:?}");
+        }
+
+        // …but a bare TCPForward wins over a legacy body, matching the LANE dispatch, which tests
+        // `is_plain_tcp_forward` first.
+        let both = TcpPortHandler {
+            tcp_forward: "127.0.0.1:8000".into(),
+            text: Some("hi".into()),
+            ..Default::default()
+        };
+        assert!(is_plain_tcp_forward(&both));
+        assert_eq!(serve_type(&both), ServeType::Tcp);
+    }
+
+    #[test]
+    fn serve_type_renders_gos_names() {
+        // These strings are interpolated into an operator-facing message, so they are Go's
+        // `serveType.String()` verbatim — including the unnamed `-1` case.
+        assert_eq!(ServeType::Https.to_string(), "https");
+        assert_eq!(ServeType::Http.to_string(), "http");
+        assert_eq!(ServeType::Tcp.to_string(), "tcp");
+        assert_eq!(
+            ServeType::TlsTerminatedTcp.to_string(),
+            "tls-terminated-tcp"
+        );
+        assert_eq!(ServeType::Unknown.to_string(), "unknownServeType");
+    }
+
+    #[test]
+    fn second_serve_on_a_busy_port_is_refused_with_gos_message() {
+        // THE gap: port 443 terminates HTTPS; `tnet serve --tcp 443 tcp://localhost:8000` read the
+        // config, inserted over the port and sent it back. It used to succeed and the HTTPS serve
+        // was gone with no diagnostic.
+        let mut existing = ServeConfig::default();
+        go_web(
+            &mut existing,
+            "host.example.ts.net",
+            443,
+            true,
+            "127.0.0.1:3000",
+        );
+
+        let mut incoming = existing.clone();
+        incoming.tcp.insert(
+            "443".into(),
+            TcpPortHandler {
+                tcp_forward: "127.0.0.1:8000".into(),
+                ..Default::default()
+            },
+        );
+        incoming.web.retain(|k, _| !k.ends_with(":443"));
+
+        assert_eq!(
+            validate_serve_config_update(&existing, &incoming),
+            Err(r#"want to serve "tcp", but port 443 is already serving "https""#.to_string()),
+            "Go's message verbatim — it is what the operator is shown"
+        );
+    }
+
+    #[test]
+    fn every_serve_type_change_on_a_busy_port_is_refused() {
+        let shapes = [
+            (
+                ServeType::Https,
+                TcpPortHandler {
+                    https: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                ServeType::Http,
+                TcpPortHandler {
+                    http: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                ServeType::Tcp,
+                TcpPortHandler {
+                    tcp_forward: "127.0.0.1:8000".into(),
+                    ..Default::default()
+                },
+            ),
+            (
+                ServeType::TlsTerminatedTcp,
+                TcpPortHandler {
+                    terminate_tls: "host.example.ts.net".into(),
+                    tcp_forward: "127.0.0.1:8000".into(),
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (old_type, old_h) in &shapes {
+            for (new_type, new_h) in &shapes {
+                let mut existing = ServeConfig::default();
+                existing.tcp.insert("8443".into(), old_h.clone());
+                let mut incoming = ServeConfig::default();
+                incoming.tcp.insert("8443".into(), new_h.clone());
+                let got = validate_serve_config_update(&existing, &incoming);
+                if old_type == new_type {
+                    assert_eq!(
+                        got,
+                        Ok(()),
+                        "re-serving {old_type} over {old_type} is a re-target, not a conflict"
+                    );
+                } else {
+                    assert_eq!(
+                        got,
+                        Err(format!(
+                            "want to serve \"{new_type}\", but port 8443 is already serving \
+                             \"{old_type}\""
+                        ))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn same_serve_type_may_be_re_targeted_and_free_ports_are_untouched() {
+        let mut existing = ServeConfig::default();
+        go_web(
+            &mut existing,
+            "host.example.ts.net",
+            443,
+            true,
+            "127.0.0.1:3000",
+        );
+        set_tcp_forward(&mut existing, 2222, "127.0.0.1:22".into());
+
+        // Re-point the https serve at another backend: same serve type → allowed.
+        let mut incoming = ServeConfig::default();
+        go_web(
+            &mut incoming,
+            "host.example.ts.net",
+            443,
+            true,
+            "127.0.0.1:9000",
+        );
+        set_tcp_forward(&mut incoming, 2222, "127.0.0.1:22".into());
+        // …and add a serve on a port nothing holds.
+        set_tcp_forward(&mut incoming, 8443, "127.0.0.1:5000".into());
+        assert_eq!(validate_serve_config_update(&existing, &incoming), Ok(()));
+
+        // Taking a port down (`serve --https=443 off`) is never a conflict: the rule only looks at
+        // ports the INCOMING config serves.
+        let mut down = existing.clone();
+        down.tcp.remove("443");
+        down.web.retain(|k, _| !k.ends_with(":443"));
+        assert_eq!(validate_serve_config_update(&existing, &down), Ok(()));
+
+        // `serve reset` sends an empty config — Go's `if !incoming.Valid() { return nil }`.
+        assert_eq!(
+            validate_serve_config_update(&existing, &ServeConfig::default()),
+            Ok(())
+        );
+        // A first serve with nothing in force — Go's `if !existing.Valid() { return nil }`.
+        assert_eq!(
+            validate_serve_config_update(&ServeConfig::default(), &existing),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn shapeless_handlers_and_unservable_port_keys_do_not_conflict() {
+        // Two handlers that name no serve shape are both Go's `-1`, which compares equal: no refusal.
+        let mut existing = ServeConfig::default();
+        existing.tcp.insert(
+            "443".into(),
+            TcpPortHandler {
+                proxy_protocol: 2,
+                ..Default::default()
+            },
+        );
+        let mut incoming = ServeConfig::default();
+        incoming.tcp.insert("443".into(), TcpPortHandler::default());
+        assert_eq!(validate_serve_config_update(&existing, &incoming), Ok(()));
+
+        // Going from shapeless to a real serve IS a change of kind, and Go names the unknown side.
+        let mut incoming = ServeConfig::default();
+        set_tcp_forward(&mut incoming, 443, "127.0.0.1:8000".into());
+        assert_eq!(
+            validate_serve_config_update(&existing, &incoming),
+            Err(
+                r#"want to serve "tcp", but port 443 is already serving "unknownServeType""#
+                    .to_string()
+            )
+        );
+
+        // A key that is not a tailnet port is never served (the LANE dispatch and
+        // `build_web_serve_state` both skip it), so there is no live serve to protect.
+        let mut existing = ServeConfig::default();
+        existing.tcp.insert(
+            "not-a-port".into(),
+            TcpPortHandler {
+                https: true,
+                ..Default::default()
+            },
+        );
+        let mut incoming = ServeConfig::default();
+        incoming.tcp.insert(
+            "not-a-port".into(),
+            TcpPortHandler {
+                tcp_forward: "127.0.0.1:8000".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(validate_serve_config_update(&existing, &incoming), Ok(()));
     }
 
     #[tokio::test]
