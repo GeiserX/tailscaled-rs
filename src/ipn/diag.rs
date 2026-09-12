@@ -446,18 +446,66 @@ pub(super) async fn netcheck(dev: &tailscale::Device) -> Response {
 /// an engine error (e.g. no netcheck report yet → no measured preferred DERP region for the
 /// latency ranking) → a clear [`Response::Error`]. Read-only — it computes a suggestion, mutates
 /// nothing (engaging the node is a separate `set --exit-node`).
+///
+/// The engine's answer is then passed through the administrator's `AllowedSuggestedExitNodes`
+/// allow-list ([`permitted_suggestion`]), so a policy-managed node is never steered onto a node the
+/// administrator excluded.
 pub(super) async fn suggest_exit_node(dev: &tailscale::Device) -> Response {
     match dev.suggest_exit_node().await {
-        Ok(Some(s)) => Response::ExitNodeSuggestion {
-            suggestion: Some(crate::localapi::ExitNodeSuggestionView {
-                id: s.id.0,
-                name: s.name,
-            }),
+        Ok(suggestion) => Response::ExitNodeSuggestion {
+            suggestion: permitted_suggestion(
+                suggestion,
+                super::syspolicy::allowed_suggested_exit_nodes().as_ref(),
+            ),
         },
-        Ok(None) => Response::ExitNodeSuggestion { suggestion: None },
         Err(e) => Response::Error {
             message: format!("exit-node suggest failed: {e:?}"),
         },
+    }
+}
+
+/// Apply the administrator's exit-node suggestion allow-list to the engine's answer — the daemon-side
+/// half of Go's `AllowedSuggestedExitNodes` gate (`suggestExitNodeUsingDERP`'s
+/// `if allowList != nil && !allowList.Contains(peer.StableID()) { continue }`,
+/// `ipn/ipnlocal/local.go`).
+///
+/// `allow_list` is [`syspolicy::allowed_suggested_exit_nodes`](super::syspolicy::allowed_suggested_exit_nodes):
+/// `None` when the key is unset, which is **no restriction** (Go's nil set), and `Some(set)` when it
+/// is configured — including `Some(empty)` for a configured empty array, which permits nothing. A
+/// suggestion the set excludes is withheld, yielding the same honest empty result Go produces when no
+/// candidate passes the filter: recommending a forbidden node, which an operator would then engage
+/// with `set --exit-node=<id>`, is the one outcome the policy exists to prevent.
+///
+/// **Refuse, not re-rank.** Go filters the *candidate list* before the DERP-latency ranking, so it
+/// answers with the best node the administrator permits. This daemon is handed one already-chosen
+/// node, so an allow-list that excludes the engine's top pick while permitting a runner-up yields no
+/// suggestion here where Go yields that runner-up. Re-ranking needs the candidate set and the DERP
+/// latencies, neither of which the engine exposes — engine ask #44 in `docs/ENGINE_ASKS.md`; it is
+/// deliberately not re-implemented from the peer list, which would be a different measurement wearing
+/// Go's name. The withholding is logged, because "no suggestion available" for a policy reason and
+/// for an empty tailnet are very different things to the operator reading the daemon log. (The
+/// engine's suggestion is *sticky*, so a withheld node stays withheld across calls rather than
+/// flapping.)
+fn permitted_suggestion(
+    suggestion: Option<tailscale::ExitNodeSuggestion>,
+    allow_list: Option<&std::collections::BTreeSet<String>>,
+) -> Option<crate::localapi::ExitNodeSuggestionView> {
+    let suggestion = suggestion?;
+    let id = suggestion.id.0;
+    match allow_list {
+        Some(allowed) if !allowed.contains(&id) => {
+            tracing::warn!(
+                suggested_id = %id,
+                allowed = allowed.len(),
+                "exit-node suggest: withholding the suggestion — AllowedSuggestedExitNodes does not \
+                 list it; this build cannot re-rank to the best allowed node (see ENGINE_ASKS #44)"
+            );
+            None
+        }
+        _ => Some(crate::localapi::ExitNodeSuggestionView {
+            id,
+            name: suggestion.name,
+        }),
     }
 }
 
@@ -2527,5 +2575,104 @@ mod tests {
         assert_eq!(p2, base.join("doc (2).txt").to_string_lossy());
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Build the engine's suggestion shape the way `Device::suggest_exit_node` returns it.
+    fn suggestion(id: &str, name: &str) -> tailscale::ExitNodeSuggestion {
+        tailscale::ExitNodeSuggestion {
+            id: tailscale::StableNodeId(id.to_string()),
+            name: name.to_string(),
+        }
+    }
+
+    /// An allow-list as `syspolicy::allowed_suggested_exit_nodes` resolves one.
+    fn allow(ids: &[&str]) -> std::collections::BTreeSet<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    #[test]
+    fn an_unrestricted_node_gets_the_engines_suggestion_verbatim() {
+        use super::permitted_suggestion;
+        // `None` = `AllowedSuggestedExitNodes` unset = Go's nil set = no restriction. A node with no
+        // policy file must keep getting suggestions, id and name untouched.
+        let view = permitted_suggestion(
+            Some(suggestion("nodeTOPPICK", "exit-1.example.ts.net")),
+            None,
+        )
+        .expect("an unset allow-list must not suppress the suggestion");
+        assert_eq!(view.id, "nodeTOPPICK");
+        assert_eq!(view.name, "exit-1.example.ts.net");
+    }
+
+    #[test]
+    fn a_suggestion_the_administrator_permits_is_handed_back() {
+        use super::permitted_suggestion;
+        let allowed = allow(&["nodeAAA", "nodeTOPPICK"]);
+        let view = permitted_suggestion(
+            Some(suggestion("nodeTOPPICK", "exit-1.example.ts.net")),
+            Some(&allowed),
+        )
+        .expect("a listed node is exactly what the allow-list is for");
+        assert_eq!(view.id, "nodeTOPPICK");
+        assert_eq!(view.name, "exit-1.example.ts.net");
+    }
+
+    #[test]
+    fn a_suggestion_outside_the_allow_list_is_withheld() {
+        use super::permitted_suggestion;
+        // The bug this closes: the engine ranks on DERP latency alone and can hand back a node the
+        // administrator excluded, which the operator would then engage with `set --exit-node=<id>`.
+        // An empty result is what Go returns when no candidate passes the filter.
+        let allowed = allow(&["nodeAAA", "nodeBBB"]);
+        assert_eq!(
+            permitted_suggestion(
+                Some(suggestion("nodeFORBIDDEN", "exit-9.example.ts.net")),
+                Some(&allowed),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_configured_empty_allow_list_withholds_every_suggestion() {
+        use super::permitted_suggestion;
+        // `Some(empty)` is a configured `[]`: a restriction no node satisfies. Distinct from `None`.
+        let allowed = allow(&[]);
+        assert_eq!(
+            permitted_suggestion(
+                Some(suggestion("nodeAAA", "exit-1.example.ts.net")),
+                Some(&allowed)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn no_suggestion_stays_no_suggestion_under_every_allow_list() {
+        use super::permitted_suggestion;
+        // `Ok(None)` from the engine (no eligible candidate) is already the honest empty result; the
+        // filter must not turn it into anything else, whatever the policy says.
+        let allowed = allow(&["nodeAAA"]);
+        assert_eq!(permitted_suggestion(None, None), None);
+        assert_eq!(permitted_suggestion(None, Some(&allowed)), None);
+        assert_eq!(permitted_suggestion(None, Some(&allow(&[]))), None);
+    }
+
+    #[test]
+    fn the_allow_list_matches_the_stable_id_exactly() {
+        use super::permitted_suggestion;
+        // Membership is whole-id equality (Go `set.Set[tailcfg.StableNodeID].Contains`), not a prefix
+        // or substring test — a near-miss id is not a match in either direction.
+        let allowed = allow(&["nodeAAA"]);
+        for id in ["nodeAA", "nodeAAAA", "NODEAAA", " nodeAAA"] {
+            assert_eq!(
+                permitted_suggestion(
+                    Some(suggestion(id, "exit-1.example.ts.net")),
+                    Some(&allowed)
+                ),
+                None,
+                "{id} is not the listed id and must not be suggested"
+            );
+        }
     }
 }

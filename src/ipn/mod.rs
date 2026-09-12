@@ -288,6 +288,129 @@ pub async fn captive_portal_loop(backend: std::sync::Arc<tokio::sync::Mutex<Back
     }
 }
 
+/// The always-on reconnect timer's runtime half — Go's `b.clock.AfterFunc` callback from
+/// `startReconnectTimerLocked`, plus the always-on slice of `sysPolicyChanged`
+/// (`ipn/ipnlocal/local.go`). A daemon-lifetime task, spawned by `tailnetd` beside
+/// [`captive_portal_loop`]. Never returns.
+///
+/// ## What it is for
+///
+/// A disconnect the always-on gate permits leaves the node down and, by itself, indefinitely so:
+/// [`Backend::override_always_on`] is what stops the policy re-assert from undoing it. `ReconnectAfter`
+/// is the administrator's bound on that window — "a user with a reason may take the node down for
+/// exactly this long and no longer" — and something has to be awake to close it. That is this loop.
+///
+/// ## Why a loop rather than a task per arming
+///
+/// Firing means a bring-up, and a bring-up needs the `Arc<Mutex<Backend>>` that the backend cannot
+/// hand to itself from inside `down`. So the arming lives in a [`watch`](tokio::sync::watch) cell on
+/// the backend ([`Backend::watch_reconnect`]) and this loop — which does hold the `Arc` — sleeps
+/// against it. Arming, re-arming and cancelling are all a `send` into that cell, which wakes the
+/// loop immediately: there is no poll interval to make a cancellation lag, and a node that never
+/// disconnects costs exactly one parked task.
+///
+/// The same loop carries the policy-change subscription, because Go resets the override from
+/// `sysPolicyChanged` and this fork's policy-change edge is a process-global tick
+/// ([`syspolicy::watch_policy`]) with no backend receiver to hang off. Honest scope note: this
+/// build's one policy source captures its file at startup, so that tick fires on a `syspolicy
+/// reload` without any value having moved — which is exactly why
+/// [`Backend::sys_policy_changed`] compares a snapshot instead of resetting on every tick.
+///
+/// ## The guards
+///
+/// When the sleep elapses, the arming has to re-prove itself under the lock — it is still the live
+/// timer, and its profile is still the current one — before anything is brought up. See
+/// [`ReconnectTimer`] for why each guard exists. The bring-up itself runs **off-lock** through
+/// [`drive_up`], the same discipline every other bring-up path here follows, so an automatic
+/// reconnect never head-of-line blocks a concurrent `status`/`down`.
+pub async fn reconnect_loop(backend: std::sync::Arc<tokio::sync::Mutex<Backend>>) {
+    let mut armed_rx = backend.lock().await.watch_reconnect();
+    let mut policy_rx = syspolicy::watch_policy();
+
+    loop {
+        // Take a copy of the current arming: the sleep below must not hold a borrow of the cell,
+        // and the value is what the fire-time guards are checked against.
+        let armed = armed_rx.borrow_and_update().clone();
+        tokio::select! {
+            // The cell moved: a new arming replaced this one, or it was cancelled. Re-read it.
+            changed = armed_rx.changed() => {
+                if changed.is_err() {
+                    // The backend (and its sender) is gone — the daemon is shutting down.
+                    return;
+                }
+            }
+            // The effective policy may have moved. Only a change to an always-on key revokes an
+            // outstanding exemption, which `sys_policy_changed` decides.
+            changed = policy_rx.changed() => {
+                if changed.is_err() {
+                    // The policy bus is a process-global `LazyLock` sender that nothing drops, so
+                    // this is unreachable in a running daemon. Ending the loop is still the right
+                    // answer if it ever happens: a receiver that returns an error immediately would
+                    // otherwise spin this task at full speed.
+                    tracing::warn!(
+                        "always-on: the policy-change bus closed; stopping the reconnect loop"
+                    );
+                    return;
+                }
+                let keys = syspolicy::always_on_keys();
+                backend.lock().await.sys_policy_changed(keys);
+            }
+            // The window elapsed.
+            () = sleep_until_armed(armed.as_ref()) => {
+                let Some(armed) = armed else {
+                    unreachable!("sleep_until_armed never completes without an arming");
+                };
+                reconnect_now(&backend, &armed).await;
+            }
+        }
+    }
+}
+
+/// Sleep until `armed`'s deadline, or forever when nothing is armed — the "no timer" arm of
+/// [`reconnect_loop`]'s `select!`, kept a named future so the loop reads as the three edges it is.
+async fn sleep_until_armed(armed: Option<&ReconnectTimer>) {
+    match armed {
+        Some(timer) => tokio::time::sleep_until(timer.deadline()).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Fire one due reconnect: re-check Go's two guards under the lock, then bring the node up off-lock
+/// and log the outcome in Go's words (`automatically reconnected as %q after %v`, or the matching
+/// failure line).
+///
+/// The bring-up carries **no auth key**, which is what Go's `WantRunning:true` edit amounts to: the
+/// node resumes from the registration it still holds. A profile whose key a `logout` discarded has
+/// nothing to resume, so this reaches `NeedsLogin` and takes the failure line — the honest report,
+/// and the same terminal state Go's edit leaves that profile in.
+async fn reconnect_now(
+    backend: &std::sync::Arc<tokio::sync::Mutex<Backend>>,
+    armed: &ReconnectTimer,
+) {
+    let profile = {
+        let mut be = backend.lock().await;
+        if !be.claim_due_reconnect(armed) {
+            return;
+        }
+        // Go names the profile's login name in the message; this fork has no user profile on the
+        // backend, so it names the profile the way every other operator-facing line here does (the
+        // display name, falling back to the id) — the same choice the always-on audit record makes.
+        be.current_profile_name().await
+    };
+    let after = armed.after_go();
+    match drive_up(backend, None, None, UpOptions::default()).await {
+        Ok(()) => tracing::info!(
+            "always-on: automatically reconnected as {} after {after}",
+            syspolicy::quoted(&profile)
+        ),
+        Err(e) => tracing::warn!(
+            error = %format!("{e:#}"),
+            "always-on: failed to automatically reconnect as {} after {after}",
+            syspolicy::quoted(&profile)
+        ),
+    }
+}
+
 /// One `serve --tcp` accept loop: bind the node's tailnet IPv4 on `port` and splice every inbound
 /// connection to `target` (a localhost `host:port`). Runs forever until the listener errors (engine
 /// torn down) or the task is aborted. Spawns one sub-task per accepted connection so a slow peer
@@ -1864,6 +1987,98 @@ pub struct Backend {
     /// `status --watch` therefore learns about the warning on its next snapshot rather than being
     /// pushed one — consistent with this fork's `Notify` having no health stream at all.
     captive_portal_detected: bool,
+    /// Whether a disconnect the always-on gate PERMITTED is currently standing — Go's
+    /// `LocalBackend.overrideAlwaysOn` (`ipn/ipnlocal/local.go`).
+    ///
+    /// While it is set, [`syspolicy::apply_to_prefs`] skips the `AlwaysOn.Enabled` re-assert, so the
+    /// disconnect survives every reconcile point instead of being undone by the next unrelated `tnet
+    /// set`. (An `up` is a reconcile point too, but it clears this first — see below, and that is
+    /// the point: bringing the node up by hand is not something the policy has to fight.) Without it
+    /// the [`ReconnectAfter`][reconnect] timer
+    /// would be pointless: the re-assert would put the node back up long before the timer fired.
+    ///
+    /// Set on a disconnect and cleared on exactly the three events Go clears it on:
+    /// - a **connect** — [`begin_up`](Backend::begin_up), where `want_running` goes back to true;
+    /// - a **profile switch** — [`activate_profile`](Backend::activate_profile), because the
+    ///   exemption was granted against the profile that asked for it;
+    /// - an always-on **policy change** — [`sys_policy_changed`](Backend::sys_policy_changed), Go's
+    ///   `sysPolicyChanged` clearing it whenever `AlwaysOn.Enabled` or `AlwaysOn.OverrideWithReason`
+    ///   moves, so an administrator's edit revokes an outstanding exemption.
+    ///
+    /// **In-memory, exactly like Go's**, and that is the safe direction: a daemon restart loses the
+    /// exemption, the profile load reconciles policy with the flag clear, and an always-on node comes
+    /// back up. A policy whose whole purpose is to keep the node connected must not be defeated by
+    /// killing the daemon.
+    ///
+    /// [reconnect]: syspolicy::PKEY_RECONNECT_AFTER
+    override_always_on: bool,
+    /// The outstanding always-on reconnect timer's arming, or `None` when none is armed — Go's
+    /// `LocalBackend.reconnectTimer` (`ipn/ipnlocal/local.go`).
+    ///
+    /// A [`watch`](tokio::sync::watch) cell rather than a spawned-per-arm task, because the thing
+    /// that has to fire it — a bring-up — needs the `Arc<Mutex<Backend>>` the backend cannot hand
+    /// itself. [`reconnect_loop`] holds that `Arc`, watches this cell, and sleeps until the deadline
+    /// in it; re-arming or cancelling is a `send` that wakes the loop, which is what makes
+    /// [`stop_reconnect_timer`](Backend::stop_reconnect_timer) exact rather than advisory. The cell
+    /// is the single source of truth for "is a timer armed", so a daemon that never spawns the loop
+    /// (a unit test, another binary) still arms and cancels observably — it just never fires.
+    ///
+    /// See [`ReconnectTimer`] for the two guards the loop re-checks before it acts.
+    reconnect_tx: tokio::sync::watch::Sender<Option<ReconnectTimer>>,
+    /// Monotonic arming counter behind [`ReconnectTimer::seq`] — Go compares timer *identity*
+    /// (`b.reconnectTimer != timer`); this fork compares a number, because the armed value is copied
+    /// out of the watch cell rather than being a pointer the loop can hold.
+    reconnect_seq: u64,
+    /// The always-on policy keys as they were when this backend last looked — the snapshot
+    /// [`sys_policy_changed`](Backend::sys_policy_changed) compares against to decide whether an
+    /// administrator's edit revoked an outstanding exemption (Go's
+    /// `policy.HasChangedAnyOf(pkey.AlwaysOn, pkey.AlwaysOnOverrideWithReason)`).
+    ///
+    /// Seeded at [`load`](Backend::load) and updated on every comparison, so a change is seen exactly
+    /// once no matter how many times the policy ticks.
+    always_on_keys: syspolicy::AlwaysOnKeys,
+}
+
+/// One arming of the always-on reconnect timer — the state Go's `startReconnectTimerLocked` captures
+/// in the closure it hands to `b.clock.AfterFunc` (`ipn/ipnlocal/local.go`).
+///
+/// Both guards Go re-checks when the timer fires are carried here rather than recomputed, because
+/// both are answers about *the moment the timer was armed*:
+///
+/// - [`seq`](ReconnectTimer::seq) is Go's `b.reconnectTimer != timer` identity check. A timer that
+///   was cancelled or replaced while its sleep was in flight must not act — the sleep cannot be
+///   un-scheduled once the loop has entered it, so the arming that wakes has to prove it is still
+///   the live one.
+/// - [`profile`](ReconnectTimer::profile) is Go's captured `profileID`. Without it, a timer armed
+///   by a disconnect on one profile would reconnect whichever profile happened to be active when it
+///   fired — a different node, on a different tailnet, that nobody asked to be connected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconnectTimer {
+    /// Which arming this is; see the type docs. Compared against
+    /// [`Backend::reconnect_seq`](Backend::reconnect_seq) at fire time.
+    seq: u64,
+    /// The profile id that was active when the timer was armed.
+    profile: String,
+    /// The configured `ReconnectAfter`, kept so the fire-time log can name the window that elapsed
+    /// (Go's `after %v`) without re-reading a policy that may have moved since.
+    after: std::time::Duration,
+    /// When it fires — `armed_at + after`, on the same monotonic clock the loop sleeps against.
+    deadline: tokio::time::Instant,
+}
+
+impl ReconnectTimer {
+    /// When this arming fires.
+    pub fn deadline(&self) -> tokio::time::Instant {
+        self.deadline
+    }
+
+    /// The configured window, rendered the way Go's `%v` renders a `time.Duration` (`30m0s`) — used
+    /// in the two log lines `reconnect_loop` writes, so they read exactly like `tailscaled`'s.
+    fn after_go(&self) -> String {
+        crate::goduration::format_go_duration(
+            i64::try_from(self.after.as_nanos()).unwrap_or(i64::MAX),
+        )
+    }
 }
 
 /// What a [`Backend::switch_profile`] call actually did — the daemon-side half of the reporting Go's
@@ -2058,6 +2273,16 @@ impl Backend {
             has_node_key: false,
             // No detection has run yet; the captive-portal loop is the only writer from here on.
             captive_portal_detected: false,
+            // No disconnect has been permitted in THIS process, so no always-on exemption stands and
+            // no reconnect is outstanding. Both are deliberately in-memory (see the field docs): a
+            // restart forgets an exemption, and the profile-load reconcile below then brings an
+            // always-on node back up, which is the direction that keeps the policy's promise.
+            override_always_on: false,
+            reconnect_tx: tokio::sync::watch::channel(None).0,
+            reconnect_seq: 0,
+            // Seed the always-on snapshot from the policy as it stands at boot, so the first
+            // comparison reports a real change rather than "everything changed".
+            always_on_keys: syspolicy::always_on_keys(),
         };
         backend.has_node_key = backend.has_persisted_node_key().await;
         // Go reconciles system policy on every profile load, and this is one (the daemon's own, at
@@ -2085,13 +2310,17 @@ impl Backend {
     /// in-memory values are what `status`, `get` and the next bring-up all read, so nothing is lost
     /// by waiting for a real write.
     ///
+    /// It carries [`override_always_on`](Backend::override_always_on) into the apply, which is what
+    /// keeps a disconnect the always-on gate PERMITTED from being undone here: while the exemption
+    /// stands, the `AlwaysOn.Enabled` re-assert is skipped at every one of these call sites.
+    ///
     /// Silent when the policy is silent (the overwhelmingly common case: no `--syspolicy-file`, or
     /// one whose settings are already in force). A key this build cannot enforce is logged at WARN
     /// *every* time, not once: an administrator who shipped it is owed a message that is still in the
     /// log when they go looking, and the alternative — reporting intent that changes nothing — is the
     /// failure this whole path exists to remove.
     fn reconcile_sys_policy(&mut self, at: &'static str) {
-        let applied = syspolicy::apply_to_prefs(&mut self.prefs);
+        let applied = syspolicy::apply_to_prefs(&mut self.prefs, self.override_always_on);
         for change in &applied.changed {
             tracing::info!(
                 at,
@@ -2109,6 +2338,169 @@ impl Backend {
                 refusal.reason
             );
         }
+    }
+
+    /// Record that a disconnect this daemon **permitted** has just taken `want_running` from true to
+    /// false — Go's `onEditPrefsLocked` disconnect arm (`ipn/ipnlocal/local.go`):
+    ///
+    /// ```text
+    /// b.overrideAlwaysOn = true
+    /// if reconnectAfter, _ := b.polc.GetDuration(pkey.ReconnectAfter, 0); reconnectAfter > 0 {
+    ///     b.startReconnectTimerLocked(reconnectAfter)
+    /// }
+    /// ```
+    ///
+    /// Called by [`down`](Backend::down) and [`logout`](Backend::logout) — the two verbs that make
+    /// that transition — **after** the gate has allowed the disconnect and the pref has been flipped,
+    /// and only when the pref really was true before (Go guards on `oldPrefs.WantRunning()`, so a
+    /// `down` on an already-down node neither grants an exemption nor re-arms a timer, and cannot be
+    /// used to keep pushing a deadline out).
+    ///
+    /// `reconnect_after` is [`syspolicy::reconnect_after`]'s answer, passed in rather than read here
+    /// so the decision is testable without the process-global policy registry — the same split the
+    /// policy module uses throughout. `None` means the administrator set no bound: the exemption is
+    /// still granted (that is what makes the disconnect stick), it simply has no expiry, which is
+    /// Go's behaviour for an unset or non-positive `ReconnectAfter`.
+    fn on_permitted_disconnect(&mut self, reconnect_after: Option<std::time::Duration>) {
+        self.override_always_on = true;
+        // `None` arms nothing, and — like Go, whose `if reconnectAfter > 0` has no else — does not
+        // stop an existing timer either. Nothing can be outstanding here anyway: the transition
+        // guard at the call site means the node was up, and coming up cancels any timer.
+        if let Some(after) = reconnect_after {
+            self.start_reconnect_timer(after);
+        }
+    }
+
+    /// Arm (or re-arm) the reconnect timer to fire `after` from now — Go
+    /// `startReconnectTimerLocked`, which stops any previous timer and captures the current profile
+    /// id before scheduling.
+    ///
+    /// The arming is published to [`reconnect_loop`], which does the sleeping; replacing the value in
+    /// the cell IS the "stop any previous timer" half, because the loop re-reads the cell on every
+    /// change and the superseded arming can no longer pass [`claim_due_reconnect`] even if its sleep
+    /// were somehow still in flight.
+    fn start_reconnect_timer(&mut self, after: std::time::Duration) {
+        self.reconnect_seq += 1;
+        let armed = ReconnectTimer {
+            seq: self.reconnect_seq,
+            profile: self.current_profile.clone(),
+            after,
+            deadline: tokio::time::Instant::now() + after,
+        };
+        tracing::info!(
+            profile = %armed.profile,
+            after = %armed.after_go(),
+            "always-on: disconnect permitted; the node will reconnect itself when ReconnectAfter \
+             elapses"
+        );
+        // `send_replace`, not `send`: `send` REFUSES when there is no receiver, which would leave a
+        // daemon that never spawned `reconnect_loop` (a unit test, another binary) silently unarmed.
+        // The cell is the source of truth for "is a timer armed", so the value is written either
+        // way; with no loop running it simply has nobody to fire it, which is the honest state.
+        self.reconnect_tx.send_replace(Some(armed));
+    }
+
+    /// Cancel any outstanding reconnect timer — Go's `b.reconnectTimer.Stop()`, reached from every
+    /// place Go resets the always-on override.
+    ///
+    /// Idempotent and silent when nothing is armed, so the reset paths can call it unconditionally.
+    fn stop_reconnect_timer(&mut self) {
+        if self.is_reconnect_armed() {
+            self.reconnect_tx.send_replace(None);
+        }
+    }
+
+    /// Whether a reconnect timer is currently armed — the cell read, kept in one place so no caller
+    /// holds a [`watch`](tokio::sync::watch) borrow across a send (which would deadlock on the
+    /// cell's own lock).
+    fn is_reconnect_armed(&self) -> bool {
+        self.reconnect_tx.borrow().is_some()
+    }
+
+    /// Clear a standing always-on exemption and cancel its timer — Go's
+    /// `resetAlwaysOnOverrideLocked`. `at` names the event for the log.
+    ///
+    /// Idempotent: with no exemption standing and no timer armed this does nothing and says nothing,
+    /// which is what lets the three reset sites (connect, profile switch, always-on policy change)
+    /// call it unconditionally.
+    fn reset_always_on_override(&mut self, at: &'static str) {
+        let was_armed = self.is_reconnect_armed();
+        if self.override_always_on || was_armed {
+            tracing::info!(
+                at,
+                cancelled_reconnect = was_armed,
+                "always-on: the permitted-disconnect exemption no longer stands"
+            );
+        }
+        self.override_always_on = false;
+        self.stop_reconnect_timer();
+    }
+
+    /// React to the effective system policy having moved — Go's `sysPolicyChanged`, narrowed to the
+    /// part that owns backend state: `policy.HasChangedAnyOf(pkey.AlwaysOn,
+    /// pkey.AlwaysOnOverrideWithReason)` clears the always-on override.
+    ///
+    /// `current` is [`syspolicy::always_on_keys`]'s answer, passed in by [`reconnect_loop`] (which
+    /// holds the policy-change subscription) so the comparison is testable without the process-global
+    /// registry. Only a *change* resets: a policy tick that leaves both keys where they were must not
+    /// revoke an exemption the administrator did not touch — which matters here because this build's
+    /// one policy source captures the file at startup, so `tnet syspolicy reload` ticks the bus
+    /// without ever changing a value.
+    ///
+    /// Returns whether it reset anything, so a caller can log the edge.
+    fn sys_policy_changed(&mut self, current: syspolicy::AlwaysOnKeys) -> bool {
+        if current == self.always_on_keys {
+            return false;
+        }
+        tracing::info!(
+            "always-on: the administrator changed an always-on policy key; revoking any \
+             outstanding permitted-disconnect exemption"
+        );
+        self.always_on_keys = current;
+        self.reset_always_on_override("policy change");
+        true
+    }
+
+    /// Subscribe to the reconnect-timer arming cell — the handle [`reconnect_loop`] sleeps against.
+    pub fn watch_reconnect(&self) -> tokio::sync::watch::Receiver<Option<ReconnectTimer>> {
+        self.reconnect_tx.subscribe()
+    }
+
+    /// Go's two fire-time guards, taken together and under the same lock: is `armed` still the live
+    /// arming, and is the profile it was armed for still the current one?
+    ///
+    /// ```text
+    /// if b.reconnectTimer != timer { return }
+    /// b.reconnectTimer = nil
+    /// cp := b.pm.CurrentProfile()
+    /// if cp.ID() != profileID { return }
+    /// ```
+    ///
+    /// Go clears `b.reconnectTimer` between the two checks, and so does this: a claim that passes
+    /// the identity check empties the cell whether or not the profile check then lets the reconnect
+    /// through, so a due timer fires at most once either way. The identity check's own refusal
+    /// touches nothing — a superseded arming must not cancel the one that replaced it.
+    fn claim_due_reconnect(&mut self, armed: &ReconnectTimer) -> bool {
+        let live = self.reconnect_tx.borrow().clone();
+        if live.as_ref() != Some(armed) {
+            // Cancelled or replaced while the sleep was in flight (a manual `up`, a second `down`, a
+            // profile switch, a policy change). The newer intent wins.
+            return false;
+        }
+        if armed.profile != self.current_profile {
+            // The profile moved out from under the timer. Go returns here WITHOUT reconnecting, and
+            // with the timer already cleared above — the exemption belonged to the old profile, and
+            // reconnecting this one would connect a node nobody asked for.
+            self.reconnect_tx.send_replace(None);
+            tracing::info!(
+                armed_for = %armed.profile,
+                current = %self.current_profile,
+                "always-on: dropping a reconnect armed under a different profile"
+            );
+            return false;
+        }
+        self.reconnect_tx.send_replace(None);
+        true
     }
 
     /// The state directory this daemon is actually using — the root under which every profile's prefs
@@ -2360,6 +2752,11 @@ impl Backend {
         self.boot_attempted_up = false;
         // Adopt the target profile's node-key fact (computed above against the new `key_path`).
         self.has_node_key = has_node_key;
+        // An always-on exemption belongs to the profile whose operator asked for it, so it does not
+        // travel across a switch — and neither does its reconnect timer (Go resets both on a profile
+        // change). Cleared BEFORE the reconcile below, so the incoming profile is reconciled against
+        // the policy as written rather than under the outgoing profile's exemption.
+        self.reset_always_on_override("profile switch");
         // A profile load, exactly like the one in `load`: system policy applies to the newly-active
         // profile's prefs too, so a switch cannot be used to step out from under it. In memory only
         // (the swap above already persisted everything a switch owes to disk).
@@ -3253,6 +3650,10 @@ impl Backend {
         self.prefs.want_running = true;
         self.prefs.logged_out = false;
         self.ever_configured = true;
+        // The node is being connected, so any always-on exemption a previous disconnect earned is
+        // spent and its reconnect timer has nothing left to do — Go resets both on the connect edge.
+        // Before the reconcile below, so `AlwaysOn.Enabled` is back in force from this moment on.
+        self.reset_always_on_override("up");
         // System policy has the last word — after `--reset`, after every override this command
         // named, and before the persist. That ordering is the whole contract: an `up` cannot be used
         // to step out from under an administrator's policy, and `up --reset` (the one genuine
@@ -3719,6 +4120,10 @@ impl Backend {
     /// was.
     pub async fn down(&mut self, actor: alwayson::Actor<'_>) -> Result<()> {
         self.check_disconnect_policy(actor).await?;
+        // Go gates the always-on override + reconnect timer on the *transition*
+        // (`mp.WantRunningSet && !mp.WantRunning && oldPrefs.WantRunning()`), so read the old value
+        // before the flip below. A `down` on an already-down node is not a disconnect.
+        let was_running = self.prefs.want_running;
         self.stop_device().await;
         // Bump the generation so an `up` whose `Device::new` is still in flight (lock released) is
         // recognized as stale by `finish_up` and its device discarded — `down` wins. The bump also
@@ -3726,6 +4131,11 @@ impl Backend {
         self.bump_generation();
         self.prefs.want_running = false;
         self.ever_configured = true;
+        // The disconnect stands: stop the always-on re-assert from undoing it, and give it the
+        // deadline the administrator configured (if any) — Go's `onEditPrefsLocked`.
+        if was_running {
+            self.on_permitted_disconnect(syspolicy::reconnect_after());
+        }
         self.persist_prefs().await?;
         Ok(())
     }
@@ -3793,6 +4203,9 @@ impl Backend {
         // `WantRunning:false`, so the same `ipnauth.Disconnect` check applies), and a refusal must
         // leave the registration intact.
         self.check_disconnect_policy(actor).await?;
+        // Read the pre-edit intent for the same transition guard `down` uses: Go routes a logout
+        // through the same `WantRunning:false` edit, so `onEditPrefsLocked` fires for it too.
+        let was_running = self.prefs.want_running;
         // 1. Best-effort control-plane deregistration while the device is still alive. (Let-chain
         // rather than nested `if let` — clippy::collapsible_if; mirrors the `&&`-let style this
         // module already uses, e.g. the revert-guard arms.)
@@ -3847,6 +4260,13 @@ impl Backend {
         self.prefs.logged_out = true;
         self.prefs.has_logged_in = false;
         self.ever_configured = true;
+        // Same disconnect bookkeeping as `down` (Go makes no distinction — both are a
+        // `WantRunning:false` edit). What the timer can achieve differs, though: a logout has
+        // discarded the node key, so the reconnect it fires has no registration to resume and
+        // reaches `NeedsLogin` instead of `Running`, which the failure log says out loud.
+        if was_running {
+            self.on_permitted_disconnect(syspolicy::reconnect_after());
+        }
         self.persist_prefs().await?;
         Ok(())
     }
@@ -4435,7 +4855,8 @@ impl Backend {
     /// Suggest the best available exit node (the `tnet exit-node suggest` path). Thin `pub` shim over
     /// [`diag::suggest_exit_node`], uniform with the other off-lock diagnostics. See it for the
     /// `suggest_exit_node()` → [`Response::ExitNodeSuggestion`](crate::localapi::Response) mapping
-    /// (`Ok(None)` = no eligible candidate, an honest empty result, not an error).
+    /// (`Ok(None)` = no eligible candidate, an honest empty result, not an error) and for the
+    /// `AllowedSuggestedExitNodes` allow-list the engine's answer is filtered through.
     pub async fn suggest_exit_node(dev: &tailscale::Device) -> crate::localapi::Response {
         diag::suggest_exit_node(dev).await
     }
@@ -5182,6 +5603,13 @@ mod tests {
             // present drive the real wipe/build paths, which keep the cache consistent on their own.
             has_node_key: false,
             captive_portal_detected: false,
+            // No disconnect has happened yet, so no exemption stands and nothing is armed. No
+            // `reconnect_loop` runs in a unit test, which is deliberate: the arming cell is the
+            // observable state, and the tests below assert on it rather than on a fired timer.
+            override_always_on: false,
+            reconnect_tx: tokio::sync::watch::channel(None).0,
+            reconnect_seq: 0,
+            always_on_keys: syspolicy::AlwaysOnKeys::default(),
         }
     }
 
@@ -5782,6 +6210,330 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    // --- the always-on override + its `ReconnectAfter` timer (Go `onEditPrefsLocked`,
+    // `startReconnectTimerLocked`, `sysPolicyChanged`) ------------------------------------------
+    //
+    // These drive the backend's own decisions directly. The policy READ that feeds them
+    // (`syspolicy::reconnect_after`) is tested in `syspolicy`, over a resolved document, because the
+    // policy registry is process-global and registering into it would leak into every other test in
+    // this binary — the same split every other policy consumer here uses.
+
+    /// A permitted disconnect, as `down`/`logout` report it, with the administrator's bound.
+    fn permitted_disconnect(be: &mut Backend, after: Option<std::time::Duration>) {
+        be.on_permitted_disconnect(after);
+    }
+
+    #[tokio::test]
+    async fn a_permitted_disconnect_stands_and_carries_the_administrators_deadline() {
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-alwayson-arm-{}", std::process::id()));
+        let mut be = backend_for(&dir);
+        assert!(!be.override_always_on);
+        assert_eq!(
+            *be.reconnect_tx.borrow(),
+            None,
+            "nothing armed on a fresh backend"
+        );
+
+        let before = tokio::time::Instant::now();
+        permitted_disconnect(&mut be, Some(std::time::Duration::from_secs(30 * 60)));
+
+        assert!(
+            be.override_always_on,
+            "without the override the re-assert would undo the disconnect at the next reconcile"
+        );
+        let armed = be
+            .reconnect_tx
+            .borrow()
+            .clone()
+            .expect("a positive ReconnectAfter must arm a timer");
+        assert_eq!(
+            armed.profile, be.current_profile,
+            "Go captures the profile id at arming time"
+        );
+        assert_eq!(armed.after, std::time::Duration::from_secs(30 * 60));
+        assert!(
+            armed.deadline() >= before + std::time::Duration::from_secs(30 * 60),
+            "the deadline is measured from the disconnect, not from some later event"
+        );
+        assert_eq!(
+            armed.after_go(),
+            "30m0s",
+            "Go renders the window with Duration.String()"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disconnect_with_no_configured_bound_stands_but_never_expires() {
+        // Go's `if reconnectAfter > 0`: with no bound configured the exemption is still granted (that
+        // is what makes the permitted disconnect stick), it simply has no expiry.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-alwayson-nobound-{}", std::process::id()));
+        let mut be = backend_for(&dir);
+        permitted_disconnect(&mut be, None);
+        assert!(be.override_always_on);
+        assert_eq!(
+            *be.reconnect_tx.borrow(),
+            None,
+            "an unset/zero/negative ReconnectAfter must not arm a timer"
+        );
+    }
+
+    #[tokio::test]
+    async fn re_arming_supersedes_the_previous_timer() {
+        // Go's `startReconnectTimerLocked` stops any previous timer before scheduling, and its
+        // callback re-checks `b.reconnectTimer != timer`. Both halves matter: a superseded arming
+        // whose sleep is already in flight must not reconnect on the newer one's behalf.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-alwayson-rearm-{}", std::process::id()));
+        let mut be = backend_for(&dir);
+        permitted_disconnect(&mut be, Some(std::time::Duration::from_secs(60)));
+        let first = be.reconnect_tx.borrow().clone().expect("armed");
+        permitted_disconnect(&mut be, Some(std::time::Duration::from_secs(7200)));
+        let second = be.reconnect_tx.borrow().clone().expect("re-armed");
+
+        assert_ne!(
+            first.seq, second.seq,
+            "a re-arm is a different timer, not the same one moved"
+        );
+        assert!(second.deadline() > first.deadline());
+        assert!(
+            !be.claim_due_reconnect(&first),
+            "the superseded arming must refuse to fire"
+        );
+        assert_eq!(
+            be.reconnect_tx.borrow().clone(),
+            Some(second.clone()),
+            "and refusing must not cancel the arming that replaced it"
+        );
+        assert!(be.claim_due_reconnect(&second), "the live arming fires");
+        assert_eq!(
+            *be.reconnect_tx.borrow(),
+            None,
+            "Go clears `b.reconnectTimer` before reconnecting, so a fire cannot happen twice"
+        );
+        assert!(
+            !be.claim_due_reconnect(&second),
+            "and a second attempt with the same arming is refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_armed_under_one_profile_never_connects_another() {
+        // Go captures `profileID` at arming time and re-checks it in the callback. Without that
+        // guard, a timer armed by a disconnect on one profile brings up whichever profile happens to
+        // be active when it fires — a different node, on a different tailnet, that nobody asked for.
+        // (A switch also cancels the timer outright; this pins the guard itself, which is what
+        // protects the window between the deadline and the lock.)
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-alwayson-profile-{}", std::process::id()));
+        let mut be = backend_for(&dir);
+        permitted_disconnect(&mut be, Some(std::time::Duration::from_secs(60)));
+        let armed = be.reconnect_tx.borrow().clone().expect("armed");
+
+        be.current_profile = "work".to_string();
+        assert!(
+            !be.claim_due_reconnect(&armed),
+            "a timer armed for another profile must not reconnect this one"
+        );
+        assert_eq!(
+            *be.reconnect_tx.borrow(),
+            None,
+            "and it is discarded rather than left to fire again"
+        );
+    }
+
+    #[tokio::test]
+    async fn down_grants_the_exemption_only_on_the_true_to_false_transition() {
+        // Go gates on `oldPrefs.WantRunning()`, so an idempotent `down` on an already-down node is
+        // not a disconnect: it must neither grant an exemption nor push an existing deadline out.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-alwayson-down-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // A node that was up: `down` grants the exemption (no policy file is registered in this test
+        // process, so there is no bound to arm — that read is tested in `syspolicy`).
+        let mut be = backend_for(&dir);
+        be.prefs.want_running = true;
+        be.down(alwayson::Actor::Operator {
+            reason: Some("laptop returned to IT"),
+        })
+        .await
+        .expect("an unmanaged node may always disconnect");
+        assert!(!be.prefs.want_running);
+        assert!(
+            be.override_always_on,
+            "a permitted disconnect must suppress the always-on re-assert"
+        );
+
+        // A node that was already down: nothing to permit, so nothing is granted.
+        let mut be = backend_for(&dir);
+        be.prefs.want_running = false;
+        be.down(alwayson::Actor::Operator { reason: None })
+            .await
+            .expect("a down on a down node is a no-op success");
+        assert!(
+            !be.override_always_on,
+            "a `down` on an already-down node is not a disconnect and grants no exemption"
+        );
+
+        // A logout is the same edit in Go, and takes the same road here.
+        let mut be = backend_for(&dir);
+        be.prefs.want_running = true;
+        be.logout(alwayson::Actor::Operator { reason: None })
+            .await
+            .expect("logout");
+        assert!(be.override_always_on, "a logout is a disconnect too");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn connecting_the_node_ends_the_exemption_and_cancels_the_reconnect() {
+        // Go resets `overrideAlwaysOn` (and stops the timer) on the connect edge: the window a
+        // disconnect bought is spent the moment the node is brought back up by hand.
+        let dir = std::env::temp_dir().join(format!("tailnetd-alwayson-up-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+
+        permitted_disconnect(&mut be, Some(std::time::Duration::from_secs(30 * 60)));
+        assert!(be.reconnect_tx.borrow().is_some());
+
+        be.begin_up(UpOptions::default(), None)
+            .await
+            .expect("a device-less begin_up mints a fresh key and prepares the config");
+        assert!(
+            !be.override_always_on,
+            "`up` re-arms the policy: from here on AlwaysOn.Enabled is back in force"
+        );
+        assert_eq!(
+            *be.reconnect_tx.borrow(),
+            None,
+            "and the reconnect it would have performed has already happened"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn switching_profile_ends_the_exemption_and_cancels_the_reconnect() {
+        // The exemption was granted to the profile whose operator asked for it, so it does not
+        // travel — Go resets it on a profile change.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-alwayson-switch-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+
+        permitted_disconnect(&mut be, Some(std::time::Duration::from_secs(30 * 60)));
+        be.create_profile("work").await.expect("create + switch");
+
+        assert!(
+            !be.override_always_on,
+            "the exemption does not follow the switch"
+        );
+        assert_eq!(
+            *be.reconnect_tx.borrow(),
+            None,
+            "and neither does its timer"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn only_a_real_always_on_policy_change_revokes_an_outstanding_exemption() {
+        // Go's `sysPolicyChanged` resets the override on
+        // `HasChangedAnyOf(AlwaysOn, AlwaysOnOverrideWithReason)`. The "HasChanged" part is
+        // load-bearing here: this build's policy source captures its file at startup, so a `tnet
+        // syspolicy reload` ticks the change bus without a single value having moved — and a tick
+        // that revoked the exemption would cut a permitted disconnect short for no reason.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-alwayson-policy-{}", std::process::id()));
+        let mut be = backend_for(&dir);
+        be.always_on_keys = syspolicy::AlwaysOnKeys {
+            enabled: Some(true),
+            override_with_reason: Some(true),
+        };
+        permitted_disconnect(&mut be, Some(std::time::Duration::from_secs(30 * 60)));
+
+        assert!(
+            !be.sys_policy_changed(syspolicy::AlwaysOnKeys {
+                enabled: Some(true),
+                override_with_reason: Some(true),
+            }),
+            "an unchanged policy is not a change"
+        );
+        assert!(be.override_always_on, "so the exemption still stands");
+        assert!(
+            be.reconnect_tx.borrow().is_some(),
+            "and its timer is still armed"
+        );
+
+        // The administrator withdraws the override key: the exemption it granted goes with it.
+        assert!(be.sys_policy_changed(syspolicy::AlwaysOnKeys {
+            enabled: Some(true),
+            override_with_reason: None,
+        }));
+        assert!(!be.override_always_on);
+        assert_eq!(*be.reconnect_tx.borrow(), None);
+
+        // The snapshot is updated, so the same change is not re-reported on the next tick.
+        assert!(!be.sys_policy_changed(syspolicy::AlwaysOnKeys {
+            enabled: Some(true),
+            override_with_reason: None,
+        }));
+    }
+
+    #[tokio::test]
+    async fn the_reconnect_wait_is_the_deadline_and_nothing_when_unarmed() {
+        // The loop's two waiting states, over the production future it selects on: an armed timer
+        // sleeps until its deadline and no earlier, and an unarmed backend waits forever (a task
+        // that returned instead would spin, retaking the backend lock at full speed).
+        //
+        // Real time, not a paused clock (this crate does not carry tokio's `test-util`), so the
+        // margins are chosen to be robust rather than tight: "must not fire early" is asserted 10
+        // seconds short of the deadline, and the firing case uses a window long enough that a
+        // loaded machine still reaches it inside the timeout.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-alwayson-wait-{}", std::process::id()));
+        let mut be = backend_for(&dir);
+
+        permitted_disconnect(&mut be, Some(std::time::Duration::from_secs(10)));
+        let armed = be.reconnect_tx.borrow().clone().expect("armed");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                sleep_until_armed(Some(&armed))
+            )
+            .await
+            .is_err(),
+            "a timer must not fire before its deadline"
+        );
+
+        // The same future, armed for a window that does elapse: it completes, and only then.
+        permitted_disconnect(&mut be, Some(std::time::Duration::from_millis(30)));
+        let armed = be.reconnect_tx.borrow().clone().expect("re-armed");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            sleep_until_armed(Some(&armed)),
+        )
+        .await
+        .expect("a timer must fire once its deadline passes");
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                sleep_until_armed(None)
+            )
+            .await
+            .is_err(),
+            "with nothing armed the loop must park rather than wake"
+        );
     }
 
     #[tokio::test]

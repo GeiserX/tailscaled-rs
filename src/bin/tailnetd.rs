@@ -687,6 +687,17 @@ async fn run(applied_env: Option<tailscaled_rs::envknob::Applied>) -> Result<()>
     // so the loop cannot outlive the backend it reports on.
     let captive_portal_task = tokio::spawn(ipn::captive_portal_loop(Arc::clone(&backend)));
 
+    // The always-on reconnect timer (Go `ipn/ipnlocal/local.go`, `startReconnectTimerLocked`): a
+    // daemon-lifetime task that closes the window a permitted always-on disconnect opened, after the
+    // `ReconnectAfter` the administrator configured, and that revokes an outstanding exemption when
+    // an always-on policy key changes. Parked and free until a disconnect arms it, so a node nobody
+    // disconnects — and every node with no policy file — pays one idle task and nothing else.
+    //
+    // Detached for the same reasons as the captive-portal loop: it must never be able to end
+    // `serve`, and it owns no resource needing orderly teardown beyond its `Arc`. Aborted after
+    // `serve` returns so an armed timer cannot fire into a backend that is being shut down.
+    let reconnect_task = tokio::spawn(ipn::reconnect_loop(Arc::clone(&backend)));
+
     // Serve the LocalAPI socket until SIGINT/SIGTERM, with SIGHUP handled *concurrently* as a reload
     // (never a shutdown). `serve`'s shutdown future is still SIGINT/SIGTERM only — the SIGHUP loop is
     // a SEPARATE `select!` branch that holds its own `Arc` clone and runs forever, so a SIGHUP can
@@ -730,9 +741,14 @@ async fn run(applied_env: Option<tailscaled_rs::envknob::Applied>) -> Result<()>
             }
         }
     };
-    // The daemon is exiting: stop reporting on a backend that is about to be torn down. Aborting
-    // before `shutdown` also guarantees the loop is not holding the backend lock we need next.
+    // The daemon is exiting: stop reporting on a backend that is about to be torn down, and stop any
+    // armed reconnect from bringing it back up mid-shutdown. Aborting before `shutdown` also
+    // guarantees neither loop is holding the backend lock we need next. An outstanding reconnect is
+    // in-memory and dies here with the process: on the next start, an `AlwaysOn.Enabled` node is
+    // reconciled back up at profile load (earlier than the deadline, never later), and a node whose
+    // administrator set only `ReconnectAfter` stays down until someone brings it up.
     captive_portal_task.abort();
+    reconnect_task.abort();
 
     serve_result?;
 
