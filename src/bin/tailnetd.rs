@@ -234,9 +234,10 @@ struct Args {
     /// Defaults to `/etc/tailscale/syspolicy.json` (`%ProgramData%\Tailscale\syspolicy.json` on
     /// Windows) — an absent file is simply no policy, not an error — and **an empty value disables
     /// the source**. A file that fails to load is logged and the daemon carries on: a broken policy
-    /// file must not keep the node off the tailnet. NOTE: the settings are *reported* today
-    /// (`tnet syspolicy list`/`reload`), not yet applied to prefs — Go applies them in
-    /// `ipnlocal.applySysPolicy`, a surface this fork does not have yet.
+    /// file must not keep the node off the tailnet. The settings are both reported (`tnet syspolicy
+    /// list`/`reload`) and APPLIED to prefs, at profile load and on every prefs write (`up`, `set`,
+    /// `--config`), so policy outranks anything an operator sets locally. A key this build cannot
+    /// enforce is logged at WARN each time rather than silently reported as if it took effect.
     #[arg(long, value_name = "PATH", default_value_t = default_syspolicy_file())]
     syspolicy_file: String,
     /// Run a debug HTTP server on `[host:]port` exposing `GET /debug/metrics` (Go `tailscaled

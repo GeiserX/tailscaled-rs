@@ -2060,7 +2060,55 @@ impl Backend {
             captive_portal_detected: false,
         };
         backend.has_node_key = backend.has_persisted_node_key().await;
+        // Go reconciles system policy on every profile load, and this is one (the daemon's own, at
+        // boot). IN MEMORY ONLY — see `reconcile_sys_policy` for why loading must not write.
+        backend.reconcile_sys_policy("profile load");
         Ok(backend)
+    }
+
+    /// Overwrite this backend's in-memory prefs with whatever the effective system policy (MDM)
+    /// says — the Rust analogue of the `applySysPolicy` half of Go's `reconcilePrefs`
+    /// (`ipn/ipnlocal/local.go`).
+    ///
+    /// Called from every place Go reconciles: a **profile load** ([`load`](Backend::load) at daemon
+    /// start, [`switch_profile`](Backend::switch_profile)) and every **prefs write**
+    /// ([`begin_up`](Backend::begin_up), [`begin_set`](Backend::begin_set),
+    /// [`apply_config`](Backend::apply_config)) — always AFTER the caller's own overrides have
+    /// landed, which is what makes policy outrank a live `tnet set`, a `tnet up` flag, a `--config`
+    /// document and `up --reset` alike. `at` names the call site for the log.
+    ///
+    /// It mutates prefs and **does not persist**. On the write paths the caller persists a moment
+    /// later anyway, so the policy's values are durable. On a profile load there is deliberately
+    /// nothing to persist: writing at boot would create a `prefs.json` for a node that has never been
+    /// configured, and this daemon derives `ever_configured` from that file's existence — so merely
+    /// dropping a policy file on a fresh host would turn its next `NoState` into `Stopped`. The
+    /// in-memory values are what `status`, `get` and the next bring-up all read, so nothing is lost
+    /// by waiting for a real write.
+    ///
+    /// Silent when the policy is silent (the overwhelmingly common case: no `--syspolicy-file`, or
+    /// one whose settings are already in force). A key this build cannot enforce is logged at WARN
+    /// *every* time, not once: an administrator who shipped it is owed a message that is still in the
+    /// log when they go looking, and the alternative — reporting intent that changes nothing — is the
+    /// failure this whole path exists to remove.
+    fn reconcile_sys_policy(&mut self, at: &'static str) {
+        let applied = syspolicy::apply_to_prefs(&mut self.prefs);
+        for change in &applied.changed {
+            tracing::info!(
+                at,
+                key = change.key,
+                pref = change.pref,
+                value = %change.value,
+                "system policy overrode a pref"
+            );
+        }
+        for refusal in &applied.refused {
+            tracing::warn!(
+                at,
+                key = refusal.key,
+                "system policy setting is NOT enforced by this build: {}",
+                refusal.reason
+            );
+        }
     }
 
     /// The state directory this daemon is actually using — the root under which every profile's prefs
@@ -2312,6 +2360,10 @@ impl Backend {
         self.boot_attempted_up = false;
         // Adopt the target profile's node-key fact (computed above against the new `key_path`).
         self.has_node_key = has_node_key;
+        // A profile load, exactly like the one in `load`: system policy applies to the newly-active
+        // profile's prefs too, so a switch cannot be used to step out from under it. In memory only
+        // (the swap above already persisted everything a switch owes to disk).
+        self.reconcile_sys_policy("profile switch");
         // The device is down (we tore it down above and never auto-`up` the target), so the target's
         // state is already final — derive it from the same source `status` uses. `have_self_node` is
         // false for the same reason: no device, hence no netmap.
@@ -2789,6 +2841,19 @@ impl Backend {
         // configured-at-least-once (a `set` on a never-touched node has now written prefs), matching
         // `up`/`down`, so a `set`-then-restart reads `Stopped`, not `NoState`.
         self.ever_configured = true;
+        // System policy has the last word, applied after this command's overrides and before the
+        // persist — so `tnet set --hostname laptop` against a policy that pins `Hostname` persists
+        // (and, on the live path below, PUSHES) the pinned name, not the typed one. Policy beating a
+        // live `set` is the entire point of policy; a `set` that could quietly win would make the
+        // policy file advisory.
+        //
+        // The live setters below fire on `named_*` — what the REQUEST named — not on what the
+        // reconcile changed, which is correct rather than a gap: the only policy source is the JSON
+        // file, captured once at startup, and every path that can reach a running device (profile
+        // load, then `up`) has already applied it, so a reconcile here can only move a pref the
+        // request itself just moved. If a re-readable policy source is ever registered, that
+        // reasoning ends with it and the live-setter gating has to be widened to the union.
+        self.reconcile_sys_policy("set");
         self.persist_prefs().await?;
         // The other half of `--nickname` (Go's `profiles.go` rename, see the apply arm above): make
         // the display name of the CURRENT profile follow the nickname, so `switch --list` shows it
@@ -2955,7 +3020,16 @@ impl Backend {
         // writes ControlURL, so a `set`-then-`up` on a fresh node is unguarded there. Keying on
         // `ever_configured` here (flipped true by a bare `tnet set`) would wrongly arm the guard on
         // that exact sequence; `has_logged_in` is the faithful signal. (tsd-i7c)
-        revert_guard::check_accidental_reverts(&self.prefs, opts, self.prefs.has_logged_in)
+        //
+        // Then drop anything the system policy PINS. `begin_up` re-applies policy over this `up`'s
+        // own overrides just before persisting, so a pinned pref is one the `up` provably cannot
+        // revert — warning about it would refuse a command that changes nothing and tell the
+        // operator to re-mention a setting they are not permitted to change. See
+        // `revert_guard::drop_policy_pinned`.
+        revert_guard::drop_policy_pinned(
+            revert_guard::check_accidental_reverts(&self.prefs, opts, self.prefs.has_logged_in),
+            &syspolicy::pinned_prefs(),
+        )
     }
 
     /// Whether this `up` must be refused for changing the control server on a **Running** node
@@ -3179,6 +3253,11 @@ impl Backend {
         self.prefs.want_running = true;
         self.prefs.logged_out = false;
         self.ever_configured = true;
+        // System policy has the last word — after `--reset`, after every override this command
+        // named, and before the persist. That ordering is the whole contract: an `up` cannot be used
+        // to step out from under an administrator's policy, and `up --reset` (the one genuine
+        // wholesale replace) cannot either.
+        self.reconcile_sys_policy("up");
         self.persist_prefs().await?;
 
         let mut config = self.build_config().await?;
@@ -3599,6 +3678,13 @@ impl Backend {
     /// b.pm.CurrentPrefs().WantRunning()`. A `down` on a node that is already down is therefore not
     /// a disconnect and is not refused — which matters, because the alternative would wedge an
     /// always-on node's operator out of the idempotent `down` that Go lets through.
+    ///
+    /// Note what "already down" means under an always-on policy: prefs that were *persisted* down do
+    /// not qualify, because [`reconcile_sys_policy`](Backend::reconcile_sys_policy) re-asserts
+    /// `want_running` at profile load, before any command is evaluated — Go's `reconcilePrefs` does
+    /// the same, which is why its `CurrentPrefs().WantRunning()` reads true there too. The state that
+    /// does qualify is the window after a disconnect this gate PERMITTED and before the next
+    /// reconcile point, where a second `down` is genuinely a no-op.
     ///
     /// A permitted disconnect that the policy *required a reason for* leaves Go's audit record. This
     /// daemon has no transport to ship it to control (engine ask #41), so it goes to the daemon log
@@ -4280,6 +4366,17 @@ impl Backend {
     /// (no backend state, no lock, node-up-independent). Thin shim over
     /// [`syspolicy::reload_effective_policy`]; observationally identical to `syspolicy_list` while no
     /// policy store is registered (the forced re-read re-merges zero sources). Never errors.
+    ///
+    /// It deliberately does **not** re-apply the policy to prefs, and stays `&self`-free and
+    /// lock-free as a result. Two reasons, both structural rather than convenient: the only store
+    /// this daemon registers is the JSON file, which Go captures at construction and never re-reads,
+    /// so a reload cannot resolve anything the daemon has not already applied; and the reconcile runs
+    /// on every prefs write ([`Backend::reconcile_sys_policy`]), so there is no drift for a reload to
+    /// correct. Re-applying would turn a read-only verb — classified `PermitRead` in
+    /// [`crate::auth`] precisely because reading policy has no side effects — into a prefs write, for
+    /// no observable gain. A store that can genuinely change under the daemon would change that
+    /// calculus and the auth classification with it (see the invariant on
+    /// `syspolicy::registered_store_settings`).
     pub fn syspolicy_reload() -> crate::localapi::Response {
         crate::localapi::Response::Policy(syspolicy::reload_effective_policy())
     }
@@ -4894,6 +4991,13 @@ impl Backend {
     ) -> Result<Option<secrecy::SecretString>> {
         let authkey = config.apply_to_prefs(&mut self.prefs)?;
         self.ever_configured = true;
+        // System policy is applied AFTER the config merge, so a declarative config cannot outrank an
+        // administrator's policy either. This is also the answer to the config's `Locked` field,
+        // which this fork parses and warns about but does not honour (see `conffile`): `Locked` asks
+        // for the config to be immune to out-of-band `tnet set`, which is a weaker claim than the one
+        // policy already makes — and if it is ever honoured it must be honoured BELOW policy, not
+        // above it.
+        self.reconcile_sys_policy("config apply");
         self.persist_prefs().await?;
         Ok(authkey)
     }

@@ -135,24 +135,28 @@ async fn a_policy_file_decides_whether_a_node_may_be_disconnected() {
         "a refused disconnect must leave the persisted up-intent exactly as it was"
     );
 
-    // Go gates the TRANSITION, not the state: `mp.WantRunningSet && !mp.WantRunning &&
-    // b.pm.CurrentPrefs().WantRunning()`. A node that is already down is not being disconnected, so
-    // the same policy must let the idempotent `down` through.
-    let already_down = temp_dir("already-down");
-    let _ = tokio::fs::remove_dir_all(&already_down).await;
-    tokio::fs::create_dir_all(&already_down).await.unwrap();
-    tokio::fs::write(
-        already_down.join("prefs.json"),
-        br#"{"want_running":false}"#,
-    )
-    .await
-    .unwrap();
-    let mut stopped = Backend::load(&already_down).await.expect("load");
-    stopped
+    // A node whose prefs say it is DOWN is not "already down" once the policy has been reconciled:
+    // a profile load applies the effective policy (`syspolicy::apply_to_prefs`), and
+    // `AlwaysOn.Enabled` re-asserts the up-intent in memory before any command runs. So the same
+    // refusal applies to it — which is the re-connect half of always-on mode, observed from outside.
+    // Go does this too: `reconcilePrefs` runs `applySysPolicy` on every profile load, so its
+    // `b.pm.CurrentPrefs().WantRunning()` is already true by the time the gate reads it.
+    let stopped_dir = temp_dir("persisted-down");
+    let _ = tokio::fs::remove_dir_all(&stopped_dir).await;
+    tokio::fs::create_dir_all(&stopped_dir).await.unwrap();
+    tokio::fs::write(stopped_dir.join("prefs.json"), br#"{"want_running":false}"#)
+        .await
+        .unwrap();
+    let mut stopped = Backend::load(&stopped_dir).await.expect("load");
+    let err = stopped
         .down(Actor::Operator { reason: None })
         .await
-        .expect("a `down` on an already-down node is not a disconnect and must not be refused");
-    let _ = tokio::fs::remove_dir_all(&already_down).await;
+        .expect_err("the profile load re-asserted the up-intent, so this IS a disconnect");
+    assert_eq!(
+        format!("{err:#}"),
+        "disconnect not allowed: always-on mode is enabled"
+    );
+    let _ = tokio::fs::remove_dir_all(&stopped_dir).await;
 
     // ---------------------------------------------------------------------------------------
     // 2. Add `AlwaysOn.OverrideWithReason`: the refusal narrows to "say why".
@@ -198,6 +202,16 @@ async fn a_policy_file_decides_whether_a_node_may_be_disconnected() {
         !persisted_want_running(&dir).await,
         "the permitted disconnect must actually have brought the node down"
     );
+
+    // Go gates the TRANSITION, not the state: `mp.WantRunningSet && !mp.WantRunning &&
+    // b.pm.CurrentPrefs().WantRunning()`. Here is where a node is genuinely already down under an
+    // always-on policy — between a permitted disconnect and the next reconcile point, which is the
+    // window Go's `overrideAlwaysOn` flag holds open for a configured duration and this daemon holds
+    // open until something reconciles. A second, reasonless `down` in that window is idempotent, not
+    // a disconnect, and must not be refused.
+    be.down(Actor::Operator { reason: None })
+        .await
+        .expect("a `down` on an already-down node is not a disconnect and must not be refused");
 
     let _ = tokio::fs::remove_dir_all(&dir).await;
 }

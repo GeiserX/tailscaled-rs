@@ -210,6 +210,35 @@ pub(super) fn check_accidental_reverts(
     reverts
 }
 
+/// Drop every revert whose pref the system policy **pins** (`pinned` comes from
+/// [`syspolicy::pinned_prefs`], whose names are the `key` strings above).
+///
+/// The guard's question is "would this `up` silently lose a setting the operator cares about?". For
+/// a policy-pinned pref the answer is no, and cannot be: the same `up` re-applies the policy over
+/// its own overrides just before persisting (see [`Backend::begin_up`]), so the value the guard is
+/// about to name is the value the node ends with either way. Reporting it would refuse an `up` that
+/// changes nothing, and — worse — tell the operator to re-mention a setting they are not allowed to
+/// change, with `--reset` offered as the way out even though `--reset` cannot escape policy either.
+///
+/// Kept a separate pass rather than another condition inside each arm: the pinning rule is one
+/// sentence about the whole guard, not eleven near-identical clauses, and the guard itself stays a
+/// pure function of `(prefs, opts, has_logged_in)` that a test can drive with no policy at all.
+///
+/// [`syspolicy::pinned_prefs`]: super::syspolicy::pinned_prefs
+/// [`Backend::begin_up`]: super::Backend::begin_up
+pub(super) fn drop_policy_pinned(
+    reverts: Vec<RevertedPref>,
+    pinned: &[&'static str],
+) -> Vec<RevertedPref> {
+    if pinned.is_empty() {
+        return reverts;
+    }
+    reverts
+        .into_iter()
+        .filter(|r| !pinned.contains(&r.key.as_str()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,5 +687,48 @@ mod tests {
         let reverts = check_accidental_reverts(&prefs, &opts, true);
         let keys: Vec<&str> = reverts.iter().map(|r| r.key.as_str()).collect();
         assert_eq!(keys, vec!["advertise_routes"], "{keys:?}");
+    }
+
+    #[test]
+    fn a_policy_pinned_pref_is_not_reported_as_an_accidental_revert() {
+        // A node whose hostname AND exit node are both non-default, under an `up` that mentions
+        // neither: without policy both are reverts, with `hostname` pinned only the exit node is.
+        let prefs = Prefs {
+            hostname: Some("kiosk-3".into()),
+            exit_node: Some("100.64.0.9".into()),
+            has_logged_in: true,
+            ..Prefs::default()
+        };
+        let opts = UpOptions {
+            ssh: Some(true),
+            ..UpOptions::default()
+        };
+        let reverts = check_accidental_reverts(&prefs, &opts, true);
+        let keys: Vec<&str> = reverts.iter().map(|r| r.key.as_str()).collect();
+        assert!(keys.contains(&"hostname"), "{keys:?}");
+        assert!(keys.contains(&"exit_node"), "{keys:?}");
+
+        let kept = drop_policy_pinned(reverts, &["hostname"]);
+        let keys: Vec<&str> = kept.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["exit_node"],
+            "a pinned pref cannot be reverted, so it must not be warned about; an unpinned one still must"
+        );
+    }
+
+    #[test]
+    fn with_nothing_pinned_every_revert_survives() {
+        let prefs = Prefs {
+            hostname: Some("kiosk-3".into()),
+            has_logged_in: true,
+            ..Prefs::default()
+        };
+        let opts = UpOptions {
+            ssh: Some(true),
+            ..UpOptions::default()
+        };
+        let reverts = check_accidental_reverts(&prefs, &opts, true);
+        assert_eq!(drop_policy_pinned(reverts.clone(), &[]), reverts);
     }
 }

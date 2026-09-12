@@ -20,12 +20,18 @@
 //! from the engine and are what actually stops the disconnect; only the *delivery* of the record to
 //! control is deferred.
 //!
-//! Also deferred, deliberately: Go's `ReconnectAfter` timer and the `overrideAlwaysOn` flag that
-//! goes with it (`onEditPrefsLocked` arms the timer after a permitted disconnect, and
-//! `applySysPolicyLocked` forces `WantRunning` back to true while no override stands). Both are
-//! part of the *re-connect* half of always-on mode, which is a background task with its own
-//! lifecycle, and the second of them depends on syspolicy being applied to prefs at all — which
-//! this daemon does not yet do (see [`syspolicy`](super::syspolicy)'s module docs).
+//! The *re-connect* half of always-on mode is the other side of this gate, and it is split the way
+//! Go splits it: `applySysPolicyLocked` forcing `WantRunning` back to true lives in
+//! [`syspolicy::apply_to_prefs`](super::syspolicy::apply_to_prefs), which runs at every reconcile
+//! point (daemon start, `up`, `set`, `--config` reload). So a node this gate refuses to disconnect
+//! also comes back up if something else stopped it.
+//!
+//! Still deferred, deliberately: Go's `ReconnectAfter` timer and the `overrideAlwaysOn` flag that
+//! goes with it (`onEditPrefsLocked` arms the timer after a permitted disconnect, and the re-assert
+//! is suppressed while the override stands). That pair is a background task with its own lifecycle,
+//! and without it the window a permitted disconnect buys is "until the next reconcile point" rather
+//! than the duration an administrator configured — see
+//! [`syspolicy`](super::syspolicy)'s module docs.
 //!
 //! [`Backend::down`]: super::Backend::down
 //! [`Backend::logout`]: super::Backend::logout
@@ -64,8 +70,12 @@ pub enum Actor<'a> {
     /// which `WithPolicyChecks` hands back unwrapped. **Not policy-checked**: there is no operator to
     /// supply a reason, and refusing here would abort a reload halfway, leaving the persisted prefs
     /// disagreeing with the live engine. Go reaches the same end state by a different road — its
-    /// `applySysPolicyLocked` simply forces `WantRunning` back to true after the reload — and that
-    /// road opens here when syspolicy is applied to prefs.
+    /// `applySysPolicyLocked` simply forces `WantRunning` back to true after the reload — and this
+    /// daemon now takes that road too: `apply_config` reconciles policy after merging the config, so
+    /// under `AlwaysOn.Enabled` a reloaded `Enabled:false` never reaches this actor at all (the
+    /// reconcile puts `want_running` back up and the reload becomes a rebuild). The unrestricted
+    /// actor stays because that is what the road is *for*: the case with no always-on policy, where
+    /// the reload really does stop the node and there is no operator to ask for a reason.
     Daemon,
 }
 

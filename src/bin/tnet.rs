@@ -1137,9 +1137,10 @@ enum Command {
         n: bool,
     },
     /// Diagnose the system policy / MDM configuration (Go `tailscale syspolicy`). `list` prints the
-    /// effective policy; `reload` forces a re-read first. On Linux/Unix no policy store is registered
-    /// (Tailscale reads MDM policy only on Windows), so both normally print "No policy settings" —
-    /// this is the faithful, accurate result, not a stub.
+    /// effective policy; `reload` forces a re-read first. Both normally print "No policy settings"
+    /// unless the daemon was started with `tailnetd --syspolicy-file` — this is the faithful,
+    /// accurate result, not a stub. What is listed is also ENFORCED: the daemon applies these
+    /// settings to its prefs at startup and on every prefs write, so they outrank `tnet set`.
     Syspolicy {
         #[command(subcommand)]
         cmd: SyspolicyCmd,
@@ -2058,16 +2059,17 @@ enum ExitNodeCmd {
 /// `tnet syspolicy` subcommands (Go `tailscale syspolicy`). Both honor `--json`.
 #[derive(Subcommand)]
 enum SyspolicyCmd {
-    /// Print the effective system policy (Go `tailscale syspolicy list`). On Linux/Unix no policy
-    /// store is registered, so this normally prints "No policy settings".
+    /// Print the effective system policy (Go `tailscale syspolicy list`). Prints "No policy
+    /// settings" unless the daemon was started with `tailnetd --syspolicy-file`.
     List {
         /// Output as JSON (the snapshot as `{"scope":..,"settings":[..]}`).
         #[arg(long)]
         json: bool,
     },
     /// Force a re-read of the system policy, then print it (Go `tailscale syspolicy reload`).
-    /// Re-reads the external policy sources; mutates no node state. With no registered store the
-    /// result matches `list`.
+    /// Re-reads the external policy sources; mutates no node state — the JSON file source is
+    /// captured when the daemon starts, so picking up an edit to it takes a daemon restart, and the
+    /// result here always matches `list`.
     Reload {
         /// Output as JSON.
         #[arg(long)]
