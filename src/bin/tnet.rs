@@ -2080,7 +2080,9 @@ enum ExitNodeCmd {
 #[derive(Subcommand)]
 enum SyspolicyCmd {
     /// Print the effective system policy (Go `tailscale syspolicy list`). Prints "No policy
-    /// settings" unless the daemon was started with `tailnetd --syspolicy-file`.
+    /// settings" unless the daemon was started with `tailnetd --syspolicy-file`. A configured
+    /// `AuthKey` shows its Name and Origin with `<redacted>` for its Value: it is the credential
+    /// the node registers with, and the daemon never sends it here.
     List {
         /// Output as JSON (the snapshot as `{"scope":..,"settings":[..]}`).
         #[arg(long)]
@@ -9550,7 +9552,10 @@ fn format_netcheck(r: &tailscaled_rs::localapi::NetcheckReport, mode: NetcheckFo
 /// `No policy settings\n` (the normal result on Linux/Unix, where no policy store is registered);
 /// the populated case is the four-column `Name / Origin / Value / Error` table with a dashed
 /// separator, rows sorted by key, an error rendered `{...}` in the Error column (mutually exclusive
-/// with Value), and a trailing blank line. Crucially, value rows END IN WHITESPACE — Go's tabwriter
+/// with Value), and a trailing blank line. The one value the daemon does not send is a configured
+/// `AuthKey`, which arrives already rendered as `<redacted>` (see `ipn::syspolicy`) — this renderer
+/// prints whatever the daemon resolved and has no redaction rule of its own.
+/// Crucially, value rows END IN WHITESPACE — Go's tabwriter
 /// pads the Value column out to width and the empty trailing Error cell leaves that padding at line
 /// end — so we keep it (see the `render_row` note) to match Go's exact bytes.
 ///

@@ -238,6 +238,10 @@ struct Args {
     /// list`/`reload`) and APPLIED to prefs, at profile load and on every prefs write (`up`, `set`,
     /// `--config`), so policy outranks anything an operator sets locally. A key this build cannot
     /// enforce is logged at WARN each time rather than silently reported as if it took effect.
+    /// One key inverts that precedence, deliberately: `AuthKey` — the credential that enrols the
+    /// node — is used only when no auth key was given on the command line, in `TS_AUTH_KEY` or in a
+    /// `--config` file, and never on a node that is already enrolled. Its value is redacted out of
+    /// `tnet syspolicy list`. See `ipn::syspolicy` for both rulings.
     #[arg(long, value_name = "PATH", default_value_t = default_syspolicy_file())]
     syspolicy_file: String,
     /// Run a debug HTTP server on `[host:]port` exposing `GET /debug/metrics` (Go `tailscaled
@@ -1164,6 +1168,14 @@ async fn reconcile_on_reload(backend: &Arc<Mutex<Backend>>, prefs_path: &std::pa
 ///   rotation).
 /// - no persisted key AND no `TS_AUTH_KEY` → nothing to resume from and no key to auth with; still
 ///   attempt `up(None, ..)` so the engine yields the authoritative needs-login state, not a guess.
+///
+/// A fourth source sits BEHIND all of these and is resolved inside [`ipn::Backend::up`] rather than
+/// here: the administrator's `AuthKey` system policy (Go `Start`'s `pkey.AuthKey`). It is consulted
+/// on the two arms that hand `up` no key — the resume and the nothing-to-go-on arms — and its own
+/// gate then refuses it for any node that has already enrolled, so a managed host still resumes from
+/// its persisted key on every reboot and only ever *registers* from policy while it is unenrolled.
+/// That is the fleet-enrolment case the key exists for, and it is why the "cannot resume or
+/// authenticate" warning below is not the end of the story on an MDM-managed host.
 async fn auto_start(backend: &mut Backend, config_authkey: Option<secrecy::SecretString>) {
     if !backend.wants_running() {
         return;

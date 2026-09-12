@@ -1248,6 +1248,12 @@ pub struct PolicySetting {
     /// The resolved value rendered as a string (Go prints the `any` value with `%v`). `None` when the
     /// setting resolved to an error instead of a value (then [`error`](PolicySetting::error) is set).
     /// The "Value" column.
+    ///
+    /// One key's value is deliberately **not** here: the daemon renders a configured `AuthKey` as
+    /// the literal `<redacted>`, because it is a registration credential and this report is a
+    /// reporting surface (`tnet syspolicy list`, and every `Watch` policy frame). The row still says
+    /// the key is configured and which store supplied it; the key itself never leaves the daemon.
+    /// See `ipn::syspolicy`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
     /// The resolution error for this key, if any (Go prints it wrapped in `{...}` in the "Error"

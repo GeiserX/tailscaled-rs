@@ -1215,9 +1215,17 @@ pub async fn drive_up(
     opts: UpOptions,
 ) -> Result<()> {
     // Phase 1: brief lock — prep + persist prefs, build Config (folding in any transient WIF creds),
-    // bump generation.
+    // bump generation. The administrator's `AuthKey` policy is resolved here too, under the same
+    // lock and BEFORE `begin_up` mutates the prefs: `begin_up` sets `want_running = true` and tears
+    // any device down, so a gate read after it would be reading the state this very `up` created,
+    // not the state the node was in when the operator asked.
+    let mut authkey = authkey;
     let pending = {
         let mut be = backend.lock().await;
+        // Go `Start`'s auth-key precedence, last step: policy only when nothing else supplied a key.
+        if authkey.is_none() {
+            authkey = be.policy_auth_key();
+        }
         be.begin_up(opts, wif.as_ref()).await
     }?;
 
@@ -3076,6 +3084,83 @@ impl Backend {
         key_file_has_node_key(&self.key_path).await
     }
 
+    /// The node facts the administrator's `AuthKey` is gated on — Go's `b.state`, `b.conf` and
+    /// `b.pm.Profiles()` at the top of `Start`, spelled the way this daemon holds them. See
+    /// [`syspolicy::auth_key`] for what each one guards.
+    ///
+    /// Two of the four need a ruling, because Go's expression does not exist here:
+    ///
+    /// * **`running`/`needs_login` come from the ENGINE, and are `false` when there is no engine.**
+    ///   This is the load-bearing part. Go's `ipn.NeedsLogin` means the control plane says this node
+    ///   must log in; [`State::NeedsLogin`] here is *also* produced by [`derive_state_from`] for
+    ///   "wants to be up but no engine is built yet" — which is every enrolled node at daemon start.
+    ///   Feeding that into Go's escape hatch would take the policy key on every single boot, i.e.
+    ///   re-register an already-enrolled host exactly as often as it reboots, which is the failure
+    ///   the guard exists to prevent. So the escape hatch keys on the engine's own
+    ///   [`state_from_device`] verdict (`NeedsLogin` / `Expired` → [`State::NeedsLogin`]), the only
+    ///   signal here that carries the meaning Go's does. With no device the answer is simply "the
+    ///   control plane is not asking", and `enrolled` decides.
+    /// * **`enrolled` is `has_logged_in`, not `ever_configured`.** Go tests `len(b.pm.Profiles()) >
+    ///   0`; this daemon has one profile and two candidate signals. `ever_configured` (a prefs.json
+    ///   exists) is true after a bare `tnet set` on a node that never registered, and would lock a
+    ///   never-enrolled node out of the very key meant to enrol it. `has_logged_in` is this fork's
+    ///   port of Go's `Persist.UserProfile.LoginName != ""` — it is set when the node actually
+    ///   registers and cleared by `logout` — so it answers "is this node already enrolled", which is
+    ///   the intent the guard carries.
+    fn auth_key_gate(&self) -> syspolicy::AuthKeyGate {
+        // The engine's authoritative view, when an engine exists. A cheap, non-blocking `watch`
+        // borrow — the same source `status` and `up_control_url_guard` read.
+        let engine_state = self
+            .device
+            .as_ref()
+            .map(|dev| state_from_device(dev.device_state()).0);
+        syspolicy::AuthKeyGate {
+            running: engine_state == Some(State::Running),
+            needs_login: engine_state == Some(State::NeedsLogin),
+            enrolled: self.prefs.has_logged_in,
+            config_in_use: self.config_source.is_some(),
+        }
+    }
+
+    /// The administrator's `AuthKey`, for a bring-up that has no key of its own — Go `Start`'s third
+    /// and last auth-key source, resolved through [`syspolicy::auth_key`] and logged the way Go logs
+    /// it.
+    ///
+    /// Called by [`up`](Backend::up) and [`drive_up`] — the two entry points that carry a
+    /// registration credential — and by nothing else: a `set`/`reload-config` rebuild deliberately
+    /// resumes from the persisted node key and must never (re)authenticate, which is also why Go
+    /// reads this in `Start` and nowhere else.
+    fn policy_auth_key(&self) -> Option<secrecy::SecretString> {
+        match syspolicy::auth_key(self.auth_key_gate()) {
+            // The overwhelmingly common case: no policy file, or one that configures no key.
+            syspolicy::AuthKeyDecision::NotConfigured => None,
+            syspolicy::AuthKeyDecision::Use(key) => {
+                // Go: `b.logf("Start: setting opts.AuthKey from syspolicy")`. The key itself is
+                // never logged (it is a `SecretString` precisely so it cannot be).
+                tracing::info!(
+                    "registering with the AuthKey supplied by system policy (MDM); no auth key was \
+                     given on the command line, in TS_AUTH_KEY or in a --config file"
+                );
+                Some(key)
+            }
+            // Go: `b.logf("Start: not setting opts.AuthKey from syspolicy; login profiles exist,
+            // state=%v", b.state)`. An administrator whose key is being ignored must be able to find
+            // out why from the log, so the reason and the state both go in.
+            syspolicy::AuthKeyDecision::Skipped(reason) => {
+                let state = match self.device.as_ref() {
+                    Some(dev) => state_from_device(dev.device_state()).0,
+                    None => self.derive_state(false),
+                };
+                tracing::info!(
+                    reason,
+                    state = state.as_str(),
+                    "not taking the AuthKey from system policy"
+                );
+                None
+            }
+        }
+    }
+
     /// Bring the node up in a single call (the auto-start / single-owner path).
     ///
     /// Runs all three phases ([`begin_up`](Backend::begin_up) → [`build_device`] →
@@ -3087,11 +3172,18 @@ impl Backend {
     /// For the **concurrent LocalAPI server**, use the explicit `begin_up` / `build_device` /
     /// `finish_up` phases so the slow handshake runs *without* the backend lock and a concurrent
     /// `status` is not head-of-line blocked.
+    ///
+    /// With **no** `authkey` — the caller had no `--config` key and no `TS_AUTH_KEY` — the
+    /// administrator's `AuthKey` policy is consulted last ([`policy_auth_key`](Backend::policy_auth_key)),
+    /// which is what lets an MDM payload enrol a node nobody logs into. A key the caller *did* pass
+    /// always wins.
     pub async fn up(
         &mut self,
         authkey: Option<secrecy::SecretString>,
         opts: UpOptions,
     ) -> Result<()> {
+        // Go `Start`'s auth-key precedence, last step: policy only when nothing else supplied a key.
+        let authkey = authkey.or_else(|| self.policy_auth_key());
         // The single-owner `up` (daemon auto-start / resume at boot) carries no workload-identity
         // creds — it resumes from the persisted node key or a config auth key. WIF registration is
         // driven only through the LocalAPI `up` path (`drive_up`).
@@ -11172,5 +11264,61 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn the_auth_key_gate_opens_only_for_a_node_that_has_never_enrolled() {
+        // The facts `syspolicy::auth_key` decides on, as this daemon derives them. A fresh node —
+        // no registration behind it, no `--config`, no engine — is the fleet-enrolment case: every
+        // guard is open.
+        let dir = std::env::temp_dir().join(format!(
+            "tailnetd-authkey-gate-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let mut be = backend_for(&dir);
+        assert_eq!(
+            be.auth_key_gate(),
+            syspolicy::AuthKeyGate {
+                running: false,
+                needs_login: false,
+                enrolled: false,
+                config_in_use: false,
+            },
+            "a never-configured node must be able to take the administrator's key"
+        );
+
+        // A node that has actually registered is enrolled: the key must not re-register it. This is
+        // `has_logged_in`, NOT `ever_configured` — a bare `tnet set` writes a prefs.json without
+        // ever registering, and that must not lock the node out of the key meant to enrol it.
+        be.ever_configured = true;
+        assert!(
+            !be.auth_key_gate().enrolled,
+            "a prefs.json from a bare `set` is not an enrolment"
+        );
+        be.prefs.has_logged_in = true;
+        assert!(
+            be.auth_key_gate().enrolled,
+            "a node that completed registration is enrolled"
+        );
+
+        // A `--config` file is the declarative source for the credential; policy does not reach past
+        // it (Go's `b.conf == nil`).
+        assert!(!be.auth_key_gate().config_in_use);
+        be.set_config_source(crate::conffile::ConfigSource::File(dir.join("cfg.json")));
+        assert!(be.auth_key_gate().config_in_use);
+
+        // With no engine there is no control-plane opinion: `running`/`needs_login` stay false and
+        // `enrolled` alone decides. (This is the divergence documented on `auth_key_gate`: the
+        // DERIVED state of a down node that wants to be up is `NeedsLogin`, which would otherwise
+        // hand the policy key to an enrolled node on every single boot.)
+        be.prefs.want_running = true;
+        assert_eq!(be.derive_state(false), State::NeedsLogin);
+        assert!(
+            !be.auth_key_gate().needs_login,
+            "only the engine may say the control plane wants a fresh login"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
