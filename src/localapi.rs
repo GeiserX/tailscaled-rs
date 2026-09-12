@@ -82,6 +82,35 @@ pub enum Request {
         /// `skip_serializing_if` back-compat discipline (a bare watch stays `{"cmd":"watch"}`).
         #[serde(default, skip_serializing_if = "core::ops::Not::not")]
         prefs: bool,
+        /// Stream the effective system policy as [`NotifyView::policy`]: a front-loaded snapshot on
+        /// subscribe, then a fresh snapshot whenever the policy may have moved. The analogue of Go's
+        /// `ipn.NotifySysPolicyChanges` (`1 << 17`), which makes the first `Notify` carry the current
+        /// effective `setting.Snapshot` in `Notify.Policy` and re-sends it — always in full, never as
+        /// a delta — on every subsequent policy change.
+        ///
+        /// Like [`prefs`](Request::Watch::prefs) and unlike `initial_state`/`initial_netmap` this is
+        /// **daemon-built**, not an engine `NotifyWatchOpt` bit: the policy registry lives in the
+        /// daemon, not the engine.
+        ///
+        /// ## What "on change" means in THIS build — read before relying on it
+        ///
+        /// Go registers real change sources (a Windows registry watcher; a handle a management agent
+        /// writes through) and pushes the moment one of them moves. This build has exactly one
+        /// source, the `--syspolicy-file` JSON document, which is read once at startup and — exactly
+        /// as in Go, whose `JSONPolicyStore` captures the file at construction — never re-read. So
+        /// the honest contract here is **the initial snapshot, plus a push on every `syspolicy
+        /// reload`** (and on a source being registered). A `syspolicy reload` is a real change
+        /// signal, just a coarser one: an administrator who edits the policy file behind the
+        /// daemon's back is not seen until someone asks for a reload, or the daemon restarts.
+        /// Promising more than that would be promising a watch this build cannot perform.
+        ///
+        /// Even so, this is the difference between a watcher that can see policy and one that
+        /// cannot. Policy outranks local prefs on every write here, so a `tnet set` that appears to
+        /// do nothing is explained by a policy row — and before this bit, the only way to see that
+        /// row was to ask for it, which cannot distinguish "unchanged" from "changed, and I have not
+        /// asked again".
+        #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+        policy: bool,
     },
     /// Bring the node up (`WantRunning = true`), optionally (re)setting login/config fields.
     Up {
@@ -2050,8 +2079,11 @@ pub struct ProfileEntry {
 /// The engine's [`Notify`](tailscale::Notify) (v0.39.0) has exactly three fields — `state`,
 /// `net_map`, `browse_to_url` — so this view fills exactly those (with `state`'s terminal-failure
 /// reason split out into [`error`](NotifyView::error), mirroring how [`StatusReport`] already
-/// separates `state` from `error`). It has **no `prefs` field**: a prefs-change broadcast is a later
-/// phase, not this one.
+/// separates `state` from `error`). Two further fields are **daemon-built**, sourced from state the
+/// engine does not hold at all: [`prefs`](NotifyView::prefs) (this fork's prefs are daemon-owned) and
+/// [`policy`](NotifyView::policy) (the system-policy registry lives in the daemon). Both are Go
+/// `Notify` fields — `Notify.Prefs` and `Notify.Policy` — so carrying them here is a port, not an
+/// invention; only the plumbing that feeds them differs.
 ///
 /// The richer Go `Notify` fields (`Health`, `PeerChangedPatch`, `Engine`, `FilesWaiting`,
 /// `SuggestedExitNode`, …) are intentionally **absent**: the fork's engine does not surface them on
@@ -2098,6 +2130,23 @@ pub struct NotifyView {
     /// daemon-owned). `None` when this frame carried no prefs change (or the `prefs` bit was unset).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefs: Option<PrefsView>,
+    /// The effective system policy, if the `policy` mask bit was set (Go `Notify.Policy`, gated by
+    /// `ipn.NotifySysPolicyChanges`). A front-loaded snapshot on subscribe, then a fresh one on every
+    /// policy change — always the **full** snapshot, never a delta, exactly as Go documents
+    /// `Notify.Policy`.
+    ///
+    /// It is the very [`PolicyReport`] [`Response::Policy`] carries, produced by the same
+    /// `Backend::policy_snapshot` call `syspolicy list`/`reload` answer from — the flat list of
+    /// per-key origin/value/error rows this fork already reports, not a second rendering of the same
+    /// snapshot. One producer, so a rule the report adopts (redacting a credential-bearing key, for
+    /// instance) reaches this stream by construction; that matters here more than on the CLI,
+    /// because a notify stream is read by more processes than a CLI is.
+    ///
+    /// DAEMON-built (not an engine `Notify` field — the engine has no policy registry). See
+    /// [`Request::Watch::policy`] for what "on change" can and cannot mean in this build. `None` when
+    /// this frame carried no policy change (or the `policy` bit was unset).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PolicyReport>,
 }
 
 /// A single peer entry in a [`StatusReport`].
@@ -2378,6 +2427,7 @@ mod tests {
                 initial_state: false,
                 initial_netmap: false,
                 prefs: false,
+                policy: false,
             })
             .unwrap(),
             r#"{"cmd":"watch"}"#
@@ -2388,6 +2438,7 @@ mod tests {
                 initial_state: false,
                 initial_netmap: false,
                 prefs: false,
+                policy: false,
             }
         ));
         // A masked watch round-trips its bits (the Notify-path selector): each `true` field appears on
@@ -2398,12 +2449,13 @@ mod tests {
                 initial_state: true,
                 initial_netmap: true,
                 prefs: true,
+                policy: true,
             })
             .unwrap(),
-            r#"{"cmd":"watch","initial_state":true,"initial_netmap":true,"prefs":true}"#
+            r#"{"cmd":"watch","initial_state":true,"initial_netmap":true,"prefs":true,"policy":true}"#
         );
         match serde_json::from_str::<Request>(
-            r#"{"cmd":"watch","initial_state":true,"initial_netmap":true,"prefs":true}"#,
+            r#"{"cmd":"watch","initial_state":true,"initial_netmap":true,"prefs":true,"policy":true}"#,
         )
         .unwrap()
         {
@@ -2411,9 +2463,24 @@ mod tests {
                 initial_state,
                 initial_netmap,
                 prefs,
+                policy,
             } => {
-                assert!(initial_state && initial_netmap && prefs);
+                assert!(initial_state && initial_netmap && prefs && policy);
             }
+            other => panic!("expected masked Watch, got {other:?}"),
+        }
+        // A client that predates the `policy` bit sends the three-field masked line. It must still
+        // parse, with `policy` defaulting OFF — a watcher never gets a feed it did not ask for. The
+        // same back-compat discipline every earlier mask bit got.
+        match serde_json::from_str::<Request>(
+            r#"{"cmd":"watch","initial_state":true,"initial_netmap":true,"prefs":true}"#,
+        )
+        .unwrap()
+        {
+            Request::Watch { policy, .. } => assert!(
+                !policy,
+                "a watch line written before the policy bit existed must not turn it on"
+            ),
             other => panic!("expected masked Watch, got {other:?}"),
         }
         // A `prefs`-only watch (the Phase-2 daemon-built path) is also masked — only `prefs` on the wire.
@@ -2422,9 +2489,100 @@ mod tests {
                 initial_state: false,
                 initial_netmap: false,
                 prefs: true,
+                policy: false,
             })
             .unwrap(),
             r#"{"cmd":"watch","prefs":true}"#
+        );
+        // A `policy`-only watch (Go's `NotifySysPolicyChanges` alone) is masked too: a management agent
+        // that only wants to know when the administrator changed something asks for nothing else.
+        assert_eq!(
+            serde_json::to_string(&Request::Watch {
+                initial_state: false,
+                initial_netmap: false,
+                prefs: false,
+                policy: true,
+            })
+            .unwrap(),
+            r#"{"cmd":"watch","policy":true}"#
+        );
+        match serde_json::from_str::<Request>(r#"{"cmd":"watch","policy":true}"#).unwrap() {
+            Request::Watch {
+                initial_state,
+                initial_netmap,
+                prefs,
+                policy,
+            } => {
+                assert!(policy, "the policy bit must survive the round trip");
+                assert!(
+                    !initial_state && !initial_netmap && !prefs,
+                    "a policy-only watch must not imply any other mask bit"
+                );
+            }
+            other => panic!("expected masked Watch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn notify_policy_frame_carries_the_reports_own_rows() {
+        // Go's `Notify.Policy` is the very `setting.Snapshot` `GetEffectivePolicy` returns. Ours is the
+        // very `PolicyReport` `Response::Policy` carries, so the notify frame and a one-shot
+        // `syspolicy list` describe the policy with the identical rows — no second rendering to drift.
+        let report = PolicyReport {
+            scope: "Device".to_string(),
+            settings: vec![
+                PolicySetting {
+                    key: "AlwaysOn.Enabled".to_string(),
+                    origin: "JSONFile (Device)".to_string(),
+                    value: Some("true".to_string()),
+                    error: None,
+                },
+                PolicySetting {
+                    key: "Hostname".to_string(),
+                    origin: "JSONFile (Device)".to_string(),
+                    value: None,
+                    error: Some("unreadable".to_string()),
+                },
+            ],
+        };
+        let frame = NotifyView {
+            policy: Some(report.clone()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&Response::Notify(frame.clone())).unwrap();
+        // A policy-only frame carries ONLY the policy key: every other field is nil-means-unchanged.
+        assert_eq!(
+            json,
+            r#"{"kind":"notify","policy":{"scope":"Device","settings":[{"key":"AlwaysOn.Enabled","origin":"JSONFile (Device)","value":"true"},{"key":"Hostname","origin":"JSONFile (Device)","error":"unreadable"}]}}"#
+        );
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::Notify(back) => assert_eq!(back, frame),
+            other => panic!("expected a notify frame, got {other:?}"),
+        }
+
+        // Absent `policy` means "unchanged", NOT "no policy" — a state-only frame must not be read as
+        // the administrator having cleared the policy.
+        let state_only = NotifyView {
+            state: Some("Running".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&Response::Notify(state_only)).unwrap(),
+            r#"{"kind":"notify","state":"Running"}"#
+        );
+        // ...and an empty-but-present snapshot is distinguishable from it: that IS a policy, it just
+        // has no rows (the daemon registered no source), which is what the CLI prints as "No policy
+        // settings".
+        let empty = NotifyView {
+            policy: Some(PolicyReport {
+                scope: "Device".to_string(),
+                settings: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&Response::Notify(empty)).unwrap(),
+            r#"{"kind":"notify","policy":{"scope":"Device"}}"#
         );
     }
 

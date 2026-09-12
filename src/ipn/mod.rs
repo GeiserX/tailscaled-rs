@@ -4358,7 +4358,37 @@ impl Backend {
     /// `Backend` so the `server.rs` dispatch reads uniformly with the other diagnostics. On this
     /// platform (no registered policy store) the snapshot is always empty — faithful to Go on Linux.
     pub fn syspolicy_list() -> crate::localapi::Response {
-        crate::localapi::Response::Policy(syspolicy::effective_policy())
+        crate::localapi::Response::Policy(Self::policy_snapshot())
+    }
+
+    /// The effective device-scope policy snapshot, as a bare report rather than a
+    /// [`Response`](crate::localapi::Response).
+    ///
+    /// Exists so the notify feed and the one-shot `syspolicy list` read the *same* snapshot through
+    /// the *same* renderer: [`syspolicy_list`](Self::syspolicy_list) wraps this, and the masked
+    /// `Watch` path's policy frames call it directly. Go's `Notify.Policy` is likewise the very
+    /// `setting.Snapshot` `GetEffectivePolicy` returns, not a second rendering of it. Keeping one
+    /// producer is what makes any rule the report adopts — redacting a credential-bearing key, say —
+    /// apply to the notify stream too, which matters more there: a notify stream is read by more
+    /// processes than a CLI is.
+    ///
+    /// Static for the same reason [`syspolicy_list`](Self::syspolicy_list) is: policy resolution
+    /// reads no backend/engine state and needs no lock.
+    pub fn policy_snapshot() -> crate::localapi::PolicyReport {
+        syspolicy::effective_policy()
+    }
+
+    /// Subscribe to policy-change ticks (a masked `Watch` with the `policy` bit) — the analogue of
+    /// the `policyclient.RegisterChangeCallback` Go's `WatchNotifications` registers for the life of
+    /// a session with `NotifySysPolicyChanges` set. The receiver re-reads
+    /// [`policy_snapshot`](Self::policy_snapshot) on each tick.
+    ///
+    /// Static (no backend state, no lock): the policy registry is process-global, like Go's `rsop`
+    /// store list. See `syspolicy::watch_policy` for exactly which events tick it in this build —
+    /// notably, an edit to the policy file behind the daemon's back does **not**, because nothing
+    /// re-reads the file until a `syspolicy reload`.
+    pub fn watch_policy() -> tokio::sync::watch::Receiver<()> {
+        syspolicy::watch_policy()
     }
 
     /// Force a re-read of the effective system policy (the `tnet syspolicy reload` path; Go
