@@ -15,7 +15,12 @@
 //! (Go's `rsop` store list is too), so — like `tests/syspolicy_file.rs` — this binary holds exactly
 //! ONE test and it owns the registry for the whole process.
 //!
-//! Upstream: `ipn/ipnauth/policy.go` and `ipn/ipnlocal/local.go` (`checkEditPrefsAccessLocked`) @
+//! The same is true of the *window* a permitted disconnect opens: that `ReconnectAfter` written into
+//! the file reaches the arming, and that the disconnect then survives a reconcile point, can only be
+//! seen with a real policy source registered — so it is the last section of the one test here.
+//!
+//! Upstream: `ipn/ipnauth/policy.go` and `ipn/ipnlocal/local.go` (`checkEditPrefsAccessLocked`,
+//! `onEditPrefsLocked`, `startReconnectTimerLocked`) @
 //! `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`.
 
 use std::path::{Path, PathBuf};
@@ -205,13 +210,90 @@ async fn a_policy_file_decides_whether_a_node_may_be_disconnected() {
 
     // Go gates the TRANSITION, not the state: `mp.WantRunningSet && !mp.WantRunning &&
     // b.pm.CurrentPrefs().WantRunning()`. Here is where a node is genuinely already down under an
-    // always-on policy — between a permitted disconnect and the next reconcile point, which is the
-    // window Go's `overrideAlwaysOn` flag holds open for a configured duration and this daemon holds
-    // open until something reconciles. A second, reasonless `down` in that window is idempotent, not
-    // a disconnect, and must not be refused.
+    // always-on policy — inside the window Go's `overrideAlwaysOn` flag holds open. A second,
+    // reasonless `down` in that window is idempotent, not a disconnect, and must not be refused.
     be.down(Actor::Operator { reason: None })
         .await
         .expect("a `down` on an already-down node is not a disconnect and must not be refused");
 
+    // ---------------------------------------------------------------------------------------
+    // 4. The window itself: a permitted disconnect STAYS, and carries the administrator's bound.
+    // ---------------------------------------------------------------------------------------
+    // The unit tests pin the override flag and the timer over already-resolved inputs. What they
+    // cannot see is this: that `ReconnectAfter` written into a policy FILE reaches the arming, and
+    // that the flag really does hold the re-assert off at a reconcile point the operator did not ask
+    // for. That second half is the bug the flag exists to fix — without it an unrelated `tnet set`
+    // puts a node the policy had already agreed to release back on the tailnet.
+    register_policy(
+        "reconnect-after",
+        r#"{"AlwaysOn.Enabled": true, "AlwaysOn.OverrideWithReason": true,
+            "ReconnectAfter": "30m"}"#,
+    );
+
+    let bounded_dir = temp_dir("bounded");
+    let mut bounded = connected_backend(&bounded_dir).await;
+    assert!(
+        bounded.watch_reconnect().borrow().is_none(),
+        "a freshly loaded backend has no reconnect outstanding"
+    );
+
+    let before = tokio::time::Instant::now();
+    bounded
+        .down(Actor::Operator {
+            reason: Some("laptop returned to IT"),
+        })
+        .await
+        .expect("a reasoned disconnect must be permitted");
+    assert!(
+        !persisted_want_running(&bounded_dir).await,
+        "the permitted disconnect must actually have brought the node down"
+    );
+
+    let armed =
+        bounded.watch_reconnect().borrow().clone().expect(
+            "a configured ReconnectAfter must arm the reconnect the administrator asked for",
+        );
+    let window = std::time::Duration::from_secs(30 * 60);
+    assert!(
+        armed.deadline() >= before + window,
+        "the node must come back after the configured window, not before it"
+    );
+    assert!(
+        armed.deadline() <= tokio::time::Instant::now() + window,
+        "…and not later than one window from the disconnect either"
+    );
+
+    // The reconcile point that used to undo it: an unrelated `set`, which applies the effective
+    // policy after the caller's own overrides. The node must stay down.
+    bounded
+        .set(tailscaled_rs::ipn::SetOptions {
+            hostname: Some("documented-node".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("an unrelated `set` on a down node just persists");
+    assert!(
+        !persisted_want_running(&bounded_dir).await,
+        "a permitted disconnect must survive a reconcile point — otherwise the administrator's \
+         window is 'until somebody runs an unrelated command', which is not a window at all"
+    );
+    assert!(
+        bounded.watch_reconnect().borrow().is_some(),
+        "and its deadline must still stand: a `set` is not a connect"
+    );
+
+    // Bringing the node up by hand spends the window: the exemption is over and the reconnect has
+    // nothing left to do. Driven through `begin_up` — the prepare-and-persist phase, which is where
+    // the connect edge lives — so this test never reaches for a control server it cannot have.
+    bounded
+        .begin_up(tailscaled_rs::ipn::UpOptions::default(), None)
+        .await
+        .expect("the connect path must prepare cleanly on a device-less backend");
+    assert!(
+        bounded.watch_reconnect().borrow().is_none(),
+        "`up` must cancel an outstanding reconnect"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&bounded_dir).await;
     let _ = tokio::fs::remove_dir_all(&dir).await;
 }

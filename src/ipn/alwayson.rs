@@ -26,12 +26,24 @@
 //! point (daemon start, `up`, `set`, `--config` reload). So a node this gate refuses to disconnect
 //! also comes back up if something else stopped it.
 //!
-//! Still deferred, deliberately: Go's `ReconnectAfter` timer and the `overrideAlwaysOn` flag that
-//! goes with it (`onEditPrefsLocked` arms the timer after a permitted disconnect, and the re-assert
-//! is suppressed while the override stands). That pair is a background task with its own lifecycle,
-//! and without it the window a permitted disconnect buys is "until the next reconcile point" rather
-//! than the duration an administrator configured — see
-//! [`syspolicy`](super::syspolicy)'s module docs.
+//! ## The window a permitted disconnect buys
+//!
+//! A disconnect this gate *allows* would otherwise be undone by that re-assert at the next reconcile
+//! point — which is to say at an arbitrary moment, whenever somebody next ran an unrelated `tnet
+//! set`. Go's answer is the pair `onEditPrefsLocked` sets up, and both halves are ported:
+//!
+//! - [`Backend::override_always_on`](super::Backend::override_always_on) (Go's `overrideAlwaysOn`)
+//!   suppresses the re-assert for as long as the permitted disconnect stands, so it survives every
+//!   reconcile point;
+//! - the `ReconnectAfter` timer ends that window on the administrator's schedule: `down`/`logout`
+//!   arm it from [`syspolicy::reconnect_after`](super::syspolicy::reconnect_after) and
+//!   [`reconnect_loop`](super::reconnect_loop) fires it, bringing the node back up.
+//!
+//! The administrator's contract is therefore the one they configured: a user with a reason may take
+//! the node down for exactly `ReconnectAfter` and no longer. With no `ReconnectAfter` configured the
+//! disconnect stands until someone connects the node, switches profile, or the administrator edits
+//! an always-on key — and until the daemon restarts, because the override is in-memory (as it is in
+//! Go) and an always-on node reconciles back up at profile load.
 //!
 //! [`Backend::down`]: super::Backend::down
 //! [`Backend::logout`]: super::Backend::logout
