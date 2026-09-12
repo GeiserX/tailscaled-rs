@@ -1548,12 +1548,14 @@ as a backdated `/machine/register` (`ts_control/src/tokio/logout.rs`), which car
 expiry and nothing else. The only `audit` strings in the tree are the netmap's
 `DataPlaneAuditLogID` fields, which are about data-plane logging, not client actions.
 
-**Why not a daemon-side facsimile.** The daemon already accepts the flag and writes the reason to its
-own log before the attempt, which is the honest half it can do alone: a local record, next to the
-event it explains. What it cannot do is the half that made the flag exist — put the justification
-where the tailnet's policy reads it. Nothing on this side of the LocalAPI can reach control except
-through the engine, so a "reason" that stops at the daemon can never satisfy a policy that requires
-one. Written down here rather than papered over.
+**Why not a daemon-side facsimile.** Go's `--reason` answers to two policies, and only one of them
+is local. The **device** policy — `AlwaysOn.Enabled` / `AlwaysOn.OverrideWithReason`, read from the
+MDM/syspolicy source — is enforced by this daemon today (`src/ipn/alwayson.rs`): a reasonless
+disconnect is refused with Go's own message, and a permitted one writes Go's `DISCONNECT_NODE` audit
+record. What is still missing is the **tailnet** half: putting that record where control reads it.
+Nothing on this side of the LocalAPI can reach control except through the engine, so a record that
+stops at the daemon's log satisfies the administrator's device policy and nothing on the tailnet.
+Written down here rather than papered over.
 
 **Ask (option 2 covers both commands; option 1 covers `logout` only):**
 

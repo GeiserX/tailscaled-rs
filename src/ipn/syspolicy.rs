@@ -24,13 +24,20 @@
 //! ordering rule is still implemented ([`merge`], last writer wins) rather than assumed away, so
 //! adding a second source later is a registration call and not a redesign.
 //!
-//! ## Reporting only
+//! ## Reported, and read by name
 //!
-//! The snapshot is *reported* (`tnet syspolicy list`/`reload`); it is not yet *applied* to prefs.
-//! Go enforces policy in `ipnlocal.applySysPolicy` — a separate surface this fork does not have, so
-//! writing `"Hostname"` into the policy file makes it visible to `syspolicy list` without changing
-//! the node's hostname. Keeping the source and the enforcement separate is deliberate: an operator
-//! can see exactly what the daemon parsed before any of it has an effect.
+//! The snapshot is *reported* (`tnet syspolicy list`/`reload`); it is not *applied* to prefs. Go
+//! rewrites prefs from the policy in `ipnlocal.applySysPolicy` — a separate surface this fork does
+//! not have, so writing `"Hostname"` into the policy file makes it visible to `syspolicy list`
+//! without changing the node's hostname. Keeping the source and that enforcement separate is
+//! deliberate: an operator can see exactly what the daemon parsed before any of it has an effect.
+//!
+//! Three keys are nonetheless *read by name* and act, because their effect is a refusal rather than
+//! a rewritten pref: `tailnetd` reads [`PKEY_ENCRYPT_STATE`] and [`PKEY_HARDWARE_ATTESTATION`] for
+//! two startup refusals, and the disconnect gate ([`alwayson`](super::alwayson)) reads
+//! [`PKEY_ALWAYS_ON`] and [`PKEY_ALWAYS_ON_OVERRIDE_WITH_REASON`] to decide whether `down`/`logout`
+//! may proceed. So `AlwaysOn.Enabled` in the policy file is enforced; `Hostname` is still only
+//! reported.
 //!
 //! Scope: Go's CLI always resolves `setting.DefaultScope()`, which is the **device scope** on every
 //! non-Windows platform, and `LoadJSONPolicyFile` registers at `setting.DeviceScope`. We record that
@@ -59,6 +66,15 @@ pub const PKEY_ENCRYPT_STATE: &str = "EncryptState";
 /// Go `pkey.HardwareAttestation` — the policy key that asks a daemon to bind the node identity to a
 /// hardware-backed key. Read by name for the same reason as [`PKEY_ENCRYPT_STATE`].
 pub const PKEY_HARDWARE_ATTESTATION: &str = "HardwareAttestation";
+
+/// Go `pkey.AlwaysOn` — the policy key that forbids disconnecting the node. Read by name by the
+/// disconnect gate ([`alwayson`](super::alwayson)), so — like [`PKEY_ENCRYPT_STATE`] — the spelling
+/// has exactly one definition, shared with [`DEFINITIONS`].
+pub const PKEY_ALWAYS_ON: &str = "AlwaysOn.Enabled";
+
+/// Go `pkey.AlwaysOnOverrideWithReason` — the policy key that lets an operator disconnect an
+/// always-on node by saying why. Read by name for the same reason as [`PKEY_ALWAYS_ON`].
+pub const PKEY_ALWAYS_ON_OVERRIDE_WITH_REASON: &str = "AlwaysOn.OverrideWithReason";
 
 /// The scope name the CLI resolves, matching Go `setting.DefaultScope().String()` on non-Windows
 /// hosts (`"Device"`). Centralized so the report and any future scope plumbing agree on the spelling.
@@ -298,8 +314,8 @@ const DEFINITIONS: &[Definition] = &[
     def("AllowedSuggestedExitNodes", ValueType::StringList),
     def("ExitNode.AllowOverride", ValueType::Boolean),
     def("AllowTailscaledRestart", ValueType::Boolean),
-    def("AlwaysOn.Enabled", ValueType::Boolean),
-    def("AlwaysOn.OverrideWithReason", ValueType::Boolean),
+    def(PKEY_ALWAYS_ON, ValueType::Boolean),
+    def(PKEY_ALWAYS_ON_OVERRIDE_WITH_REASON, ValueType::Boolean),
     def("InstallUpdates", ValueType::PreferenceOption),
     def("AuthKey", ValueType::String),
     def("CheckUpdates", ValueType::PreferenceOption),
@@ -424,7 +440,11 @@ fn go_type_name(v: &Value) -> &'static str {
 
 /// Go's `%q` on a string: double-quoted with escapes. Rust's `{:?}` agrees with Go for the
 /// characters a policy key or value realistically contains.
-fn quoted(s: &str) -> String {
+///
+/// `pub(super)` because the always-on audit record renders Go's `%q` over a profile name and a
+/// username too ([`alwayson`](super::alwayson)), and two spellings of "Go's %q" would be one
+/// spelling too many.
+pub(super) fn quoted(s: &str) -> String {
     format!("{s:?}")
 }
 

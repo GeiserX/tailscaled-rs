@@ -21,6 +21,7 @@ use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::auth::{self, Access, AuthPolicy};
+use crate::ipn::alwayson;
 use crate::ipn::{self, Backend};
 use crate::localapi::{Request, Response};
 
@@ -1385,19 +1386,28 @@ async fn dispatch(
         // one lock is correct and simplest — no concurrent `up` should interleave a half-logout.
         //
         // `--reason` (Go's, which travels as the base64 `X-Tailscale-Reason` header) is the
-        // operator's justification. This daemon registers no policy store that could *require* one
-        // and the engine has no audit-log transport to control, so what the reason buys here is a
-        // record in the daemon's own log, written before the attempt — a logout that then FAILS is
-        // exactly the record an operator reading the log later wants the justification attached to.
+        // operator's justification, and it is now load-bearing: `Backend::logout` runs the always-on
+        // gate (`ipn::alwayson`) first, so on a node whose policy file sets `AlwaysOn.Enabled` this
+        // logout can be REFUSED — with Go's message — and the reason is what lifts the refusal when
+        // `AlwaysOn.OverrideWithReason` is also set. The log line below is written before the
+        // attempt, so a logout that is refused, or that fails later, still carries the justification
+        // an operator reading the log wants attached to it. (The reason is still not forwarded to
+        // control; that half needs an engine transport — ask #41.)
         Request::Logout { reason } => {
             let mut be = backend.lock().await;
             if let Some(reason) = reason.as_deref() {
                 tracing::info!(
-                    reason = %sanitize_request_reason(reason),
+                    peer_uid = ?peer_uid,
+                    reason = %alwayson::sanitize_request_reason(reason),
                     "logout requested with an operator-supplied reason"
                 );
             }
-            match be.logout().await {
+            match be
+                .logout(alwayson::Actor::Operator {
+                    reason: reason.as_deref(),
+                })
+                .await
+            {
                 Ok(()) => {
                     tracing::info!("logout: node deregistered + key wiped");
                     Response::Ok {
@@ -1411,19 +1421,24 @@ async fn dispatch(
         }
         // `down` (Go `tailscale down`): clears want-running, keeping the node key so a later `up`
         // resumes. `--reason` (Go attaches it to the prefs edit as `apitype.RequestReasonKey`) gets
-        // the same treatment as `logout --reason` and for the same reason — this daemon registers no
-        // policy store that could *require* one and has no audit-log transport, so what it buys is a
-        // record in the daemon's own log, written BEFORE the attempt so a `down` that then fails is
-        // still explained.
+        // the same treatment as `logout --reason` and for the same reason: `Backend::down` runs the
+        // same always-on gate, so a policy-managed node can refuse this `down`, and the log line is
+        // written BEFORE the attempt so a refused or failed `down` is still explained.
         Request::Down { reason } => {
             let mut be = backend.lock().await;
             if let Some(reason) = reason.as_deref() {
                 tracing::info!(
-                    reason = %sanitize_request_reason(reason),
+                    peer_uid = ?peer_uid,
+                    reason = %alwayson::sanitize_request_reason(reason),
                     "down requested with an operator-supplied reason"
                 );
             }
-            match be.down().await {
+            match be
+                .down(alwayson::Actor::Operator {
+                    reason: reason.as_deref(),
+                })
+                .await
+            {
                 Ok(()) => {
                     tracing::info!("node down");
                     Response::Ok {
@@ -1783,30 +1798,6 @@ fn switch_outcome_response(result: anyhow::Result<crate::ipn::SwitchOutcome>) ->
     }
 }
 
-/// Harden an operator-supplied `--reason` text (Go's LocalAPI `RequestReason`, carried by both
-/// `logout` and `down`) for the daemon log. The reason is free text typed by whoever ran the
-/// command, and it lands in a log a human (or a log shipper) reads later,
-/// so it is untrusted for formatting: every control character — newline, CR, tab, ANSI escape —
-/// becomes `_` so one reason can never forge a second log line or steer a terminal, and the value is
-/// capped at [`MAX_LOGGED_REASON`] characters so a megabyte of "justification" cannot flood the log.
-/// Truncation is marked with a trailing `…` so a reader can tell the record is not the whole text.
-/// Same treatment (and same rationale) as the `bugreport` note's `sanitize_marker_note`.
-fn sanitize_request_reason(reason: &str) -> String {
-    let mut out: String = reason
-        .chars()
-        .take(MAX_LOGGED_REASON)
-        .map(|c| if c.is_control() { '_' } else { c })
-        .collect();
-    if reason.chars().nth(MAX_LOGGED_REASON).is_some() {
-        out.push('…');
-    }
-    out
-}
-
-/// Character cap applied to a logged `--reason` (see [`sanitize_request_reason`]). Generous
-/// for a real justification, far below anything that would bloat the daemon log.
-const MAX_LOGGED_REASON: usize = 256;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1964,41 +1955,5 @@ mod tests {
         // Best-effort cleanup before the assertion so a failure still removes the dir.
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(mode, 0o700, "loose socket dir must be tightened to 0700");
-    }
-
-    #[test]
-    fn request_reason_is_sanitized_before_it_reaches_the_log() {
-        // The reason (`logout --reason`, `down --reason`) is operator free text that ends up in the
-        // daemon log, so a newline must not be able to forge a second log record and an escape must
-        // not be able to steer a terminal that later renders the log.
-        let forged = "returned to IT\nINFO forged: node re-registered";
-        let clean = sanitize_request_reason(forged);
-        assert!(
-            !clean.contains('\n'),
-            "a newline must not survive into the log line: {clean:?}"
-        );
-        assert_eq!(clean, "returned to IT_INFO forged: node re-registered");
-        assert_eq!(
-            sanitize_request_reason("laptop returned to IT"),
-            "laptop returned to IT",
-            "ordinary text must pass through untouched"
-        );
-        assert!(
-            !sanitize_request_reason("\u{1b}[2Jwiped").contains('\u{1b}'),
-            "ANSI escapes must be neutralized"
-        );
-
-        // Over-long input is capped and marked as truncated.
-        let long = "j".repeat(MAX_LOGGED_REASON + 50);
-        let capped = sanitize_request_reason(&long);
-        assert_eq!(capped.chars().count(), MAX_LOGGED_REASON + 1);
-        assert!(
-            capped.ends_with('…'),
-            "truncation must be visible: {capped:?}"
-        );
-        // Exactly at the cap: no truncation marker.
-        let exact = sanitize_request_reason(&"j".repeat(MAX_LOGGED_REASON));
-        assert_eq!(exact.chars().count(), MAX_LOGGED_REASON);
-        assert!(!exact.ends_with('…'));
     }
 }
