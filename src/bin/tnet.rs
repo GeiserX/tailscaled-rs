@@ -130,8 +130,10 @@ enum Command {
         #[arg(long = "clear-advertise-routes", alias = "advertise-routes-clear")]
         advertise_routes_clear: bool,
         /// Advertise these ACL tags (comma-separated `tag:<name>`, e.g. `tag:server,tag:ci`) at
-        /// registration (Go `--advertise-tags`). Replaces the whole set. Use `--clear-advertise-tags`
-        /// to request none; passing neither leaves the persisted set unchanged.
+        /// registration (Go `--advertise-tags`). The `tag:` prefix may be omitted on a value with no
+        /// colon in it — `server,ci` means `tag:server,tag:ci`. Replaces the whole set. Use
+        /// `--clear-advertise-tags` to request none; passing neither leaves the persisted set
+        /// unchanged.
         #[arg(long, value_name = "tag:NAME,...", value_delimiter = ',')]
         advertise_tags: Vec<String>,
         /// Stop advertising any ACL tags (clears the set). Use this instead of an empty
@@ -388,8 +390,10 @@ enum Command {
         #[arg(long = "clear-advertise-routes", alias = "advertise-routes-clear")]
         advertise_routes_clear: bool,
         /// Advertise these ACL tags (comma-separated `tag:<name>`, e.g. `tag:server,tag:ci`) at
-        /// registration (Go `--advertise-tags`). Replaces the whole set. Use `--clear-advertise-tags`
-        /// to request none; passing neither leaves the persisted set unchanged.
+        /// registration (Go `--advertise-tags`). The `tag:` prefix may be omitted on a value with no
+        /// colon in it — `server,ci` means `tag:server,tag:ci`. Replaces the whole set. Use
+        /// `--clear-advertise-tags` to request none; passing neither leaves the persisted set
+        /// unchanged.
         #[arg(long, value_name = "tag:NAME,...", value_delimiter = ',')]
         advertise_tags: Vec<String>,
         /// Stop advertising any ACL tags (clears the set). Use this instead of an empty
@@ -567,15 +571,17 @@ enum Command {
     Down {
         /// Why this node is being disconnected (Go `tailscale down --reason`: "reason for the
         /// disconnect, if required by a policy"), for a fleet where a policy asks the operator to
-        /// justify a disconnect. The text is sent to the daemon, which records it in its log
-        /// alongside the disconnect.
+        /// justify a disconnect.
         ///
-        /// HONEST SCOPE: the same as `logout --reason` (which see) — Go carries the reason as the
-        /// LocalAPI `RequestReason` so a node whose policy demands a justification can be
-        /// disconnected at all, and it lands in that node's audit log. This fork registers no policy
-        /// store on Unix (`tnet syspolicy list` shows why) and the engine has no audit-log transport
-        /// to control, so nothing *requires* a reason here and it is not forwarded to the control
-        /// plane — it is recorded locally, next to the disconnect it explains.
+        /// It is required when the daemon's system policy (`tnet syspolicy list`) sets both
+        /// `AlwaysOn.Enabled` and `AlwaysOn.OverrideWithReason`: without it the daemon refuses with
+        /// "disconnect not allowed: reason required". With `AlwaysOn.Enabled` alone the disconnect is
+        /// refused whatever you type here — that policy offers no override.
+        ///
+        /// SCOPE: the same as `logout --reason` (which see) — the refusal is enforced by this
+        /// daemon, but the audit record a permitted disconnect leaves is written to the daemon's own
+        /// log and NOT forwarded to the control plane, which needs an engine surface that does not
+        /// exist yet (`docs/ENGINE_ASKS.md` #41).
         #[arg(long, value_name = "TEXT")]
         reason: Option<String>,
         /// Pre-accept a named risk and skip its safety refusal (Go `--accept-risk`), e.g. `lose-ssh`
@@ -596,16 +602,14 @@ enum Command {
     /// `tailscale logout`.
     Logout {
         /// Why this node is being logged out (Go `tailscale logout --reason`), for a fleet where a
-        /// policy asks the operator to justify a disconnect. The text is sent to the daemon, which
-        /// records it in its log alongside the logout.
+        /// policy asks the operator to justify a disconnect. A logout is a disconnect, so it is
+        /// gated exactly like `down --reason`: with `AlwaysOn.Enabled` set in the daemon's system
+        /// policy (`tnet syspolicy list`) the logout is refused, unless
+        /// `AlwaysOn.OverrideWithReason` is also set — and then this text is what lifts the refusal.
         ///
-        /// HONEST SCOPE: in Go the reason is what unlocks a logout on a node whose MDM policy
-        /// requires a justification, and it lands in the node's audit log. This fork registers no
-        /// policy store on Unix (`tnet syspolicy list` shows why) and the engine has no audit-log
-        /// transport to control, so nothing *requires* a reason here and the reason is not forwarded
-        /// to the control plane — it is recorded locally. The flag exists so the operator's habit and
-        /// the tooling that types it keep working against this daemon. Forwarding it needs an engine
-        /// surface that does not exist yet; the ask is filed as `docs/ENGINE_ASKS.md` #41.
+        /// SCOPE: in Go the reason also lands in the node's audit log, which control keeps. Here the
+        /// audit record is written to the daemon's own log and is NOT forwarded to the control plane:
+        /// that needs an engine surface that does not exist yet, filed as `docs/ENGINE_ASKS.md` #41.
         #[arg(long, value_name = "TEXT")]
         reason: Option<String>,
     },
@@ -2603,7 +2607,8 @@ async fn refuse_ssh_toggle_risk_if_needed(
 /// unchanged). A non-empty list takes precedence over the clear flag. The name is deliberately NOT
 /// `*_routes` — it carries no route/tag-specific semantics, so reusing it for tags is correct, not a
 /// footgun. (Any value VALIDATION — CIDR parsing for routes, `tag:` form for tags — happens elsewhere,
-/// daemon-side; this only resolves the three-way replace/clear/unchanged intent.)
+/// daemon-side, as does the `tag:`-prefix completion for a colon-less tag; this only resolves the
+/// three-way replace/clear/unchanged intent.)
 fn resolve_list_or_clear(items: Vec<String>, clear: bool) -> Option<Vec<String>> {
     if !items.is_empty() {
         Some(items)

@@ -35,21 +35,28 @@
 //! That is the entire point of policy: a `tnet set --hostname laptop` against a policy file pinning
 //! `"Hostname"` persists the pinned name, not the typed one.
 //!
-//! What it applies, and the three rulings this fork had to make that Go did not:
+//! What it applies, and the rulings this fork had to make that Go did not:
 //!
 //! - `LoginURL` → `control_url`, `Hostname` → `hostname`. `Hostname` is a **tri-state**: absent
 //!   leaves the pref alone, a non-empty value pins it, and a present-but-empty value CLEARS it (back
 //!   to the OS hostname). Go needs a `"HostnameDefaultValue"` sentinel to express that, because its
 //!   pref is a bare string; here the pref is already an `Option<String>` and the store already knows
 //!   whether a key is configured, so the tri-state falls out with no sentinel.
-//! - `AlwaysOn.Enabled` forces `want_running` back to true. Go can be overridden by a signed-in user
-//!   with `AlwaysOn.OverrideWithReason`; this daemon has no user session to hang an override on, so
-//!   that key is **reported as unenforced** rather than half-implemented. Nothing here reverts a
-//!   `tnet down` — see the note on [`apply_settings_to_prefs`].
+//! - `AlwaysOn.Enabled` forces `want_running` back to true. That is only half of always-on mode: the
+//!   other half is the **disconnect gate** ([`alwayson`](super::alwayson)), which reads
+//!   [`PKEY_ALWAYS_ON`] and [`PKEY_ALWAYS_ON_OVERRIDE_WITH_REASON`] by name and refuses a
+//!   `down`/`logout` outright unless the override key is set and the operator gave a reason. Go
+//!   splits it the same way (`applySysPolicy` re-asserts the intent, `ipnauth.CheckDisconnectPolicy`
+//!   refuses the disconnect), so both keys are enforced here and neither is reported as unenforced.
+//!   What is **not** ported is the window between the two: Go's `overrideAlwaysOn` flag and
+//!   `ReconnectAfter` timer, which suppress the re-assert for as long as a permitted override
+//!   stands. Without them a disconnect the gate allowed holds until the next reconcile point
+//!   (daemon start, `up`, `set`, `--config` reload) and is undone there — see the note on
+//!   [`apply_settings_to_prefs`].
 //! - Seven of Go's eight `preferencePolicies` map onto one bool pref each. The eighth,
 //!   `UnattendedMode` (Go `ForceDaemon`), asks a GUI client to keep the daemon connected while no
 //!   user is logged in; a system daemon with no user session is unattended by construction, which is
-//!   why there is no pref for it — so it too is reported as unenforced.
+//!   why there is no pref for it — so it is reported as unenforced.
 //! - `ExitNodeID` is **not applied**. Go pins a `tailcfg.StableNodeID`, and parks the pref on a
 //!   deliberately invalid id while an `auto:` expression is unresolved so that traffic blackholes
 //!   instead of leaking past the policy. This fork's exit node is one selector resolved by tailnet IP
@@ -64,6 +71,10 @@
 //! this build cannot enforce, and the daemon logs it at WARN every time the policy is reconciled. A
 //! report that renders an administrator's intent while changing nothing is worse than no policy
 //! support at all, so an unenforceable key has to say so.
+//!
+//! Two more keys act without ever touching prefs, because their effect is a refusal rather than a
+//! rewritten pref: `tailnetd` reads [`PKEY_ENCRYPT_STATE`] and [`PKEY_HARDWARE_ATTESTATION`] by name
+//! for two startup refusals.
 //!
 //! Two consequences worth stating. The applied values are **persisted** into `prefs.json` by
 //! whichever write follows (a profile load applies in memory only and writes nothing, so merely
@@ -104,6 +115,15 @@ pub const PKEY_ENCRYPT_STATE: &str = "EncryptState";
 /// Go `pkey.HardwareAttestation` — the policy key that asks a daemon to bind the node identity to a
 /// hardware-backed key. Read by name for the same reason as [`PKEY_ENCRYPT_STATE`].
 pub const PKEY_HARDWARE_ATTESTATION: &str = "HardwareAttestation";
+
+/// Go `pkey.AlwaysOn` — the policy key that forbids disconnecting the node. Read by name by the
+/// disconnect gate ([`alwayson`](super::alwayson)), so — like [`PKEY_ENCRYPT_STATE`] — the spelling
+/// has exactly one definition, shared with [`DEFINITIONS`].
+pub const PKEY_ALWAYS_ON: &str = "AlwaysOn.Enabled";
+
+/// Go `pkey.AlwaysOnOverrideWithReason` — the policy key that lets an operator disconnect an
+/// always-on node by saying why. Read by name for the same reason as [`PKEY_ALWAYS_ON`].
+pub const PKEY_ALWAYS_ON_OVERRIDE_WITH_REASON: &str = "AlwaysOn.OverrideWithReason";
 
 /// The scope name the CLI resolves, matching Go `setting.DefaultScope().String()` on non-Windows
 /// hosts (`"Device"`). Centralized so the report and any future scope plumbing agree on the spelling.
@@ -343,8 +363,8 @@ const DEFINITIONS: &[Definition] = &[
     def("AllowedSuggestedExitNodes", ValueType::StringList),
     def("ExitNode.AllowOverride", ValueType::Boolean),
     def("AllowTailscaledRestart", ValueType::Boolean),
-    def("AlwaysOn.Enabled", ValueType::Boolean),
-    def("AlwaysOn.OverrideWithReason", ValueType::Boolean),
+    def(PKEY_ALWAYS_ON, ValueType::Boolean),
+    def(PKEY_ALWAYS_ON_OVERRIDE_WITH_REASON, ValueType::Boolean),
     def("InstallUpdates", ValueType::PreferenceOption),
     def("AuthKey", ValueType::String),
     def("CheckUpdates", ValueType::PreferenceOption),
@@ -505,7 +525,11 @@ fn go_type_name(v: &Value) -> &'static str {
 
 /// Go's `%q` on a string: double-quoted with escapes. Rust's `{:?}` agrees with Go for the
 /// characters a policy key or value realistically contains.
-fn quoted(s: &str) -> String {
+///
+/// `pub(super)` because the always-on audit record renders Go's `%q` over a profile name and a
+/// username too ([`alwayson`](super::alwayson)), and two spellings of "Go's %q" would be one
+/// spelling too many.
+pub(super) fn quoted(s: &str) -> String {
     format!("{s:?}")
 }
 
@@ -894,12 +918,15 @@ pub(super) fn apply_to_prefs(prefs: &mut Prefs) -> PolicyApplication {
 ///
 /// **`down` and `logout` are deliberately not reconcile points.** `AlwaysOn.Enabled` re-asserts
 /// `want_running` wherever this runs, which means a node under an always-on policy comes back up at
-/// the next daemon start, `up`, `set` or config reload — but a `tnet down` the operator just typed
-/// still stops the node now. Go can afford to revert that write because it also gives a signed-in
-/// user a documented way out (`AlwaysOn.OverrideWithReason`); with no user session to hang an
-/// override on, reverting the `down` here would leave a fleet with no way to stop a node for
-/// maintenance at all. The override key is reported as unenforced so the gap is visible rather than
-/// inferred.
+/// the next daemon start, `up`, `set` or config reload — but a disconnect the gate has just let
+/// through still stops the node now, and stays stopped until one of those points comes round.
+/// Re-asserting inside `down` itself would make the permitted disconnect a lie: the gate
+/// ([`alwayson`](super::alwayson)) is where the policy decides whether the operator may stop the
+/// node, and a `down` that is allowed and then immediately undone is worse than one that is refused,
+/// because nothing tells the operator which happened. Go bridges the same gap with the
+/// `overrideAlwaysOn` flag and its `ReconnectAfter` timer — a permitted override suppresses the
+/// re-assert for a bounded window, then the node reconnects. Neither is ported yet, so the window
+/// here is "until the next reconcile point" rather than a duration the administrator sets.
 fn apply_settings_to_prefs(settings: &[PolicySetting], prefs: &mut Prefs) -> PolicyApplication {
     let mut out = PolicyApplication::default();
 
@@ -937,21 +964,16 @@ fn apply_settings_to_prefs(settings: &[PolicySetting], prefs: &mut Prefs) -> Pol
 
     // `AlwaysOn.Enabled` → force the node back to "should be connected". One-way: the policy can
     // only turn want-running ON (Go's `alwaysOn && !prefs.WantRunning`), never off.
-    if configured_boolean(settings, "AlwaysOn.Enabled") == Some(true) && !prefs.want_running {
+    //
+    // `AlwaysOn.OverrideWithReason` has no pref to move and is therefore absent here, but it is NOT
+    // unenforced: the disconnect gate reads it by name to decide whether `down`/`logout` may proceed
+    // at all (see the module docs), which is the whole of its effect in Go too.
+    if configured_boolean(settings, PKEY_ALWAYS_ON) == Some(true) && !prefs.want_running {
         prefs.want_running = true;
         out.changed.push(PolicyChange {
-            key: "AlwaysOn.Enabled",
+            key: PKEY_ALWAYS_ON,
             pref: "want_running",
             value: "true".to_string(),
-        });
-    }
-    if configured_boolean(settings, "AlwaysOn.OverrideWithReason").is_some() {
-        out.refused.push(PolicyRefusal {
-            key: "AlwaysOn.OverrideWithReason",
-            reason:
-                "this daemon has no signed-in user session to attach an always-on override to, \
-                     so there is nobody the exemption could be granted to"
-                    .to_string(),
         });
     }
 
@@ -1461,7 +1483,10 @@ mod tests {
             let def = definition_of(key).unwrap_or_else(|| panic!("{key} must be defined"));
             assert_eq!(def.ty, ValueType::String, "{key}");
         }
-        for key in ["AlwaysOn.Enabled", "AlwaysOn.OverrideWithReason"] {
+        // `PKEY_ALWAYS_ON` is named by the apply path; `PKEY_ALWAYS_ON_OVERRIDE_WITH_REASON` is
+        // named by the disconnect gate, which reads it through the same store and so needs the same
+        // definition to exist with the same type.
+        for key in [PKEY_ALWAYS_ON, PKEY_ALWAYS_ON_OVERRIDE_WITH_REASON] {
             let def = definition_of(key).unwrap_or_else(|| panic!("{key} must be defined"));
             assert_eq!(def.ty, ValueType::Boolean, "{key}");
         }
@@ -1735,21 +1760,36 @@ mod tests {
     }
 
     #[test]
-    fn the_two_keys_with_no_pref_to_move_are_reported_unenforced() {
-        // Neither has a counterpart in this daemon; reporting them is what keeps the policy file
-        // from looking enforced when it is not.
+    fn the_key_with_no_pref_to_move_is_reported_unenforced() {
+        // `UnattendedMode` has no counterpart in this daemon; reporting it is what keeps the policy
+        // file from looking enforced when it is not.
         let mut prefs = Prefs::default();
-        let applied = apply(
-            r#"{"UnattendedMode": "always", "AlwaysOn.OverrideWithReason": true}"#,
-            &mut prefs,
-        );
+        let applied = apply(r#"{"UnattendedMode": "always"}"#, &mut prefs);
         assert!(applied.changed.is_empty(), "{applied:?}");
         let refused: Vec<&str> = applied.refused.iter().map(|r| r.key).collect();
         assert!(refused.contains(&"UnattendedMode"), "{refused:?}");
-        assert!(
-            refused.contains(&"AlwaysOn.OverrideWithReason"),
-            "{refused:?}"
+    }
+
+    #[test]
+    fn the_always_on_override_key_is_not_reported_unenforced() {
+        // It moves no pref, so the apply path is silent about it — but it IS enforced, by the
+        // disconnect gate that reads it by name. Reporting it as unenforced would tell an
+        // administrator their `--reason` exemption does nothing, which is the opposite of true.
+        let mut prefs = Prefs::default();
+        let applied = apply(
+            r#"{"AlwaysOn.Enabled": true, "AlwaysOn.OverrideWithReason": true}"#,
+            &mut prefs,
         );
+        assert!(
+            prefs.want_running,
+            "AlwaysOn.Enabled still re-asserts intent"
+        );
+        let refused: Vec<&str> = applied.refused.iter().map(|r| r.key).collect();
+        assert!(refused.is_empty(), "{refused:?}");
+        // The gate's own decision is pinned by the unit tests in `alwayson` (over resolved booleans)
+        // and end-to-end by `tests/alwayson_disconnect.rs` (over a registered policy file); this
+        // test owns only the half that lives here — that the apply path stays quiet about the key
+        // instead of contradicting them.
     }
 
     #[test]

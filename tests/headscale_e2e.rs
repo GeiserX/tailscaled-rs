@@ -41,6 +41,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tailscaled_rs::ipn::Backend;
+use tailscaled_rs::ipn::alwayson::Actor;
 
 /// Per-process-unique counter so a re-run never collides on a temp path.
 static UNIQUE: AtomicU64 = AtomicU64::new(0);
@@ -145,7 +146,10 @@ async fn headscale_join_netmap_down() {
     let reached_running = last_state == "Running";
     let self_addr = self_ipv4.clone();
 
-    backend.down().await.expect("down() should succeed");
+    backend
+        .down(Actor::Operator { reason: None })
+        .await
+        .expect("down() should succeed");
     backend.shutdown().await;
     let _ = tokio::fs::remove_dir_all(&state_dir).await;
 
@@ -274,7 +278,10 @@ async fn headscale_debug_capture_writes_pcap() {
     // Read the file back BEFORE teardown.
     let bytes = tokio::fs::read(&pcap).await.unwrap_or_default();
 
-    backend.down().await.expect("down()");
+    backend
+        .down(Actor::Operator { reason: None })
+        .await
+        .expect("down()");
     backend.shutdown().await;
     let _ = tokio::fs::remove_dir_all(&state_dir).await;
 
@@ -370,7 +377,10 @@ async fn headscale_rebind_is_non_disruptive() {
     // The node must remain Running after a rebind (it re-binds sockets, not the registration).
     let still_running = running && backend.status().await.state == "Running";
 
-    backend.down().await.expect("down()");
+    backend
+        .down(Actor::Operator { reason: None })
+        .await
+        .expect("down()");
     backend.shutdown().await;
     let _ = tokio::fs::remove_dir_all(&state_dir).await;
 
@@ -505,7 +515,10 @@ async fn headscale_set_live_vs_rebuild_dispatch() {
     };
 
     // ALWAYS tear down + clean up before asserting, so a failure can't leave a registered node behind.
-    backend.down().await.expect("down()");
+    backend
+        .down(Actor::Operator { reason: None })
+        .await
+        .expect("down()");
     backend.shutdown().await;
     let _ = tokio::fs::remove_dir_all(&state_dir).await;
 
@@ -609,7 +622,10 @@ async fn headscale_readonly_diagnostics_on_running_node() {
     // `tnet ip` reads the same self address we already polled.
     let ip = self_ipv4.clone();
 
-    backend.down().await.expect("down()");
+    backend
+        .down(Actor::Operator { reason: None })
+        .await
+        .expect("down()");
     backend.shutdown().await;
     let _ = tokio::fs::remove_dir_all(&state_dir).await;
 

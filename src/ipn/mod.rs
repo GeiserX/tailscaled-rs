@@ -73,6 +73,7 @@ use anyhow::{Context, Result, anyhow};
 use crate::localapi::{PeerReport, StatusReport};
 use crate::prefs::Prefs;
 
+pub mod alwayson;
 mod captive;
 mod config;
 mod control_url;
@@ -508,15 +509,38 @@ async fn arm_funnel_lane(
     }
 }
 
-/// Validate `--advertise-tags` values byte-for-byte against Go's `tailcfg.CheckTag` (which `up`/`set`
-/// apply via `Hostinfo.CheckRequestTags`): each must be `tag:<name>` where `<name>` is non-empty,
+/// Complete and validate `--advertise-tags` values, returning the values as the daemon will store
+/// and advertise them.
+///
+/// **Completion** first, exactly as Go's `prefsFromUpArgs` does before it validates: a value that
+/// contains NO colon at all gets the `tag:` prefix added for it, so `--advertise-tags server,ci`
+/// means `tag:server,tag:ci`. The no-colon condition is the whole rule — a value that already has a
+/// colon is passed through untouched, so a malformed `foo:bar` still reaches the check below and is
+/// refused by name instead of being quietly turned into a `tag:foo:bar` nobody asked for.
+///
+/// **Validation** then runs byte-for-byte against Go's `tailcfg.CheckTag` (which `up`/`set` apply
+/// via `Hostinfo.CheckRequestTags`): each must be `tag:<name>` where `<name>` is non-empty,
 /// **starts with an ASCII letter**, and contains only `[A-Za-z0-9-]`. Matching Go's gate exactly
 /// matters because the engine does NOT re-validate — it ships `requested_tags` straight to control —
 /// so this is the *only* client-side check; a too-lax gate lets a malformed tag reach control and be
 /// rejected there with a confusing error instead of failing locally with a precise one. Returns the
-/// first offender. Pure so it can guard both `begin_up` and `begin_set` before any pref is mutated.
-fn validate_advertise_tags(tags: &[String]) -> Result<()> {
+/// first offender, quoting the COMPLETED value (Go's `tag: %q`) so the operator is shown the tag as
+/// the daemon would have seen it rather than the shorthand they typed.
+///
+/// Go completes in the CLI and validates in `tailcfg`; this fork does both here, daemon-side, so
+/// that `up` and `set` keep sharing one notion of what a tag is — a direct LocalAPI caller gets the
+/// same completion the CLI does. Pure so it can guard both `begin_up` and `begin_set` before any pref
+/// is mutated.
+fn complete_and_validate_advertise_tags(tags: &[String]) -> Result<Vec<String>> {
+    let mut out = Vec::with_capacity(tags.len());
     for t in tags {
+        // Allow operators to omit the `tag:` prefix; if the tag has no colon at all, add it for
+        // them (Go `prefsFromUpArgs`).
+        let t = if t.contains(':') {
+            t.clone()
+        } else {
+            format!("tag:{t}")
+        };
         let name = t.strip_prefix("tag:").ok_or_else(|| {
             anyhow!("invalid tag {t:?}: tags must be of the form tag:<name> (e.g. tag:server)")
         })?;
@@ -543,8 +567,9 @@ fn validate_advertise_tags(tags: &[String]) -> Result<()> {
                 "invalid tag {t:?}: tag names may contain only letters, digits, or '-'"
             ));
         }
+        out.push(t);
     }
-    Ok(())
+    Ok(out)
 }
 
 /// The advertised-route SET a pending `up`/`set` would leave behind, as the pair
@@ -1341,7 +1366,10 @@ pub async fn drive_reload_config(
         // (idempotent — `apply_config` already set it). No off-lock build needed for a teardown.
         ReloadAction::BringDown => {
             let mut be = backend.lock().await;
-            be.down().await?;
+            // `Actor::Daemon`: the daemon reconciling intent `reload_config` has already persisted,
+            // not an operator asking to disconnect — so the always-on gate does not apply (see
+            // `alwayson::Actor::Daemon` for why refusing here would be the wrong shape).
+            be.down(alwayson::Actor::Daemon).await?;
         }
         // Node up, reloaded config keeps it up → rebuild from the now-updated prefs. The
         // preflight → begin_up → (off-lock) build_device → finish_up → off-lock orphan settle
@@ -1469,8 +1497,9 @@ pub struct UpOptions {
     /// (`Some(vec![])` clears it). A `Vec` alone could not express "unchanged", hence the `Option`.
     pub advertise_routes: Option<Vec<String>>,
     /// Advertise-tags override (Go `--advertise-tags`). `None` leaves the pref unchanged; `Some(vec)`
-    /// replaces the set (`Some(vec![])` clears it). Each entry must be `tag:<name>` (validated at the
-    /// CLI/server boundary).
+    /// replaces the set (`Some(vec![])` clears it). Each entry must be `tag:<name>`, or a value with
+    /// no colon at all, which `complete_and_validate_advertise_tags` completes to `tag:<value>`
+    /// before anything is persisted.
     pub advertise_tags: Option<Vec<String>>,
     /// Accept-subnet-routes override (`None` leaves the pref unchanged; `Some(b)` sets it). Go's
     /// `tailscale up --accept-routes`; same tri-state as `set`'s `accept_routes`.
@@ -1593,7 +1622,8 @@ pub struct SetOptions {
     /// Subnet routes this node advertises (`None` unchanged; `Some(vec)` replaces). Applied LIVE via
     /// [`tailscale::Device::set_advertise_routes`] (no reconnect).
     pub advertise_routes: Option<Vec<String>>,
-    /// ACL tags this node advertises (`None` unchanged; `Some(vec)` replaces; `tag:<name>` each). Has
+    /// ACL tags this node advertises (`None` unchanged; `Some(vec)` replaces; `tag:<name>` each, or
+    /// a colon-less value completed to `tag:<value>` by `complete_and_validate_advertise_tags`). Has
     /// NO live engine setter (tags are requested at registration via `Config.requested_tags`), so on
     /// a running node it takes the [`SetAction::Rebuild`] path — a brief reconnect.
     pub advertise_tags: Option<Vec<String>>,
@@ -2641,7 +2671,7 @@ impl Backend {
     /// Does **no** network I/O for the `Rebuild` case (the slow `Device::new` is the caller's
     /// off-lock job); the only blocking steps here are the quick live setter mailbox round-trips on
     /// the `Live` path.
-    pub async fn begin_set(&mut self, opts: SetOptions) -> Result<SetOutcome> {
+    pub async fn begin_set(&mut self, mut opts: SetOptions) -> Result<SetOutcome> {
         // Decide the path BEFORE mutating prefs — `needs_rebuild()` inspects which fields the
         // request named, which the apply below would not change, but reading it first keeps the
         // decision crisply about the *request* rather than post-apply state. Also snapshot which
@@ -2682,9 +2712,14 @@ impl Backend {
             false,
         );
         crate::routes::validate_advertise_routes(&prospective_routes, prospective_advertise_exit)?;
-        // Same pre-validate-before-persist discipline for advertise-tags (tag:<name> form).
-        if let Some(tags) = opts.advertise_tags.as_ref() {
-            validate_advertise_tags(tags)?;
+        // Same pre-validate-before-persist discipline for advertise-tags — and the COMPLETION that
+        // goes with it: a value with no colon at all becomes `tag:<value>` here, so the shorthand
+        // `--advertise-tags server` persists and advertises as `tag:server` (Go completes the same
+        // values in its CLI; this fork completes daemon-side so `up` and `set` share one rule). The
+        // completed list replaces what was asked for, so everything below — the apply into prefs,
+        // the persist, the rebuild — sees the tags exactly as control will.
+        if let Some(tags) = opts.advertise_tags.as_mut() {
+            *tags = complete_and_validate_advertise_tags(tags)?;
         }
         // And RESOLVE a named `--exit-node` before persisting: the unsupported `auto:` form, then
         // the netmap-backed checks Go runs on the CLI argument (`exitNodeIPOfArg`). Same reason as
@@ -3035,7 +3070,11 @@ impl Backend {
     /// shutdown (bounded by [`SHUTDOWN_TIMEOUT`]), so on a *reconfigure* (a device was already live)
     /// this phase is not strictly instantaneous under the lock — only the fresh-up case is. The
     /// common, head-of-line-sensitive case (no prior device) returns immediately.
-    pub async fn begin_up(&mut self, opts: UpOptions, wif: Option<&WifCreds>) -> Result<PendingUp> {
+    pub async fn begin_up(
+        &mut self,
+        mut opts: UpOptions,
+        wif: Option<&WifCreds>,
+    ) -> Result<PendingUp> {
         // PRE-VALIDATE the advertised route SET FIRST — before tearing down the device, mutating, or
         // persisting prefs. Same persist-before-validate gap as `begin_set`: `build_config` (below,
         // the final authority on the CIDR parse) only rejects a malformed CIDR AFTER `stop_device` +
@@ -3052,9 +3091,13 @@ impl Backend {
             opts.reset,
         );
         crate::routes::validate_advertise_routes(&prospective_routes, prospective_advertise_exit)?;
-        // Same pre-validate-before-teardown discipline for advertise-tags (tag:<name> form).
-        if let Some(tags) = opts.advertise_tags.as_ref() {
-            validate_advertise_tags(tags)?;
+        // Same pre-validate-before-teardown discipline for advertise-tags, including the
+        // `tag:`-prefix COMPLETION for a value with no colon at all — `up --advertise-tags server`
+        // is `tag:server`, as it is in Go. Rewritten in place so the apply/persist below store the
+        // completed form; a value that already has a colon is left alone and refused by name if it
+        // is not a tag.
+        if let Some(tags) = opts.advertise_tags.as_mut() {
+            *tags = complete_and_validate_advertise_tags(tags)?;
         }
         // And RESOLVE a named `--exit-node` before teardown/persist: reject the unsupported `auto:`
         // form (no auto-selection in this build), then check the value against the netmap the way Go
@@ -3610,8 +3653,72 @@ impl Backend {
         config::build_config(&self.prefs, &self.key_path, self.listen_port).await
     }
 
+    /// The current profile's display NAME — what `tnet switch --list` shows, and Go's
+    /// `LoginProfile.Name()`. Falls back to the profile id when the profile has no display name (the
+    /// usual case for `default`), which is exactly what [`list_profiles`](Backend::list_profiles)
+    /// already decides, so the name in an audit record and the name in `switch --list` cannot drift.
+    async fn current_profile_name(&self) -> String {
+        self.list_profiles()
+            .await
+            .into_iter()
+            .find(|p| p.current)
+            .map(|p| p.name)
+            .unwrap_or_else(|| self.current_profile.clone())
+    }
+
+    /// The always-on disconnect gate — Go's `checkEditPrefsAccessLocked` calling
+    /// `actor.CheckProfileAccess(…, ipnauth.Disconnect, …)`, which lands in
+    /// [`alwayson::check_disconnect_policy`].
+    ///
+    /// Called by [`down`](Backend::down) and [`logout`](Backend::logout) as their first act, so the
+    /// two commands that take `WantRunning` from true to false share one rule and neither can be the
+    /// only gate. It refuses before any teardown or persist, so a refusal costs nothing.
+    ///
+    /// Go gates a **transition**, not a state: `mp.WantRunningSet && !mp.WantRunning &&
+    /// b.pm.CurrentPrefs().WantRunning()`. A `down` on a node that is already down is therefore not
+    /// a disconnect and is not refused — which matters, because the alternative would wedge an
+    /// always-on node's operator out of the idempotent `down` that Go lets through.
+    ///
+    /// Note what "already down" means under an always-on policy: prefs that were *persisted* down do
+    /// not qualify, because [`reconcile_sys_policy`](Backend::reconcile_sys_policy) re-asserts
+    /// `want_running` at profile load, before any command is evaluated — Go's `reconcilePrefs` does
+    /// the same, which is why its `CurrentPrefs().WantRunning()` reads true there too. The state that
+    /// does qualify is the window after a disconnect this gate PERMITTED and before the next
+    /// reconcile point, where a second `down` is genuinely a no-op.
+    ///
+    /// A permitted disconnect that the policy *required a reason for* leaves Go's audit record. This
+    /// daemon has no transport to ship it to control (engine ask #41), so it goes to the daemon log
+    /// under Go's action name — written before the teardown, so a disconnect that then fails is
+    /// still explained.
+    async fn check_disconnect_policy(&self, actor: alwayson::Actor<'_>) -> Result<()> {
+        if !self.prefs.want_running {
+            return Ok(());
+        }
+        // Go's `actor.Username()` is best-effort and, outside Windows, has no implementation — so
+        // Go itself takes the no-username branch on every platform this daemon runs on. The LocalAPI
+        // peer is identified here by uid rather than by name (see `crate::auth`); resolving that uid
+        // to a passwd entry is the one thing a username branch would need, and it is a call-site
+        // change when it arrives, not a reshaping of the record.
+        let username = None;
+        let profile = self.current_profile_name().await;
+        if let Some(details) = alwayson::check_disconnect_policy(actor, &profile, username)? {
+            tracing::info!(
+                action = alwayson::AUDIT_NODE_DISCONNECT,
+                details = %details,
+                "audit: always-on disconnect permitted by policy"
+            );
+        }
+        Ok(())
+    }
+
     /// Bring the node down (`WantRunning = false`) without logging out; tears down the engine.
-    pub async fn down(&mut self) -> Result<()> {
+    ///
+    /// `actor` says who asked, which is what decides whether the always-on policy is consulted — see
+    /// [`check_disconnect_policy`](Backend::check_disconnect_policy). A refused disconnect returns
+    /// the refusal **before** anything is torn down or persisted, so the node is left exactly as it
+    /// was.
+    pub async fn down(&mut self, actor: alwayson::Actor<'_>) -> Result<()> {
+        self.check_disconnect_policy(actor).await?;
         self.stop_device().await;
         // Bump the generation so an `up` whose `Device::new` is still in flight (lock released) is
         // recognized as stale by `finish_up` and its device discarded — `down` wins. The bump also
@@ -3680,7 +3787,12 @@ impl Backend {
     ///    login). This is the daemon's responsibility because the engine's `logout` intentionally
     ///    leaves the key on disk (re-`new` with the same key is its *re-login* path — the opposite of
     ///    what `tailscale logout` means). A missing key file is fine (already fresh).
-    pub async fn logout(&mut self) -> Result<()> {
+    pub async fn logout(&mut self, actor: alwayson::Actor<'_>) -> Result<()> {
+        // 0. The always-on gate, before the control-plane call and before anything is torn down: a
+        // logout is a disconnect (Go routes it through the same `editPrefsLocked` with
+        // `WantRunning:false`, so the same `ipnauth.Disconnect` check applies), and a refusal must
+        // leave the registration intact.
+        self.check_disconnect_policy(actor).await?;
         // 1. Best-effort control-plane deregistration while the device is still alive. (Let-chain
         // rather than nested `if let` — clippy::collapsible_if; mirrors the `&&`-let style this
         // module already uses, e.g. the revert-guard arms.)
@@ -5597,7 +5709,9 @@ mod tests {
         tokio::fs::write(&be.key_path, b"{\"key_state\":{}}")
             .await
             .unwrap();
-        be.down().await.expect("down");
+        be.down(alwayson::Actor::Operator { reason: None })
+            .await
+            .expect("down");
         assert!(!be.prefs.want_running, "down clears want_running");
         assert!(!be.prefs.logged_out, "down must NOT set logged_out");
         assert!(
@@ -5615,7 +5729,9 @@ mod tests {
         be.prefs.has_logged_in = true; // a registered node
         // key file still present from the `down` case above.
         assert!(tokio::fs::try_exists(&be.key_path).await.unwrap());
-        be.logout().await.expect("logout");
+        be.logout(alwayson::Actor::Operator { reason: None })
+            .await
+            .expect("logout");
         assert!(!be.prefs.want_running, "logout clears want_running");
         assert!(
             be.prefs.logged_out,
@@ -5924,7 +6040,7 @@ mod tests {
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let mut be = backend_for(&dir);
         assert!(!tokio::fs::try_exists(&be.key_path).await.unwrap());
-        be.logout()
+        be.logout(alwayson::Actor::Operator { reason: None })
             .await
             .expect("logout with no key file must succeed");
         assert!(be.prefs.logged_out);
@@ -6692,7 +6808,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = be.logout().await;
+        let result = be.logout(alwayson::Actor::Operator { reason: None }).await;
         assert!(
             result.is_err(),
             "a key-wipe failure must make logout fail, not silently half-complete"
@@ -6873,7 +6989,9 @@ mod tests {
         assert!(be.prefs.want_running, "begin_up sets want_running");
 
         // A `down` lands while the (hypothetical) handshake is still in flight → supersedes.
-        be.down().await.expect("down");
+        be.down(alwayson::Actor::Operator { reason: None })
+            .await
+            .expect("down");
         assert!(!be.prefs.want_running, "down clears want_running");
         assert!(
             be.generation > pending.generation,
@@ -7156,6 +7274,139 @@ mod tests {
             !tokio::fs::try_exists(dir.join("prefs.json")).await.unwrap(),
             "a set rejected for a bad CIDR must not have persisted prefs.json"
         );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn begin_set_completes_bare_advertise_tags() {
+        // Go's `prefsFromUpArgs` lets an operator omit the `tag:` prefix — `--advertise-tags
+        // server,ci` is `tag:server,tag:ci` — and every piece of upstream documentation an operator
+        // copies from says so. This fork validates tags daemon-side so `up` and `set` share one
+        // rule, so the completion has to live there too: a bare name must be ACCEPTED and stored in
+        // its completed form, since `requested_tags` goes to control exactly as persisted.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-set-baretags-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+
+        be.begin_set(SetOptions {
+            // One shorthand, one already-prefixed: the completion is per-value.
+            advertise_tags: Some(vec!["server".to_string(), "tag:ci".to_string()]),
+            ..SetOptions::default()
+        })
+        .await
+        .expect("a bare tag name must be accepted, as `tailscale set --advertise-tags server` is");
+        assert_eq!(
+            be.prefs.advertise_tags,
+            vec!["tag:server".to_string(), "tag:ci".to_string()],
+            "the COMPLETED tags must be what lands in prefs — control sees these verbatim"
+        );
+        // And the completed form is what was persisted, so the next boot advertises the same tags.
+        let persisted = tokio::fs::read_to_string(dir.join("prefs.json"))
+            .await
+            .unwrap();
+        assert!(
+            persisted.contains("tag:server") && !persisted.contains("\"server\""),
+            "prefs.json must hold the completed tag, got {persisted}"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn begin_set_refuses_colon_bearing_non_tag_without_completing_it() {
+        // The colon rule is the half of Go's completion that does the refusing: it applies ONLY to a
+        // value with no colon at all, so a malformed `foo:bar` still reaches the `CheckTag` port and
+        // is refused by name instead of being silently turned into `tag:foo:bar` — a tag nobody
+        // asked for, advertised to control. Refused before anything is mutated or persisted.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-set-colontag-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+        be.prefs.advertise_tags = vec!["tag:baseline".to_string()];
+
+        let err = be
+            .begin_set(SetOptions {
+                advertise_tags: Some(vec!["foo:bar".to_string()]),
+                accept_routes: Some(true),
+                ..SetOptions::default()
+            })
+            .await
+            .expect_err("a colon-bearing value that is not a tag must still be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("\"foo:bar\"") && !msg.contains("tag:foo:bar"),
+            "the refusal must name the value as typed and must not show a completed one, got {msg:?}"
+        );
+        assert_eq!(
+            be.prefs.advertise_tags,
+            vec!["tag:baseline".to_string()],
+            "a refused set must leave the tags pref untouched"
+        );
+        assert!(
+            !be.prefs.accept_routes,
+            "a refused set must not have applied the co-named accept_routes change"
+        );
+        assert!(
+            !tokio::fs::try_exists(dir.join("prefs.json")).await.unwrap(),
+            "a set refused for a bad tag must not have persisted prefs.json"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn begin_up_completes_bare_advertise_tags() {
+        // The same shorthand on the `up` path — this is the command in upstream's own docs
+        // (`tailscale up --advertise-tags server`), and it used to be refused here by a rule an
+        // operator copying that documentation has no reason to expect.
+        let dir = std::env::temp_dir().join(format!("tailnetd-up-baretags-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+
+        be.begin_up(
+            UpOptions {
+                advertise_tags: Some(vec!["server".to_string()]),
+                ..UpOptions::default()
+            },
+            None,
+        )
+        .await
+        .expect("a bare tag name must be accepted, as `tailscale up --advertise-tags server` is");
+        assert_eq!(
+            be.prefs.advertise_tags,
+            vec!["tag:server".to_string()],
+            "`up` must persist the completed tag, exactly as `set` does"
+        );
+
+        // And an illegal name is still refused — quoting the COMPLETED value, as Go's `tag: %q`
+        // does, so the operator is shown the tag as the daemon would have seen it.
+        let mut be = backend_for(&dir);
+        // `PendingUp` is not `Debug`, so match rather than `expect_err` (as the other `begin_up`
+        // tests do).
+        match be
+            .begin_up(
+                UpOptions {
+                    advertise_tags: Some(vec!["9server".to_string()]),
+                    ..UpOptions::default()
+                },
+                None,
+            )
+            .await
+        {
+            Ok(_) => panic!("a completed tag with an illegal name must still be refused"),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                assert!(
+                    msg.contains("\"tag:9server\""),
+                    "the refusal must quote the completed value, got {msg:?}"
+                );
+            }
+        }
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

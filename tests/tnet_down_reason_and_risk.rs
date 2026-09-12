@@ -16,9 +16,11 @@
 //! running the built `tnet` against a stub daemon that speaks the LocalAPI's one-line JSON — the
 //! same style as `tests/whois_flow_arguments.rs`.
 //!
-//! HONEST SCOPE: `--reason` is carried to the daemon and recorded in its log, not forwarded to the
-//! control plane — this fork registers no policy store that could *require* a justification and the
-//! engine has no audit-log transport. That is the same scope `logout --reason` already documents.
+//! SCOPE: `--reason` is carried to the daemon, where the always-on gate (`src/ipn/alwayson.rs`) is
+//! what can *require* it — a policy file setting `AlwaysOn.Enabled` + `AlwaysOn.OverrideWithReason`
+//! makes a reasonless `down` a refusal. It is still not forwarded to the control plane: the audit
+//! record lands in the daemon's log, because the engine has no audit-log transport. The refusals
+//! themselves are covered by `tests/alwayson_disconnect.rs`; this file is about the CLI surface.
 //!
 //! Upstream: `cmd/tailscale/cli/down.go` and `cmd/tailscale/cli/risks.go` @
 //! `53a0d659afa51835dd7a9283873cca44261454f8`.

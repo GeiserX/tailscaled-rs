@@ -126,7 +126,9 @@ pub enum Request {
         #[serde(default)]
         advertise_routes: Option<Vec<String>>,
         /// ACL tags this node requests (Go `--advertise-tags`, each `tag:<name>`). `None` unchanged;
-        /// `Some(vec)` replaces (`Some([])` clears). `#[serde(default)]` keeps the wire back-compatible.
+        /// `Some(vec)` replaces (`Some([])` clears). A value with no colon at all is completed to
+        /// `tag:<value>` by the daemon (Go does this in its CLI), so a caller may send either form.
+        /// `#[serde(default)]` keeps the wire back-compatible.
         #[serde(default)]
         advertise_tags: Option<Vec<String>>,
         /// Accept (and route to) subnet routes advertised by peers (Go `tailscale up
@@ -252,7 +254,7 @@ pub enum Request {
         #[serde(default)]
         advertise_routes: Option<Vec<String>>,
         /// ACL tags this node requests (`None` unchanged; `Some(vec)` replaces, `Some([])` clears;
-        /// each `tag:<name>`).
+        /// each `tag:<name>`, or a colon-less value the daemon completes to `tag:<value>`).
         #[serde(default)]
         advertise_tags: Option<Vec<String>>,
         /// Run the Tailscale SSH server (`None` unchanged; `Some(b)` sets it). Toggling SSH via
@@ -561,10 +563,12 @@ pub enum Request {
         /// when the flag was omitted — which is also what an older client sending the bare
         /// `{"cmd":"down"}` deserializes to.
         ///
-        /// Same HONEST SCOPE as [`Logout::reason`](Request::Logout): this fork registers no policy
-        /// store that could *require* a justification and the engine has no audit-log transport to
-        /// control, so the daemon records the reason in its own log alongside the disconnect and
-        /// nothing else consumes it. It is not forwarded to the control plane.
+        /// Same SCOPE as [`Logout::reason`](Request::Logout): the reason is what lifts the always-on
+        /// refusal (`ipn::alwayson`) on a node whose policy file sets `AlwaysOn.Enabled` **and**
+        /// `AlwaysOn.OverrideWithReason` — without it the daemon answers Go's "disconnect not
+        /// allowed: reason required" and the node stays up. What is still missing is delivery: the
+        /// audit record a permitted disconnect leaves goes to the daemon's own log, not to the
+        /// control plane, because the engine exposes no audit-log transport (ask #41).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
@@ -578,12 +582,13 @@ pub enum Request {
         /// as the base64 `X-Tailscale-Reason` LocalAPI header). `None` when the flag was omitted —
         /// which is also what an older client sending the bare `{"cmd":"logout"}` deserializes to.
         ///
-        /// HONEST SCOPE: in Go the reason is what lets a user disconnect a node whose MDM policy
-        /// requires a justification, and it is recorded in the node's audit log. This fork registers
-        /// no policy store on Unix (see [`SyspolicyList`](Request::SyspolicyList)) and the engine has
-        /// no audit-log transport to control, so the daemon *records the reason in its own log*
-        /// alongside the logout and nothing else consumes it. It is not forwarded to the control
-        /// plane.
+        /// SCOPE: in Go the reason is what lets a user disconnect a node whose MDM policy requires a
+        /// justification, and it is recorded in the node's audit log. This fork now enforces the
+        /// first half: a policy file (see [`SyspolicyList`](Request::SyspolicyList)) that sets
+        /// `AlwaysOn.Enabled` makes the daemon refuse this logout outright, and one that also sets
+        /// `AlwaysOn.OverrideWithReason` makes it refuse a logout with no reason. The second half is
+        /// still local — the audit record is written to the daemon's own log rather than shipped to
+        /// control, which needs an engine transport that does not exist (ask #41).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
