@@ -1813,17 +1813,19 @@ struct ServeFlags {
     /// NOT SUPPORTED by this build (Go `--service=svc:<name>`): attach the serve to a Tailscale
     /// Service (VIP) rather than to this node. Refused rather than ignored — the LocalAPI
     /// `ServeConfig` here carries no `Services` map, and Services are a control-plane + netmap
-    /// feature the pinned engine does not surface. Go's own two refusals for the flag (with
-    /// `funnel`, and with a foreground serve) still come first, in Go's words.
+    /// feature the pinned engine does not surface. EVERY check `runServeCombined` performs comes
+    /// first — Go's own two refusals for this flag (with `funnel`, and with a foreground serve)
+    /// among them — so a command line Go would have rejected is rejected in Go's words, and only
+    /// one Go would have accepted reaches the message above. See [`check_serve_flags`].
     #[arg(long, value_name = "SERVICE")]
     service: Option<String>,
     /// NOT SUPPORTED by this build (Go `--tun`): serve on the kernel TUN interface instead of the
     /// userspace netstack. Refused rather than ignored — this daemon's serve lanes are netstack-only.
     ///
     /// Go models `--tun` as a fifth serve type ([`ServeKind::Tun`]), mutually exclusive with the
-    /// four port flags and legal only alongside `--service`; since `--service` is refused here, the
-    /// refusal a `tnet` command line actually reaches is Go's own `tun mode is only supported for
-    /// services`.
+    /// four port flags and legal only alongside `--service`. Without a service, the refusal a `tnet`
+    /// command line reaches is Go's own `tun mode is only supported for services`; WITH one, Go
+    /// would have accepted the pair, so what lands is this build's `--service` gap.
     #[arg(long)]
     tun: bool,
     /// NOT SUPPORTED by this build (Go `--proxy-protocol=1|2`): prepend a PROXY-protocol header to
@@ -13345,6 +13347,75 @@ fn parse_accept_app_caps(values: &[String]) -> Result<Vec<String>> {
     Ok(caps)
 }
 
+/// The only refusal in `runServeCombined`'s own body that it does not simply return: when
+/// `srvTypeAndPortFromFlags` fails, Go prints the cause ITSELF — `fmt.Fprintf(e.stderr(),
+/// "error: %v\n\n", err)` — and then returns `errHelpFunc(subcmd)`, whose whole text is ``try
+/// `tailscale <serve|funnel> --help` for usage info``. Go's `main` prints that second error with a
+/// bare `fmt.Fprintln(os.Stderr, err)` and exits 1, so the operator sees the cause, a blank line,
+/// and a pointer at the right help page.
+///
+/// Go frames four MORE refusals this way, all of them inside `validateArgs`, which `runServeCombined`
+/// calls before anything else: the legacy-CLI translation, `invalid argument format`, and
+/// `invalid number of arguments (%d)` (plus a bare `flag.ErrHelp` for an empty argument list without
+/// `--tun`). None of those are ported — argument arity and shape are clap's job in this build, with
+/// clap's wording and clap's exit 2 — so the flag-grammar refusal below is the only framed one here.
+///
+/// The hint is worth carrying and not just the cause: for the person who has mistyped a port, the
+/// cause alone does not say which of the four port flags it is even about — Go's sentence names the
+/// wrong one on purpose (see [`serve_kind_and_port`]) — and the help page it points at does.
+///
+/// It is carried as its own error type, rather than as a pre-rendered string, so [`check_serve_flags`]
+/// stays pure and testable: the type keeps the two halves apart, [`ServeUsageError::go_stderr`]
+/// renders exactly the bytes Go's process writes, and [`check_serve_flags_or_exit`] is the single
+/// place that writes them and exits. The hint names `tnet`, this binary, the way every other
+/// message here does.
+#[derive(Debug)]
+struct ServeUsageError {
+    /// The `srvTypeAndPortFromFlags` error, printed under Go's `error: ` prefix.
+    cause: String,
+    /// Go's `infoMap[subcmd].Name`: the command the help hint points at, `serve` or `funnel`.
+    verb: &'static str,
+}
+
+impl ServeUsageError {
+    fn new(cause: &anyhow::Error, funnel: bool) -> Self {
+        Self {
+            cause: cause.to_string(),
+            verb: if funnel { "funnel" } else { "serve" },
+        }
+    }
+
+    /// Exactly what Go's process writes to stderr for this refusal: the `error: %v` line, the blank
+    /// line Go's `\n\n` leaves, then the hint plus the newline `fmt.Fprintln` adds.
+    fn go_stderr(&self) -> String {
+        format!("error: {}\n\n{self}\n", self.cause)
+    }
+}
+
+/// Go's error VALUE here is `errHelpFunc`'s hint alone — the cause was already printed — so that is
+/// what this displays.
+impl std::fmt::Display for ServeUsageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "try `tnet {} --help` for usage info", self.verb)
+    }
+}
+
+impl std::error::Error for ServeUsageError {}
+
+/// [`check_serve_flags`] as `runServeCombined` performs it, and the ONLY form of it a command lane
+/// may call: a [`ServeUsageError`] is written to stderr with Go's framing and exits 1, rather than
+/// propagating to `main` to be printed as one `Error: …` line with the cause dropped. Every other
+/// refusal propagates untouched.
+fn check_serve_flags_or_exit(flags: &ServeFlags, funnel: bool) -> Result<(ServeKind, u16)> {
+    check_serve_flags(flags, funnel).map_err(|e| match e.downcast::<ServeUsageError>() {
+        Ok(usage) => {
+            eprint!("{}", usage.go_stderr());
+            std::process::exit(1);
+        }
+        Err(other) => other,
+    })
+}
+
 /// Validate a `serve`/`funnel` flag set and resolve its listener, running `serve_v2.go`'s own checks
 /// in `serve_v2.go`'s order before any of this build's "not supported" refusals.
 ///
@@ -13355,27 +13426,39 @@ fn parse_accept_app_caps(values: &[String]) -> Result<Vec<String>> {
 /// command line Go would have ACCEPTED reaches a "not supported by this build" message, which then
 /// names the specific missing capability rather than degrading to a serve that silently lacks the
 /// requested property.
+///
+/// One error out of here must NOT simply be propagated: a [`ServeUsageError`] displays as the help
+/// hint ALONE, because by the time Go builds that value it has already printed the cause itself. So
+/// every production caller goes through [`check_serve_flags_or_exit`], which writes both halves and
+/// exits; a bare `check_serve_flags(…)?` would print the hint with the cause silently dropped.
 fn check_serve_flags(flags: &ServeFlags, funnel: bool) -> Result<(ServeKind, u16)> {
     // Go validates --accept-app-caps inside the flag's `Set`, i.e. before every other check.
     let app_caps = parse_accept_app_caps(&flags.accept_app_caps)?;
 
-    if let Some(service) = &flags.service {
+    if flags.service.is_some() {
         if funnel {
             anyhow::bail!("--service flag is not supported with funnel");
         }
         if !serve_background(flags) {
             anyhow::bail!("--service flag is only compatible with background mode");
         }
-        anyhow::bail!(
-            "--service={} is not supported by this build: Tailscale Services (VIP) are a control \
-             plane + netmap feature the pinned engine does not surface, and this LocalAPI \
-             ServeConfig carries no `Services` map to write. Serve on the node itself instead \
-             (drop --service)",
-            sanitize_for_terminal(service)
-        );
+        // Go has nothing else to say about --service until it has talked to the daemon, so this
+        // build's own refusal for it waits below, behind the rest of Go's checks.
     }
 
-    let (kind, port) = serve_kind_and_port(flags)?;
+    // `mount, err := cleanURLPath(e.setPath)`, which Go runs BEFORE it resolves the listener. The
+    // cleaned value is dropped here — [`build_web_serve`] cleans the same string again when it
+    // writes the handler, and only a web serve gets that far — because what this call is for is the
+    // ORDER: `--set-path=/a/../b --https=70000` has two things wrong with it, and the one Go names
+    // is the mount point.
+    if let Some(set_path) = flags.set_path.as_deref() {
+        clean_url_path(set_path)
+            .map_err(|e| anyhow::anyhow!("failed to clean the mount point: {e}"))?;
+    }
+
+    // Go frames a `srvTypeAndPortFromFlags` failure unlike every other refusal in
+    // `runServeCombined` — see [`ServeUsageError`] — so it is tagged as it comes out.
+    let (kind, port) = serve_kind_and_port(flags).map_err(|e| ServeUsageError::new(&e, funnel))?;
 
     // Go's `uint` zero is "unset", so --proxy-protocol=0 asks for nothing and is not refused.
     let proxy_protocol = flags.proxy_protocol.filter(|v| *v != 0);
@@ -13388,12 +13471,25 @@ fn check_serve_flags(flags: &ServeFlags, funnel: bool) -> Result<(ServeKind, u16
         }
     }
 
-    if kind == ServeKind::Tun {
-        // Go: `!forService && srvType == serveTypeTUN`. --service is refused above, so this is the
-        // only --tun outcome a tnet command line can reach, and it is Go's own.
+    // Go: `!forService && srvType == serveTypeTUN`, with `forService := e.service != ""`. The
+    // `--service` half of the condition is real here now that this build's `--service` refusal runs
+    // after this point: `--tun --service=…` is a shape Go ACCEPTS, so it must reach the build gap
+    // rather than a sentence saying a service is what it is missing.
+    if kind == ServeKind::Tun && flags.service.is_none() {
         anyhow::bail!("tun mode is only supported for services");
     }
 
+    // Everything above is Go's. From here down the command line is one Go would have ACCEPTED, and
+    // each refusal names the capability this build lacks.
+    if let Some(service) = &flags.service {
+        anyhow::bail!(
+            "--service={} is not supported by this build: Tailscale Services (VIP) are a control \
+             plane + netmap feature the pinned engine does not surface, and this LocalAPI \
+             ServeConfig carries no `Services` map to write. Serve on the node itself instead \
+             (drop --service)",
+            sanitize_for_terminal(service)
+        );
+    }
     if let Some(version) = proxy_protocol {
         anyhow::bail!(
             "--proxy-protocol={version} is not supported by this build: the engine's TCP serve \
@@ -13475,7 +13571,7 @@ async fn hold_foreground_serve(
 /// `funnel --https=443 off` is the exact inverse of turning it on and the tailnet-internal serve
 /// survives.
 async fn run_serve_v2(socket: &std::path::Path, flags: ServeFlags, funnel: bool) -> Result<()> {
-    let (kind, port) = check_serve_flags(&flags, funnel)?;
+    let (kind, port) = check_serve_flags_or_exit(&flags, funnel)?;
     let verb = if funnel { "funnel" } else { "serve" };
 
     // `off` is accepted in the target position (Go `serve --https=PORT off`) and after a target (Go
@@ -13591,7 +13687,8 @@ async fn run_serve_v2(socket: &std::path::Path, flags: ServeFlags, funnel: bool)
             cfg.web.retain(|k, _| !k.ends_with(&suffix));
             format!("tls+tcp {host}:{port} -> {fwd} (TLS-terminated)")
         }
-        // `check_serve_flags` refuses --tun above, for Go's reason, before anything is written.
+        // `check_serve_flags` refuses --tun above before anything is written: for Go's reason
+        // without `--service`, and for this build's `--service` gap with it.
         ServeKind::Tun => unreachable!("a TUN serve never reaches the config writer"),
     };
     if funnel {
@@ -13766,7 +13863,7 @@ async fn run_funnel(
         None => {}
     }
     if let Some((port, on)) = legacy_funnel_toggle(&flags) {
-        check_serve_flags(&flags, true)?;
+        check_serve_flags_or_exit(&flags, true)?;
         return run_funnel_toggle(socket, port, on).await;
     }
     run_serve_v2(socket, flags, true).await
@@ -19271,11 +19368,19 @@ mod tests {
                 .expect_err("65535 is the highest port there is")
                 .to_string();
             assert_eq!(err, want, "{arg}");
-            // And through the whole flag check, not just the resolver.
+            // And through the whole flag check, not just the resolver — where Go also wraps it in
+            // the `error: …` + help-hint framing (see
+            // `a_flag_grammar_refusal_gets_gos_framing_and_help_hint`).
             let err = check_serve_flags(&flags, false)
-                .expect_err("the refusal is not skipped on the way in")
-                .to_string();
-            assert_eq!(err, want, "{arg}");
+                .expect_err("the refusal is not skipped on the way in");
+            let usage = err
+                .downcast_ref::<ServeUsageError>()
+                .unwrap_or_else(|| panic!("{arg}: Go frames this one: {err}"));
+            assert_eq!(
+                usage.go_stderr(),
+                format!("error: {want}\n\ntry `tnet serve --help` for usage info\n"),
+                "{arg}"
+            );
         }
 
         // The boundary itself: 65535 is a port, 65536 is one past every port.
@@ -19305,6 +19410,138 @@ mod tests {
     }
 
     #[test]
+    fn a_flag_grammar_refusal_gets_gos_framing_and_help_hint() {
+        // runServeCombined does not return a srvTypeAndPortFromFlags error: it prints
+        // `error: %v\n\n` itself and returns errHelpFunc(subcmd), which Go's main prints bare
+        // before exiting 1. So the operator gets the cause, a blank line, and the help pointer.
+        let (_, flags) = parse_serve(&["--tcp=70000", "3000"]);
+        let err = check_serve_flags(&flags, false).expect_err("65535 is the highest port there is");
+        let usage = err
+            .downcast_ref::<ServeUsageError>()
+            .expect("Go frames this refusal");
+        // The error VALUE is errHelpFunc's hint alone — the cause has already been printed.
+        assert_eq!(usage.to_string(), "try `tnet serve --help` for usage info");
+        assert_eq!(
+            usage.go_stderr(),
+            "error: port number 70000 is too high for https flag\n\ntry `tnet serve --help` for \
+             usage info\n"
+        );
+
+        // `funnel` shares serve_v2.go, and errHelpFunc names infoMap[subcmd].Name, so the hint
+        // points at the command that was actually run.
+        let (_, flags) = parse_funnel(&["--https=70000", "3000"]);
+        let err = check_serve_flags(&flags, true).expect_err("funnel range-checks the same way");
+        assert_eq!(
+            err.downcast_ref::<ServeUsageError>()
+                .expect("the funnel path is framed too")
+                .go_stderr(),
+            "error: port number 70000 is too high for https flag\n\ntry `tnet funnel --help` for \
+             usage info\n"
+        );
+
+        // The framing belongs to the FUNCTION, not to the one message: srvTypeAndPortFromFlags'
+        // other error gets it too.
+        let (_, flags) = parse_serve(&["--https=443", "--tcp=22", "3000"]);
+        let err = check_serve_flags(&flags, false).expect_err("two port flags name one listener");
+        let framed = err
+            .downcast_ref::<ServeUsageError>()
+            .expect("the multiple-types error comes from the same function")
+            .go_stderr();
+        assert!(
+            framed.starts_with("error: cannot serve multiple types"),
+            "{framed}"
+        );
+        assert!(
+            framed.ends_with("\n\ntry `tnet serve --help` for usage info\n"),
+            "{framed}"
+        );
+
+        // …and only to that function. Every other refusal in runServeCombined is returned plainly,
+        // so it must NOT carry the hint.
+        for argv in [
+            vec!["--proxy-protocol=1", "3000"],
+            vec!["--service=svc:web", "--bg=false", "3000"],
+            vec!["--tun", "3000"],
+            vec!["--set-path=/a/../b", "3000"],
+        ] {
+            let (_, flags) = parse_serve(&argv);
+            let err = check_serve_flags(&flags, false).expect_err("still a refusal");
+            assert!(
+                err.downcast_ref::<ServeUsageError>().is_none(),
+                "{argv:?} is not a flag-grammar refusal: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn gos_checks_all_run_before_this_builds_service_gap() {
+        // runServeCombined's order is: the two --service refusals, cleanURLPath, then
+        // srvTypeAndPortFromFlags. A command line Go would have rejected must be rejected here for
+        // Go's reason, even when --service is also on it — otherwise the build gap masks the typo
+        // that is actually wrong with the line.
+        let (_, flags) = parse_serve(&["--service=svc:web", "--bg", "--tcp=70000", "3000"]);
+        let err =
+            check_serve_flags(&flags, false).expect_err("70000 is not a port, service or not");
+        assert_eq!(
+            err.downcast_ref::<ServeUsageError>()
+                .unwrap_or_else(|| panic!("Go reports the port here, not the gap: {err}"))
+                .go_stderr(),
+            "error: port number 70000 is too high for https flag\n\ntry `tnet serve --help` for \
+             usage info\n"
+        );
+
+        // cleanURLPath runs before the listener is resolved, so when BOTH are wrong Go names the
+        // mount point — and wraps it the way Go wraps it.
+        let (_, flags) = parse_serve(&["--set-path=/a/../b", "--https=70000", "3000"]);
+        let err = check_serve_flags(&flags, false)
+            .expect_err("a mount point path.Clean rewrites is refused")
+            .to_string();
+        assert_eq!(
+            err,
+            r#"failed to clean the mount point: invalid mount point "/a/../b""#
+        );
+        // Same, ahead of the --service gap.
+        let (_, flags) = parse_serve(&["--service=svc:web", "--bg", "--set-path=//foo", "3000"]);
+        let err = check_serve_flags(&flags, false)
+            .expect_err("Go cleans the mount point before it looks at the service")
+            .to_string();
+        assert_eq!(
+            err,
+            r#"failed to clean the mount point: invalid mount point "//foo""#
+        );
+
+        // A mount point Go accepts is not refused, trailing slash included (cleanURLPath allows
+        // `urlPath == c+"/"`).
+        for path in ["/api", "/api/", "/"] {
+            let arg = format!("--set-path={path}");
+            let (_, flags) = parse_serve(&[&arg, "3000"]);
+            assert_eq!(
+                check_serve_flags(&flags, false).unwrap(),
+                (ServeKind::Https, 443),
+                "{arg}"
+            );
+        }
+
+        // Only once every check of Go's has passed does the build gap land — and it lands for
+        // `--tun --service=…` too, which Go accepts (its tun refusal is `!forService && …`).
+        for argv in [
+            vec!["--service=svc:web", "--bg", "--tcp=2222", "3000"],
+            vec!["--service=svc:web", "--bg", "--set-path=/api", "3000"],
+            vec!["--service=svc:web", "--bg", "--tun"],
+        ] {
+            let (_, flags) = parse_serve(&argv);
+            let err = check_serve_flags(&flags, false)
+                .expect_err("this build has no Services")
+                .to_string();
+            assert!(err.contains("--service=svc:web"), "{argv:?}: {err}");
+            assert!(
+                err.contains("not supported by this build"),
+                "{argv:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn tun_is_gos_fifth_serve_type() {
         // serve_v2.go: --tun sets serveTypeTUN and counts toward the exclusivity check…
         let (_, flags) = parse_serve(&["--tun", "3000"]);
@@ -19315,8 +19552,9 @@ mod tests {
             .to_string();
         assert!(err.contains("cannot serve multiple types"), "{err}");
 
-        // …and Go refuses it outright without a service, which is the only shape this build can
-        // express: `--service` is refused before `--tun` is ever looked at.
+        // …and Go refuses it outright without a service (`!forService && srvType == serveTypeTUN`),
+        // which is the only --tun shape this build can express — with a service, Go accepts the pair
+        // and the refusal that lands is this build's own gap.
         let (_, flags) = parse_serve(&["--tun", "3000"]);
         let err = check_serve_flags(&flags, false)
             .expect_err("--tun without a service is refused by Go too")
