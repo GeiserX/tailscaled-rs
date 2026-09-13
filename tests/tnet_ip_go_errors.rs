@@ -1,6 +1,8 @@
-//! `tnet ip` must fail where `tailscale ip` fails, with Go's text and nothing added to it.
+//! `tnet ip` must resolve its argument the way `tailscale ip` resolves it, and fail where it fails,
+//! with Go's text and nothing added to it.
 //!
-//! Upstream is `cmd/tailscale/cli/ip.go` (`runIP`) and `cmd/tailscale/tailscale.go` (`main`) @
+//! Upstream is `cmd/tailscale/cli/ip.go` (`runIP`, `peerMatchingIP`),
+//! `cmd/tailscale/cli/ping.go` (`tailscaleIPFromArg`) and `cmd/tailscale/tailscale.go` (`main`) @
 //! `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8` (v1.102.4). Two behaviours are pinned here:
 //!
 //! 1. Once `runIP` has resolved the address list — this node's, a peer's or a Service's — it returns
@@ -149,10 +151,11 @@ fn a_node_with_no_address_is_refused_with_its_backend_state() {
     }
 }
 
-/// A named peer with no address gets the same refusal, and its state comes from the one `Status`
-/// the peer lookup already read.
+/// A peer NAMED on the command line that carries no address is refused by Go's
+/// `tailscaleIPFromArg`, which runs before `runIP`'s empty-list check and has its own text:
+/// `node found but lacks an IP`. One `Status` answers the whole lookup.
 #[test]
-fn an_addressless_peer_is_refused_from_the_status_already_read() {
+fn a_named_addressless_peer_gets_gos_node_found_but_lacks_an_ip() {
     let peer = PeerReport {
         name: "addressless.tail0123.ts.net".into(),
         stable_id: "n2".into(),
@@ -161,7 +164,7 @@ fn an_addressless_peer_is_refused_from_the_status_already_read() {
     let daemon = StubDaemon::start(vec![status("Starting", vec![peer])]);
     let out = daemon.tnet(&["ip", "addressless.tail0123.ts.net"]);
     assert_eq!(out.status.code(), Some(1), "stdout {:?}", stdout(&out));
-    assert_eq!(stderr(&out), "no current Tailscale IPs; state: Starting\n");
+    assert_eq!(stderr(&out), "node found but lacks an IP\n");
     assert_eq!(stdout(&out), "");
     let requests = daemon.requests();
     assert_eq!(requests.len(), 1, "{requests:?}");
@@ -182,4 +185,112 @@ fn a_node_with_an_address_needs_no_status_round_trip() {
     let requests = daemon.requests();
     assert_eq!(requests.len(), 1, "{requests:?}");
     assert!(matches!(requests[0], Request::Ip), "{requests:?}");
+}
+
+/// A netmap with this node and one peer, both addressed, and a MagicDNS suffix — enough for the
+/// name arms of Go's `tailscaleIPFromArg`.
+fn named_netmap() -> Response {
+    Response::Status(StatusReport {
+        state: "Running".into(),
+        self_name: Some("my-desktop.tail0123.ts.net".into()),
+        self_ipv4: Some("100.64.0.1".into()),
+        self_ipv6: Some("fd7a:115c:a1e0::1".into()),
+        magic_dns_suffix: Some("tail0123.ts.net".into()),
+        peers: vec![PeerReport {
+            name: "my-laptop.tail0123.ts.net".into(),
+            ipv4: "100.64.0.2".into(),
+            ipv6: Some("fd7a:115c:a1e0::2".into()),
+            stable_id: "n1".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    })
+}
+
+/// `tailscale ip <this node's own name>` prints this node's addresses: Go's `tailscaleIPFromArg`
+/// falls through the peer loop to `if match(st.Self) && len(st.Self.TailscaleIPs) > 0`, and
+/// `peerMatchingIP` then finds this node again by the address that returned. Matching the argument
+/// against peers only, the node could not name itself.
+#[test]
+fn this_nodes_own_name_prints_this_nodes_addresses() {
+    for arg in ["my-desktop", "MY-DESKTOP", "my-desktop.tail0123.ts.net"] {
+        let daemon = StubDaemon::start(vec![named_netmap()]);
+        let out = daemon.tnet(&["ip", arg]);
+        assert!(out.status.success(), "{arg}: {}", stderr(&out));
+        assert_eq!(stdout(&out), "100.64.0.1\nfd7a:115c:a1e0::1\n", "{arg}");
+        // `-1` is Go's quad-one over the matched node's own list.
+        let daemon = StubDaemon::start(vec![named_netmap()]);
+        let out = daemon.tnet(&["ip", "-1", arg]);
+        assert!(out.status.success(), "{arg}: {}", stderr(&out));
+        assert_eq!(stdout(&out), "100.64.0.1\n", "{arg}");
+    }
+}
+
+/// Go matches a peer by its SHORT MagicDNS name, case-insensitively
+/// (`strings.EqualFold(hostOrIP, dnsOrQuoteHostname(st, ps))`), as well as by its full DNS name.
+/// Comparing the argument against the stored FQDN answered only the second.
+#[test]
+fn a_short_or_miscased_peer_name_resolves_like_go() {
+    for arg in [
+        "my-laptop",
+        "MY-LAPTOP",
+        "my-laptop.tail0123.ts.net",
+        "my-laptop.tail0123.ts.net.",
+    ] {
+        let daemon = StubDaemon::start(vec![named_netmap()]);
+        let out = daemon.tnet(&["ip", arg]);
+        assert!(out.status.success(), "{arg}: {}", stderr(&out));
+        assert_eq!(stdout(&out), "100.64.0.2\nfd7a:115c:a1e0::2\n", "{arg}");
+        let requests = daemon.requests();
+        assert_eq!(requests.len(), 1, "{arg}: {requests:?}");
+        assert!(
+            matches!(requests[0], Request::Status),
+            "{arg}: {requests:?}"
+        );
+    }
+}
+
+/// Go echoes the string `tailscaleIPFromArg` returned — for an address literal, the argument
+/// untouched — in `no peer or service found with IP %v`. Re-printing a parsed address instead
+/// answers a question about `fd7a:115c:a1e0:0::99` by naming a different spelling of it.
+#[test]
+fn an_unmatched_literal_is_echoed_as_the_operator_typed_it() {
+    let daemon = StubDaemon::start(vec![
+        named_netmap(),
+        Response::Services { services: vec![] },
+    ]);
+    let out = daemon.tnet(&["ip", "fd7a:115c:a1e0:0::99"]);
+    assert_eq!(out.status.code(), Some(1), "stdout {:?}", stdout(&out));
+    assert_eq!(
+        stderr(&out),
+        "no peer or service found with IP fd7a:115c:a1e0:0::99\n"
+    );
+    assert_eq!(stdout(&out), "");
+    let requests = daemon.requests();
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert!(matches!(requests[1], Request::Services), "{requests:?}");
+}
+
+/// A name no node in the netmap carries is Go's last arm: `net.Resolver.LookupHost`, whose first
+/// answer goes back through `peerMatchingIP` and the Service lookup. `localhost` comes from the
+/// machine's own hosts file, so this exercises the fallback without a name server: the address it
+/// resolves to belongs to no node and no Service, and the refusal names THAT address — proof the
+/// lookup happened, where the old code stopped at the name.
+#[test]
+fn a_name_in_no_netmap_reaches_the_host_resolver() {
+    let daemon = StubDaemon::start(vec![
+        named_netmap(),
+        Response::Services { services: vec![] },
+    ]);
+    let out = daemon.tnet(&["ip", "localhost"]);
+    assert_eq!(out.status.code(), Some(1), "stdout {:?}", stdout(&out));
+    let err = stderr(&out);
+    let resolved = err
+        .trim_end()
+        .strip_prefix("no peer or service found with IP ")
+        .unwrap_or_else(|| panic!("unexpected stderr: {err:?}"))
+        .parse::<std::net::IpAddr>()
+        .unwrap_or_else(|e| panic!("stderr must echo the resolved address, got {err:?}: {e}"));
+    assert!(resolved.is_loopback(), "localhost resolved to {resolved}");
+    assert_eq!(stdout(&out), "");
 }
