@@ -1,18 +1,15 @@
-//! `tnet web` must take Go's `--cgi` and `--origin`, so a reverse-proxied deployment can say what
-//! URL it is really served at — and so a `tailscale web --cgi` command line does not die at the
-//! parser.
+//! `tnet web` must take Go's `--cgi` and `--origin`, so a `tailscale web --cgi --origin=…` command
+//! line does not die at the parser.
 //!
-//! Go's `web` (`cmd/tailscale/cli/web.go` @ 53a0d659afa51835dd7a9283873cca44261454f8) registers five
-//! flags: `--listen`, `--prefix`, `--readonly`, `--cgi` ("run as CGI script") and `--origin`
-//! ("origin at which the web UI is served (if behind a reverse proxy or used with cgi)"). This fork
-//! carried the first three; the last two are what this file guards.
+//! Go's `web` (`cmd/tailscale/cli/web.go` @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8, v1.102.4)
+//! registers five flags: `--listen`, `--prefix`, `--readonly`, `--cgi` ("run as CGI script") and
+//! `--origin` ("origin at which the web UI is served (if behind a reverse proxy or used with cgi)").
+//! This fork carried the first three; the last two are what this file guards.
 //!
-//! Two of those guards were wrong about Go, and this file now pins the corrections. Go's `--origin`
-//! is stored verbatim and compared against the HOST of a request's `Origin` header
-//! (`client/web/web.go`, `csrfProtect`), so a bare `example.net` — the value
-//! `client/web/web_test.go` passes — is exactly what it takes; and Go's `runWeb` branches on
-//! `--cgi` before it ever reads `--listen`, so the two together run normally with the address
-//! unused. Neither may fail here.
+//! Go's `--origin` is stored verbatim, with no validation, and read only by `csrfProtect`'s Host
+//! comparison (`client/web/web.go`) — never for the URL `runWeb` prints. So no value may be refused
+//! here, and none may move the printed URL. Go's `runWeb` also branches on `--cgi` before it ever
+//! reads `--listen`, so the two together run normally with the address unused.
 //!
 //! `--cgi` is a serving *mode*, not a flag rename: instead of binding a listener, the process serves
 //! one request out of the CGI/1.1 environment, writes the response to stdout and exits. That makes
@@ -122,8 +119,8 @@ fn cgi_mode_answers_one_request_on_stdout_and_binds_nothing() {
 
 #[test]
 fn cgi_mode_takes_gos_prefix_as_the_path_it_answers_on() {
-    // `--prefix` names the path this process answers on in BOTH serving modes; `--origin` names the
-    // URL the outside world reaches, which is the half `--prefix` cannot supply.
+    // `--prefix` names the path this process answers on in BOTH serving modes, with or without an
+    // `--origin` beside it.
     let out = cgi_request(
         &["--prefix", "/tailscale", "--origin=https://ts.example.com"],
         "/tailscale",
@@ -175,52 +172,98 @@ fn listen_is_accepted_and_ignored_next_to_cgi() {
 }
 
 #[test]
-fn origin_takes_gos_bare_host_and_still_refuses_a_value_that_is_no_origin() {
-    // The value Go documents and tests: a bare host, which its CSRF check compares against the host
-    // of the request's `Origin` header. Go validates nothing, so this must get past argument
-    // handling and serve the request.
-    let out = cgi_request(&["--origin", "example.net"], "/nope");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "a bare host is the shape Go's `--origin` takes; stdout: {stdout}, stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        stdout.starts_with("Status: 404 Not Found\r\n"),
-        "a bare-host origin must serve, not refuse; got: {stdout}"
-    );
+fn origin_is_taken_verbatim_and_never_refused() {
+    // Go's `runWeb` does `if webArgs.origin != "" { opts.OriginOverride = webArgs.origin }` and
+    // nothing else with the value: no parse, no trim, no error path. So every one of these — Go's
+    // bare host, a `host:port`, and values no URL grammar would call an origin — must serve the
+    // request and exit 0, exactly as `tailscale web --cgi --origin=<value>` does.
+    for origin in [
+        "example.net",
+        "192.0.2.10:8088",
+        "https://ts.example.com/tailscale",
+        "ftp://ts.example.com",
+        "/tailscale",
+        "https:///tailscale",
+        "https://ts.example.com/ui?a=1",
+        "ts.example.com/ui#top",
+        "user:pw@ts.example.com",
+        "http://[not-a-host",
+        " ",
+        "",
+    ] {
+        let flag = format!("--origin={origin}");
+        let out = cgi_request(&[&flag], "/nope");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "Go stores `--origin {origin:?}` unvalidated, so it must not fail; stdout: {stdout}, \
+             stderr: {stderr}"
+        );
+        assert!(
+            stdout.starts_with("Status: 404 Not Found\r\n"),
+            "`--origin {origin:?}` must serve the request, not refuse it; got: {stdout:?}"
+        );
+        // Nothing complains about the value anywhere, including the invoking server's error log.
+        assert!(
+            out.stderr.is_empty(),
+            "`--origin {origin:?}` is accepted silently, as in Go; got stderr: {stderr}"
+        );
+    }
+}
 
-    // A host and a port, which is the same shape with the parse trap in it (`example.net:8088`
-    // reads as a scheme to a URL parser).
-    let out = cgi_request(&["--origin", "192.0.2.10:8088"], "/nope");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    // The exit status, not only the response: a refusal that still managed to write the 404 — or a
-    // late failure after writing it — would leave stdout right and the script's status wrong, and
-    // the invoking server reads the status too.
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "`host:port` is a host Go takes, so this must serve and exit 0; stdout: {stdout}, \
-         stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        stdout.starts_with("Status: 404 Not Found\r\n"),
-        "`host:port` is a host, not a scheme; got: {stdout:?}"
-    );
+/// A child process killed when it goes out of scope, so a failed assertion cannot leak a listener.
+struct KillOnDrop(std::process::Child);
 
-    // What is refused is a value that names no host in either shape — it could neither be compared
-    // with an `Origin` header nor linked to. Refused before anything binds or is contacted.
-    let out = tnet(&["web", "--origin", "ftp://ts.example.com"], &[]);
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn origin_does_not_change_the_url_the_listener_prints() {
+    // Go's startup line is `web server running on: urlOfListenAddr(webArgs.listen)`; `--origin`
+    // reaches only `csrfProtect`. So the printed (and browser-opened) URL is the listener's own,
+    // whatever origin is given. Binding a loopback port sends nothing, and the line is printed
+    // before any connection is accepted, so this never waits on the network.
+    use std::io::BufRead as _;
+    let child = Command::new(env!("CARGO_BIN_EXE_tnet"))
+        .args([
+            "--socket",
+            UNREACHABLE_SOCKET,
+            "web",
+            "--listen",
+            "127.0.0.1:0",
+            "--no-browser",
+            "--prefix",
+            "/tailscale",
+            "--origin",
+            "https://ts.example.com/outside",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("the `tnet` binary built for this test should run");
+    let mut child = KillOnDrop(child);
+    let stdout = child.0.stdout.take().expect("stdout is piped");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = std::io::BufReader::new(stdout).read_line(&mut line);
+        let _ = tx.send(line);
+    });
+    let line = rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("`tnet web` should print its startup line once it has bound");
     assert!(
-        !out.status.success(),
-        "the web UI is not reached over ftp, so that origin cannot be right"
+        line.contains("http://127.0.0.1:") && line.contains("/tailscale"),
+        "the printed URL is the bound address plus the served path; got: {line:?}"
     );
-    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("--origin") && stderr.contains("http or https"),
-        "the refusal should name the flag and what it wants; got: {stderr}"
+        !line.contains("ts.example.com") && !line.contains("/outside"),
+        "`--origin` must not replace the URL the listener prints; got: {line:?}"
     );
 }
