@@ -6128,7 +6128,7 @@ async fn run_ip(
         eprintln!("assertion failed: this node does not hold {want_ip}");
         std::process::exit(1);
     }
-    let out = if let Some(peer) = peer {
+    let out: Result<String, String> = if let Some(peer) = peer {
         // Peer address: resolve the argument against the netmap ([`ip_arg_matching_node`]) — by
         // name, or by any address the peer or this node holds. We fetch Status (not whois, which is
         // IP-only) so a NAME also works.
@@ -6139,7 +6139,7 @@ async fn run_ip(
                 return Err(e).with_context(|| format!("querying status at {}", socket.display()));
             }
         };
-        match ip_arg_matching_node(&peer, &status) {
+        let resolved = match ip_arg_matching_node(&peer, &status) {
             // Project both families so `ip -6 <peer>` / a bare `ip <peer>` show the node's IPv6
             // (Go prints the matched node's `TailscaleIPs` filtered by family).
             Some(addrs) => format_ip_filtered(addrs.ipv4, addrs.ipv6, sel),
@@ -6188,10 +6188,12 @@ async fn run_ip(
                     std::process::exit(1);
                 }
             },
-        }
+        };
+        // Go's `BackendState` comes from this same `Status` read, so no second round trip.
+        resolved.map_err(|why| why.message(&status.state))
     } else {
         // Self addresses.
-        match round_trip(socket, &Request::Ip).await {
+        let resolved = match round_trip(socket, &Request::Ip).await {
             Ok(Response::Ip { ipv4, ipv6 }) => {
                 format_ip_filtered(ipv4.as_deref(), ipv6.as_deref(), sel)
             }
@@ -6203,6 +6205,24 @@ async fn run_ip(
             Err(e) => {
                 return Err(e).with_context(|| format!("querying ip at {}", socket.display()));
             }
+        };
+        match resolved {
+            Ok(out) => Ok(out),
+            Err(IpUnanswered::NoFamily(message)) => Err(message.to_string()),
+            // Go reads `ips` and `BackendState` from one `Status`; the `ip` reply carries no state,
+            // so `Status` is fetched here, on the one answer that names it. A node that holds an
+            // address never pays for it.
+            Err(why @ IpUnanswered::NoCurrentIps) => {
+                let status = match round_trip(socket, &Request::Status).await {
+                    Ok(Response::Status(s)) => s,
+                    Ok(other) => anyhow::bail!("unexpected response to status request: {other:?}"),
+                    Err(e) => {
+                        return Err(e)
+                            .with_context(|| format!("querying status at {}", socket.display()));
+                    }
+                };
+                Err(why.message(&status.state))
+            }
         }
     };
     match out {
@@ -6210,12 +6230,16 @@ async fn run_ip(
             print!("{out}");
             Ok(())
         }
-        // Go's `runIP` RETURNS here instead of printing: the match loop selected nothing and `-4`
-        // or `-6` was set, so the caller asked for a family this target holds no address in. An
-        // error is a stderr message and a non-zero exit, which is the whole reason Go wrote it as
-        // an error and not as an `outln` — `tnet ip -6 host` is meant to be testable by its exit
-        // status.
-        Err(message) => anyhow::bail!(message),
+        // Go's `runIP` RETURNS here instead of printing: the target holds no address at all, or
+        // none in the family `-4`/`-6` asked for. An error is a stderr message and a non-zero exit,
+        // which is the whole reason Go wrote it as an error and not as an `outln` — `tnet ip -6
+        // host` is meant to be testable by its exit status. Go's `main` prints it with
+        // `fmt.Fprintln(os.Stderr, err)` and exits 1: the bare text. Returning it through `main`'s
+        // `Result` would add an `Error: ` prefix a script matching the text trips over.
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -7985,36 +8009,44 @@ fn service_addrs_matching_ip(
 /// a Service carries a list, so the family of each address is determined by parsing it. An address
 /// that does not parse is dropped rather than mis-filed under a family it may not belong to.
 ///
-/// `Err` carries Go's error return for a `-4`/`-6` that selects nothing ([`ip_no_match_error`]):
-/// the same tail, because Go runs one match loop over whichever `ips` slice was resolved.
-fn format_service_ips(addrs: &[String], sel: IpSelect) -> Result<String, &'static str> {
+/// `Err` carries Go's error returns ([`IpUnanswered`]): the same two as a node's, because Go runs
+/// one empty check and one match loop over whichever `ips` slice was resolved.
+fn format_service_ips(addrs: &[String], sel: IpSelect) -> Result<String, IpUnanswered> {
+    // Go's `ips` is a `[]netip.Addr`, so everything it counts is an address. Parsing first means an
+    // entry that does not parse is dropped BEFORE Go's `len(ips) == 0` check: a Service carrying
+    // nothing usable is refused as addressless rather than answered with nothing.
+    let parsed: Vec<(&str, std::net::IpAddr)> = addrs
+        .iter()
+        .filter_map(|addr| {
+            addr.parse::<std::net::IpAddr>()
+                .ok()
+                .map(|ip| (addr.as_str(), ip))
+        })
+        .collect();
+    if parsed.is_empty() {
+        return Err(IpUnanswered::NoCurrentIps);
+    }
     // Go truncates to the first address BEFORE the family filter — `ips = ips[:1]`, then its match
     // loop. Because Go refuses `-1` alongside `-4`/`-6` ([`ip_usage_refusal`] ports that check), the
     // two never narrow the same call, so the order is unobservable; it is kept as Go writes it so
     // this stays a port rather than a re-derivation.
     let considered = if sel.first {
-        addrs.get(..1).unwrap_or(addrs)
+        parsed.get(..1).unwrap_or(&parsed)
     } else {
-        addrs
+        parsed.as_slice()
     };
     let mut out = String::new();
-    for addr in considered {
-        let Ok(parsed) = addr.parse::<std::net::IpAddr>() else {
-            continue;
-        };
-        let wanted = if parsed.is_ipv4() { !sel.v6 } else { !sel.v4 };
+    for (addr, ip) in considered {
+        let wanted = if ip.is_ipv4() { !sel.v6 } else { !sel.v4 };
         if wanted {
             out.push_str(addr);
             out.push('\n');
         }
     }
-    if out.is_empty() {
-        if let Some(message) = ip_no_match_error(sel) {
-            return Err(message);
-        }
-        return Ok("(no matching tailnet address)\n".to_string());
+    match ip_no_match_error(sel) {
+        Some(message) if out.is_empty() => Err(IpUnanswered::NoFamily(message)),
+        _ => Ok(out),
     }
-    Ok(out)
 }
 
 /// clap value parser for `cert --min-validity`: Go's duration grammar, verbatim — including its error
@@ -10331,9 +10363,9 @@ struct IpSelect {
 /// Go `ip.go`'s `if !match` tail: the match loop printed nothing. `-4` and `-6` each name the
 /// family that came up empty and Go RETURNS that as an error — `no Tailscale IPv4 address` /
 /// `no Tailscale IPv6 address` — so the command exits non-zero with the text on stderr. With
-/// neither flag set both families are wanted, so an empty answer means the target had no address
-/// at all: Go covers that case earlier (`no current Tailscale IPs; state: %v`) and its `!match`
-/// tail has nothing left to say, hence `None` here and the caller's placeholder.
+/// neither flag set both families are wanted, so the loop can print nothing only for an empty
+/// address list, which Go refuses before the loop ([`IpUnanswered::NoCurrentIps`]); its `!match`
+/// tail has nothing left to say, hence `None` here.
 ///
 /// Shared by [`format_ip_filtered`] and [`format_service_ips`] because Go shares it: `runIP`
 /// resolves this node, a peer or a Service into ONE `ips` slice and runs a single match loop over
@@ -10348,15 +10380,37 @@ fn ip_no_match_error(sel: IpSelect) -> Option<&'static str> {
     }
 }
 
+/// Why `tnet ip` resolved its target and still printed nothing — Go `runIP`'s two error returns once
+/// `ips` is settled. Each is an error in Go (stderr, exit 1), never a line on stdout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IpUnanswered {
+    /// `if len(ips) == 0`: the resolved node or Service holds no address at all. Go checks this
+    /// BEFORE `-1` and the family filter, so `-4`/`-6` on an addressless node get this, not the
+    /// family message.
+    NoCurrentIps,
+    /// `if !match` with `-4`/`-6` set ([`ip_no_match_error`]): addresses exist, none in the family
+    /// asked for.
+    NoFamily(&'static str),
+}
+
+impl IpUnanswered {
+    /// Go's error text. `state` is Go's `st.BackendState`; only
+    /// [`NoCurrentIps`](Self::NoCurrentIps) names it.
+    fn message(self, state: &str) -> String {
+        match self {
+            IpUnanswered::NoCurrentIps => format!("no current Tailscale IPs; state: {state}"),
+            IpUnanswered::NoFamily(message) => message.to_string(),
+        }
+    }
+}
+
 /// Format `tnet ip` output applying an [`IpSelect`]: `-4` keeps only IPv4, `-6` only IPv6, `-1` only
 /// the first address (Go's quad-one). With no flags, both families print (IPv4 then IPv6), one per
 /// line. Pure → unit-testable.
 ///
-/// `Err` is Go's error return, not a line of output: an explicit `-4`/`-6` that selects nothing is
-/// `no Tailscale IPv4 address` / `no Tailscale IPv6 address` on stderr and a non-zero exit (see
-/// [`ip_no_match_error`]). The placeholder survives only for the unflagged empty answer, which is
-/// a node holding no address at all — Go reports THAT as `no current Tailscale IPs; state: %v`,
-/// a message built from `BackendState`, which this wire response does not carry.
+/// `Err` is one of Go's error returns, not a line of output ([`IpUnanswered`]): a node holding no
+/// address at all, checked first as Go checks it, or an explicit `-4`/`-6` that selects nothing.
+/// The caller prints it to stderr and exits non-zero.
 ///
 /// The two narrowings run in Go's order — `-1` truncates the address list, and only then does the
 /// family filter run over what survived — so this and [`format_service_ips`] answer the same
@@ -10366,13 +10420,17 @@ fn format_ip_filtered(
     ipv4: Option<&str>,
     ipv6: Option<&str>,
     sel: IpSelect,
-) -> Result<String, &'static str> {
+) -> Result<String, IpUnanswered> {
     // Go's `ips`, in netmap order: IPv4 then IPv6. A node has at most one address per family here,
     // so each one's family is positional — unlike a Service's list, nothing needs parsing.
     let all: Vec<(&str, bool)> = [(ipv4, true), (ipv6, false)]
         .into_iter()
         .filter_map(|(addr, is_v4)| addr.map(|addr| (addr, is_v4)))
         .collect();
+    // Go's `len(ips) == 0`, ahead of `-1` and the match loop.
+    if all.is_empty() {
+        return Err(IpUnanswered::NoCurrentIps);
+    }
     // -1: only the first (Go's quad-one — the primary address). Go's `ips = ips[:1]`, ahead of the
     // family filter below, which is its match loop.
     let considered = if sel.first {
@@ -10391,13 +10449,10 @@ fn format_ip_filtered(
             out.push('\n');
         }
     }
-    if out.is_empty() {
-        if let Some(message) = ip_no_match_error(sel) {
-            return Err(message);
-        }
-        return Ok("(no matching tailnet address)\n".to_string());
+    match ip_no_match_error(sel) {
+        Some(message) if out.is_empty() => Err(IpUnanswered::NoFamily(message)),
+        _ => Ok(out),
     }
-    Ok(out)
 }
 
 /// Format the `tnet file list` output: one `"{name}  ({size} bytes)"` line per waiting file, or a
@@ -19984,7 +20039,7 @@ mod tests {
                     ..Default::default()
                 }
             ),
-            Err("no Tailscale IPv6 address")
+            Err(IpUnanswered::NoFamily("no Tailscale IPv6 address"))
         );
         assert_eq!(
             ip_usage_refusal(false, true, true),
@@ -20001,7 +20056,7 @@ mod tests {
                     ..Default::default()
                 }
             ),
-            Err("no Tailscale IPv4 address")
+            Err(IpUnanswered::NoFamily("no Tailscale IPv4 address"))
         );
     }
 
@@ -20023,7 +20078,7 @@ mod tests {
                     ..Default::default()
                 }
             ),
-            Err("no Tailscale IPv6 address")
+            Err(IpUnanswered::NoFamily("no Tailscale IPv6 address"))
         );
         // And its mirror: `-4` on an IPv6-only node.
         assert_eq!(
@@ -20035,14 +20090,40 @@ mod tests {
                     ..Default::default()
                 }
             ),
-            Err("no Tailscale IPv4 address")
+            Err(IpUnanswered::NoFamily("no Tailscale IPv4 address"))
         );
-        // A node with no address at all and no family flag is Go's OTHER branch — the earlier
-        // `no current Tailscale IPs; state: %v`, which needs a `BackendState` this wire response
-        // does not carry. Left as the placeholder rather than answered with the wrong message.
+        // A node with no address at all is Go's EARLIER refusal, `len(ips) == 0`, checked before
+        // `-1` and the family filter — so `-4`/`-6` on it get this, not the family message, and no
+        // selector gets a placeholder line and exit 0.
+        for sel in [
+            IpSelect::default(),
+            IpSelect {
+                v4: true,
+                ..Default::default()
+            },
+            IpSelect {
+                v6: true,
+                ..Default::default()
+            },
+            IpSelect {
+                first: true,
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                format_ip_filtered(None, None, sel),
+                Err(IpUnanswered::NoCurrentIps)
+            );
+        }
+        // It names the backend state (Go's `%v` of `st.BackendState`); the family errors carry
+        // their own text and no state.
         assert_eq!(
-            format_ip_filtered(None, None, IpSelect::default()),
-            Ok("(no matching tailnet address)\n".to_string())
+            IpUnanswered::NoCurrentIps.message("NeedsLogin"),
+            "no current Tailscale IPs; state: NeedsLogin"
+        );
+        assert_eq!(
+            IpUnanswered::NoFamily("no Tailscale IPv6 address").message("Running"),
+            "no Tailscale IPv6 address"
         );
         // The message names the family that was ASKED for, not the one the node happens to hold:
         // Go branches on `ipArgs.want4`/`want6`, not on what was in `ips`.
@@ -20113,7 +20194,7 @@ mod tests {
                     ..Default::default()
                 }
             ),
-            Err("no Tailscale IPv6 address"),
+            Err(IpUnanswered::NoFamily("no Tailscale IPv6 address")),
             "Go's order: -1 truncates to the v4 address, then -6 filters it away"
         );
         assert_eq!(
@@ -23400,13 +23481,33 @@ mod tests {
                     ..Default::default()
                 }
             ),
-            Err("no Tailscale IPv4 address")
+            Err(IpUnanswered::NoFamily("no Tailscale IPv4 address"))
         );
         assert_eq!(
             format_ip_filtered(v6_only.ipv4, v6_only.ipv6, IpSelect::default()),
             Ok("fd7a:115c:a1e0::3\n".to_string()),
             "and without the flag it still prints the address it does have"
         );
+        // A peer that resolves but holds no address at all is Go's `len(ips) == 0` refusal, which
+        // runs before `-1` and the family filter, so every selector gets it.
+        let addressless = ip_arg_matching_node("addressless.tail0123.ts.net", &status)
+            .expect("the fixture carries an addressless peer");
+        for sel in [
+            IpSelect::default(),
+            IpSelect {
+                v4: true,
+                ..Default::default()
+            },
+            IpSelect {
+                first: true,
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                format_ip_filtered(addressless.ipv4, addressless.ipv6, sel),
+                Err(IpUnanswered::NoCurrentIps)
+            );
+        }
     }
 
     #[test]
@@ -23483,13 +23584,26 @@ mod tests {
                     ..Default::default()
                 }
             ),
-            Err("no Tailscale IPv4 address")
+            Err(IpUnanswered::NoFamily("no Tailscale IPv4 address"))
         );
-        // Unparseable addresses are dropped, so a Service carrying only those answers empty; with
-        // no family flag that is not Go's `!match` error, and the placeholder still stands in.
+        // Go's `ips` holds only parsed addresses, so a Service carrying nothing that parses is an
+        // empty list and gets Go's `len(ips) == 0` refusal — under a family flag too, since Go
+        // checks it before the match loop. Never a placeholder line on stdout.
+        for sel in [
+            IpSelect::default(),
+            IpSelect {
+                v4: true,
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                format_service_ips(&["not-an-address".to_string()], sel),
+                Err(IpUnanswered::NoCurrentIps)
+            );
+        }
         assert_eq!(
-            format_service_ips(&["not-an-address".to_string()], IpSelect::default()),
-            Ok("(no matching tailnet address)\n".to_string())
+            format_service_ips(&[], IpSelect::default()),
+            Err(IpUnanswered::NoCurrentIps)
         );
     }
 
