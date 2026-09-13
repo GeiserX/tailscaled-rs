@@ -127,6 +127,14 @@
 //! peculiarities have their own sections below: it ranks LAST among this daemon's auth-key sources,
 //! and its value is redacted out of the snapshot.
 //!
+//! It also takes a companion key to do its job unattended, and an administrator writing the file
+//! needs to know which. The daemon's boot-time auto-start only runs for a node that **wants to
+//! run**, and a host nobody has touched has no `prefs.json` to say so — so the file that carries
+//! `AuthKey` should carry `AlwaysOn.Enabled` too: the always-on key re-asserts the intent as this
+//! same reconcile runs at profile load, and the auth key is then what the resulting bring-up
+//! registers with. `AuthKey` alone still enrols a node the operator brings up by hand (`tnet up`
+//! with no key of its own); it is the pair that needs nobody at the keyboard.
+//!
 //! A further key acts on an *answer* rather than on a pref: `AllowedSuggestedExitNodes` is the
 //! administrator's allow-list for exit-node suggestions, resolved as a set by
 //! [`allowed_suggested_exit_nodes`] and applied by [`diag::suggest_exit_node`](super::diag), which
@@ -2184,7 +2192,18 @@ mod tests {
     /// unknown key, so the setting would simply never apply and nothing would say why.
     #[test]
     fn every_key_the_apply_path_names_is_a_registered_definition_of_the_right_type() {
-        for key in ["LoginURL", "Hostname", PKEY_EXIT_NODE_ID, PKEY_EXIT_NODE_IP] {
+        for key in [
+            "LoginURL",
+            "Hostname",
+            PKEY_EXIT_NODE_ID,
+            PKEY_EXIT_NODE_IP,
+            // Named by `read_auth_key`, which decodes it with `Value::as_str`. Defined as anything
+            // but `String` and the administrator's enrolment credential stops working: either
+            // `validate` refuses the whole file for the value they wrote, or the decode yields
+            // `None` and the key is configured, reported and inert — which is the exact failure
+            // `auth_key` exists to remove.
+            PKEY_AUTH_KEY,
+        ] {
             let def = definition_of(key).unwrap_or_else(|| panic!("{key} must be defined"));
             assert_eq!(def.ty, ValueType::String, "{key}");
         }

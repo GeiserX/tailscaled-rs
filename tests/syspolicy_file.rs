@@ -15,7 +15,9 @@
 //!    reporting are actually connected — and is APPLIED to the prefs a `Backend::load` comes up
 //!    with, over a persisted `prefs.json` that says the opposite; with the one exception the report
 //!    makes for a credential: a configured `AuthKey` is reported as `<redacted>` and its value never
-//!    crosses the LocalAPI;
+//!    crosses the LocalAPI — and the same load, on a state dir with no profile at all, leaves a
+//!    never-configured host wanting to run and writes nothing, which is the precondition the
+//!    `AuthKey` needs to enrol that host unattended;
 //! 3. a *broken* file is logged and the daemon still comes up and serves.
 //!
 //! Case 2 registers into a process-global registry (Go's `rsop` store list is global too), so it is
@@ -222,6 +224,46 @@ fn a_loaded_policy_file_reaches_the_localapi_report() {
         "a profile load must not persist the policy's values:\n{on_disk}"
     );
     let _ = std::fs::remove_dir_all(&state_dir);
+
+    // ---------------------------------------------------------------------------------------
+    // ...and it holds on a host nobody has ever touched, which is the case the `AuthKey` in this
+    // file exists for.
+    //
+    // The credential only ever registers a node that is not yet enrolled, and the daemon's
+    // boot-time auto-start only runs for a node that WANTS to run. A never-configured host has no
+    // `prefs.json` to say either — so both facts have to come from this same policy file, or the
+    // administrator is back to logging into each machine. `AlwaysOn.Enabled` supplies the intent
+    // through the very reconcile above; `Backend::load` is where a daemon start performs it.
+    // ---------------------------------------------------------------------------------------
+    let fresh_dir = temp_path("fresh-statedir");
+    let _ = std::fs::remove_dir_all(&fresh_dir);
+    std::fs::create_dir_all(&fresh_dir).expect("the temp state dir should be creatable");
+    let fresh = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a current-thread runtime should build")
+        .block_on(Backend::load(&fresh_dir))
+        .expect("the backend should load a state dir with no profile in it");
+    assert!(
+        fresh.wants_running(),
+        "a node that has never been configured must still want to run under AlwaysOn.Enabled — \
+         without that the boot-time auto-start returns early and the policy's AuthKey is never \
+         reached"
+    );
+    assert_eq!(
+        fresh.prefs_view().hostname.as_deref(),
+        Some("documented-node"),
+        "the policy applies to a defaulted profile the same as to a persisted one"
+    );
+    // And it still writes nothing: `ever_configured` is the existence of this file, so a policy
+    // file that created one would turn the fresh node's `NoState` into `Stopped` just by being
+    // present — and, on the auth-key gate's own terms, would be the daemon inventing a history for
+    // a node that has none.
+    assert!(
+        !fresh_dir.join("prefs.json").exists(),
+        "loading a never-configured profile under a policy file must not create prefs.json"
+    );
+    let _ = std::fs::remove_dir_all(&fresh_dir);
 }
 
 /// A policy file with a mistake in it is *logged* and the daemon **still comes up** — Go's hook is

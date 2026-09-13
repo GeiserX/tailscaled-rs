@@ -129,9 +129,19 @@ of it off.)
 - **`syspolicy`** — the MDM / device-management policy store. The `--syspolicy-file` JSON source is
   *shipped*: it is resolved, reported (`tnet syspolicy list`/`reload`) and **applied over prefs** at
   profile load and on every prefs write, so policy outranks `tnet set`, `tnet up` and `--config`
-  alike. The PLATFORM stores (Windows registry / Apple managed-prefs / Group Policy) are still
-  *blocked* on the per-OS policy-store readers (and most useful once Windows lands); they register as
-  additional sources under the same merge, so adding one is a registration call, not a redesign.
+  alike. **One key inverts that ordering and it is not a bug:** `AuthKey` — the registration
+  credential, the only policy setting whose consumer is not a pref — is consulted **last**, after an
+  explicit `tnet up --auth-key` / `TS_AUTH_KEY` and after the `--config` file's own `AuthKey`. That
+  is Go's order in `Start`, and it is the right one for a credential: an operator who typed a key
+  meant *that* key. It registers a node that has never enrolled (or one the control plane is asking
+  to log in again) and is refused for one that is already enrolled, so dropping a policy file next to
+  a live node never silently re-registers it; a file carrying `AlwaysOn.Enabled` as well is what
+  enrols a never-touched host with nobody logging into it. Its value is the one thing the reports do
+  not print — `tnet syspolicy list` shows the row, the origin and `<redacted>` in the Value column,
+  so an administrator can confirm the key arrived without the credential leaving the daemon. The
+  PLATFORM stores (Windows registry / Apple managed-prefs / Group Policy) are still *blocked* on the
+  per-OS policy-store readers (and most useful once Windows lands); they register as additional
+  sources under the same merge, so adding one is a registration call, not a redesign.
 - **`systray`** — Go's desktop system-tray GUI. To match: a tray app driving the LocalAPI. A real
   target when a desktop UX is wanted; *not-yet-built* (a separate UI surface, not daemon-internal).
 - **`configure` (synology / sysext / jetkvm / kubeconfig)** — host-specific setup glue. Each is a
