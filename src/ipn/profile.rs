@@ -108,6 +108,14 @@ pub(super) fn resolve_target_to_id(target: &str, meta: &ProfilesFile) -> Option<
         .map(|(id, _)| id.clone())
 }
 
+/// The refusal for a target [`resolve_target_to_id`] matches to no profile. Go's `switchProfile` and
+/// `removeProfile` (`cmd/tailscale/cli/switch.go`) both write `errf("No profile named %q\n",
+/// args[0])`, capitalised, and `tnet` prints this line with no `error: ` in front so stderr reads the
+/// same. `%q` goes through the crate's one spelling of it, [`quoted`](super::syspolicy::quoted).
+pub(super) fn no_profile_named(target: &str) -> String {
+    format!("No profile named {}", super::syspolicy::quoted(target))
+}
+
 /// The `(prefs.json, node.key.json)` paths for profile `id` under `state_dir`. The default profile
 /// maps to the legacy top-level paths (so existing installs are untouched); every other profile maps
 /// under `profiles/<id>/`. `id` MUST already be validated by [`is_valid_profile_id`] — this joins it
@@ -352,6 +360,16 @@ mod tests {
         );
         // "home" is a known id → resolves to id "home", NOT to "work" (whose name is "home").
         assert_eq!(resolve_target_to_id("home", &prec).as_deref(), Some("home"));
+    }
+
+    #[test]
+    fn the_unmatched_target_refusal_is_gos_text() {
+        // Go: `errf("No profile named %q\n", args[0])`. Capital N, no prefix, the target quoted.
+        assert_eq!(no_profile_named("wrok"), r#"No profile named "wrok""#);
+        assert_eq!(
+            no_profile_named(r#"a "b" c"#),
+            r#"No profile named "a \"b\" c""#
+        );
     }
 
     #[test]

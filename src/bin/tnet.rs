@@ -5191,6 +5191,27 @@ fn switch_request(new: bool, target: String) -> Request {
     }
 }
 
+/// [`send_ok_or_die`] for the `switch` requests, printing a refusal the way `tailscale switch` does.
+///
+/// Go's `switchProfile` and `removeProfile` write a failure with `errf` (and `main` prints a returned
+/// error with `fmt.Fprintln(os.Stderr, err)`), so stderr is the message alone — `No profile named
+/// "wrok"` — where `send_ok_or_die` would put `error: ` in front and miss a script matching Go's line.
+/// Exit status is 1 either way.
+async fn send_switch_or_die(socket: &std::path::Path, request: Request) -> Result<()> {
+    match round_trip(socket, &request).await {
+        Ok(Response::Ok { message }) => {
+            println!("ok: {message}");
+            Ok(())
+        }
+        Ok(Response::Error { message }) => {
+            eprintln!("{message}");
+            std::process::exit(1);
+        }
+        Ok(other) => anyhow::bail!("unexpected response: {other:?}"),
+        Err(e) => Err(e).with_context(|| format!("talking to daemon at {}", socket.display())),
+    }
+}
+
 async fn run_switch(
     socket: &std::path::Path,
     list: bool,
@@ -5206,7 +5227,7 @@ async fn run_switch(
     }
     // `switch remove <id>` (subcommand) takes precedence.
     if let Some(SwitchCmd::Remove { target }) = cmd {
-        return send_ok_or_die(socket, Request::DeleteProfile { target }).await;
+        return send_switch_or_die(socket, Request::DeleteProfile { target }).await;
     }
     if list {
         match round_trip(socket, &Request::ProfileList).await {
@@ -5229,7 +5250,7 @@ async fn run_switch(
         }
     }
     match target {
-        Some(target) => send_ok_or_die(socket, switch_request(new, target)).await,
+        Some(target) => send_switch_or_die(socket, switch_request(new, target)).await,
         // Unreachable: `switch_usage_refusal` above already exited on a missing target. Kept as a
         // total match (rather than an `expect`) so a future edit to the refusal table degrades into
         // the same usage line instead of a panic.
