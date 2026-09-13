@@ -2802,7 +2802,7 @@ impl Backend {
         // canonical id BEFORE any teardown, so a no-match is rejected with the device untouched.
         let meta = profile::load_profiles_file(&self.state_dir).await;
         let resolved = profile::resolve_target_to_id(target, &meta)
-            .ok_or_else(|| anyhow!("no profile named {target:?}"))?;
+            .ok_or_else(|| anyhow!(profile::no_profile_named(target)))?;
         self.activate_profile(&resolved).await
     }
 
@@ -2951,7 +2951,7 @@ impl Backend {
         // path component, which is what the file removals below rely on.
         let meta = profile::load_profiles_file(&self.state_dir).await;
         let resolved = profile::resolve_target_to_id(target, &meta)
-            .ok_or_else(|| anyhow!("no profile named {target:?}"))?;
+            .ok_or_else(|| anyhow!(profile::no_profile_named(target)))?;
         let target: &str = &resolved;
         if target == self.current_profile {
             // Go's `if profID == cp.ID`: nothing is removed and the command succeeds.
@@ -7680,10 +7680,7 @@ mod tests {
             .delete_profile("work")
             .await
             .expect_err("removing an unknown profile must be refused, not a silent no-op");
-        assert!(
-            format!("{err:#}").contains("no profile named"),
-            "unexpected error: {err:#}"
-        );
+        assert_eq!(format!("{err:#}"), r#"No profile named "work""#);
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -7876,10 +7873,8 @@ mod tests {
             .switch_profile("wrok-laptop")
             .await
             .expect_err("a target that matches no profile must be refused, not created");
-        assert!(
-            format!("{err:#}").contains("no profile named"),
-            "unexpected error: {err:#}"
-        );
+        // Go's text exactly, not a lower-cased cousin a script matching Go's line would miss.
+        assert_eq!(format!("{err:#}"), r#"No profile named "wrok-laptop""#);
 
         // Nothing moved: not the active profile, not its prefs, not the active paths.
         assert_eq!(be.current_profile, profile::DEFAULT_PROFILE_ID);
@@ -10190,10 +10185,7 @@ mod tests {
             .switch_profile("work-laptop")
             .await
             .expect_err("a cleared nickname must no longer name a profile");
-        assert!(
-            format!("{err:#}").contains("no profile named"),
-            "unexpected error: {err:#}"
-        );
+        assert_eq!(format!("{err:#}"), r#"No profile named "work-laptop""#);
         // And the id still does, on the profile whose name was cleared.
         assert_eq!(
             be.switch_profile("work").await.unwrap(),

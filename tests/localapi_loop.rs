@@ -908,10 +908,7 @@ async fn profile_switch_list_and_remove_round_trip_over_the_wire() {
         .round_trip(r#"{"cmd":"switch_profile","target":"work"}"#)
         .await
     {
-        Response::Error { message } => assert!(
-            message.contains("no profile named"),
-            "unexpected refusal: {message:?}"
-        ),
+        Response::Error { message } => assert_eq!(message, r#"No profile named "work""#),
         other => panic!("expected Response::Error switching to an unknown profile, got {other:?}"),
     }
     // ...and the refused target really was not created: still just the default profile, still current.
@@ -934,9 +931,9 @@ async fn profile_switch_list_and_remove_round_trip_over_the_wire() {
         .round_trip(r#"{"cmd":"switch_profile","target":"work","create":true}"#)
         .await
     {
-        Response::Error { message } => assert!(
-            message.contains("no profile named"),
-            "an unmodelled field must not turn a switch into a creation: {message:?}"
+        Response::Error { message } => assert_eq!(
+            message, r#"No profile named "work""#,
+            "an unmodelled field must not turn a switch into a creation"
         ),
         other => panic!("expected Response::Error, got {other:?}"),
     }
@@ -1026,10 +1023,7 @@ async fn profile_switch_list_and_remove_round_trip_over_the_wire() {
         .round_trip(r#"{"cmd":"delete_profile","target":"nonesuch"}"#)
         .await
     {
-        Response::Error { message } => assert!(
-            message.contains("no profile named"),
-            "unexpected refusal: {message:?}"
-        ),
+        Response::Error { message } => assert_eq!(message, r#"No profile named "nonesuch""#),
         other => panic!("expected Response::Error removing an unknown profile, got {other:?}"),
     }
 
