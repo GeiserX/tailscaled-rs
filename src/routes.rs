@@ -90,8 +90,9 @@ pub fn validate_via_prefix(p: &ipnet::IpNet) -> Result<(), String> {
 }
 
 /// One reason a route set cannot be advertised. Carries the offending value rather than only a
-/// string so a caller can tell the kinds apart (the `--config` loader prefixes its own messages);
-/// [`Display`](std::fmt::Display) renders Go's wording, which is what every current caller wants.
+/// string so a caller can tell the kinds apart (`Backend::check_prefs` folds them into its own error
+/// list); [`Display`](std::fmt::Display) renders Go's wording, which is what every current caller
+/// wants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteError {
     /// Not an IP prefix at all. Go gets this for free — its `AdvertiseRoutes` is a
@@ -100,8 +101,10 @@ pub enum RouteError {
     /// A prefix with host bits set, e.g. `192.0.2.5/24`: accepted by the parser, and *not* what the
     /// operator meant. `masked` is the prefix they did mean.
     NonMasked {
-        /// The route exactly as the operator wrote it.
-        route: String,
+        /// The route as PARSED, not as typed. Go reports `%s` of the `netip.Prefix` it decoded, so
+        /// `2001:0DB8::1/64` comes back as `2001:db8::1/64`; echoing the operator's spelling here
+        /// would leave the two halves of one message in two different notations.
+        route: ipnet::IpNet,
         /// The same route with its host bits cleared — the value to use instead.
         masked: ipnet::IpNet,
     },
@@ -183,10 +186,7 @@ pub fn calc_advertise_routes(
         };
         let masked = net.trunc();
         if masked != net {
-            errors.push(RouteError::NonMasked {
-                route: s.clone(),
-                masked,
-            });
+            errors.push(RouteError::NonMasked { route: net, masked });
             continue;
         }
         // Go asks `IsViaPrefix` first and only then `ValidateViaPrefix`, so a prefix outside the via
@@ -361,6 +361,19 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "route 192.0.2.5/24 has non-address bits set; expected 192.0.2.0/24"
+        );
+    }
+
+    /// Go's `%s` formats the `netip.Prefix` it parsed, not the operator's spelling, so an IPv6
+    /// route written long-hand and in upper case is named back in its canonical form. Both halves
+    /// of the message are then in the same notation, which is what makes "expected" a value the
+    /// operator can paste back into the config.
+    #[test]
+    fn non_masked_route_is_reported_canonically_not_as_typed() {
+        let err = validate_advertise_routes(&routes(&["2001:0DB8:0000::1/64"]), false).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "route 2001:db8::1/64 has non-address bits set; expected 2001:db8::/64"
         );
     }
 
