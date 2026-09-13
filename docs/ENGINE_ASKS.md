@@ -1921,3 +1921,120 @@ refusal is stable rather than flapping) but is one more reason the gate belongs 
 `permitted_suggestion`'s filter arm becomes redundant (the nil-versus-empty reading and its tests
 move with the argument). `tnet exit-node suggest` then answers with the best *allowed* exit node
 instead of withholding when the best overall is not allowed. Consumed via a pin bump. — engine lane
+
+## 45. A lag signal out of `IpnBusWatcher` — so a notify watcher that falls behind is told and disconnected, not silently starved
+
+**Why:** upstream used to drop notifications for a slow watcher and no longer does. In
+`ipn/ipnlocal/local.go` @ `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`, `sendToLocked` writes each
+per-session frame into the session's 128-deep channel with a non-blocking send, and the `default`
+arm is a disconnect, not a drop:
+
+```go
+select {
+case sess.ch <- nForSess:
+default:
+    if sess.mask&ipn.NotifyInProcessNoDisconnect != 0 {
+        select {
+        case sess.ch <- nForSess:
+        case <-sess.ctx.Done():
+        }
+        continue
+    }
+    b.closeLaggingWatchSessionLocked(sess)
+}
+```
+
+`closeLaggingWatchSessionLocked` does three things, in this order: it removes the session from
+`b.notifyWatchers`; it **drains** every frame still queued ("the session already fell behind, so the
+queued delta stream is not trustworthy"); then it queues one terminal frame whose `ErrMessage` is
+`watchIPNBusFellBehindMessage` (`"IPN bus consumer fell behind; closing watch"`) and closes the
+channel. A LocalAPI watcher that cannot keep up is told once, then disconnected, and knows it must
+subscribe again and take a fresh snapshot. Blocking instead is kept for
+`NotifyInProcessNoDisconnect`, which only works in-process; the LocalAPI handler refuses it.
+
+The engine still does what upstream stopped doing. Verified against pin `9d847a6e`/v0.43.0:
+`deliver` in `ts_runtime/src/ipn_bus.rs` treats a full channel as success:
+
+```rust
+match tx.try_send(n) {
+    Ok(()) => false,
+    Err(mpsc::error::TrySendError::Full(_)) => false,
+    Err(mpsc::error::TrySendError::Closed(_)) => true,
+}
+```
+
+Its doc comment cites Go's non-blocking send as the model. That was right before upstream swapped
+the drop for a disconnect. `IpnBusWatcher::next` returns `Option<Notify>`, so nothing about a drop
+reaches the consumer: no counter, no marker, no closed stream.
+
+The drop costs more than one frame. `run_bus` calls `borrow_and_update()` on the source `watch` cell
+before `deliver`, so the dropped value counts as *seen*. The frames still in the queue are **older**
+values of that cell. A consumer that catches up ends on a stale state or peer set, and stays there
+until that cell next changes. On a quiet node that can be indefinitely. A slow reader is easy to
+get: `tnet status --watch` piped into a stalled pager, or a management agent doing synchronous work
+per frame. Neither side learns that the view has split from the daemon's. Once ask #28 lands and
+`net_map` carries deltas instead of full sets, a dropped delta would corrupt the watcher's view for
+good. So this ask should land before, or with, #28.
+
+**Why not a daemon-side facsimile.** `stream_notify` (`src/server.rs`) owns the socket and could send
+a terminal `NotifyView { error }` and return in a few lines. What it cannot do is know *when*. The
+drop happens inside the engine's task, before the daemon's `watcher.next()` runs. The daemon never
+sees the discarded frame, and it cannot read the queue depth of the channel the engine holds. A
+write timeout on the client socket, or a guess at queue depth from frame timing, would measure
+something else and call it "fell behind". That guess would disconnect healthy watchers and miss real
+drops. Refused under the honest-omission rule; hence this ask.
+
+**Out of scope, stated so it is not re-filed:** the two feeds the daemon builds itself need nothing.
+Prefs (`Backend::watch_prefs`) and policy (`Backend::watch_policy`) ride `tokio::sync::watch`, and
+each frame is a full snapshot read at send time. A `watch` coalesces to the latest value rather than
+dropping an entry, and for a full-snapshot feed coalescing loses nothing: the next frame is the
+current truth. Only the engine's `mpsc` bus has this hazard.
+
+**Ask (either shape is enough; the first is closer to Go and preferred):**
+
+1. **Port Go's behaviour into the engine.** On `TrySendError::Full`, drain the watcher's queue, queue
+   one terminal item that says the watcher fell behind, and end the stream. That needs an item type
+   that can carry the terminal item, in the shape of
+   `tokio::sync::broadcast::error::RecvError::Lagged`:
+
+```rust
+/// One item from the IPN bus.
+#[non_exhaustive]
+pub enum IpnBusEvent {
+    Notify(Notify),
+    /// The watcher's buffer filled and the bus dropped a notification. The stream ends after
+    /// this item. Frames queued before the drop were discarded, not delivered (Go
+    /// `closeLaggingWatchSessionLocked`), so the consumer must subscribe again for a fresh
+    /// snapshot.
+    Lagged,
+}
+
+impl IpnBusWatcher {
+    /// `None` after `Lagged`, and on runtime shutdown as today.
+    pub async fn next_event(&mut self) -> Option<IpnBusEvent>;
+}
+```
+
+   `next()` can stay as it is for embedders that want lossy streaming, so nothing downstream breaks.
+   The drain has to happen *in the engine*: once the terminal item is behind queued frames, a consumer
+   reading in order has already taken the stale frames. **Order matters:** drain first, then the
+   terminal item, then close. A client that gets stale frames *after* the error cannot tell which
+   side of the gap they came from. A `Receiver` cannot be drained from the sending side, so this
+   probably means an `Arc<AtomicBool>` "lagged" flag that `next_event` checks before `recv()`, or
+   swapping to a channel the engine can clear. Either is fine, as long as the consumer sees the
+   order above.
+
+2. **Or expose a lag count** (e.g. `IpnBusWatcher::dropped() -> u64`, or `Lagged(u64)` delivered on the
+   next successful receive) and leave the disconnect to the caller. That is smaller, but the daemon
+   then cannot port the drain step: by the time the count shows up, the stale queued frames are
+   already out of `next()`. Hence (1) is preferred.
+
+**Daemon impact once landed:** `stream_notify` switches to `next_event`. On `Lagged` it writes one
+`Response::Notify(NotifyView { error: Some("IPN bus consumer fell behind; closing watch") })` and
+returns, which closes the connection. Nothing is written after that frame. The daemon still writes
+any prefs or policy frame whose select arm won before the lag was seen: those are full snapshots, so
+they are safe. `tnet`'s notify reader already echoes every `Notify` frame and exits cleanly when the
+stream closes, so a JSON consumer sees Go's terminal message. Note that `NotifyView::error` today
+means "terminal registration failure, alongside a `NeedsLogin` state". The lag frame carries `error`
+with no `state`, which is how Go overloads `Notify.ErrMessage` too, and the field's doc comment will
+need to say so. Consumed via a pin bump. — engine lane

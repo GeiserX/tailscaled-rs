@@ -654,6 +654,16 @@ async fn stream_watch(
 /// device `Arc` out under the lock, drop the lock, then subscribe + stream off-lock — exactly the
 /// "clone the work out, drop the lock" discipline [`stream_nc`] and the other slow engine calls use —
 /// so a notify watcher never head-of-line blocks a concurrent `up`/`down`/`status`.
+///
+/// ## A reader that falls behind is not told (engine-gated)
+///
+/// Go (`sendToLocked` → `closeLaggingWatchSessionLocked`) disconnects a watcher whose 128-deep queue
+/// fills. It drains the queue, sends one `"IPN bus consumer fell behind; closing watch"` frame, and
+/// closes. This fork's engine drops the frame on a full queue and records nothing, so from
+/// `watcher.next()` a dropped notification looks like no notification. This function therefore cannot
+/// send Go's terminal frame. Guessing at lag here (a write timeout, a queue-depth estimate) would be a
+/// facsimile, so it is not done. See `docs/ENGINE_ASKS.md` ask #45. The prefs and policy feeds are
+/// not affected: they are full snapshots over `watch`, which coalesces instead of dropping.
 async fn stream_notify(
     write_half: &mut tokio::net::unix::OwnedWriteHalf,
     backend: &Arc<Mutex<Backend>>,
