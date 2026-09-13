@@ -14582,6 +14582,31 @@ fn kubeconfig_path() -> Result<String> {
     kubeconfig_path_from(kubeconfig.as_deref(), home.as_deref())
 }
 
+/// Spell an [`std::io::Error`] the way Go spells the same failure, because everything this command
+/// reports about a kubeconfig it could not write is Go's `*os.PathError` text reassembled by hand:
+/// `<syscall> <path>: <this>`.
+///
+/// Rust's `Display` gives `Permission denied (os error 13)` where Go's `syscall.Errno` table gives
+/// `permission denied`: capitalised, and carrying an errno number Go never prints. The two tables
+/// otherwise agree word for word (both are the C library's strings; Go's are lowercased), so
+/// dropping the suffix `Display` appends and lowercasing the first character is the whole
+/// difference. An error with no errno behind it — there is none on this path today — is left as
+/// Rust spells it, since there is no Go text to match it against.
+fn go_io_error_text(e: &std::io::Error) -> String {
+    let display = e.to_string();
+    let Some(code) = e.raw_os_error() else {
+        return display;
+    };
+    let text = display
+        .strip_suffix(&format!(" (os error {code})"))
+        .unwrap_or(&display);
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_lowercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
 /// Go's `kubeconfigAccessErr`: one wording for every reason the kubeconfig cannot be written, so
 /// the precheck below and a failed directory creation read the same to whoever hits them.
 ///
@@ -14610,13 +14635,14 @@ fn kubeconfig_access_err(path: &str, detail: &str) -> anyhow::Error {
 fn is_writable(path: &std::path::Path) -> std::result::Result<(), String> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
-    let md = std::fs::metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+    let md = std::fs::metadata(path)
+        .map_err(|e| format!("stat {}: {}", path.display(), go_io_error_text(&e)))?;
     if !md.is_dir() {
         return std::fs::OpenOptions::new()
             .write(true)
             .open(path)
             .map(drop)
-            .map_err(|e| format!("open {}: {e}", path.display()));
+            .map_err(|e| format!("open {}: {}", path.display(), go_io_error_text(&e)));
     }
     // Go's `os.CreateTemp(path, ".tailscale-kubeconfig-*")`, whose randomness only has to avoid a
     // collision: a fresh name per attempt, `O_EXCL` so a name already taken is retried rather than
@@ -14636,12 +14662,18 @@ fn is_writable(path: &std::path::Path) -> std::result::Result<(), String> {
             Ok(f) => {
                 drop(f);
                 return std::fs::remove_file(&probe)
-                    .map_err(|e| format!("remove {}: {e}", probe.display()));
+                    .map_err(|e| format!("remove {}: {}", probe.display(), go_io_error_text(&e)));
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                last = format!("open {}: {e}", probe.display());
+                last = format!("open {}: {}", probe.display(), go_io_error_text(&e));
             }
-            Err(e) => return Err(format!("open {}: {e}", probe.display())),
+            Err(e) => {
+                return Err(format!(
+                    "open {}: {}",
+                    probe.display(),
+                    go_io_error_text(&e)
+                ));
+            }
         }
     }
     Err(last)
@@ -14687,7 +14719,7 @@ fn check_kubeconfig_writable(path: &str) -> Result<()> {
             Err(e) => {
                 return Err(kubeconfig_access_err(
                     path,
-                    &format!("stat {}: {e}", probe.display()),
+                    &format!("stat {}: {}", probe.display(), go_io_error_text(&e)),
                 ));
             }
         }
@@ -14696,6 +14728,64 @@ fn check_kubeconfig_writable(path: &str) -> Result<()> {
             return Ok(()); // reached the filesystem root
         }
         probe = parent;
+    }
+}
+
+/// Go's `os.MkdirAll(path, perm)`, ported for the ERROR it returns rather than for what it creates.
+///
+/// `std::fs::create_dir_all` does the same work but hands back a bare `io::Error` with no path in
+/// it, so a caller can only name the directory it asked for. Go returns the `*os.PathError` of the
+/// one `mkdir` that failed, which names the topmost component it could not create: for
+/// `$KUBECONFIG=~/.kube/a/b/config` under a home directory that refuses writes, Go says
+/// `mkdir /home/x/.kube: permission denied` and the guessed version says `.../.kube/a/b` — a
+/// directory that was never the problem, and that the reader would then go and inspect.
+///
+/// The walk is Go's, including its ends: an existing directory is already done, an existing
+/// NON-directory is `ENOTDIR` against *that* component, the parent is created before this level,
+/// and a level that lost the race to a concurrent creator counts as created (Go's `Lstat`
+/// re-check), so two `configure kubeconfig` runs at once do not make each other fail.
+fn go_mkdir_all(path: &std::path::Path, mode: u32) -> std::result::Result<(), String> {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    let failed = |p: &std::path::Path, e: &std::io::Error| {
+        format!("mkdir {}: {}", p.display(), go_io_error_text(e))
+    };
+    match std::fs::metadata(path) {
+        Ok(md) if md.is_dir() => return Ok(()),
+        // Go: `&PathError{Op: "mkdir", Path: path, Err: syscall.ENOTDIR}` — the component in the
+        // way is named, not the descendant that could never have been created below it.
+        Ok(_) => {
+            return Err(failed(
+                path,
+                &std::io::Error::from_raw_os_error(libc::ENOTDIR),
+            ));
+        }
+        Err(_) => {}
+    }
+    // Go's parent, taken on the string: trailing separators first, then the last element. It
+    // recurses only while something longer than the root is left, which is what ends the walk.
+    let bytes = path.as_os_str().as_bytes();
+    let mut i = bytes.len();
+    while i > 0 && bytes[i - 1] == b'/' {
+        i -= 1;
+    }
+    let mut j = i;
+    while j > 0 && bytes[j - 1] != b'/' {
+        j -= 1;
+    }
+    if j > 1 {
+        let parent = std::path::Path::new(std::ffi::OsStr::from_bytes(&bytes[..j - 1]));
+        go_mkdir_all(parent, mode)?;
+    }
+    match std::fs::DirBuilder::new().mode(mode).create(path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if std::fs::symlink_metadata(path).is_ok_and(|md| md.is_dir()) {
+                return Ok(());
+            }
+            Err(failed(path, &e))
+        }
     }
 }
 
@@ -14712,7 +14802,7 @@ fn check_kubeconfig_writable(path: &str) -> Result<()> {
 /// [`write_kubeconfig_file`].)
 fn set_kubeconfig_for_peer(scheme: &str, fqdn: &str, path: &str) -> Result<()> {
     use std::io::Write as _;
-    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+    use std::os::unix::fs::OpenOptionsExt as _;
 
     let p = std::path::Path::new(path);
     // Go: `if _, err := os.Stat(dir); err != nil { if !os.IsNotExist(err) { return err }; ...
@@ -14725,17 +14815,23 @@ fn set_kubeconfig_for_peer(scheme: &str, fqdn: &str, path: &str) -> Result<()> {
         match std::fs::metadata(dir) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::DirBuilder::new()
-                    .mode(0o755)
-                    .recursive(true)
-                    .create(dir)
-                    // Go wraps this one in `kubeconfigAccessErr`, which names the kubeconfig rather
-                    // than the directory — the file is what the operator asked for.
-                    .map_err(|e| {
-                        kubeconfig_access_err(path, &format!("mkdir {}: {e}", dir.display()))
-                    })?;
+                // Go wraps this one in `kubeconfigAccessErr`, which names the kubeconfig rather
+                // than the directory — the file is what the operator asked for — carrying
+                // `MkdirAll`'s own error, which names the component that refused.
+                go_mkdir_all(dir, 0o755).map_err(|why| kubeconfig_access_err(path, &why))?;
             }
-            Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+            // Go returns this one BARE: `if !os.IsNotExist(err) { return err }`, the stat's
+            // `*os.PathError` and nothing else. It is deliberately not a "cannot write kubeconfig"
+            // — the directory is there and cannot even be looked at, which is a different problem
+            // from a kubeconfig that will not take a write — so adding a wrapper here would answer
+            // a question the operator did not ask.
+            Err(e) => {
+                return Err(anyhow!(
+                    "stat {}: {}",
+                    sanitize_for_terminal(&dir.display().to_string()),
+                    go_io_error_text(&e)
+                ));
+            }
         }
     }
     let existing = match std::fs::read(p) {
@@ -24404,6 +24500,109 @@ users:
             }
             std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn kubeconfig_errno_text_is_gos_not_rusts() {
+        // Everything `configure kubeconfig` says about a write it could not do is Go's
+        // `*os.PathError` text rebuilt by hand — `<syscall> <path>: <errno>` — so the errno has to
+        // be Go's word for it. Rust's own `Display` would say `Permission denied (os error 13)`:
+        // capitalised, and with a number Go never prints.
+        assert_eq!(
+            go_io_error_text(&std::io::Error::from_raw_os_error(libc::EACCES)),
+            "permission denied"
+        );
+        assert_eq!(
+            go_io_error_text(&std::io::Error::from_raw_os_error(libc::ENOENT)),
+            "no such file or directory"
+        );
+        assert_eq!(
+            go_io_error_text(&std::io::Error::from_raw_os_error(libc::ENOTDIR)),
+            "not a directory"
+        );
+        assert_eq!(
+            go_io_error_text(&std::io::Error::from_raw_os_error(libc::EROFS)),
+            "read-only file system"
+        );
+        // An error with no errno behind it has no Go text to match; it is passed through.
+        assert_eq!(
+            go_io_error_text(&std::io::Error::other("made up")),
+            "made up"
+        );
+    }
+
+    #[test]
+    fn kubeconfig_write_failures_are_worded_like_gos() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = std::env::temp_dir().join(format!("tnet-kubeerrtext-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // The precheck on a read-only kubeconfig. Go: `cannot write kubeconfig at %q: %w` around
+        // the `*os.PathError` from `os.OpenFile`.
+        let ro = root.join("readonly");
+        std::fs::write(&ro, "apiVersion: v1\nkind: Config\n").unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o400)).unwrap();
+        if std::fs::OpenOptions::new().write(true).open(&ro).is_err() {
+            let err = check_kubeconfig_writable(ro.to_str().unwrap())
+                .expect_err("a read-only kubeconfig cannot be written");
+            assert_eq!(
+                format!("{err:#}"),
+                format!(
+                    "cannot write kubeconfig at \"{p}\": open {p}: permission denied",
+                    p = ro.display()
+                )
+            );
+        }
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        // A kubeconfig several directories below something that will not take a write. Go's
+        // `MkdirAll` names the component that actually refused — the first one it could not create
+        // — not the whole tree it was asked for.
+        let locked = root.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+        if mode_bits_are_enforced_for_us(&locked) {
+            let target = locked.join(".kube/a/b/config");
+            let err = set_kubeconfig_for_peer(
+                "https://",
+                "foo.tail-scale.ts.net",
+                target.to_str().unwrap(),
+            )
+            .expect_err("a directory tree that cannot be created is a refusal");
+            assert_eq!(
+                format!("{err:#}"),
+                format!(
+                    "cannot write kubeconfig at \"{t}\": mkdir {k}: permission denied",
+                    t = target.display(),
+                    k = locked.join(".kube").display()
+                )
+            );
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        // A parent directory that cannot even be stat'ed. Go returns that error BARE — no
+        // `cannot write kubeconfig` around it — because the problem is not the kubeconfig.
+        let nostat = root.join("nostat");
+        std::fs::create_dir(&nostat).unwrap();
+        std::fs::set_permissions(&nostat, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let dir = nostat.join(".kube");
+        if std::fs::metadata(&dir).is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound) {
+            let target = dir.join("config");
+            let err = set_kubeconfig_for_peer(
+                "https://",
+                "foo.tail-scale.ts.net",
+                target.to_str().unwrap(),
+            )
+            .expect_err("a parent that cannot be stat'ed is a refusal");
+            assert_eq!(
+                format!("{err:#}"),
+                format!("stat {}: permission denied", dir.display())
+            );
+        }
+        std::fs::set_permissions(&nostat, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         let _ = std::fs::remove_dir_all(&root);
     }
