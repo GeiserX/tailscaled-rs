@@ -1005,8 +1005,10 @@ enum Command {
         /// NO authentication — a warning is printed if you do.
         #[arg(long, value_name = "ADDR")]
         listen: Option<String>,
-        /// Run the UI in read-only mode (Go `web --readonly`). This build's web UI is ALWAYS read-only
-        /// (no mutating manage mode yet), so this flag is accepted for Go compatibility and is a no-op.
+        /// Run the UI in read-only mode (Go `web --readonly`). This build's page is always read-only
+        /// (no mutating manage mode yet), but the flag still decides what Go decides with it: without
+        /// it, `web` first turns on the daemon's web client pref (as `tnet set --webclient` would),
+        /// logging that it does so, and fails if the daemon cannot be reached to do it.
         #[arg(long)]
         readonly: bool,
         /// URL path prefix the UI is served under (Go `web --prefix`), for use behind a reverse proxy
@@ -3162,12 +3164,13 @@ async fn main() -> Result<()> {
         } => run_update(check || dry_run, yes, version, track).await,
         // `web` (Go `tailscale web`): serve the read-only status UI. Reuses the same embedded HTTP
         // server as `status --web`, but with Go's command name + flags (default localhost:8088). The
-        // `--readonly` flag is a no-op (this build's web UI is always read-only). `--prefix` serves
-        // the page under a URL path prefix (for reverse proxies), `--origin` is accepted and unused
-        // (see its flag doc), and `--cgi` swaps the listener for one CGI request/response.
+        // page is always read-only; `--readonly` only skips Go's step of turning on the daemon's web
+        // client first. `--prefix` serves the page under a URL path prefix (for reverse proxies),
+        // `--origin` is accepted and unused (see its flag doc), and `--cgi` swaps the listener for
+        // one CGI request/response.
         Command::Web {
             listen,
-            readonly: _,
+            readonly,
             prefix,
             no_browser,
             cgi,
@@ -3176,6 +3179,7 @@ async fn main() -> Result<()> {
             run_web(
                 &socket,
                 listen,
+                readonly,
                 prefix.unwrap_or_default(),
                 !no_browser,
                 cgi,
@@ -12243,22 +12247,123 @@ fn cgi_response(status: &str, body: &str) -> String {
 /// anyway). Refusing the pair would be worse than useless here — in CGI mode this process's stdout
 /// *is* the response body, so a refusal printed there reaches the invoking web server as a
 /// malformed CGI response instead of a page.
+///
+/// Between the two, Go's `runWeb` step that `--readonly` skips: unless the daemon's `RunWebClient`
+/// pref is already on, log that the tailscaled web client is being started and turn the pref on,
+/// failing the command if that cannot be done. It runs before the mode split, so it gates `--cgi`
+/// too — which is why only `--readonly` (or a pref that is already on) reaches a CGI response with
+/// nothing on stderr. Go turns the pref back off on interrupt only in listener mode; a CGI request
+/// leaves it on.
 async fn run_web(
     socket: &std::path::Path,
     listen: Option<String>,
+    readonly: bool,
     prefix: String,
     browser: bool,
     cgi: bool,
 ) -> Result<()> {
+    let started_web_client = !readonly && start_tailscaled_web_client(socket).await?;
     if cgi {
         // CGI mode owns stdout: the response IS this process's stdout, so nothing may be printed
         // alongside it (no startup line) and no browser is opened (there is no server to browse).
         return run_web_cgi(socket, &normalize_served_path(&prefix)).await;
     }
     let listen = listen.unwrap_or_else(|| DEFAULT_WEB_LISTEN.to_string());
-    run_status_web(socket, &listen, browser, &prefix)
+    let serve = async {
+        run_status_web(socket, &listen, browser, &prefix)
+            .await
+            .with_context(|| format!("serving web UI on {listen}"))
+    };
+    if !started_web_client {
+        return serve.await;
+    }
+    // Go shuts down the web client it started when the CLI is interrupted, then exits 0.
+    //
+    // Interruption is the ONLY path that turns the pref back off. A serving failure — the bind
+    // that finds the port taken — returns the error with the pref left on, which is what Go does
+    // too: its `setRunWebClient(false)` lives in the goroutine parked on `signal.NotifyContext`'s
+    // context, and a failed `http.ListenAndServe` returns straight out of `runWeb` past it. Go's
+    // `defer cancel()` does wake that goroutine on the way out, but it races the error's own trip
+    // to `os.Exit(1)` and loses it (an IPC `EditPrefs` against two stack frames); and on the rare
+    // run where it won, it would `os.Exit(0)` and swallow the failure. Turning the pref off here
+    // would deterministically pick half of a race Go never meant to have, so a failed `web` leaves
+    // the pref as Go leaves it: on, for `tnet set --webclient=false` to clear.
+    tokio::select! {
+        served = serve => served,
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("stopping tailscaled web client");
+            if let Err(e) = set_run_web_client(socket, false).await {
+                eprintln!("stopping tailscaled web client: {e:#}");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Go's `tsconst.WebListenPort`: where tailscaled's own web client listens.
+const WEB_CLIENT_LISTEN_PORT: u16 = 5252;
+
+/// The address Go's `runWeb` logs the web client at: `netip.AddrPortFrom(selfIP, WebListenPort)`,
+/// where `selfIP` is the node's first Tailscale IP, or the zero `Addr` when the status read failed
+/// or the node has none — which Go's `AddrPort.String` renders as `invalid AddrPort`.
+fn web_client_log_addr(self_ipv4: Option<&str>, self_ipv6: Option<&str>) -> String {
+    self_ipv4
+        .or(self_ipv6)
+        .and_then(|ip| ip.parse::<std::net::IpAddr>().ok())
+        .map(|ip| std::net::SocketAddr::new(ip, WEB_CLIENT_LISTEN_PORT).to_string())
+        .unwrap_or_else(|| "invalid AddrPort".to_string())
+}
+
+/// Go's `runWeb` pre-serve step (skipped under `--readonly`): unless the daemon's `RunWebClient`
+/// pref is already on, log `starting tailscaled web client at …` to stderr and turn the pref on.
+/// Returns whether it turned the pref on. As in Go, a failed prefs read counts as "not on", so an
+/// unreachable daemon logs the line and then fails with `starting web client in tailscaled: …`.
+async fn start_tailscaled_web_client(socket: &std::path::Path) -> Result<bool> {
+    let self_ip = match round_trip(socket, &Request::Status).await {
+        Ok(Response::Status(s)) => {
+            web_client_log_addr(s.self_ipv4.as_deref(), s.self_ipv6.as_deref())
+        }
+        _ => web_client_log_addr(None, None),
+    };
+    if let Ok(Response::Prefs(prefs)) = round_trip(socket, &Request::GetPrefs).await
+        && prefs.webclient
+    {
+        return Ok(false);
+    }
+    eprintln!("starting tailscaled web client at http://{self_ip}");
+    set_run_web_client(socket, true)
         .await
-        .with_context(|| format!("serving web UI on {listen}"))
+        .map_err(|e| anyhow::anyhow!("starting web client in tailscaled: {e:#}"))?;
+    Ok(true)
+}
+
+/// Go's `setRunWebClient`: an `EditPrefs` naming only `RunWebClient` — here the `set` request with
+/// every other pref left unchanged.
+async fn set_run_web_client(socket: &std::path::Path, on: bool) -> Result<()> {
+    let request = Request::Set {
+        hostname: None,
+        accept_routes: None,
+        accept_dns: None,
+        shields_up: None,
+        exit_node: None,
+        advertise_exit_node: None,
+        advertise_routes: None,
+        advertise_tags: None,
+        ssh: None,
+        advertise_connector: None,
+        auto_update: None,
+        update_check: None,
+        operator: None,
+        nickname: None,
+        report_posture: None,
+        webclient: Some(on),
+        exit_node_allow_lan_access: None,
+    };
+    match round_trip(socket, &request).await? {
+        Response::Ok { .. } => Ok(()),
+        Response::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("unexpected response to set: {other:?}"),
+    }
 }
 
 /// `tnet web --cgi` (Go `web --cgi` → `cgi.Serve`): serve ONE request from the CGI/1.1 environment
@@ -20606,6 +20711,22 @@ mod tests {
         );
         assert_eq!(route_web_request("POST", "/", "/"), WebRoute::NotFound);
         assert_eq!(route_web_request("", "/", "/"), WebRoute::NotFound);
+    }
+
+    #[test]
+    fn web_client_log_addr_renders_gos_addr_port() {
+        // The node's first Tailscale IP with Go's `WebListenPort`, IPv4 first as in `TailscaleIPs`.
+        assert_eq!(
+            web_client_log_addr(Some("100.64.0.1"), Some("fd7a:115c:a1e0::1")),
+            "100.64.0.1:5252"
+        );
+        assert_eq!(
+            web_client_log_addr(None, Some("fd7a:115c:a1e0::1")),
+            "[fd7a:115c:a1e0::1]:5252"
+        );
+        // No IP (or no status at all) is Go's zero `Addr`, which `AddrPort.String` spells this way.
+        assert_eq!(web_client_log_addr(None, None), "invalid AddrPort");
+        assert_eq!(web_client_log_addr(Some(""), None), "invalid AddrPort");
     }
 
     #[test]
