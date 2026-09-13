@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.62.1](https://github.com/GeiserX/tailscaled-rs/compare/v0.62.0...v0.62.1) (2026-09-13)
+
+
+### Bug Fixes
+
+* **tests:** free the parity ledger contract from one edition's PR number ([#463](https://github.com/GeiserX/tailscaled-rs/issues/463)) ([5d3ead6](https://github.com/GeiserX/tailscaled-rs/commit/5d3ead6ba71bdff512c7295562a8ba6c6fe59e65))
+
 ## [0.62.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.61.0...v0.62.0) (2026-09-12)
 
 
