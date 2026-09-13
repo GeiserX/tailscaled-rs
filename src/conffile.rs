@@ -144,7 +144,13 @@ pub struct ConfigVAlpha {
     /// as Go's `ToPrefs` does — and the list is checked as a SET
     /// ([`crate::routes::calc_advertise_routes`]): a 4via6 prefix must decode, and a default route
     /// must appear in both families or in neither (a lone `0.0.0.0/0` is a half exit node).
-    pub advertise_routes: Vec<String>,
+    ///
+    /// `Option`, not a bare `Vec`, because Go guards the whole block with `if c.AdvertiseRoutes !=
+    /// nil` and an explicit `"AdvertiseRoutes": []` is a non-nil empty slice: it sets the pref to
+    /// empty (`AdvertiseRoutesSet = true`) and WITHDRAWS every advertised route. Only an absent key
+    /// (or JSON `null`) leaves the persisted routes alone. A bare `Vec` cannot tell the two apart,
+    /// and would make "stop advertising these subnets" unsayable in a declarative config.
+    pub advertise_routes: Option<Vec<String>>,
     /// HONORED → [`Prefs::advertise_exit_node`]. Go `AdvertiseExitNode` — advertise this node as an
     /// exit node. It **composes** with [`advertise_routes`](ConfigVAlpha::advertise_routes) rather
     /// than replacing it: Go stores the exit-node advertisement *inside* `AdvertiseRoutes` (as the two
@@ -454,10 +460,13 @@ impl Config {
     /// the config supplied one) for the caller to use at bring-up — it is a credential, not a
     /// persisted pref, so it is never written into `prefs`.
     ///
-    /// A field left unset in the config (`None` / empty vec) does NOT touch the corresponding pref, so
-    /// the config layers on top of the daemon's defaults rather than resetting them. Each engine-gated
-    /// / non-goal field that is *set to a non-default value* is logged at `warn` so a headless operator
-    /// can see it was parsed but not applied (honest omission — never a silent drop).
+    /// A field left unset in the config (`None`) does NOT touch the corresponding pref, so the config
+    /// layers on top of the daemon's defaults rather than resetting them. "Unset" means ABSENT, not
+    /// empty: an explicit `"AdvertiseRoutes": []` is a value, and applying it withdraws every
+    /// advertised route (Go's `if c.AdvertiseRoutes != nil` guard — see the field's docs). Each
+    /// engine-gated / non-goal field that is *set to a non-default value* is logged at `warn` so a
+    /// headless operator can see it was parsed but not applied (honest omission — never a silent
+    /// drop).
     ///
     /// `AuthKey` resolution: a bare value is returned as-is; a `file:<path>` value is read from that
     /// file (trimmed) — Go's convention for keeping the secret out of the (often world-readable)
@@ -491,7 +500,8 @@ impl Config {
         // exit node whose clients leak their IPv6 traffic out of their own link. That last rule is
         // asked of the routes this config COMPOSES with `AdvertiseExitNode` — the two are one field in
         // Go and two prefs here — and of the set that will actually be persisted, so a config that
-        // names no routes is judged on the prefs it leaves in place.
+        // does not mention routes at all is judged on the prefs it leaves in place, while one that
+        // names an explicit `[]` is judged on the empty set it is about to write.
         //
         // Go's own config loader checks only the masking rule (`ipn/conf.go` `ToPrefs`); the set-level
         // rules live in its CLI path. They are applied here as well because a declaratively-managed
@@ -501,22 +511,25 @@ impl Config {
         // paths refuse the same configs. Every offender is collected (Go `errors.Join`) rather than
         // only the first: a headless deploy should learn about all its bad routes in one boot, not one
         // per restart.
-        let prospective_routes = if c.advertise_routes.is_empty() {
-            prefs.advertise_routes.clone()
-        } else {
-            c.advertise_routes.clone()
+        let prospective_routes = match &c.advertise_routes {
+            // Present, even as an explicit `[]`: this list REPLACES the persisted one, so it is the
+            // list to judge — an empty one withdraws every route, which is a legal outcome.
+            Some(routes) => routes.clone(),
+            // Absent: the config says nothing about routes, so the prefs already on disk are what
+            // will be advertised, and they are what the pairing rule is asked about.
+            None => prefs.advertise_routes.clone(),
         };
         let prospective_advertise_exit = c.advertise_exit_node.unwrap_or(prefs.advertise_exit_node);
-        if let Err(errs) =
-            crate::routes::calc_advertise_routes(&prospective_routes, prospective_advertise_exit)
-        {
-            bail!(
-                "{}",
-                errs.iter()
-                    .map(|e| format!("config: {e}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            );
+        // Wrapped ONCE, in Go's words. Go's `ToPrefs` returns `errors.Join` of the bare route
+        // errors and its two callers (`initPrefsFromConfig`, `setConfigLocked`) put
+        // `error parsing config to prefs: %w` around the whole join. Prefixing every line with
+        // "config: " instead said the same thing once per bad route and in nobody's wording; the
+        // wrapper goes on the front of the joined block, so the lines below it are Go's verbatim.
+        if let Err(e) = crate::routes::validate_advertise_routes(
+            &prospective_routes,
+            prospective_advertise_exit,
+        ) {
+            bail!("error parsing config to prefs: {e}");
         }
         if let Some(exit) = &c.exit_node {
             // The engine's `ExitNodeSelector::FromStr` is infallible (a non-IP string → a Name that
@@ -560,8 +573,11 @@ impl Config {
         if let Some(exit) = &c.exit_node {
             prefs.exit_node = Some(exit.clone());
         }
-        if !c.advertise_routes.is_empty() {
-            prefs.advertise_routes = c.advertise_routes.clone();
+        // Go: `if c.AdvertiseRoutes != nil { mp.AdvertiseRoutes = c.AdvertiseRoutes;
+        // mp.AdvertiseRoutesSet = true }`. PRESENCE of the key is the switch, not non-emptiness —
+        // `"AdvertiseRoutes": []` is present, and withdraws everything this node advertised.
+        if let Some(routes) = &c.advertise_routes {
+            prefs.advertise_routes = routes.clone();
         }
         if let Some(v) = c.shields_up {
             prefs.shields_up = v;
@@ -879,6 +895,83 @@ mod tests {
     }
 
     #[test]
+    fn explicit_empty_advertise_routes_withdraws_them() {
+        // Go guards the whole block with `if c.AdvertiseRoutes != nil`, and JSON `[]` decodes to a
+        // NON-nil empty slice: it sets `AdvertiseRoutes` to empty with `AdvertiseRoutesSet = true`,
+        // withdrawing every route this node advertised. Reading the field as a bare `Vec` made an
+        // explicit `[]` indistinguishable from an absent key, so a declaratively managed subnet
+        // router could not be told to stop advertising by editing its config — the routes it had
+        // already published stayed published, and only the operator's intent changed.
+        let c = cfg(r#"{"version":"alpha0","AdvertiseRoutes":[]}"#);
+        let mut p = Prefs {
+            advertise_routes: vec!["192.0.2.0/24".to_string(), "198.51.100.0/24".to_string()],
+            ..Prefs::default()
+        };
+        c.apply_to_prefs(&mut p).unwrap();
+        assert!(
+            p.advertise_routes.is_empty(),
+            "an explicit [] withdraws every advertised route, got {:?}",
+            p.advertise_routes
+        );
+
+        // Withdrawing the subnet routes of a node that also advertises itself as an exit node is
+        // still legal — the exit-node intent lives in its own pref here, and the composed set is
+        // both default routes, so the pairing rule is satisfied.
+        let mut p_exit = Prefs {
+            advertise_routes: vec!["192.0.2.0/24".to_string()],
+            advertise_exit_node: true,
+            ..Prefs::default()
+        };
+        c.apply_to_prefs(&mut p_exit).unwrap();
+        assert!(p_exit.advertise_routes.is_empty());
+        assert!(p_exit.advertise_exit_node);
+
+        // Go's nil is spelled two ways in JSON — an absent key and an explicit `null` — and neither
+        // touches the pref. That is the layering contract the rest of this module keeps.
+        for json in [
+            r#"{"version":"alpha0","AdvertiseRoutes":null}"#,
+            r#"{"version":"alpha0"}"#,
+        ] {
+            let mut p2 = Prefs {
+                advertise_routes: vec!["192.0.2.0/24".to_string()],
+                ..Prefs::default()
+            };
+            cfg(json).apply_to_prefs(&mut p2).unwrap();
+            assert_eq!(
+                p2.advertise_routes,
+                vec!["192.0.2.0/24".to_string()],
+                "{json} must leave the persisted routes alone"
+            );
+        }
+    }
+
+    #[test]
+    fn route_refusals_are_wrapped_once_and_name_the_parsed_prefix() {
+        // Two message-shape rules in one refusal. (1) Go's `ToPrefs` returns `errors.Join` of the
+        // bare route errors and its callers (`initPrefsFromConfig`, `setConfigLocked`) wrap that
+        // join ONCE as `error parsing config to prefs: %w` — not once per line. (2) Go's `%s`
+        // formats the `netip.Prefix` it parsed, so a route typed long-hand and in upper case is
+        // named back canonically; the "expected" half is canonical either way, so echoing the raw
+        // string put the two halves of one sentence in two different notations.
+        let c = cfg(r#"{"version":"alpha0","AdvertiseRoutes":
+                ["2001:0DB8:0000::1/64","192.0.2.5/24"]}"#);
+        let mut p = Prefs::default();
+        let e = match c.apply_to_prefs(&mut p) {
+            Ok(_) => panic!("routes with host bits set must be refused"),
+            Err(e) => e.to_string(),
+        };
+        let lines: Vec<&str> = e.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                "error parsing config to prefs: route 2001:db8::1/64 has non-address bits set; \
+                 expected 2001:db8::/64",
+                "route 192.0.2.5/24 has non-address bits set; expected 192.0.2.0/24",
+            ]
+        );
+    }
+
+    #[test]
     fn apply_refuses_a_default_route_advertised_in_one_family_only() {
         // The half-exit-node leak, from the path that most needs catching it: a declaratively managed
         // subnet router boots with nobody reading command output. `0.0.0.0/0` alone takes its clients'
@@ -892,7 +985,8 @@ mod tests {
         };
         assert_eq!(
             e,
-            "config: 0.0.0.0/0 advertised without its IPv6 counterpart, please also advertise ::/0"
+            "error parsing config to prefs: 0.0.0.0/0 advertised without its IPv6 counterpart, \
+             please also advertise ::/0"
         );
         // All-or-nothing: the good route in the same list was not written either.
         assert_eq!(p.advertise_routes, before.advertise_routes);
@@ -907,7 +1001,8 @@ mod tests {
         };
         assert_eq!(
             e6,
-            "config: ::/0 advertised without its IPv4 counterpart, please also advertise 0.0.0.0/0"
+            "error parsing config to prefs: ::/0 advertised without its IPv4 counterpart, please \
+             also advertise 0.0.0.0/0"
         );
     }
 
@@ -956,7 +1051,8 @@ mod tests {
         };
         assert_eq!(
             e,
-            "config: fd7a:115c:a1e0:b1a::/64 4-in-6 prefix must be at least a /96"
+            "error parsing config to prefs: fd7a:115c:a1e0:b1a::/64 4-in-6 prefix must be at least \
+             a /96"
         );
         assert!(p.advertise_routes.is_empty());
 
