@@ -15,8 +15,8 @@
 //! one request out of the CGI/1.1 environment, writes the response to stdout and exits. That makes
 //! it testable end-to-end here without any daemon at all — the 404 route never reaches one, and an
 //! unreachable socket is exactly the 500 route. The unit tests in `src/bin/tnet.rs` cover the pure
-//! pieces (routing, the environment precedence, the origin grammar); this file checks that the real
-//! binary wires them together.
+//! pieces (routing, the environment precedence, the URL the listener reports); this file checks
+//! that the real binary wires them together.
 //!
 //! One step of Go's `runWeb` comes BEFORE the CGI branch (`cmd/tailscale/cli/web.go` @
 //! bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8, v1.102.4): unless `--readonly` is given or the daemon's
@@ -332,17 +332,17 @@ impl Drop for KillOnDrop {
     }
 }
 
-#[test]
-fn origin_does_not_change_the_url_the_listener_prints() {
-    // Go's startup line is `web server running on: urlOfListenAddr(webArgs.listen)`; `--origin`
-    // reaches only `csrfProtect`. So the printed (and browser-opened) URL is the listener's own,
-    // whatever origin is given. Binding a loopback port sends nothing, and the line is printed
-    // before any connection is accepted, so this never waits on the network.
-    //
-    // `--readonly` for the same reason [`cgi_request`] passes it: it is what skips Go's pre-serve
-    // step of turning the daemon's web client pref on, which against this unreachable socket would
-    // fail the command before it ever bound a listener. The URL under test is unaffected by it.
-    use std::io::BufRead as _;
+/// Run `tnet web --origin <origin>` on an ephemeral loopback port and return the startup line it
+/// prints. The child is killed when the returned value's scope ends, so a failed assertion cannot
+/// leak a listener.
+///
+/// Binding a loopback port sends nothing, and the line is printed before any connection is
+/// accepted, so this never waits on the network.
+///
+/// `--readonly` for the same reason [`cgi_request`] passes it: it is what skips Go's pre-serve
+/// step of turning the daemon's web client pref on, which against this unreachable socket would
+/// fail the command before it ever bound a listener. The URL under test is unaffected by it.
+fn startup_line_with_origin(origin: &str) -> String {
     let child = Command::new(env!("CARGO_BIN_EXE_tnet"))
         .args([
             "--socket",
@@ -355,7 +355,7 @@ fn origin_does_not_change_the_url_the_listener_prints() {
             "--prefix",
             "/tailscale",
             "--origin",
-            "https://ts.example.com/outside",
+            origin,
         ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -366,19 +366,75 @@ fn origin_does_not_change_the_url_the_listener_prints() {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut line = String::new();
-        let _ = std::io::BufReader::new(stdout).read_line(&mut line);
+        let _ = BufReader::new(stdout).read_line(&mut line);
         let _ = tx.send(line);
     });
-    let line = rx
-        .recv_timeout(std::time::Duration::from_secs(30))
-        .expect("`tnet web` should print its startup line once it has bound");
+    rx.recv_timeout(std::time::Duration::from_secs(30))
+        .expect("`tnet web` should print its startup line once it has bound")
+}
+
+#[test]
+fn origin_does_not_change_the_url_the_listener_prints() {
+    // Go's startup line is `web server running on: urlOfListenAddr(webArgs.listen)`; `--origin`
+    // reaches only `csrfProtect`. So the printed (and browser-opened) URL is the listener's own,
+    // whatever origin is given — and in every shape Go takes, not only the one that already looks
+    // like a URL. `example.net` and `192.0.2.10:8088` are the shapes Go's own tests pass, and they
+    // are exactly the ones a URL built from the origin has to invent a scheme for. There is nothing
+    // here to invent one for: `urlOfListenAddr` only ever formats the listen address.
+    for origin in [
+        "https://ts.example.com/outside",
+        "ts.example.com",
+        "ts.example.com:9999",
+    ] {
+        let line = startup_line_with_origin(origin);
+        assert!(
+            line.contains("http://127.0.0.1:") && line.contains("/tailscale"),
+            "the printed URL is the bound address plus the served path; got: {line:?}"
+        );
+        assert!(
+            !line.contains("ts.example.com") && !line.contains("/outside"),
+            "`--origin {origin}` must not replace the URL the listener prints; got: {line:?}"
+        );
+    }
+}
+
+#[test]
+fn origin_does_not_reach_the_page_that_is_served() {
+    // The other half of the same divergence: the page itself, not just the startup line. Nothing in
+    // Go's UI renders `OriginOverride` — `csrfProtect` is its only reader — so the bytes served
+    // with an origin must be the bytes served without one.
+    //
+    // The CGI route is the one a reverse proxy actually invokes, which is the case `--origin`
+    // exists for. It needs a daemon because only the 200 page is rendered at all; the 404 body is a
+    // constant and could not carry an origin either way. The stub's web client pref is already on,
+    // so Go's pre-serve step is a no-op and stderr stays empty.
+    let daemon = StubDaemon::start(true);
+    let socket = daemon
+        .socket
+        .to_str()
+        .expect("the stub socket path is UTF-8");
+    let page = |extra: &[&str]| {
+        let mut args = vec!["--socket", socket, "web", "--cgi"];
+        args.extend_from_slice(extra);
+        let out = tnet(&args, &[("REQUEST_METHOD", "GET"), ("REQUEST_URI", "/")]);
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.status.code(), Some(0), "{extra:?}; stderr: {stderr}");
+        let stdout = String::from_utf8(out.stdout).expect("the served page is UTF-8");
+        assert!(
+            stdout.starts_with("Status: 200 OK\r\n"),
+            "{extra:?} should render the status page; got: {stdout}"
+        );
+        stdout
+    };
+    let with_origin = page(&["--origin=https://ts.example.com/outside"]);
     assert!(
-        line.contains("http://127.0.0.1:") && line.contains("/tailscale"),
-        "the printed URL is the bound address plus the served path; got: {line:?}"
+        !with_origin.contains("ts.example.com") && !with_origin.contains("rel=\"canonical\""),
+        "`--origin` must not state a URL on the page; got: {with_origin}"
     );
-    assert!(
-        !line.contains("ts.example.com") && !line.contains("/outside"),
-        "`--origin` must not replace the URL the listener prints; got: {line:?}"
+    assert_eq!(
+        with_origin,
+        page(&[]),
+        "`--origin` has no effect on what is served, so the two responses are identical"
     );
 }
 
