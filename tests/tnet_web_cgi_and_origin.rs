@@ -29,6 +29,11 @@
 //! [`cgi_request`] passes; the tests at the bottom pin the step itself, against no daemon and
 //! against a stub one.
 //!
+//! That step has one undo and only one: Go's interrupt goroutine. A listener that cannot bind
+//! returns the error with the pref left on, because Go's `setRunWebClient(false)` sits in that
+//! goroutine and a failed `http.ListenAndServe` returns past it. The last test pins that, so a
+//! tidier-looking undo cannot be added without it being a deliberate break with Go.
+//!
 //! The flag surface is read by running the built `tnet` and parsing `--help` — clap's own parser,
 //! not a second copy of the flag list — the way `tests/tnet_up_go_flag_spellings.rs` does.
 
@@ -400,4 +405,33 @@ fn cgi_is_silent_when_the_web_client_is_already_on_or_readonly_is_given() {
             "{args:?} (pref on: {webclient}) must not edit the pref"
         );
     }
+}
+
+#[test]
+fn a_failed_listener_leaves_the_web_client_pref_on_as_go_does() {
+    let daemon = StubDaemon::start(false);
+    // A listen address no host can bind: the port is out of range, so it fails while being parsed.
+    // (An address that merely looks unbindable could be bindable on some test host, and this test
+    // would then serve until it was killed.)
+    let out = daemon.tnet(&["web", "--listen", "127.0.0.1:99999"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a listener that cannot bind fails the command; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("serving web UI on 127.0.0.1:99999"),
+        "the bind failure is what the command reports; got: {stderr}"
+    );
+    // The pref this run turned on stays on. Go's `setRunWebClient(false)` runs only from the
+    // goroutine watching for an interrupt; a serving failure returns past it.
+    assert_eq!(
+        daemon.webclient_sets(),
+        vec![Some(true)],
+        "a failed listener must not edit the pref a second time"
+    );
+    assert!(
+        !stderr.contains("stopping tailscaled web client"),
+        "that line belongs to the interrupt path only; got: {stderr}"
+    );
 }

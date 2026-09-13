@@ -12430,6 +12430,16 @@ async fn run_web(
         return serve.await;
     }
     // Go shuts down the web client it started when the CLI is interrupted, then exits 0.
+    //
+    // Interruption is the ONLY path that turns the pref back off. A serving failure — the bind
+    // that finds the port taken — returns the error with the pref left on, which is what Go does
+    // too: its `setRunWebClient(false)` lives in the goroutine parked on `signal.NotifyContext`'s
+    // context, and a failed `http.ListenAndServe` returns straight out of `runWeb` past it. Go's
+    // `defer cancel()` does wake that goroutine on the way out, but it races the error's own trip
+    // to `os.Exit(1)` and loses it (an IPC `EditPrefs` against two stack frames); and on the rare
+    // run where it won, it would `os.Exit(0)` and swallow the failure. Turning the pref off here
+    // would deterministically pick half of a race Go never meant to have, so a failed `web` leaves
+    // the pref as Go leaves it: on, for `tnet set --webclient=false` to clear.
     tokio::select! {
         served = serve => served,
         _ = tokio::signal::ctrl_c() => {
