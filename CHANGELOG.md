@@ -25,6 +25,20 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.62.2](https://github.com/GeiserX/tailscaled-rs/compare/v0.62.1...v0.62.2) (2026-09-13)
+
+
+### Bug Fixes
+
+* **conffile:** let an explicit empty AdvertiseRoutes withdraw the routes ([#469](https://github.com/GeiserX/tailscaled-rs/issues/469)) ([07014b1](https://github.com/GeiserX/tailscaled-rs/commit/07014b168464458b4c056eb7a37fbb00d6bfcc8e))
+* **configure:** word kubeconfig write failures the way Go words them ([#479](https://github.com/GeiserX/tailscaled-rs/issues/479)) ([8b73c68](https://github.com/GeiserX/tailscaled-rs/commit/8b73c685c4a3935b1a131cb8903b0cb5837ec890))
+* **ip:** fail on an addressless target the way tailscale ip does ([#466](https://github.com/GeiserX/tailscaled-rs/issues/466)) ([154955d](https://github.com/GeiserX/tailscaled-rs/commit/154955db594d47ce220e256b13174a40f795db24))
+* **ip:** resolve `tnet ip <name>` the way `tailscale ip` resolves it ([#468](https://github.com/GeiserX/tailscaled-rs/issues/468)) ([ec78e84](https://github.com/GeiserX/tailscaled-rs/commit/ec78e847b50cefe5bd3cbc953cf24b275bf56770))
+* **serve:** make a refused serve command line answer the way Go's does ([#476](https://github.com/GeiserX/tailscaled-rs/issues/476)) ([66b8f8c](https://github.com/GeiserX/tailscaled-rs/commit/66b8f8c2508ad6128340da1460c7054e21908e85))
+* **switch:** refuse an unknown target with Go's bare No profile named ([#471](https://github.com/GeiserX/tailscaled-rs/issues/471)) ([16207c1](https://github.com/GeiserX/tailscaled-rs/commit/16207c1205576a10e81ccab4e89c139dc0b7378f))
+* **web:** start the tailscaled web client before serving, as Go does ([#472](https://github.com/GeiserX/tailscaled-rs/issues/472)) ([965f73f](https://github.com/GeiserX/tailscaled-rs/commit/965f73fbf4591c84529466ec844c728f037be476))
+* **web:** take --origin unvalidated and keep it out of the printed URL ([#475](https://github.com/GeiserX/tailscaled-rs/issues/475)) ([9340f88](https://github.com/GeiserX/tailscaled-rs/commit/9340f884ce16af5e8fb84e029fda2d8246c40421))
+
 ## [0.62.1](https://github.com/GeiserX/tailscaled-rs/compare/v0.62.0...v0.62.1) (2026-09-13)
 
 
