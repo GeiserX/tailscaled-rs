@@ -11202,6 +11202,7 @@ async fn watch_status(socket: &std::path::Path, json: bool, filter: StatusFilter
         initial_netmap: false,
         prefs: false,
         policy: false,
+        suggested_exit_node: false,
     })?;
     line.push(b'\n');
     write_half.write_all(&line).await?;
@@ -11261,9 +11262,9 @@ async fn watch_status(socket: &std::path::Path, json: bool, filter: StatusFilter
 
 /// `debug watch-ipn` (Go `tailscale debug watch-ipn-bus`): stream the daemon's IPN notification bus,
 /// printing one JSON [`NotifyView`](tailscaled_rs::localapi::NotifyView) per line. Sends the **masked**
-/// `watch` request with every mask bit set (`initial_state`, `initial_netmap`, `prefs`, `policy`) so
-/// the first frames are the current state + peer set + prefs + effective policy, and each later frame
-/// carries only what changed. Reuses `watch_status`'s
+/// `watch` request with every mask bit set (`initial_state`, `initial_netmap`, `prefs`, `policy`,
+/// `suggested_exit_node`) so the first frames are the current state + peer set + prefs + effective
+/// policy + exit-node suggestion, and each later frame carries only what changed. Reuses `watch_status`'s
 /// streaming-read shape — connect, write the one request line, then read [`Response`] lines until the
 /// daemon closes the stream — but on the Notify path: `Notify` frames print as JSON, an `Error` frame
 /// exits non-zero, and any other reply (impossible on this connection) is noted and skipped.
@@ -11274,14 +11275,16 @@ async fn run_debug_watch_ipn(socket: &std::path::Path) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
 
     // The MASKED watch: all snapshots requested → the daemon streams `Response::Notify` frames (not
-    // `Response::Status`), front-loading the current state + peer set + prefs + effective policy, then
-    // streaming each change (a fresh prefs frame on every up/set/logout/switch/reload-config, and a
-    // fresh policy snapshot on every `syspolicy reload`).
+    // `Response::Status`), front-loading the current state + peer set + prefs + effective policy +
+    // exit-node suggestion, then streaming each change (a fresh prefs frame on every
+    // up/set/logout/switch/reload-config, a fresh policy snapshot on every `syspolicy reload`, and the
+    // exit-node suggestion whenever a computed one differs from the last published).
     let mut line = serde_json::to_vec(&Request::Watch {
         initial_state: true,
         initial_netmap: true,
         prefs: true,
         policy: true,
+        suggested_exit_node: true,
     })?;
     line.push(b'\n');
     write_half.write_all(&line).await?;
