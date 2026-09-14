@@ -2509,30 +2509,96 @@ fn risk_accepted(accepted: &str, risk: &str) -> bool {
 /// after a refused risk — and the only part of the exchange that says the node was not touched.
 const RISK_ABORTED: &str = "aborted, no changes made";
 
-/// Go's `presentRiskToUser` (`cmd/tailscale/cli/risks.go`) for a risk the caller has already found
-/// unaccepted: write the risk message and the escape hatch, then hand back Go's `errAborted` for the
-/// caller to `return` (so it reaches the operator on stderr, through the same path as every other
-/// command error).
+/// Go's `prompt.YesNo` (`util/prompt/prompt.go`): ask `msg` and read a yes/no answer — but only when
+/// `interactive`, which the caller sets to Go's `isatty(Stdin) && isatty(Stdout)`. Otherwise it is a
+/// script, and Go returns `dflt` without writing or reading anything.
 ///
-/// Faithful in three ways that are easy to get wrong:
+/// On a terminal it prints `msg` with `[Y/n]` or `[y/N]` (the capital is the default), reads one line,
+/// and lowercases the first word of it the way `fmt.Scanln(&resp)` + `strings.ToLower` do: `y`, `yes`
+/// and `sure` are yes, an empty answer (or EOF, or a read error — Go ignores `Scanln`'s error) is
+/// `dflt`, and anything else is no.
+fn prompt_yes_no(
+    msg: &str,
+    dflt: bool,
+    interactive: bool,
+    input: &mut impl std::io::BufRead,
+    output: &mut impl std::io::Write,
+) -> bool {
+    if !interactive {
+        return dflt;
+    }
+    let choices = if dflt { "[Y/n]" } else { "[y/N]" };
+    let _ = write!(output, "{msg} {choices} ");
+    // `fmt.Print` is unbuffered; flush so the question is on screen before the read blocks.
+    let _ = output.flush();
+    let mut line = String::new();
+    let _ = input.read_line(&mut line);
+    match line
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_lowercase()
+        .as_str()
+    {
+        "y" | "yes" | "sure" => true,
+        "" => dflt,
+        _ => false,
+    }
+}
+
+/// Go's `presentRiskToUser` (`cmd/tailscale/cli/risks.go`) for a risk the caller has already found
+/// unaccepted: write the risk message and the escape hatch, then ask `Continue?` with a `false`
+/// default. `Ok(())` means the operator said yes at a terminal and the command goes ahead, as in Go.
+/// `Err` carries Go's `errAborted` text. The caller prints it bare on stderr and exits 1, because
+/// that is what Go's `main` does (`fmt.Fprintln(os.Stderr, err)`). Returning it through `main`'s
+/// `Result` would add an `Error: ` prefix.
+///
+/// Faithful in four ways that are easy to get wrong:
 /// - **Stream.** Go's `outln(riskMessage)` and `printf("To skip this warning, use --accept-risk=%s\n",
 ///   riskType)` both write to `Stdout`. The warning is the command's *output*, not a diagnostic.
 /// - **Wording.** `To skip this warning, use --accept-risk=<risk>` is Go's sentence, verbatim; the
 ///   operator can paste it out of the terminal and it names the risk that fired.
+/// - **The prompt.** `prompt.YesNo("Continue?", false)` ([`prompt_yes_no`]) only asks when stdin
+///   AND stdout are both terminals. A script, a CI job or a pipe gets the `false` default without
+///   a read, so it still aborts and never hangs waiting for an answer.
 /// - **The abort error.** Go's decline path returns `errAborted`; without it a refusal ends with the
 ///   warning as its last word and nothing that states the outcome.
 ///
-/// What is NOT ported is the prompt: Go follows the two lines with `prompt.YesNo("Continue?", false)`.
-/// That helper returns its `false` default whenever stdin and stdout are not BOTH terminals, so on any
-/// non-interactive run — a script, a CI job, a pipe — Go itself takes exactly this path and aborts.
-/// This CLI has no TTY-prompt path, so it always takes it: fail-closed, and never more permissive than
-/// upstream. Callers keep Go's acceptance check (`isRiskAccepted`, here [`risk_accepted`]) themselves,
-/// because they fold it into a wider gate — `down`'s [`down_ssh_refusal`] also has to be over a
-/// Tailscale SSH session before a risk exists at all.
-fn present_risk_to_user(risk_type: &str, risk_message: &str) -> anyhow::Error {
-    println!("{risk_message}");
-    println!("To skip this warning, use --accept-risk={risk_type}");
-    anyhow::anyhow!(RISK_ABORTED)
+/// Callers keep Go's acceptance check (`isRiskAccepted`, here [`risk_accepted`]) themselves, because
+/// they fold it into a wider gate. For `down`, [`down_ssh_refusal`] also requires a Tailscale SSH
+/// session before a risk exists at all.
+fn present_risk_to_user(
+    risk_type: &str,
+    risk_message: &str,
+    interactive: bool,
+    input: &mut impl std::io::BufRead,
+    output: &mut impl std::io::Write,
+) -> Result<(), &'static str> {
+    let _ = writeln!(output, "{risk_message}");
+    let _ = writeln!(
+        output,
+        "To skip this warning, use --accept-risk={risk_type}"
+    );
+    if prompt_yes_no("Continue?", false, interactive, input, output) {
+        return Ok(());
+    }
+    Err(RISK_ABORTED)
+}
+
+/// [`present_risk_to_user`] on the real stdin and stdout, with Go's `isatty` test on both.
+fn present_risk_to_user_on_terminal(
+    risk_type: &str,
+    risk_message: &str,
+) -> Result<(), &'static str> {
+    use std::io::IsTerminal as _;
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    present_risk_to_user(
+        risk_type,
+        risk_message,
+        interactive,
+        &mut std::io::stdin().lock(),
+        &mut std::io::stdout().lock(),
+    )
 }
 
 /// The pure decision behind the SSH-server-toggle `lose-ssh` risk — the Rust analogue of Go's
@@ -3400,11 +3466,11 @@ const DOWN_LOSE_SSH_RISK: &str = "You are connected over Tailscale; this action 
 /// 1. **Leftover arguments** — `down` takes none; [`down_positional_refusal`] carries Go's message.
 /// 2. **The `lose-ssh` risk** — refuse over a Tailscale SSH session unless `--accept-risk=lose-ssh`
 ///    (or `all`). Decided entirely CLI-side from `$SSH_CLIENT`, like Go's `isSSHOverTailscale`, and
-///    before anything reaches the daemon. [`present_risk_to_user`] then renders it exactly as Go
-///    does on a declined risk: warning + `To skip this warning, use --accept-risk=lose-ssh` on
-///    stdout, and Go's `errAborted` (`aborted, no changes made`) as the command's error. Go would
-///    prompt first on a terminal; this CLI has no TTY-prompt path and so always takes Go's own
-///    non-interactive answer, which is to abort.
+///    before anything reaches the daemon. [`present_risk_to_user`] then does what Go does: the
+///    warning and `To skip this warning, use --accept-risk=lose-ssh` go to stdout, then `Continue?
+///    [y/N]` is asked if stdin and stdout are both terminals. A yes lets `down` go ahead. Anything
+///    else, or no terminal, prints Go's `errAborted` (`aborted, no changes made`) bare on stderr
+///    and exits 1.
 /// 3. **Already stopped** — one read-only `status` round-trip; if the node is `Stopped`, say so on
 ///    stderr and exit 0 without a redundant edit (Go's `warnf` + `return nil`).
 /// 4. **The edit** — `Request::Down`, carrying `--reason` for the daemon to record (Go attaches it
@@ -3420,9 +3486,13 @@ async fn run_down(
         anyhow::bail!(message);
     }
     if down_ssh_refusal(is_ssh_over_tailscale(), accept_risk.unwrap_or("")) {
-        // Go: `presentRiskToUser(riskLoseSSH, <message>, downArgs.acceptedRisks)` — warning and hint
-        // on stdout, then `errAborted` returned as the command's error. See [`present_risk_to_user`].
-        return Err(present_risk_to_user("lose-ssh", DOWN_LOSE_SSH_RISK));
+        // Go: `presentRiskToUser(riskLoseSSH, <message>, downArgs.acceptedRisks)`. See
+        // [`present_risk_to_user`]. Go's `main` prints the returned `errAborted` bare, so it is
+        // printed here rather than returned; returning it would add an `Error: ` prefix.
+        if let Err(aborted) = present_risk_to_user_on_terminal("lose-ssh", DOWN_LOSE_SSH_RISK) {
+            eprintln!("{aborted}");
+            std::process::exit(1);
+        }
     }
     // Go's `localClient.Status(ctx)` pre-check. A transport failure is Go's `error fetching current
     // status` — surfaced here with the same "talking to daemon" context every other verb uses, so a
@@ -15506,14 +15576,79 @@ mod tests {
         // Go `presentRiskToUser`: the decline path returns `errAborted`, and upstream `main` prints
         // the returned error before exiting 1 — so `aborted, no changes made` is the sentence that
         // actually tells the operator nothing was changed. A refusal that only warns loses it.
-        let err = present_risk_to_user("lose-ssh", DOWN_LOSE_SSH_RISK);
-        assert_eq!(err.to_string(), "aborted, no changes made");
+        //
+        // Not a terminal (a script): Go's `prompt.YesNo` returns its `false` default without
+        // asking or reading, so the output is the two lines and nothing else.
+        let mut out = Vec::new();
+        let mut input = std::io::Cursor::new(b"y\n".to_vec());
+        let err = present_risk_to_user("lose-ssh", DOWN_LOSE_SSH_RISK, false, &mut input, &mut out)
+            .unwrap_err();
+        assert_eq!(err, "aborted, no changes made");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("{DOWN_LOSE_SSH_RISK}\nTo skip this warning, use --accept-risk=lose-ssh\n")
+        );
+        assert_eq!(
+            input.position(),
+            0,
+            "no terminal: the answer must not be read"
+        );
         // The message `down` hands it is Go's, verbatim: one sentence, single-spaced (the source
         // literal is written with a line continuation, which is easy to get wrong by a space).
         assert_eq!(
             DOWN_LOSE_SSH_RISK,
             "You are connected over Tailscale; this action will disable Tailscale and result in your session disconnecting."
         );
+    }
+
+    #[test]
+    fn a_risk_at_a_terminal_asks_gos_continue_prompt() {
+        // Go `presentRiskToUser` then `prompt.YesNo("Continue?", false)`: on a terminal the operator
+        // is asked, and a yes lets the command go ahead instead of forcing a re-run with
+        // `--accept-risk`.
+        let run = |answer: &str| {
+            let mut out = Vec::new();
+            let mut input = std::io::Cursor::new(answer.as_bytes().to_vec());
+            let result =
+                present_risk_to_user("lose-ssh", DOWN_LOSE_SSH_RISK, true, &mut input, &mut out);
+            (result, String::from_utf8(out).unwrap())
+        };
+        let (result, out) = run("y\n");
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            out,
+            format!(
+                "{DOWN_LOSE_SSH_RISK}\nTo skip this warning, use --accept-risk=lose-ssh\nContinue? [y/N] "
+            )
+        );
+        // Go's yes words, lowercased first; `fmt.Scanln` skips leading blanks and takes one word.
+        for yes in ["yes\n", "sure\n", "Y\n", "YES\n", "  y\n", "y extra\n", "y"] {
+            assert_eq!(run(yes).0, Ok(()), "{yes:?} is a yes in Go");
+        }
+        // The default is `false`: an empty line, EOF, or any other word aborts.
+        for no in ["\n", "", "n\n", "no\n", "yep\n", "continue\n"] {
+            assert_eq!(run(no).0, Err(RISK_ABORTED), "{no:?} must abort");
+        }
+    }
+
+    #[test]
+    fn go_yes_no_shows_its_default_and_skips_the_read_off_a_terminal() {
+        let ask = |dflt: bool, interactive: bool, answer: &str| {
+            let mut out = Vec::new();
+            let mut input = std::io::Cursor::new(answer.as_bytes().to_vec());
+            let yes = prompt_yes_no("Continue?", dflt, interactive, &mut input, &mut out);
+            (yes, String::from_utf8(out).unwrap(), input.position())
+        };
+        // The capital letter marks the default, and an empty answer takes it.
+        assert_eq!(ask(true, true, "\n"), (true, "Continue? [Y/n] ".into(), 1));
+        assert_eq!(
+            ask(false, true, "\n"),
+            (false, "Continue? [y/N] ".into(), 1)
+        );
+        assert!(!ask(true, true, "nope\n").0);
+        // Not a terminal: the default comes back with nothing written and nothing read.
+        assert_eq!(ask(true, false, "n\n"), (true, String::new(), 0));
+        assert_eq!(ask(false, false, "y\n"), (false, String::new(), 0));
     }
 
     #[test]
