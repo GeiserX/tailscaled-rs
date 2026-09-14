@@ -1680,11 +1680,12 @@ and the `clearing_the_nickname_blanks_the_name_and_cannot_restore_a_login_name` 
 
 **Why:** control-to-node ("c2n") is the mechanism by which an admin console *acts on* a node rather
 than merely reading about it, and a node built on this stack can answer exactly the two paths the
-engine hardcodes. Upstream registers around twenty handlers on it: `/echo`, `POST /logtail/flush`, `POST /sockstats`, the `/debug/*` family and
+engine hardcodes. Upstream registers twenty-three handlers on it: `/echo`, `POST /logtail/flush`, `POST /sockstats`, the `/debug/*` family and
 `POST /netfilter-kind` in `ipn/ipnlocal/c2n.go` itself, plus `GET`+`POST /update`
 (`feature/clientupdate/clientupdate.go`), `GET /posture/identity` (`feature/posture/posture.go`),
 `GET /appconnector/routes` (`feature/appconnectors/appconnectors.go`), `POST /wol`
-(`feature/wakeonlan/wakeonlan.go`), `GET /vip-services` (`ipn/ipnlocal/serve.go`),
+(`feature/wakeonlan/wakeonlan.go`), `/debug/tka/log` (`feature/tailnetlock/tailnetlock.go`),
+`GET /conn25/state` (`feature/conn25/conn25.go`), `GET /vip-services` (`ipn/ipnlocal/serve.go`),
 `GET /tls-cert-status` (`ipn/ipnlocal/cert.go`) and `/ssh/usernames` (`ssh/tailssh/tailssh.go`).
 
 The absence is already documented here three times, one symptom at a time, without the cause being
@@ -1791,9 +1792,18 @@ Two, and both turn a pref this daemon already carries into something with a wire
 - **`GET /posture/identity`** → `tailcfg.C2NPostureIdentityResponse` (`SerialNumbers`,
   `IfaceHardwareAddrs`, `PostureDisabled`). `Prefs::posture_checking` is persisted, threaded into
   `Config.posture_checking` and reported by `tnet get`, and means nothing on the wire because
-  nothing answers the pull. With the hook, the `false` case becomes a real `{"PostureDisabled":
-  true}` — Go's own answer for a node that opted out, sent because the operator opted out rather
-  than because the fork is silent. The `true` case additionally needs serial-number and MAC
+  nothing answers the pull. The pref is not the whole answer, though: Go reads the
+  `PostureChecking` syspolicy `PreferenceOption` on every request
+  (`GetPreferenceOption(pkey.PostureChecking, …)` in `handleC2NPostureIdentityGet`) and collects
+  only when `choice.ShouldEnable(prefs.PostureChecking())` — so `always` collects with the pref
+  off, `never` refuses with it on, and only `user-decides`, an unset policy or a failed policy read
+  leaves the pref to decide. Go does not fold that key into prefs (`preferencePolicies` in
+  `ipn/ipnlocal/local.go` has no posture row), and neither does `PREFERENCE_POLICIES` in
+  `src/ipn/syspolicy.rs`, which already registers `PostureChecking` as a `PreferenceOption` and
+  implements `ShouldEnable`; the handler has to consult the policy itself. With the hook, a
+  disabled outcome becomes a real `{"PostureDisabled": true}` — Go's own answer for a node that
+  opted out, or that policy opted out, sent because of that choice rather than because the fork is
+  silent. The enabled outcome additionally needs serial-number and MAC
   collection (Go's `posture.GetSerialNumbers` / `GetHardwareAddrs`, behind Go's `hwaddrs=true` query
   gate); that is local OS work on the daemon side and a separate piece, so the honest first shape
   reports what it can collect and omits what it cannot.
@@ -1802,9 +1812,11 @@ Two, and both turn a pref this daemon already carries into something with a wire
   advertisement that the console may act on this node, which nothing then honours. `Enabled` is that
   pref (Go: `envknob.AllowsRemoteUpdate() || upPref.Apply.EqualBool(true)`). `Supported` is
   `feature.CanAutoUpdate()` upstream and is honestly `false` here — `tnet update` is a manual,
-  operator-invoked command and there is no updater to trigger — so `POST /update` answers
-  `Err: "not supported"`, which is Go's own string for exactly that state in `handleC2NUpdatePost`,
-  not a fork invention. A node that advertises `AllowsUpdate` and then declines the trigger in
+  operator-invoked command and there is no updater to trigger. `POST /update` refuses in Go's
+  order (`handleC2NUpdatePost`): `Err: "not enabled"` while `Enabled` is false — every node whose
+  `auto_update_apply` is unset or `false` — and `Err: "not supported"` only once it is true. Both
+  are Go's own strings, not fork inventions, and the order is part of the port: checking
+  `Supported` first would give a node that never opted in the wrong reason. A node that advertises `AllowsUpdate` and then declines the trigger in
   upstream's words is strictly better than one that advertises it and never answers at all. Running
   an actual update from the trigger is its own piece of work.
 
@@ -1816,7 +1828,8 @@ several high-availability subnet routers is alive.
 
 The `/debug/*` family — `/debug/prefs`, `/debug/metrics`, `/debug/netmap`, `/debug/health`,
 `/debug/goroutines`, `/debug/component-logging`, `/debug/logheap`, `/debug/pprof/heap`,
-`/debug/pprof/allocs` — together with `POST /sockstats`, is a **remote read of daemon internals by
+`/debug/pprof/allocs`, and `/debug/tka/log` from `feature/tailnetlock/tailnetlock.go` — together
+with `POST /sockstats`, is a **remote read of daemon internals by
 the control plane**. This fork should not start answering it on the same day it gains the ability
 to, and the hook does not require it to.
 
@@ -1835,7 +1848,8 @@ paragraph, taken after the hook exists rather than bundled into it.
 The rest are declined for plainer reasons: `POST /logtail/flush` (no logtail client here),
 `POST /netfilter-kind` (no netfilter layer at all — ask #21, bead `tsd-m8s`),
 `GET /appconnector/routes` (the c2n half of ask #39, and blocked on the route learning that ask
-asks for), `POST /wol`, `/ssh/usernames` and `GET /tls-cert-status`.
+asks for), `GET /conn25/state` (no conn25 extension here, so no state to report), `POST /wol`,
+`/ssh/usernames` and `GET /tls-cert-status`.
 
 **Daemon impact once landed:** one `watch_c2n` task in the daemon's IPN layer with a method+path
 dispatch of its own, and the two handlers above, reading prefs the daemon already holds. The

@@ -27,6 +27,41 @@
 const ASKS: &str = include_str!("../docs/ENGINE_ASKS.md");
 const PREFS: &str = include_str!("../src/prefs.rs");
 const THREAT_MODEL: &str = include_str!("../docs/THREAT_MODEL.md");
+const SYSPOLICY: &str = include_str!("../src/ipn/syspolicy.rs");
+
+/// Every c2n handler upstream registers, exactly as its `RegisterC2N` call spells the pattern, at
+/// tailscale `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8` (v1.102.4). Found by
+/// `grep -rn 'RegisterC2N(' --include='*.go'` over that tree, tests excluded. The ask scopes the
+/// hook against this census, so a handler missing from it is a decision nobody took.
+const UPSTREAM_C2N_HANDLERS: &[&str] = &[
+    // ipn/ipnlocal/c2n.go
+    "/echo",
+    "POST /logtail/flush",
+    "POST /sockstats",
+    "/debug/pprof/heap",
+    "/debug/pprof/allocs",
+    "/debug/goroutines",
+    "/debug/prefs",
+    "/debug/metrics",
+    "/debug/component-logging",
+    "/debug/logheap",
+    "/debug/netmap",
+    "/debug/health",
+    "POST /netfilter-kind",
+    // ipn/ipnlocal/serve.go, ipn/ipnlocal/cert.go
+    "GET /vip-services",
+    "GET /tls-cert-status",
+    // ssh/tailssh/tailssh.go
+    "/ssh/usernames",
+    // feature/*
+    "GET /conn25/state",
+    "GET /posture/identity",
+    "GET /appconnector/routes",
+    "/debug/tka/log",
+    "POST /wol",
+    "GET /update",
+    "POST /update",
+];
 
 /// The ask, matched by its number so a retitle that keeps the ask intact still resolves.
 const ASK_HEADING_PREFIX: &str = "## 43.";
@@ -243,4 +278,87 @@ fn the_reduced_prefs_point_at_an_ask_that_covers_them() {
             );
         }
     }
+}
+
+/// The text of the answered-first bullet that opens with `lead`, up to the next bullet.
+fn answered_bullet(lead: &str) -> &'static str {
+    let answered = subsection(ANSWERED_HEADING);
+    let start = answered
+        .find(lead)
+        .unwrap_or_else(|| panic!("ask #43 should still carry a `{lead}` bullet"));
+    let body = &answered[start..];
+    match body[lead.len()..].find("\n- ") {
+        Some(end) => &body[..lead.len() + end],
+        None => body,
+    }
+}
+
+/// Every handler upstream registers is placed on one side of the line: answered first (or already
+/// answered by the engine), or declined with a reason. A handler the ask never names is neither
+/// promised nor refused, and whoever implements the hook has no ruling for it.
+#[test]
+fn every_upstream_c2n_handler_is_answered_or_declined() {
+    let answered = c2n_paths(subsection(ANSWERED_HEADING));
+    let declined = c2n_paths(subsection(DECLINED_HEADING));
+
+    let unplaced: Vec<&str> = UPSTREAM_C2N_HANDLERS
+        .iter()
+        .map(|pattern| pattern.split_once(' ').map_or(*pattern, |(_, path)| path))
+        .filter(|path| !answered.iter().chain(&declined).any(|p| p == path))
+        .collect();
+    assert!(
+        unplaced.is_empty(),
+        "ask #43 neither answers nor declines upstream's {unplaced:?} (registered with RegisterC2N \
+         at bbcd7d1); its census is incomplete"
+    );
+}
+
+/// Go's `handleC2NUpdatePost` refuses `not enabled` before it ever checks `Supported`, so a node
+/// that never opted in hears `not enabled`, and `not supported` is only the answer once it has.
+/// This fork's `Supported` is always false, so an ask that names only the second string would have
+/// every node answer it — the wrong reason for all of them that left the pref unset.
+#[test]
+fn post_update_refuses_not_enabled_before_not_supported() {
+    let bullet = answered_bullet("- **`GET /update` and `POST /update`**");
+
+    let not_enabled = bullet.find("\"not enabled\"").unwrap_or_else(|| {
+        panic!(
+            "the /update bullet must name Go's first refusal, `Err: \"not enabled\"`, which \
+             `handleC2NUpdatePost` returns while `Enabled` is false"
+        )
+    });
+    let not_supported = bullet
+        .find("\"not supported\"")
+        .expect("the /update bullet should still name `Err: \"not supported\"`");
+    assert!(
+        not_enabled < not_supported,
+        "the /update bullet should give Go's refusals in Go's order: `not enabled`, then \
+         `not supported`"
+    );
+}
+
+/// Go decides `PostureDisabled` from the `PostureChecking` syspolicy first and the pref second
+/// (`choice.ShouldEnable(prefs.PostureChecking())` in `feature/posture/posture.go`). An ask that
+/// ties the answer to `Prefs::posture_checking` alone would have a handler ignore an MDM `always`
+/// or `never`, though this daemon already registers the key.
+#[test]
+fn posture_disabled_honours_the_posture_checking_policy() {
+    let bullet = answered_bullet("- **`GET /posture/identity`**");
+    let spans = code_spans(bullet);
+
+    assert!(
+        spans.contains(&"PostureChecking"),
+        "the /posture/identity bullet must name the `PostureChecking` syspolicy that overrides \
+         `Prefs::posture_checking` in Go's handler"
+    );
+    assert!(
+        bullet.contains("ShouldEnable"),
+        "the /posture/identity bullet should say how the policy combines with the pref (Go's \
+         `ShouldEnable`), not just that a policy exists"
+    );
+    assert!(
+        SYSPOLICY.contains("def(\"PostureChecking\", ValueType::PreferenceOption)"),
+        "the ask says src/ipn/syspolicy.rs already registers `PostureChecking` as a \
+         `PreferenceOption`; that is no longer true"
+    );
 }
