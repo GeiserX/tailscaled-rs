@@ -238,6 +238,134 @@ async fn try_read_watch_status(
     }
 }
 
+/// Open a MASKED watch with `request_line` and return the open connection plus the first `count`
+/// frames, each read under a bounded timeout so a missing frame fails the test instead of hanging it.
+async fn open_masked_watch(
+    harness: &Harness,
+    request_line: &str,
+    count: usize,
+) -> (
+    tokio::net::unix::OwnedWriteHalf,
+    BufReader<tokio::net::unix::OwnedReadHalf>,
+    Vec<Response>,
+) {
+    let stream = UnixStream::connect(&harness.socket_path)
+        .await
+        .expect("CLI connect to LocalAPI socket for masked watch");
+    let (read_half, mut write_half) = stream.into_split();
+    write_half
+        .write_all(format!("{request_line}\n").as_bytes())
+        .await
+        .expect("write masked watch request");
+    write_half
+        .flush()
+        .await
+        .expect("flush masked watch request");
+    let mut reader = BufReader::new(read_half);
+    let mut frames = Vec::with_capacity(count);
+    for i in 0..count {
+        let frame = try_read_watch_status(&mut reader, Duration::from_secs(5))
+            .await
+            .unwrap_or_else(|| panic!("masked watch frame {i} never arrived for {request_line}"));
+        frames.push(frame);
+    }
+    (write_half, reader, frames)
+}
+
+/// `initial_status` (Go `NotifyInitialStatus`): a masked watch that sets only this bit takes the
+/// Notify path (not the legacy bare-watch status stream), and its first frame is a `NotifyView`
+/// whose `initial_status` is the very report a one-shot `status` returns — nothing else populated.
+#[tokio::test]
+async fn initial_status_watch_front_loads_the_status_report() {
+    let harness = Harness::start().await;
+
+    let expected = match harness.round_trip(r#"{"cmd":"status"}"#).await {
+        Response::Status(report) => report,
+        other => panic!("expected Response::Status, got {other:?}"),
+    };
+
+    let (_write, mut reader, frames) =
+        open_masked_watch(&harness, r#"{"cmd":"watch","initial_status":true}"#, 1).await;
+    match &frames[0] {
+        Response::Notify(view) => {
+            assert_eq!(
+                view.initial_status.as_deref(),
+                Some(&expected),
+                "the watch snapshot must be the same report `status` returns"
+            );
+            assert!(
+                view.state.is_none()
+                    && view.error.is_none()
+                    && view.browse_to_url.is_none()
+                    && view.net_map.is_none()
+                    && view.prefs.is_none()
+                    && view.policy.is_none(),
+                "the status frame carries only the snapshot, got {view:?}"
+            );
+        }
+        other => panic!("a masked watch must stream Notify frames, got {other:?}"),
+    }
+    // The snapshot is sent once: with nothing changing, no second frame follows.
+    assert!(
+        try_read_watch_status(&mut reader, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "the initial status must not be repeated"
+    );
+
+    harness.shutdown_and_verify().await;
+}
+
+/// The snapshot is the FIRST frame of the stream, ahead of the other daemon-built front-loads —
+/// Go's `NotifyInitialStatus` rides on the session's first Notify — and a watch that did not set
+/// the bit never receives one.
+#[tokio::test]
+async fn initial_status_is_first_and_only_sent_when_asked_for() {
+    let harness = Harness::start().await;
+
+    let (_write, _reader, frames) = open_masked_watch(
+        &harness,
+        r#"{"cmd":"watch","prefs":true,"policy":true,"initial_status":true}"#,
+        3,
+    )
+    .await;
+    let views: Vec<_> = frames
+        .into_iter()
+        .map(|f| match f {
+            Response::Notify(view) => view,
+            other => panic!("a masked watch must stream Notify frames, got {other:?}"),
+        })
+        .collect();
+    assert!(
+        views[0].initial_status.is_some(),
+        "the first frame must carry the initial status, got {:?}",
+        views[0]
+    );
+    assert!(
+        views[1].prefs.is_some() && views[2].policy.is_some(),
+        "prefs and policy front-loads follow the snapshot, got {views:?}"
+    );
+    assert!(
+        views[1..].iter().all(|v| v.initial_status.is_none()),
+        "only the first frame carries the snapshot"
+    );
+
+    // Without the bit: the same front-loads, and no snapshot anywhere.
+    let (_write, _reader, frames) =
+        open_masked_watch(&harness, r#"{"cmd":"watch","prefs":true,"policy":true}"#, 2).await;
+    for frame in frames {
+        match frame {
+            Response::Notify(view) => assert!(
+                view.initial_status.is_none(),
+                "a watch that did not ask for the snapshot must not get one, got {view:?}"
+            ),
+            other => panic!("a masked watch must stream Notify frames, got {other:?}"),
+        }
+    }
+
+    harness.shutdown_and_verify().await;
+}
+
 /// 1. status round-trip: a fresh, never-configured node reports an unauthenticated, not-running
 ///    snapshot, and the server shuts down cleanly (socket removed).
 #[tokio::test]

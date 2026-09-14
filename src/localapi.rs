@@ -111,6 +111,19 @@ pub enum Request {
         /// asked again".
         #[serde(default, skip_serializing_if = "core::ops::Not::not")]
         policy: bool,
+        /// Make the first [`Response::Notify`] frame carry a whole status snapshot in
+        /// [`NotifyView::initial_status`]. The analogue of Go's `ipn.NotifyInitialStatus` (`1 << 14`),
+        /// which fills `Notify.InitialStatus` so a watcher can build a continuous view of the node
+        /// from one connection instead of pairing a watch with a separate `status` request whose
+        /// ordering against the stream it cannot know.
+        ///
+        /// Like [`prefs`](Request::Watch::prefs) this is **daemon-built**, not an engine
+        /// `NotifyWatchOpt` bit: the snapshot is the daemon's own [`StatusReport`], peers included
+        /// (Go builds it with `WantPeers: true`). It is sent once per watch, never re-sent. See
+        /// [`NotifyView::initial_status`] for the ordering it does and does not guarantee. Same
+        /// `#[serde(default)]` + `skip_serializing_if` back-compat discipline as the other bits.
+        #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+        initial_status: bool,
     },
     /// Bring the node up (`WantRunning = true`), optionally (re)setting login/config fields.
     Up {
@@ -1535,7 +1548,7 @@ pub struct FileTargetReport {
 /// [`StatusReport::default`], so a JSON document missing any field (e.g. an older client's status
 /// line) deserializes instead of hard-erroring. Fields keep their `skip_serializing_if` so the
 /// emitted wire still drops empty optionals.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StatusReport {
     /// The IPN state name. One of the seven [`crate::ipn::State`] variants (the authoritative
@@ -2127,11 +2140,12 @@ pub struct ProfileEntry {
 /// The engine's [`Notify`](tailscale::Notify) (v0.39.0) has exactly three fields — `state`,
 /// `net_map`, `browse_to_url` — so this view fills exactly those (with `state`'s terminal-failure
 /// reason split out into [`error`](NotifyView::error), mirroring how [`StatusReport`] already
-/// separates `state` from `error`). Two further fields are **daemon-built**, sourced from state the
-/// engine does not hold at all: [`prefs`](NotifyView::prefs) (this fork's prefs are daemon-owned) and
-/// [`policy`](NotifyView::policy) (the system-policy registry lives in the daemon). Both are Go
-/// `Notify` fields — `Notify.Prefs` and `Notify.Policy` — so carrying them here is a port, not an
-/// invention; only the plumbing that feeds them differs.
+/// separates `state` from `error`). Three further fields are **daemon-built**, sourced from state the
+/// engine does not hold at all: [`prefs`](NotifyView::prefs) (this fork's prefs are daemon-owned),
+/// [`policy`](NotifyView::policy) (the system-policy registry lives in the daemon) and
+/// [`initial_status`](NotifyView::initial_status) (the daemon's own status snapshot). All three are Go
+/// `Notify` fields — `Notify.Prefs`, `Notify.Policy` and `Notify.InitialStatus` — so carrying them
+/// here is a port, not an invention; only the plumbing that feeds them differs.
 ///
 /// The richer Go `Notify` fields (`Health`, `PeerChangedPatch`, `Engine`, `FilesWaiting`,
 /// `SuggestedExitNode`, …) are intentionally **absent**: the fork's engine does not surface them on
@@ -2195,6 +2209,38 @@ pub struct NotifyView {
     /// this frame carried no policy change (or the `policy` bit was unset).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy: Option<PolicyReport>,
+    /// A whole status snapshot, sent once as the first frame of a watch that set the
+    /// `initial_status` bit (Go `Notify.InitialStatus`, gated by `ipn.NotifyInitialStatus`).
+    ///
+    /// It is the very [`StatusReport`] [`Response::Status`] carries, produced by the same
+    /// `Backend::status` call, so `watch` and `status` cannot drift. That includes the peer list: Go
+    /// builds its snapshot with `WantPeers: true`, and `Backend::status` lists peers whenever the node
+    /// is `Running` and its netmap answers within the status query timeout — the same condition
+    /// under which `tnet status` lists them.
+    ///
+    /// ## Ordering — what this build guarantees, and the window it does not close
+    ///
+    /// Go assembles the snapshot under the backend mutex in the same critical section that registers
+    /// the watcher, so no event can reach the watcher before its snapshot, and none can fall between
+    /// the two. This daemon has no single lock spanning its state and the engine's notification bus,
+    /// so it takes the snapshot **first**, before it subscribes to the engine bus:
+    ///
+    /// - **Guaranteed:** this frame is the first frame of the stream. No state, netmap, prefs or
+    ///   policy frame is written to this watcher before it.
+    /// - **Not guaranteed:** an engine change that lands after the snapshot is taken and before the
+    ///   bus subscription is made is not delivered as its own frame. The window is short (one lock
+    ///   handoff and one subscribe), and it is the same window every device epoch already has when a
+    ///   `down`/`up` replaces the engine and the watch re-subscribes. To close it, also set
+    ///   `initial_state` and `initial_netmap`: the subscription then re-sends the current state and
+    ///   peer set, so any change in the window arrives as a later frame that overrides the snapshot.
+    ///   Prefs and policy changes are not affected: those channels are subscribed before the
+    ///   snapshot is taken.
+    ///
+    /// DAEMON-built. `None` on every frame after the first, and on every frame of a watch that did
+    /// not set the bit. Boxed so a [`Response::Notify`] stays no larger than a [`Response::Status`];
+    /// serde encodes a `Box` exactly like its contents, so the wire is unaffected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_status: Option<Box<StatusReport>>,
 }
 
 /// A single peer entry in a [`StatusReport`].
@@ -2476,6 +2522,7 @@ mod tests {
                 initial_netmap: false,
                 prefs: false,
                 policy: false,
+                initial_status: false,
             })
             .unwrap(),
             r#"{"cmd":"watch"}"#
@@ -2487,6 +2534,7 @@ mod tests {
                 initial_netmap: false,
                 prefs: false,
                 policy: false,
+                initial_status: false,
             }
         ));
         // A masked watch round-trips its bits (the Notify-path selector): each `true` field appears on
@@ -2498,12 +2546,13 @@ mod tests {
                 initial_netmap: true,
                 prefs: true,
                 policy: true,
+                initial_status: true,
             })
             .unwrap(),
-            r#"{"cmd":"watch","initial_state":true,"initial_netmap":true,"prefs":true,"policy":true}"#
+            r#"{"cmd":"watch","initial_state":true,"initial_netmap":true,"prefs":true,"policy":true,"initial_status":true}"#
         );
         match serde_json::from_str::<Request>(
-            r#"{"cmd":"watch","initial_state":true,"initial_netmap":true,"prefs":true,"policy":true}"#,
+            r#"{"cmd":"watch","initial_state":true,"initial_netmap":true,"prefs":true,"policy":true,"initial_status":true}"#,
         )
         .unwrap()
         {
@@ -2512,8 +2561,9 @@ mod tests {
                 initial_netmap,
                 prefs,
                 policy,
+                initial_status,
             } => {
-                assert!(initial_state && initial_netmap && prefs && policy);
+                assert!(initial_state && initial_netmap && prefs && policy && initial_status);
             }
             other => panic!("expected masked Watch, got {other:?}"),
         }
@@ -2538,6 +2588,7 @@ mod tests {
                 initial_netmap: false,
                 prefs: true,
                 policy: false,
+                initial_status: false,
             })
             .unwrap(),
             r#"{"cmd":"watch","prefs":true}"#
@@ -2550,6 +2601,7 @@ mod tests {
                 initial_netmap: false,
                 prefs: false,
                 policy: true,
+                initial_status: false,
             })
             .unwrap(),
             r#"{"cmd":"watch","policy":true}"#
@@ -2560,14 +2612,114 @@ mod tests {
                 initial_netmap,
                 prefs,
                 policy,
+                initial_status,
             } => {
                 assert!(policy, "the policy bit must survive the round trip");
                 assert!(
-                    !initial_state && !initial_netmap && !prefs,
+                    !initial_state && !initial_netmap && !prefs && !initial_status,
                     "a policy-only watch must not imply any other mask bit"
                 );
             }
             other => panic!("expected masked Watch, got {other:?}"),
+        }
+        // An `initial_status`-only watch (Go's `NotifyInitialStatus` alone) is masked: only its own
+        // key goes on the wire, and it parses back without implying any other bit.
+        assert_eq!(
+            serde_json::to_string(&Request::Watch {
+                initial_state: false,
+                initial_netmap: false,
+                prefs: false,
+                policy: false,
+                initial_status: true,
+            })
+            .unwrap(),
+            r#"{"cmd":"watch","initial_status":true}"#
+        );
+        match serde_json::from_str::<Request>(r#"{"cmd":"watch","initial_status":true}"#).unwrap() {
+            Request::Watch {
+                initial_state,
+                initial_netmap,
+                prefs,
+                policy,
+                initial_status,
+            } => {
+                assert!(
+                    initial_status,
+                    "the initial_status bit must survive the round trip"
+                );
+                assert!(
+                    !initial_state && !initial_netmap && !prefs && !policy,
+                    "a status-only watch must not imply any other mask bit"
+                );
+            }
+            other => panic!("expected masked Watch, got {other:?}"),
+        }
+        // A client that predates the bit sends every other bit. It must parse with `initial_status`
+        // OFF, so no older watcher is handed a snapshot frame it does not know how to read.
+        match serde_json::from_str::<Request>(
+            r#"{"cmd":"watch","initial_state":true,"initial_netmap":true,"prefs":true,"policy":true}"#,
+        )
+        .unwrap()
+        {
+            Request::Watch { initial_status, .. } => assert!(
+                !initial_status,
+                "a watch line written before the initial_status bit existed must not turn it on"
+            ),
+            other => panic!("expected masked Watch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn notify_initial_status_frame_carries_the_status_report() {
+        // Go's `Notify.InitialStatus` is the `ipnstate.Status` a `status` call returns. Ours is the
+        // very `StatusReport` `Response::Status` carries, so a status frame decodes back to the
+        // identical report — peers included — and carries nothing else.
+        let report = StatusReport {
+            state: "Running".to_string(),
+            want_running: true,
+            self_ipv4: Some("100.64.0.1".to_string()),
+            self_name: Some("node-a.tail0123.ts.net".to_string()),
+            magic_dns_suffix: Some("tail0123.ts.net".to_string()),
+            peers: vec![PeerReport {
+                name: "node-b.tail0123.ts.net".to_string(),
+                ipv4: "100.64.0.2".to_string(),
+                stable_id: "nB".to_string(),
+                online: Some(true),
+                cur_addr: Some("192.0.2.7:41641".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let frame = NotifyView {
+            initial_status: Some(Box::new(report.clone())),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&Response::Notify(frame.clone())).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let object = value.as_object().unwrap();
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["initial_status", "kind"],
+            "a status frame is nil-means-unchanged for every other field"
+        );
+        assert_eq!(
+            object["initial_status"],
+            serde_json::to_value(&report).unwrap(),
+            "the snapshot must serialize exactly as the status report itself does"
+        );
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::Notify(back) => {
+                assert_eq!(back, frame);
+                assert_eq!(back.initial_status.unwrap().peers, report.peers);
+            }
+            other => panic!("expected a notify frame, got {other:?}"),
+        }
+        // A frame that predates the field (or any later frame) decodes with the snapshot absent.
+        match serde_json::from_str::<Response>(r#"{"kind":"notify","state":"Running"}"#).unwrap() {
+            Response::Notify(back) => assert!(back.initial_status.is_none()),
+            other => panic!("expected a notify frame, got {other:?}"),
         }
     }
 
