@@ -1961,10 +1961,9 @@ pub struct LockLogEntry {
     /// Go prints tailnet-lock key ids in. Empty for an unsigned AUM (the genesis checkpoint).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub signer_key_ids: Vec<String>,
-    /// The AUM's canonical CBOR serialization (Go `NetworkLockUpdate.Raw`), hex-encoded. Carried so
-    /// an operator can decode the full AUM out-of-band; the daemon itself never decodes it (it has no
-    /// AUM decoder), which is why `tnet lock log`'s human output cannot print Go's per-kind key
-    /// detail. Emitted only by `tnet lock log --json`.
+    /// The AUM's canonical CBOR serialization (Go `NetworkLockUpdate.Raw`), hex-encoded. The daemon
+    /// never decodes it; `tnet lock log --json=1` does, in the CLI as Go does, to expand it into Go's
+    /// schema-1 fields. The human output does not decode it, so it prints no per-kind key detail.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub raw: String,
 }
