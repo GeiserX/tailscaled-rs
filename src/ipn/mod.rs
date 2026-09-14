@@ -142,14 +142,19 @@ struct ConnectivityHealth {
     /// Whether the engine's net report names a reachable DERP region. `false` is Go's `no-derp-home`
     /// warnable.
     derp_home: Option<bool>,
+    /// Whether the host forwards the routes this node advertises
+    /// ([`crate::ipforward::ip_forwarding_broken`], negated). `false` is Go's `ip-forwarding-off`
+    /// warnable.
+    ip_forwarding: Option<bool>,
 }
 
 impl ConnectivityHealth {
     /// Nothing observed — every signal unknown, so nothing is unhealthy. Used outside `Running`,
-    /// where upstream's loop is not even alive and neither observation is worth paying for.
+    /// where upstream's loop is not even alive and no observation is worth paying for.
     const UNKNOWN: Self = Self {
         any_interface_up: None,
         derp_home: None,
+        ip_forwarding: None,
     };
 }
 
@@ -164,11 +169,14 @@ impl ConnectivityHealth {
 /// captivePortalWarnable.Code }` (`feature/captiveportal/captiveportal.go`), over the members of that
 /// set this daemon can observe.
 ///
-/// When more than one is unhealthy the one with the shortest
-/// [`time_to_visible`](captive::ConnectivityWarnable::time_to_visible) wins. Go breaks on whichever
-/// warning its map iteration reaches first — order it does not care about, because the *event* that
-/// wakes its loop is the first warnable to become visible. Picking the soonest-visible reproduces
-/// that timing and is deterministic, which the map order is not.
+/// When more than one is unhealthy a transient warnable wins over a
+/// [`steady`](captive::ConnectivityWarnable::is_steady) one, and among the rest the one with the
+/// shortest [`time_to_visible`](captive::ConnectivityWarnable::time_to_visible) wins. Go breaks on
+/// whichever warning its map iteration reaches first — order it does not care about, because the
+/// *event* that wakes its loop is the warnable that just changed. A steady warnable that was already
+/// unhealthy is not that event, so it must not hide a network that has just gone down (and the
+/// rechecks that come with it); among transient ones, the soonest-visible reproduces Go's timing and
+/// is deterministic, which the map order is not.
 fn connectivity_impacted_from(
     state: State,
     health: ConnectivityHealth,
@@ -184,11 +192,15 @@ fn connectivity_impacted_from(
             health.any_interface_up,
         ),
         (captive::ConnectivityWarnable::NoDerpHome, health.derp_home),
+        (
+            captive::ConnectivityWarnable::IpForwardingOff,
+            health.ip_forwarding,
+        ),
     ]
     .into_iter()
     .filter(|(_, healthy)| *healthy == Some(false))
     .map(|(warnable, _)| warnable)
-    .min_by_key(|w| w.time_to_visible())
+    .min_by_key(|w| (w.is_steady(), w.time_to_visible()))
 }
 
 /// The captive-portal detection loop — Go `ipn/ipnlocal/captiveportal.go`, its
@@ -4765,6 +4777,10 @@ impl Backend {
     ///   *"Tailscale could not connect to any relay server"*), and the warnable that fires when a
     ///   portal swallows a live node's traffic, since the portal answers the DERP connections instead
     ///   of the relay.
+    /// - `ip-forwarding-off` — a kernel-TUN node advertises routes its host will not forward
+    ///   ([`ip_forwarding_broken`](Backend::ip_forwarding_broken), Go's check from
+    ///   `applyPrefsToHostinfoLocked`). A steady condition, so it earns one probe per onset rather
+    ///   than rechecks ([`captive::ConnectivityWarnable::is_steady`]).
     ///
     /// Reading both matters, and not only for tidiness: the engine's net report is the node's
     /// **last** measurement, so a path that dies under a live session keeps naming its old home
@@ -4816,10 +4832,25 @@ impl Backend {
                         None
                     }
                 },
+                ip_forwarding: Some(!self.ip_forwarding_broken()),
             },
             _ => ConnectivityHealth::UNKNOWN,
         };
         connectivity_impacted_from(state, health)
+    }
+
+    /// Go's `ip-forwarding-off` verdict for this node: the check `applyPrefsToHostinfoLocked` installs
+    /// over the advertised routes (Go `hi.RoutableIPs`, which folds in the exit-node defaults). A
+    /// route set that does not compose advertises nothing, so it is checked as no routes.
+    fn ip_forwarding_broken(&self) -> bool {
+        let routes = crate::routes::calc_advertise_routes(
+            &self.prefs.advertise_routes,
+            self.prefs.advertise_exit_node,
+        )
+        .unwrap_or_default();
+        crate::ipforward::ip_forwarding_broken(self.prefs.tun_enabled, &routes, || {
+            linkmon::interface_ips()
+        })
     }
 
     /// Record the verdict of a captive-portal detection pass (Go's
@@ -5916,6 +5947,7 @@ mod tests {
         ConnectivityHealth {
             any_interface_up: Some(any_interface_up),
             derp_home: Some(derp_home),
+            ip_forwarding: Some(true),
         }
     }
 
@@ -5996,6 +6028,7 @@ mod tests {
                 ConnectivityHealth {
                     any_interface_up: Some(false),
                     derp_home: None,
+                    ip_forwarding: None,
                 },
             ),
             Some(captive::ConnectivityWarnable::NetworkStatus),
@@ -6022,6 +6055,69 @@ mod tests {
             std::time::Duration::from_secs(12),
             "no-derp-home: 10s TimeToVisible + Go's 2s detection interval"
         );
+    }
+
+    #[test]
+    fn captive_detection_triggers_on_ip_forwarding_off() {
+        // health/warnings.go marks `ip-forwarding-off` `ImpactsConnectivity: true`, so a subnet
+        // router whose host will not forward is a node Go's `onHealthChange` probes for.
+        let forwarding_off = ConnectivityHealth {
+            ip_forwarding: Some(false),
+            ..health(true, true)
+        };
+        assert_eq!(
+            connectivity_impacted_from(State::Running, forwarding_off),
+            Some(captive::ConnectivityWarnable::IpForwardingOff),
+            "network and relay healthy, forwarding off: still impacted"
+        );
+        assert_eq!(
+            connectivity_impacted_from(State::Stopped, forwarding_off),
+            None,
+            "outside Running upstream's loop is not alive"
+        );
+
+        // With a transient warnable also unhealthy, the transient one is reported, so a network
+        // that dies under a misconfigured subnet router still gets its settle time and rechecks.
+        assert_eq!(
+            connectivity_impacted_from(
+                State::Running,
+                ConnectivityHealth {
+                    ip_forwarding: Some(false),
+                    ..health(false, true)
+                }
+            ),
+            Some(captive::ConnectivityWarnable::NetworkStatus)
+        );
+        assert_eq!(
+            connectivity_impacted_from(
+                State::Running,
+                ConnectivityHealth {
+                    ip_forwarding: Some(false),
+                    ..health(true, false)
+                }
+            ),
+            Some(captive::ConnectivityWarnable::NoDerpHome)
+        );
+    }
+
+    #[test]
+    fn a_netstack_node_never_reports_ip_forwarding_off() {
+        // Go installs the forwarding check only when `!b.sys.IsNetstackRouter()`: the userspace
+        // netstack forwards, not the kernel, whatever routes are advertised.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-captive-ipforward-{}", std::process::id()));
+        let mut be = backend_for(&dir);
+        be.prefs.tun_enabled = false;
+        be.prefs.advertise_routes = vec!["192.0.2.0/24".to_string()];
+        be.prefs.advertise_exit_node = true;
+        assert!(!be.ip_forwarding_broken());
+
+        // A TUN node that advertises nothing has no check installed either.
+        be.prefs.tun_enabled = true;
+        be.prefs.advertise_routes.clear();
+        be.prefs.advertise_exit_node = false;
+        assert!(!be.ip_forwarding_broken());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
