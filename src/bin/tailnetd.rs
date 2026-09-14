@@ -1322,16 +1322,38 @@ fn log_resume_decision(resuming: bool, have_authkey: bool, ephemeral: bool) {
 ///   fork has no hook on any platform, so the condition is permanently true and there is nothing to
 ///   test at runtime.
 ///
-/// **The message therefore keeps Go's sentence but not Go's `%s`.** It opens with Go's literal
-/// `--bird-socket is not supported on …`, so an operator or a runbook keyed to Go's wording still
-/// matches; the `%s` becomes "this platform or in this build of tailnetd" rather than a concrete
-/// GOOS, because naming one would invite the false repair of moving to another OS. That is the same
-/// split the neighbouring ported refusals make — [`can_encrypt_state`] reproduces Go's `on %s`
-/// verbatim where the platform arm is as true here as upstream, and
-/// [`can_use_hardware_attestation`] keeps Go's shape while naming the honest scope where the cause
-/// is the build. (Refusals with no Go string behind them, like `debugmode`'s `--derp` and
-/// `--portmap`, use this fork's own "is not supported by tailnetd" instead; this one has an
-/// upstream string to carry.) The paragraph that follows still names the real reason.
+/// **The message keeps Go's sentence but not Go's `%s`.** [`can_use_bird`] holds the sentence on
+/// its own, the way [`can_encrypt_state`] and [`can_use_hardware_attestation`] hold theirs, and this
+/// function does the presenting — the same split [`explicit_tpm_flag_refusal`] makes. The `%s`
+/// becomes "this platform or in this build of tailnetd" rather than a concrete GOOS, because naming
+/// one would invite the false repair of moving to another OS. (Refusals with no Go string behind
+/// them, like `debugmode`'s `--derp` and `--portmap`, use this fork's own "is not supported by
+/// tailnetd" instead; this one has an upstream string to carry.)
+///
+/// **What an operator's `grep` actually matches, stated plainly**, because "keeps Go's wording" has
+/// been read here as more than it is. Go's whole output is one bare line — `log.SetFlags(0)` drops
+/// the date/time prefix `log` would otherwise write, and `log.Fatalf` writes the sentence and exits
+/// 1:
+///
+/// ```text
+/// --bird-socket is not supported on linux
+/// ```
+///
+/// This fork's output differs from that in three deliberate ways:
+///
+/// 1. the `%s` slot carries fork text rather than a GOOS, as above;
+/// 2. it is prefixed `error: ` and closed with a full stop, which is how **every** fatal refusal on
+///    this binary's stderr reads (the experiment gate, both TPM refusals) — one flag opting out of
+///    that would make `tailnetd`'s startup errors inconsistent to gain a prefix match that the `%s`
+///    substitution has already cost;
+/// 3. explanatory paragraphs follow on later lines, since a reader of this message cannot go and
+///    read `feature/bird` to find out what was refused.
+///
+/// So a substring match on `--bird-socket is not supported on ` matches and is what the tests pin;
+/// a match anchored to the start of the line, or one expecting Go's full line including its GOOS,
+/// does not and cannot. What line 1 must *not* do is break Go's sentence up — nothing is
+/// interpolated into the middle of it, and the rejected path is echoed further down rather than
+/// inside it, so the sentence survives whole for the match that does work.
 ///
 /// One Go edge case ports with it: the empty path is **not** a refusal. Go's guard is
 /// `birdSocketPath != ""`, so `--bird-socket=""` means "no BIRD socket" exactly like omitting the
@@ -1341,9 +1363,11 @@ fn log_resume_decision(resuming: bool, have_authkey: bool, ephemeral: bool) {
 fn bird_socket_refusal(path: Option<&str>) -> Option<String> {
     // Go: `args.birdSocketPath != ""` — an unset *or* explicitly empty path is "no BIRD socket".
     let path = path.filter(|p| !p.is_empty())?;
+    // Go: `!wgengine.HookNewBird.IsSet()`. Never satisfied here, but routed through the same shape
+    // as the neighbouring refusals so Go's sentence has one home.
+    let reason = can_use_bird().err()?;
     Some(format!(
-        "error: --bird-socket is not supported on this platform or in this build of tailnetd \
-         (given {path:?}).\n\
+        "error: {reason}.\n\
          Go accepts this flag for a subnet router that hands its advertised routes to a BIRD BGP \
          daemon: it passes the socket path to its engine (`wgengine.Config.BIRDSocket`, built via \
          `wgengine.HookNewBird`), which enables BIRD's `tailscale` protocol while this node is a \
@@ -1355,10 +1379,27 @@ fn bird_socket_refusal(path: Option<&str>) -> Option<String> {
          --bird-socket would leave a \
          subnet router believing its BGP announcements track its primary-route status when nothing \
          was ever connected to BIRD.\n\
-         Drop the flag to start tailnetd. Routes are still advertised to the tailnet with `tnet up \
-         --advertise-routes=<prefix,...>`; driving BIRD from that state needs a BIRD hook in the \
-         engine, and is out of scope here until it has one."
+         Drop the flag (it was given {path:?}) to start tailnetd. Routes are still advertised to \
+         the tailnet with `tnet up --advertise-routes=<prefix,...>`; driving BIRD from that state \
+         needs a BIRD hook in the engine, and is out of scope here until it has one."
     ))
+}
+
+/// Whether a BIRD control socket could be wired up here — this fork's standing answer to Go's
+/// `wgengine.HookNewBird.IsSet()` (`cmd/tailscaled/tailscaled.go`,
+/// `feature/condregister/maybe_bird.go` @ `53a0d659afa51835dd7a9283873cca44261454f8`).
+///
+/// Always `Err`, and the `Err` carries Go's `log.Fatalf` sentence with its `%s` slot filled — see
+/// [`bird_socket_refusal`] for why that slot names the build rather than `runtime.GOOS`, and for
+/// what is and is not added around this sentence before an operator sees it. Upstream the hook is
+/// registered by `feature/bird` on `linux || darwin || freebsd || openbsd`; there is no BIRD code
+/// in this fork and no hook in the `tailscale-rs` engine to register one against, so the answer
+/// does not vary by platform and takes no arguments.
+///
+/// Separate from the message so Go's string is one testable value, the way
+/// [`can_encrypt_state`] and [`can_use_hardware_attestation`] are.
+fn can_use_bird() -> Result<(), String> {
+    Err("--bird-socket is not supported on this platform or in this build of tailnetd".to_string())
 }
 
 /// This host's OS in Go's `runtime.GOOS` spelling, so a message ported from Go names the platform
@@ -1866,8 +1907,8 @@ mod tests {
     // is linked in. This fork is permanently in that case, so the things worth pinning are: the
     // flag PARSES (a Go-shaped command line must reach the refusal, not clap's "unexpected
     // argument"), an omitted or empty path is NOT a refusal (Go's guard is `birdSocketPath != ""`),
-    // a real path IS refused with a message that says why, and the refusal opens with Go's own
-    // sentence while deliberately declining Go's `%s`.
+    // a real path IS refused with a message that says why, and the refusal carries Go's own
+    // sentence whole while deliberately declining Go's `%s`.
 
     #[test]
     fn bird_socket_flag_parses_rather_than_being_an_unknown_argument() {
@@ -1919,7 +1960,8 @@ mod tests {
             message.starts_with("error: --bird-socket is not supported on "),
             "keeps Go's refusal sentence, `on` and all; got {message:?}"
         );
-        // Echoes the rejected path.
+        // Echoes the rejected path — on a later line, see
+        // `bird_socket_refusal_keeps_gos_sentence_whole_on_the_first_line`.
         assert!(
             message.contains("/run/bird.ctl"),
             "names the path it was given; got {message:?}"
@@ -1933,6 +1975,51 @@ mod tests {
         assert!(
             message.contains("--advertise-routes"),
             "points at the route-advertising path that does work; got {message:?}"
+        );
+    }
+
+    /// Go's whole output here is one bare line: `log.SetFlags(0)` drops the date/time prefix and
+    /// `log.Fatalf` writes `--bird-socket is not supported on linux`. This fork wraps that sentence
+    /// — `error: ` in front and a full stop behind, which is how every fatal refusal on this
+    /// binary's stderr reads — and follows it with explanation. What it must never do is break the
+    /// sentence itself up: an earlier revision spliced `(given "/run/bird.ctl")` into the middle of
+    /// line 1, between Go's words and their full stop, which left the ported string reading as a
+    /// prefix rather than as Go's sentence. Pinned here so the wrapping stays exactly what the doc
+    /// comment on [`bird_socket_refusal`] discloses, and the path an operator was given stays off
+    /// Go's line.
+    #[test]
+    fn bird_socket_refusal_keeps_gos_sentence_whole_on_the_first_line() {
+        let message =
+            bird_socket_refusal(Some("/run/bird.ctl")).expect("a non-empty path must be refused");
+        let first_line = message
+            .lines()
+            .next()
+            .expect("the message has a first line");
+
+        // Go's sentence, `%s` slot aside, with nothing but the file-wide `error: ` and a full stop
+        // around it — and, crucially, nothing inside it.
+        let go_sentence = can_use_bird().expect_err("this fork never has a BIRD hook");
+        assert_eq!(
+            first_line,
+            format!("error: {go_sentence}."),
+            "line 1 is Go's sentence and the disclosed wrapping, nothing else; got {first_line:?}"
+        );
+
+        // The path is still reported to the operator, just not from inside Go's sentence.
+        assert!(
+            !first_line.contains("/run/bird.ctl"),
+            "the rejected path must not be spliced into Go's sentence; got {first_line:?}"
+        );
+        assert!(
+            message.lines().skip(1).any(|l| l.contains("/run/bird.ctl")),
+            "the rejected path must still be named further down; got {message:?}"
+        );
+
+        // The substring match the doc comment promises an operator or a runbook — this is the one
+        // that works, and it works because the sentence is unbroken.
+        assert!(
+            message.contains("--bird-socket is not supported on "),
+            "Go's wording must be greppable as one run of text; got {message:?}"
         );
     }
 
