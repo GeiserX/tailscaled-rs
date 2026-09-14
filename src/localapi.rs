@@ -111,6 +111,18 @@ pub enum Request {
         /// asked again".
         #[serde(default, skip_serializing_if = "core::ops::Not::not")]
         policy: bool,
+        /// Front-load a whole [`StatusReport`] as the session's first [`Response::Notify`] frame, in
+        /// [`NotifyView::initial_status`]. The analogue of Go's `ipn.NotifyInitialStatus` (`1 << 14`),
+        /// which upstream recommends over fetching the netmap: a watcher that wants a snapshot AND a
+        /// stream asks for both on one connection instead of racing a `status` request on a second.
+        ///
+        /// It is the same report [`Request::Status`] answers with, peers included (Go builds it with
+        /// `WantPeers: true`). Sent once per session, not once per device epoch — Go's
+        /// `InitialStatus` is carried by the first `Notify` only. Daemon-built like `prefs`/`policy`.
+        /// See [`NotifyView::initial_status`] for the ordering guarantee this build can and cannot
+        /// give. Same `#[serde(default)]` + `skip_serializing_if` back-compat discipline.
+        #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+        initial_status: bool,
     },
     /// Bring the node up (`WantRunning = true`), optionally (re)setting login/config fields.
     Up {
@@ -1535,7 +1547,7 @@ pub struct FileTargetReport {
 /// [`StatusReport::default`], so a JSON document missing any field (e.g. an older client's status
 /// line) deserializes instead of hard-erroring. Fields keep their `skip_serializing_if` so the
 /// emitted wire still drops empty optionals.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct StatusReport {
     /// The IPN state name. One of the seven [`crate::ipn::State`] variants (the authoritative
@@ -2129,9 +2141,10 @@ pub struct ProfileEntry {
 /// reason split out into [`error`](NotifyView::error), mirroring how [`StatusReport`] already
 /// separates `state` from `error`). Two further fields are **daemon-built**, sourced from state the
 /// engine does not hold at all: [`prefs`](NotifyView::prefs) (this fork's prefs are daemon-owned) and
-/// [`policy`](NotifyView::policy) (the system-policy registry lives in the daemon). Both are Go
-/// `Notify` fields — `Notify.Prefs` and `Notify.Policy` — so carrying them here is a port, not an
-/// invention; only the plumbing that feeds them differs.
+/// [`policy`](NotifyView::policy) (the system-policy registry lives in the daemon), plus the
+/// one-shot [`initial_status`](NotifyView::initial_status) snapshot. All three are Go `Notify`
+/// fields — `Notify.Prefs`, `Notify.Policy` and `Notify.InitialStatus` — so carrying them here is a
+/// port, not an invention; only the plumbing that feeds them differs.
 ///
 /// The richer Go `Notify` fields (`Health`, `PeerChangedPatch`, `Engine`, `FilesWaiting`,
 /// `SuggestedExitNode`, …) are intentionally **absent**: the fork's engine does not surface them on
@@ -2195,6 +2208,44 @@ pub struct NotifyView {
     /// this frame carried no policy change (or the `policy` bit was unset).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy: Option<PolicyReport>,
+    /// A whole status snapshot, if the `initial_status` mask bit was set (Go `Notify.InitialStatus`,
+    /// gated by `ipn.NotifyInitialStatus`). Present on the session's FIRST frame only, and never
+    /// again: later changes arrive as `state` / `net_map` / `prefs` frames, which a watcher applies
+    /// over this snapshot.
+    ///
+    /// It is the very [`StatusReport`] [`Response::Status`] carries, produced by the same
+    /// `Backend::status` call, so `watch` and `status` cannot drift. Peers are included, as Go's
+    /// `WantPeers: true` includes them; on a node that is not `Running` the list is empty because
+    /// there is no netmap, exactly as a one-shot `status` reports it.
+    ///
+    /// ## Ordering: snapshot first, then subscribe — and the window that leaves
+    ///
+    /// Go assembles `InitialStatus` under `b.mu` in the same critical section that registers the
+    /// watcher, so no event can reach the watcher before its snapshot and none can fall between the
+    /// two. This daemon has no single lock spanning its backend and the engine bus, so it does not
+    /// claim that. What it does:
+    ///
+    /// - The lifecycle, prefs and policy subscriptions are taken BEFORE the snapshot, so an
+    ///   `up`/`down`, a prefs write or a policy reload landing after it is still delivered.
+    /// - The snapshot is then the first frame written, ahead of every other front-load and every
+    ///   engine event. Nothing on this connection precedes it.
+    /// - Only then is the engine's IPN bus subscribed. A connection-state or peer-set change that
+    ///   lands between the snapshot and that subscription is NOT delivered as its own frame.
+    ///
+    /// Subscribing to the bus first would not close that window from here: the engine's bus
+    /// watcher records its baseline inside a task it spawns, after `watch_ipn_bus` has returned,
+    /// so the daemon cannot observe the moment it became current. Closing it needs an engine-side
+    /// change. A watcher that must not miss that edge also sets `initial_state` / `initial_netmap`:
+    /// the engine front-loads the state and peer set as of its own subscription, which is never
+    /// older than this snapshot and supersedes it.
+    ///
+    /// DAEMON-built (not an engine `Notify` field). `None` on every frame but the first, and on
+    /// every frame when the bit was unset.
+    ///
+    /// Boxed only to keep [`Response`] small (a whole report inline would make every frame carry
+    /// its size); serde encodes a `Box` exactly like its contents, so the wire is unaffected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_status: Option<Box<StatusReport>>,
 }
 
 /// A single peer entry in a [`StatusReport`].
@@ -2476,6 +2527,7 @@ mod tests {
                 initial_netmap: false,
                 prefs: false,
                 policy: false,
+                initial_status: false,
             })
             .unwrap(),
             r#"{"cmd":"watch"}"#
@@ -2487,6 +2539,7 @@ mod tests {
                 initial_netmap: false,
                 prefs: false,
                 policy: false,
+                initial_status: false,
             }
         ));
         // A masked watch round-trips its bits (the Notify-path selector): each `true` field appears on
@@ -2498,12 +2551,13 @@ mod tests {
                 initial_netmap: true,
                 prefs: true,
                 policy: true,
+                initial_status: true,
             })
             .unwrap(),
-            r#"{"cmd":"watch","initial_state":true,"initial_netmap":true,"prefs":true,"policy":true}"#
+            r#"{"cmd":"watch","initial_state":true,"initial_netmap":true,"prefs":true,"policy":true,"initial_status":true}"#
         );
         match serde_json::from_str::<Request>(
-            r#"{"cmd":"watch","initial_state":true,"initial_netmap":true,"prefs":true,"policy":true}"#,
+            r#"{"cmd":"watch","initial_state":true,"initial_netmap":true,"prefs":true,"policy":true,"initial_status":true}"#,
         )
         .unwrap()
         {
@@ -2512,8 +2566,54 @@ mod tests {
                 initial_netmap,
                 prefs,
                 policy,
+                initial_status,
             } => {
-                assert!(initial_state && initial_netmap && prefs && policy);
+                assert!(initial_state && initial_netmap && prefs && policy && initial_status);
+            }
+            other => panic!("expected masked Watch, got {other:?}"),
+        }
+        // A client that predates the `initial_status` bit sends the four-field masked line. It must
+        // still parse with the bit OFF: a watcher never gets a snapshot it did not ask for.
+        match serde_json::from_str::<Request>(
+            r#"{"cmd":"watch","initial_state":true,"initial_netmap":true,"prefs":true,"policy":true}"#,
+        )
+        .unwrap()
+        {
+            Request::Watch { initial_status, .. } => assert!(
+                !initial_status,
+                "a watch line written before the initial_status bit existed must not turn it on"
+            ),
+            other => panic!("expected masked Watch, got {other:?}"),
+        }
+        // An `initial_status`-only watch (Go's `NotifyInitialStatus` alone) is masked, and implies no
+        // other bit.
+        assert_eq!(
+            serde_json::to_string(&Request::Watch {
+                initial_state: false,
+                initial_netmap: false,
+                prefs: false,
+                policy: false,
+                initial_status: true,
+            })
+            .unwrap(),
+            r#"{"cmd":"watch","initial_status":true}"#
+        );
+        match serde_json::from_str::<Request>(r#"{"cmd":"watch","initial_status":true}"#).unwrap() {
+            Request::Watch {
+                initial_state,
+                initial_netmap,
+                prefs,
+                policy,
+                initial_status,
+            } => {
+                assert!(
+                    initial_status,
+                    "the initial_status bit must survive the round trip"
+                );
+                assert!(
+                    !initial_state && !initial_netmap && !prefs && !policy,
+                    "a status-only watch must not imply any other mask bit"
+                );
             }
             other => panic!("expected masked Watch, got {other:?}"),
         }
@@ -2538,6 +2638,7 @@ mod tests {
                 initial_netmap: false,
                 prefs: true,
                 policy: false,
+                initial_status: false,
             })
             .unwrap(),
             r#"{"cmd":"watch","prefs":true}"#
@@ -2550,6 +2651,7 @@ mod tests {
                 initial_netmap: false,
                 prefs: false,
                 policy: true,
+                initial_status: false,
             })
             .unwrap(),
             r#"{"cmd":"watch","policy":true}"#
@@ -2560,10 +2662,11 @@ mod tests {
                 initial_netmap,
                 prefs,
                 policy,
+                initial_status,
             } => {
                 assert!(policy, "the policy bit must survive the round trip");
                 assert!(
-                    !initial_state && !initial_netmap && !prefs,
+                    !initial_state && !initial_netmap && !prefs && !initial_status,
                     "a policy-only watch must not imply any other mask bit"
                 );
             }
