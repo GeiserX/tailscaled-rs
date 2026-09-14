@@ -690,15 +690,37 @@ async fn stream_notify(
     // reason: a reload landing between here and the first select must not be lost.
     let mut policy_rx = Backend::watch_policy();
 
+    // One session id per connection, minted before any frame is written (Go mints it at the top of
+    // `WatchNotificationsAs`). Every frame below goes out through `stamp`: the first one carries the
+    // id when `initial_state` is set, whichever feed produces it, and all of them carry the version.
+    let session_id = match new_session_id() {
+        Ok(id) => id,
+        Err(e) => {
+            let _ = write_response(
+                write_half,
+                &Response::Error {
+                    message: format!("{e:#}"),
+                },
+            )
+            .await;
+            return Ok(());
+        }
+    };
+    let mut stamp = NotifyStamp::new(session_id, initial_state);
+
     // `prefs` front-load: emit the current prefs as the first frame (Go `NotifyInitialPrefs`). Done
     // once up front (daemon-built, not tied to a device epoch). A write error = client gone.
-    if prefs && emit_prefs_frame(write_half, backend).await.is_err() {
+    if prefs
+        && emit_prefs_frame(write_half, backend, &mut stamp)
+            .await
+            .is_err()
+    {
         return Ok(());
     }
     // `policy` front-load: Go's `NotifySysPolicyChanges` explicitly makes the FIRST notify — sent
     // immediately — carry the current effective snapshot, so this is part of the bit's contract, not
     // an optimisation. Also daemon-built and epoch-independent.
-    if policy && emit_policy_frame(write_half).await.is_err() {
+    if policy && emit_policy_frame(write_half, &mut stamp).await.is_err() {
         return Ok(());
     }
 
@@ -724,7 +746,7 @@ async fn stream_notify(
                     if res.is_err() {
                         return Ok(()); // prefs sender dropped (daemon gone)
                     }
-                    if emit_prefs_frame(write_half, backend).await.is_err() {
+                    if emit_prefs_frame(write_half, backend, &mut stamp).await.is_err() {
                         return Ok(()); // client hung up
                     }
                     continue; // still no device — loop back to the device-derive/wait
@@ -736,7 +758,7 @@ async fn stream_notify(
                     if res.is_err() {
                         return Ok(()); // policy sender dropped (process gone)
                     }
-                    if emit_policy_frame(write_half).await.is_err() {
+                    if emit_policy_frame(write_half, &mut stamp).await.is_err() {
                         return Ok(()); // client hung up
                     }
                     continue; // still no device — loop back to the device-derive/wait
@@ -780,10 +802,7 @@ async fn stream_notify(
                                 // than emit a meaningless frame.
                                 continue;
                             };
-                            if write_response(write_half, &Response::Notify(view))
-                                .await
-                                .is_err()
-                            {
+                            if write_notify(write_half, &mut stamp, view).await.is_err() {
                                 return Ok(()); // client hung up
                             }
                         }
@@ -803,7 +822,7 @@ async fn stream_notify(
                     if res.is_err() {
                         return Ok(()); // prefs sender dropped (daemon gone)
                     }
-                    if emit_prefs_frame(write_half, backend).await.is_err() {
+                    if emit_prefs_frame(write_half, backend, &mut stamp).await.is_err() {
                         return Ok(()); // client hung up
                     }
                 }
@@ -813,7 +832,7 @@ async fn stream_notify(
                     if res.is_err() {
                         return Ok(()); // policy sender dropped (process gone)
                     }
-                    if emit_policy_frame(write_half).await.is_err() {
+                    if emit_policy_frame(write_half, &mut stamp).await.is_err() {
                         return Ok(()); // client hung up
                     }
                 }
@@ -822,20 +841,74 @@ async fn stream_notify(
     }
 }
 
+/// The identity fields one masked watch puts on its frames: Go `Notify.Version` on every frame, and
+/// Go `Notify.SessionID` on the first frame only, and only under `initial_state` (Go sets it on its
+/// initial notify only under `NotifyInitialState`). `stream_notify` owns exactly one per connection,
+/// and every frame it writes (bus, prefs or policy) passes through [`NotifyStamp::stamp`], so the id
+/// is stable for the life of the connection and no frame source can skip the version.
+struct NotifyStamp {
+    /// This connection's session id (the `sessionID` Go's `WatchNotificationsAs` mints). Minted even
+    /// when it will not be published, as Go does, so it can later key per-session daemon state.
+    session_id: String,
+    /// Whether the next frame still owes the client the session id.
+    session_id_pending: bool,
+}
+
+impl NotifyStamp {
+    fn new(session_id: String, initial_state: bool) -> Self {
+        Self {
+            session_id,
+            session_id_pending: initial_state,
+        }
+    }
+
+    /// Fill `view`'s identity fields: the daemon version always, the session id on the first frame
+    /// of an `initial_state` watch and never again.
+    fn stamp(&mut self, mut view: crate::localapi::NotifyView) -> crate::localapi::NotifyView {
+        view.version = Some(env!("CARGO_PKG_VERSION").to_string());
+        if std::mem::take(&mut self.session_id_pending) {
+            view.session_id = Some(self.session_id.clone());
+        }
+        view
+    }
+}
+
+/// Mint a watch session id: 16 lowercase hex characters (the length of Go's `rands.HexString(16)`)
+/// from 8 bytes of OS entropy. Nothing is derived from a counter or a clock, so neither a second
+/// connection nor a restarted daemon can be handed an id already issued; 64 random bits make an
+/// accidental collision negligible.
+fn new_session_id() -> Result<String> {
+    let mut bytes = [0u8; 8];
+    getrandom::fill(&mut bytes)
+        .map_err(|e| anyhow::anyhow!("reading OS entropy for a watch session id: {e}"))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Write one stamped notify frame. Returns `Err` if the client hung up.
+async fn write_notify(
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    stamp: &mut NotifyStamp,
+    view: crate::localapi::NotifyView,
+) -> Result<()> {
+    write_response(write_half, &Response::Notify(stamp.stamp(view))).await
+}
+
 /// Emit one `Response::Notify { prefs: Some(current prefs) }` frame (the daemon-built prefs feed).
 /// A brief await-free lock reads the projection; returns `Err` if the client hung up (so the caller
 /// returns `Ok(())` and ends the stream). Shared by the front-load + both prefs select arms.
 async fn emit_prefs_frame(
     write_half: &mut tokio::net::unix::OwnedWriteHalf,
     backend: &Arc<Mutex<Backend>>,
+    stamp: &mut NotifyStamp,
 ) -> Result<()> {
     let view = { backend.lock().await.prefs_view() };
-    write_response(
+    write_notify(
         write_half,
-        &Response::Notify(crate::localapi::NotifyView {
+        stamp,
+        crate::localapi::NotifyView {
             prefs: Some(view),
             ..Default::default()
-        }),
+        },
     )
     .await
 }
@@ -848,13 +921,17 @@ async fn emit_prefs_frame(
 /// so this never touches the lock — and a `syspolicy reload` therefore cannot be head-of-line blocked
 /// by a slow `up`. Returns `Err` if the client hung up (so the caller returns `Ok(())` and ends the
 /// stream). Shared by the front-load + both policy select arms.
-async fn emit_policy_frame(write_half: &mut tokio::net::unix::OwnedWriteHalf) -> Result<()> {
-    write_response(
+async fn emit_policy_frame(
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    stamp: &mut NotifyStamp,
+) -> Result<()> {
+    write_notify(
         write_half,
-        &Response::Notify(crate::localapi::NotifyView {
+        stamp,
+        crate::localapi::NotifyView {
             policy: Some(Backend::policy_snapshot()),
             ..Default::default()
-        }),
+        },
     )
     .await
 }
@@ -896,6 +973,10 @@ fn project_notify(notify: tailscale::Notify) -> Option<crate::localapi::NotifyVi
         // emitted separately by `emit_prefs_frame`/`emit_policy_frame`).
         prefs: None,
         policy: None,
+        // The identity fields belong to the connection, not to the engine notification: the
+        // watch's `NotifyStamp` fills them on the way out, for every frame source alike.
+        version: None,
+        session_id: None,
     };
     // The engine never emits an all-`None` Notify, but guard the projection anyway: a frame with no
     // populated field carries nothing for a consumer to apply.
@@ -2010,6 +2091,58 @@ mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
     use tokio::net::UnixStream;
+
+    #[test]
+    fn notify_stamp_publishes_the_session_id_once_and_the_version_always() {
+        // An `initial_state` watch: Go's initial notify carries `SessionID`, and no later one does.
+        let mut stamp = NotifyStamp::new("0123456789abcdef".to_string(), true);
+        let first = stamp.stamp(crate::localapi::NotifyView {
+            prefs: Some(Default::default()),
+            ..Default::default()
+        });
+        assert_eq!(first.session_id.as_deref(), Some("0123456789abcdef"));
+        assert_eq!(first.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        assert!(first.prefs.is_some(), "stamping must not drop the payload");
+        for _ in 0..3 {
+            let later = stamp.stamp(crate::localapi::NotifyView {
+                state: Some("Running".to_string()),
+                ..Default::default()
+            });
+            assert_eq!(
+                later.session_id, None,
+                "only the first frame carries the id"
+            );
+            assert_eq!(later.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        }
+
+        // Without `initial_state` the id is never published (Go gates it on `NotifyInitialState`),
+        // but every frame still says which daemon produced it.
+        let mut quiet = NotifyStamp::new("fedcba9876543210".to_string(), false);
+        for _ in 0..2 {
+            let frame = quiet.stamp(Default::default());
+            assert_eq!(frame.session_id, None);
+            assert_eq!(frame.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        }
+    }
+
+    #[test]
+    fn session_ids_have_gos_shape_and_are_not_reused() {
+        let ids: std::collections::HashSet<String> =
+            (0..256).map(|_| new_session_id().unwrap()).collect();
+        assert_eq!(
+            ids.len(),
+            256,
+            "a session id must never be handed out twice"
+        );
+        for id in &ids {
+            assert_eq!(id.len(), 16, "Go mints rands.HexString(16): {id:?}");
+            assert!(
+                id.bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+                "lowercase hex: {id:?}"
+            );
+        }
+    }
 
     /// Drive `read_capped_line` with `input`: write the bytes into one end of a `UnixStream` pair
     /// (off-task so a write larger than the socket buffer cannot deadlock against the reader), drop

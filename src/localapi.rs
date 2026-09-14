@@ -64,6 +64,21 @@ pub enum Request {
         /// [`NotifyWatchOpt::INITIAL_STATE`](tailscale::NotifyWatchOpt::INITIAL_STATE). `#[serde(default)]`
         /// makes it `false` when omitted (so a bare watch still parses); `skip_serializing_if` drops it
         /// from the wire when `false`, preserving the exact `{"cmd":"watch"}` legacy encoding.
+        ///
+        /// ## The session id
+        ///
+        /// Setting this bit also makes the first frame carry [`NotifyView::session_id`], exactly as
+        /// Go's `WatchNotificationsAs` puts `Notify.SessionID` on its initial notify only under
+        /// `NotifyInitialState`. The id is minted once per connection, from the OS CSPRNG (16 hex
+        /// characters, the length of Go's `rands.HexString(16)`), stays the same for the life of the
+        /// connection, and is never reused by another one.
+        ///
+        /// **It is not yet load-bearing.** In Go the daemon keys `ServeConfig.Foreground` by this id
+        /// and deletes that entry when the watch ends (`DeleteForegroundSession`), which is how a
+        /// foreground `serve` is torn down even when its CLI is killed. This fork does not model
+        /// `ServeConfig.Foreground`: nothing on the daemon is keyed by the id, nothing is cleaned up
+        /// when the connection closes, and a foreground `tnet serve` still restores its previous
+        /// config from its own signal handler. The id is published so that work has its primitive.
         #[serde(default, skip_serializing_if = "core::ops::Not::not")]
         initial_state: bool,
         /// Front-load the current peer set as the first [`Response::Notify`] frame's
@@ -2195,6 +2210,20 @@ pub struct NotifyView {
     /// this frame carried no policy change (or the `policy` bit was unset).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy: Option<PolicyReport>,
+    /// The version of the daemon that produced this frame (Go `Notify.Version`). Set on **every**
+    /// frame of a masked watch, as Go's `sendToLocked` fills it on the way out, so a consumer of a
+    /// bus whose field set is not a stable API can always tell which backend it is reading. It is
+    /// the same crate version [`Response::Version`] reports. Always `Some` on a daemon-sent frame;
+    /// `None` only when decoding a frame from a daemon that predates the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// The opaque identifier of this watch connection (Go `Notify.SessionID`). Carried by the
+    /// **first** frame only, and only when the watch set
+    /// [`initial_state`](Request::Watch::initial_state) — Go gates it on `NotifyInitialState` the
+    /// same way. No later frame repeats it, so a client that needs it must keep it. See
+    /// [`initial_state`](Request::Watch::initial_state) for what the id is (and is not yet) used for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 /// A single peer entry in a [`StatusReport`].
@@ -2632,6 +2661,34 @@ mod tests {
             serde_json::to_string(&Response::Notify(empty)).unwrap(),
             r#"{"kind":"notify","policy":{"scope":"Device"}}"#
         );
+    }
+
+    #[test]
+    fn notify_identity_fields_wire_format() {
+        // Pin the names of Go's `Notify.Version` / `Notify.SessionID` on this wire, and that a frame
+        // from a daemon that predates them still decodes (both absent → `None`).
+        let first = NotifyView {
+            state: Some("Stopped".to_string()),
+            version: Some("0.0.0".to_string()),
+            session_id: Some("0123456789abcdef".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&Response::Notify(first.clone())).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"notify","state":"Stopped","version":"0.0.0","session_id":"0123456789abcdef"}"#
+        );
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::Notify(back) => assert_eq!(back, first),
+            other => panic!("expected a notify frame, got {other:?}"),
+        }
+        match serde_json::from_str::<Response>(r#"{"kind":"notify","state":"Running"}"#).unwrap() {
+            Response::Notify(old) => {
+                assert_eq!(old.version, None);
+                assert_eq!(old.session_id, None);
+            }
+            other => panic!("expected a notify frame, got {other:?}"),
+        }
     }
 
     #[test]

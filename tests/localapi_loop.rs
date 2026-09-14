@@ -1330,3 +1330,128 @@ async fn a_policy_masked_watch_front_loads_the_snapshot_and_is_pushed_on_reload(
 
     harness.shutdown_and_verify().await;
 }
+
+/// Open a masked watch with `request` and return its reader once the request is on the wire, with
+/// the write half: the caller holds it for the life of the watch, since dropping it half-closes the
+/// socket.
+async fn open_watch(
+    socket_path: &std::path::Path,
+    request: &[u8],
+) -> (
+    BufReader<tokio::net::unix::OwnedReadHalf>,
+    tokio::net::unix::OwnedWriteHalf,
+) {
+    let stream = UnixStream::connect(socket_path)
+        .await
+        .expect("CLI connect to LocalAPI socket for a masked watch");
+    let (read_half, mut write_half) = stream.into_split();
+    write_half
+        .write_all(request)
+        .await
+        .expect("write masked watch request");
+    write_half.flush().await.expect("flush watch request");
+    (BufReader::new(read_half), write_half)
+}
+
+/// Go `Notify.SessionID` and `Notify.Version` end to end over the real socket. Go's
+/// `WatchNotificationsAs` mints one id per watch and puts it on the initial notify only under
+/// `NotifyInitialState`; `sendToLocked` stamps the version on every notify. A foreground
+/// `tailscale serve` reads exactly one notify and refuses with `missing SessionID` when it is empty,
+/// so the id has to be on the FIRST frame, whichever feed produced it — here the prefs front-load,
+/// because a harness node that never went up has no engine bus to produce a state frame.
+///
+/// The frames are driven by prefs, not policy, on purpose: the policy registry is process-global,
+/// so a `syspolicy reload` here would push into the parked watcher of the policy test running
+/// alongside in this process. Prefs belong to this harness's own backend.
+#[tokio::test]
+async fn a_masked_watch_carries_a_per_connection_session_id_and_the_daemon_version() {
+    let harness = Harness::start().await;
+    let version = env!("CARGO_PKG_VERSION");
+
+    let (mut with_state, with_state_w) = open_watch(
+        &harness.socket_path,
+        b"{\"cmd\":\"watch\",\"initial_state\":true,\"prefs\":true}\n",
+    )
+    .await;
+    let Response::Notify(first) = try_read_watch_status(&mut with_state, Duration::from_secs(5))
+        .await
+        .expect("the policy front-load is sent immediately")
+    else {
+        panic!("a masked watch streams Notify frames");
+    };
+    let session_id = first
+        .session_id
+        .clone()
+        .expect("an initial_state watch's first frame carries the session id");
+    assert_eq!(
+        session_id.len(),
+        16,
+        "Go's rands.HexString(16) shape: {session_id:?}"
+    );
+    assert_eq!(first.version.as_deref(), Some(version));
+
+    // A second connection is a second session: the id will key server-side state, so it must differ.
+    let (mut other, other_w) = open_watch(
+        &harness.socket_path,
+        b"{\"cmd\":\"watch\",\"initial_state\":true,\"prefs\":true}\n",
+    )
+    .await;
+    let Response::Notify(other_first) = try_read_watch_status(&mut other, Duration::from_secs(5))
+        .await
+        .expect("the second watch's front-load")
+    else {
+        panic!("a masked watch streams Notify frames");
+    };
+    let other_id = other_first
+        .session_id
+        .expect("the second watch's first frame carries its own id");
+    assert_ne!(
+        other_id, session_id,
+        "two connections must never share a session id"
+    );
+
+    // Without `initial_state` the id is not published (Go's gate), but the version still is.
+    let (mut prefs_only, prefs_only_w) = open_watch(
+        &harness.socket_path,
+        b"{\"cmd\":\"watch\",\"prefs\":true}\n",
+    )
+    .await;
+    let Response::Notify(prefs_first) =
+        try_read_watch_status(&mut prefs_only, Duration::from_secs(5))
+            .await
+            .expect("the prefs-only front-load")
+    else {
+        panic!("a masked watch streams Notify frames");
+    };
+    assert_eq!(prefs_first.session_id, None);
+    assert_eq!(prefs_first.version.as_deref(), Some(version));
+
+    // A later frame on the first connection: the version again, and no repeat of the id.
+    // `down` persists prefs, which ticks every prefs watcher of this harness's backend.
+    match harness.round_trip(r#"{"cmd":"down"}"#).await {
+        Response::Ok { .. } => {}
+        other => panic!("down on an offline node must succeed, got {other:?}"),
+    }
+    let Response::Notify(pushed) = try_read_watch_status(&mut with_state, Duration::from_secs(5))
+        .await
+        .expect("a prefs change pushes a fresh prefs frame to the parked watcher")
+    else {
+        panic!("a masked watch streams Notify frames");
+    };
+    assert!(pushed.prefs.is_some());
+    assert_eq!(
+        pushed.session_id, None,
+        "no frame after the first repeats the id"
+    );
+    assert_eq!(pushed.version.as_deref(), Some(version));
+
+    drop((
+        with_state,
+        with_state_w,
+        other,
+        other_w,
+        prefs_only,
+        prefs_only_w,
+    ));
+    harness.shutdown_and_verify().await;
+}
