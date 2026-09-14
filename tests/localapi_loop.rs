@@ -830,6 +830,98 @@ async fn watch_redrives_on_lifecycle_bump_after_parking_on_down_node() {
     harness.shutdown_and_verify().await;
 }
 
+/// Open a masked watch with `request_line` and return the open halves plus its first `Notify` frame.
+async fn open_notify_stream(
+    socket_path: &std::path::Path,
+    request_line: &str,
+) -> (
+    tokio::net::unix::OwnedWriteHalf,
+    BufReader<tokio::net::unix::OwnedReadHalf>,
+    tailscaled_rs::localapi::NotifyView,
+) {
+    let stream = UnixStream::connect(socket_path)
+        .await
+        .expect("CLI connect to LocalAPI socket for notify watch");
+    let (read_half, mut write_half) = stream.into_split();
+    write_half
+        .write_all(format!("{request_line}\n").as_bytes())
+        .await
+        .expect("write watch request");
+    write_half.flush().await.expect("flush watch request");
+    let mut reader = BufReader::new(read_half);
+    let first = try_read_watch_status(&mut reader, Duration::from_secs(5))
+        .await
+        .expect("a masked watch front-loads its first frame promptly");
+    match first {
+        Response::Notify(view) => (write_half, reader, view),
+        other => panic!("expected a notify frame, got {other:?}"),
+    }
+}
+
+/// A masked watch names its session and its daemon, the way Go's `WatchNotificationsAs` does: the
+/// first frame of an `initial_state` watch carries a per-connection session id, no later frame
+/// repeats it, a second connection gets a different one, a watch without `initial_state` never gets
+/// one, and every frame carries the daemon version.
+#[tokio::test]
+async fn notify_watch_carries_session_id_on_first_frame_and_version_on_every_frame() {
+    let harness = Harness::start().await;
+    let version = Some(env!("CARGO_PKG_VERSION").to_string());
+    let with_state = r#"{"cmd":"watch","initial_state":true,"prefs":true}"#;
+
+    let (a_write, mut a_reader, a_first) =
+        open_notify_stream(&harness.socket_path, with_state).await;
+    assert!(
+        a_first.prefs.is_some(),
+        "the offline node front-loads prefs"
+    );
+    assert_eq!(a_first.version, version);
+    let a_id = a_first
+        .session_id
+        .clone()
+        .expect("the first frame of an initial_state watch carries the session id");
+    assert_eq!(a_id.len(), 16, "{a_id:?}");
+
+    let (b_write, b_reader, b_first) = open_notify_stream(&harness.socket_path, with_state).await;
+    let b_id = b_first
+        .session_id
+        .expect("second connection gets its own id");
+    assert_ne!(
+        a_id, b_id,
+        "a session id must not be shared across connections"
+    );
+
+    let (c_write, c_reader, c_first) =
+        open_notify_stream(&harness.socket_path, r#"{"cmd":"watch","prefs":true}"#).await;
+    assert_eq!(
+        c_first.session_id, None,
+        "without initial_state the id is not sent (Go's NotifyInitialState gate)"
+    );
+    assert_eq!(c_first.version, version);
+
+    // Move the prefs so connection A gets a second frame: it names the daemon again, not the session.
+    {
+        let mut be = harness.backend.lock().await;
+        let _pending = be
+            .begin_up(tailscaled_rs::ipn::UpOptions::default(), None)
+            .await
+            .expect("begin_up persists prefs offline (no engine)");
+    }
+    match try_read_watch_status(&mut a_reader, Duration::from_secs(5))
+        .await
+        .expect("a prefs change delivers a second frame")
+    {
+        Response::Notify(view) => {
+            assert!(view.prefs.is_some());
+            assert_eq!(view.session_id, None, "no later frame repeats the id");
+            assert_eq!(view.version, version);
+        }
+        other => panic!("expected a notify frame, got {other:?}"),
+    }
+
+    drop((a_write, a_reader, b_write, b_reader, c_write, c_reader));
+    harness.shutdown_and_verify().await;
+}
+
 /// 6. WATCH wake-edge invariant, unit-pinned: a fresh `watch_lifecycle()` subscriber observes the
 /// generation ADVANCE across the up path's bump — the observable wake edge the `finish_up` fix relies
 /// on. This is the narrow, engine-free assertion that pins the mechanism the fix builds on: that the
