@@ -369,9 +369,16 @@ fn down_over_tailscale_ssh_is_refused_unless_the_risk_is_accepted() {
         out.contains("To skip this warning, use --accept-risk=lose-ssh"),
         "expected Go's own hint sentence, on stdout: {out}"
     );
+    // Go's `main` prints the error with `fmt.Fprintln(os.Stderr, err)`: exactly the sentence, with
+    // no `Error: ` in front of it, so a script matching the whole line sees Go's line.
+    assert_eq!(
+        err, "aborted, no changes made\n",
+        "a declined risk must end in Go's errAborted, bare, so the operator reads that nothing changed"
+    );
+    // Piped stdin/stdout is not a terminal, so Go's `prompt.YesNo` asks nothing and aborts.
     assert!(
-        err.contains("aborted, no changes made"),
-        "a declined risk must end in Go's errAborted, so the operator reads that nothing changed: {err}"
+        !out.contains("Continue?"),
+        "no prompt without a terminal, as in Go: {out}"
     );
     // The warning is the command's output, not a diagnostic: `tnet down 2>/dev/null` must still
     // show it, and `> /dev/null` must not swallow the failure.
