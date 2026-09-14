@@ -565,6 +565,20 @@ pub enum Request {
         /// digits, `-` or `_`; 1-64 characters) that does not already name a profile.
         id: String,
     },
+    /// Switch to a new, empty profile — the first thing `tnet login` does, as Go's `tailscale login`
+    /// calls `LocalClient.SwitchToEmptyProfile` before it runs the login (`cmd/tailscale/cli/
+    /// login.go`). The profile the node was on is left alone, name and key included, so a following
+    /// `--nickname` names the profile being logged in rather than renaming the old one. A WRITE,
+    /// gated like [`SwitchProfile`](Request::SwitchProfile).
+    ///
+    /// The daemon picks the new id (Go's four-hex-digit `newUnusedID`). A current profile that holds
+    /// no node key is already empty in the sense Go means — Go never saves a profile that has not
+    /// logged in, and deletes one on logout — so the daemon stays on it and answers
+    /// `already on profile` instead of leaving a second empty profile behind.
+    ///
+    /// Its own command for the reason [`CreateProfile`](Request::CreateProfile) is: a daemon that
+    /// predates it answers `bad request`, and `login` stops there with nothing renamed.
+    SwitchToEmptyProfile,
     /// Delete a profile (Go `tailscale switch remove`). The target may be an id or a display name,
     /// like [`SwitchProfile`](Request::SwitchProfile). Refuses a target that matches no known profile
     /// (Go: `No profile named %q`) and the reserved `default` profile. Naming the profile that is
@@ -2763,6 +2777,15 @@ mod tests {
             Request::CreateProfile { id } => assert_eq!(id, "work"),
             other => panic!("expected CreateProfile, got {other:?}"),
         }
+        // `login`'s switch to an empty profile carries nothing: the daemon chooses the id.
+        assert_eq!(
+            serde_json::to_string(&Request::SwitchToEmptyProfile).unwrap(),
+            r#"{"cmd":"switch_to_empty_profile"}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<Request>(r#"{"cmd":"switch_to_empty_profile"}"#).unwrap(),
+            Request::SwitchToEmptyProfile
+        ));
         // A `create` key on a switch is NOT a creation: `SwitchProfile` models no such field, so it
         // deserializes as the plain switch it reads as, and the daemon refuses an unknown target.
         match serde_json::from_str::<Request>(
