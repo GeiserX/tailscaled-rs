@@ -14441,20 +14441,16 @@ fn validate_kube_fqdn(fqdn: &str) -> Result<()> {
 ///
 /// Refuses (Go's `errInvalidKubeconfig`) a document that does not parse, or that is not an
 /// `apiVersion: v1` / `kind: Config` mapping. That refusal is what keeps a merge from turning into a
-/// silent overwrite of a file this build did not understand.
+/// silent overwrite of a file this build did not understand. The error is Go's text and nothing
+/// else, `invalid kubeconfig`, and [`set_kubeconfig_for_peer`] passes it on unwrapped as Go does.
 ///
 /// `scheme` is Go's `"https://"` / `"http://"` (see [`kube_scheme`] and [`kubeconfig_inputs`]). The
 /// caller has already run [`validate_kube_fqdn`], so the name is a plain DNS name.
 fn update_kubeconfig(cfg_yaml: &str, scheme: &str, fqdn: &str) -> Result<String> {
     use serde_json::{Map, Value, json};
 
-    let invalid = || {
-        anyhow!(
-            "configure kubeconfig: invalid kubeconfig — it is not an `apiVersion: v1` / `kind: \
-             Config` YAML document. Refusing to touch it (Go refuses the same way): merging into a \
-             file this build cannot read would mean overwriting it."
-        )
-    };
+    // Go: `var errInvalidKubeconfig = errors.New("invalid kubeconfig")`.
+    let invalid = || anyhow!("invalid kubeconfig");
     // Go unmarshals into a `map[string]any` and treats a nil map (empty input, or a document that is
     // only comments / an explicit `null`) as "start a fresh config"; anything that is not a mapping
     // fails to unmarshal at all.
@@ -14834,18 +14830,32 @@ fn set_kubeconfig_for_peer(scheme: &str, fqdn: &str, path: &str) -> Result<()> {
             }
         }
     }
-    let existing = match std::fs::read(p) {
-        Ok(b) => String::from_utf8(b).map_err(|_| {
-            anyhow!(
-                "configure kubeconfig: {path} is not valid UTF-8, so it is not a kubeconfig this \
-                 build can merge into. Refusing to overwrite it."
-            )
-        })?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e).with_context(|| format!("reading kubeconfig {path}")),
+    // Go: `os.ReadFile` then `fmt.Errorf("reading kubeconfig: %w", err)`. ReadFile's error is the
+    // `*os.PathError` of whichever syscall failed, so the open and the read are kept apart here to
+    // name the right one: a `$KUBECONFIG` that is a directory opens fine and fails at `read`.
+    let read_err = |op: &str, e: &std::io::Error| {
+        anyhow!(
+            "reading kubeconfig: {op} {}: {}",
+            sanitize_for_terminal(path),
+            go_io_error_text(e)
+        )
     };
-    let merged = update_kubeconfig(&existing, scheme, fqdn)
-        .with_context(|| format!("merging the auth-proxy cluster into {path}"))?;
+    let existing = match std::fs::File::open(p) {
+        Ok(mut f) => {
+            let mut b = Vec::new();
+            std::io::Read::read_to_end(&mut f, &mut b).map_err(|e| read_err("read", &e))?;
+            // Go hands the bytes straight to `updateKubeconfig`, whose YAML decoder fails on an
+            // invalid UTF-8 sequence (`invalid leading UTF-8 octet`) and maps that, like every
+            // unmarshal failure, to `errInvalidKubeconfig`. This check stands in for that failure,
+            // so the words are the same.
+            String::from_utf8(b).map_err(|_| anyhow!("invalid kubeconfig"))?
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(read_err("open", &e)),
+    };
+    // Go: `b, err = updateKubeconfig(b, scheme, fqdn); if err != nil { return err }` — returned
+    // bare, so a malformed file reads `invalid kubeconfig` and nothing more.
+    let merged = update_kubeconfig(&existing, scheme, fqdn)?;
     // Go: `os.WriteFile(filePath, b, 0600)`. The mode applies on creation; an existing file keeps
     // whatever mode it had, so this never loosens a kubeconfig the user tightened.
     let mut f = std::fs::OpenOptions::new()
@@ -24325,16 +24335,10 @@ users:
         // overwriting: a merge that cannot read the file would replace it and lose every cluster.
         let err = update_kubeconfig("apiVersion: v1\nkind: ,asdf", "https://", "foo.example.com")
             .expect_err("invalid YAML must not be merged into");
-        assert!(
-            err.to_string().contains("invalid kubeconfig"),
-            "unhelpful refusal: {err}"
-        );
+        assert_eq!(format!("{err:#}"), "invalid kubeconfig", "Go's exact words");
         let err = update_kubeconfig("apiVersion: v1\nkind: Pod", "https://", "foo.example.com")
             .expect_err("a non-kubeconfig document must not be merged into");
-        assert!(
-            err.to_string().contains("invalid kubeconfig"),
-            "unhelpful refusal: {err}"
-        );
+        assert_eq!(format!("{err:#}"), "invalid kubeconfig", "Go's exact words");
         // A YAML mapping that is not a kubeconfig at all (no apiVersion/kind) is refused too — Go
         // compares the missing keys against "v1"/"Config" and they are unequal.
         assert!(
@@ -24400,13 +24404,25 @@ users:
         std::fs::write(&path, "not: a kubeconfig\n").unwrap();
         let err = set_kubeconfig_for_peer("https://", "foo.tail-scale.ts.net", &path_str)
             .expect_err("an unreadable kubeconfig must not be overwritten");
-        assert!(
-            format!("{err:#}").contains("invalid kubeconfig"),
-            "unhelpful refusal: {err:#}"
-        );
+        // Go's `setKubeconfigForPeer` returns `updateKubeconfig`'s error bare: no path, no wrapper.
+        assert_eq!(format!("{err:#}"), "invalid kubeconfig");
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "not: a kubeconfig\n",
+            "a refused merge must not have touched the file"
+        );
+
+        // Bytes that are not UTF-8 are a malformed file too: Go's YAML decoder fails on them and
+        // `updateKubeconfig` says `invalid kubeconfig`. (Not a `\xff\xfe` start — goyaml reads that
+        // as a UTF-16 byte-order mark and decodes it.)
+        let not_utf8: &[u8] = b"apiVersion: v1\n\x80\n";
+        std::fs::write(&path, not_utf8).unwrap();
+        let err = set_kubeconfig_for_peer("https://", "foo.tail-scale.ts.net", &path_str)
+            .expect_err("a kubeconfig that is not UTF-8 must not be overwritten");
+        assert_eq!(format!("{err:#}"), "invalid kubeconfig");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            not_utf8,
             "a refused merge must not have touched the file"
         );
 
@@ -24603,6 +24619,40 @@ users:
             );
         }
         std::fs::set_permissions(&nostat, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        // A kubeconfig that exists but cannot be read. Go: `reading kubeconfig: %w` around
+        // `os.ReadFile`'s `*os.PathError`, which names the syscall that failed.
+        let wo = root.join("writeonly");
+        std::fs::write(&wo, "apiVersion: v1\nkind: Config\n").unwrap();
+        std::fs::set_permissions(&wo, std::fs::Permissions::from_mode(0o200)).unwrap();
+        if std::fs::File::open(&wo).is_err() {
+            let err =
+                set_kubeconfig_for_peer("https://", "foo.tail-scale.ts.net", wo.to_str().unwrap())
+                    .expect_err("an unreadable kubeconfig is a refusal");
+            assert_eq!(
+                format!("{err:#}"),
+                format!(
+                    "reading kubeconfig: open {}: permission denied",
+                    wo.display()
+                )
+            );
+        }
+        std::fs::set_permissions(&wo, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        // A kubeconfig path that is a directory opens, then fails at the read — so Go's error names
+        // `read`, not `open`. Root cannot read a directory either, so this runs everywhere.
+        let isdir = root.join("isdir");
+        std::fs::create_dir(&isdir).unwrap();
+        let err =
+            set_kubeconfig_for_peer("https://", "foo.tail-scale.ts.net", isdir.to_str().unwrap())
+                .expect_err("a directory is not a kubeconfig");
+        assert_eq!(
+            format!("{err:#}"),
+            format!(
+                "reading kubeconfig: read {}: is a directory",
+                isdir.display()
+            )
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
