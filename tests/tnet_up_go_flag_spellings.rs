@@ -11,7 +11,11 @@
 //! flag set for both `up` and `login` and registers `--nickname` inside `if cmd == "login"`, so
 //! `tailscale up --nickname` is a usage error upstream too — profile naming lives on `login` and on
 //! `set`. It is exercised on `up` here only because operators reach for it there anyway, and the
-//! fork answers it by name instead of leaving them clap's "unexpected argument".
+//! fork answers it by name instead of leaving them clap's "unexpected argument" — at Go's own exit
+//! status, because Go decides it in `flag.Parse` (`newFlagSet` uses `flag.ExitOnError`, so an
+//! unregistered flag exits 2). Same for `--host-routes=false`, which `notFalseVar.Set` fails inside
+//! the same `flag.Parse`. A refusal that said the right thing at the wrong status would still break
+//! a wrapper script that branches on one.
 //!
 //! One flag set means one flag surface to guard: because `newUpFlagSet` is shared, whatever `up`
 //! owes Go's spellings, `login` owes too — `--auth-key` and `--host-routes` from the unconditional
@@ -33,9 +37,13 @@
 use std::process::Command;
 use std::process::Output;
 
-/// The flags Go's `newUpFlagSet` registers on `up` unconditionally, in the spellings a ported
-/// command line carries: `--auth-key` (up.go:102), `--login-server` (up.go:108) and the hidden
-/// `notFalseVar` `--host-routes` (up.go:111).
+/// The three `up` spellings this fork had to grow, not the whole of `newUpFlagSet`: `--auth-key`
+/// (up.go:102), `--login-server` (up.go:108) and the hidden `notFalseVar` `--host-routes`
+/// (up.go:111) are the flags Go registers on `up` that this fork spelled differently or did not
+/// carry at all. `newUpFlagSet` registers many more unconditionally (`--accept-routes`,
+/// `--accept-dns`, `--exit-node`, `--shields-up`, `--hostname`, `--advertise-routes`, `--timeout`,
+/// …); those already parse under Go's own names and are guarded where they are implemented, so
+/// listing them here would say this file checks more than it does.
 const GO_UP_FLAGS: [&str; 3] = ["--auth-key", "--login-server", "--host-routes"];
 
 /// The flag `newUpFlagSet` registers only under `if cmd == "login"`, so it is on Go's `login` and
@@ -101,9 +109,10 @@ fn declared_flag(line: &str) -> Option<String> {
 #[test]
 fn tnet_up_takes_each_go_up_flag_spelling() {
     // The defect this guards against returning: a command line copied from Go dying at argument
-    // parsing. Every flag Go registers on `up` must get past clap. Each is given the argument
-    // shape Go gives it — `--host-routes` is Go's `notFalseVar`, a bool flag that never consumes
-    // the next argument.
+    // parsing. Each of the three spellings in `GO_UP_FLAGS` — not every flag `newUpFlagSet`
+    // registers, only the ones this fork had to grow — must get past clap. Each is given the
+    // argument shape Go gives it: `--host-routes` is Go's `notFalseVar`, a bool flag that never
+    // consumes the next argument.
     for flag in GO_UP_FLAGS {
         let argv: Vec<&str> = if flag == "--host-routes" {
             vec!["up", flag]
@@ -134,6 +143,13 @@ fn host_routes_carries_gos_only_true_is_allowed_refusal() {
     assert!(
         !out.status.success(),
         "`tnet up --host-routes=false` should fail the way Go's notFalseVar does"
+    );
+    // `notFalseVar.Set` fails inside `flag.Parse`, and `newFlagSet` asks for `flag.ExitOnError`, so
+    // upstream prints and exits 2. Exiting 1 would report a flag-parse failure as a run that ran.
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "`tnet up --host-routes=false` is refused in Go's flag parser, which exits 2; got: {stderr}"
     );
     assert!(
         stderr.contains("only 'true' is allowed"),
@@ -182,19 +198,24 @@ fn nickname_is_distinguished_from_the_flags_that_are_only_renames() {
     let out = tnet(&["up", GO_LOGIN_ONLY_FLAG, "work-laptop"]);
     let refusal = String::from_utf8_lossy(&out.stderr).into_owned();
     // Refused, but on this fork's terms rather than clap's: the operator gets told where profile
-    // naming lives, not "unexpected argument". The status check states the intent — `up` must never
-    // grow a working `--nickname`, since Go's has none to match — though with no daemon reachable
-    // here it is the message assertions below that actually discriminate: drop the refusal and the
-    // command fails on the socket instead, with none of this text.
+    // naming lives, not "unexpected argument". With no daemon reachable here it is the message
+    // assertions that discriminate a refusal from a socket failure — drop the refusal and the
+    // command dies on the socket instead, with none of this text.
     assert!(
         !out.status.success(),
         "`tnet up --nickname` must fail: accepting it would give `up` behaviour upstream's `up` \
          does not have; got: {refusal}"
     );
-    assert_ne!(
+    // Upstream's answer to `tailscale up --nickname` comes out of `flag.Parse`: the flag is not in
+    // `up`'s set, and `newFlagSet` asks for `flag.ExitOnError`, so Go prints `flag provided but not
+    // defined: -nickname` and exits 2. Only the sentence is this fork's; the status is Go's, and
+    // exiting 1 here would tell a wrapper script the command ran when it never parsed. That the
+    // refusal is ours and not clap's is what the message assertions below establish.
+    assert_eq!(
         out.status.code(),
         Some(2),
-        "`tnet up --nickname` should be refused by name, not by clap; got: {refusal}"
+        "`tnet up --nickname` should exit 2, the status Go's flag parser gives a flag it does not \
+         register; got: {refusal}"
     );
     assert!(
         !refusal.contains("unexpected argument"),
@@ -225,9 +246,10 @@ fn nickname_is_distinguished_from_the_flags_that_are_only_renames() {
 
 #[test]
 fn tnet_login_takes_each_flag_gos_shared_flag_set_gives_it() {
-    // The same defect as `tnet_up_takes_each_go_up_flag_spelling`, one command over: `login` reads
-    // its flags off `newUpFlagSet` too, so `tailscale login --auth-key=…`, `--host-routes` and
-    // `--nickname` all parse upstream and must parse here rather than exiting 2.
+    // The same defect as `tnet_up_takes_each_go_up_flag_spelling`, one command over, and over the
+    // same three spellings rather than the whole shared flag set: `login` reads its flags off
+    // `newUpFlagSet` too, so `tailscale login --auth-key=…`, `--host-routes` and `--nickname` all
+    // parse upstream and must parse here rather than exiting 2.
     for flag in GO_LOGIN_FLAGS {
         let argv: Vec<&str> = if flag == "--host-routes" {
             vec!["login", flag]
@@ -257,6 +279,12 @@ fn login_host_routes_carries_the_same_refusal_up_does() {
     assert!(
         !out.status.success(),
         "`tnet login --host-routes=false` should fail the way Go's notFalseVar does"
+    );
+    // One flag set, one refusal, one exit status: `flag.ExitOnError` is set for `login` too.
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "`tnet login --host-routes=false` is refused in Go's flag parser, which exits 2; got:          {stderr}"
     );
     assert!(
         stderr.contains("only 'true' is allowed"),

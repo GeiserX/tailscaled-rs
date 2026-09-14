@@ -130,7 +130,8 @@ Go's hidden `--host-routes` is accepted and does nothing — it has had to be `t
 1.67, and this build's userspace netstack installs no host routes at all — while `--host-routes=false`
 is refused with Go's own "only 'true' is allowed". `up --nickname` is refused by name, pointing at
 `tnet set --nickname`: no `up` names a login profile, in this fork or in Go, which registers
-`--nickname` on `set` and `login` only.
+`--nickname` on `set` and `login` only. Both refusals exit **2**, the status Go's flag package gives
+a parse failure — upstream decides both inside `flag.Parse`, so only the sentence is this fork's.
 
 `tnet set` (Go `tailscale set`) adjusts policy prefs on an already-running node. Changing
 `--exit-node`, `--hostname`, `--accept-routes`, `--advertise-routes`, or `--advertise-exit-node`
