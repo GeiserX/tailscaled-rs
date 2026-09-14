@@ -238,6 +238,124 @@ async fn try_read_watch_status(
     }
 }
 
+/// `initial_status` (Go `NotifyInitialStatus`): a masked watch that sets only this bit takes the
+/// Notify path (not the legacy bare-watch status stream), and its first frame is a `NotifyView`
+/// whose `initial_status` is the very report a one-shot `status` returns — nothing else populated.
+#[tokio::test]
+async fn initial_status_watch_front_loads_the_status_report() {
+    let harness = Harness::start().await;
+
+    let expected = match harness.round_trip(r#"{"cmd":"status"}"#).await {
+        Response::Status(report) => report,
+        other => panic!("expected Response::Status, got {other:?}"),
+    };
+
+    let (_write, mut reader) =
+        open_masked_watch(&harness, b"{\"cmd\":\"watch\",\"initial_status\":true}\n").await;
+    let view = read_notify(&mut reader, "the initial_status front-load").await;
+    assert_eq!(
+        view.initial_status.as_deref(),
+        Some(&expected),
+        "the watch snapshot must be the same report `status` returns"
+    );
+    assert!(
+        view.state.is_none()
+            && view.error.is_none()
+            && view.browse_to_url.is_none()
+            && view.net_map.is_none()
+            && view.prefs.is_none()
+            && view.policy.is_none(),
+        "the status frame carries only the snapshot, got {view:?}"
+    );
+    // Without `initial_state` there is no session id; the version is stamped on it like any frame.
+    assert_eq!(view.session_id, None);
+    assert!(
+        view.version.is_some(),
+        "every notify frame names the version"
+    );
+    // The snapshot is sent once: with nothing changing, no second frame follows.
+    assert!(
+        try_read_watch_status(&mut reader, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "the initial status must not be repeated"
+    );
+
+    harness.shutdown_and_verify().await;
+}
+
+/// The snapshot is the FIRST frame of the stream, ahead of the other daemon-built front-loads —
+/// Go's `NotifyInitialStatus` rides on the session's first Notify — and a watch that did not set
+/// the bit never receives one.
+#[tokio::test]
+async fn initial_status_is_first_and_only_sent_when_asked_for() {
+    let harness = Harness::start().await;
+
+    let (_write, mut reader) = open_masked_watch(
+        &harness,
+        b"{\"cmd\":\"watch\",\"prefs\":true,\"policy\":true,\"initial_status\":true}\n",
+    )
+    .await;
+    let mut views = Vec::with_capacity(3);
+    for what in [
+        "the status front-load",
+        "the prefs front-load",
+        "the policy front-load",
+    ] {
+        views.push(read_notify(&mut reader, what).await);
+    }
+    assert!(
+        views[0].initial_status.is_some(),
+        "the first frame must carry the initial status, got {:?}",
+        views[0]
+    );
+    assert!(
+        views[1].prefs.is_some() && views[2].policy.is_some(),
+        "prefs and policy front-loads follow the snapshot, got {views:?}"
+    );
+    assert!(
+        views[1..].iter().all(|v| v.initial_status.is_none()),
+        "only the first frame carries the snapshot"
+    );
+
+    // Without the bit: the same front-loads, and no snapshot anywhere.
+    let (_write, mut reader) = open_masked_watch(
+        &harness,
+        b"{\"cmd\":\"watch\",\"prefs\":true,\"policy\":true}\n",
+    )
+    .await;
+    for what in ["the prefs front-load", "the policy front-load"] {
+        let view = read_notify(&mut reader, what).await;
+        assert!(
+            view.initial_status.is_none(),
+            "a watch that did not ask for the snapshot must not get one, got {view:?}"
+        );
+    }
+
+    // With `initial_state` as well, the session id rides the snapshot — the first frame written —
+    // and is not repeated on the prefs frame that follows (Go puts `SessionID` on the same first
+    // Notify that carries `InitialStatus`).
+    let (_write, mut reader) = open_masked_watch(
+        &harness,
+        b"{\"cmd\":\"watch\",\"initial_state\":true,\"prefs\":true,\"initial_status\":true}\n",
+    )
+    .await;
+    let first = read_notify(&mut reader, "the status front-load").await;
+    assert!(
+        first.initial_status.is_some(),
+        "the snapshot is still first: {first:?}"
+    );
+    assert!(
+        first.session_id.is_some(),
+        "the session id rides the first frame written, here the snapshot: {first:?}"
+    );
+    let next = read_notify(&mut reader, "the prefs front-load").await;
+    assert!(next.prefs.is_some(), "prefs follows the snapshot: {next:?}");
+    assert_eq!(next.session_id, None, "the id is not repeated");
+
+    harness.shutdown_and_verify().await;
+}
+
 /// 1. status round-trip: a fresh, never-configured node reports an unauthenticated, not-running
 ///    snapshot, and the server shuts down cleanly (socket removed).
 #[tokio::test]
