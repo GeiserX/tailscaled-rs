@@ -39,6 +39,21 @@ fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
+/// Whether Go's macOS root check fires for this test run: a `tun` build on macOS, not running as
+/// root. Go runs that check before `createEngine` sees the value, so while it fires, every `--tun`
+/// value that does not mention `userspace-networking` gets the root line instead of its own refusal.
+/// Tests of those per-value refusals step aside then;
+/// `a_non_root_macos_device_is_refused_with_gos_single_line` covers that case.
+fn macos_root_line_applies() -> bool {
+    #[cfg(all(feature = "tun", target_os = "macos"))]
+    // SAFETY: `geteuid()` takes no arguments, has no preconditions and cannot fail.
+    unsafe {
+        libc::geteuid() != 0
+    }
+    #[cfg(not(all(feature = "tun", target_os = "macos")))]
+    false
+}
+
 /// The flag is on `tailnetd`'s own surface (clap's `--help`), so a command line copied from a unit
 /// file reaches the daemon instead of "unexpected argument".
 #[test]
@@ -121,11 +136,32 @@ fn a_device_name_without_the_tun_feature_refuses_by_name() {
     );
 }
 
+/// On macOS Go refuses a non-root `tailscaled` with ONE line and nothing else on stderr:
+/// `log.SetFlags(0)` + `log.Fatalf("tailscaled requires root; use sudo tailscaled (or use
+/// --tun=userspace-networking)")`. The daemon must print that line with the product name swapped and
+/// no `error:` prefix, so a script matching Go's line matches this one. Run as root, the check does not
+/// apply, so the test has nothing to assert.
+#[test]
+fn a_non_root_macos_device_is_refused_with_gos_single_line() {
+    if !macos_root_line_applies() {
+        return;
+    }
+    let out = tailnetd(&["--tun=utun"]);
+    assert_eq!(out.status.code(), Some(1), "stderr:\n{}", stderr(&out));
+    assert_eq!(
+        stderr(&out),
+        "tailnetd requires root; use sudo tailnetd (or use --tun=userspace-networking)\n"
+    );
+}
+
 /// Go's `tap:TAPNAME[:BRIDGENAME]` is a layer-2 device the engine has no transport for. It is
 /// refused with that reason — never silently downgraded to the netstack, which would leave a bridge
 /// that was asked for and never built.
 #[test]
 fn tap_is_refused_with_a_named_reason() {
+    if macos_root_line_applies() {
+        return;
+    }
     let out = tailnetd(&["--tun=tap:tap0:br0"]);
     assert_eq!(
         out.status.code(),
@@ -149,6 +185,9 @@ fn tap_is_refused_with_a_named_reason() {
 /// sentence and all.
 #[test]
 fn an_empty_tun_value_is_gos_error() {
+    if macos_root_line_applies() {
+        return;
+    }
     let out = tailnetd(&["--tun="]);
     assert_eq!(
         out.status.code(),

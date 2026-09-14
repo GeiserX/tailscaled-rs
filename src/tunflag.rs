@@ -71,6 +71,22 @@
 /// remedy every refusal below points at, and the value packaged units pass.
 pub const USERSPACE_NETWORKING: &str = "userspace-networking";
 
+/// Go's macOS privilege refusal, word for word with the product name swapped: Go prints
+/// `tailscaled requires root; use sudo tailscaled (or use --tun=userspace-networking)` through
+/// `log.Fatalf` after `log.SetFlags(0)`, so this is the whole line an operator (or a script) sees.
+pub const DARWIN_REQUIRES_ROOT: &str =
+    "tailnetd requires root; use sudo tailnetd (or use --tun=userspace-networking)";
+
+/// Whether this platform refuses a kernel TUN interface to this process before trying to open one.
+///
+/// That is true on darwin for a non-root process and nowhere else. Off darwin Go does not pre-judge
+/// privilege: the device open decides, so a process with `CAP_NET_ADMIN` and a non-zero uid gets its
+/// TUN. Both the `--tun` flag and the `tun_enabled` pref ([`crate::ipn`]'s `build_config`) use this
+/// test, so the flag and the pref cannot disagree.
+pub fn kernel_tun_refused_before_open(goos: &str, euid: u32) -> bool {
+    goos == "darwin" && euid != 0
+}
+
 /// The data path a `--tun` value resolved to — the daemon's two transports, which is what Go's
 /// `tryEngine` reduces its `name` to as well (`onlyNetstack = name == "userspace-networking"`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,7 +115,7 @@ pub fn resolve(value: &str, goos: &str) -> Result<TunTransport, String> {
 /// This process's effective uid on unix; `0` elsewhere (Windows has no euid, and its TUN adapter is
 /// gated by service privileges this daemon does not model — so the root condition is simply not a
 /// reason to reject a candidate there).
-fn euid() -> u32 {
+pub(crate) fn euid() -> u32 {
     #[cfg(unix)]
     // SAFETY: `geteuid()` takes no arguments, has no preconditions and cannot fail.
     unsafe {
@@ -134,6 +150,22 @@ pub fn resolve_with(
     goos: &str,
     euid: u32,
 ) -> Result<TunTransport, String> {
+    // Go's macOS root check, run where Go runs it: over the WHOLE flag value, in `main`, before
+    // `createEngine` looks at a single candidate (so before the empty-value check too). It is a
+    // single bare line with nothing wrapped around it, because Go `log.Fatalf`s it after
+    // `log.SetFlags(0)`. A value that mentions `userspace-networking` anywhere skips it, as Go's
+    // `strings.Contains` does, and the per-candidate test in `candidate` then passes over the device
+    // so the list falls back instead. `--cleanup` never gets here (`tailnetd` skips `--tun`
+    // resolution under it), which is Go's `!args.cleanUp`.
+    //
+    // A build without the `tun` feature is left to `candidate`: it has no kernel TUN at all, so
+    // "use sudo" would send the operator after a remedy that cannot work.
+    if tun_feature
+        && kernel_tun_refused_before_open(goos, euid)
+        && !value.contains(USERSPACE_NETWORKING)
+    {
+        return Err(DARWIN_REQUIRES_ROOT.to_string());
+    }
     // Go `createEngine`. An explicitly empty `--tun=` is NOT "use the default": Go's flag default is
     // already gone by then (the operator overrode it with the empty string), so it is an error.
     if value.is_empty() {
@@ -199,24 +231,19 @@ fn candidate(name: &str, tun_feature: bool, goos: &str, euid: u32) -> Result<Tun
                 .to_string(),
         );
     }
-    // Go's ONE early privilege check, and it is macOS-only: `runtime.GOOS == "darwin" &&
-    // os.Getuid() != 0 && !strings.Contains(args.tunname, "userspace-networking") && !args.cleanUp`
-    // → `log.Fatalf("tailscaled requires root; use sudo tailscaled (or use
-    // --tun=userspace-networking)")`. Deciding it per candidate (rather than over the whole flag
-    // value, as Go's `strings.Contains` does) reaches the same place: a darwin operator who wrote
-    // `tailscale0,userspace-networking` still lands on the netstack, because the device candidate is
-    // passed over and the next one wins — which is what Go's fallback loop does after the open fails.
+    // Go's ONE early privilege check, and it is macOS-only. `resolve_with` has already run it over
+    // the whole value; reaching here as non-root on darwin means the value mentions
+    // `userspace-networking`, so Go skipped the check and let `tryEngine`'s open fail for this
+    // candidate. That open would fail, so this candidate is passed over and the loop falls back,
+    // just as Go's does: `utun,userspace-networking` lands on the netstack.
     //
     // Off darwin there is deliberately no test. Go does not pre-judge privilege there; `tryEngine`
     // opens the device and only fails if the open fails, so a daemon with `CAP_NET_ADMIN` but a
     // non-zero uid — the ordinary container and hardened-unit setup — brings its TUN up. A uid test
     // here would refuse that host for a device it can actually create, and would name a capability it
     // never looked at. The open is the authority; this resolver's job is to get out of its way.
-    if goos == "darwin" && euid != 0 {
-        return Err(format!(
-            "creating a kernel TUN interface on macOS requires root; use sudo tailnetd (or use \
-             --tun={USERSPACE_NETWORKING})"
-        ));
+    if kernel_tun_refused_before_open(goos, euid) {
+        return Err(DARWIN_REQUIRES_ROOT.to_string());
     }
     // macOS: bare `utun` is Go's "any free unit number" (`defaultTunName`'s darwin case), and it is
     // NOT a literal interface name — `tun-rs` parses the trailing digits as the unit and rejects an
@@ -365,26 +392,66 @@ mod tests {
         }
     }
 
-    /// Go's one early privilege refusal is macOS-only — `tailscaled requires root; use sudo
-    /// tailscaled (or use --tun=userspace-networking)` — so a non-root darwin host is refused here
-    /// too, in Go's words. It must not claim to have tested a capability: `CAP_NET_ADMIN` does not
-    /// exist on macOS, and no uid test is a capability test anywhere.
+    /// Go's one early privilege refusal is macOS-only and is ONE bare line:
+    /// `log.Fatalf("tailscaled requires root; use sudo tailscaled (or use --tun=userspace-networking)")`
+    /// after `log.SetFlags(0)`. The refusal must be exactly that line with the product name swapped.
+    /// It must not be wrapped in a `--tun "<name>":` prefix or followed by a remedy paragraph, or a
+    /// script matching Go's line stops matching.
     #[test]
-    fn a_device_name_as_non_root_on_darwin_says_root_and_names_the_remedy() {
-        let err = resolve_with("tailscale0", true, "darwin", 501)
-            .expect_err("macOS refuses a kernel TUN device to a non-root process");
+    fn a_device_name_as_non_root_on_darwin_is_gos_single_line() {
+        for value in ["tailscale0", "utun", "utun,tailscale0", "tap:tap0"] {
+            assert_eq!(
+                resolve_with(value, true, "darwin", 501),
+                Err(
+                    "tailnetd requires root; use sudo tailnetd (or use --tun=userspace-networking)"
+                        .to_string()
+                ),
+                "--tun={value:?} as non-root on darwin"
+            );
+        }
+    }
+
+    /// Go runs its darwin check in `main`, before `createEngine`'s `no --tun value specified`, so a
+    /// non-root macOS process with an empty `--tun=` gets the root line, not the empty-value one.
+    #[test]
+    fn the_darwin_root_line_comes_before_the_empty_value_refusal() {
+        assert_eq!(
+            resolve_with("", true, "darwin", 501),
+            Err(DARWIN_REQUIRES_ROOT.to_string())
+        );
+        assert_eq!(
+            resolve_with("", true, "darwin", 0),
+            Err("no --tun value specified".to_string()),
+            "as root the check does not fire and createEngine's own refusal stands"
+        );
+    }
+
+    /// A build with no kernel-TUN transport is refused for the missing feature on darwin too.
+    /// Telling that operator to use sudo would point at a remedy that cannot work.
+    #[test]
+    fn a_non_root_darwin_build_without_tun_names_the_feature_not_root() {
+        let err = resolve_with("utun", false, "darwin", 501).expect_err("no kernel TUN here");
         assert!(
-            err.contains("requires root"),
-            "should say root is required; got:\n{err}"
+            err.contains("`tun` cargo feature"),
+            "should name the missing feature; got:\n{err}"
         );
         assert!(
-            err.contains(&format!("--tun={USERSPACE_NETWORKING}")),
-            "should name Go's remedy; got:\n{err}"
+            !err.contains("requires root"),
+            "must not send the operator to sudo for a transport not in the binary; got:\n{err}"
         );
-        assert!(
-            !err.contains("CAP_NET_ADMIN"),
-            "must not name a capability nothing here tested; got:\n{err}"
-        );
+    }
+
+    /// The privilege test shared with `build_config` fires on darwin for a non-root process only.
+    #[test]
+    fn kernel_tun_is_refused_before_open_only_on_non_root_darwin() {
+        assert!(kernel_tun_refused_before_open("darwin", 501));
+        assert!(!kernel_tun_refused_before_open("darwin", 0));
+        for goos in ["linux", "freebsd", "openbsd", "windows"] {
+            assert!(
+                !kernel_tun_refused_before_open(goos, 1000),
+                "{goos}: the device open decides, as in Go's tryEngine"
+            );
+        }
     }
 
     /// Off darwin, Go does not pre-judge privilege at all: `createEngine` calls `tryEngine`, which

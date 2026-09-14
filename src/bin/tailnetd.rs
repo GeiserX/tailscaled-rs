@@ -392,7 +392,7 @@ async fn run(applied_env: Option<tailscaled_rs::envknob::Applied>) -> Result<()>
         Some(value) => match tailscaled_rs::tunflag::resolve(value, goos()) {
             Ok(transport) => Some(transport),
             Err(e) => {
-                eprintln!("error: {e}");
+                eprintln!("{e}");
                 std::process::exit(1);
             }
         },

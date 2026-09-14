@@ -156,7 +156,8 @@ pub(super) async fn build_config(
     }
     // TUN-mode data path. Default is the engine's userspace netstack (unprivileged); TUN hands
     // packets to a real kernel interface, which needs (a) a daemon built with the `tun` cargo
-    // feature [`tailscale/tun`] and (b) root / CAP_NET_ADMIN. We preflight both and FAIL LOUDLY
+    // feature [`tailscale/tun`] and (b) root / CAP_NET_ADMIN. We preflight (a) everywhere and (b)
+    // only on macOS, where it is a plain uid test (see `tun_privilege_preflight`), and FAIL LOUDLY
     // — never silently downgrade to netstack, because the operator asked for OS-wide
     // connectivity and a silent fallback would be a confusing, hard-to-notice half-working state.
     if prefs.tun_enabled {
@@ -169,17 +170,9 @@ pub(super) async fn build_config(
         }
         #[cfg(feature = "tun")]
         {
-            // Privilege preflight: the engine's TUN transport errors `RootUserRequired` without
-            // root; surface that here with actionable context before the handshake starts.
-            #[cfg(unix)]
-            // SAFETY: geteuid() is infallible (no args, no preconditions).
-            if unsafe { libc::geteuid() } != 0 {
-                return Err(anyhow!(
-                    "TUN mode requires root / CAP_NET_ADMIN to create the kernel TUN interface, \
-                     but the daemon is not running as root. Run tailnetd as root (the packaged \
-                     systemd/launchd units do) or use the default userspace-networking mode"
-                ));
-            }
+            // Privilege preflight, macOS only. See `tun_privilege_preflight` for why there is no
+            // uid test anywhere else.
+            tun_privilege_preflight(super::captive::goos(), crate::tunflag::euid())?;
             // Select the kernel-TUN transport. The engine (v0.6.7+) re-exports `TransportMode`
             // and `TunConfig` from the facade, so the daemon can construct the value directly.
             //
@@ -263,10 +256,73 @@ pub(super) async fn build_config(
     Ok(config)
 }
 
+/// The TUN-mode privilege preflight, decided from `goos` (Go's `runtime.GOOS` spelling) and the
+/// process's effective uid.
+///
+/// Only macOS is refused here. It is the one platform where Go pre-judges privilege
+/// (`cmd/tailscaled/tailscaled.go`: `runtime.GOOS == "darwin" && os.Getuid() != 0`). Everywhere else
+/// Go's `tryEngine` opens the device and the open decides. The engine does the same: its TUN transport
+/// returns `RootUserRequired` only when the open itself is denied. A Linux daemon with a non-zero uid
+/// that holds `CAP_NET_ADMIN` (a hardened systemd unit's `AmbientCapabilities=CAP_NET_ADMIN`, or a
+/// container) can create the interface, and a uid test here would refuse it a device it can open.
+#[cfg_attr(not(feature = "tun"), allow(dead_code))]
+fn tun_privilege_preflight(goos: &str, euid: u32) -> Result<()> {
+    if crate::tunflag::kernel_tun_refused_before_open(goos, euid) {
+        return Err(anyhow!(
+            "TUN mode on macOS requires root to create the utun interface, but the daemon is not \
+             running as root. Run tailnetd as root (sudo, or the packaged launchd unit) or use the \
+             default userspace-networking mode"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::prefs::Prefs;
+
+    /// Off macOS a non-root uid is not a reason to refuse TUN. The process may hold `CAP_NET_ADMIN`,
+    /// and only the device open can tell. Before this preflight was gated, every non-zero euid was
+    /// refused with "requires root / CAP_NET_ADMIN" without checking any capability.
+    #[test]
+    fn tun_preflight_does_not_refuse_a_non_root_uid_off_macos() {
+        for goos in ["linux", "freebsd", "openbsd", "windows"] {
+            assert!(
+                tun_privilege_preflight(goos, 1000).is_ok(),
+                "{goos}: a non-root uid must be left to the device open"
+            );
+        }
+    }
+
+    /// macOS keeps its refusal, as Go's `tailscaled` does. The message says root and does not name
+    /// `CAP_NET_ADMIN`, which does not exist there and which nothing here checked.
+    #[test]
+    fn tun_preflight_refuses_a_non_root_uid_on_macos_only() {
+        let err = tun_privilege_preflight("darwin", 501)
+            .expect_err("macOS refuses a kernel TUN to a non-root process")
+            .to_string();
+        assert!(err.contains("requires root"), "got:\n{err}");
+        assert!(!err.contains("CAP_NET_ADMIN"), "got:\n{err}");
+        assert!(tun_privilege_preflight("darwin", 0).is_ok());
+    }
+
+    /// The same fact through `build_config` itself: on Linux, a `tun`-feature daemon asked for TUN
+    /// builds a `TransportMode::Tun` config whatever its uid, because building the config opens
+    /// nothing. Before the fix this failed for every non-root test runner.
+    #[cfg(all(feature = "tun", target_os = "linux"))]
+    #[tokio::test]
+    async fn build_config_tun_is_not_refused_for_a_non_root_uid_on_linux() {
+        let prefs = Prefs {
+            tun_enabled: true,
+            ..Default::default()
+        };
+        let cfg = config_for_prefs(&prefs).await;
+        assert!(
+            matches!(cfg.transport_mode, tailscale::TransportMode::Tun(_)),
+            "tun_enabled should select the kernel-TUN transport"
+        );
+    }
 
     /// A `build_config` over a throwaway key path with the given control_url override. The key file
     /// is created on first read, so each call gets a unique temp path to stay parallel-safe.
