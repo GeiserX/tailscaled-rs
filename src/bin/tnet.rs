@@ -645,10 +645,12 @@ enum Command {
     /// Authenticate this node with the control plane (Go `tailscale login`). With no `--authkey`, this
     /// is an **interactive login**: the node contacts control, reaches `NeedsLogin`, and the auth URL
     /// is printed for you to open in a browser; the node finishes connecting once you authorize it.
-    /// With `--authkey`/`--authkey-file` (or `$TS_AUTH_KEY`) it registers non-interactively. Like Go's
-    /// `login`, this re-authenticates **without changing any prefs** other than the profile name Go
-    /// gives `login` alone (`--nickname`) — it is `up`'s auth half on its own (use `tnet up <flags>`
-    /// to also change settings). Brings the node up (sets want-running).
+    /// With `--authkey`/`--authkey-file` (or `$TS_AUTH_KEY`) it registers non-interactively.
+    ///
+    /// Like Go's `login`, it first moves to a new, empty profile, so the account you were logged in to
+    /// stays as it was (`tnet switch` back to it); if the current profile has never logged in, it is
+    /// used as is. It changes no prefs other than the profile name Go gives `login` alone
+    /// (`--nickname`), which names the new profile. Brings the node up (sets want-running).
     Login {
         /// Pre-auth key for non-interactive login, or `file:<path>` to read the key from a file.
         /// Prefer `--authkey-file` or `$TS_AUTH_KEY` (a bare `--authkey` is visible in `ps`/shell
@@ -3003,8 +3005,9 @@ async fn main() -> Result<()> {
         // daemon. A dedicated renderer (not `dispatch_simple`) because the connection is EXPECTED to
         // die under a successful call — see `run_shutdown`.
         Command::Shutdown => run_shutdown(&socket).await,
-        // `login` (Go `tailscale login`): interactive (or authkey) (re)authentication that changes no
-        // prefs — `up`'s auth half on its own. Reuses the interactive-login machinery.
+        // `login` (Go `tailscale login`): switch to an empty profile, then interactive (or authkey)
+        // authentication that changes no prefs — `up`'s auth half on its own. Reuses the
+        // interactive-login machinery.
         Command::Login {
             authkey,
             authkey_file,
@@ -3960,10 +3963,11 @@ fn up_json_string(
 /// `StartLoginInteractive`). Reuses `poll_for_auth_url` to surface the URL, exactly like an
 /// interactive `up`.
 ///
-/// `--nickname` is the exception, and it is Go's own: `up.go` registers it on the shared flag set
-/// when `cmd == "login"`, so naming the profile is part of logging in. It is applied first, through
-/// [`login_nickname_request`], and it is deliberately NOT folded into the `up` request below — that
-/// request has to keep mentioning no pref.
+/// Before any of that, as Go's `loginCmd.Exec` does, it switches to an empty profile, then applies
+/// `--nickname` there — the two requests [`login_profile_requests`] lists. `--nickname` is Go's own:
+/// `up.go` registers it on the shared flag set when `cmd == "login"`, so naming the profile is part
+/// of logging in. It is deliberately NOT folded into the `up` request below — that request has to
+/// keep mentioning no pref.
 async fn run_login(
     socket: &std::path::Path,
     authkey: Option<String>,
@@ -3988,28 +3992,28 @@ async fn run_login(
         );
         std::process::exit(1);
     }
-    // Resolve the secret (zeroized `SecretString`); `None` → interactive login. Before the
-    // `--nickname` half, so a `file:`/`--authkey-file` that cannot be read fails with nothing renamed.
+    // Resolve the secret (zeroized `SecretString`); `None` → interactive login. Before the profile
+    // switch, so a `file:`/`--authkey-file` that cannot be read fails with the node untouched.
     let authkey = resolve_authkey(authkey, authkey_file).await?;
     let interactive = authkey.is_none();
-    // Go `login --nickname`: `ipn.Prefs.ProfileName` is part of the prefs the login applies, so it
-    // lands BEFORE the node re-authenticates (as it does upstream, where the name is in the prefs
-    // handed to `Start` and survives an auth the operator never completes). A failure here aborts
-    // the login rather than half-applying it.
-    if let Some(request) = login_nickname_request(nickname) {
+    // Go `login`: `SwitchToEmptyProfile`, then `runUp`, whose prefs carry `ipn.Prefs.ProfileName`.
+    // So the switch comes first and the nickname lands on the profile being logged in, before it
+    // authenticates. A failure at either step aborts the login rather than half-applying it.
+    for request in login_profile_requests(nickname) {
         match round_trip(socket, &request)
             .await
             .with_context(|| format!("talking to daemon at {}", socket.display()))?
         {
-            // The rename is a step of `login`, not a command of its own: its "preferences updated"
-            // line would only be noise before the login's own `ok:`. Go prints nothing for it either.
+            // Both are steps of `login`, not commands of their own: their lines would only be noise
+            // before the login's own `ok:`. Go prints nothing for them either.
             Response::Ok { .. } => {}
             Response::Error { message } => {
                 eprintln!("error: {message}");
                 std::process::exit(1);
             }
+            // Neither step can draw another reply: the switch answers `Ok` or `Error` only, and
             // `set --nickname` names one pref and reverts none, so the guard cannot fire on it.
-            other => anyhow::bail!("unexpected response to login --nickname: {other:?}"),
+            other => anyhow::bail!("unexpected response to login: {other:?}"),
         }
     }
     // An `up` that mentions NO pref (every override `None`) + force_reauth: just (re)authenticate.
@@ -11672,6 +11676,19 @@ fn check_host_routes(value: Option<&str>) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The requests `login` sends before it authenticates, in order: Go `loginCmd.Exec`'s
+/// `localClient.SwitchToEmptyProfile` ([`Request::SwitchToEmptyProfile`]), then, only when
+/// `--nickname` was given, [`login_nickname_request`]. The order is the whole point: the rename
+/// goes to the current profile, so sent first it would rename the account the node was already
+/// logged in to (upstream, `runUp` only sets `ProfileName` after the switch).
+///
+/// Pure → unit-testable.
+fn login_profile_requests(nickname: Option<Option<String>>) -> Vec<Request> {
+    std::iter::once(Request::SwitchToEmptyProfile)
+        .chain(login_nickname_request(nickname))
+        .collect()
 }
 
 /// Build the one-pref `set` request that carries Go `login --nickname` (`ipn.Prefs.ProfileName`), or
@@ -22404,6 +22421,34 @@ mod tests {
         assert!(
             login_nickname_request(parse_login(&[]).1).is_none(),
             "an absent --nickname must not send a `set` at all"
+        );
+    }
+
+    #[test]
+    fn login_switches_to_an_empty_profile_before_it_names_one() {
+        // Go's `loginCmd.Exec` calls `SwitchToEmptyProfile` before `runUp`, so `--nickname` names the
+        // new profile. The rename goes to whichever profile is current, so the switch must come first.
+        let (_, nickname, _) = parse_login(&["--nickname=work"]);
+        let requests = login_profile_requests(nickname);
+        assert!(
+            matches!(
+                &requests[..],
+                [
+                    Request::SwitchToEmptyProfile,
+                    Request::Set {
+                        nickname: Some(Some(name)),
+                        ..
+                    },
+                ] if name == "work"
+            ),
+            "{requests:?}"
+        );
+
+        // Without `--nickname` Go still switches: every `login` starts from an empty profile.
+        let requests = login_profile_requests(parse_login(&[]).1);
+        assert!(
+            matches!(&requests[..], [Request::SwitchToEmptyProfile]),
+            "{requests:?}"
         );
     }
 
