@@ -1330,3 +1330,113 @@ async fn a_policy_masked_watch_front_loads_the_snapshot_and_is_pushed_on_reload(
 
     harness.shutdown_and_verify().await;
 }
+
+/// Open a masked watch with `request` (a JSON line without its newline) and return both halves.
+async fn open_masked_watch(
+    harness: &Harness,
+    request: &str,
+) -> (
+    tokio::net::unix::OwnedWriteHalf,
+    BufReader<tokio::net::unix::OwnedReadHalf>,
+) {
+    let stream = UnixStream::connect(&harness.socket_path)
+        .await
+        .expect("CLI connect to LocalAPI socket for a masked watch");
+    let (read_half, mut write_half) = stream.into_split();
+    write_half
+        .write_all(format!("{request}\n").as_bytes())
+        .await
+        .expect("write masked watch request");
+    write_half.flush().await.expect("flush watch request");
+    (write_half, BufReader::new(read_half))
+}
+
+/// Go's `ipn.NotifyInitialStatus` makes the first `Notify` of a watch carry a whole `ipnstate.Status`,
+/// so a watcher gets its snapshot and the stream that continues it on ONE connection. Before this bit
+/// a watcher had to open a second `status` connection and could not order the two.
+///
+/// Pinned here, over the real socket: the bit alone selects the Notify path (not the legacy status
+/// stream); the frame carries exactly the report a one-shot `status` returns; it follows the
+/// `prefs`/`policy` front-loads; and it is sent once — a lifecycle bump that re-derives the device
+/// epoch does not re-send it.
+///
+/// Honest scope: the harness never brings a node up, so this exercises the device-less arm. The
+/// bus-ordered arm (snapshot taken after the engine's initial frame) needs a live engine.
+#[tokio::test]
+async fn a_status_masked_watch_front_loads_the_status_report_once() {
+    let harness = Harness::start().await;
+    let Response::Status(expected) = harness.round_trip(r#"{"cmd":"status"}"#).await else {
+        panic!("a one-shot status must answer with a status report");
+    };
+
+    // Only the `initial_status` bit. It must select the Notify path on its own: were it left out of the
+    // masked/bare selector, this watch would stream a `Response::Status` instead.
+    let (status_write, mut status_reader) =
+        open_masked_watch(&harness, r#"{"cmd":"watch","initial_status":true}"#).await;
+    let first = try_read_watch_status(&mut status_reader, Duration::from_secs(5))
+        .await
+        .expect("a status-masked watch must send its snapshot immediately, before any change");
+    let Response::Notify(first) = first else {
+        panic!("the initial_status bit alone must select the Notify path, got {first:?}");
+    };
+    assert_eq!(
+        first.initial_status.as_deref(),
+        Some(&expected),
+        "the watch snapshot is the very report a one-shot `status` answers with"
+    );
+    assert!(
+        first.state.is_none()
+            && first.net_map.is_none()
+            && first.browse_to_url.is_none()
+            && first.prefs.is_none()
+            && first.policy.is_none(),
+        "a status-only watch must not be sent fields it did not ask for: {first:?}"
+    );
+
+    // With prefs and policy asked for too, the status frame comes after both of their front-loads.
+    let (all_write, mut all_reader) = open_masked_watch(
+        &harness,
+        r#"{"cmd":"watch","prefs":true,"policy":true,"initial_status":true}"#,
+    )
+    .await;
+    let mut frames = Vec::new();
+    for _ in 0..3 {
+        match try_read_watch_status(&mut all_reader, Duration::from_secs(5)).await {
+            Some(Response::Notify(view)) => frames.push(view),
+            other => panic!("expected three front-loaded Notify frames, got {other:?}"),
+        }
+    }
+    assert!(frames[0].prefs.is_some() && frames[0].initial_status.is_none());
+    assert!(frames[1].policy.is_some() && frames[1].initial_status.is_none());
+    assert_eq!(frames[2].initial_status.as_deref(), Some(&expected));
+
+    // One-shot: a lifecycle bump makes both watchers re-derive their epoch, and neither may be sent a
+    // second snapshot. (`begin_up` bumps the generation offline, leaving no device — see
+    // `watch_redrives_on_lifecycle_bump_after_parking_on_down_node`.)
+    {
+        let mut be = harness.backend.lock().await;
+        let _pending = be
+            .begin_up(tailscaled_rs::ipn::UpOptions::default(), None)
+            .await
+            .expect("begin_up bumps the generation offline (no engine)");
+    }
+    assert!(
+        try_read_watch_status(&mut status_reader, Duration::from_millis(500))
+            .await
+            .is_none(),
+        "a status-only watcher must not be re-sent the snapshot when its epoch is re-derived"
+    );
+    while let Some(frame) = try_read_watch_status(&mut all_reader, Duration::from_millis(500)).await
+    {
+        let Response::Notify(frame) = frame else {
+            panic!("a masked watch streams Notify frames, got {frame:?}");
+        };
+        assert!(
+            frame.initial_status.is_none(),
+            "the status front-load is sent once per watch, never again: {frame:?}"
+        );
+    }
+
+    drop((status_write, status_reader, all_write, all_reader));
+    harness.shutdown_and_verify().await;
+}
