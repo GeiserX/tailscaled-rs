@@ -43,12 +43,12 @@
 //!   path rather than fabricating a per-interface bind the HTTP client cannot do.
 //! - **No `captiveportal_detected` client metric.** Go bumps a `clientmetric` counter; this daemon
 //!   has no client-metric registry of its own (`tnet metrics` proxies the engine's).
-//! - **Two connectivity signals instead of a health tracker.** Go probes while *any* registered
+//! - **Three connectivity signals instead of a health tracker.** Go probes while *any* registered
 //!   warnable with `ImpactsConnectivity` — other than the captive-portal warnable itself — is
 //!   unhealthy. This fork has no health tracker, so [`ConnectivityWarnable`] enumerates that set
-//!   directly: the members it can observe are `network-status` and `no-derp-home`, and the three it
-//!   cannot (or must not) are named with their reasons on that type. The *state* the trigger runs in
-//!   is Go's unchanged: `Running`, and only `Running`.
+//!   directly: the members it can observe are `network-status`, `no-derp-home` and
+//!   `ip-forwarding-off`, and the two it cannot are named with their reasons on that type. The
+//!   *state* the trigger runs in is Go's unchanged: `Running`, and only `Running`.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -104,6 +104,17 @@ pub(super) const NO_DERP_HOME_TIME_TO_VISIBLE: Duration = Duration::from_secs(10
 /// `ImpactsConnectivity: true`, `TimeToVisible: 5 * time.Second`).
 pub(super) const NETWORK_STATUS_TIME_TO_VISIBLE: Duration = Duration::from_secs(5);
 
+/// How long "this node advertises routes the kernel will not forward" must persist before it counts
+/// as a connectivity problem — Go `health.ipForwardingWarnable` (`health/warnings.go`: *"Subnet
+/// routing is enabled, but IP forwarding is disabled…"*, `ImpactsConnectivity: true`) sets **no**
+/// `TimeToVisible` at all.
+///
+/// Zero is not a placeholder here, it is the value: `health.Warnable.IsVisible` returns true
+/// immediately when `TimeToVisible == 0`, and `setUnhealthyLocked` then publishes the change to the
+/// event bus at once rather than arming a visibility timer. So upstream's captive loop hears about
+/// this warnable the instant the check fails, and owes it only [`DETECTION_INTERVAL`].
+pub(super) const IP_FORWARDING_OFF_TIME_TO_VISIBLE: Duration = Duration::ZERO;
+
 /// One of Go's `ImpactsConnectivity` warnables, as an observable this daemon actually has.
 ///
 /// Upstream's captive-portal extension does not watch a single fact. It walks the whole health
@@ -115,20 +126,16 @@ pub(super) const NETWORK_STATUS_TIME_TO_VISIBLE: Duration = Duration::from_secs(
 /// "except the captive-portal warnable" exclusion is structural — `captive-portal-detected` is this
 /// loop's *output*, so it is not a member and can never re-trigger the loop that raised it.
 ///
-/// Go registers five `ImpactsConnectivity` warnables (`health/warnings.go`). Three are **not** here,
-/// each for a stated reason rather than by omission:
+/// Go registers five `ImpactsConnectivity` warnables (`health/warnings.go`). Two are **not** here,
+/// for a stated reason rather than by omission: `no-derp-connection` ("Relay server unavailable")
+/// and `no-udp4-bind` ("NAT traversal setup failure") are magicsock/DERP-client facts. The engine at
+/// this pin publishes no health signal for either —
+/// [`Device::netcheck`](tailscale::Device::netcheck) reports measured region latencies, not whether
+/// the home relay's connection is actually established and not whether the UDP socket bound — so
+/// they are engine-side, and are not faked from something else.
 ///
-/// - `no-derp-connection` ("Relay server unavailable") and `no-udp4-bind` ("NAT traversal setup
-///   failure") are magicsock/DERP-client facts. The engine at this pin publishes no health signal for
-///   either — [`Device::netcheck`](tailscale::Device::netcheck) reports measured region latencies,
-///   not whether the home relay's connection is actually established — so they are engine-side, and
-///   are not faked from something else.
-/// - `ip-forwarding-off` is deliberately left out even though the daemon *can* compute it
-///   ([`crate::ipforward::forwarding_warning`]). It is a **steady** condition: a misconfigured subnet
-///   router keeps it unhealthy indefinitely. Upstream is event-driven — it probes on a health
-///   *change* — so a permanently-unhealthy warnable costs it nothing, whereas this fork polls
-///   ([`RECHECK_INTERVAL`]) and would probe forever on a node whose network is fine. Including it
-///   would copy the letter of Go's loop and break its behaviour.
+/// The three that are here do not all behave the same under this fork's poll, which is why
+/// [`retriggers`](Self::retriggers) exists: see its doc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum ConnectivityWarnable {
     /// Go `health.NetworkStatusWarnable` ("network-status"): the host has no interface that could
@@ -140,6 +147,21 @@ pub(super) enum ConnectivityWarnable {
     /// the warnable a portal trips most directly, since the portal answers the relay connections
     /// itself.
     NoDerpHome,
+    /// Go `health.ipForwardingWarnable` ("ip-forwarding-off"): this node advertises routes, runs a
+    /// kernel data path, and the host will not forward — so nothing it routes can work.
+    ///
+    /// Upstream feeds it from the closure `applyPrefsToHostinfoLocked` installs with
+    /// `health.Tracker.SetIPForwardingCheck` (`ipn/ipnlocal/local.go`), under exactly two gates:
+    /// the node advertises at least one route (`len(hi.RoutableIPs) > 0`) and it is not a netstack
+    /// router. Here the same pair of gates plus the same sysctl read live in
+    /// [`crate::ipforward::forwarding_broken`] and its caller.
+    ///
+    /// It reaches the captive loop because it is one of Go's `ImpactsConnectivity` warnables, not
+    /// because IP forwarding has anything to do with portals: a portal is one plausible reason a
+    /// router's traffic is not flowing, and Go probes for it on *any* of the five. The value of
+    /// including it is a subnet router behind hotel Wi-Fi getting told the truth — log in — instead
+    /// of being left staring at a forwarding warning that is not the whole story.
+    IpForwardingOff,
 }
 
 impl ConnectivityWarnable {
@@ -150,6 +172,34 @@ impl ConnectivityWarnable {
         match self {
             Self::NetworkStatus => "network-status",
             Self::NoDerpHome => "no-derp-home",
+            Self::IpForwardingOff => "ip-forwarding-off",
+        }
+    }
+
+    /// Whether this fork's [`RECHECK_INTERVAL`] backoff should keep re-probing while this warnable
+    /// stays the impacted one.
+    ///
+    /// Upstream never asks the question, because it never re-probes on a clock: after a pass its
+    /// loop nils its timer and blocks until the next `needsCaptiveDetection` signal, and that signal
+    /// is only sent from `Extension.onHealthChange` — on a health *change*
+    /// (`feature/captiveportal/captiveportal.go`). So Go's re-probe rate is the node's health-change
+    /// rate, and that rate is wildly different across these warnables.
+    ///
+    /// `network-status` and `no-derp-home` are live measurements of a network that is, by
+    /// hypothesis, broken. They and their neighbours in the tracker flap while it stays broken, so
+    /// Go keeps re-arming its 2s timer, and this fork's poll-plus-backoff is the honest stand-in for
+    /// a bus it does not have.
+    ///
+    /// `ip-forwarding-off` is a sysctl and a pref. Neither moves without the operator, so while it
+    /// is the only thing wrong nothing changes, no further signal is sent, and Go probes **once**.
+    /// Re-probing it every [`RECHECK_INTERVAL`] would be this fork inventing traffic upstream does
+    /// not send: a subnet router with forwarding off would hit `tailscale.com` forever on a network
+    /// that is otherwise perfectly healthy. So the backoff is skipped for it, which reproduces Go's
+    /// one probe rather than its letter.
+    pub(super) const fn retriggers(self) -> bool {
+        match self {
+            Self::NetworkStatus | Self::NoDerpHome => true,
+            Self::IpForwardingOff => false,
         }
     }
 
@@ -159,6 +209,7 @@ impl ConnectivityWarnable {
         match self {
             Self::NetworkStatus => NETWORK_STATUS_TIME_TO_VISIBLE,
             Self::NoDerpHome => NO_DERP_HOME_TIME_TO_VISIBLE,
+            Self::IpForwardingOff => IP_FORWARDING_OFF_TIME_TO_VISIBLE,
         }
     }
 
@@ -209,6 +260,11 @@ pub(super) const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// has run, what governs the next one is [`RECHECK_INTERVAL`] since that pass. Go is in the same
 /// position — after its first probe it is on a timer, not on a fresh visibility wait — and a
 /// warnable that changes under an already-probing episode is not new evidence worth a new probe.
+///
+/// The backoff applies only to a warnable that would have kept upstream's health tracker firing
+/// ([`ConnectivityWarnable::retriggers`]). A steady one probes once per episode, which is what Go
+/// does with it, and is why including `ip-forwarding-off` in the trigger does not turn a
+/// misconfigured subnet router into a permanent source of probe traffic.
 #[derive(Debug, Default)]
 pub(super) struct EpisodeTimer {
     /// The warnable currently being waited out and when it became the reported one. `None` between
@@ -253,8 +309,11 @@ impl EpisodeTimer {
             // triggering warnable's `TimeToVisible` (the health tracker's), then the captive loop's
             // own `captivePortalDetectionInterval` on top.
             None => now.duration_since(since) >= warnable.settle_time(),
-            // Still impacted after a pass: re-probe on the backoff, measured from the probe.
-            Some(ran) => now.duration_since(ran) >= RECHECK_INTERVAL,
+            // Still impacted after a pass: re-probe on the backoff, measured from the probe — but
+            // only for a warnable whose condition would have kept Go's health tracker firing. A
+            // steady one (`ip-forwarding-off`) gets Go's single probe and then nothing, because
+            // upstream sends no second signal either. See `ConnectivityWarnable::retriggers`.
+            Some(ran) => warnable.retriggers() && now.duration_since(ran) >= RECHECK_INTERVAL,
         };
         if due {
             self.last_run = Some(now);
@@ -1417,6 +1476,38 @@ mod tests {
         assert!(!timer.probe_due(NoDerpHome, at(t, 8)));
         assert!(!timer.probe_due(NoDerpHome, at(t, 36)));
         assert!(timer.probe_due(NoDerpHome, at(t, 37)), "30s after the pass");
+    }
+
+    #[test]
+    fn a_steady_warnable_probes_once_per_episode() {
+        // `ip-forwarding-off` carries no `TimeToVisible` (health/warnings.go), so it is visible the
+        // moment the check fails and owes only Go's 2s `captivePortalDetectionInterval`.
+        use ConnectivityWarnable::IpForwardingOff;
+        let t = tokio::time::Instant::now();
+        let mut timer = EpisodeTimer::default();
+
+        assert!(!timer.probe_due(IpForwardingOff, at(t, 0)));
+        assert!(!timer.probe_due(IpForwardingOff, at(t, 1)));
+        assert!(
+            timer.probe_due(IpForwardingOff, at(t, 2)),
+            "visible at once, then Go's 2s detection interval"
+        );
+
+        // ... and then never again while it is all that is wrong. Upstream re-probes off health
+        // CHANGES, and a sysctl the operator has not touched produces none, so its loop probes once.
+        // This fork polls, so without the `retriggers` gate the 30s backoff would have it hitting
+        // tailscale.com forever on a node whose network is otherwise fine.
+        for secs in [32, 33, 60, 3600, 86_400] {
+            assert!(
+                !timer.probe_due(IpForwardingOff, at(t, secs)),
+                "t+{secs}s: a steady warnable must not re-probe on the backoff"
+            );
+        }
+
+        // Recovery ends the episode; a later one waits out its own settle time and probes once more.
+        timer.recovered();
+        assert!(!timer.probe_due(IpForwardingOff, at(t, 90_000)));
+        assert!(timer.probe_due(IpForwardingOff, at(t, 90_002)));
     }
 
     #[test]
