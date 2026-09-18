@@ -141,7 +141,11 @@ have no in-place engine setter, and the last two are re-advertised to control on
 a package manager owns (`brew upgrade` is the update path there), or a platform with no published
 release artifact — because the pref is advertised to control as `Hostinfo.AllowsUpdate`, so accepting
 it would tell the tailnet admin that a remote update trigger will be honoured by a node that cannot
-honour one. Declining (`--no-auto-update`) is accepted everywhere.
+honour one. Declining (`--no-auto-update`) is accepted everywhere. The same refusal applies to the
+declarative path — a config file's `"AutoUpdate": {"Apply": true}` fails the load on such an
+installation, because the claim reaching control is the same one whether a command or a file made it
+— and, as in Go, the rule is asked of the prefs a write would LEAVE BEHIND, so an opt-in already
+stored keeps failing later `set`s until `--no-auto-update` withdraws it.
 `--operator`, `--report-posture`, `--webclient`, `--update-check` and
 `--exit-node-allow-lan-access` are **carried prefs**: they are persisted and reported (`tnet get`),
 but nothing in this build acts on them yet — each flag's `--help` says exactly what it does and does

@@ -200,6 +200,11 @@ pub struct ConfigVAlpha {
     /// (`ipn.AutoUpdatePrefs`) — self-update policy. Go applies the **whole struct** when the key is
     /// present (`AutoUpdateSet{ApplySet: true, CheckSet: true}`), so a missing inner key means that
     /// inner field's Go zero value, not the pref default — see [`AutoUpdatePrefs`].
+    ///
+    /// `Apply: true` is REFUSED (see [`Config::apply_to_prefs`]) on an installation that could never
+    /// replace its own binary, the same refusal `tnet set --auto-update` gets: the pref is advertised
+    /// to control as `Hostinfo.AllowsUpdate`, and a config file is no more entitled to make that
+    /// claim than an operator is. `Apply: false` and an absent `Apply` are accepted everywhere.
     pub auto_update: Option<AutoUpdatePrefs>,
     /// WARNED. Go `ServeConfigTemp` — an embedded serve config. Set via `tnet serve` in this fork, not
     /// the declarative config; parsed as opaque (`serde_json::Value`) because we never inspect it.
@@ -547,6 +552,38 @@ impl Config {
                     "config: exitNode {exit:?} uses the auto: form, which this build does not support"
                 );
             }
+        }
+        // An auto-update OPT-IN this installation could never honour is refused here too, so the
+        // declarative ingress cannot make a claim the interactive one refuses. `AutoUpdate.Apply` is
+        // not local state: the engine advertises it as `Hostinfo.AllowsUpdate` at registration and on
+        // every map request, so a `--config` daemon on a host whose binary can never be replaced
+        // would otherwise tell the tailnet admin that a remote update trigger will be honoured —
+        // precisely the dishonest advertisement `Backend::begin_set` and `Backend::check_prefs`
+        // refuse to make. Same rule, same predicate, same wording as those two
+        // (`ipn::selfupdate::check_auto_update_pref`, Go `checkAutoUpdatePrefsLocked`), so every
+        // ingress to this pref answers alike.
+        //
+        // Upstream does NOT check here — `initPrefsFromConfig` and `setConfigLocked`
+        // (`ipn/ipnlocal/local.go`) apply the config's prefs with `ApplyEdits` + `SetPrefs` and never
+        // reach `checkPrefsLocked`; only `Start`'s `opts.UpdatePrefs` and `EditPrefs` do. This is the
+        // same deliberate divergence the advertised-route rules above already make, for the same
+        // reason: a declaratively-managed node is exactly the deployment where nobody reads command
+        // output, so a claim nothing can keep would be made silently and forever.
+        //
+        // Only what the CONFIG declares is judged, never a pref already on disk: refusing a persisted
+        // opt-in here would stop the daemon booting, and `tnet set --no-auto-update` — the way to
+        // clear it — needs a running daemon. The write paths judge the resulting posture
+        // (`Backend::prospective_auto_update`); this one judges its own input.
+        if let Some(au) = c.auto_update
+            && let Some(e) = crate::ipn::selfupdate::check_auto_update_pref(
+                au.apply,
+                crate::ipn::selfupdate::auto_update_refusal().as_deref(),
+            )
+        {
+            bail!(
+                "config: AutoUpdate.Apply: {e}. In a config file that is \
+                 `\"AutoUpdate\": {{\"Apply\": false}}`, or omitting the `AutoUpdate` key"
+            );
         }
 
         // `Enabled` is special: Go ALWAYS masks `WantRunning` in from a config (`mp.WantRunning =
@@ -1239,7 +1276,7 @@ mod tests {
                 "PostureChecking":true,
                 "RunWebClient":true,
                 "AppConnector":{"Advertise":true},
-                "AutoUpdate":{"Check":true,"Apply":true}
+                "AutoUpdate":{"Check":true,"Apply":false}
             }"#);
         let mut p = Prefs::default();
         c.apply_to_prefs(&mut p).unwrap();
@@ -1249,7 +1286,11 @@ mod tests {
         assert!(p.run_web_client, "--webclient");
         assert!(p.advertise_app_connector, "--advertise-connector");
         assert!(p.auto_update_check, "--update-check");
-        assert_eq!(p.auto_update_apply, Some(true), "--auto-update");
+        // `Apply` is spelled as the DECLINE here, and that is not a weaker assertion of "honored":
+        // the pref moves off its never-stated default either way. The opt-in is the one config value
+        // whose acceptance depends on the host (`auto_update_opt_in_is_refused_when_the_installation
+        // _cannot_update`), so pinning the mapping on it would pin it on only half the world's CI.
+        assert_eq!(p.auto_update_apply, Some(false), "--auto-update");
         // None of them may still be claimed as "parsed but not honored" — a warning that lies is as
         // bad as a silent drop.
         assert!(
@@ -1293,11 +1334,14 @@ mod tests {
     /// `tailscaled` and another here.
     #[test]
     fn auto_update_object_writes_both_inner_fields_like_go() {
-        let c = cfg(r#"{"version":"alpha0","AutoUpdate":{"Apply":true}}"#);
+        // Spelled with `Apply: false` so the mapping is pinned on every host: an `Apply: true` is
+        // refused where the installation can never replace its own binary (the test below), and this
+        // one is about which FIELDS a present `AutoUpdate` object writes, not about the opt-in rule.
+        let c = cfg(r#"{"version":"alpha0","AutoUpdate":{"Apply":false}}"#);
         let mut p = Prefs::default();
         assert!(p.auto_update_check, "the pref's own default is true");
         c.apply_to_prefs(&mut p).unwrap();
-        assert_eq!(p.auto_update_apply, Some(true));
+        assert_eq!(p.auto_update_apply, Some(false));
         assert!(
             !p.auto_update_check,
             "an AutoUpdate object omitting Check writes Go's zero value (false), because Go assigns \
@@ -1324,6 +1368,77 @@ mod tests {
         c.apply_to_prefs(&mut p).unwrap();
         assert_eq!(p.auto_update_apply, Some(false));
         assert!(!p.auto_update_check);
+    }
+
+    /// The declarative ingress may not make a claim the interactive one refuses. `AutoUpdate.Apply`
+    /// is advertised to control as `Hostinfo.AllowsUpdate`, so on an installation whose binary can
+    /// never be replaced, a `--config` opt-in is the same dishonest advertisement `tnet set
+    /// --auto-update` is refused for — reaching the tailnet admin from a file instead of a command.
+    ///
+    /// Which branch this host takes is a property of the host, so the test asks the same predicate
+    /// the production code asks and asserts the branch that applies; the rule's own two outcomes are
+    /// pinned host-independently in `ipn::selfupdate`.
+    #[test]
+    fn auto_update_opt_in_is_refused_when_the_installation_cannot_update() {
+        use crate::ipn::selfupdate;
+
+        // The opt-in alongside an unrelated pref, so the all-or-nothing contract is visible: a
+        // refused config must not have applied the fields it listed before the bad one.
+        let c = cfg(r#"{"version":"alpha0","Hostname":"node-a","AutoUpdate":{"Apply":true}}"#);
+        let mut p = Prefs::default();
+        let applied = c.apply_to_prefs(&mut p);
+        match selfupdate::auto_update_refusal() {
+            None => {
+                applied.expect("an installation that can replace its own binary may opt in");
+                assert_eq!(p.auto_update_apply, Some(true));
+                assert_eq!(p.hostname.as_deref(), Some("node-a"));
+            }
+            Some(_) => {
+                let err = applied
+                    .expect_err("a config opt-in on an un-updatable installation must be refused");
+                let msg = format!("{err:#}");
+                assert!(msg.contains("Auto-updates are not supported"), "got {msg}");
+                assert!(
+                    msg.contains("Hostinfo.AllowsUpdate"),
+                    "the refusal must say what the pref claims to the tailnet: {msg}"
+                );
+                assert!(
+                    msg.contains(r#""AutoUpdate": {"Apply": false}"#),
+                    "a config-file refusal must name the config-file fix, not only the CLI one: \
+                     {msg}"
+                );
+                assert_eq!(
+                    p.auto_update_apply, None,
+                    "a refused config must leave the pref never-stated"
+                );
+                assert_eq!(
+                    p.hostname, None,
+                    "apply_to_prefs is all-or-nothing: nothing may be applied when it bails"
+                );
+            }
+        }
+
+        // A DECLINE, and a config that says nothing about auto-update, are legal on every
+        // installation — neither claims anything to the tailnet (Go acts on `EqualBool(true)` alone).
+        let mut p = Prefs::default();
+        cfg(r#"{"version":"alpha0","AutoUpdate":{"Apply":false}}"#)
+            .apply_to_prefs(&mut p)
+            .expect("declining auto-update is legal on every installation");
+        assert_eq!(p.auto_update_apply, Some(false));
+
+        // A pref already on DISK is never re-litigated here, whatever this host can do: the write
+        // paths judge the posture a write would leave behind, but a config is read at boot, and a
+        // daemon that refuses to start over a persisted pref cannot be told to stop claiming it —
+        // `tnet set --no-auto-update` needs a running daemon.
+        let mut p = Prefs {
+            auto_update_apply: Some(true),
+            ..Prefs::default()
+        };
+        cfg(r#"{"version":"alpha0","Hostname":"h"}"#)
+            .apply_to_prefs(&mut p)
+            .expect("a config that says nothing about auto-update must not judge the stored pref");
+        assert_eq!(p.auto_update_apply, Some(true));
+        assert_eq!(p.hostname.as_deref(), Some("h"));
     }
 
     /// The contract this module lives by, pinned as one test: EVERY field of Go's `ConfigVAlpha`
@@ -1361,7 +1476,7 @@ mod tests {
                 "RunWebClient":true,
                 "ShieldsUp":true,
                 "RemoteConfig":true,
-                "AutoUpdate":{"Check":true,"Apply":true},
+                "AutoUpdate":{"Check":true,"Apply":false},
                 "ServeConfigTemp":{"TCP":{}},
                 "StaticEndpoints":["192.0.2.10:41641"],
                 "RelayServerPort":0,
@@ -1388,7 +1503,9 @@ mod tests {
         assert!(p.run_web_client);
         assert!(p.shields_up);
         assert!(p.auto_update_check);
-        assert_eq!(p.auto_update_apply, Some(true));
+        // Non-default (the pref default is the never-stated `None`), and host-independent: an
+        // `Apply: true` is refused wherever the installation can never replace its own binary.
+        assert_eq!(p.auto_update_apply, Some(false));
 
         // WARNED — the remaining 10, in Go's declaration order. An exact match (not `contains`) is
         // the point: it fails both when a Go field goes unreported AND when a field lingers here

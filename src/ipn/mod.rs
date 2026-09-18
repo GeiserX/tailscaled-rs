@@ -812,6 +812,16 @@ struct CheckPrefsEnv<'a> {
     /// The netmap view a NAMED exit-node selector is resolved against (see
     /// [`resolve_exit_node_arg`]). [`ExitNodeFacts::default`] when the request names none.
     exit_node_facts: &'a ExitNodeFacts,
+    /// [`selfupdate::auto_update_refusal`]'s verdict for this host: `Some(reason)` = this
+    /// installation can never replace its own binary, `None` = it can (Go `feature.CanAutoUpdate()`).
+    /// Consulted only for an auto-update OPT-IN, matching Go's `checkAutoUpdatePrefsLocked`.
+    ///
+    /// Injected for the same reason as `ssh_gate`: the verdict is a property of the host the tests
+    /// run on — every CI Linux runner answers `None`, every macOS developer machine answers
+    /// `Some(..)` — so a test that read it from the process could only ever assert the branch its
+    /// own host takes, and the rule's ORDER within the chain would go unchecked wherever the rule
+    /// does not fire.
+    auto_update_gate: Option<&'a str>,
 }
 
 /// Whether `arg` names `peer`, in any of the three spellings Go's `exitNodeIPOfArg` accepts: the
@@ -3386,10 +3396,15 @@ impl Backend {
         // `Hostinfo.AllowsUpdate` on registration and on every map request, so setting it tells the
         // tailnet admin that a remote update trigger will be honoured. Same "before a single pref is
         // mutated" discipline as the checks above — a refused `set` leaves prefs.json untouched, and
-        // it is asked after the SSH gate so the two refusals report in `check_prefs`'s (4)-then-(5)
+        // it is asked after the SSH gate so the two refusals report in `check_prefs`'s (3)-then-(4)
         // order.
+        //
+        // Asked about the pref this `set` would LEAVE BEHIND, not about the edit mask: Go validates
+        // `p1` after `ApplyEdits` (see [`Backend::prospective_auto_update`]), so a persisted opt-in
+        // on a node that can never apply an update fails every later prefs write until it is
+        // declined — and the dry-run verb, which composes the same value, answers the same.
         if let Some(e) = selfupdate::check_auto_update_pref(
-            opts.auto_update,
+            self.prospective_auto_update(opts.auto_update),
             selfupdate::auto_update_refusal().as_deref(),
         ) {
             return Err(anyhow!(e));
@@ -5143,18 +5158,26 @@ impl Backend {
     /// peer that exists, a peer that actually advertises an exit node, an unambiguous name);
     /// (2) **exit-node-vs-advertise
     /// conflict** — cannot use an exit node and advertise as one simultaneously (Go
-    /// `checkExitNodePrefsLocked`); (3) the advertised-route SET is one Go would send: every entry a
-    /// masked CIDR, every 4via6 prefix decodable, and a default route present in both families or in
-    /// neither (Go `netutil.CalcAdvertiseRoutes`, via [`crate::routes`]); (4) SSH-server enable requires the `ssh` build feature (the local
+    /// `checkExitNodePrefsLocked`); (3) SSH-server enable requires the `ssh` build feature (the local
     /// analogue of Go's capability gate — a faithful, build-time check) **and** must clear the
     /// host/operator gate Go's `checkSSHPrefsLocked` applies,
     /// [`featureknob::can_run_tailscale_ssh`](crate::featureknob::can_run_tailscale_ssh) — chiefly
     /// its `TS_DISABLE_SSH_SERVER` administrative off-switch, which is how an image build or a
     /// configuration-managed host holds the SSH server down whatever the tailnet or the user asks
-    /// for; (5) an auto-update **opt-in** requires an installation that can replace its own binary
+    /// for; (4) an auto-update **opt-in** requires an installation that can replace its own binary
     /// (Go `checkAutoUpdatePrefsLocked` → `feature.CanAutoUpdate()`, decided here by
-    /// [`selfupdate::auto_update_refusal`]). Go's operator/profile-name/config-lock/Funnel-shields
-    /// rules reference prefs this fork does not model, so they are correctly N/A.
+    /// [`selfupdate::auto_update_refusal`]); (5) the advertised-route SET is one Go would send: every
+    /// entry a masked CIDR, every 4via6 prefix decodable, and a default route present in both
+    /// families or in neither (Go `netutil.CalcAdvertiseRoutes`, via [`crate::routes`]). Go's
+    /// operator/profile-name/config-lock/Funnel-shields rules reference prefs this fork does not
+    /// model, so they are correctly N/A.
+    ///
+    /// The last two are in that order because Go's is: `checkPrefsLocked` accumulates with
+    /// `errors.Join` in a fixed sequence that ends `checkAutoUpdatePrefsLocked` then
+    /// `checkAdvertiseRoutes`, so a posture failing both reports the auto-update sentence first.
+    /// Both sides report every violation, so this is only the order the operator reads them in —
+    /// but it is free to match, and an answer that reads like the one upstream gives is one less
+    /// diff for anyone comparing the two daemons.
     pub async fn check_prefs(
         &self,
         exit_node: Option<Option<String>>,
@@ -5170,6 +5193,7 @@ impl Backend {
             Some(Some(_)) => self.exit_node_facts().await,
             _ => ExitNodeFacts::default(),
         };
+        let auto_update_refusal = selfupdate::auto_update_refusal();
         self.check_prefs_gated(
             exit_node,
             advertise_exit_node,
@@ -5179,8 +5203,26 @@ impl Backend {
             CheckPrefsEnv {
                 ssh_gate: crate::featureknob::can_run_tailscale_ssh(),
                 exit_node_facts: &facts,
+                auto_update_gate: auto_update_refusal.as_deref(),
             },
         )
+    }
+
+    /// The `AutoUpdate.Apply` a request would LEAVE BEHIND: the value it names, else the one already
+    /// persisted. Go's edit path composes exactly this before it validates — `editPrefsLocked` does
+    /// `p1 := b.pm.CurrentPrefs().AsStruct(); p1.ApplyEdits(mp); b.checkPrefsLocked(p1)`
+    /// (`ipn/ipnlocal/local.go`) — so the rule is asked about the resulting posture, not about the
+    /// edit mask.
+    ///
+    /// The difference is the whole point of having one helper: an opt-in already sitting in
+    /// `prefs.json` (persisted before this rule existed, or carried over from a host that could
+    /// update) keeps claiming `Hostinfo.AllowsUpdate` on every map request, so on an installation
+    /// that can never apply an update it must fail the NEXT prefs write too, exactly as it does
+    /// upstream — not only a write that happens to name `--auto-update`. The way out is the same as
+    /// Go's: name the pref and decline it (`tnet set --no-auto-update`), because the named value
+    /// wins here.
+    fn prospective_auto_update(&self, named: Option<bool>) -> Option<bool> {
+        named.or(self.prefs.auto_update_apply)
     }
 
     /// One [`status`](Backend::status) snapshot, projected into the facts an exit-node selector is
@@ -5205,9 +5247,6 @@ impl Backend {
 
     /// [`check_prefs`](Self::check_prefs) with the host-derived inputs passed IN rather than read
     /// from the process environment or the engine — see [`CheckPrefsEnv`] for why they are injected.
-    /// `auto_update` stays a plain override (rule (5) reads the host's update provenance through
-    /// [`selfupdate::auto_update_refusal`], which needs no injection to be testable — its own pure
-    /// predicate takes the facts as arguments).
     fn check_prefs_gated(
         &self,
         exit_node: Option<Option<String>>,
@@ -5228,10 +5267,7 @@ impl Backend {
             .clone()
             .unwrap_or_else(|| self.prefs.advertise_routes.clone());
         let prospective_ssh = ssh.unwrap_or(self.prefs.ssh_enabled);
-        let prospective_auto_update = match auto_update {
-            Some(v) => Some(v),
-            None => self.prefs.auto_update_apply,
-        };
+        let prospective_auto_update = self.prospective_auto_update(auto_update);
 
         let mut errors: Vec<String> = Vec::new();
 
@@ -5260,18 +5296,7 @@ impl Backend {
                 "Cannot advertise an exit node and use an exit node at the same time.".into(),
             );
         }
-        // (3) the advertised-route SET (Go `netutil.CalcAdvertiseRoutes`): every entry is a parseable,
-        // MASKED CIDR, every 4via6 prefix actually decodes, and a default route is advertised in BOTH
-        // families or in neither. Asked of the set the two inputs COMPOSE — `prospective_advertise_exit`
-        // contributes the two default routes, exactly as Go's `advertiseDefaultRoute` argument does —
-        // because the set is what this node will offer control, and a lone default route there is a
-        // half exit node whichever input produced it. See [`crate::routes`] for each rule.
-        if let Err(errs) =
-            crate::routes::calc_advertise_routes(&prospective_routes, prospective_advertise_exit)
-        {
-            errors.extend(errs.iter().map(ToString::to_string));
-        }
-        // (4) SSH-server enable requires the `ssh` build feature (local analogue of Go's
+        // (3) SSH-server enable requires the `ssh` build feature (local analogue of Go's
         // capability gate — a faithful build-time check; the netmap-capability check is engine-gated)
         // AND must clear the host/operator gate (Go `checkSSHPrefsLocked` → `CanRunTailscaleSSH`).
         // Both are reported when both fail: this call exists to tell the caller everything that is
@@ -5290,15 +5315,30 @@ impl Backend {
             }
         }
 
-        // (5) an auto-update opt-in on an installation that can never apply one (Go
+        // (4) an auto-update opt-in on an installation that can never apply one (Go
         // `checkAutoUpdatePrefsLocked`). `AutoUpdate.Apply` is advertised to control as
         // `Hostinfo.AllowsUpdate`, so accepting it here would let the node tell the tailnet admin
-        // that a remote update trigger will be honoured when nothing could honour it.
-        if let Some(e) = selfupdate::check_auto_update_pref(
-            prospective_auto_update,
-            selfupdate::auto_update_refusal().as_deref(),
-        ) {
+        // that a remote update trigger will be honoured when nothing could honour it. Asked BEFORE
+        // the route rule below because Go asks it there: `checkPrefsLocked` joins
+        // `checkAutoUpdatePrefsLocked` and then `checkAdvertiseRoutes`, so a posture that fails both
+        // reads the same way here as it does upstream.
+        if let Some(e) =
+            selfupdate::check_auto_update_pref(prospective_auto_update, env.auto_update_gate)
+        {
             errors.push(e);
+        }
+
+        // (5) the advertised-route SET (Go `netutil.CalcAdvertiseRoutes`, joined LAST by
+        // `checkPrefsLocked` as it is here): every entry is a parseable, MASKED CIDR, every 4via6
+        // prefix actually decodes, and a default route is advertised in BOTH families or in neither.
+        // Asked of the set the two inputs COMPOSE — `prospective_advertise_exit` contributes the two
+        // default routes, exactly as Go's `advertiseDefaultRoute` argument does — because the set is
+        // what this node will offer control, and a lone default route there is a half exit node
+        // whichever input produced it. See [`crate::routes`] for each rule.
+        if let Err(errs) =
+            crate::routes::calc_advertise_routes(&prospective_routes, prospective_advertise_exit)
+        {
+            errors.extend(errs.iter().map(ToString::to_string));
         }
 
         if errors.is_empty() {
@@ -6187,6 +6227,7 @@ mod tests {
                 CheckPrefsEnv {
                     ssh_gate: disabled(),
                     exit_node_facts: &ExitNodeFacts::default(),
+                    auto_update_gate: None,
                 },
             )
             .expect_err("TS_DISABLE_SSH_SERVER must refuse an SSH-server enable");
@@ -6209,6 +6250,7 @@ mod tests {
                 CheckPrefsEnv {
                     ssh_gate: disabled(),
                     exit_node_facts: &ExitNodeFacts::default(),
+                    auto_update_gate: None,
                 },
             )
             .is_ok(),
@@ -6224,6 +6266,7 @@ mod tests {
                 CheckPrefsEnv {
                     ssh_gate: disabled(),
                     exit_node_facts: &ExitNodeFacts::default(),
+                    auto_update_gate: None,
                 },
             )
             .is_ok(),
@@ -6241,6 +6284,7 @@ mod tests {
             CheckPrefsEnv {
                 ssh_gate: allowed(),
                 exit_node_facts: &ExitNodeFacts::default(),
+                auto_update_gate: None,
             },
         );
         if cfg!(feature = "ssh") {
@@ -6253,6 +6297,98 @@ mod tests {
                 "only the build-feature refusal applies when the knob is clear, got {msg:?}"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_prefs_reports_the_auto_update_rule_before_the_route_rule() {
+        // Go's `checkPrefsLocked` accumulates with `errors.Join` in a fixed sequence whose last two
+        // children are `checkAutoUpdatePrefsLocked` and then `checkAdvertiseRoutes`
+        // (`ipn/ipnlocal/local.go`). Both daemons report every violation, so this is only the order
+        // the operator READS them in — but an answer that reads like upstream's is one less diff for
+        // anyone comparing the two, and nothing but the order of two pushes decides it.
+        //
+        // The host's update provenance is handed in, so this asserts the same thing on a machine
+        // that can replace its own binary and on one that cannot — the ordering bug is invisible to
+        // any test that lets the rule stay silent.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-checkprefs-order-{}", std::process::id()));
+        let be = backend_for(&dir);
+        let cannot = selfupdate::auto_update_refusal_for(None, None, "macos/aarch64")
+            .expect("a platform with no published artifact can never update");
+
+        let err = be
+            .check_prefs_gated(
+                None,
+                None,
+                Some(vec!["10.0.0.5/24".into()]),
+                None,
+                Some(true),
+                CheckPrefsEnv {
+                    ssh_gate: Ok(()),
+                    exit_node_facts: &ExitNodeFacts::default(),
+                    auto_update_gate: Some(&cannot),
+                },
+            )
+            .expect_err("an opt-in plus an unmasked route fails two rules");
+        let msg = format!("{err:#}");
+        let auto_at = msg
+            .find("Auto-updates are not supported")
+            .unwrap_or_else(|| panic!("the auto-update refusal must be reported: {msg}"));
+        let route_at = msg
+            .find("has non-address bits set")
+            .unwrap_or_else(|| panic!("the route refusal must be reported: {msg}"));
+        assert!(
+            auto_at < route_at,
+            "Go joins the auto-update rule BEFORE the advertise-routes rule; got {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_prefs_judges_the_auto_update_pref_the_write_would_leave_behind() {
+        // Go composes the prospective prefs and validates THOSE: `editPrefsLocked` does
+        // `p1 := CurrentPrefs(); p1.ApplyEdits(mp); checkPrefsLocked(p1)`. So an opt-in already in
+        // `prefs.json` — persisted before this rule existed, or carried over from a host that could
+        // update — keeps failing every later prefs write until it is declined, because it keeps
+        // claiming `Hostinfo.AllowsUpdate` on every map request for as long as it is stored.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-checkprefs-merge-{}", std::process::id()));
+        let mut be = backend_for(&dir);
+        let cannot = selfupdate::auto_update_refusal_for(None, None, "macos/aarch64")
+            .expect("a platform with no published artifact can never update");
+        let facts = ExitNodeFacts::default();
+        let env = || CheckPrefsEnv {
+            ssh_gate: Ok(()),
+            exit_node_facts: &facts,
+            auto_update_gate: Some(&cannot),
+        };
+
+        // Nothing stored, nothing named → nothing claimed, so nothing to refuse.
+        assert!(
+            be.check_prefs_gated(None, None, None, None, None, env())
+                .is_ok(),
+            "a node that never stated the pref is valid on any installation"
+        );
+
+        // Stored opt-in, and a check about some unrelated pref: the posture that write would leave
+        // behind still claims auto-update, so it is still refused.
+        be.prefs.auto_update_apply = Some(true);
+        let err = be
+            .check_prefs_gated(None, None, None, None, None, env())
+            .expect_err("a stored opt-in must fail a check that does not clear it");
+        assert!(
+            format!("{err:#}").contains("Hostinfo.AllowsUpdate"),
+            "got {err:#}"
+        );
+
+        // Naming the decline is the way out — the named value wins over the stored one, exactly as
+        // `ApplyEdits` overwrites the field it masks.
+        assert!(
+            be.check_prefs_gated(None, None, None, None, Some(false), env())
+                .is_ok(),
+            "declining the stored opt-in must be a valid posture"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -8938,6 +9074,7 @@ mod tests {
                 CheckPrefsEnv {
                     ssh_gate: Ok(()),
                     exit_node_facts: &facts,
+                    auto_update_gate: None,
                 },
             )
             .expect_err("a peer advertising no exit node must be reported");
@@ -8960,6 +9097,7 @@ mod tests {
                     "100.64.0.7",
                     true,
                 )]),
+                auto_update_gate: None,
             },
         );
         assert!(ok.is_ok(), "a real exit node must be accepted: {ok:?}");
@@ -8976,6 +9114,7 @@ mod tests {
                 CheckPrefsEnv {
                     ssh_gate: Ok(()),
                     exit_node_facts: &facts,
+                    auto_update_gate: None,
                 },
             )
             .expect_err("auto: selection is unsupported")
@@ -10398,6 +10537,85 @@ mod tests {
         .await
         .expect("a set that never names auto-update is unaffected by the rule");
         assert_eq!(be.prefs.auto_update_apply, Some(false));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn set_and_check_prefs_agree_on_a_stored_auto_update_opt_in() {
+        // The dry run and the real write must give the same verdict for the same posture — that is
+        // the whole contract of a `check-prefs` verb, and Go gets it by construction: `CheckPrefs`
+        // and `EditPrefs` both hand `checkPrefsLocked` the prefs that would RESULT (`p1` after
+        // `ApplyEdits`), never the edit mask. Here both paths compose the value through one helper
+        // (`Backend::prospective_auto_update`) for the same reason.
+        //
+        // The case that separates the two is an opt-in already in `prefs.json` with a `set` that
+        // does not mention auto-update: reading the mask, the write sees `None` and proceeds; reading
+        // the posture, both see the stored claim. Which verdict THIS host gives is a property of the
+        // host, so the assertion is that the two AGREE, plus the durable state of whichever branch
+        // applies.
+        let dir = std::env::temp_dir().join(format!(
+            "tailnetd-set-autoupdate-agree-{}",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+        be.prefs.auto_update_apply = Some(true);
+
+        let dry_run = be.check_prefs(None, None, None, None, None).await;
+        let write = be
+            .begin_set(SetOptions {
+                hostname: Some("unrelated".to_string()),
+                ..SetOptions::default()
+            })
+            .await;
+        assert_eq!(
+            dry_run.is_err(),
+            write.is_err(),
+            "check-prefs and set must agree: dry run {dry_run:?}, write {write:?}"
+        );
+
+        match selfupdate::auto_update_refusal() {
+            None => {
+                write.expect("this installation can update, so the stored opt-in is honest");
+                assert_eq!(be.prefs.hostname.as_deref(), Some("unrelated"));
+            }
+            Some(_) => {
+                let err = write.expect_err(
+                    "a stored opt-in on an installation that can never update must fail the write",
+                );
+                assert!(
+                    format!("{err:#}").contains("Hostinfo.AllowsUpdate"),
+                    "got {err:#}"
+                );
+                assert_eq!(
+                    be.prefs.hostname, None,
+                    "a refused set must not have applied the pref it named"
+                );
+                assert!(
+                    !tokio::fs::try_exists(&be.prefs_path).await.unwrap(),
+                    "a refused set must not have persisted anything"
+                );
+
+                // The way out is the one Go leaves: name the pref and decline it. The named value
+                // wins over the stored one, so this write is about a posture that claims nothing.
+                be.begin_set(SetOptions {
+                    auto_update: Some(false),
+                    ..SetOptions::default()
+                })
+                .await
+                .expect("declining the stored opt-in must be accepted");
+                assert_eq!(be.prefs.auto_update_apply, Some(false));
+                be.begin_set(SetOptions {
+                    hostname: Some("unrelated".to_string()),
+                    ..SetOptions::default()
+                })
+                .await
+                .expect("with the claim withdrawn, unrelated edits work again");
+                assert_eq!(be.prefs.hostname.as_deref(), Some("unrelated"));
+            }
+        }
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
