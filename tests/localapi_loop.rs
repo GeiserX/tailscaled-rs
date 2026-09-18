@@ -1237,7 +1237,10 @@ async fn debug_portmap_refuses_an_unknown_type() {
 
 /// The `policy` mask bit (Go `ipn.NotifySysPolicyChanges`, `1 << 17`) end to end over the real
 /// socket: a masked `Watch` asking only for policy must get the effective snapshot as its FIRST
-/// frame, and a fresh snapshot pushed to it whenever the policy may have moved.
+/// frame, and a fresh snapshot pushed to it whenever the policy actually CHANGES — and nothing
+/// otherwise. Go's `rsop.(*Policy).reloadNow` invokes the change callbacks under
+/// `if old != nil && !old.EqualItems(new)`, so a forced `Policy.Reload()` over a store that has not
+/// moved notifies no watcher.
 ///
 /// Why this matters here more than upstream: policy outranks local prefs on every write in this
 /// fork, so a `tnet set` that appears to do nothing is explained by a policy row. Before this bit the
@@ -1248,13 +1251,16 @@ async fn debug_portmap_refuses_an_unknown_type() {
 /// device-scope report a daemon without a policy source resolves — which is the point being pinned:
 /// the frame is *present*, carrying a scope and an (empty) row list, rather than absent. The rows a
 /// real file produces are pinned where a source is actually registered (tests/syspolicy_file.rs),
-/// and they are the same rows by construction: both come from `Backend::policy_snapshot`.
+/// and they are the same rows by construction: both come from `Backend::policy_snapshot`. That file
+/// is also where the *positive* edge is pinned end to end — registering a source takes the effective
+/// policy from empty to its rows and does wake a watcher — because registration is process-global
+/// and this binary's other fourteen tests must keep resolving an empty policy.
 ///
-/// The `syspolicy reload` that drives the change edge is invoked on the backend API rather than over
-/// a second socket connection purely so the assertion is about the notify path and nothing else; it
-/// is the identical call `server::serve` dispatches the `syspolicy_reload` verb to.
+/// The `syspolicy reload` below is invoked on the backend API rather than over a second socket
+/// connection purely so the assertion is about the notify path and nothing else; it is the identical
+/// call `server::serve` dispatches the `syspolicy_reload` verb to.
 #[tokio::test]
-async fn a_policy_masked_watch_front_loads_the_snapshot_and_is_pushed_on_reload() {
+async fn a_policy_masked_watch_front_loads_the_snapshot_and_stays_quiet_on_an_unchanged_reload() {
     let harness = Harness::start().await;
 
     let stream = UnixStream::connect(&harness.socket_path)
@@ -1296,8 +1302,7 @@ async fn a_policy_masked_watch_front_loads_the_snapshot_and_is_pushed_on_reload(
         "a policy-only watch must not be sent fields it did not ask for: {first:?}"
     );
 
-    // Nothing has changed, so nothing more may arrive: this is what makes the push below meaningful
-    // (it is the reload that produces the frame, not a chatty stream).
+    // Nothing has changed, so nothing more may arrive.
     assert!(
         try_read_watch_status(&mut reader, Duration::from_millis(300))
             .await
@@ -1305,27 +1310,25 @@ async fn a_policy_masked_watch_front_loads_the_snapshot_and_is_pushed_on_reload(
         "a parked policy watcher must stay quiet while the policy does not move"
     );
 
-    // The change edge. `syspolicy reload` is the operator saying "the policy may have moved", and the
-    // only such moment this build can observe (the JSON source is captured at startup and never
-    // re-read), so it is the signal the bit is built on.
+    // A forced re-read. It answers with the snapshot — and must leave the parked watcher exactly as
+    // quiet as it was, because it re-resolved the rows that watcher already holds. `Notify.Policy`
+    // means "the effective policy changed"; a frame here would assert a change that did not happen,
+    // and a management agent acting on policy frames would re-apply on every operator `reload`.
     let Response::Policy(reloaded) = Backend::syspolicy_reload() else {
         panic!("syspolicy_reload must reply with a policy report");
     };
-
-    let second = try_read_watch_status(&mut reader, Duration::from_secs(5))
-        .await
-        .expect(
-            "a `syspolicy reload` must push a fresh snapshot to a parked policy watcher — without \
-             it a watcher cannot tell 'unchanged' from 'changed and I have not asked again'",
-        );
-    let Response::Notify(second) = second else {
-        panic!("a masked watch streams Notify frames, got {second:?}");
-    };
     assert_eq!(
-        second.policy.as_ref(),
-        Some(&reloaded),
-        "the pushed frame carries the SAME report the `syspolicy reload` verb answered with — one \
-         producer, so the notify stream cannot drift from the one-shot read"
+        &reloaded, snapshot,
+        "the reload re-resolved the very rows the front-loaded frame carried — one producer, so the \
+         notify stream cannot drift from the one-shot read"
+    );
+
+    assert!(
+        try_read_watch_status(&mut reader, Duration::from_secs(1))
+            .await
+            .is_none(),
+        "a `syspolicy reload` that resolved the same rows must push no policy frame: Go invokes the \
+         change callbacks only under `!old.EqualItems(new)`"
     );
 
     harness.shutdown_and_verify().await;

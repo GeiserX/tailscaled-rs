@@ -313,9 +313,10 @@ pub async fn captive_portal_loop(backend: std::sync::Arc<tokio::sync::Mutex<Back
 /// The same loop carries the policy-change subscription, because Go resets the override from
 /// `sysPolicyChanged` and this fork's policy-change edge is a process-global tick
 /// ([`syspolicy::watch_policy`]) with no backend receiver to hang off. Honest scope note: this
-/// build's one policy source captures its file at startup, so that tick fires on a `syspolicy
-/// reload` without any value having moved — which is exactly why
-/// [`Backend::sys_policy_changed`] compares a snapshot instead of resetting on every tick.
+/// build's one policy source captures its file at startup, so — now that the tick fires only when
+/// the merge actually moves (Go's `reloadNow` guard) — a `syspolicy reload` does not wake this loop
+/// at all. [`Backend::sys_policy_changed`] still compares a snapshot rather than resetting on every
+/// tick, because a tick means *some* key moved, not that an always-on key did.
 ///
 /// ## The guards
 ///

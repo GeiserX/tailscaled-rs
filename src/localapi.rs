@@ -95,20 +95,27 @@ pub enum Request {
         /// ## What "on change" means in THIS build — read before relying on it
         ///
         /// Go registers real change sources (a Windows registry watcher; a handle a management agent
-        /// writes through) and pushes the moment one of them moves. This build has exactly one
-        /// source, the `--syspolicy-file` JSON document, which is read once at startup and — exactly
-        /// as in Go, whose `JSONPolicyStore` captures the file at construction — never re-read. So
-        /// the honest contract here is **the initial snapshot, plus a push on every `syspolicy
-        /// reload`** (and on a source being registered). A `syspolicy reload` is a real change
-        /// signal, just a coarser one: an administrator who edits the policy file behind the
-        /// daemon's back is not seen until someone asks for a reload, or the daemon restarts.
-        /// Promising more than that would be promising a watch this build cannot perform.
+        /// writes through) and pushes the moment one of them moves — and *only* then: its
+        /// `rsop.(*Policy).reloadNow` invokes the change callbacks under
+        /// `if old != nil && !old.EqualItems(new)`, so a re-resolve landing on the same items
+        /// notifies nobody. This build enforces the same guard.
+        ///
+        /// This build has exactly one source, the `--syspolicy-file` JSON document, which is read
+        /// once at startup and — exactly as in Go, whose `JSONPolicyStore` captures the file at
+        /// construction — never re-read. A `syspolicy reload` therefore re-resolves the very rows a
+        /// watcher already holds, and so emits **no frame**. The honest contract here is the initial
+        /// snapshot, and after it a frame only if the effective policy actually moves; with this
+        /// daemon's single captured source, the source being registered at startup is the one moment
+        /// that can happen. An administrator who edits the policy file behind the daemon's back is
+        /// not seen until the daemon restarts. Promising more than that would be promising a watch
+        /// this build cannot perform, and emitting an unchanged frame on every reload would be
+        /// promising it while delivering nothing: the field's meaning is *changed*, so a frame that
+        /// repeats the watcher's own rows asserts something untrue.
         ///
         /// Even so, this is the difference between a watcher that can see policy and one that
         /// cannot. Policy outranks local prefs on every write here, so a `tnet set` that appears to
-        /// do nothing is explained by a policy row — and before this bit, the only way to see that
-        /// row was to ask for it, which cannot distinguish "unchanged" from "changed, and I have not
-        /// asked again".
+        /// do nothing is explained by a policy row, and the front-loaded snapshot is how a watcher
+        /// gets that row without a second round trip.
         #[serde(default, skip_serializing_if = "core::ops::Not::not")]
         policy: bool,
     },
