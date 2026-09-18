@@ -633,14 +633,15 @@ enum Command {
     /// true (`tnet syspolicy list` shows whether it does). Without the policy the request is refused
     /// and nothing happens.
     ///
-    /// The stop is graceful and identical to a SIGTERM: in-flight requests drain, the node is taken
-    /// down cleanly and the state file and socket are closed the way they always are.
+    /// The stop is graceful: in-flight requests drain, the node is taken down cleanly and the state
+    /// file and socket are closed the way they are on a SIGTERM.
     ///
-    /// WHETHER IT COMES BACK is the service manager's decision, not this command's — which is why the
-    /// policy key is named for a restart. The units this fork installs (`tnet install`) restart the
-    /// daemon on failure only, and a `shutdown` is a clean exit, so on a stock install this STOPS the
-    /// daemon until something starts it again. Set `Restart=always` (systemd) or `KeepAlive`
-    /// unconditionally (launchd) if you want the restart behaviour the key's name suggests.
+    /// EXPECT THE DAEMON TO COME BACK — which is why the policy key is named for a restart. The
+    /// daemon exits NON-ZERO after a `shutdown` (a SIGTERM still exits 0), and the units `tnet
+    /// install` writes restart on failure, so on a stock install the daemon is back within seconds
+    /// with a fresh process. That is the point of the verb: it is a restart you can grant to a
+    /// management agent without granting root. To make it a lasting stop instead, stop the service
+    /// (`systemctl stop tailnetd`, `launchctl bootout`) rather than calling this.
     Shutdown,
     /// Authenticate this node with the control plane (Go `tailscale login`). With no `--authkey`, this
     /// is an **interactive login**: the node contacts control, reaches `NeedsLogin`, and the auth URL
