@@ -311,23 +311,19 @@ fn main() -> Result<()> {
     // addition to it does not survive. On Linux there is no such file, exactly as in Go: the packaged
     // unit's `EnvironmentFile=-/etc/default/tailnetd` is the seam there.
     //
-    // A malformed file is FATAL, with the file, the line number and the line (Go stashes the error for
-    // its health tracker; this fork has none yet, and silently ignoring an administrator's typo would
-    // start the daemon under an environment nobody wrote — see the module docs). Absent file, or a
-    // platform with none: nothing happens. Bare message + exit 1 matches the flag refusals below.
-    let applied_env = match tailscaled_rs::envknob::apply_disk_config() {
-        Ok(applied) => applied,
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        }
-    };
+    // A malformed file is NOT fatal, exactly as in Go: `envknob.ApplyDiskConfig()` is called for its
+    // effect there and its error discarded, to be printed later from `run` while the daemon comes up
+    // regardless. The lines above a bad one still apply and the rest of startup continues; whatever
+    // did not apply rides out in `Applied::problems` and is reported below, once flags are parsed.
+    // A daemon that refuses to start over a typo in an optional file strands the operator who would
+    // fix it on the far side of the tailnet. Absent file, or a platform with none: nothing happens.
+    let applied_env = tailscaled_rs::envknob::apply_disk_config();
 
     run(applied_env)
 }
 
 #[tokio::main]
-async fn run(applied_env: Option<tailscaled_rs::envknob::Applied>) -> Result<()> {
+async fn run(applied_env: tailscaled_rs::envknob::Applied) -> Result<()> {
     // Parse flags FIRST: clap handles `--help`/`--version` (print + exit 0) and rejects unknown
     // flags before we touch the experiment gate or any state, matching how Go `tailscaled` parses its
     // flag set up front. The parsed values then override the env-derived defaults below.
@@ -399,6 +395,17 @@ async fn run(applied_env: Option<tailscaled_rs::envknob::Applied>) -> Result<()>
         None => None,
     };
 
+    // Anything in the operator env file that did NOT apply, said once per problem. HERE, and not at
+    // the `apply_disk_config` call in `main`, for two reasons that are both Go's: `log.Printf("Error
+    // reading environment config: %v", err)` lives in Go's `run`, after its flag parse (so a
+    // `--help`/`--version`/`debug` run is silent about it) and before its `--cleanup` branch (so a
+    // cleanup run still says it) — and a message emitted from `main` would land before clap had a
+    // chance to print help. stderr rather than `tracing`, because the log filter is not built until
+    // after the experiment gate below and this must not be held back behind either.
+    for problem in &applied_env.problems {
+        eprintln!("error reading environment config: {problem}");
+    }
+
     // `--cleanup` (Go `tailscaled --cleanup`): reclaim OS-level network state from a previous run,
     // then exit — WITHOUT running the engine, so it deliberately runs BEFORE the experiment gate
     // below (Go likewise drops cleanup's normal prerequisites, e.g. the macOS root check). In
@@ -450,10 +457,10 @@ async fn run(applied_env: Option<tailscaled_rs::envknob::Applied>) -> Result<()>
     // Say that the env file was read, now that there is somewhere to say it. Names only — a value in
     // that file can be a secret (`TS_AUTH_KEY`), and this is the same discipline the prefs logging
     // uses. Silent when there was no file, which is the normal case on nearly every host.
-    if let Some(applied) = &applied_env {
+    if let Some(path) = &applied_env.path {
         tracing::info!(
-            path = %applied.path.display(),
-            keys = %applied.keys.join(","),
+            path = %path.display(),
+            keys = %applied_env.keys.join(","),
             "applied operator environment file"
         );
     }
