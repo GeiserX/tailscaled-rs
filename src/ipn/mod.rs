@@ -313,9 +313,10 @@ pub async fn captive_portal_loop(backend: std::sync::Arc<tokio::sync::Mutex<Back
 /// The same loop carries the policy-change subscription, because Go resets the override from
 /// `sysPolicyChanged` and this fork's policy-change edge is a process-global tick
 /// ([`syspolicy::watch_policy`]) with no backend receiver to hang off. Honest scope note: this
-/// build's one policy source captures its file at startup, so that tick fires on a `syspolicy
-/// reload` without any value having moved — which is exactly why
-/// [`Backend::sys_policy_changed`] compares a snapshot instead of resetting on every tick.
+/// build's one policy source captures its file at startup and the tick fires only when the merge
+/// actually moves (Go's `reloadNow` guard), so a `syspolicy reload` does not wake this loop at all.
+/// [`Backend::sys_policy_changed`] still compares a snapshot rather than resetting on every tick,
+/// because a tick means *some* key moved, not that an always-on key did.
 ///
 /// ## The guards
 ///
@@ -2504,9 +2505,9 @@ impl Backend {
     /// `current` is [`syspolicy::always_on_keys`]'s answer, passed in by [`reconnect_loop`] (which
     /// holds the policy-change subscription) so the comparison is testable without the process-global
     /// registry. Only a *change* resets: a policy tick that leaves both keys where they were must not
-    /// revoke an exemption the administrator did not touch — which matters here because this build's
-    /// one policy source captures the file at startup, so `tnet syspolicy reload` ticks the bus
-    /// without ever changing a value.
+    /// revoke an exemption the administrator did not touch. That is Go's own reason for
+    /// `HasChangedAnyOf` and it survives the bus being change-gated, because a tick says *some* key
+    /// moved — not that one of these two did.
     ///
     /// Returns whether it reset anything, so a caller can log the edge.
     fn sys_policy_changed(&mut self, current: syspolicy::AlwaysOnKeys) -> bool {
@@ -5074,9 +5075,11 @@ impl Backend {
     /// [`policy_snapshot`](Self::policy_snapshot) on each tick.
     ///
     /// Static (no backend state, no lock): the policy registry is process-global, like Go's `rsop`
-    /// store list. See `syspolicy::watch_policy` for exactly which events tick it in this build —
-    /// notably, an edit to the policy file behind the daemon's back does **not**, because nothing
-    /// re-reads the file until a `syspolicy reload`.
+    /// store list. See `syspolicy::watch_policy` for exactly which events tick it in this build. Two
+    /// things it does **not** tick on: an edit to the policy file behind the daemon's back (nothing
+    /// re-reads the file at all — only a restart picks it up), and a `syspolicy reload`, which
+    /// re-resolves the rows a watcher already holds and so is not a change. A tick means the
+    /// effective policy moved, matching Go's `reloadNow` callback guard.
     pub fn watch_policy() -> tokio::sync::watch::Receiver<()> {
         syspolicy::watch_policy()
     }
@@ -6721,9 +6724,9 @@ mod tests {
     async fn only_a_real_always_on_policy_change_revokes_an_outstanding_exemption() {
         // Go's `sysPolicyChanged` resets the override on
         // `HasChangedAnyOf(AlwaysOn, AlwaysOnOverrideWithReason)`. The "HasChanged" part is
-        // load-bearing here: this build's policy source captures its file at startup, so a `tnet
-        // syspolicy reload` ticks the change bus without a single value having moved — and a tick
-        // that revoked the exemption would cut a permitted disconnect short for no reason.
+        // load-bearing: a tick says the effective policy moved, not that one of *these two* keys
+        // did, so any other key changing would otherwise cut a permitted disconnect short for no
+        // reason.
         let dir =
             std::env::temp_dir().join(format!("tailnetd-alwayson-policy-{}", std::process::id()));
         let mut be = backend_for(&dir);
@@ -6867,8 +6870,8 @@ mod tests {
 
         assert!(
             !be.exit_node_policy_changed(pinned_with_override),
-            "an unchanged policy is not a change — this build's source captures its file at \
-             startup, so a `syspolicy reload` ticks the bus without a value having moved"
+            "an unchanged policy is not a change — a tick says some key moved, not that one of \
+             these exit-node keys did, so the comparison is what protects the override"
         );
         assert!(be.override_exit_node_policy, "so the override still stands");
 

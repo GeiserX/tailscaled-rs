@@ -730,8 +730,9 @@ async fn stream_notify(
                     continue; // still no device — loop back to the device-derive/wait
                 }
                 // Policy ticks are served on the device-less path too: policy is resolved from the
-                // registry, not the netmap, so a `syspolicy reload` on a down node is just as real a
-                // change as one on a running node.
+                // registry, not the netmap, so a policy change on a down node is just as real as one
+                // on a running node. (A tick only ever means the effective policy MOVED — see
+                // `syspolicy::reload_and_publish` — so every frame emitted here carries new rows.)
                 res = policy_rx.changed(), if policy => {
                     if res.is_err() {
                         return Ok(()); // policy sender dropped (process gone)

@@ -24,7 +24,9 @@
 //! deliberately the ONLY test in this binary that registers a source.
 //!
 //! Upstream: `cmd/tailscaled/syspolicy.go` + `util/syspolicy/load.go` @
-//! `53a0d659afa51835dd7a9283873cca44261454f8`.
+//! `53a0d659afa51835dd7a9283873cca44261454f8`; the change-callback rule the notify assertions in
+//! case 2 pin is `util/syspolicy/rsop/resultant_policy.go` (`reloadNow`) @
+//! `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`.
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -93,6 +95,17 @@ fn a_loaded_policy_file_reaches_the_localapi_report() {
     )
     .expect("the temp policy file should be writable");
 
+    // Subscribe BEFORE the load: registering a source is the one moment in this build at which the
+    // effective policy genuinely moves (empty → six rows), so it is the one moment a policy watcher
+    // must be woken. The receiver starts synced, so any tick it sees below came from that load.
+    let mut policy_rx = Backend::watch_policy();
+    assert!(
+        !policy_rx
+            .has_changed()
+            .expect("the policy channel is static and never closes"),
+        "a fresh policy watcher must start synced — it front-loads its own snapshot instead"
+    );
+
     let outcome = syspolicy::load_json_policy_file(syspolicy::JSON_FILE_SOURCE_NAME, &path);
     let _ = std::fs::remove_file(&path);
     assert_eq!(
@@ -139,30 +152,14 @@ fn a_loaded_policy_file_reaches_the_localapi_report() {
         "the auth key must not reach the LocalAPI reply: {wire}"
     );
 
-    // `reload` forces a re-read and must report the same thing: Go's JSON store captures the file at
-    // construction and never re-reads it, so the two verbs agree for this source by construction.
-    //
-    // It must ALSO push that snapshot to anyone watching the notify bus with the `policy` mask bit —
-    // Go's `NotifySysPolicyChanges` / `sysPolicyChangedForSession`. Subscribe first: the receiver
-    // starts synced, so the tick it sees can only have come from the reload below.
-    let mut policy_rx = Backend::watch_policy();
-    assert!(
-        !policy_rx
-            .has_changed()
-            .expect("the policy channel is static and never closes"),
-        "a fresh policy watcher must start synced — it front-loads its own snapshot instead"
-    );
-    let Response::Policy(reloaded) = Backend::syspolicy_reload() else {
-        panic!("syspolicy_reload must reply with a policy report");
-    };
-    assert_eq!(reloaded, report);
+    // The load above moved the effective policy, so it must have reached anyone watching the notify
+    // bus with the `policy` mask bit — Go's `NotifySysPolicyChanges` / `sysPolicyChangedForSession`.
     assert!(
         policy_rx
             .has_changed()
             .expect("the policy channel is static and never closes"),
-        "a `syspolicy reload` must reach a policy watcher: it is the one change edge this build \
-         can observe, and without it a watcher cannot tell 'policy unchanged' from 'policy changed \
-         and I have not asked again'"
+        "registering a source with six settings takes the effective policy from empty to those \
+         six rows; a policy watcher must be woken for it"
     );
     policy_rx.borrow_and_update();
     // What a watcher re-reads on that tick is the report itself, rows and all — not a second
@@ -171,6 +168,25 @@ fn a_loaded_policy_file_reaches_the_localapi_report() {
         Backend::policy_snapshot(),
         report,
         "the pushed snapshot and the `syspolicy list` report are the same rows"
+    );
+
+    // `reload` forces a re-read and must report the same thing: Go's JSON store captures the file at
+    // construction and never re-reads it, so the two verbs agree for this source by construction.
+    //
+    // And because they agree, the reload must emit NOTHING on the notify bus. Go's
+    // `rsop.(*Policy).reloadNow` invokes the change callbacks only under `!old.EqualItems(new)`, so
+    // a forced reload over an unchanged store notifies no watcher; here the store can never have
+    // changed, so every reload is silent. A frame at this point would tell a management agent the
+    // effective policy had changed while handing it the rows it already had.
+    let Response::Policy(reloaded) = Backend::syspolicy_reload() else {
+        panic!("syspolicy_reload must reply with a policy report");
+    };
+    assert_eq!(reloaded, report);
+    assert!(
+        !policy_rx
+            .has_changed()
+            .expect("the policy channel is static and never closes"),
+        "a `syspolicy reload` that re-resolved the same rows must not push a policy frame"
     );
 
     // ---------------------------------------------------------------------------------------
