@@ -166,6 +166,50 @@ fn host_routes_carries_gos_only_true_is_allowed_refusal() {
     );
 }
 
+/// Go's line, byte for byte, at the ref this port was read from (tailscale
+/// `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`, v1.102.4): `notFalseVar.Set` returns "unsupported
+/// value; only 'true' is allowed" (`cmd/tailscale/cli/up.go`) and the flag package wraps it with
+/// `invalid boolean value %q for -%s: %v` (Go `src/flag/flag.go`) — ONE dash, the name as
+/// registered.
+const GO_HOST_ROUTES_LINE: &str =
+    "invalid boolean value \"false\" for -host-routes: unsupported value; only 'true' is allowed";
+
+/// Where Go's `-host-routes` is respelled for this CLI's operators, and nothing else is.
+const GO_FLAG_IN_LINE: &str = " for -host-routes:";
+const FORK_FLAG_IN_LINE: &str = " for --host-routes:";
+
+#[test]
+fn host_routes_refusal_is_gos_line_respelled_and_nothing_more() {
+    // What "carries Go's refusal" is allowed to mean, pinned so the README and the doc comments
+    // can say it without a reader having to take their word for it: the fork prints Go's sentence
+    // with the flag rewritten to the spelling that was typed, and prints nothing else.
+    //
+    // Two ways that claim can rot. Drift in the sentence — a reworded "only 'true' is allowed", a
+    // second dash left off, an `Error: ` prefix back in front — makes the README's "Go's own" false
+    // in the direction that matters, because an operator grepping Go's text would stop matching.
+    // And Go's `failf` prints the message and then calls `f.usage()` (Go `src/flag/flag.go`), so
+    // upstream's stderr is the sentence FOLLOWED BY the command's whole flag list; this fork stops
+    // at the sentence. Equality against the one expected line pins both at once: the sentence is
+    // Go's modulo the one substitution, and no usage block trails it.
+    let out = tnet(&["up", "--host-routes=false"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let expected = GO_HOST_ROUTES_LINE.replace(GO_FLAG_IN_LINE, FORK_FLAG_IN_LINE);
+    assert_ne!(
+        expected, GO_HOST_ROUTES_LINE,
+        "the respelling this test is about should actually change the line"
+    );
+    let printed: Vec<&str> = stderr
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert_eq!(
+        printed,
+        vec![expected.as_str()],
+        "`tnet up --host-routes=false` should print Go's refusal with only `-host-routes` \
+         respelled `--host-routes`, and no usage block after it; got: {stderr}"
+    );
+}
+
 #[test]
 fn nickname_is_distinguished_from_the_flags_that_are_only_renames() {
     // `--auth-key` and `--login-server` were aliases waiting to be written: `up` already carried the
@@ -216,9 +260,12 @@ fn nickname_is_distinguished_from_the_flags_that_are_only_renames() {
     );
     // Upstream's answer to `tailscale up --nickname` comes out of `flag.Parse`: the flag is not in
     // `up`'s set, and `newFlagSet` asks for `flag.ExitOnError`, so Go prints `flag provided but not
-    // defined: -nickname` and exits 2. Only the sentence is this fork's; the status is Go's, and
-    // exiting 1 here would tell a wrapper script the command ran when it never parsed. That the
-    // refusal is ours and not clap's is what the message assertions below establish.
+    // defined: -nickname` and exits 2. The status is Go's; this fork's departures are the sentence
+    // and the usage block Go's `failf` prints after it (see
+    // `host_routes_refusal_is_gos_line_respelled_and_nothing_more`). Exiting 1 here would tell a
+    // wrapper script the command ran when it never parsed. That the refusal is ours and not clap's
+    // — which exits 2 too — is what the message assertions below establish, and after this the
+    // message is the only thing left that distinguishes the two.
     assert_eq!(
         out.status.code(),
         Some(2),

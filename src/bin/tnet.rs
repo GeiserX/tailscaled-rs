@@ -11636,28 +11636,35 @@ struct PortedUpFlags {
     /// `--nickname <NAME>`, hidden. Carried only to be refused by name: neither this fork's `up`
     /// nor Go's takes a profile name. Go's own answer is its flag parser's `flag provided but not
     /// defined: -nickname`, so the refusal keeps that answer's exit status and its bare, unprefixed
-    /// shape, and replaces only the sentence.
+    /// shape. What it does not keep is that sentence, nor the usage block Go's parser prints after
+    /// it — both departures, and the reasons for both, are in [`exit_like_gos_flag_parser`].
     nickname: Option<String>,
 }
 
 /// Print a refusal that Go decides in its **flag parser**, and exit the way that parser exits.
 ///
-/// `newFlagSet` (`cmd/tailscale/cli/cli.go`) builds every flag set with `flag.ExitOnError`, so a
+/// `newFlagSet` (`cmd/tailscale/cli/cli.go`) builds its flag sets with `flag.ExitOnError` — every
+/// one a native build makes, its `runtime.GOOS == "js"` case being the lone exception — so a
 /// flag that is not in the set (`flag provided but not defined: -nickname`) and a `Var` whose `Set`
 /// returns an error (`notFalseVar` on `--host-routes`) both print to stderr and exit **2** — `runUp`
 /// never runs. That is deliberately a different status from the exit 1 the other refusals here end
 /// at (`up_usage_refusal`, `switch_usage_refusal`, `sysext_refusal`), and the difference is the part
 /// worth keeping: a wrapper script can tell a command line it typed wrong from a node that would not
 /// come up. It is also the status clap gives its own parse errors, so a ported command line gets one
-/// answer whether or not this CLI happens to carry the flag.
+/// answer whether or not this CLI happens to carry the flag — which leaves the message as the whole
+/// of what the hidden `--nickname` buys over clap's "unexpected argument", and the message is why
+/// the flag is carried at all.
 ///
 /// Printing here rather than returning the error also drops the `Error: ` prefix `main`'s
 /// `Result` return would have `Termination` add, which is the second half of matching Go: its flag
 /// package prints the bare sentence. Both are pinned in `tests/tnet_up_go_flag_spellings.rs`.
 ///
 /// For `--nickname` the sentence itself is this fork's: it names where the behaviour does live
-/// instead of stopping at "not defined" (`--host-routes` keeps Go's own wording). Go's usage block
-/// is left off for the same reason every other refusal here leaves it off — the message already
+/// instead of stopping at "not defined". `--host-routes` keeps Go's sentence, respelled in one
+/// place only: Go's flag package prints the name it registered, `-host-routes`, and this one prints
+/// the name a `tnet` operator typed. Go's usage block is dropped both times — `failf` prints the
+/// message and then calls `f.usage()`, so upstream's stderr carries the command's whole flag list
+/// after the sentence — for the reason every other refusal here leaves it off: the message already
 /// says what to run.
 fn exit_like_gos_flag_parser(err: &anyhow::Error) -> ! {
     eprintln!("{err}");
