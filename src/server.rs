@@ -646,6 +646,20 @@ async fn stream_watch(
 /// Neither is tied to a device epoch: prefs change on a down node, and policy is resolved from the
 /// process-global registry rather than the netmap, so both are also served on the device-less arm.
 ///
+/// ## A reader that falls behind is NOT told (engine gap, `docs/ENGINE_ASKS.md` #45)
+///
+/// Frames are written to the socket inline, so a slow client stalls `watcher.next()` and the engine's
+/// 128-deep per-watcher queue fills. Go disconnects such a watcher: `sendToLocked` drains its queue,
+/// sends one terminal `Notify` whose `ErrMessage` is `"IPN bus consumer fell behind; closing watch"`,
+/// and closes it, so the client knows to re-subscribe. The engine's bus instead drops the frame and
+/// keeps streaming, and records nothing, so this function cannot tell a gap happened. It does not
+/// guess (a write timeout or a queue-depth estimate would be a facsimile). Once the engine reports
+/// lag, the handling is: drop the watcher (discarding queued frames), write one
+/// [`NotifyView::error`](crate::localapi::NotifyView::error) frame, return — in that order.
+///
+/// The daemon-built prefs and policy feeds are not affected: they ride `tokio::sync::watch`, which
+/// coalesces to the latest full snapshot instead of dropping an entry, so a slow reader loses nothing.
+///
 /// ## Lock discipline (the load-bearing rule)
 ///
 /// The backend guard is held only for the brief `watch_lifecycle()` subscribe and the brief
