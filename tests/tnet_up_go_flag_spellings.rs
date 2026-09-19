@@ -284,7 +284,7 @@ fn login_host_routes_carries_the_same_refusal_up_does() {
     assert_eq!(
         out.status.code(),
         Some(2),
-        "`tnet login --host-routes=false` is refused in Go's flag parser, which exits 2; got:          {stderr}"
+        "`tnet login --host-routes=false` is refused in Go's flag parser, which exits 2; got: {stderr}"
     );
     assert!(
         stderr.contains("only 'true' is allowed"),
