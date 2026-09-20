@@ -8868,11 +8868,40 @@ fn check_exit_node_suggest_flags(force_probe: bool) -> Result<()> {
     Ok(())
 }
 
+/// The notice `exit-node suggest` prints when the daemon has no node to suggest — one string per
+/// reason, because the two reasons are not the same news.
+///
+/// `withheld_by_policy: false` is the ordinary empty answer (Go's empty `SuggestExitNode` response):
+/// nothing on this tailnet is an eligible exit-node candidate right now, and there is nothing the
+/// operator can do about it here.
+///
+/// `withheld_by_policy: true` is this build's own outcome and must not borrow the other's wording.
+/// The engine did pick a node; `AllowedSuggestedExitNodes` excludes it; and, unlike upstream, this
+/// build cannot re-rank the candidates to answer with the best *permitted* one — it is handed a
+/// single already-chosen node (engine ask #44). Printing "no eligible exit-node peer right now"
+/// there would be a plain falsehood, and it would hide the two things that DO work: list that node
+/// in the policy, or choose a permitted exit node by hand.
+///
+/// Pure (a `bool` in, a `&'static str` out) so both notices are pinned by unit tests rather than by
+/// reading the terminal.
+fn exit_node_suggest_empty_notice(withheld_by_policy: bool) -> &'static str {
+    if withheld_by_policy {
+        "No exit node suggestion available: the AllowedSuggestedExitNodes policy does not list the \
+         node this build picked.\nThis build cannot re-rank to the best permitted node, so it \
+         suggests none. List that node in the policy, or choose a permitted one with `tnet \
+         exit-node list` and `tnet set --exit-node=<id>`."
+    } else {
+        "No exit node suggestion available (no eligible exit-node peer right now)."
+    }
+}
+
 /// `exit-node suggest` (Go `tailscale exit-node suggest`): ask the daemon for the best available exit
 /// node and print it with the `tnet set --exit-node=<id>` command to engage it. A `None` suggestion
-/// (no eligible candidate) prints a clear notice and exits 0 (not an error — there was simply nothing
-/// to suggest, matching Go's empty response). The suggested name is control-supplied text, so it is
-/// run through `sanitize_for_terminal` before printing.
+/// prints a clear notice and exits 0 (not an error — there was simply nothing to suggest, matching
+/// Go's empty response); *which* notice depends on why the answer is empty — see
+/// [`exit_node_suggest_empty_notice`], which keeps the policy refusal from being read as an empty
+/// tailnet. The suggested name is control-supplied text, so it is run through
+/// `sanitize_for_terminal` before printing.
 ///
 /// `--force-probe` is refused first, before the socket is touched — the flag asks for a measurement
 /// this build cannot take, so there is nothing to ask the daemon for. See
@@ -8885,6 +8914,7 @@ async fn run_exit_node_suggest(socket: &std::path::Path, force_probe: bool) -> R
     match response {
         Response::ExitNodeSuggestion {
             suggestion: Some(s),
+            ..
         } => {
             // Name is control-supplied — sanitize before printing. The id is a stable node id
             // (`[A-Za-z0-9]`-ish), echoed verbatim as the selector for `set --exit-node`.
@@ -8892,9 +8922,13 @@ async fn run_exit_node_suggest(socket: &std::path::Path, force_probe: bool) -> R
             println!("To use it, run: tnet set --exit-node={}", s.id);
             Ok(())
         }
-        Response::ExitNodeSuggestion { suggestion: None } => {
-            // No eligible candidate — an honest empty result, not an error. Exit 0.
-            println!("No exit node suggestion available (no eligible exit-node peer right now).");
+        Response::ExitNodeSuggestion {
+            suggestion: None,
+            withheld_by_policy,
+        } => {
+            // Empty — an honest empty result, not an error. Exit 0 either way; the notice names
+            // which of the two empties this is.
+            println!("{}", exit_node_suggest_empty_notice(withheld_by_policy));
             Ok(())
         }
         Response::Error { message } => {
@@ -18703,6 +18737,43 @@ mod tests {
         assert!(!force_probe, "the flag must default off");
         check_exit_node_suggest_flags(force_probe)
             .expect("the unprobed suggestion is what this build serves");
+    }
+
+    #[test]
+    fn an_empty_suggestion_says_which_empty_it_is() {
+        // Upstream filters the candidates before ranking them, so its empty answer means "nothing
+        // passed the filter" and it otherwise suggests the best PERMITTED node. This build is handed
+        // one already-chosen node and can only refuse it, so its empty answer has a second cause the
+        // operator can act on. Printing one notice for both would tell an administrator whose policy
+        // excluded the top pick that the tailnet has no exit node, which is false and points nowhere.
+        let withheld = exit_node_suggest_empty_notice(true);
+        assert!(
+            withheld.contains("AllowedSuggestedExitNodes"),
+            "the policy refusal must name the policy: {withheld}"
+        );
+        assert!(
+            withheld.contains("cannot re-rank"),
+            "it must admit why it has no permitted node to offer instead: {withheld}"
+        );
+        assert!(
+            withheld.contains("tnet set --exit-node=<id>"),
+            "it must point at the way out: {withheld}"
+        );
+        assert!(
+            !withheld.contains("no eligible exit-node peer"),
+            "the policy refusal must not borrow the empty-tailnet wording: {withheld}"
+        );
+
+        // The ordinary empty answer is unchanged — Go's empty response, nothing to act on.
+        let no_candidate = exit_node_suggest_empty_notice(false);
+        assert_eq!(
+            no_candidate,
+            "No exit node suggestion available (no eligible exit-node peer right now)."
+        );
+        assert_ne!(
+            withheld, no_candidate,
+            "the two empties must not read the same"
+        );
     }
 
     #[test]

@@ -5126,7 +5126,10 @@ impl Backend {
     /// [`diag::suggest_exit_node`], uniform with the other off-lock diagnostics. See it for the
     /// `suggest_exit_node()` → [`Response::ExitNodeSuggestion`](crate::localapi::Response) mapping
     /// (`Ok(None)` = no eligible candidate, an honest empty result, not an error) and for the
-    /// `AllowedSuggestedExitNodes` allow-list the engine's answer is filtered through.
+    /// `AllowedSuggestedExitNodes` allow-list the engine's answer is filtered through — a suggestion
+    /// that list excludes comes back empty *and flagged* (`withheld_by_policy`), because unlike Go
+    /// this build cannot re-rank to the best permitted node and must not pass its refusal off as an
+    /// empty tailnet.
     pub async fn suggest_exit_node(dev: &tailscale::Device) -> crate::localapi::Response {
         diag::suggest_exit_node(dev).await
     }

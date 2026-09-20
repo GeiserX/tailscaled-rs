@@ -1864,7 +1864,10 @@ configured empty array means nothing is allowed.
 
 The daemon now enforces the half it can (`permitted_suggestion` in `src/ipn/diag.rs`, fed by
 `syspolicy::allowed_suggested_exit_nodes`): it withholds a suggestion whose stable id the allow-list
-excludes, which is the same honest empty result Go produces when no candidate passes. What it cannot
+excludes. That coincides with Go's empty response only when the permitted set leaves no candidate at
+all; in every other case Go answers with the best permitted node and this build answers with nothing,
+so the refusal is reported as *itself* — `Response::ExitNodeSuggestion { withheld_by_policy: true }`,
+and its own `tnet` notice — rather than being passed off as Go's empty result. What the daemon cannot
 do is **re-rank**. Verified against pin `9d847a6e`/v0.43.0: `Device::suggest_exit_node()` takes no
 arguments and returns one already-chosen `ExitNodeSuggestion { id, name }`, and the engine's own
 `ts_runtime/src/exit_node_suggest.rs` says so in as many words — "The allow-list gate is likewise
@@ -1920,4 +1923,7 @@ refusal is stable rather than flapping) but is one more reason the gate belongs 
 `syspolicy::allowed_suggested_exit_nodes()` straight into the engine call and
 `permitted_suggestion`'s filter arm becomes redundant (the nil-versus-empty reading and its tests
 move with the argument). `tnet exit-node suggest` then answers with the best *allowed* exit node
-instead of withholding when the best overall is not allowed. Consumed via a pin bump. — engine lane
+instead of withholding when the best overall is not allowed, and the `withheld_by_policy` reply flag
+plus its CLI notice become dead — the outcome they describe can no longer occur, so both are removed
+with the same commit that consumes the argument (the wire field is `skip_serializing_if`-false, so
+dropping it is invisible to a client that never saw it set). Consumed via a pin bump. — engine lane
