@@ -10840,18 +10840,22 @@ mod tests {
     // After the lock-across-await fix (tsd), the `ip_report`/`whois`/`ping`/`file_cp`/`file_list`/
     // `file_get` free fns take `&tailscale::Device` (see `ipn::diag`) and the LocalAPI server runs
     // them OFF the backend lock: it clones the engine handle via `device_handle()` under a brief
-    // lock, drops the lock, and only calls the method when that handle is `Some`. The "node is not
-    // up" branch therefore lives in the dispatch arm, keyed on `device_handle()` being `None` — so
-    // the device-less precondition is unit-tested here as `device_handle().is_none()` (the single
-    // fact every "not up" reply derives from). The bad-IP-parse and path-hardening predicate tests
-    // moved to `ipn::diag` alongside the diagnostics they pin.
+    // lock, drops the lock, and only calls the method when that handle is `Some`. What a `None`
+    // handle produces therefore lives in the dispatch arm — the "node is not up" refusal for
+    // `whois`/`ping`/`file_cp`/`file_list`/`file_get`, and for `ip` an EMPTY `Response::Ip`, since a
+    // node with no engine holds no addresses and that is an answer rather than a failure. Either
+    // way the precondition is the same bit, so it is unit-tested here as `device_handle().is_none()`
+    // (the single fact every device-less reply derives from). The bad-IP-parse and path-hardening
+    // predicate tests moved to `ipn::diag` alongside the diagnostics they pin.
 
     #[tokio::test]
     async fn device_handle_is_none_without_device() {
-        // The shared precondition for every "node is not up" LocalAPI reply: with no engine up, the
-        // server's brief-lock `device_handle()` clone yields `None`, and the dispatch arm turns that
-        // into the "not up" Error WITHOUT calling the (now `&Device`-taking) engine method. One
-        // assertion covers ip/whois/ping/file_cp/file_list/file_get, which all gate on this same bit.
+        // The shared precondition for every device-less LocalAPI reply: with no engine up, the
+        // server's brief-lock `device_handle()` clone yields `None`, and the dispatch arm answers
+        // WITHOUT calling the (now `&Device`-taking) engine method. One assertion covers
+        // whois/ping/file_cp/file_list/file_get, which turn that into the "not up" Error, and `ip`,
+        // which gates on the same bit but answers an empty `Response::Ip` — pinned end to end in
+        // `tests/tnet_ip_go_errors.rs::the_real_addressless_daemon_reports_gos_state_line`.
         let dir = std::env::temp_dir().join(format!("tailnetd-diag-nodev-{}", std::process::id()));
         let be = backend_for(&dir);
         assert!(

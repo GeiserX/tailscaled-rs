@@ -3,8 +3,12 @@
 //! `ip_report` / `whois` / `ping` / `file_cp` / `file_list` / `file_get` all take a
 //! `&tailscale::Device` (never `Backend` `self`) so the LocalAPI server can run them **off the
 //! backend lock**: it clones the engine handle via [`Backend::device_handle`](super::Backend::device_handle)
-//! under a brief lock, drops the lock, and only calls these when the handle is `Some`. The
-//! device-absent "node is not up" branch therefore lives at the dispatch arm, not here.
+//! under a brief lock, drops the lock, and only calls these when the handle is `Some`. What the
+//! dispatch arm does with a `None` handle therefore lives there, not here: `whois`/`ping`/`file_cp`/
+//! `file_list`/`file_get` are refused with "node is not up", while `ip_report`'s device-absent case
+//! is answered as an EMPTY address pair — it asks what the node holds, not for work from the engine,
+//! and a node with no engine holds nothing. The reasoning is written out at the `Request::Ip` arm in
+//! `server.rs`.
 //!
 //! [`Backend`](super::Backend) keeps thin `pub` shims (`Backend::ip_report` etc.) that delegate to
 //! these free functions, so the `server.rs` dispatch call sites (`Backend::file_cp(&dev, ..)`, …)
@@ -19,8 +23,10 @@ use crate::localapi::{ConflictPolicy, FileGotReport, Response, WaitingFileReport
 /// Read-only: queries the engine's cheap address accessors and never mutates prefs or bumps the
 /// generation. Takes the engine handle as `dev` rather than reading `self.device`, so the LocalAPI
 /// server can run it **off the backend lock** (clone the `Arc` via
-/// [`device_handle`](super::Backend::device_handle), drop the lock, call here) — the device-absent
-/// "node is not up" branch now lives at the caller, which only invokes this when it holds a handle.
+/// [`device_handle`](super::Backend::device_handle), drop the lock, call here) — the caller only
+/// invokes this when it holds a handle. With no handle the caller does NOT refuse: it answers an
+/// empty address pair, because "which addresses does this node hold?" has a true answer without an
+/// engine (none), and that is the answer Go's `runIP` reads off `Status` in every backend state.
 ///
 /// Each family is best-effort: [`ipv4_addr`](tailscale::Device::ipv4_addr) /
 /// [`ipv6_addr`](tailscale::Device::ipv6_addr) `Err` before the netmap assigns the address (and

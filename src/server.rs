@@ -1680,14 +1680,27 @@ async fn dispatch(
         // `down`. So we follow the same "clone the work out, drop the lock" discipline as `drive_up`:
         // lock only long enough to clone the engine handle (`device_handle()`), DROP the lock, then
         // run the engine call off-lock. `Some` reproduces each method's prior behavior; `None` is the
-        // "node is not up" branch that used to live inside the method. The backend methods build the
-        // typed reply verbatim (including their own bad-input error responses).
+        // "node is not up" branch that used to live inside the method — except for `ip`, see below.
+        // The backend methods build the typed reply verbatim (including their own bad-input error
+        // responses).
+        //
+        // `ip` is the one read here that is NOT an engine operation: it asks what addresses this
+        // node holds, and a node with no engine holds none. That is an answer, not a failure, so the
+        // device-absent arm reports an EMPTY pair rather than "node is not up". Upstream settles it
+        // the same way — Go's `runIP` reads `ips := st.TailscaleIPs` off the one `Status` it fetches,
+        // and `Status` answers in every backend state with an empty `TailscaleIPs` when there is no
+        // netmap, which is what lets `runIP` reach `no current Tailscale IPs; state: %v`. Splitting
+        // that field out of `status` into its own request must not turn "none" into an error: it did,
+        // and `tnet ip` on a Stopped/NeedsLogin node printed `error: node is not up` where Go prints
+        // the state line. `whois`/`ping`/`id-token` keep the refusal — each needs a live engine to
+        // perform an action, and there is no true answer to give without one.
         Request::Ip => {
             let dev = { backend.lock().await.device_handle() };
             match dev {
                 Some(dev) => Backend::ip_report(&dev).await,
-                None => Response::Error {
-                    message: "node is not up".into(),
+                None => Response::Ip {
+                    ipv4: None,
+                    ipv6: None,
                 },
             }
         }
