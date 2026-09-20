@@ -86,10 +86,12 @@ pub enum Request {
     /// byte compatibility with Go's HTTP LocalAPI, so an integer mask would buy no interoperability
     /// while committing this fork to keeping two spellings of one subscription in step forever.
     ///
-    /// Nothing offered today can trip either refusal (no field below is a member of
-    /// `NotifyRateLimitIncompatibleBits`, and there is no `rate_limit` field), which is exactly why
-    /// the ruling is written down here rather than left to be re-derived by whoever adds the fifth
-    /// field.
+    /// Nothing offered today can trip either refusal, but only one of the two is still unreachable
+    /// for BOTH of its operands. `initial_status` below is Go's `NotifyInitialStatus`, which IS a
+    /// member of `NotifyRateLimitIncompatibleBits`: half of that refusal is now spellable here, and
+    /// all that keeps it from firing is the absence of a `rate_limit` field. Whoever adds one adds
+    /// the check in [`watch_usage_refusal`] with it, which is exactly why the ruling was written
+    /// down here rather than left to be re-derived.
     ///
     /// ### `NotifyInProcessNoDisconnect` is not offered here, on purpose
     ///
@@ -941,17 +943,24 @@ pub enum Request {
 ///
 /// ## Why it accepts everything today
 ///
-/// Neither of Go's two *content* refusals can be expressed in this fork's wire format, because
-/// neither operand is offered:
+/// Neither of Go's two *content* refusals can be expressed in this fork's wire format, because in
+/// each case at least one operand is not offered:
 ///
 /// - `NotifyInProcessNoDisconnect is only valid for in-process IPN bus subscribers` — the bit is
-///   deliberately not a field at all, for the reasons recorded on [`Request::Watch`].
-/// - `NotifyRateLimit is incompatible with new-style IPN bus subscription bits %v` — there is no
-///   `rate_limit` field, and none of the four fields this fork does offer is a member of Go's
-///   `NotifyRateLimitIncompatibleBits` (`NotifyPeerChanges | NotifyNoNetMap | NotifyInitialStatus |
-///   NotifyPeerPatches`). `initial_state` is `NotifyInitialState` and `initial_netmap` is
-///   `NotifyInitialNetMap`, neither of which is in that set; `prefs` and `policy` are daemon-built
-///   and have no bit.
+///   deliberately not a field at all, for the reasons recorded on [`Request::Watch`]. Neither
+///   operand exists, so this one cannot be reached from any wire this fork will ever accept
+///   without a deliberate decision to offer the bit.
+/// - `NotifyRateLimit is incompatible with new-style IPN bus subscription bits %v` — one operand
+///   IS now offered. `initial_status` is Go's `NotifyInitialStatus`, and `NotifyInitialStatus` is
+///   a member of `NotifyRateLimitIncompatibleBits` (`NotifyPeerChanges | NotifyNoNetMap |
+///   NotifyInitialStatus | NotifyPeerPatches`). What is missing is the other one: there is no
+///   `rate_limit` field, so a client cannot ask for the combination Go rejects. Of the remaining
+///   fields, `initial_state` is `NotifyInitialState` and `initial_netmap` is `NotifyInitialNetMap`,
+///   neither of which is in that set; `prefs` and `policy` are daemon-built and have no bit.
+///
+///   Concretely, the day a `rate_limit: bool` field lands, the check this function owes is
+///   `rate_limit && (initial_status || …any later member of that set…)`, answered with Go's
+///   message verbatim and the offending bit names interpolated where Go interpolates them.
 ///
 /// (Go's third, `bad mask` for a value that will not parse, is structurally impossible here: a
 /// mis-typed field is a serde decode error answered as `bad request` by the server's parse arm,
@@ -969,6 +978,11 @@ pub fn watch_usage_refusal(req: &Request) -> Option<String> {
         initial_netmap: _,
         prefs: _,
         policy: _,
+        // Go's `NotifyInitialStatus`, and a member of `NotifyRateLimitIncompatibleBits` — the first
+        // field here that Go attaches a refusal to. It is still unrefusable on its own: Go rejects
+        // it only in combination with `NotifyRateLimit`, which this fork does not offer. See the
+        // doc above for the exact check to write when it does.
+        initial_status: _,
     } = req
     else {
         // Every other verb is a one-shot; this judges subscriptions only.
@@ -2774,17 +2788,21 @@ mod tests {
     fn watch_usage_refusal_accepts_every_subscription_this_fork_can_spell() {
         // The ruling recorded on `Request::Watch`, in code: Go refuses two subscriptions before it
         // subscribes (`NotifyInProcessNoDisconnect` from a LocalAPI client, and `NotifyRateLimit`
-        // combined with any of `NotifyRateLimitIncompatibleBits`), and NEITHER is expressible in
-        // this fork's named-boolean spelling — no field is a member of that incompatible set and
-        // there is no rate-limit field. So every one of the sixteen subscriptions a client can ask
-        // for is usable, including the all-bits-on one that would be the richest combination to
-        // refuse if any rule applied to it.
-        for bits in 0u8..16 {
+        // combined with any of `NotifyRateLimitIncompatibleBits`), and neither is expressible in
+        // this fork's named-boolean spelling — for each, at least one operand is not a field. So
+        // every one of the thirty-two subscriptions a client can ask for is usable, including the
+        // all-bits-on one that would be the richest combination to refuse if any rule applied.
+        //
+        // Note `initial_status` is NOT a free pass any more: it is Go's `NotifyInitialStatus`, a
+        // member of `NotifyRateLimitIncompatibleBits`. It is accepted because the other operand
+        // (`NotifyRateLimit`) has no field here, not because the bit is innocent.
+        for bits in 0u8..32 {
             let req = Request::Watch {
                 initial_state: bits & 1 != 0,
                 initial_netmap: bits & 2 != 0,
                 prefs: bits & 4 != 0,
                 policy: bits & 8 != 0,
+                initial_status: bits & 16 != 0,
             };
             assert_eq!(
                 watch_usage_refusal(&req),
@@ -2802,9 +2820,10 @@ mod tests {
         // The evidence behind that ruling. Go's refusals operate on bits of one integer, so a client
         // can always SEND a forbidden mask and be told no. Here the same words are field names, and
         // a name this fork does not offer is not a value the daemon looks at — serde drops it. A
-        // line naming every bit Go has a refusal for therefore decodes to a BARE watch (the legacy
-        // status-stream path), carrying none of them, and is accepted.
-        let line = r#"{"cmd":"watch","in_process_no_disconnect":true,"rate_limit":true,"peer_changes":true,"no_net_map":true,"initial_status":true,"peer_patches":true}"#;
+        // line naming every bit Go has a refusal for, MINUS the ones this fork now offers as real
+        // fields, therefore decodes to a BARE watch (the legacy status-stream path), carrying none
+        // of them, and is accepted.
+        let line = r#"{"cmd":"watch","in_process_no_disconnect":true,"rate_limit":true,"peer_changes":true,"no_net_map":true,"peer_patches":true}"#;
         let req = serde_json::from_str::<Request>(line).unwrap();
         match &req {
             Request::Watch {
@@ -2812,8 +2831,9 @@ mod tests {
                 initial_netmap,
                 prefs,
                 policy,
+                initial_status,
             } => assert!(
-                !initial_state && !initial_netmap && !prefs && !policy,
+                !initial_state && !initial_netmap && !prefs && !policy && !initial_status,
                 "a watch naming only unoffered bits must decode to a bare watch, got {req:?}"
             ),
             other => panic!("expected Watch, got {other:?}"),
@@ -2826,6 +2846,44 @@ mod tests {
         // When one of those names becomes a real field, this assertion starts failing, which is the
         // point: its author has to come here, read the ruling on `Request::Watch`, and port the
         // refusal Go attaches to it.
+        //
+        // That has already happened once, and this is what it looks like on the other side.
+        // `initial_status` — Go's `NotifyInitialStatus`, a member of
+        // `NotifyRateLimitIncompatibleBits` — IS a field now, so the line above may no longer name
+        // it: sent, it is received rather than dropped. It is still accepted, and for a reason that
+        // has to be checked rather than assumed: Go refuses `NotifyInitialStatus` only WITH
+        // `NotifyRateLimit`, and `rate_limit` above is still one of the names serde drops. Half a
+        // forbidden combination is not a forbidden combination.
+        let line = r#"{"cmd":"watch","initial_status":true,"rate_limit":true}"#;
+        let req = serde_json::from_str::<Request>(line).unwrap();
+        match &req {
+            Request::Watch {
+                initial_status,
+                initial_state,
+                initial_netmap,
+                prefs,
+                policy,
+            } => {
+                assert!(
+                    initial_status,
+                    "initial_status is an offered field now — it must be received, not dropped: \
+                     {req:?}"
+                );
+                assert!(
+                    !initial_state && !initial_netmap && !prefs && !policy,
+                    "and `rate_limit` is still unoffered, so it must not have set anything else: \
+                     {req:?}"
+                );
+            }
+            other => panic!("expected Watch, got {other:?}"),
+        }
+        assert_eq!(
+            watch_usage_refusal(&req),
+            None,
+            "only one operand of Go's rate-limit refusal is spellable here, so there is nothing to \
+             refuse yet — the day `rate_limit` becomes a field, this line is the one that has to \
+             change to Go's message"
+        );
     }
 
     #[test]

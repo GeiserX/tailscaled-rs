@@ -347,6 +347,7 @@ async fn handle_conn(
                             initial_netmap,
                             prefs,
                             policy,
+                            initial_status,
                         }) {
                             write_response(&mut write_half, &Response::Error { message }).await?;
                             continue;
