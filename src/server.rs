@@ -24,7 +24,7 @@ use crate::auth::{self, Access, AuthPolicy};
 use crate::ipn::alwayson;
 use crate::ipn::syspolicy;
 use crate::ipn::{self, Backend};
-use crate::localapi::{Request, Response};
+use crate::localapi::{Request, Response, watch_usage_refusal};
 
 /// Max bytes for a single newline-delimited request line. LocalAPI requests are tiny JSON, so this
 /// is generous; its only job is to stop a single newline-less connection from growing the read
@@ -334,6 +334,23 @@ async fn handle_conn(
                         policy,
                         initial_status,
                     }) => {
+                        // Judge the SUBSCRIPTION before subscribing it to anything: Go's
+                        // `serveWatchIPNBus` runs all of its refusals ahead of `WatchNotifications`,
+                        // so a refused watcher never takes a resource and never emits a frame. A
+                        // refusal is a request-level error like a denied `nc` — write the error line
+                        // and keep the request loop alive, because this connection was never
+                        // hijacked. Nothing on today's wire can trigger it (see
+                        // `watch_usage_refusal`); the call sits here so that the day a mask field
+                        // carrying one of Go's refusals lands, the refusal is already wired.
+                        if let Some(message) = watch_usage_refusal(&Request::Watch {
+                            initial_state,
+                            initial_netmap,
+                            prefs,
+                            policy,
+                        }) {
+                            write_response(&mut write_half, &Response::Error { message }).await?;
+                            continue;
+                        }
                         // A long-lived stream: take a permit from the SEPARATE stream budget so a
                         // flood of `Watch` connections can't starve the short-lived control pool. If
                         // the stream budget is exhausted, refuse cleanly (the client can retry) rather
