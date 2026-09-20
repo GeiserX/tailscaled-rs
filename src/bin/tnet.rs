@@ -12254,6 +12254,11 @@ fn cgi_response(status: &str, body: &str) -> String {
 /// too — which is why only `--readonly` (or a pref that is already on) reaches a CGI response with
 /// nothing on stderr. Go turns the pref back off on interrupt only in listener mode; a CGI request
 /// leaves it on.
+///
+/// Whichever mode runs, it runs under the same interrupt arm ([`serve_until_interrupt`]): Go arms
+/// `signal.NotifyContext` before any of this and ends every interrupted run at `os.Exit(0)`, so
+/// what the pref state changes is [`web_interrupt_stops_web_client`], never whether Ctrl-C is
+/// handled at all.
 async fn run_web(
     socket: &std::path::Path,
     listen: Option<String>,
@@ -12263,10 +12268,15 @@ async fn run_web(
     cgi: bool,
 ) -> Result<()> {
     let started_web_client = !readonly && start_tailscaled_web_client(socket).await?;
+    // Whether an interrupt of THIS run has a pref to put back — the only conditional part of Go's
+    // interrupt goroutine. The arm itself is not conditional: every run gets one.
+    let stop_web_client = web_interrupt_stops_web_client(cgi, started_web_client);
     if cgi {
         // CGI mode owns stdout: the response IS this process's stdout, so nothing may be printed
         // alongside it (no startup line) and no browser is opened (there is no server to browse).
-        return run_web_cgi(socket, &normalize_served_path(&prefix)).await;
+        let served_path = normalize_served_path(&prefix);
+        let serve = run_web_cgi(socket, &served_path);
+        return serve_until_interrupt(serve, web_interrupt(), std::future::ready(())).await;
     }
     let listen = listen.unwrap_or_else(|| DEFAULT_WEB_LISTEN.to_string());
     let serve = async {
@@ -12274,11 +12284,6 @@ async fn run_web(
             .await
             .with_context(|| format!("serving web UI on {listen}"))
     };
-    if !started_web_client {
-        return serve.await;
-    }
-    // Go shuts down the web client it started when the CLI is interrupted, then exits 0.
-    //
     // Interruption is the ONLY path that turns the pref back off. A serving failure — the bind
     // that finds the port taken — returns the error with the pref left on, which is what Go does
     // too: its `setRunWebClient(false)` lives in the goroutine parked on `signal.NotifyContext`'s
@@ -12288,13 +12293,59 @@ async fn run_web(
     // run where it won, it would `os.Exit(0)` and swallow the failure. Turning the pref off here
     // would deterministically pick half of a race Go never meant to have, so a failed `web` leaves
     // the pref as Go leaves it: on, for `tnet set --webclient=false` to clear.
-    tokio::select! {
-        served = serve => served,
-        _ = tokio::signal::ctrl_c() => {
+    let on_interrupt = async {
+        if stop_web_client {
             eprintln!("stopping tailscaled web client");
             if let Err(e) = set_run_web_client(socket, false).await {
                 eprintln!("stopping tailscaled web client: {e:#}");
             }
+        }
+    };
+    serve_until_interrupt(serve, web_interrupt(), on_interrupt).await
+}
+
+/// Whether an interrupted `web` run turns the daemon's `RunWebClient` pref back off: only a
+/// listener run that itself turned the pref on does.
+///
+/// This is the whole of what Go's interrupt goroutine makes conditional —
+/// `if !webArgs.cgi && startedManagementClient` guards the `setRunWebClient(false)` step and
+/// nothing else. Every other interrupted run (`--readonly`, a daemon whose pref was already on, a
+/// `--cgi` request) still stops the server and ends at `os.Exit(0)`; it just has no pref of its own
+/// to put back. Pure → unit-testable.
+fn web_interrupt_stops_web_client(cgi: bool, started_web_client: bool) -> bool {
+    !cgi && started_web_client
+}
+
+/// The interrupt source for a `web` run: Go's `signal.NotifyContext(ctx, os.Interrupt)`, which
+/// `runWeb` arms as its first statement — before the pref step, before the mode split, for every
+/// run the command has.
+///
+/// Completing this future means "interrupted". If the handler cannot be installed at all, park
+/// forever instead of completing: a run that reported an interrupt it never received would tear
+/// down a healthy server the moment it started serving.
+async fn web_interrupt() {
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Serve until the work finishes or an interrupt arrives, which is the shape of Go's `runWeb`: the
+/// command's return value is whatever serving returned, but an interrupt runs `on_interrupt` and
+/// then ends the run SUCCESSFULLY — Go's goroutine finishes `<-ctx.Done()` with `os.Exit(0)` for
+/// every interrupted run, so a supervisor that stops a `web` listener reads a clean exit, not the
+/// 130 a default SIGINT disposition would leave.
+///
+/// The signal is a parameter rather than a call inside, so the ordering this encodes can be tested
+/// without raising a real SIGINT at the test process.
+async fn serve_until_interrupt(
+    serve: impl std::future::Future<Output = Result<()>>,
+    interrupt: impl std::future::Future<Output = ()>,
+    on_interrupt: impl std::future::Future<Output = ()>,
+) -> Result<()> {
+    tokio::select! {
+        served = serve => served,
+        _ = interrupt => {
+            on_interrupt.await;
             Ok(())
         }
     }
@@ -21089,6 +21140,82 @@ mod tests {
         assert!(
             cgi_response("404 Not Found", WEB_NOT_FOUND_BODY).starts_with("Status: 404 Not Found")
         );
+    }
+
+    #[test]
+    fn web_interrupt_stops_web_client_only_when_this_run_started_it() {
+        // A listener run that turned the pref on is the single case Go's interrupt goroutine puts
+        // it back: `if !webArgs.cgi && startedManagementClient`.
+        assert!(web_interrupt_stops_web_client(false, true));
+        // `--readonly`, or a daemon whose `RunWebClient` pref was already on: this run changed no
+        // pref, so an interrupt leaves the pref exactly as it found it.
+        assert!(!web_interrupt_stops_web_client(false, false));
+        // CGI mode never puts it back, even when it was the run that turned it on.
+        assert!(!web_interrupt_stops_web_client(true, true));
+        assert!(!web_interrupt_stops_web_client(true, false));
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_web_run_ends_successfully_with_no_pref_to_restore() {
+        // The `--readonly` (and already-on) shape: serving never returns on its own, the interrupt
+        // arrives, and there is no web client of ours to stop. Go's goroutine reaches `os.Exit(0)`
+        // on this path exactly as it does when it started one, so the command must report success —
+        // a supervisor that stops the listener it started reads a clean exit, not the 130 that an
+        // unhandled SIGINT leaves behind.
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let result = serve_until_interrupt(
+            std::future::pending::<Result<()>>(),
+            std::future::ready(()),
+            async {
+                if web_interrupt_stops_web_client(false, false) {
+                    stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            },
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            !stopped.load(std::sync::atomic::Ordering::SeqCst),
+            "a run that started no web client has no pref to turn back off"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_web_run_that_started_the_web_client_stops_it() {
+        // The other half: the same clean exit, with the pref this run turned on turned back off.
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let result = serve_until_interrupt(
+            std::future::pending::<Result<()>>(),
+            std::future::ready(()),
+            async {
+                if web_interrupt_stops_web_client(false, true) {
+                    stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            },
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(stopped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_web_serving_failure_is_returned_and_skips_the_interrupt_step() {
+        // The bind that finds the port taken: the error is what the command returns, and the
+        // interrupt step never runs — so the pref is left on, as Go leaves it after a failed `web`.
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let result = serve_until_interrupt(
+            std::future::ready(Err(anyhow::anyhow!("serving web UI on localhost:8088"))),
+            std::future::pending::<()>(),
+            async {
+                stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .await;
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "serving web UI on localhost:8088"
+        );
+        assert!(!stopped.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]
