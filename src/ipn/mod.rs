@@ -653,9 +653,20 @@ async fn arm_funnel_lane(
 /// **starts with an ASCII letter**, and contains only `[A-Za-z0-9-]`. Matching Go's gate exactly
 /// matters because the engine does NOT re-validate — it ships `requested_tags` straight to control —
 /// so this is the *only* client-side check; a too-lax gate lets a malformed tag reach control and be
-/// rejected there with a confusing error instead of failing locally with a precise one. Returns the
-/// first offender, quoting the COMPLETED value (Go's `tag: %q`) so the operator is shown the tag as
-/// the daemon would have seen it rather than the shorthand they typed.
+/// rejected there with a confusing error instead of failing locally with a precise one.
+///
+/// The REFUSAL is ported too, not just the gate: the first offender comes back as Go's
+/// `fmt.Errorf("tag: %q: %s", tag, err)` — the frame `tag: `, the COMPLETED value quoted (so the
+/// operator is shown the tag as the daemon would have seen it rather than the shorthand they
+/// typed), then one of `CheckTag`'s four reason strings verbatim:
+///
+/// - `tags must start with 'tag:'`
+/// - `tag names must not be empty`
+/// - `tag names must start with a letter, after 'tag:'`
+/// - `tag names can only contain numbers, letters, or dashes`
+///
+/// Rewording them would be a silent divergence: operators and scripts that key off `tailscale up`'s
+/// output are the reason the text is part of the port, not decoration on top of it.
 ///
 /// Go completes in the CLI and validates in `tailcfg`; this fork does both here, daemon-side, so
 /// that `up` and `set` keep sharing one notion of what a tag is — a direct LocalAPI caller gets the
@@ -671,19 +682,20 @@ fn complete_and_validate_advertise_tags(tags: &[String]) -> Result<Vec<String>> 
         } else {
             format!("tag:{t}")
         };
-        let name = t.strip_prefix("tag:").ok_or_else(|| {
-            anyhow!("invalid tag {t:?}: tags must be of the form tag:<name> (e.g. tag:server)")
-        })?;
+        // Each refusal below is Go's `tag: %q: %s` frame over `tailcfg.CheckTag`'s own reason
+        // string, verbatim and in CheckTag's order, so an operator (or a script) reading this
+        // daemon's refusal reads what `tailscale up` prints.
+        let name = t
+            .strip_prefix("tag:")
+            .ok_or_else(|| anyhow!("tag: {t:?}: tags must start with 'tag:'"))?;
         match name.bytes().next() {
             None => {
-                return Err(anyhow!(
-                    "invalid tag {t:?}: the tag name (after 'tag:') is empty"
-                ));
+                return Err(anyhow!("tag: {t:?}: tag names must not be empty"));
             }
             // Go requires the first name char to be a letter.
             Some(b) if !b.is_ascii_alphabetic() => {
                 return Err(anyhow!(
-                    "invalid tag {t:?}: tag names must start with a letter (after 'tag:')"
+                    "tag: {t:?}: tag names must start with a letter, after 'tag:'"
                 ));
             }
             _ => {}
@@ -694,7 +706,7 @@ fn complete_and_validate_advertise_tags(tags: &[String]) -> Result<Vec<String>> 
             .any(|b| !b.is_ascii_alphanumeric() && b != b'-')
         {
             return Err(anyhow!(
-                "invalid tag {t:?}: tag names may contain only letters, digits, or '-'"
+                "tag: {t:?}: tag names can only contain numbers, letters, or dashes"
             ));
         }
         out.push(t);
@@ -8587,8 +8599,10 @@ mod tests {
             "`up` must persist the completed tag, exactly as `set` does"
         );
 
-        // And an illegal name is still refused — quoting the COMPLETED value, as Go's `tag: %q`
-        // does, so the operator is shown the tag as the daemon would have seen it.
+        // And an illegal name is still refused — with Go's whole refusal, `tag: %q: %s` over
+        // `tailcfg.CheckTag`'s reason, quoting the COMPLETED value so the operator is shown the tag
+        // as the daemon would have seen it. Asserted here and not only on the pure helper because
+        // this is the path a LocalAPI caller is on: the message has to survive the trip out.
         let mut be = backend_for(&dir);
         // `PendingUp` is not `Debug`, so match rather than `expect_err` (as the other `begin_up`
         // tests do).
@@ -8605,9 +8619,9 @@ mod tests {
             Ok(_) => panic!("a completed tag with an illegal name must still be refused"),
             Err(e) => {
                 let msg = format!("{e:#}");
-                assert!(
-                    msg.contains("\"tag:9server\""),
-                    "the refusal must quote the completed value, got {msg:?}"
+                assert_eq!(
+                    msg, r#"tag: "tag:9server": tag names must start with a letter, after 'tag:'"#,
+                    "`begin_up` must surface Go's refusal verbatim, got {msg:?}"
                 );
             }
         }

@@ -584,6 +584,77 @@ mod tests {
         );
     }
 
+    /// Go refuses a bad tag as `fmt.Errorf("tag: %q: %s", tag, err)` over `tailcfg.CheckTag`'s own
+    /// reason string — `cmd/tailscale/cli/up.go` (`prefsFromUpArgs`) and `tailcfg/tailcfg.go`
+    /// (`CheckTag`) @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8 — so `tailscale up --advertise-tags
+    /// foo:bar` prints `tag: "foo:bar": tags must start with 'tag:'`. Pin the WHOLE refusal, not
+    /// just that it is one: the frame, the quoted COMPLETED value, and each of CheckTag's four
+    /// reasons, in CheckTag's order. An operator who knows the Go message, or a script that greps
+    /// for it, gets the same bytes out of this daemon.
+    #[test]
+    fn advertise_tags_refusals_match_go_checktag() {
+        use super::super::complete_and_validate_advertise_tags as check;
+        for (typed, want) in [
+            // CheckTag clause 1 — no `tag:` prefix. Only a COLON-BEARING value can reach it: a
+            // colon-less one is completed to `tag:<value>` before CheckTag ever sees it.
+            ("foo:bar", r#"tag: "foo:bar": tags must start with 'tag:'"#),
+            (
+                "TAG:server",
+                r#"tag: "TAG:server": tags must start with 'tag:'"#,
+            ),
+            // clause 2 — empty name. Note the quoted value is the completed one, so the bare `""`
+            // an operator typed is reported as the `tag:` the daemon made of it.
+            ("tag:", r#"tag: "tag:": tag names must not be empty"#),
+            ("", r#"tag: "tag:": tag names must not be empty"#),
+            // clause 3 — name does not start with an ASCII letter.
+            (
+                "tag:9server",
+                r#"tag: "tag:9server": tag names must start with a letter, after 'tag:'"#,
+            ),
+            (
+                "9server",
+                r#"tag: "tag:9server": tag names must start with a letter, after 'tag:'"#,
+            ),
+            (
+                "tag:-web",
+                r#"tag: "tag:-web": tag names must start with a letter, after 'tag:'"#,
+            ),
+            // clause 4 — a later byte outside [0-9A-Za-z-].
+            (
+                "tag:my_tag",
+                r#"tag: "tag:my_tag": tag names can only contain numbers, letters, or dashes"#,
+            ),
+            (
+                "tag:has space",
+                r#"tag: "tag:has space": tag names can only contain numbers, letters, or dashes"#,
+            ),
+            (
+                "tag:exit!",
+                r#"tag: "tag:exit!": tag names can only contain numbers, letters, or dashes"#,
+            ),
+        ] {
+            let err = format!(
+                "{:#}",
+                check(&[typed.into()]).expect_err("a tag CheckTag rejects must be refused here")
+            );
+            assert_eq!(
+                err, want,
+                "refusing {typed:?} must read exactly as Go's `tag: %q: %s` over CheckTag"
+            );
+        }
+        // The offender is reported one at a time and it is the FIRST one, as Go's loop returns on
+        // the first CheckTag failure — the good tag before it is not what the operator hears about.
+        let err = format!(
+            "{:#}",
+            check(&["tag:ok".into(), "tag:bad!".into(), "tag:worse!".into()])
+                .expect_err("a list containing a bad tag must be refused")
+        );
+        assert_eq!(
+            err,
+            r#"tag: "tag:bad!": tag names can only contain numbers, letters, or dashes"#
+        );
+    }
+
     /// A node that already advertises routes; the canonical "non-default prefs present" fixture.
     fn configured_prefs() -> Prefs {
         Prefs {
