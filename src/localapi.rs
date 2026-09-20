@@ -624,6 +624,13 @@ pub enum Request {
     },
     /// Report this node's own tailnet addresses (Go `tailscale ip`). Read-only — gated like
     /// [`Status`](Request::Status).
+    ///
+    /// Always answered with [`Response::Ip`], never refused for want of an engine: this asks a
+    /// question about the node, not for work from the engine, and a node with no engine holds no
+    /// addresses — an EMPTY pair, which is an answer. That mirrors where Go reads them from, the
+    /// `TailscaleIPs` field of a `Status` that answers in every backend state, and it is what lets
+    /// the CLI reach Go's `no current Tailscale IPs; state: %v` instead of reporting the request as
+    /// failed on a `Stopped`/`NeedsLogin` node.
     Ip,
     /// Resolve a tailnet IP to the peer that owns it (Go `tailscale whois`). Read-only.
     ///

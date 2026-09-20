@@ -10,10 +10,22 @@
 //!    filter run. That is an error: stderr and exit 1, not a placeholder on stdout and exit 0.
 //! 2. Go's `main` prints a returned error with `fmt.Fprintln(os.Stderr, err)` and exits 1, so stderr
 //!    is exactly the error text. An `Error: ` prefix breaks a script matching on it.
+//! 3. `--assert` reports the asserted address AND the list it was compared against
+//!    (`assertion failed: IP %q not found among %v`), so a failed assertion says what the node does
+//!    hold — `[]` when it holds nothing.
 //!
 //! The unit tests next to `format_ip_filtered` (src/bin/tnet.rs) pin the decisions. What they cannot
 //! see is the process: its exit status, the exact stderr bytes, and which requests reached the
-//! daemon. Each test here runs the built `tnet` against a stub daemon on a Unix socket.
+//! daemon. Each test here runs the built `tnet` against a daemon on a Unix socket.
+//!
+//! Most use [`StubDaemon`], which serves a scripted reply per connection — the only way to put the
+//! node in a chosen netmap state without a tailnet. A stub can also serve a reply the real daemon
+//! never would, though, and that is exactly how the `no current Tailscale IPs` path came to be
+//! pinned against a fiction: the stub answered `ip` with an empty address pair while the production
+//! daemon refused the request outright on a node with no engine. So the empty-address case is
+//! pinned twice — once against the stub for the selector matrix, and once against the REAL
+//! [`RealDaemon`] (`Backend::load` + `server::serve`, offline), which is the node a `tnet ip` on a
+//! Stopped or NeedsLogin machine actually talks to.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
@@ -22,7 +34,9 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use tailscaled_rs::ipn::Backend;
 use tailscaled_rs::localapi::{PeerReport, Request, Response, StatusReport};
+use tailscaled_rs::server;
 
 /// Per-process-unique counter so tests running in parallel never share a socket path.
 static UNIQUE: AtomicU64 = AtomicU64::new(0);
@@ -293,4 +307,219 @@ fn a_name_in_no_netmap_reaches_the_host_resolver() {
         .unwrap_or_else(|e| panic!("stderr must echo the resolved address, got {err:?}: {e}"));
     assert!(resolved.is_loopback(), "localhost resolved to {resolved}");
     assert_eq!(stdout(&out), "");
+}
+
+/// The REAL daemon, offline: `Backend::load` over a fresh state dir plus the real `server::serve`
+/// on a socket of its own. No engine, no network, no auth key — `Backend::load` reads `prefs.json`
+/// and constructs with `device: None`, which is precisely the addressless node (`NoState`,
+/// `Stopped`, `NeedsLogin`) whose `ip` reply the stub above can only guess at.
+///
+/// It runs on a thread of its own with its own current-thread runtime, so the test body stays
+/// synchronous and can block on `Command::output()` without starving the server.
+struct RealDaemon {
+    state_dir: PathBuf,
+    socket: PathBuf,
+    /// Fire to ask `serve` to stop; taken in `Drop`.
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    /// The thread running the server's runtime; joined in `Drop` so no daemon outlives its test.
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RealDaemon {
+    /// Start the daemon over a fresh state dir. `prefs` is written to `prefs.json` before the load
+    /// when given, which is how a test picks the backend state the refusal has to name: absent
+    /// prefs is a never-configured node (`NoState`), `want_running` with no engine is `NeedsLogin`.
+    fn start(prefs: Option<&str>) -> RealDaemon {
+        let n = UNIQUE.fetch_add(1, Ordering::Relaxed);
+        // Terse on purpose: a Unix socket path is capped at `SUN_LEN` (104 bytes on macOS,
+        // 108 on Linux) INCLUDING the temp dir, and `bind` fails outright once the whole path
+        // exceeds it. The daemon's socket lives inside this directory, so both names stay short.
+        let state_dir = std::env::temp_dir().join(format!("tid-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state_dir);
+        std::fs::create_dir_all(&state_dir).expect("create the daemon state dir");
+        if let Some(prefs) = prefs {
+            std::fs::write(state_dir.join("prefs.json"), prefs).expect("seed prefs.json");
+        }
+        let socket = state_dir.join("d.sock");
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let serve_socket = socket.clone();
+        let serve_dir = state_dir.clone();
+        let thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build the daemon's runtime");
+            runtime.block_on(async move {
+                let backend = Backend::load(&serve_dir)
+                    .await
+                    .expect("Backend::load must succeed offline (file read only)");
+                let backend = Arc::new(tokio::sync::Mutex::new(backend));
+                server::serve(&serve_socket, backend, async {
+                    shutdown_rx.await.ok();
+                })
+                .await
+                .expect("serve returned an error");
+            });
+        });
+
+        // `serve` binds inside itself, so readiness is observed by connecting. Bounded: a daemon
+        // that never comes up fails the test instead of hanging it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::os::unix::net::UnixStream::connect(&socket).is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the daemon never bound {}",
+                socket.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        RealDaemon {
+            state_dir,
+            socket,
+            shutdown: Some(shutdown_tx),
+            thread: Some(thread),
+        }
+    }
+
+    /// Run the built `tnet` against this daemon.
+    fn tnet(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_tnet"))
+            .arg("--socket")
+            .arg(&self.socket)
+            .args(args)
+            .output()
+            .expect("the `tnet` binary built for this test should run")
+    }
+}
+
+impl Drop for RealDaemon {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        let _ = std::fs::remove_dir_all(&self.state_dir);
+    }
+}
+
+/// A node with no engine is the addressless node this error text exists for, and the PRODUCTION
+/// daemon has to answer it the way Go's `Status` does: with an empty address list, not a refusal.
+/// Go's `runIP` reads `ips` and `BackendState` out of one `Status`, so a `Stopped`/`NeedsLogin`
+/// node prints `no current Tailscale IPs; state: <state>`. While the daemon answered the split-out
+/// `ip` request with `node is not up`, `tnet ip` printed `error: node is not up` and exited before
+/// the state line could be reached — on exactly the node the message is about.
+#[test]
+fn the_real_addressless_daemon_reports_gos_state_line() {
+    for (prefs, state) in [
+        // Never configured: no prefs file at all.
+        (None, "NoState"),
+        // Wants to be up but has no engine — Go's `NeedsLogin`.
+        (Some(r#"{"want_running":true}"#), "NeedsLogin"),
+    ] {
+        let daemon = RealDaemon::start(prefs);
+        for args in [&["ip"][..], &["ip", "-4"], &["ip", "-6"], &["ip", "-1"]] {
+            let out = daemon.tnet(args);
+            assert_eq!(
+                out.status.code(),
+                Some(1),
+                "{state} {args:?}: stdout {:?}",
+                stdout(&out)
+            );
+            assert_eq!(
+                stderr(&out),
+                format!("no current Tailscale IPs; state: {state}\n"),
+                "{state} {args:?}"
+            );
+            assert_eq!(stdout(&out), "", "{state} {args:?}");
+        }
+    }
+}
+
+/// `--assert` on that same real addressless node: Go compares against `st.TailscaleIPs` before the
+/// empty-list check, so it reports the assertion — and reports the empty list with it. This asked
+/// the daemon for `ip` too, so it failed with `error: node is not up` for the same reason.
+#[test]
+fn the_real_addressless_daemon_fails_an_assertion_with_an_empty_list() {
+    let daemon = RealDaemon::start(None);
+    let out = daemon.tnet(&["ip", "--assert", "100.64.0.1"]);
+    assert_eq!(out.status.code(), Some(1), "stdout {:?}", stdout(&out));
+    assert_eq!(
+        stderr(&out),
+        "assertion failed: IP \"100.64.0.1\" not found among []\n"
+    );
+    assert_eq!(stdout(&out), "");
+}
+
+/// Go's `runIP` counts `-1`, `-4` and `-6` and refuses as soon as two are set, before `--assert`
+/// and before any daemon call. Go's `main` then prints that error with `fmt.Fprintln(os.Stderr,
+/// err)`: the bare line. Returning it through `main`'s `Result` instead prefixed it with `Error: `,
+/// which every other error path in this command had already stopped doing.
+#[test]
+fn mutually_exclusive_selectors_are_refused_in_gos_bare_words() {
+    for args in [
+        &["ip", "-1", "-4"][..],
+        &["ip", "-1", "-6"],
+        &["ip", "-4", "-6"],
+        &["ip", "-1", "-4", "-6"],
+        // The refusal runs first, so neither a peer argument nor `--assert` changes it.
+        &["ip", "-4", "-6", "my-laptop"],
+        &["ip", "-1", "-4", "--assert", "100.64.0.1"],
+    ] {
+        let daemon = StubDaemon::start(vec![]);
+        let out = daemon.tnet(args);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{args:?}: stdout {:?}",
+            stdout(&out)
+        );
+        assert_eq!(
+            stderr(&out),
+            "tnet ip -1, -4, and -6 are mutually exclusive\n",
+            "{args:?}"
+        );
+        assert_eq!(stdout(&out), "", "{args:?}");
+        // Go refuses before `localClient.Status`, so an unusable invocation costs no round trip and
+        // answers the same whether or not a daemon is listening.
+        assert!(
+            daemon.requests().is_empty(),
+            "{args:?}: {:?}",
+            daemon.requests()
+        );
+    }
+}
+
+/// A failed `--assert` on a node that DOES hold addresses names both operands of Go's error: the
+/// asserted address, quoted as typed, and the list it was compared against. Naming only the wanted
+/// address left the operator of a failed assertion unable to see what the node actually holds.
+#[test]
+fn a_failed_assertion_names_the_addresses_the_node_does_hold() {
+    let daemon = StubDaemon::start(vec![Response::Ip {
+        ipv4: Some("100.64.0.1".into()),
+        ipv6: Some("fd7a:115c:a1e0::1".into()),
+    }]);
+    let out = daemon.tnet(&["ip", "--assert", "203.0.113.9"]);
+    assert_eq!(out.status.code(), Some(1), "stdout {:?}", stdout(&out));
+    assert_eq!(
+        stderr(&out),
+        "assertion failed: IP \"203.0.113.9\" not found among [100.64.0.1 fd7a:115c:a1e0::1]\n"
+    );
+    assert_eq!(stdout(&out), "");
+}
+
+/// The other side of the predicate, unchanged by the new text: a match prints nothing and exits 0.
+#[test]
+fn a_held_address_asserts_silently() {
+    let daemon = StubDaemon::start(vec![Response::Ip {
+        ipv4: Some("100.64.0.1".into()),
+        ipv6: Some("fd7a:115c:a1e0::1".into()),
+    }]);
+    let out = daemon.tnet(&["ip", "--assert", "fd7a:115c:a1e0::1"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    assert_eq!(stderr(&out), "");
 }
