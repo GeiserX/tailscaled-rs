@@ -13393,16 +13393,73 @@ impl std::fmt::Display for ServeUsageError {
 
 impl std::error::Error for ServeUsageError {}
 
-/// [`check_serve_flags`] as `runServeCombined` performs it: a [`ServeUsageError`] is written to
-/// stderr with Go's framing and exits 1, rather than propagating to `main` to be printed as one
-/// `Error: …` line. Every other refusal propagates untouched.
+/// A `runServeCombined` refusal whose Go text carries no prefix of its own.
+///
+/// Go's `main` prints whatever `cli.Run` returns with a bare `fmt.Fprintln(os.Stderr, err)` and
+/// exits 1 — no `Error: `, no `error: `, just the sentence. `anyhow` does not work that way: a
+/// `main` returning `Result` renders its error as `Error: {err}`, so every refusal that simply
+/// propagates picks up bytes Go never wrote. Two of `runServeCombined`'s refusals are insulated
+/// from that by accident, because Go bakes the prefix into the string literal itself —
+/// `errors.New("Error: --service flag is not supported with funnel")` — so the literal here is
+/// written without it. Three refusals carry no prefix in Go at all:
+///
+/// * `fmt.Errorf("PROXY protocol is only supported for TCP forwarding, not HTTP/HTTPS")`
+/// * `fmt.Errorf("invalid PROXY protocol version %d; must be 1 or 2", …)`
+/// * `errors.New("tun mode is only supported for services")`
+///
+/// Those three print bare in Go, so they are tagged with this type and written by
+/// [`check_serve_flags_or_exit`] instead of propagating. Prefixing the literals to compensate is not
+/// the same fix and is actively wrong: it would double the prefix on the two `--service` refusals,
+/// which would then read `Error: Error: …`. Whether a refusal is byte-correct is a property of the
+/// process, so the rendering path is where it belongs.
+///
+/// Like [`ServeUsageError`] this is a type rather than a pre-rendered string, so [`check_serve_flags`]
+/// stays pure: the refusal keeps its plain [`Display`](std::fmt::Display) text for callers that only
+/// want the sentence, and [`ServeBareError::go_stderr`] renders the exact bytes Go's process writes.
+#[derive(Debug)]
+struct ServeBareError(String);
+
+impl ServeBareError {
+    fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+
+    /// Exactly what Go's process writes to stderr for this refusal: the sentence and the newline
+    /// `fmt.Fprintln` adds, with nothing in front of it.
+    fn go_stderr(&self) -> String {
+        format!("{}\n", self.0)
+    }
+}
+
+impl std::fmt::Display for ServeBareError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ServeBareError {}
+
+/// [`check_serve_flags`] as `runServeCombined` performs it: a refusal Go's process writes itself —
+/// a [`ServeUsageError`] with Go's `error: ` + help-hint framing, or a [`ServeBareError`] with no
+/// framing at all — goes to stderr here and exits 1, rather than propagating to `main` to be printed
+/// as one `Error: …` line. A refusal whose Go text already begins with Go's own `Error: ` is left to
+/// propagate, since adding a prefix to it here would only double Go's.
 fn check_serve_flags_or_exit(flags: &ServeFlags, funnel: bool) -> Result<(ServeKind, u16)> {
-    check_serve_flags(flags, funnel).map_err(|e| match e.downcast::<ServeUsageError>() {
-        Ok(usage) => {
-            eprint!("{}", usage.go_stderr());
-            std::process::exit(1);
+    check_serve_flags(flags, funnel).map_err(|e| {
+        let go_stderr = e
+            .downcast_ref::<ServeUsageError>()
+            .map(ServeUsageError::go_stderr)
+            .or_else(|| {
+                e.downcast_ref::<ServeBareError>()
+                    .map(ServeBareError::go_stderr)
+            });
+        match go_stderr {
+            Some(bytes) => {
+                eprint!("{bytes}");
+                std::process::exit(1);
+            }
+            None => e,
         }
-        Err(other) => other,
     })
 }
 
@@ -13448,11 +13505,18 @@ fn check_serve_flags(flags: &ServeFlags, funnel: bool) -> Result<(ServeKind, u16
     // Go's `uint` zero is "unset", so --proxy-protocol=0 asks for nothing and is not refused.
     let proxy_protocol = flags.proxy_protocol.filter(|v| *v != 0);
     if let Some(version) = proxy_protocol {
+        // Both of Go's PROXY-protocol refusals print bare — see [`ServeBareError`].
         if kind.is_web() {
-            anyhow::bail!("PROXY protocol is only supported for TCP forwarding, not HTTP/HTTPS");
+            return Err(ServeBareError::new(
+                "PROXY protocol is only supported for TCP forwarding, not HTTP/HTTPS",
+            )
+            .into());
         }
         if version != 1 && version != 2 {
-            anyhow::bail!("invalid PROXY protocol version {version}; must be 1 or 2");
+            return Err(ServeBareError::new(format!(
+                "invalid PROXY protocol version {version}; must be 1 or 2"
+            ))
+            .into());
         }
     }
 
@@ -13461,7 +13525,8 @@ fn check_serve_flags(flags: &ServeFlags, funnel: bool) -> Result<(ServeKind, u16
     // is a shape Go accepts, so it must reach the build gap rather than a sentence saying a service
     // is what it is missing.
     if kind == ServeKind::Tun && flags.service.is_none() {
-        anyhow::bail!("tun mode is only supported for services");
+        // `errors.New`, unprefixed, printed bare by Go's `main` — see [`ServeBareError`].
+        return Err(ServeBareError::new("tun mode is only supported for services").into());
     }
 
     // Everything above is Go's. From here down the command line is one Go would have ACCEPTED, and
@@ -19548,6 +19613,58 @@ mod tests {
             assert!(
                 err.downcast_ref::<ServeUsageError>().is_none(),
                 "{argv:?} is not a flag-grammar refusal: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn gos_unprefixed_refusals_are_tagged_to_be_written_bare() {
+        // Go's `main` prints `cli.Run`'s error with a bare `fmt.Fprintln(os.Stderr, err)`, so a
+        // refusal whose Go literal carries no prefix of its own must not reach this build's
+        // `Result`-returning `main` — `anyhow` would put `Error: ` in front of it. Those three are
+        // tagged as they come out, and `go_stderr` is the bytes Go's process writes.
+        for (argv, want) in [
+            (
+                vec!["--proxy-protocol=1", "3000"],
+                "PROXY protocol is only supported for TCP forwarding, not HTTP/HTTPS",
+            ),
+            (
+                vec!["--tcp=443", "--proxy-protocol=3", "3000"],
+                "invalid PROXY protocol version 3; must be 1 or 2",
+            ),
+            (
+                vec!["--tun", "3000"],
+                "tun mode is only supported for services",
+            ),
+        ] {
+            let (_, flags) = parse_serve(&argv);
+            let err = check_serve_flags(&flags, false).expect_err("still a refusal");
+            let bare = err
+                .downcast_ref::<ServeBareError>()
+                .unwrap_or_else(|| panic!("{argv:?}: Go prints this one bare: {err}"));
+            assert_eq!(bare.go_stderr(), format!("{want}\n"), "{argv:?}");
+            // The sentence itself is untouched, so a caller that only wants the text still has it.
+            assert_eq!(err.to_string(), want, "{argv:?}");
+        }
+
+        // The other half of the rule: Go spells `Error: ` into these two literals itself, so they
+        // must NOT be tagged — and the three above must not be prefixed to "match Go" — or the
+        // prefix ends up doubled. (What these two actually print is a separate matter: `main` wraps
+        // every serve/funnel error in a `via <socket>` context, so neither reaches a plain render.
+        // That divergence is not this change's; `tests/serve_refusal_stderr_framing.rs` pins it.)
+        for (argv, funnel) in [
+            (vec!["--service=svc:web", "--bg=false", "3000"], false),
+            (vec!["--service=svc:web", "3000"], true),
+        ] {
+            let flags = if funnel {
+                parse_funnel(&argv).1
+            } else {
+                parse_serve(&argv).1
+            };
+            let err = check_serve_flags(&flags, funnel).expect_err("still a refusal");
+            assert!(
+                err.downcast_ref::<ServeBareError>().is_none(),
+                "{argv:?} already carries Go's own `Error: `: {err}"
             );
         }
     }
