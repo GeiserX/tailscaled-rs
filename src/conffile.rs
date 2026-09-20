@@ -143,7 +143,9 @@ pub struct ConfigVAlpha {
     /// masked prefix — [`Config::apply_to_prefs`] refuses one with host bits set (`192.0.2.5/24`),
     /// as Go's `ToPrefs` does — and the list is checked as a SET
     /// ([`crate::routes::calc_advertise_routes`]): a 4via6 prefix must decode, and a default route
-    /// must appear in both families or in neither (a lone `0.0.0.0/0` is a half exit node).
+    /// must appear in both families or in neither (a lone `0.0.0.0/0` is a half exit node). Those
+    /// last two are this fork's own rules on this path — Go keeps them in its CLI — so they are
+    /// refused in this module's words rather than in `ToPrefs`'.
     ///
     /// `Option`, not a bare `Vec`, because Go guards the whole block with `if c.AdvertiseRoutes !=
     /// nil` and an explicit `"AdvertiseRoutes": []` is a non-nil empty slice: it sets the pref to
@@ -504,13 +506,21 @@ impl Config {
         // names an explicit `[]` is judged on the empty set it is about to write.
         //
         // Go's own config loader checks only the masking rule (`ipn/conf.go` `ToPrefs`); the set-level
-        // rules live in its CLI path. They are applied here as well because a declaratively-managed
-        // subnet router is exactly the deployment where nobody reads command output: a half-advertised
-        // default route would otherwise boot silently and leak with no operator on the other end.
-        // Same rules, same messages as `Backend::check_prefs`, so the declarative and interactive
-        // paths refuse the same configs. Every offender is collected (Go `errors.Join`) rather than
-        // only the first: a headless deploy should learn about all its bad routes in one boot, not one
-        // per restart.
+        // rules live in its CLI path (`netutil.CalcAdvertiseRoutes`, reached from `up`/`set`, the k8s
+        // operator and client/web — never from a config file). They are applied here as well because a
+        // declaratively-managed subnet router is exactly the deployment where nobody reads command
+        // output: a half-advertised default route would otherwise boot silently and leak with no
+        // operator on the other end. Same rules, same messages as `Backend::check_prefs`, so the
+        // declarative and interactive paths refuse the same configs. Every offender is collected (Go
+        // `errors.Join`) rather than only the first: a headless deploy should learn about all its bad
+        // routes in one boot, not one per restart.
+        //
+        // Which is why the refusal is reported in TWO blocks, by whose rule each reason is
+        // ([`crate::routes::RouteError::refused_by_go_config_path`]). Go's config-path refusals get
+        // Go's config-path wrapper, verbatim. The rules only this fork asks here get this module's own
+        // `config: ` wording, because telling an operator whose config Go loads that "parsing config to
+        // prefs" failed sends them to a Go message that has no such rule in it, and reads as a syntax
+        // error in a file that has none.
         let prospective_routes = match &c.advertise_routes {
             // Present, even as an explicit `[]`: this list REPLACES the persisted one, so it is the
             // list to judge — an empty one withdraws every route, which is a legal outcome.
@@ -520,16 +530,36 @@ impl Config {
             None => prefs.advertise_routes.clone(),
         };
         let prospective_advertise_exit = c.advertise_exit_node.unwrap_or(prefs.advertise_exit_node);
-        // Wrapped ONCE, in Go's words. Go's `ToPrefs` returns `errors.Join` of the bare route
-        // errors and its two callers (`initPrefsFromConfig`, `setConfigLocked`) put
-        // `error parsing config to prefs: %w` around the whole join. Prefixing every line with
-        // "config: " instead said the same thing once per bad route and in nobody's wording; the
-        // wrapper goes on the front of the joined block, so the lines below it are Go's verbatim.
-        if let Err(e) = crate::routes::validate_advertise_routes(
-            &prospective_routes,
-            prospective_advertise_exit,
-        ) {
-            bail!("error parsing config to prefs: {e}");
+        // Each block is wrapped ONCE. Go's `ToPrefs` returns `errors.Join` of the bare route errors
+        // and its two callers (`initPrefsFromConfig`, `setConfigLocked`) put
+        // `error parsing config to prefs: %w` around the whole join, so that wrapper goes on the front
+        // of the joined block and the lines below it are Go's verbatim. This fork's extra set-level
+        // rules get one wrapper of their own for the same reason — repeating a prefix per line says
+        // the same thing once per bad route. A config that trips both kinds reports both blocks, so a
+        // headless boot still learns everything wrong with it at once.
+        if let Err(errs) =
+            crate::routes::calc_advertise_routes(&prospective_routes, prospective_advertise_exit)
+        {
+            let (go_rules, our_rules): (Vec<_>, Vec<_>) =
+                errs.iter().partition(|e| e.refused_by_go_config_path());
+            let join = |group: Vec<&crate::routes::RouteError>| {
+                group
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            let mut blocks: Vec<String> = Vec::new();
+            if !go_rules.is_empty() {
+                blocks.push(format!("error parsing config to prefs: {}", join(go_rules)));
+            }
+            if !our_rules.is_empty() {
+                blocks.push(format!(
+                    "config: refusing the advertised route set: {}",
+                    join(our_rules)
+                ));
+            }
+            bail!("{}", blocks.join("\n"));
         }
         if let Some(exit) = &c.exit_node {
             // The engine's `ExitNodeSelector::FromStr` is infallible (a non-IP string → a Name that
@@ -976,6 +1006,11 @@ mod tests {
         // The half-exit-node leak, from the path that most needs catching it: a declaratively managed
         // subnet router boots with nobody reading command output. `0.0.0.0/0` alone takes its clients'
         // v4 traffic while their v6 traffic leaves out their own link, and neither end can see it.
+        //
+        // This config LOADS in Go — `ToPrefs` checks only the masking rule, and the pairing rule sits
+        // in `netutil.CalcAdvertiseRoutes`, which no config path calls — so the refusal is this fork's
+        // and says so. Wearing Go's `error parsing config to prefs:` sentence would send an operator
+        // holding a config Go accepts to a Go function that has no such rule in it.
         let c = cfg(r#"{"version":"alpha0","AdvertiseRoutes":["0.0.0.0/0","192.0.2.0/24"]}"#);
         let mut p = Prefs::default();
         let before = p.clone();
@@ -985,8 +1020,8 @@ mod tests {
         };
         assert_eq!(
             e,
-            "error parsing config to prefs: 0.0.0.0/0 advertised without its IPv6 counterpart, \
-             please also advertise ::/0"
+            "config: refusing the advertised route set: 0.0.0.0/0 advertised without its IPv6 \
+             counterpart, please also advertise ::/0"
         );
         // All-or-nothing: the good route in the same list was not written either.
         assert_eq!(p.advertise_routes, before.advertise_routes);
@@ -1001,8 +1036,67 @@ mod tests {
         };
         assert_eq!(
             e6,
-            "error parsing config to prefs: ::/0 advertised without its IPv4 counterpart, please \
-             also advertise 0.0.0.0/0"
+            "config: refusing the advertised route set: ::/0 advertised without its IPv4 \
+             counterpart, please also advertise 0.0.0.0/0"
+        );
+    }
+
+    #[test]
+    fn only_gos_own_config_rules_are_refused_in_gos_config_words() {
+        // Go splits the route rules across two functions and puts only ONE of them on the config
+        // path: `ipn/conf.go` `ToPrefs` checks `route != route.Masked()`, and its callers wrap the
+        // join as `error parsing config to prefs: %w`. The pairing rule and the 4via6 validation live
+        // in `netutil.CalcAdvertiseRoutes`, which at v1.102.4 is reached from `up`, `set`, the k8s
+        // operator and client/web — never from a config file. This fork asks all of them here anyway,
+        // so the one thing that has to be right is WHOSE words each refusal is reported in.
+        let refuse = |json: &str| {
+            let mut p = Prefs::default();
+            match cfg(json).apply_to_prefs(&mut p) {
+                Ok(_) => panic!("expected {json} to be refused"),
+                Err(e) => e.to_string(),
+            }
+        };
+
+        // Go's rule → Go's wrapper, verbatim.
+        let masked = refuse(r#"{"version":"alpha0","AdvertiseRoutes":["192.0.2.5/24"]}"#);
+        assert_eq!(
+            masked,
+            "error parsing config to prefs: route 192.0.2.5/24 has non-address bits set; expected \
+             192.0.2.0/24"
+        );
+
+        // Not Go's rules → not Go's wrapper. Both of these configs load in Go.
+        for json in [
+            r#"{"version":"alpha0","AdvertiseRoutes":["0.0.0.0/0"]}"#,
+            r#"{"version":"alpha0","AdvertiseRoutes":["fd7a:115c:a1e0:b1a::/64"]}"#,
+        ] {
+            let e = refuse(json);
+            assert!(
+                !e.contains("error parsing config to prefs"),
+                "{json} is refused in Go's config-path words for a rule Go's config path does not \
+                 have: {e}"
+            );
+            assert!(
+                e.starts_with("config: refusing the advertised route set: "),
+                "{e}"
+            );
+        }
+
+        // A config that trips both kinds still reports everything wrong with it in one boot: two
+        // blocks, each wrapped once, each under the wrapper that belongs to it.
+        let both = refuse(
+            r#"{"version":"alpha0","AdvertiseRoutes":["192.0.2.5/24","0.0.0.0/0","garbage"]}"#,
+        );
+        assert_eq!(
+            both.lines().collect::<Vec<_>>(),
+            vec![
+                "error parsing config to prefs: route 192.0.2.5/24 has non-address bits set; \
+                 expected 192.0.2.0/24",
+                "\"garbage\" is not a valid IP address or CIDR prefix",
+                "config: refusing the advertised route set: 0.0.0.0/0 advertised without its IPv6 \
+                 counterpart, please also advertise ::/0",
+            ],
+            "got:\n{both}"
         );
     }
 
@@ -1042,7 +1136,9 @@ mod tests {
     fn apply_refuses_a_malformed_4via6_route() {
         // A 4via6 prefix too short to carry the site id it is supposed to encode (Go
         // `netutil.ValidateViaPrefix`, message verbatim). Without this it is advertised as an ordinary
-        // IPv6 route that decodes to no IPv4 CIDR at all.
+        // IPv6 route that decodes to no IPv4 CIDR at all. Go reaches that check from its CLI and not
+        // from a config file, so the reason is Go's but the refusal is this fork's, and the wrapper
+        // around it is this module's rather than `ToPrefs`'.
         let c = cfg(r#"{"version":"alpha0","AdvertiseRoutes":["fd7a:115c:a1e0:b1a::/64"]}"#);
         let mut p = Prefs::default();
         let e = match c.apply_to_prefs(&mut p) {
@@ -1051,8 +1147,8 @@ mod tests {
         };
         assert_eq!(
             e,
-            "error parsing config to prefs: fd7a:115c:a1e0:b1a::/64 4-in-6 prefix must be at least \
-             a /96"
+            "config: refusing the advertised route set: fd7a:115c:a1e0:b1a::/64 4-in-6 prefix must \
+             be at least a /96"
         );
         assert!(p.advertise_routes.is_empty());
 
