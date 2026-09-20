@@ -332,6 +332,7 @@ async fn handle_conn(
                         initial_netmap,
                         prefs,
                         policy,
+                        initial_status,
                     }) => {
                         // Judge the SUBSCRIPTION before subscribing it to anything: Go's
                         // `serveWatchIPNBus` runs all of its refusals ahead of `WatchNotifications`,
@@ -367,7 +368,8 @@ async fn handle_conn(
                             .await?;
                             break;
                         };
-                        if !initial_state && !initial_netmap && !prefs && !policy {
+                        if !initial_state && !initial_netmap && !prefs && !policy && !initial_status
+                        {
                             // Bare watch → the legacy status-stream path, untouched.
                             stream_watch(&mut write_half, &backend).await?;
                         } else {
@@ -379,6 +381,7 @@ async fn handle_conn(
                                 initial_netmap,
                                 prefs,
                                 policy,
+                                initial_status,
                             )
                             .await?;
                         }
@@ -663,6 +666,12 @@ async fn stream_watch(
 /// Neither is tied to a device epoch: prefs change on a down node, and policy is resolved from the
 /// process-global registry rather than the netmap, so both are also served on the device-less arm.
 ///
+/// A third daemon-built front-load, the `initial_status` snapshot (Go `NotifyInitialStatus`), goes
+/// out before both of them and is never repeated. It is taken AFTER the lifecycle/prefs/policy
+/// subscriptions and BEFORE the first bus subscription; the window that ordering leaves, and why
+/// subscribing to the bus first would not close it, is documented on
+/// [`NotifyView::initial_status`](crate::localapi::NotifyView::initial_status).
+///
 /// ## Lock discipline (the load-bearing rule)
 ///
 /// The backend guard is held only for the brief `watch_lifecycle()` subscribe and the brief
@@ -678,6 +687,7 @@ async fn stream_notify(
     initial_netmap: bool,
     prefs: bool,
     policy: bool,
+    initial_status: bool,
 ) -> Result<()> {
     use tailscale::NotifyWatchOpt;
 
@@ -707,7 +717,24 @@ async fn stream_notify(
     // reason: a reload landing between here and the first select must not be lost.
     let mut policy_rx = Backend::watch_policy();
 
-    // `prefs` front-load: emit the current prefs as the first frame (Go `NotifyInitialPrefs`). Done
+    // `initial_status` front-load (Go `NotifyInitialStatus`): the whole `status` report, peers
+    // included, as the session's first frame. Taken after the subscriptions above (so a lifecycle,
+    // prefs or policy change after it is still delivered) and before the first bus subscription.
+    // Go gets atomicity from one mutex; this daemon cannot, and `NotifyView::initial_status` says
+    // which edge that leaves. `status()` bounds its engine query, so the lock is held briefly — the
+    // same call a one-shot `status` makes. Sent once: Go carries it in the first `Notify` only.
+    if initial_status {
+        let report = { backend.lock().await.status().await };
+        let frame = Response::Notify(crate::localapi::NotifyView {
+            initial_status: Some(Box::new(report)),
+            ..Default::default()
+        });
+        if write_response(write_half, &frame).await.is_err() {
+            return Ok(());
+        }
+    }
+
+    // `prefs` front-load: emit the current prefs up front (Go `NotifyInitialPrefs`). Done
     // once up front (daemon-built, not tied to a device epoch). A write error = client gone.
     if prefs && emit_prefs_frame(write_half, backend).await.is_err() {
         return Ok(());
@@ -908,11 +935,12 @@ fn project_notify(notify: tailscale::Notify) -> Option<crate::localapi::NotifyVi
         error,
         browse_to_url,
         net_map,
-        // `prefs` and `policy` are the daemon-built fields, never sourced from an engine `Notify` —
-        // `project_notify` only maps engine fields, so both are always `None` here (those feeds are
-        // emitted separately by `emit_prefs_frame`/`emit_policy_frame`).
+        // `prefs`, `policy` and `initial_status` are the daemon-built fields, never sourced from an
+        // engine `Notify` — `project_notify` only maps engine fields, so all three are always `None`
+        // here (those feeds are emitted separately by `stream_notify`'s front-loads).
         prefs: None,
         policy: None,
+        initial_status: None,
     };
     // The engine never emits an all-`None` Notify, but guard the projection anyway: a frame with no
     // populated field carries nothing for a consumer to apply.
