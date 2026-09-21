@@ -24,7 +24,7 @@ use crate::auth::{self, Access, AuthPolicy};
 use crate::ipn::alwayson;
 use crate::ipn::syspolicy;
 use crate::ipn::{self, Backend};
-use crate::localapi::{Request, Response};
+use crate::localapi::{Request, Response, watch_usage_refusal};
 
 /// Max bytes for a single newline-delimited request line. LocalAPI requests are tiny JSON, so this
 /// is generous; its only job is to stop a single newline-less connection from growing the read
@@ -334,6 +334,26 @@ async fn handle_conn(
                         policy,
                         initial_status,
                     }) => {
+                        // Judge the SUBSCRIPTION before subscribing it to anything: Go's
+                        // `serveWatchIPNBus` runs all of its refusals ahead of `WatchNotifications`,
+                        // so a refused watcher never takes a resource and never emits a frame. A
+                        // refusal is a request-level error like a denied `nc` — write the error line
+                        // and keep the request loop alive, because this connection was never
+                        // hijacked. Nothing on today's wire can trigger it (see
+                        // `watch_usage_refusal`) — not even `initial_status`, which IS a member of
+                        // Go's `NotifyRateLimitIncompatibleBits` but needs a `rate_limit` field this
+                        // fork does not offer to be incompatible WITH. The call sits here so that
+                        // the day the other half of one of Go's refusals lands, it is already wired.
+                        if let Some(message) = watch_usage_refusal(&Request::Watch {
+                            initial_state,
+                            initial_netmap,
+                            prefs,
+                            policy,
+                            initial_status,
+                        }) {
+                            write_response(&mut write_half, &Response::Error { message }).await?;
+                            continue;
+                        }
                         // A long-lived stream: take a permit from the SEPARATE stream budget so a
                         // flood of `Watch` connections can't starve the short-lived control pool. If
                         // the stream budget is exhausted, refuse cleanly (the client can retry) rather
@@ -655,14 +675,37 @@ async fn stream_watch(
 /// subscribing to the bus first would not close it, is documented on
 /// [`NotifyView::initial_status`](crate::localapi::NotifyView::initial_status).
 ///
+/// ## A reader that falls behind is NOT told (engine gap, `docs/ENGINE_ASKS.md` #45)
+///
+/// Frames are written to the socket inline, so a slow client stalls `watcher.next()` and the engine's
+/// 128-deep per-watcher queue fills. Go disconnects such a watcher: `sendToLocked` drains its queue,
+/// sends one terminal `Notify` whose `ErrMessage` is `"IPN bus consumer fell behind; closing watch"`,
+/// and closes it, so the client knows to re-subscribe. The engine's bus instead drops the frame and
+/// keeps streaming, and records nothing, so this function cannot tell a gap happened. It does not
+/// guess (a write timeout or a queue-depth estimate would be a facsimile). Once the engine reports
+/// lag, the handling is: drop the watcher (discarding queued frames), write one
+/// [`NotifyView::error`](crate::localapi::NotifyView::error) frame, return — in that order.
+///
+/// The daemon-built prefs, policy and `initial_status` feeds are not affected: the first two ride
+/// `tokio::sync::watch`, which coalesces to the latest full snapshot instead of dropping an entry, so
+/// a slow reader loses nothing, and the third is a single frame written before the bus is subscribed
+/// at all.
+///
 /// ## Lock discipline (the load-bearing rule)
 ///
-/// The backend guard is held only for the brief `watch_lifecycle()` subscribe and the brief
-/// `device_handle()` clone — **never** across `dev.watch_ipn_bus(mask).await` (which is async and
-/// constructs the per-watcher channel) nor across `watcher.next()`/`life.changed()`. We clone the
-/// device `Arc` out under the lock, drop the lock, then subscribe + stream off-lock — exactly the
-/// "clone the work out, drop the lock" discipline [`stream_nc`] and the other slow engine calls use —
-/// so a notify watcher never head-of-line blocks a concurrent `up`/`down`/`status`.
+/// The backend guard is held for the brief `watch_lifecycle()` subscribe, the brief
+/// `device_handle()` clone, and — only when `initial_status` was asked for — the one-shot
+/// `Backend::status().await` snapshot, which is the single hold in this function that spans an
+/// `await`. That last one is bounded: on a `Running` node `status()` queries the engine under
+/// `STATUS_QUERY_TIMEOUT`, and it is the same hold [`stream_watch`] already takes for every one of
+/// its per-transition snapshots. The guard is **never** held across `dev.watch_ipn_bus(mask).await`
+/// (which is async and constructs the per-watcher channel) nor across
+/// `watcher.next()`/`life.changed()`. We clone the device `Arc` out under the lock, drop the lock,
+/// then subscribe + stream off-lock — exactly the "clone the work out, drop the lock" discipline
+/// [`stream_nc`] and the other slow engine calls use. So a notify watcher head-of-line blocks a
+/// concurrent `up`/`down`/`status` for at most that one bounded snapshot, and only when
+/// `initial_status` was requested; for the unbounded parts — the subscribe and the stream itself —
+/// never.
 async fn stream_notify(
     write_half: &mut tokio::net::unix::OwnedWriteHalf,
     backend: &Arc<Mutex<Backend>>,
