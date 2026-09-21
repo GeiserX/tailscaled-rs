@@ -86,10 +86,14 @@ pub enum Request {
     /// byte compatibility with Go's HTTP LocalAPI, so an integer mask would buy no interoperability
     /// while committing this fork to keeping two spellings of one subscription in step forever.
     ///
-    /// Nothing offered today can trip either refusal (no field below is a member of
-    /// `NotifyRateLimitIncompatibleBits`, and there is no `rate_limit` field), which is exactly why
-    /// the ruling is written down here rather than left to be re-derived by whoever adds the fifth
-    /// field.
+    /// Nothing offered today can trip either refusal, though the second is now one field away:
+    /// [`initial_status`](Request::Watch::initial_status) below IS Go's `NotifyInitialStatus`, a
+    /// member of `NotifyRateLimitIncompatibleBits`. The combination stays unspellable only because
+    /// the OTHER operand is missing — this fork has no `rate_limit` field, and `NotifyRateLimit` is
+    /// a rate limiter on a delta stream, which is meaningless until there is a delta stream to
+    /// limit. Whoever adds a `rate_limit` field owes [`watch_usage_refusal`] Go's message, verbatim,
+    /// with `initial_status` already in the incompatible set. That is exactly why the ruling is
+    /// written down here rather than left to be re-derived.
     ///
     /// ### `NotifyInProcessNoDisconnect` is not offered here, on purpose
     ///
@@ -156,6 +160,20 @@ pub enum Request {
         /// asked again".
         #[serde(default, skip_serializing_if = "core::ops::Not::not")]
         policy: bool,
+        /// Front-load a whole [`StatusReport`] as the session's first [`Response::Notify`] frame, in
+        /// [`NotifyView::initial_status`]. The analogue of Go's `ipn.NotifyInitialStatus` (`1 << 14`,
+        /// declared in `ipn/backend.go`, served by `WatchNotificationsAs` in `ipn/ipnlocal/local.go`
+        /// @ `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`), which upstream recommends over fetching the
+        /// netmap: a watcher that wants a snapshot AND a stream asks for both on one connection
+        /// instead of racing a `status` request on a second.
+        ///
+        /// It is the same report [`Request::Status`] answers with, peers included (Go builds it with
+        /// `WantPeers: true`). Sent once per session, not once per device epoch — Go's
+        /// `InitialStatus` is carried by the first `Notify` only. Daemon-built like `prefs`/`policy`.
+        /// See [`NotifyView::initial_status`] for the ordering guarantee this build can and cannot
+        /// give. Same `#[serde(default)]` + `skip_serializing_if` back-compat discipline.
+        #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+        initial_status: bool,
     },
     /// Bring the node up (`WantRunning = true`), optionally (re)setting login/config fields.
     Up {
@@ -929,17 +947,20 @@ pub enum Request {
 ///
 /// ## Why it accepts everything today
 ///
-/// Neither of Go's two *content* refusals can be expressed in this fork's wire format, because
-/// neither operand is offered:
+/// Neither of Go's two *content* refusals can be expressed in this fork's wire format, because in
+/// each case at least one operand is not offered:
 ///
 /// - `NotifyInProcessNoDisconnect is only valid for in-process IPN bus subscribers` — the bit is
 ///   deliberately not a field at all, for the reasons recorded on [`Request::Watch`].
-/// - `NotifyRateLimit is incompatible with new-style IPN bus subscription bits %v` — there is no
-///   `rate_limit` field, and none of the four fields this fork does offer is a member of Go's
-///   `NotifyRateLimitIncompatibleBits` (`NotifyPeerChanges | NotifyNoNetMap | NotifyInitialStatus |
-///   NotifyPeerPatches`). `initial_state` is `NotifyInitialState` and `initial_netmap` is
-///   `NotifyInitialNetMap`, neither of which is in that set; `prefs` and `policy` are daemon-built
-///   and have no bit.
+/// - `NotifyRateLimit is incompatible with new-style IPN bus subscription bits %v` — this one is a
+///   two-operand rule, and this fork now offers exactly one of the operands. `initial_status` IS
+///   Go's `NotifyInitialStatus`, a member of `NotifyRateLimitIncompatibleBits` (`NotifyPeerChanges |
+///   NotifyNoNetMap | NotifyInitialStatus | NotifyPeerPatches`); the other three members have no
+///   field here, `initial_state` (`NotifyInitialState`) and `initial_netmap` (`NotifyInitialNetMap`)
+///   are not in that set, and `prefs`/`policy` are daemon-built and have no bit at all. What is
+///   missing is the *trigger*: there is no `rate_limit` field, so a caller cannot ask for the rate
+///   limiter those bits are incompatible WITH. A subscription naming `initial_status` alone is
+///   exactly what Go accepts too.
 ///
 /// (Go's third, `bad mask` for a value that will not parse, is structurally impossible here: a
 /// mis-typed field is a serde decode error answered as `bad request` by the server's parse arm,
@@ -947,16 +968,23 @@ pub enum Request {
 ///
 /// So this is the *place* those refusals go rather than the refusals themselves — which is why it
 /// exists now, while the surface is still small enough that the ruling is cheap to record. The
-/// destructuring below names every field instead of using `..` ON PURPOSE: adding a fifth mask field
-/// stops compiling here until its author has decided whether that field carries one of Go's
-/// refusals, and Go's message goes in next to the check, verbatim. The return type is owned because
-/// one of the two messages interpolates the offending bits.
+/// destructuring below names every field instead of using `..` ON PURPOSE: adding a mask field stops
+/// compiling here until its author has decided whether that field carries one of Go's refusals, and
+/// Go's message goes in next to the check, verbatim. That is how `initial_status` arrived: it landed
+/// here first, was checked against `NotifyRateLimitIncompatibleBits` — where it IS a member — and is
+/// accepted only because the `rate_limit` half of that rule is not on this wire. Whoever adds a
+/// `rate_limit` field owes this function Go's message, verbatim, with `initial_status` already in
+/// the incompatible set. The return type is owned because one of the two messages interpolates the
+/// offending bits.
 pub fn watch_usage_refusal(req: &Request) -> Option<String> {
     let Request::Watch {
         initial_state: _,
         initial_netmap: _,
         prefs: _,
         policy: _,
+        // In `NotifyRateLimitIncompatibleBits`, but harmless without a `rate_limit` field to be
+        // incompatible with. Read the doc above before that stops being true.
+        initial_status: _,
     } = req
     else {
         // Every other verb is a one-shot; this judges subscriptions only.
@@ -1631,7 +1659,7 @@ pub struct FileTargetReport {
 /// [`StatusReport::default`], so a JSON document missing any field (e.g. an older client's status
 /// line) deserializes instead of hard-erroring. Fields keep their `skip_serializing_if` so the
 /// emitted wire still drops empty optionals.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct StatusReport {
     /// The IPN state name. One of the seven [`crate::ipn::State`] variants (the authoritative
@@ -2225,9 +2253,10 @@ pub struct ProfileEntry {
 /// reason split out into [`error`](NotifyView::error), mirroring how [`StatusReport`] already
 /// separates `state` from `error`). Two further fields are **daemon-built**, sourced from state the
 /// engine does not hold at all: [`prefs`](NotifyView::prefs) (this fork's prefs are daemon-owned) and
-/// [`policy`](NotifyView::policy) (the system-policy registry lives in the daemon). Both are Go
-/// `Notify` fields — `Notify.Prefs` and `Notify.Policy` — so carrying them here is a port, not an
-/// invention; only the plumbing that feeds them differs.
+/// [`policy`](NotifyView::policy) (the system-policy registry lives in the daemon), plus the
+/// one-shot [`initial_status`](NotifyView::initial_status) snapshot. All three are Go `Notify`
+/// fields — `Notify.Prefs`, `Notify.Policy` and `Notify.InitialStatus` — so carrying them here is a
+/// port, not an invention; only the plumbing that feeds them differs.
 ///
 /// The richer Go `Notify` fields (`Health`, `PeerChangedPatch`, `Engine`, `FilesWaiting`,
 /// `SuggestedExitNode`, …) are intentionally **absent**: the fork's engine does not surface them on
@@ -2291,6 +2320,52 @@ pub struct NotifyView {
     /// this frame carried no policy change (or the `policy` bit was unset).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy: Option<PolicyReport>,
+    /// A whole status snapshot, if the `initial_status` mask bit was set (Go `Notify.InitialStatus`,
+    /// gated by `ipn.NotifyInitialStatus`, assembled by `WatchNotificationsAs` in
+    /// `ipn/ipnlocal/local.go` @ `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`). Present on the
+    /// session's FIRST frame only, and never again: later changes arrive as `state` / `net_map`
+    /// frames — which come off the engine bus regardless of the mask, since the mask gates only the
+    /// engine's *initial* front-load — and as `prefs` frames when that bit is also set. A watcher
+    /// applies them over this snapshot.
+    ///
+    /// It is the very [`StatusReport`] [`Response::Status`] carries, produced by the same
+    /// `Backend::status` call, so `watch` and `status` cannot drift. Peers are included, as Go's
+    /// `WantPeers: true` includes them; on a node that is not `Running` the list is empty because
+    /// there is no netmap, exactly as a one-shot `status` reports it.
+    ///
+    /// ## Ordering: snapshot first, then subscribe — and the window that leaves
+    ///
+    /// Go assembles `InitialStatus` under `b.mu` in the same critical section that registers the
+    /// watcher, so no event can reach the watcher before its snapshot and none can fall between the
+    /// two. This daemon has no single lock spanning its backend and the engine bus, so it does not
+    /// claim that. What it does:
+    ///
+    /// - The lifecycle, prefs and policy subscriptions are taken BEFORE the snapshot, so an `up`, a
+    ///   prefs write (when the `prefs` bit is set) or a policy reload (when the `policy` bit is set)
+    ///   landing after it is still delivered. Those last two arms are bit-gated, so a watcher that
+    ///   asked for `initial_status` alone is sent no prefs frame and no policy frame, ever — the
+    ///   subscriptions are taken, but nothing reads them. A `down` is delivered as no frame at all
+    ///   on any masked watch: tearing the device down ends its bus rather than emitting a terminal
+    ///   state, and this stream simply falls back to the device-less arm and parks.
+    /// - The snapshot is then the first frame written, ahead of every other front-load and every
+    ///   engine event. Nothing on this connection precedes it.
+    /// - Only then is the engine's IPN bus subscribed. A connection-state or peer-set change that
+    ///   lands between the snapshot and that subscription is NOT delivered as its own frame.
+    ///
+    /// Subscribing to the bus first would not close that window from here: the engine's bus
+    /// watcher records its baseline inside a task it spawns, after `watch_ipn_bus` has returned,
+    /// so the daemon cannot observe the moment it became current. Closing it needs an engine-side
+    /// change. A watcher that must not miss that edge also sets `initial_state` / `initial_netmap`:
+    /// the engine front-loads the state and peer set as of its own subscription, which is never
+    /// older than this snapshot and supersedes it.
+    ///
+    /// DAEMON-built (not an engine `Notify` field). `None` on every frame but the first, and on
+    /// every frame when the bit was unset.
+    ///
+    /// Boxed only to keep [`Response`] small (a whole report inline would make every frame carry
+    /// its size); serde encodes a `Box` exactly like its contents, so the wire is unaffected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_status: Option<Box<StatusReport>>,
 }
 
 /// A single peer entry in a [`StatusReport`].
@@ -2572,6 +2647,7 @@ mod tests {
                 initial_netmap: false,
                 prefs: false,
                 policy: false,
+                initial_status: false,
             })
             .unwrap(),
             r#"{"cmd":"watch"}"#
@@ -2583,6 +2659,7 @@ mod tests {
                 initial_netmap: false,
                 prefs: false,
                 policy: false,
+                initial_status: false,
             }
         ));
         // A masked watch round-trips its bits (the Notify-path selector): each `true` field appears on
@@ -2594,12 +2671,13 @@ mod tests {
                 initial_netmap: true,
                 prefs: true,
                 policy: true,
+                initial_status: true,
             })
             .unwrap(),
-            r#"{"cmd":"watch","initial_state":true,"initial_netmap":true,"prefs":true,"policy":true}"#
+            r#"{"cmd":"watch","initial_state":true,"initial_netmap":true,"prefs":true,"policy":true,"initial_status":true}"#
         );
         match serde_json::from_str::<Request>(
-            r#"{"cmd":"watch","initial_state":true,"initial_netmap":true,"prefs":true,"policy":true}"#,
+            r#"{"cmd":"watch","initial_state":true,"initial_netmap":true,"prefs":true,"policy":true,"initial_status":true}"#,
         )
         .unwrap()
         {
@@ -2608,8 +2686,54 @@ mod tests {
                 initial_netmap,
                 prefs,
                 policy,
+                initial_status,
             } => {
-                assert!(initial_state && initial_netmap && prefs && policy);
+                assert!(initial_state && initial_netmap && prefs && policy && initial_status);
+            }
+            other => panic!("expected masked Watch, got {other:?}"),
+        }
+        // A client that predates the `initial_status` bit sends the four-field masked line. It must
+        // still parse with the bit OFF: a watcher never gets a snapshot it did not ask for.
+        match serde_json::from_str::<Request>(
+            r#"{"cmd":"watch","initial_state":true,"initial_netmap":true,"prefs":true,"policy":true}"#,
+        )
+        .unwrap()
+        {
+            Request::Watch { initial_status, .. } => assert!(
+                !initial_status,
+                "a watch line written before the initial_status bit existed must not turn it on"
+            ),
+            other => panic!("expected masked Watch, got {other:?}"),
+        }
+        // An `initial_status`-only watch (Go's `NotifyInitialStatus` alone) is masked, and implies no
+        // other bit.
+        assert_eq!(
+            serde_json::to_string(&Request::Watch {
+                initial_state: false,
+                initial_netmap: false,
+                prefs: false,
+                policy: false,
+                initial_status: true,
+            })
+            .unwrap(),
+            r#"{"cmd":"watch","initial_status":true}"#
+        );
+        match serde_json::from_str::<Request>(r#"{"cmd":"watch","initial_status":true}"#).unwrap() {
+            Request::Watch {
+                initial_state,
+                initial_netmap,
+                prefs,
+                policy,
+                initial_status,
+            } => {
+                assert!(
+                    initial_status,
+                    "the initial_status bit must survive the round trip"
+                );
+                assert!(
+                    !initial_state && !initial_netmap && !prefs && !policy,
+                    "a status-only watch must not imply any other mask bit"
+                );
             }
             other => panic!("expected masked Watch, got {other:?}"),
         }
@@ -2634,6 +2758,7 @@ mod tests {
                 initial_netmap: false,
                 prefs: true,
                 policy: false,
+                initial_status: false,
             })
             .unwrap(),
             r#"{"cmd":"watch","prefs":true}"#
@@ -2646,6 +2771,7 @@ mod tests {
                 initial_netmap: false,
                 prefs: false,
                 policy: true,
+                initial_status: false,
             })
             .unwrap(),
             r#"{"cmd":"watch","policy":true}"#
@@ -2656,10 +2782,11 @@ mod tests {
                 initial_netmap,
                 prefs,
                 policy,
+                initial_status,
             } => {
                 assert!(policy, "the policy bit must survive the round trip");
                 assert!(
-                    !initial_state && !initial_netmap && !prefs,
+                    !initial_state && !initial_netmap && !prefs && !initial_status,
                     "a policy-only watch must not imply any other mask bit"
                 );
             }
@@ -2672,16 +2799,19 @@ mod tests {
         // The ruling recorded on `Request::Watch`, in code: Go refuses two subscriptions before it
         // subscribes (`NotifyInProcessNoDisconnect` from a LocalAPI client, and `NotifyRateLimit`
         // combined with any of `NotifyRateLimitIncompatibleBits`), and NEITHER is expressible in
-        // this fork's named-boolean spelling — no field is a member of that incompatible set and
-        // there is no rate-limit field. So every one of the sixteen subscriptions a client can ask
-        // for is usable, including the all-bits-on one that would be the richest combination to
-        // refuse if any rule applied to it.
-        for bits in 0u8..16 {
+        // this fork's named-boolean spelling. The second is the interesting one now that
+        // `initial_status` exists: it IS `NotifyInitialStatus`, a member of that incompatible set,
+        // so half of Go's rule is on this wire. The other half is not — there is no `rate_limit`
+        // field — and Go itself accepts `NotifyInitialStatus` without it. So every one of the
+        // thirty-two subscriptions a client can ask for is usable, including the all-bits-on one
+        // that would be the richest combination to refuse if any rule applied to it.
+        for bits in 0u8..32 {
             let req = Request::Watch {
                 initial_state: bits & 1 != 0,
                 initial_netmap: bits & 2 != 0,
                 prefs: bits & 4 != 0,
                 policy: bits & 8 != 0,
+                initial_status: bits & 16 != 0,
             };
             assert_eq!(
                 watch_usage_refusal(&req),
@@ -2699,9 +2829,9 @@ mod tests {
         // The evidence behind that ruling. Go's refusals operate on bits of one integer, so a client
         // can always SEND a forbidden mask and be told no. Here the same words are field names, and
         // a name this fork does not offer is not a value the daemon looks at — serde drops it. A
-        // line naming every bit Go has a refusal for therefore decodes to a BARE watch (the legacy
+        // line naming only bits Go has a refusal for therefore decodes to a BARE watch (the legacy
         // status-stream path), carrying none of them, and is accepted.
-        let line = r#"{"cmd":"watch","in_process_no_disconnect":true,"rate_limit":true,"peer_changes":true,"no_net_map":true,"initial_status":true,"peer_patches":true}"#;
+        let line = r#"{"cmd":"watch","in_process_no_disconnect":true,"rate_limit":true,"peer_changes":true,"no_net_map":true,"peer_patches":true}"#;
         let req = serde_json::from_str::<Request>(line).unwrap();
         match &req {
             Request::Watch {
@@ -2709,8 +2839,9 @@ mod tests {
                 initial_netmap,
                 prefs,
                 policy,
+                initial_status,
             } => assert!(
-                !initial_state && !initial_netmap && !prefs && !policy,
+                !initial_state && !initial_netmap && !prefs && !policy && !initial_status,
                 "a watch naming only unoffered bits must decode to a bare watch, got {req:?}"
             ),
             other => panic!("expected Watch, got {other:?}"),
@@ -2720,9 +2851,28 @@ mod tests {
             None,
             "an unoffered bit is not a subscription this daemon can refuse — it was never received"
         );
-        // When one of those names becomes a real field, this assertion starts failing, which is the
-        // point: its author has to come here, read the ruling on `Request::Watch`, and port the
-        // refusal Go attaches to it.
+        // `NotifyInitialStatus` used to sit in that line. It is a real field now, which is exactly
+        // the event this test was written to catch: its author had to come here, read the ruling on
+        // `Request::Watch`, and check the bit against `NotifyRateLimitIncompatibleBits` — where it
+        // IS a member. It is accepted anyway, and the reason is the whole rule: Go refuses that bit
+        // only in COMBINATION with `NotifyRateLimit`, which has no field here, so the combination
+        // cannot be sent. When a `rate_limit` field lands, this is where its refusal gets tested.
+        let with_status = serde_json::from_str::<Request>(
+            r#"{"cmd":"watch","initial_status":true,"rate_limit":true}"#,
+        )
+        .unwrap();
+        match &with_status {
+            Request::Watch { initial_status, .. } => assert!(
+                initial_status,
+                "initial_status is an offered field now, not a name serde drops, got {with_status:?}"
+            ),
+            other => panic!("expected Watch, got {other:?}"),
+        }
+        assert_eq!(
+            watch_usage_refusal(&with_status),
+            None,
+            "NotifyInitialStatus without NotifyRateLimit is what Go accepts too"
+        );
     }
 
     #[test]

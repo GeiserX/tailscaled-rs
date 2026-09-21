@@ -332,6 +332,7 @@ async fn handle_conn(
                         initial_netmap,
                         prefs,
                         policy,
+                        initial_status,
                     }) => {
                         // Judge the SUBSCRIPTION before subscribing it to anything: Go's
                         // `serveWatchIPNBus` runs all of its refusals ahead of `WatchNotifications`,
@@ -339,13 +340,16 @@ async fn handle_conn(
                         // refusal is a request-level error like a denied `nc` — write the error line
                         // and keep the request loop alive, because this connection was never
                         // hijacked. Nothing on today's wire can trigger it (see
-                        // `watch_usage_refusal`); the call sits here so that the day a mask field
-                        // carrying one of Go's refusals lands, the refusal is already wired.
+                        // `watch_usage_refusal`) — not even `initial_status`, which IS a member of
+                        // Go's `NotifyRateLimitIncompatibleBits` but needs a `rate_limit` field this
+                        // fork does not offer to be incompatible WITH. The call sits here so that
+                        // the day the other half of one of Go's refusals lands, it is already wired.
                         if let Some(message) = watch_usage_refusal(&Request::Watch {
                             initial_state,
                             initial_netmap,
                             prefs,
                             policy,
+                            initial_status,
                         }) {
                             write_response(&mut write_half, &Response::Error { message }).await?;
                             continue;
@@ -367,7 +371,8 @@ async fn handle_conn(
                             .await?;
                             break;
                         };
-                        if !initial_state && !initial_netmap && !prefs && !policy {
+                        if !initial_state && !initial_netmap && !prefs && !policy && !initial_status
+                        {
                             // Bare watch → the legacy status-stream path, untouched.
                             stream_watch(&mut write_half, &backend).await?;
                         } else {
@@ -379,6 +384,7 @@ async fn handle_conn(
                                 initial_netmap,
                                 prefs,
                                 policy,
+                                initial_status,
                             )
                             .await?;
                         }
@@ -663,6 +669,12 @@ async fn stream_watch(
 /// Neither is tied to a device epoch: prefs change on a down node, and policy is resolved from the
 /// process-global registry rather than the netmap, so both are also served on the device-less arm.
 ///
+/// A third daemon-built front-load, the `initial_status` snapshot (Go `NotifyInitialStatus`), goes
+/// out before both of them and is never repeated. It is taken AFTER the lifecycle/prefs/policy
+/// subscriptions and BEFORE the first bus subscription; the window that ordering leaves, and why
+/// subscribing to the bus first would not close it, is documented on
+/// [`NotifyView::initial_status`](crate::localapi::NotifyView::initial_status).
+///
 /// ## A reader that falls behind is NOT told (engine gap, `docs/ENGINE_ASKS.md` #45)
 ///
 /// Frames are written to the socket inline, so a slow client stalls `watcher.next()` and the engine's
@@ -674,17 +686,26 @@ async fn stream_watch(
 /// lag, the handling is: drop the watcher (discarding queued frames), write one
 /// [`NotifyView::error`](crate::localapi::NotifyView::error) frame, return — in that order.
 ///
-/// The daemon-built prefs and policy feeds are not affected: they ride `tokio::sync::watch`, which
-/// coalesces to the latest full snapshot instead of dropping an entry, so a slow reader loses nothing.
+/// The daemon-built prefs, policy and `initial_status` feeds are not affected: the first two ride
+/// `tokio::sync::watch`, which coalesces to the latest full snapshot instead of dropping an entry, so
+/// a slow reader loses nothing, and the third is a single frame written before the bus is subscribed
+/// at all.
 ///
 /// ## Lock discipline (the load-bearing rule)
 ///
-/// The backend guard is held only for the brief `watch_lifecycle()` subscribe and the brief
-/// `device_handle()` clone — **never** across `dev.watch_ipn_bus(mask).await` (which is async and
-/// constructs the per-watcher channel) nor across `watcher.next()`/`life.changed()`. We clone the
-/// device `Arc` out under the lock, drop the lock, then subscribe + stream off-lock — exactly the
-/// "clone the work out, drop the lock" discipline [`stream_nc`] and the other slow engine calls use —
-/// so a notify watcher never head-of-line blocks a concurrent `up`/`down`/`status`.
+/// The backend guard is held for the brief `watch_lifecycle()` subscribe, the brief
+/// `device_handle()` clone, and — only when `initial_status` was asked for — the one-shot
+/// `Backend::status().await` snapshot, which is the single hold in this function that spans an
+/// `await`. That last one is bounded: on a `Running` node `status()` queries the engine under
+/// `STATUS_QUERY_TIMEOUT`, and it is the same hold [`stream_watch`] already takes for every one of
+/// its per-transition snapshots. The guard is **never** held across `dev.watch_ipn_bus(mask).await`
+/// (which is async and constructs the per-watcher channel) nor across
+/// `watcher.next()`/`life.changed()`. We clone the device `Arc` out under the lock, drop the lock,
+/// then subscribe + stream off-lock — exactly the "clone the work out, drop the lock" discipline
+/// [`stream_nc`] and the other slow engine calls use. So a notify watcher head-of-line blocks a
+/// concurrent `up`/`down`/`status` for at most that one bounded snapshot, and only when
+/// `initial_status` was requested; for the unbounded parts — the subscribe and the stream itself —
+/// never.
 async fn stream_notify(
     write_half: &mut tokio::net::unix::OwnedWriteHalf,
     backend: &Arc<Mutex<Backend>>,
@@ -692,6 +713,7 @@ async fn stream_notify(
     initial_netmap: bool,
     prefs: bool,
     policy: bool,
+    initial_status: bool,
 ) -> Result<()> {
     use tailscale::NotifyWatchOpt;
 
@@ -721,7 +743,24 @@ async fn stream_notify(
     // reason: a reload landing between here and the first select must not be lost.
     let mut policy_rx = Backend::watch_policy();
 
-    // `prefs` front-load: emit the current prefs as the first frame (Go `NotifyInitialPrefs`). Done
+    // `initial_status` front-load (Go `NotifyInitialStatus`): the whole `status` report, peers
+    // included, as the session's first frame. Taken after the subscriptions above (so a lifecycle,
+    // prefs or policy change after it is still delivered) and before the first bus subscription.
+    // Go gets atomicity from one mutex; this daemon cannot, and `NotifyView::initial_status` says
+    // which edge that leaves. `status()` bounds its engine query, so the lock is held briefly — the
+    // same call a one-shot `status` makes. Sent once: Go carries it in the first `Notify` only.
+    if initial_status {
+        let report = { backend.lock().await.status().await };
+        let frame = Response::Notify(crate::localapi::NotifyView {
+            initial_status: Some(Box::new(report)),
+            ..Default::default()
+        });
+        if write_response(write_half, &frame).await.is_err() {
+            return Ok(());
+        }
+    }
+
+    // `prefs` front-load: emit the current prefs up front (Go `NotifyInitialPrefs`). Done
     // once up front (daemon-built, not tied to a device epoch). A write error = client gone.
     if prefs && emit_prefs_frame(write_half, backend).await.is_err() {
         return Ok(());
@@ -922,11 +961,12 @@ fn project_notify(notify: tailscale::Notify) -> Option<crate::localapi::NotifyVi
         error,
         browse_to_url,
         net_map,
-        // `prefs` and `policy` are the daemon-built fields, never sourced from an engine `Notify` —
-        // `project_notify` only maps engine fields, so both are always `None` here (those feeds are
-        // emitted separately by `emit_prefs_frame`/`emit_policy_frame`).
+        // `prefs`, `policy` and `initial_status` are the daemon-built fields, never sourced from an
+        // engine `Notify` — `project_notify` only maps engine fields, so all three are always `None`
+        // here (those feeds are emitted separately by `stream_notify`'s front-loads).
         prefs: None,
         policy: None,
+        initial_status: None,
     };
     // The engine never emits an all-`None` Notify, but guard the projection anyway: a frame with no
     // populated field carries nothing for a consumer to apply.
