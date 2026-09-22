@@ -25,6 +25,14 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.63.1](https://github.com/GeiserX/tailscaled-rs/compare/v0.63.0...v0.63.1) (2026-09-22)
+
+
+### Bug Fixes
+
+* **captive:** trigger portal detection on ip-forwarding-off like Go ([#513](https://github.com/GeiserX/tailscaled-rs/issues/513)) ([e759491](https://github.com/GeiserX/tailscaled-rs/commit/e7594910b0467d0cde8366e74e0d9fe93e91336d))
+* **down:** ask Go's Continue? at a terminal and print its abort bare ([#511](https://github.com/GeiserX/tailscaled-rs/issues/511)) ([232da7c](https://github.com/GeiserX/tailscaled-rs/commit/232da7ca7f4a63b5bb3e128c2df1f4ba5dbd230b))
+
 ## [0.63.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.62.2...v0.63.0) (2026-09-22)
 
 
