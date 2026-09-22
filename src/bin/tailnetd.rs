@@ -388,7 +388,17 @@ async fn run(applied_env: Option<tailscaled_rs::envknob::Applied>) -> Result<()>
     // cleanup out by hand — so reclaiming a stale socket keeps working with whatever `--tun` the unit
     // file happens to carry. The resolved transport is applied to prefs further down, once the
     // backend has loaded them.
-    let tun_transport = match args.tun.as_deref().filter(|_| !args.cleanup) {
+    //
+    // Go's macOS root refusal goes out first and on its own: `log.SetFlags(0)` + `log.Fatalf` print
+    // that one line with no `error:` prefix, so a script matching Go's stderr matches this one.
+    let tun_value = args.tun.as_deref().filter(|_| !args.cleanup);
+    if let Some(line) = tun_value.and_then(|value| {
+        tailscaled_rs::tunflag::darwin_root_refusal(value, goos(), tailscaled_rs::tunflag::euid())
+    }) {
+        eprintln!("{line}");
+        std::process::exit(1);
+    }
+    let tun_transport = match tun_value {
         Some(value) => match tailscaled_rs::tunflag::resolve(value, goos()) {
             Ok(transport) => Some(transport),
             Err(e) => {
