@@ -299,7 +299,8 @@ enum Command {
         /// Accepted and inert: Go has required this to be `true` since Tailscale 1.67, and this
         /// build's userspace netstack installs no host routes at all, so the only value Go allows is
         /// the state this daemon is always in. `--host-routes=false` is refused with Go's own
-        /// message — see [`check_ported_up_flags`].
+        /// message, at the exit status Go's flag parser refuses it with — see
+        /// [`check_ported_up_flags`].
         //
         // Go types it as a `notFalseVar`, a bool flag whose `Set` accepts only "true". `num_args =
         // 0..=1` + `require_equals` reproduces that shape: bare `--host-routes` is the flag's
@@ -317,8 +318,9 @@ enum Command {
         /// NOT a `tnet up` flag, carried only so a ported command line reaches a refusal that names
         /// where profile naming lives (`tnet set --nickname`) instead of clap's "unexpected
         /// argument". Go does not register `--nickname` on `up` either — `up.go`'s shared flag set
-        /// gates it on `cmd == "login"` — so `up` is not the place this fork is missing it.
-        /// See [`check_ported_up_flags`].
+        /// gates it on `cmd == "login"` — so `up` is not the place this fork is missing it. The
+        /// refusal keeps the exit status Go's flag parser gives an unregistered flag (2), so only
+        /// the sentence differs. See [`check_ported_up_flags`].
         #[arg(long, hide = true, value_name = "NAME")]
         nickname: Option<String>,
     },
@@ -3655,8 +3657,11 @@ async fn run_up(
     // The two Go `up` spellings this build carries with no pref behind them (see `PortedUpFlags`):
     // Go decides both in its flag parser, before `runUp` looks at anything, so they are gated here
     // ahead of every other check — a `--host-routes=false` command line must not first be told
-    // about some other flag it also got wrong.
-    check_ported_up_flags(&ported)?;
+    // about some other flag it also got wrong. Refused at the flag parser's own exit status, not
+    // this function's (see `exit_like_gos_flag_parser`).
+    if let Err(err) = check_ported_up_flags(&ported) {
+        exit_like_gos_flag_parser(&err);
+    }
     // Go's own flag refusal first (stderr + exit 1), before any risk gate or daemon round-trip —
     // see `up_usage_refusal` for the ported check and why it is `up`-only.
     if let Some(message) = up_usage_refusal(
@@ -3974,8 +3979,11 @@ async fn run_login(
 ) -> Result<()> {
     // `--host-routes` is on `login` because Go's flag set is shared (`newUpFlagSet` registers it for
     // both commands). Go decides it in the flag parser, before `Exec` runs, so — as on `up` — it is
-    // gated ahead of every other check, including the risk gate below.
-    check_host_routes(host_routes.as_deref())?;
+    // gated ahead of every other check, including the risk gate below, and refused at the flag
+    // parser's exit status (see `exit_like_gos_flag_parser`).
+    if let Err(err) = check_host_routes(host_routes.as_deref()) {
+        exit_like_gos_flag_parser(&err);
+    }
     // Refuse a re-auth that could drop the very Tailscale-SSH session we're on (same gate as `up
     // --force-reauth`): `login` re-registers the node. Without an explicit accept-risk flag on
     // `login` (Go's `login` has no such flag — it always StartLoginInteractive), we mirror `up`'s
@@ -11626,8 +11634,41 @@ struct PortedUpFlags {
     /// `IsBoolFlag` default); any other value is Go's `notFalseVar` refusal.
     host_routes: Option<String>,
     /// `--nickname <NAME>`, hidden. Carried only to be refused by name: neither this fork's `up`
-    /// nor Go's takes a profile name.
+    /// nor Go's takes a profile name. Go's own answer is its flag parser's `flag provided but not
+    /// defined: -nickname`, so the refusal keeps that answer's exit status and its bare, unprefixed
+    /// shape. What it does not keep is that sentence, nor the usage block Go's parser prints after
+    /// it — both departures, and the reasons for both, are in [`exit_like_gos_flag_parser`].
     nickname: Option<String>,
+}
+
+/// Print a refusal that Go decides in its **flag parser**, and exit the way that parser exits.
+///
+/// `newFlagSet` (`cmd/tailscale/cli/cli.go`) builds its flag sets with `flag.ExitOnError` — every
+/// one a native build makes, its `runtime.GOOS == "js"` case being the lone exception — so a
+/// flag that is not in the set (`flag provided but not defined: -nickname`) and a `Var` whose `Set`
+/// returns an error (`notFalseVar` on `--host-routes`) both print to stderr and exit **2** — `runUp`
+/// never runs. That is deliberately a different status from the exit 1 the other refusals here end
+/// at (`up_usage_refusal`, `switch_usage_refusal`, `sysext_refusal`), and the difference is the part
+/// worth keeping: a wrapper script can tell a command line it typed wrong from a node that would not
+/// come up. It is also the status clap gives its own parse errors, so a ported command line gets one
+/// answer whether or not this CLI happens to carry the flag — which leaves the message as the whole
+/// of what the hidden `--nickname` buys over clap's "unexpected argument", and the message is why
+/// the flag is carried at all.
+///
+/// Printing here rather than returning the error also drops the `Error: ` prefix `main`'s
+/// `Result` return would have `Termination` add, which is the second half of matching Go: its flag
+/// package prints the bare sentence. Both are pinned in `tests/tnet_up_go_flag_spellings.rs`.
+///
+/// For `--nickname` the sentence itself is this fork's: it names where the behaviour does live
+/// instead of stopping at "not defined". `--host-routes` keeps Go's sentence, respelled in one
+/// place only: Go's flag package prints the name it registered, `-host-routes`, and this one prints
+/// the name a `tnet` operator typed. Go's usage block is dropped both times — `failf` prints the
+/// message and then calls `f.usage()`, so upstream's stderr carries the command's whole flag list
+/// after the sentence — for the reason every other refusal here leaves it off: the message already
+/// says what to run.
+fn exit_like_gos_flag_parser(err: &anyhow::Error) -> ! {
+    eprintln!("{err}");
+    std::process::exit(2)
 }
 
 /// Gate the Go `up` spellings that carry no pref (see [`PortedUpFlags`]). `Ok(())` means the
@@ -11635,8 +11676,9 @@ struct PortedUpFlags {
 ///
 /// Ordering is Go's: both are decided in the flag parser (`notFalseVar.Set` for `--host-routes`;
 /// `--nickname` is simply not in `up`'s flag set), which runs before `runUp` reads the daemon's
-/// status or validates any other flag. So this runs before every other `up` check. Pure →
-/// unit-testable.
+/// status or validates any other flag. So this runs before every other `up` check. An `Err` is
+/// Go's flag-parse failure and its callers answer it as one — stderr, exit 2, via
+/// [`exit_like_gos_flag_parser`]. Pure (no I/O, no process exit) → unit-testable.
 fn check_ported_up_flags(flags: &PortedUpFlags) -> Result<()> {
     check_host_routes(flags.host_routes.as_deref())?;
     if flags.nickname.is_some() {
@@ -11659,7 +11701,8 @@ fn check_ported_up_flags(flags: &PortedUpFlags) -> Result<()> {
 /// `None` = the flag was absent; `Some("true")` = its presence (Go's `IsBoolFlag` default) or an
 /// explicit `--host-routes=true`, the one value Go allows — accepted and inert, because this build's
 /// userspace netstack installs no host routes and Go has required `true` since Tailscale 1.67.
-/// Pure → unit-testable.
+/// An `Err` is a failure of `flag.Parse` upstream, so both callers answer it at that parser's exit
+/// status (see [`exit_like_gos_flag_parser`]). Pure → unit-testable.
 fn check_host_routes(value: Option<&str>) -> Result<()> {
     // Go's `notFalseVar.Set` rejects every value but "true", and Go's flag package wraps that in
     // `invalid boolean value %q for -host-routes: %v`. Same sentence, this CLI's flag spelling.
