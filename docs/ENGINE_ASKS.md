@@ -1685,7 +1685,9 @@ engine hardcodes. Upstream registers around twenty handlers on it: `/echo`, `POS
 (`feature/clientupdate/clientupdate.go`), `GET /posture/identity` (`feature/posture/posture.go`),
 `GET /appconnector/routes` (`feature/appconnectors/appconnectors.go`), `POST /wol`
 (`feature/wakeonlan/wakeonlan.go`), `GET /vip-services` (`ipn/ipnlocal/serve.go`),
-`GET /tls-cert-status` (`ipn/ipnlocal/cert.go`) and `/ssh/usernames` (`ssh/tailssh/tailssh.go`).
+`GET /tls-cert-status` (`ipn/ipnlocal/cert.go`), `/ssh/usernames` (`ssh/tailssh/tailssh.go`),
+`/debug/tka/log` (`feature/tailnetlock/tailnetlock.go`) and `GET /conn25/state`
+(`feature/conn25/conn25.go`).
 
 The absence is already documented here three times, one symptom at a time, without the cause being
 named: `Prefs::posture_checking` (`src/prefs.rs`) records that posture is a c2n *pull* nothing
@@ -1791,9 +1793,19 @@ Two, and both turn a pref this daemon already carries into something with a wire
 - **`GET /posture/identity`** → `tailcfg.C2NPostureIdentityResponse` (`SerialNumbers`,
   `IfaceHardwareAddrs`, `PostureDisabled`). `Prefs::posture_checking` is persisted, threaded into
   `Config.posture_checking` and reported by `tnet get`, and means nothing on the wire because
-  nothing answers the pull. With the hook, the `false` case becomes a real `{"PostureDisabled":
-  true}` — Go's own answer for a node that opted out, sent because the operator opted out rather
-  than because the fork is silent. The `true` case additionally needs serial-number and MAC
+  nothing answers the pull. The pref is not the handler's only input: Go's
+  `handleC2NPostureIdentityGet` first reads the `PostureChecking` policy
+  (`GetPreferenceOption(pkey.PostureChecking, …)`) and collects only when
+  `choice.ShouldEnable(prefs.PostureChecking())`, so an administrator's `always` turns collection
+  on over a `false` pref and `never` turns it off over a `true` one. Go does not fold that policy
+  into prefs (it is not in `preferencePolicies`, `ipn/ipnlocal/local.go`) and neither does this
+  daemon, so the handler must read it itself. `PostureChecking` is already a registered
+  `PreferenceOption` in `src/ipn/syspolicy.rs`, and `PreferenceOption::should_enable` is Go's
+  `ShouldEnable`; what the handler still needs is a public read of a preference-option policy, as
+  `get_boolean` is for booleans. With the hook, the disabled case — policy `never`, or the pref
+  `false` under `user-decides` or no policy — becomes a real `{"PostureDisabled": true}`, Go's own
+  answer, sent because the operator or the administrator opted out rather than because the fork is
+  silent. The enabled case additionally needs serial-number and MAC
   collection (Go's `posture.GetSerialNumbers` / `GetHardwareAddrs`, behind Go's `hwaddrs=true` query
   gate); that is local OS work on the daemon side and a separate piece, so the honest first shape
   reports what it can collect and omits what it cannot.
@@ -1802,9 +1814,12 @@ Two, and both turn a pref this daemon already carries into something with a wire
   advertisement that the console may act on this node, which nothing then honours. `Enabled` is that
   pref (Go: `envknob.AllowsRemoteUpdate() || upPref.Apply.EqualBool(true)`). `Supported` is
   `feature.CanAutoUpdate()` upstream and is honestly `false` here — `tnet update` is a manual,
-  operator-invoked command and there is no updater to trigger — so `POST /update` answers
-  `Err: "not supported"`, which is Go's own string for exactly that state in `handleC2NUpdatePost`,
-  not a fork invention. A node that advertises `AllowsUpdate` and then declines the trigger in
+  operator-invoked command and there is no updater to trigger. `POST /update` then refuses in
+  `handleC2NUpdatePost`'s order, which checks `Enabled` before `Supported`: with the pref unset or
+  `false` it answers `Err: "not enabled"`, and only with the pref `true` does it answer
+  `Err: "not supported"`. Both strings are Go's own for exactly those states, not fork inventions,
+  and the order matters because the default node is the unset one. A node that advertises
+  `AllowsUpdate` and then declines the trigger in
   upstream's words is strictly better than one that advertises it and never answers at all. Running
   an actual update from the trigger is its own piece of work.
 
@@ -1816,7 +1831,9 @@ several high-availability subnet routers is alive.
 
 The `/debug/*` family — `/debug/prefs`, `/debug/metrics`, `/debug/netmap`, `/debug/health`,
 `/debug/goroutines`, `/debug/component-logging`, `/debug/logheap`, `/debug/pprof/heap`,
-`/debug/pprof/allocs` — together with `POST /sockstats`, is a **remote read of daemon internals by
+`/debug/pprof/allocs`, and `/debug/tka/log` (the Tailnet Lock update log, registered from
+`feature/tailnetlock/tailnetlock.go` behind the same `buildfeatures.HasDebug` gate) — together with
+`POST /sockstats`, is a **remote read of daemon internals by
 the control plane**. This fork should not start answering it on the same day it gains the ability
 to, and the hook does not require it to.
 
@@ -1835,7 +1852,9 @@ paragraph, taken after the hook exists rather than bundled into it.
 The rest are declined for plainer reasons: `POST /logtail/flush` (no logtail client here),
 `POST /netfilter-kind` (no netfilter layer at all — ask #21, bead `tsd-m8s`),
 `GET /appconnector/routes` (the c2n half of ask #39, and blocked on the route learning that ask
-asks for), `POST /wol`, `/ssh/usernames` and `GET /tls-cert-status`.
+asks for), `POST /wol`, `/ssh/usernames`, `GET /tls-cert-status`, and `GET /conn25/state` (the
+work-in-progress connectors datapath, which this fork does not have and which upstream itself
+answers `501` outside `envknob.UseWIPCode()`).
 
 **Daemon impact once landed:** one `watch_c2n` task in the daemon's IPN layer with a method+path
 dispatch of its own, and the two handlers above, reading prefs the daemon already holds. The
@@ -1921,3 +1940,96 @@ refusal is stable rather than flapping) but is one more reason the gate belongs 
 `permitted_suggestion`'s filter arm becomes redundant (the nil-versus-empty reading and its tests
 move with the argument). `tnet exit-node suggest` then answers with the best *allowed* exit node
 instead of withholding when the best overall is not allowed. Consumed via a pin bump. — engine lane
+
+## 45. A lag signal on `IpnBusWatcher` — so a watcher that falls behind is told and disconnected, not silently starved
+
+**Why:** Go used to drop notifications for a slow watcher and no longer does. In
+`ipn/ipnlocal/local.go` @ `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`, `sendToLocked` does a
+non-blocking send into the session's 128-deep channel, and a full channel is a disconnect:
+
+```go
+select {
+case sess.ch <- nForSess:
+default:
+    if sess.mask&ipn.NotifyInProcessNoDisconnect != 0 {
+        select {
+        case sess.ch <- nForSess:
+        case <-sess.ctx.Done():
+        }
+        continue
+    }
+    b.closeLaggingWatchSessionLocked(sess)
+}
+```
+
+`closeLaggingWatchSessionLocked` removes the session from `b.notifyWatchers`, **drains** everything
+still queued ("the session already fell behind, so the queued delta stream is not trustworthy"),
+sends one terminal `Notify` whose `ErrMessage` is `watchIPNBusFellBehindMessage` (`"IPN bus consumer
+fell behind; closing watch"`), and closes the channel. The client is told once, is disconnected, and
+knows to re-subscribe and re-snapshot. The blocking arm is only for `NotifyInProcessNoDisconnect`,
+which is in-process only and which the LocalAPI handler refuses; the daemon has no in-process
+watchers, so it needs only the disconnect.
+
+Verified against pin `9d847a6e`: the engine keeps the old Go behaviour. `deliver` in
+`ts_runtime/src/ipn_bus.rs` treats a full queue as success and keeps streaming:
+
+```rust
+match tx.try_send(n) {
+    Ok(()) => false,
+    Err(mpsc::error::TrySendError::Full(_)) => false,
+    Err(mpsc::error::TrySendError::Closed(_)) => true,
+}
+```
+
+and `IpnBusWatcher::next() -> Option<Notify>` has no way to say a frame was dropped. The engine test
+`full_buffer_drops_and_never_blocks_producer` locks in the drop, so it changes with the fix. Its
+"never blocks the producer" half still holds under Go's disconnect. The daemon's
+`stream_notify` writes each frame to the socket inline, so a slow reader (`tnet` piped into a stalled
+pager, an agent doing synchronous work per frame) is exactly what fills that queue. The watcher then
+loses frames one at a time, the connection stays open, and neither side knows its view diverged.
+
+**Why not a daemon-side facsimile.** The daemon cannot see a drop, because the engine records none.
+A write timeout or a queue-depth estimate would guess at lag. It would disconnect readers that never
+lost a frame and miss ones that did. Refused under the honest-omission rule; hence this ask.
+
+**Not affected:** the daemon-built prefs and policy feeds on the same stream ride
+`tokio::sync::watch`, which coalesces to the latest full snapshot instead of dropping an entry. For a
+full-snapshot feed that loses nothing. Only the engine's `mpsc` bus has the hazard.
+
+**Ask (either piece is sufficient; the first is preferred):**
+
+1. A `Lagged` outcome on the watcher, in the shape of
+   `tokio::sync::broadcast::error::RecvError::Lagged`, that carries Go's ordering inside the engine:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WatchError {
+    /// The bus ended (runtime shutdown, source senders dropped) — today's `next() == None`.
+    Closed,
+    /// This watcher's queue was full, so a notification was dropped. Queued frames were
+    /// discarded, and the watcher is finished: every later `recv` returns `Closed`.
+    Lagged,
+}
+
+impl IpnBusWatcher {
+    pub async fn recv(&mut self) -> Result<Notify, WatchError>;
+}
+```
+
+   Inside, `deliver`'s `Full` arm sets a flag shared with the watcher and returns `true` (stop the
+   task, as `Closed` already does). `recv` checks the flag first: if it is set, it drains `rx` with
+   `try_recv`, returns `Err(Lagged)` once, and returns `Closed` after that. Draining in `recv`, not
+   at the consumer, keeps a stale queued frame from ever reaching a caller after the gap. That is the
+   point of Go's drain-then-error-then-close order. `next()` can stay as `recv().await.ok()`.
+
+2. Or a counter, `IpnBusWatcher::dropped() -> u64`, that `deliver`'s `Full` arm increments. The
+   daemon would check it after each `next()` and, when it is non-zero, do the drain/terminal/close
+   itself. This is less surface in the engine, but it leaves every embedder to re-implement the
+   ordering. The engine would also keep streaming after a gap it knows about, so (1) is preferred.
+
+**Daemon impact once landed:** in `stream_notify` (`src/server.rs`), `Err(Lagged)` drops the
+watcher, writes one `Response::Notify(NotifyView { error: Some("IPN bus consumer fell behind;
+closing watch"), .. })` frame, and returns. That is Go's terminal frame, and `NotifyView::error`
+already exists. The ordering and the message get a test that drives the bus past 128 frames.
+Consumed via a pin bump. — engine lane
