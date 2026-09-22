@@ -5204,7 +5204,7 @@ impl Backend {
     ///
     /// `&self`, not `&mut self`: the cell lives behind a `watch::Sender`, which publishes through a
     /// shared reference. That is not an accident of the type — it keeps this callable from the brief
-    /// read-style lock the off-lock diagnostics take.
+    /// lock the off-lock diagnostics take.
     pub fn publish_suggested_exit_node(&self, response: &crate::localapi::Response) -> bool {
         let crate::localapi::Response::ExitNodeSuggestion {
             suggestion: Some(suggestion),

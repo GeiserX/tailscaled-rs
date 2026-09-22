@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tailscaled_rs::ipn::Backend;
-use tailscaled_rs::localapi::{Request, Response};
+use tailscaled_rs::localapi::{ExitNodeSuggestionView, Request, Response};
 use tailscaled_rs::server;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -1327,6 +1327,229 @@ async fn a_policy_masked_watch_front_loads_the_snapshot_and_is_pushed_on_reload(
         "the pushed frame carries the SAME report the `syspolicy reload` verb answered with — one \
          producer, so the notify stream cannot drift from the one-shot read"
     );
+
+    harness.shutdown_and_verify().await;
+}
+
+/// The `suggested_exit_node` mask bit (Go `ipn.NotifyInitialSuggestedExitNode`, `1 << 10`) end to
+/// end over the real socket: the wiring between `Backend::publish_suggested_exit_node` and the frame
+/// a watcher reads, which the unit tests either side of it cannot see.
+///
+/// Three contracts in one pass, all on a device-less daemon:
+///
+/// 1. **No front-load without a device.** Unlike `prefs` and `policy` — both resolved from
+///    daemon-owned state and therefore front-loaded before the first epoch — a suggestion has to be
+///    ranked by a live engine, so a watcher on a down node is told nothing and simply waits. Pinning
+///    the silence is what makes the push below mean something.
+/// 2. **A publish reaches a parked watcher**, carrying the bare stable id and nothing the client did
+///    not ask for.
+/// 3. **The same pick again is not a frame.** Go guards its send with `prevSuggestion != res.ID`, so
+///    a stable answer costs nothing on the bus however often it is recomputed.
+///
+/// `publish_suggested_exit_node` is invoked on the backend API rather than through an `exit-node
+/// suggest` over a second connection because the computation it wraps needs a live engine and a
+/// tailnet; this is the identical call `Backend::suggest_exit_node` makes with the engine's answer,
+/// so the notify path being exercised is the whole of the path a real suggestion travels. The
+/// per-epoch front-load is the one piece out of reach — it needs that live engine, so it cannot be
+/// driven from this harness at all; the frame it writes is the same one the emitter test in
+/// `src/server.rs` pins.
+#[tokio::test]
+async fn a_suggestion_masked_watch_is_quiet_until_a_pick_moves() {
+    let harness = Harness::start().await;
+
+    // Only the `suggested_exit_node` bit: a client that just wants to know which exit node to
+    // recommend asks for nothing else.
+    let (_w, mut r) = open_masked_watch(
+        &harness,
+        b"{\"cmd\":\"watch\",\"suggested_exit_node\":true}\n",
+    )
+    .await;
+
+    // (1) Device-less: no suggestion exists to front-load, and no session id was asked for, so the
+    // stream is silent. This is the difference from `prefs`/`policy`, and it is deliberate.
+    assert!(
+        try_read_watch_status(&mut r, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "a suggestion watcher on a daemon with no device must be told nothing, not an empty frame"
+    );
+
+    // (2) The change edge: a suggestion is computed and differs from the last published (here: the
+    // first of the run), so every watcher hears it.
+    let published =
+        harness
+            .backend
+            .lock()
+            .await
+            .publish_suggested_exit_node(&Response::ExitNodeSuggestion {
+                suggestion: Some(ExitNodeSuggestionView {
+                    id: "nodeid-a".to_string(),
+                    name: "berlin".to_string(),
+                }),
+            });
+    assert!(published, "the first pick of the run is a change");
+
+    let frame = read_notify(
+        &mut r,
+        "a published exit-node suggestion must reach a parked watcher",
+    )
+    .await;
+    assert_eq!(
+        frame.suggested_exit_node.as_deref(),
+        Some("nodeid-a"),
+        "the frame carries the bare stable id, as Go's `Notify.SuggestedExitNode` does"
+    );
+    assert!(
+        frame.state.is_none()
+            && frame.net_map.is_none()
+            && frame.prefs.is_none()
+            && frame.policy.is_none(),
+        "a suggestion-only watch must not be sent fields it did not ask for: {frame:?}"
+    );
+
+    // (3) The same pick recomputed is not news. Without this guard every `exit-node suggest` and
+    // every watch front-load would wake every watcher with a value it already holds.
+    assert!(
+        !harness
+            .backend
+            .lock()
+            .await
+            .publish_suggested_exit_node(&Response::ExitNodeSuggestion {
+                suggestion: Some(ExitNodeSuggestionView {
+                    id: "nodeid-a".to_string(),
+                    name: "berlin".to_string(),
+                }),
+            }),
+        "an unchanged pick must not republish"
+    );
+    assert!(
+        try_read_watch_status(&mut r, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "an unchanged pick must not produce a second frame"
+    );
+
+    harness.shutdown_and_verify().await;
+}
+
+/// Open a masked watch with `request` (one JSON line) and return the still-open write half plus the
+/// reader. The write half must be held for the watch to stay open.
+async fn open_masked_watch(
+    harness: &Harness,
+    request: &[u8],
+) -> (
+    tokio::net::unix::OwnedWriteHalf,
+    BufReader<tokio::net::unix::OwnedReadHalf>,
+) {
+    let stream = UnixStream::connect(&harness.socket_path)
+        .await
+        .expect("CLI connect to LocalAPI socket for a masked watch");
+    let (read_half, mut write_half) = stream.into_split();
+    write_half
+        .write_all(request)
+        .await
+        .expect("write masked watch request");
+    write_half.flush().await.expect("flush watch request");
+    (write_half, BufReader::new(read_half))
+}
+
+/// Read one `Notify` frame within a bounded wait, so a regression fails instead of hanging.
+async fn read_notify(
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    what: &str,
+) -> tailscaled_rs::localapi::NotifyView {
+    match try_read_watch_status(reader, Duration::from_secs(5)).await {
+        Some(Response::Notify(view)) => view,
+        Some(other) => panic!("a masked watch streams Notify frames, got {other:?}"),
+        None => panic!("no frame arrived: {what}"),
+    }
+}
+
+/// The identity fields end to end over the real socket (Go `WatchNotificationsAs` + `sendToLocked`):
+/// an `initial_state` watch gets a session id on its first frame and never again, every frame states
+/// the daemon's version, and a second connection gets a different id.
+///
+/// The device-less daemon is the case that matters: the engine has no initial state to send, and Go's
+/// foreground `serve` reads exactly one frame for its id, so the id must arrive without an `up`.
+#[tokio::test]
+async fn an_initial_state_watch_is_given_a_session_id_once_and_a_version_always() {
+    let harness = Harness::start().await;
+    let Response::Version { version } = harness.round_trip(r#"{"cmd":"version"}"#).await else {
+        panic!("the version verb replies with a version");
+    };
+
+    // (1) `initial_state` alone on a device-less daemon: the first frame carries only identity.
+    let (_w1, mut r1) =
+        open_masked_watch(&harness, b"{\"cmd\":\"watch\",\"initial_state\":true}\n").await;
+    let first = read_notify(
+        &mut r1,
+        "an initial_state watch must send its session id immediately",
+    )
+    .await;
+    let id1 = first
+        .session_id
+        .clone()
+        .expect("the first frame of an initial_state watch carries the session id");
+    assert_eq!(id1.len(), 16, "Go's rands.HexString(16) shape, got {id1:?}");
+    assert_eq!(
+        first.version.as_deref(),
+        Some(version.as_str()),
+        "the frame names the same version `tnet version --daemon` reports"
+    );
+
+    // (2) A second connection is a different session.
+    let (_w2, mut r2) =
+        open_masked_watch(&harness, b"{\"cmd\":\"watch\",\"initial_state\":true}\n").await;
+    let id2 = read_notify(
+        &mut r2,
+        "a second initial_state watch must get its own session id",
+    )
+    .await
+    .session_id
+    .expect("the second connection's first frame carries a session id");
+    assert_ne!(
+        id1, id2,
+        "a session id must not be reused across connections"
+    );
+
+    // (3) With a prefs front-load the id rides that first real frame, and the next frame — pushed by
+    // a `down`, which persists prefs — carries the version but no id. Prefs, not policy: the prefs
+    // tick belongs to this harness's backend, while a policy reload is process-global and would push
+    // frames into the other policy watch test running alongside this one.
+    let (_w3, mut r3) = open_masked_watch(
+        &harness,
+        b"{\"cmd\":\"watch\",\"initial_state\":true,\"prefs\":true}\n",
+    )
+    .await;
+    let snapshot = read_notify(&mut r3, "the prefs front-load").await;
+    assert!(
+        snapshot.prefs.is_some(),
+        "the first frame is the prefs snapshot: {snapshot:?}"
+    );
+    let id3 = snapshot
+        .session_id
+        .expect("the id rides the first frame written, whichever feed produced it");
+    assert!(id3 != id1 && id3 != id2);
+    let Response::Ok { .. } = harness.round_trip(r#"{"cmd":"down"}"#).await else {
+        panic!("down on an offline node replies Ok");
+    };
+    let pushed = read_notify(
+        &mut r3,
+        "a down persists prefs and pushes a fresh prefs frame",
+    )
+    .await;
+    assert!(
+        pushed.prefs.is_some(),
+        "the pushed frame is prefs: {pushed:?}"
+    );
+    assert_eq!(pushed.session_id, None, "no later frame repeats the id");
+    assert_eq!(pushed.version.as_deref(), Some(version.as_str()));
+
+    // (4) Without `initial_state` there is no id, as in Go — but the version is still there.
+    let (_w4, mut r4) = open_masked_watch(&harness, b"{\"cmd\":\"watch\",\"prefs\":true}\n").await;
+    let prefs_only = read_notify(&mut r4, "the prefs front-load").await;
+    assert_eq!(prefs_only.session_id, None);
+    assert_eq!(prefs_only.version.as_deref(), Some(version.as_str()));
 
     harness.shutdown_and_verify().await;
 }
