@@ -57,6 +57,51 @@ pub enum Request {
     ///
     /// Keeping both on one `cmd` (rather than minting a second verb) mirrors Go, where the single
     /// `WatchIPNBus` LocalAPI route takes the mask as a parameter; the mask *is* the path selector.
+    ///
+    /// ## What named booleans cannot do — refuse — and where a refusal goes
+    ///
+    /// Go's `serveWatchIPNBus` (`ipn/localapi/localapi.go`) takes the whole subscription as ONE
+    /// decimal integer (`mask.UnmarshalText([]byte(s))`) and refuses three ways *before* it
+    /// subscribes to anything: `bad mask` (400) for a value that will not parse;
+    /// `NotifyInProcessNoDisconnect is only valid for in-process IPN bus subscribers` (400); and
+    /// `ipn.ValidateNotifyWatchOpt`'s `NotifyRateLimit is incompatible with new-style IPN bus
+    /// subscription bits %v` for `NotifyRateLimit` combined with any bit in
+    /// `NotifyRateLimitIncompatibleBits` (`NotifyPeerChanges | NotifyNoNetMap | NotifyInitialStatus
+    /// | NotifyPeerPatches`) — those bits describe stateful delta streams, and a rate limiter that
+    /// delays or merges messages in one breaks the consumer's ability to keep a coherent local view.
+    ///
+    /// The fields above are the better wire format in almost every respect — self-describing,
+    /// impossible to mis-type as an integer, and back-compatible by construction. What they cannot
+    /// do is refuse. An unparseable mask is a serde type error rather than a value the daemon looks
+    /// at; an unknown bit is simply a field serde ignores; and a forbidden COMBINATION has no shape
+    /// in which a caller can even express it, so there is nothing here to rule on.
+    ///
+    /// **The ruling: the booleans stay, and each of Go's refusals is ported as a cross-field check
+    /// on the parsed request** — [`watch_usage_refusal`], in the same shape this fork already uses
+    /// for Go's one cross-flag usage refusal (`--exit-node-allow-lan-access can only be used with
+    /// --exit-node`): the check moves from "is this bit set in an integer" to "are these two fields
+    /// both true", Go's message is kept verbatim, and the wire stays readable. The alternative —
+    /// carrying Go's integer mask as an extra field and validating it exactly as Go does — was
+    /// rejected: this daemon's LocalAPI is its own protocol over a Unix socket and has never claimed
+    /// byte compatibility with Go's HTTP LocalAPI, so an integer mask would buy no interoperability
+    /// while committing this fork to keeping two spellings of one subscription in step forever.
+    ///
+    /// Nothing offered today can trip either refusal (no field below is a member of
+    /// `NotifyRateLimitIncompatibleBits`, and there is no `rate_limit` field), which is exactly why
+    /// the ruling is written down here rather than left to be re-derived by whoever adds the fifth
+    /// field.
+    ///
+    /// ### `NotifyInProcessNoDisconnect` is not offered here, on purpose
+    ///
+    /// Its absence is not a gap to file. The bit's own doc in Go's `ipn/backend.go` says what it
+    /// marks: a subscriber that must not be disconnected for falling behind, so instead the PRODUCER
+    /// blocks until that subscriber catches up — possibly while holding the backend mutex. That is
+    /// only ever tolerable for a subscriber inside the process, which is why Go refuses it at the
+    /// LocalAPI boundary. Every subscriber in this fork arrives through that boundary — the daemon
+    /// has no in-process IPN bus consumer — so the bit would have nobody to describe. Nor could the
+    /// stack below honour it: the engine's per-watcher queue is bounded (`ts_runtime`'s
+    /// `NOTIFY_BUFFER`, matching Go's `make(chan *ipn.Notify, 128)`) and its producer never blocks
+    /// on a full one, it drops. Offering the bit would be offering a promise nothing under it keeps.
     Watch {
         /// Front-load the current connection state (and, in `NeedsLogin`, the auth URL as
         /// [`NotifyView::browse_to_url`]) as the first [`Response::Notify`] frame. The faithful
@@ -64,6 +109,23 @@ pub enum Request {
         /// [`NotifyWatchOpt::INITIAL_STATE`](tailscale::NotifyWatchOpt::INITIAL_STATE). `#[serde(default)]`
         /// makes it `false` when omitted (so a bare watch still parses); `skip_serializing_if` drops it
         /// from the wire when `false`, preserving the exact `{"cmd":"watch"}` legacy encoding.
+        ///
+        /// ## The session id rides on this bit
+        ///
+        /// Setting it also mints a per-connection session id, sent once as
+        /// [`NotifyView::session_id`] on the FIRST frame of the watch and never repeated — the
+        /// analogue of Go's `WatchNotificationsAs`, which sets `Notify.SessionID` only when the
+        /// watcher asked for `NotifyInitialState`. A client that wants the id must store it from that
+        /// first frame. It is fresh for every connection and stable for the life of this one.
+        ///
+        /// On a device-less daemon the engine has no initial state to front-load, so when no
+        /// prefs/policy snapshot is going out first either, the daemon sends a frame carrying only
+        /// the identity fields, so the id still arrives immediately.
+        ///
+        /// **The id is not yet load-bearing.** Go keys a foreground `serve`'s config on it
+        /// (`ServeConfig.Foreground[sessionID]`) and deletes that config when the watch ends. This
+        /// daemon does not model `ServeConfig.Foreground` yet, so nothing server-side is tied to the
+        /// id today: a foreground `tnet serve` still restores its config from its own signal handler.
         #[serde(default, skip_serializing_if = "core::ops::Not::not")]
         initial_state: bool,
         /// Front-load the current peer set as the first [`Response::Notify`] frame's
@@ -867,6 +929,57 @@ pub enum Request {
     /// why Go names the key for a *restart* rather than a shutdown. See `tnet shutdown`'s help for
     /// what the units this fork ships actually do.
     Shutdown,
+}
+
+/// The refusal a [`Request::Watch`] subscription owes *before* the daemon subscribes it to anything,
+/// or `None` when the subscription is usable. Ported from Go's `serveWatchIPNBus`
+/// (`ipn/localapi/localapi.go`) and `ipn.ValidateNotifyWatchOpt` (`ipn/backend.go`) @
+/// `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`.
+///
+/// Go judges the whole subscription up front — all three of its refusals run before
+/// `WatchNotifications` is called, so a refused watcher never subscribes and never emits a frame —
+/// and this runs at the same point on the daemon's side: first thing in the `watch` dispatch arm,
+/// before the stream permit and before either stream. A refusal is answered as an ordinary error
+/// line (Go's 400), not as a terminal stream frame; Go's second, in-process call site delivers the
+/// same failure as an `ErrMessage` frame precisely because an in-process caller has no status code
+/// to receive, and this fork has no in-process caller (see [`Request::Watch`]).
+///
+/// ## Why it accepts everything today
+///
+/// Neither of Go's two *content* refusals can be expressed in this fork's wire format, because
+/// neither operand is offered:
+///
+/// - `NotifyInProcessNoDisconnect is only valid for in-process IPN bus subscribers` — the bit is
+///   deliberately not a field at all, for the reasons recorded on [`Request::Watch`].
+/// - `NotifyRateLimit is incompatible with new-style IPN bus subscription bits %v` — there is no
+///   `rate_limit` field, and none of the four fields this fork does offer is a member of Go's
+///   `NotifyRateLimitIncompatibleBits` (`NotifyPeerChanges | NotifyNoNetMap | NotifyInitialStatus |
+///   NotifyPeerPatches`). `initial_state` is `NotifyInitialState` and `initial_netmap` is
+///   `NotifyInitialNetMap`, neither of which is in that set; `prefs` and `policy` are daemon-built
+///   and have no bit.
+///
+/// (Go's third, `bad mask` for a value that will not parse, is structurally impossible here: a
+/// mis-typed field is a serde decode error answered as `bad request` by the server's parse arm,
+/// which is the same outcome one layer earlier.)
+///
+/// So this is the *place* those refusals go rather than the refusals themselves — which is why it
+/// exists now, while the surface is still small enough that the ruling is cheap to record. The
+/// destructuring below names every field instead of using `..` ON PURPOSE: adding a fifth mask field
+/// stops compiling here until its author has decided whether that field carries one of Go's
+/// refusals, and Go's message goes in next to the check, verbatim. The return type is owned because
+/// one of the two messages interpolates the offending bits.
+pub fn watch_usage_refusal(req: &Request) -> Option<String> {
+    let Request::Watch {
+        initial_state: _,
+        initial_netmap: _,
+        prefs: _,
+        policy: _,
+    } = req
+    else {
+        // Every other verb is a one-shot; this judges subscriptions only.
+        return None;
+    };
+    None
 }
 
 /// The daemon's reply to a [`Request`].
@@ -2141,6 +2254,18 @@ pub struct ProfileEntry {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct NotifyView {
+    /// The version of the daemon that produced this frame (Go `Notify.Version`). Set on EVERY frame
+    /// the daemon writes, as Go's `sendToLocked` fills it on the way out, because the notify field
+    /// set is not a stable API and a consumer needs to know which backend it is reading. It is the
+    /// same string [`Response::Version`] answers with. `None` only on a frame built but not yet sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// The watch's session id (Go `Notify.SessionID`): set on the FIRST frame of a watch that asked
+    /// for [`initial_state`](Request::Watch::initial_state), and on no other frame. Opaque to the
+    /// client, fresh per connection, stable for its lifetime. Not yet tied to any daemon-side state —
+    /// see [`Request::Watch::initial_state`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     /// The new connection state, if it changed this frame: one of the seven `ipn.State` names
     /// (`NoState` / `NeedsLogin` / `NeedsMachineAuth` / `InUseOtherUser` / `Starting` / `Running` /
     /// `Stopped`) — the SAME string [`StatusReport::state`] uses, derived from the engine's
@@ -2571,6 +2696,64 @@ mod tests {
     }
 
     #[test]
+    fn watch_usage_refusal_accepts_every_subscription_this_fork_can_spell() {
+        // The ruling recorded on `Request::Watch`, in code: Go refuses two subscriptions before it
+        // subscribes (`NotifyInProcessNoDisconnect` from a LocalAPI client, and `NotifyRateLimit`
+        // combined with any of `NotifyRateLimitIncompatibleBits`), and NEITHER is expressible in
+        // this fork's named-boolean spelling — no field is a member of that incompatible set and
+        // there is no rate-limit field. So every one of the sixteen subscriptions a client can ask
+        // for is usable, including the all-bits-on one that would be the richest combination to
+        // refuse if any rule applied to it.
+        for bits in 0u8..16 {
+            let req = Request::Watch {
+                initial_state: bits & 1 != 0,
+                initial_netmap: bits & 2 != 0,
+                prefs: bits & 4 != 0,
+                policy: bits & 8 != 0,
+            };
+            assert_eq!(
+                watch_usage_refusal(&req),
+                None,
+                "no combination of today's mask fields is refusable, but {req:?} was refused"
+            );
+        }
+        // It judges subscriptions only: a one-shot verb is not its business (Go's check lives in the
+        // watch handler, not in the LocalAPI mux).
+        assert_eq!(watch_usage_refusal(&Request::Status), None);
+    }
+
+    #[test]
+    fn watch_cannot_spell_the_bits_go_refuses() {
+        // The evidence behind that ruling. Go's refusals operate on bits of one integer, so a client
+        // can always SEND a forbidden mask and be told no. Here the same words are field names, and
+        // a name this fork does not offer is not a value the daemon looks at — serde drops it. A
+        // line naming every bit Go has a refusal for therefore decodes to a BARE watch (the legacy
+        // status-stream path), carrying none of them, and is accepted.
+        let line = r#"{"cmd":"watch","in_process_no_disconnect":true,"rate_limit":true,"peer_changes":true,"no_net_map":true,"initial_status":true,"peer_patches":true}"#;
+        let req = serde_json::from_str::<Request>(line).unwrap();
+        match &req {
+            Request::Watch {
+                initial_state,
+                initial_netmap,
+                prefs,
+                policy,
+            } => assert!(
+                !initial_state && !initial_netmap && !prefs && !policy,
+                "a watch naming only unoffered bits must decode to a bare watch, got {req:?}"
+            ),
+            other => panic!("expected Watch, got {other:?}"),
+        }
+        assert_eq!(
+            watch_usage_refusal(&req),
+            None,
+            "an unoffered bit is not a subscription this daemon can refuse — it was never received"
+        );
+        // When one of those names becomes a real field, this assertion starts failing, which is the
+        // point: its author has to come here, read the ruling on `Request::Watch`, and port the
+        // refusal Go attaches to it.
+    }
+
+    #[test]
     fn notify_policy_frame_carries_the_reports_own_rows() {
         // Go's `Notify.Policy` is the very `setting.Snapshot` `GetEffectivePolicy` returns. Ours is the
         // very `PolicyReport` `Response::Policy` carries, so the notify frame and a one-shot
@@ -2631,6 +2814,39 @@ mod tests {
             serde_json::to_string(&Response::Notify(empty)).unwrap(),
             r#"{"kind":"notify","policy":{"scope":"Device"}}"#
         );
+    }
+
+    #[test]
+    fn notify_view_identity_fields_wire_format() {
+        // Go's `Notify` leads with `Version` then `SessionID`; the wire names here are snake_case like
+        // every other field on this stream, and both drop out when unset.
+        let first = NotifyView {
+            version: Some("0.62.2".to_string()),
+            session_id: Some("0123456789abcdef".to_string()),
+            state: Some("NeedsLogin".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&Response::Notify(first.clone())).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"notify","version":"0.62.2","session_id":"0123456789abcdef","state":"NeedsLogin"}"#
+        );
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::Notify(back) => assert_eq!(back, first),
+            other => panic!("expected a notify frame, got {other:?}"),
+        }
+        // An identity-only frame (the device-less first frame) is a valid notify on its own.
+        match serde_json::from_str::<Response>(
+            r#"{"kind":"notify","version":"0.62.2","session_id":"0123456789abcdef"}"#,
+        )
+        .unwrap()
+        {
+            Response::Notify(back) => {
+                assert_eq!(back.session_id.as_deref(), Some("0123456789abcdef"));
+                assert!(back.state.is_none() && back.prefs.is_none() && back.policy.is_none());
+            }
+            other => panic!("expected a notify frame, got {other:?}"),
+        }
     }
 
     #[test]
