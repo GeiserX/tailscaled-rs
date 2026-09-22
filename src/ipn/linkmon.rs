@@ -255,6 +255,15 @@ pub(super) fn any_interface_up() -> Option<bool> {
     }
 }
 
+/// The host's `(interface name, address)` pairs — the slice of Go's `netmon.State` that
+/// [`crate::ipforward::ip_forwarding_broken`] reads (`InterfaceIPs` and the `Interface` names).
+pub(super) fn interface_ips() -> std::io::Result<Vec<(String, IpAddr)>> {
+    Ok(live_interface_addrs()?
+        .into_iter()
+        .map(|a| (a.name, a.ip))
+        .collect())
+}
+
 // ---------------------------------------------------------------------------------------------
 // `tailnetd debug --ifconfig` / `--monitor`: rendering the host's network state.
 //
