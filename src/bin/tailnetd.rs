@@ -388,7 +388,17 @@ async fn run(applied_env: Option<tailscaled_rs::envknob::Applied>) -> Result<()>
     // cleanup out by hand — so reclaiming a stale socket keeps working with whatever `--tun` the unit
     // file happens to carry. The resolved transport is applied to prefs further down, once the
     // backend has loaded them.
-    let tun_transport = match args.tun.as_deref().filter(|_| !args.cleanup) {
+    //
+    // Go's macOS root refusal goes out first and on its own: `log.SetFlags(0)` + `log.Fatalf` print
+    // that one line with no `error:` prefix, so a script matching Go's stderr matches this one.
+    let tun_value = args.tun.as_deref().filter(|_| !args.cleanup);
+    if let Some(line) = tun_value.and_then(|value| {
+        tailscaled_rs::tunflag::darwin_root_refusal(value, goos(), tailscaled_rs::tunflag::euid())
+    }) {
+        eprintln!("{line}");
+        std::process::exit(1);
+    }
+    let tun_transport = match tun_value {
         Some(value) => match tailscaled_rs::tunflag::resolve(value, goos()) {
             Ok(transport) => Some(transport),
             Err(e) => {
@@ -754,9 +764,22 @@ async fn run(applied_env: Option<tailscaled_rs::envknob::Applied>) -> Result<()>
     captive_portal_task.abort();
     reconnect_task.abort();
 
-    serve_result?;
-
+    // Tear the backend down BEFORE the error (if any) propagates, and unconditionally. Go's
+    // equivalent is a `defer`: `ipnserver.Server.Run` opens with `defer lb.Shutdown()`, so the
+    // backend is down by the time the error it returns reaches `main`'s `log.Fatal`. Ending on an
+    // error used to skip this, which was invisible while the only error here was a failed bind — but
+    // `serve` now ends with `server::StoppedByLocalApi` on the LocalAPI `shutdown` verb, and that is
+    // the *normal* stop: skipping teardown on it would leave the engine, the state file and any live
+    // device to the process death, which is exactly what the verb exists to avoid.
     backend.lock().await.shutdown().await;
+
+    // Then the exit status. `serve` returns `StoppedByLocalApi` when the LocalAPI `shutdown` verb
+    // stopped the daemon, and `?` turns that into a non-zero exit — upstream's behaviour (its
+    // `hs.Serve` error reaches `log.Fatal` because the context was never cancelled) and the reason
+    // the key permitting the verb is named `AllowTailscaledRestart`: the shipped units restart on
+    // failure, so the non-zero exit IS the restart. SIGINT/SIGTERM still returns `Ok(())` and still
+    // exits 0, matching the one case Go maps to nil (`errors.Is(err, context.Canceled)`).
+    serve_result?;
     Ok(())
 }
 
