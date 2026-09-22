@@ -209,13 +209,13 @@ fn a_readable_but_malformed_kubeconfig_is_refused_by_the_merge() {
         !out.status.success(),
         "a kubeconfig that cannot be parsed must not be merged into:\n{err}"
     );
-    assert!(
-        err.contains("invalid kubeconfig"),
-        "the merge must be what refuses it, in Go's `errInvalidKubeconfig` words; got:\n{err}"
-    );
-    assert!(
-        !err.contains("cannot write kubeconfig at"),
-        "this file is writable, so the precheck must have passed it:\n{err}"
+    // Go's `setKubeconfigForPeer` returns `updateKubeconfig`'s `errInvalidKubeconfig` unwrapped, so
+    // the whole of what the operator reads is those two words. Compared exactly: a wrapper naming
+    // the path or the merge step would still contain them, and is exactly what this must catch.
+    // (`Error: ` is how a Rust `main` returning `Err` prints; Go's CLI prints the error alone.)
+    assert_eq!(
+        err, "Error: invalid kubeconfig\n",
+        "the merge must be what refuses it, in Go's `errInvalidKubeconfig` words and no others"
     );
     assert_eq!(
         std::fs::read_to_string(&path).unwrap(),
