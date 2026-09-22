@@ -1940,3 +1940,96 @@ refusal is stable rather than flapping) but is one more reason the gate belongs 
 `permitted_suggestion`'s filter arm becomes redundant (the nil-versus-empty reading and its tests
 move with the argument). `tnet exit-node suggest` then answers with the best *allowed* exit node
 instead of withholding when the best overall is not allowed. Consumed via a pin bump. — engine lane
+
+## 45. A lag signal on `IpnBusWatcher` — so a watcher that falls behind is told and disconnected, not silently starved
+
+**Why:** Go used to drop notifications for a slow watcher and no longer does. In
+`ipn/ipnlocal/local.go` @ `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`, `sendToLocked` does a
+non-blocking send into the session's 128-deep channel, and a full channel is a disconnect:
+
+```go
+select {
+case sess.ch <- nForSess:
+default:
+    if sess.mask&ipn.NotifyInProcessNoDisconnect != 0 {
+        select {
+        case sess.ch <- nForSess:
+        case <-sess.ctx.Done():
+        }
+        continue
+    }
+    b.closeLaggingWatchSessionLocked(sess)
+}
+```
+
+`closeLaggingWatchSessionLocked` removes the session from `b.notifyWatchers`, **drains** everything
+still queued ("the session already fell behind, so the queued delta stream is not trustworthy"),
+sends one terminal `Notify` whose `ErrMessage` is `watchIPNBusFellBehindMessage` (`"IPN bus consumer
+fell behind; closing watch"`), and closes the channel. The client is told once, is disconnected, and
+knows to re-subscribe and re-snapshot. The blocking arm is only for `NotifyInProcessNoDisconnect`,
+which is in-process only and which the LocalAPI handler refuses; the daemon has no in-process
+watchers, so it needs only the disconnect.
+
+Verified against pin `9d847a6e`: the engine keeps the old Go behaviour. `deliver` in
+`ts_runtime/src/ipn_bus.rs` treats a full queue as success and keeps streaming:
+
+```rust
+match tx.try_send(n) {
+    Ok(()) => false,
+    Err(mpsc::error::TrySendError::Full(_)) => false,
+    Err(mpsc::error::TrySendError::Closed(_)) => true,
+}
+```
+
+and `IpnBusWatcher::next() -> Option<Notify>` has no way to say a frame was dropped. The engine test
+`full_buffer_drops_and_never_blocks_producer` locks in the drop, so it changes with the fix. Its
+"never blocks the producer" half still holds under Go's disconnect. The daemon's
+`stream_notify` writes each frame to the socket inline, so a slow reader (`tnet` piped into a stalled
+pager, an agent doing synchronous work per frame) is exactly what fills that queue. The watcher then
+loses frames one at a time, the connection stays open, and neither side knows its view diverged.
+
+**Why not a daemon-side facsimile.** The daemon cannot see a drop, because the engine records none.
+A write timeout or a queue-depth estimate would guess at lag. It would disconnect readers that never
+lost a frame and miss ones that did. Refused under the honest-omission rule; hence this ask.
+
+**Not affected:** the daemon-built prefs and policy feeds on the same stream ride
+`tokio::sync::watch`, which coalesces to the latest full snapshot instead of dropping an entry. For a
+full-snapshot feed that loses nothing. Only the engine's `mpsc` bus has the hazard.
+
+**Ask (either piece is sufficient; the first is preferred):**
+
+1. A `Lagged` outcome on the watcher, in the shape of
+   `tokio::sync::broadcast::error::RecvError::Lagged`, that carries Go's ordering inside the engine:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WatchError {
+    /// The bus ended (runtime shutdown, source senders dropped) — today's `next() == None`.
+    Closed,
+    /// This watcher's queue was full, so a notification was dropped. Queued frames were
+    /// discarded, and the watcher is finished: every later `recv` returns `Closed`.
+    Lagged,
+}
+
+impl IpnBusWatcher {
+    pub async fn recv(&mut self) -> Result<Notify, WatchError>;
+}
+```
+
+   Inside, `deliver`'s `Full` arm sets a flag shared with the watcher and returns `true` (stop the
+   task, as `Closed` already does). `recv` checks the flag first: if it is set, it drains `rx` with
+   `try_recv`, returns `Err(Lagged)` once, and returns `Closed` after that. Draining in `recv`, not
+   at the consumer, keeps a stale queued frame from ever reaching a caller after the gap. That is the
+   point of Go's drain-then-error-then-close order. `next()` can stay as `recv().await.ok()`.
+
+2. Or a counter, `IpnBusWatcher::dropped() -> u64`, that `deliver`'s `Full` arm increments. The
+   daemon would check it after each `next()` and, when it is non-zero, do the drain/terminal/close
+   itself. This is less surface in the engine, but it leaves every embedder to re-implement the
+   ordering. The engine would also keep streaming after a gap it knows about, so (1) is preferred.
+
+**Daemon impact once landed:** in `stream_notify` (`src/server.rs`), `Err(Lagged)` drops the
+watcher, writes one `Response::Notify(NotifyView { error: Some("IPN bus consumer fell behind;
+closing watch"), .. })` frame, and returns. That is Go's terminal frame, and `NotifyView::error`
+already exists. The ordering and the message get a test that drives the bus past 128 frames.
+Consumed via a pin bump. — engine lane
