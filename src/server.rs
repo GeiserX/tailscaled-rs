@@ -1699,6 +1699,12 @@ async fn dispatch(
             let mut be = backend.lock().await;
             switch_outcome_response(be.create_profile(&id).await)
         }
+        // `login`'s first step (Go `LocalClient.SwitchToEmptyProfile`): move to a new, empty profile
+        // so the login and its `--nickname` do not land on the profile the node was already on.
+        Request::SwitchToEmptyProfile => {
+            let mut be = backend.lock().await;
+            switch_outcome_response(be.switch_to_empty_profile().await)
+        }
         // `switch remove <id>` (Go `tailscale switch remove`). Refuses an unknown profile, and the
         // reserved `default` one; the CURRENT profile is left alone and reported as a success, which
         // is what Go's `removeProfile` does (`Already on account %q`, exit 0) — see `DeleteOutcome`.

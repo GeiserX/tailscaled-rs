@@ -2846,6 +2846,40 @@ impl Backend {
         self.activate_profile(id).await
     }
 
+    /// Switch to a new, empty profile: Go's `LocalBackend.NewProfile` (`profileManager.
+    /// SwitchToNewProfile`), which `tailscale login` reaches through `LocalClient.
+    /// SwitchToEmptyProfile` before it logs in. The profile the node was on keeps its prefs, key and
+    /// name; the login that follows lands on the new one.
+    ///
+    /// Two differences from Go, both about when a profile exists. Go gives the new profile an id
+    /// only once it is saved after a login; this daemon registers it straight away, because every
+    /// profile here is a directory keyed by its id. And Go never saves a profile that has not logged
+    /// in (and deletes one on logout), so a current profile that has not logged in
+    /// (`has_logged_in`, Go's `Persist.UserProfile.LoginName != ""`) is already the empty profile Go
+    /// would switch to: it is kept, and reported as [`SwitchOutcome::AlreadyCurrent`], rather than
+    /// left behind as a second, unregistered entry in `switch --list`.
+    ///
+    /// The test is `has_logged_in`, not `has_node_key`. A key exists as soon as an `up` builds its
+    /// config, before control has seen the node, so an interactive login the operator never finished
+    /// still holds one. Keying on it would make every retry of such a login add a profile. Staying
+    /// on that profile is safe: `login` sends `force_reauth`, which discards the key before it
+    /// registers.
+    pub async fn switch_to_empty_profile(&mut self) -> Result<SwitchOutcome> {
+        if !self.prefs.has_logged_in {
+            return Ok(SwitchOutcome::AlreadyCurrent {
+                id: self.current_profile.clone(),
+            });
+        }
+        let meta = profile::load_profiles_file(&self.state_dir).await;
+        let id = profile::unused_profile_id(&meta, || {
+            let mut bytes = [0u8; 2];
+            getrandom::fill(&mut bytes).map(|()| bytes)
+        })
+        .map_err(|e| anyhow!("reading OS randomness for a new profile id: {e}"))?
+        .ok_or_else(|| anyhow!("could not find an unused profile id"))?;
+        self.activate_profile(&id).await
+    }
+
     /// Make profile `target` the active one: tear the current device down, repoint
     /// `prefs`/`prefs_path`/`key_path` at the target, reload its persisted prefs, persist the
     /// `current-profile` pointer, register it in `profiles.json` if new, and bump the generation (so
@@ -8006,6 +8040,95 @@ mod tests {
                 id: profile::DEFAULT_PROFILE_ID.to_string()
             }
         );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn switch_to_empty_profile_leaves_the_logged_in_profile_and_its_name_alone() {
+        // Go's `tailscale login` calls `SwitchToEmptyProfile` before it logs in, so `login
+        // --nickname=work` names a NEW profile and the one the node was logged in to keeps its name.
+        let dir = std::env::temp_dir().join(format!("tailnetd-prof-empty-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = Backend::load(&dir).await.unwrap();
+
+        // A profile that never logged in is already empty: nothing is created or torn down.
+        assert_eq!(
+            be.switch_to_empty_profile().await.unwrap(),
+            SwitchOutcome::AlreadyCurrent {
+                id: profile::DEFAULT_PROFILE_ID.to_string()
+            }
+        );
+        assert_eq!(be.list_profiles().await.len(), 1);
+
+        // An unfinished login: `up` has minted a node key (a real key file, from the engine's
+        // loader), but the node never registered. Go never saved that profile, so a retried `login`
+        // stays on it instead of leaving it behind as an orphan.
+        let (_, key_path) = profile::profile_paths(&dir, profile::DEFAULT_PROFILE_ID);
+        tailscale::config::load_key_file(&key_path, Default::default())
+            .await
+            .expect("mint a key file for the default profile");
+        let mut be = Backend::load(&dir).await.unwrap();
+        assert!(be.has_node_key, "the fixture must hold a node key");
+        assert!(!be.prefs.has_logged_in);
+        assert_eq!(
+            be.switch_to_empty_profile().await.unwrap(),
+            SwitchOutcome::AlreadyCurrent {
+                id: profile::DEFAULT_PROFILE_ID.to_string()
+            },
+            "a node key without a finished login must not make a new profile"
+        );
+        assert_eq!(be.list_profiles().await.len(), 1);
+
+        // Now the node registers (what `finish_up` records), and the profile is named.
+        be.prefs.has_logged_in = true;
+        be.rename_current_profile("home").await.unwrap();
+
+        let SwitchOutcome::Switched { id, state } = be.switch_to_empty_profile().await.unwrap()
+        else {
+            panic!("a logged-in profile must be switched away from");
+        };
+        assert_eq!(state, State::NoState, "the new profile has never logged in");
+        assert_eq!(id.len(), 4, "Go's newUnusedID shape: {id:?}");
+        assert!(
+            id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+            "Go's newUnusedID shape: {id:?}"
+        );
+        assert_eq!(be.current_profile, id);
+
+        // `login --nickname=work` names the profile it switched to, and only that one.
+        be.rename_current_profile("work").await.unwrap();
+        let profiles = be.list_profiles().await;
+        assert!(
+            profiles
+                .iter()
+                .any(|e| e.id == profile::DEFAULT_PROFILE_ID && e.name == "home" && !e.current),
+            "the profile the node was logged in to keeps its name: {profiles:?}"
+        );
+        assert!(
+            profiles
+                .iter()
+                .any(|e| e.id == id && e.name == "work" && e.current),
+            "{profiles:?}"
+        );
+        assert!(
+            tokio::fs::try_exists(&key_path).await.unwrap(),
+            "the old profile's node key must survive"
+        );
+
+        // A second login before the first one registered stays on that profile, even once the
+        // first login's `up` has minted it a key: switch, `up` (key), switch again.
+        let (_, new_key_path) = profile::profile_paths(&dir, &id);
+        tailscale::config::load_key_file(&new_key_path, Default::default())
+            .await
+            .expect("mint a key file for the new profile");
+        be.has_node_key = true;
+        assert_eq!(
+            be.switch_to_empty_profile().await.unwrap(),
+            SwitchOutcome::AlreadyCurrent { id: id.clone() }
+        );
+        assert_eq!(be.list_profiles().await.len(), 2);
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
