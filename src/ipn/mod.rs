@@ -743,6 +743,20 @@ fn prospective_route_set(
     )
 }
 
+/// The `RunSSH` an edit would LEAVE BEHIND: the named `--ssh` override if the request carries one,
+/// else what the prefs this edit starts from already say. `reset` picks that starting point the same
+/// way [`prospective_route_set`] does — `up --reset` returns every up-managed pref to its default
+/// *before* the overrides land, so `ssh_enabled`'s base is the default rather than the live pref.
+///
+/// This is the whole of Go's `p1 := CurrentPrefs().AsStruct(); p1.ApplyEdits(mp)` that
+/// `checkSSHPrefsLocked` reads (`editPrefsLockedOnEntry`): the gate is a question about the
+/// RESULTING prefs, never about which fields the edit mask happens to mention.
+fn prospective_ssh(named_ssh: Option<bool>, current: &Prefs, reset: bool) -> bool {
+    let defaults = Prefs::default();
+    let base = if reset { &defaults } else { current };
+    named_ssh.unwrap_or(base.ssh_enabled)
+}
+
 /// Reject an `auto:`-prefixed exit-node selector (Go `tailscale up/set --exit-node auto:any`, which
 /// enables *automatic* exit-node selection via `ipn.Prefs.AutoExitNode`).
 ///
@@ -3397,7 +3411,21 @@ impl Backend {
     /// Does **no** network I/O for the `Rebuild` case (the slow `Device::new` is the caller's
     /// off-lock job); the only blocking steps here are the quick live setter mailbox round-trips on
     /// the `Live` path.
-    pub async fn begin_set(&mut self, mut opts: SetOptions) -> Result<SetOutcome> {
+    pub async fn begin_set(&mut self, opts: SetOptions) -> Result<SetOutcome> {
+        self.begin_set_gated(opts, crate::featureknob::can_run_tailscale_ssh())
+            .await
+    }
+
+    /// [`begin_set`](Self::begin_set) with this host's SSH verdict passed IN rather than read from
+    /// the process environment, so the refusal it produces is unit-testable — the same injection,
+    /// for the same reason, as [`check_prefs_gated`](Self::check_prefs_gated)'s
+    /// [`CheckPrefsEnv::ssh_gate`] (`set_var` is `unsafe` in edition 2024 and races the parallel
+    /// test harness).
+    async fn begin_set_gated(
+        &mut self,
+        mut opts: SetOptions,
+        ssh_gate: Result<()>,
+    ) -> Result<SetOutcome> {
         // Decide the path BEFORE mutating prefs — `needs_rebuild()` inspects which fields the
         // request named, which the apply below would not change, but reading it first keeps the
         // decision crisply about the *request* rather than post-apply state. Also snapshot which
@@ -3463,15 +3491,20 @@ impl Backend {
         if let Some(Some(sel)) = opts.exit_node.as_ref() {
             self.check_exit_node_arg(sel).await?;
         }
-        // And refuse an SSH-server enable the host or the operator has ruled out (Go
-        // `checkSSHPrefsLocked` → `featureknob.CanRunTailscaleSSH`, run whenever `RunSSH` is being
-        // SET). This is the one gate that MUST live here rather than in `build_config`: on a node
+        // And refuse the edit when the prefs it would LEAVE BEHIND run an SSH server the host or
+        // the operator has ruled out. Go's `editPrefsLockedOnEntry` applies the edit to a COPY of
+        // the current prefs and hands that copy to `checkPrefsLocked` → `checkSSHPrefsLocked`, so
+        // the gate reads the RESULTING `RunSSH` and not the edit mask: where
+        // `TS_DISABLE_SSH_SERVER=1` appeared after `ssh_enabled` was already persisted, upstream
+        // refuses `tailscale set --hostname foo` too, rather than re-persisting a pref it would
+        // refuse to be told. See [`prospective_ssh`]; `set` has no `--reset`, so its base is
+        // always the live prefs.
+        //
+        // This is also the one gate that MUST live here rather than in `build_config`: on a node
         // that is down, `set` is persist-only and never reaches `build_config` at all, so without
         // this `TS_DISABLE_SSH_SERVER=1 tnet set --ssh` would report success and write the pref,
         // and the operator would learn the server is administratively off only at the next `up`.
-        if opts.ssh == Some(true) {
-            crate::featureknob::can_run_tailscale_ssh()?;
-        }
+        self.check_ssh_prefs_gated(opts.ssh, false, ssh_gate)?;
         // Refuse an auto-update OPT-IN this installation could never honour (Go
         // `checkAutoUpdatePrefsLocked`, the fifth child of `checkPrefsLocked` — which in Go guards
         // every prefs write, so the same rule `check_prefs` reports on the dry-run path has to fire
@@ -3807,10 +3840,19 @@ impl Backend {
     /// shutdown (bounded by [`SHUTDOWN_TIMEOUT`]), so on a *reconfigure* (a device was already live)
     /// this phase is not strictly instantaneous under the lock — only the fresh-up case is. The
     /// common, head-of-line-sensitive case (no prior device) returns immediately.
-    pub async fn begin_up(
+    pub async fn begin_up(&mut self, opts: UpOptions, wif: Option<&WifCreds>) -> Result<PendingUp> {
+        self.begin_up_gated(opts, wif, crate::featureknob::can_run_tailscale_ssh())
+            .await
+    }
+
+    /// [`begin_up`](Self::begin_up) with this host's SSH verdict passed IN rather than read from the
+    /// process environment — same injection, and same reason, as
+    /// [`begin_set_gated`](Self::begin_set_gated).
+    async fn begin_up_gated(
         &mut self,
         mut opts: UpOptions,
         wif: Option<&WifCreds>,
+        ssh_gate: Result<()>,
     ) -> Result<PendingUp> {
         // PRE-VALIDATE the advertised route SET FIRST — before tearing down the device, mutating, or
         // persisting prefs. Same persist-before-validate gap as `begin_set`: `build_config` (below,
@@ -3855,16 +3897,18 @@ impl Backend {
         if let Some(Some(sel)) = opts.exit_node.as_ref() {
             self.check_exit_node_arg(sel).await?;
         }
-        // Same discipline for an SSH-server enable: Go's `checkSSHPrefsLocked` runs
-        // `featureknob.CanRunTailscaleSSH()` whenever `RunSSH` is being SET, so a host whose
-        // operator disabled the server with `TS_DISABLE_SSH_SERVER` (or an OS upstream does not
-        // support) refuses the pref rather than accepting it and quietly running no server. Checked
-        // here, before teardown/persist, so the refusal costs neither the live device nor a written
-        // pref; `build_config` re-checks the MERGED pref (it is the final authority, and it also
-        // catches an already-persisted `ssh_enabled` on a host where the knob appeared later).
-        if opts.ssh == Some(true) {
-            crate::featureknob::can_run_tailscale_ssh()?;
-        }
+        // Same discipline — and the same RESULTING-prefs rule — for the SSH server: Go's
+        // `editPrefsLockedOnEntry` gates on the prefs the edit leaves behind
+        // (`checkPrefsLocked` → `checkSSHPrefsLocked` → `featureknob.CanRunTailscaleSSH()`), so a
+        // host whose operator disabled the server with `TS_DISABLE_SSH_SERVER` (or an OS upstream
+        // does not support) refuses the bring-up whether this command NAMES `--ssh` or merely
+        // inherits an `ssh_enabled` that was persisted before the knob appeared. Checked here,
+        // before teardown/persist, so the refusal costs neither the live device nor a written pref;
+        // `build_config` re-checks the merged pref and remains the final authority, but it is only
+        // reached after `stop_device` has already taken a live engine down. `--reset` is honoured
+        // (see [`prospective_ssh`]): it returns `ssh_enabled` to its default before the overrides
+        // land, so `up --reset` is the way back up on such a host.
+        self.check_ssh_prefs_gated(opts.ssh, opts.reset, ssh_gate)?;
 
         // Tear down any existing device first so `up` is idempotent / reconfiguring.
         self.stop_device().await;
@@ -5315,6 +5359,30 @@ impl Backend {
         resolve_exit_node_arg(sel, &self.exit_node_facts().await)
     }
 
+    /// Go `checkSSHPrefsLocked`, as `editPrefsLockedOnEntry` asks it: of the prefs the edit would
+    /// LEAVE BEHIND (see [`prospective_ssh`]), never of the edit mask. `ssh_gate` is this host's
+    /// [`featureknob::can_run_tailscale_ssh`](crate::featureknob::can_run_tailscale_ssh) verdict,
+    /// injected so the refusal is testable.
+    ///
+    /// Consulted only when the resulting prefs actually run SSH — Go's `checkSSHPrefsLocked` is a
+    /// no-op on prefs whose `RunSSH` is clear — so an edit that ends with the server off is never
+    /// refused by a host that cannot run one. That is what lets `set --ssh=false` (and `up --reset`)
+    /// be the way out on a host where the knob arrived after the pref was already persisted.
+    ///
+    /// The one rule behind both edit paths, so `up` and `set` cannot drift from each other or from
+    /// the [`check_prefs`](Self::check_prefs) dry run that is supposed to predict them.
+    fn check_ssh_prefs_gated(
+        &self,
+        named_ssh: Option<bool>,
+        reset: bool,
+        ssh_gate: Result<()>,
+    ) -> Result<()> {
+        if prospective_ssh(named_ssh, &self.prefs, reset) {
+            ssh_gate?;
+        }
+        Ok(())
+    }
+
     /// [`check_prefs`](Self::check_prefs) with the host-derived inputs passed IN rather than read
     /// from the process environment or the engine — see [`CheckPrefsEnv`] for why they are injected.
     /// `auto_update` stays a plain override (rule (5) reads the host's update provenance through
@@ -5339,7 +5407,9 @@ impl Backend {
         let prospective_routes = advertise_routes
             .clone()
             .unwrap_or_else(|| self.prefs.advertise_routes.clone());
-        let prospective_ssh = ssh.unwrap_or(self.prefs.ssh_enabled);
+        // `check_prefs` is always asked about a PATCH (it has no `--reset`), so the prospective
+        // posture is composed against the live prefs.
+        let prospective_ssh = prospective_ssh(ssh, &self.prefs, false);
         let prospective_auto_update = match auto_update {
             Some(v) => Some(v),
             None => self.prefs.auto_update_apply,
@@ -11049,6 +11119,146 @@ mod tests {
     // clear, like every other pref), and the `build_config` preflight that fails the bring-up loudly
     // when SSH is impossible. The actual spawn/abort lifecycle needs a live engine (integration
     // territory), so it is NOT unit-tested here. All offline: a device-less backend does no engine I/O.
+
+    #[tokio::test]
+    async fn set_ssh_gate_reads_the_resulting_prefs_not_the_edit_mask() {
+        // Go `ipn/ipnlocal/local.go` @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8 (v1.102.4):
+        // `editPrefsLockedOnEntry` does `p1 := CurrentPrefs().AsStruct(); p1.ApplyEdits(mp)` and
+        // hands *p1* to `checkPrefsLocked` -> `checkSSHPrefsLocked`, so the SSH gate fires on the
+        // prefs the edit LEAVES BEHIND. A host where `TS_DISABLE_SSH_SERVER=1` appeared after
+        // `ssh_enabled` was already persisted therefore refuses `set --hostname foo` as well, even
+        // though that edit never mentions SSH. The host verdict is injected (`set_var` is `unsafe`
+        // in edition 2024 and races this harness), and the refusal is the real sentence
+        // `can_run_tailscale_ssh_in` produces for a set knob.
+        let dir = std::env::temp_dir().join(format!("tailnetd-set-sshgate-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let disabled = || crate::featureknob::can_run_tailscale_ssh_in("linux", Some("1"));
+        assert!(
+            disabled().is_err(),
+            "the injected host verdict must be a refusal"
+        );
+
+        let mut be = backend_for(&dir);
+        // The pref is already on, as it would be on disk from an earlier `set --ssh`.
+        be.prefs.ssh_enabled = true;
+        let before = tokio::fs::read_to_string(&be.prefs_path).await.ok();
+
+        // An edit that says nothing about SSH must still be refused, whole.
+        let err = be
+            .begin_set_gated(
+                SetOptions {
+                    hostname: Some("foo".to_string()),
+                    ..SetOptions::default()
+                },
+                disabled(),
+            )
+            .await
+            .expect_err("an SSH-less edit must be refused while the RESULTING prefs run SSH");
+        assert!(
+            err.to_string()
+                .contains("The Tailscale SSH server has been administratively disabled."),
+            "the refusal must be the host gate's own sentence, got {err:#}"
+        );
+        assert_eq!(
+            be.prefs.hostname, None,
+            "a refused edit must not have mutated prefs"
+        );
+        assert!(be.prefs.ssh_enabled, "nor cleared the pref it refused over");
+        assert_eq!(
+            tokio::fs::read_to_string(&be.prefs_path).await.ok(),
+            before,
+            "a refused edit must not have persisted anything"
+        );
+
+        // The way back out: an edit whose RESULT is SSH-off never consults the gate, so the same
+        // refusing host accepts `set --ssh=false` (Go's `checkSSHPrefsLocked` is a no-op on prefs
+        // whose `RunSSH` is clear).
+        be.begin_set_gated(
+            SetOptions {
+                ssh: Some(false),
+                ..SetOptions::default()
+            },
+            disabled(),
+        )
+        .await
+        .expect("an edit that turns SSH off must not be gated on running SSH");
+        assert!(!be.prefs.ssh_enabled);
+
+        // And with the pref now off, an unrelated edit is accepted on that same host.
+        be.begin_set_gated(
+            SetOptions {
+                hostname: Some("foo".to_string()),
+                ..SetOptions::default()
+            },
+            disabled(),
+        )
+        .await
+        .expect("an SSH-less edit must be accepted once the resulting prefs do not run SSH");
+        assert_eq!(be.prefs.hostname.as_deref(), Some("foo"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn up_ssh_gate_reads_the_resulting_prefs_and_reset_clears_it() {
+        // The `up` half of the same upstream rule: an inherited `ssh_enabled` refuses the bring-up
+        // before `stop_device`/`persist_prefs`, so the refusal costs neither the live device nor a
+        // written pref — where the `build_config` backstop only fires after both. `up --reset`
+        // returns `ssh_enabled` to its default before the overrides land, so the resulting prefs do
+        // not run SSH and the bring-up proceeds: that is the way back up on such a host.
+        let dir = std::env::temp_dir().join(format!("tailnetd-up-sshgate-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let disabled = || crate::featureknob::can_run_tailscale_ssh_in("linux", Some("1"));
+
+        let mut be = backend_for(&dir);
+        be.prefs.ssh_enabled = true;
+        let before = tokio::fs::read_to_string(&be.prefs_path).await.ok();
+
+        // `PendingUp` is not `Debug` (it carries the engine `Config`), so match rather than
+        // `expect_err`.
+        let err = match be
+            .begin_up_gated(UpOptions::default(), None, disabled())
+            .await
+        {
+            Ok(_) => panic!("an up inheriting ssh_enabled must be refused on a barred host"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string()
+                .contains("The Tailscale SSH server has been administratively disabled."),
+            "the refusal must be the host gate's own sentence, got {err:#}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&be.prefs_path).await.ok(),
+            before,
+            "the refusal must land before anything is persisted"
+        );
+        assert_eq!(
+            be.generation, 0,
+            "and before the lifecycle generation moves"
+        );
+
+        // `--reset` wipes `ssh_enabled` first, so the RESULTING prefs do not run SSH: not gated.
+        let _pending = be
+            .begin_up_gated(
+                UpOptions {
+                    reset: true,
+                    ..UpOptions::default()
+                },
+                None,
+                disabled(),
+            )
+            .await
+            .expect("up --reset leaves SSH off, so the host gate must not fire");
+        assert!(
+            !be.prefs.ssh_enabled,
+            "--reset returns ssh_enabled to its default"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
 
     #[tokio::test]
     async fn begin_up_applies_ssh_override() {
