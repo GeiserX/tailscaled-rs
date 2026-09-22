@@ -97,6 +97,13 @@ ts_control = { package = "geiserx_ts_control", git = "https://github.com/GeiserX
 # `ts_control` dep above. Keep this rev in lockstep with `tailscale`'s.
 ts_capabilityversion = { package = "geiserx_ts_capabilityversion", git = "https://github.com/GeiserX/tailscale-rs", rev = "9d847a6e252c0b268f823145ccfa4fc04006798d" }
 
+# The engine's Tailnet Lock crate, for its AUM CBOR decoder (`ts_tka::Aum::from_cbor`) and hash.
+# `tnet lock log --json=1` decodes each update the way Go's `PrintTailnetLockLogJSONV1` does, and
+# a second, hand-written decoder of a consensus-relevant format would be the wrong thing to own.
+# Already an engine transitive dep; the facade does not re-export it. Keep this rev in lockstep
+# with `tailscale`'s.
+ts_tka = { package = "geiserx_ts_tka", git = "https://github.com/GeiserX/tailscale-rs", rev = "9d847a6e252c0b268f823145ccfa4fc04006798d" }
+
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

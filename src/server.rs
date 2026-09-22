@@ -24,7 +24,7 @@ use crate::auth::{self, Access, AuthPolicy};
 use crate::ipn::alwayson;
 use crate::ipn::syspolicy;
 use crate::ipn::{self, Backend};
-use crate::localapi::{Request, Response};
+use crate::localapi::{Request, Response, watch_usage_refusal};
 
 /// Max bytes for a single newline-delimited request line. LocalAPI requests are tiny JSON, so this
 /// is generous; its only job is to stop a single newline-less connection from growing the read
@@ -334,6 +334,24 @@ async fn handle_conn(
                         policy,
                         initial_status,
                     }) => {
+                        // Judge the SUBSCRIPTION before subscribing it to anything: Go's
+                        // `serveWatchIPNBus` runs all of its refusals ahead of `WatchNotifications`,
+                        // so a refused watcher never takes a resource and never emits a frame. A
+                        // refusal is a request-level error like a denied `nc` — write the error line
+                        // and keep the request loop alive, because this connection was never
+                        // hijacked. Nothing on today's wire can trigger it (see
+                        // `watch_usage_refusal`); the call sits here so that the day a mask field
+                        // carrying one of Go's refusals lands, the refusal is already wired.
+                        if let Some(message) = watch_usage_refusal(&Request::Watch {
+                            initial_state,
+                            initial_netmap,
+                            prefs,
+                            policy,
+                            initial_status,
+                        }) {
+                            write_response(&mut write_half, &Response::Error { message }).await?;
+                            continue;
+                        }
                         // A long-lived stream: take a permit from the SEPARATE stream budget so a
                         // flood of `Watch` connections can't starve the short-lived control pool. If
                         // the stream budget is exhausted, refuse cleanly (the client can retry) rather
@@ -655,6 +673,20 @@ async fn stream_watch(
 /// [`NotifyView::initial_status`](crate::localapi::NotifyView::initial_status) for why, and for what
 /// that order does and does not guarantee.
 ///
+/// ## A reader that falls behind is NOT told (engine gap, `docs/ENGINE_ASKS.md` #45)
+///
+/// Frames are written to the socket inline, so a slow client stalls `watcher.next()` and the engine's
+/// 128-deep per-watcher queue fills. Go disconnects such a watcher: `sendToLocked` drains its queue,
+/// sends one terminal `Notify` whose `ErrMessage` is `"IPN bus consumer fell behind; closing watch"`,
+/// and closes it, so the client knows to re-subscribe. The engine's bus instead drops the frame and
+/// keeps streaming, and records nothing, so this function cannot tell a gap happened. It does not
+/// guess (a write timeout or a queue-depth estimate would be a facsimile). Once the engine reports
+/// lag, the handling is: drop the watcher (discarding queued frames), write one
+/// [`NotifyView::error`](crate::localapi::NotifyView::error) frame, return — in that order.
+///
+/// The daemon-built prefs and policy feeds are not affected: they ride `tokio::sync::watch`, which
+/// coalesces to the latest full snapshot instead of dropping an entry, so a slow reader loses nothing.
+///
 /// ## Lock discipline (the load-bearing rule)
 ///
 /// The backend guard is held only for the brief `watch_lifecycle()` subscribe and the brief
@@ -702,15 +734,35 @@ async fn stream_notify(
     // reason: a reload landing between here and the first select must not be lost.
     let mut policy_rx = Backend::watch_policy();
 
+    // One identity per connection, minted before the first frame and kept across device epochs: the
+    // session id goes out once, on whichever frame is written first.
+    let mut session = match NotifySession::new(initial_state) {
+        Ok(session) => session,
+        Err(e) => {
+            let _ = write_response(
+                write_half,
+                &Response::Error {
+                    message: e.to_string(),
+                },
+            )
+            .await;
+            return Ok(());
+        }
+    };
+
     // `prefs` front-load: emit the current prefs as the first frame (Go `NotifyInitialPrefs`). Done
     // once up front (daemon-built, not tied to a device epoch). A write error = client gone.
-    if prefs && emit_prefs_frame(write_half, backend).await.is_err() {
+    if prefs
+        && emit_prefs_frame(write_half, &mut session, backend)
+            .await
+            .is_err()
+    {
         return Ok(());
     }
     // `policy` front-load: Go's `NotifySysPolicyChanges` explicitly makes the FIRST notify — sent
     // immediately — carry the current effective snapshot, so this is part of the bit's contract, not
     // an optimisation. Also daemon-built and epoch-independent.
-    if policy && emit_policy_frame(write_half).await.is_err() {
+    if policy && emit_policy_frame(write_half, &mut session).await.is_err() {
         return Ok(());
     }
 
@@ -724,10 +776,15 @@ async fn stream_notify(
         let Some(dev) = dev else {
             // No bus to order the status snapshot against, so send it now if it is owed. An `up`
             // landing after it still wakes `life`, which was subscribed before this snapshot.
-            if emit_initial_status_frame(write_half, backend, &mut status_pending)
+            if emit_initial_status_frame(write_half, &mut session, backend, &mut status_pending)
                 .await
                 .is_err()
             {
+                return Ok(()); // client hung up
+            }
+            // No engine frame is coming, so a still-unsent session id goes out on its own now. If the
+            // snapshot above went out it already carried the id, and this is a no-op.
+            if flush_session_id(write_half, &mut session).await.is_err() {
                 return Ok(()); // client hung up
             }
             // No device this epoch: nothing to stream from the bus. Wait for the next lifecycle change
@@ -744,7 +801,7 @@ async fn stream_notify(
                     if res.is_err() {
                         return Ok(()); // prefs sender dropped (daemon gone)
                     }
-                    if emit_prefs_frame(write_half, backend).await.is_err() {
+                    if emit_prefs_frame(write_half, &mut session, backend).await.is_err() {
                         return Ok(()); // client hung up
                     }
                     continue; // still no device — loop back to the device-derive/wait
@@ -756,7 +813,7 @@ async fn stream_notify(
                     if res.is_err() {
                         return Ok(()); // policy sender dropped (process gone)
                     }
-                    if emit_policy_frame(write_half).await.is_err() {
+                    if emit_policy_frame(write_half, &mut session).await.is_err() {
                         return Ok(()); // client hung up
                     }
                     continue; // still no device — loop back to the device-derive/wait
@@ -782,10 +839,15 @@ async fn stream_notify(
             Err(e) => {
                 tracing::debug!(error = %e, "watch_ipn_bus failed; awaiting lifecycle change");
                 // No bus to order against: do not make an owed snapshot wait for the next change.
-                if emit_initial_status_frame(write_half, backend, &mut status_pending)
+                if emit_initial_status_frame(write_half, &mut session, backend, &mut status_pending)
                     .await
                     .is_err()
                 {
+                    return Ok(()); // client hung up
+                }
+                // And, as on the device-less arm, the id must not wait for an engine frame that is
+                // not coming. A no-op when the snapshot above already carried it.
+                if flush_session_id(write_half, &mut session).await.is_err() {
                     return Ok(()); // client hung up
                 }
                 if life.changed().await.is_err() {
@@ -808,13 +870,11 @@ async fn stream_notify(
             // Forward only the parts of the engine's front-load this client asked for.
             if let Some(view) = first.and_then(|n| {
                 project_notify(retain_requested_initial(n, initial_state, initial_netmap))
-            }) && write_response(write_half, &Response::Notify(view))
-                .await
-                .is_err()
+            }) && write_notify(write_half, &mut session, view).await.is_err()
             {
                 return Ok(()); // client hung up
             }
-            if emit_initial_status_frame(write_half, backend, &mut status_pending)
+            if emit_initial_status_frame(write_half, &mut session, backend, &mut status_pending)
                 .await
                 .is_err()
             {
@@ -842,10 +902,7 @@ async fn stream_notify(
                                 // than emit a meaningless frame.
                                 continue;
                             };
-                            if write_response(write_half, &Response::Notify(view))
-                                .await
-                                .is_err()
-                            {
+                            if write_notify(write_half, &mut session, view).await.is_err() {
                                 return Ok(()); // client hung up
                             }
                         }
@@ -865,7 +922,7 @@ async fn stream_notify(
                     if res.is_err() {
                         return Ok(()); // prefs sender dropped (daemon gone)
                     }
-                    if emit_prefs_frame(write_half, backend).await.is_err() {
+                    if emit_prefs_frame(write_half, &mut session, backend).await.is_err() {
                         return Ok(()); // client hung up
                     }
                 }
@@ -875,7 +932,7 @@ async fn stream_notify(
                     if res.is_err() {
                         return Ok(()); // policy sender dropped (process gone)
                     }
-                    if emit_policy_frame(write_half).await.is_err() {
+                    if emit_policy_frame(write_half, &mut session).await.is_err() {
                         return Ok(()); // client hung up
                     }
                 }
@@ -884,20 +941,96 @@ async fn stream_notify(
     }
 }
 
+/// The version a notify frame states (Go fills `Notify.Version` with `version.Long()`). The same
+/// string the `version` verb answers with, so a watcher and `tnet version --daemon` agree.
+const NOTIFY_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Per-connection identity for a masked watch: the two fields Go's notify path puts on frames that
+/// no feed produces. `version` goes on every frame; the session id goes on the first frame only, and
+/// only when the watch asked for `initial_state` (Go `WatchNotificationsAs` gates `SessionID` on
+/// `NotifyInitialState`). Every frame of a masked watch goes through [`stamp`](Self::stamp), so no
+/// feed can forget either field.
+///
+/// The id is not yet load-bearing — see [`Request::Watch::initial_state`](crate::localapi::Request::Watch).
+struct NotifySession {
+    /// The session id still waiting for its first frame; `None` once sent, or if never asked for.
+    pending_id: Option<String>,
+}
+
+impl NotifySession {
+    /// Mint the session for one connection. Fails only if the OS entropy source does.
+    fn new(initial_state: bool) -> std::io::Result<Self> {
+        let pending_id = if initial_state {
+            Some(new_session_id()?)
+        } else {
+            None
+        };
+        Ok(Self { pending_id })
+    }
+
+    /// Whether the session id has yet to go out.
+    fn is_pending(&self) -> bool {
+        self.pending_id.is_some()
+    }
+
+    /// Fill the identity fields on a frame about to be written.
+    fn stamp(&mut self, mut view: crate::localapi::NotifyView) -> crate::localapi::NotifyView {
+        view.version = Some(NOTIFY_VERSION.to_string());
+        view.session_id = self.pending_id.take();
+        view
+    }
+}
+
+/// A fresh watch session id: 16 hex characters from the OS CSPRNG, the shape of Go's
+/// `rands.HexString(16)`. Random rather than a counter so an id is not reused across daemon restarts
+/// either; 64 random bits makes a repeat among live watches negligible.
+fn new_session_id() -> std::io::Result<String> {
+    let mut bytes = [0u8; 8];
+    getrandom::fill(&mut bytes)
+        .map_err(|e| std::io::Error::other(format!("generating a watch session id: {e}")))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Write one notify frame, stamped with the session's identity fields. Returns `Err` if the client
+/// hung up.
+async fn write_notify(
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    session: &mut NotifySession,
+    view: crate::localapi::NotifyView,
+) -> Result<()> {
+    write_response(write_half, &Response::Notify(session.stamp(view))).await
+}
+
+/// If the session id has not gone out yet, send it now on a frame carrying only the identity fields.
+/// Called before parking where no engine frame is coming (no device, or the bus subscribe failed), so
+/// a client that reads one frame for its id — as Go's foreground `serve` does — is not left waiting
+/// for an `up`. Returns `Err` if the client hung up.
+async fn flush_session_id(
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    session: &mut NotifySession,
+) -> Result<()> {
+    if !session.is_pending() {
+        return Ok(());
+    }
+    write_notify(write_half, session, crate::localapi::NotifyView::default()).await
+}
+
 /// Emit one `Response::Notify { prefs: Some(current prefs) }` frame (the daemon-built prefs feed).
 /// A brief await-free lock reads the projection; returns `Err` if the client hung up (so the caller
 /// returns `Ok(())` and ends the stream). Shared by the front-load + both prefs select arms.
 async fn emit_prefs_frame(
     write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    session: &mut NotifySession,
     backend: &Arc<Mutex<Backend>>,
 ) -> Result<()> {
     let view = { backend.lock().await.prefs_view() };
-    write_response(
+    write_notify(
         write_half,
-        &Response::Notify(crate::localapi::NotifyView {
+        session,
+        crate::localapi::NotifyView {
             prefs: Some(view),
             ..Default::default()
-        }),
+        },
     )
     .await
 }
@@ -910,13 +1043,17 @@ async fn emit_prefs_frame(
 /// so this never touches the lock — and a `syspolicy reload` therefore cannot be head-of-line blocked
 /// by a slow `up`. Returns `Err` if the client hung up (so the caller returns `Ok(())` and ends the
 /// stream). Shared by the front-load + both policy select arms.
-async fn emit_policy_frame(write_half: &mut tokio::net::unix::OwnedWriteHalf) -> Result<()> {
-    write_response(
+async fn emit_policy_frame(
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    session: &mut NotifySession,
+) -> Result<()> {
+    write_notify(
         write_half,
-        &Response::Notify(crate::localapi::NotifyView {
+        session,
+        crate::localapi::NotifyView {
             policy: Some(Backend::policy_snapshot()),
             ..Default::default()
-        }),
+        },
     )
     .await
 }
@@ -928,8 +1065,13 @@ async fn emit_policy_frame(write_half: &mut tokio::net::unix::OwnedWriteHalf) ->
 /// frame carries peers and cannot drift from a one-shot `status`; `status()` bounds its engine query
 /// with `STATUS_QUERY_TIMEOUT`, so the lock is not held indefinitely here either. Returns `Err` if the
 /// client hung up.
+///
+/// Written through [`write_notify`] like every other frame of a masked watch, so it carries the
+/// identity fields: `version` always, and the session id when it is still pending — which on a
+/// device-less watch makes this the frame the id rides out on, rather than a bare one behind it.
 async fn emit_initial_status_frame(
     write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    session: &mut NotifySession,
     backend: &Arc<Mutex<Backend>>,
     pending: &mut bool,
 ) -> Result<()> {
@@ -940,12 +1082,13 @@ async fn emit_initial_status_frame(
         let be = backend.lock().await;
         be.status().await
     };
-    write_response(
+    write_notify(
         write_half,
-        &Response::Notify(crate::localapi::NotifyView {
+        session,
+        crate::localapi::NotifyView {
             initial_status: Some(Box::new(report)),
             ..Default::default()
-        }),
+        },
     )
     .await
 }
@@ -999,6 +1142,10 @@ fn project_notify(notify: tailscale::Notify) -> Option<crate::localapi::NotifyVi
     let browse_to_url = notify.browse_to_url.map(|u| u.to_string());
 
     let view = crate::localapi::NotifyView {
+        // The identity fields are not engine fields either: `NotifySession::stamp` sets them on the
+        // way out, so every frame gets them from one place whichever feed produced it.
+        version: None,
+        session_id: None,
         state,
         error,
         browse_to_url,
@@ -2124,6 +2271,65 @@ mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
     use tokio::net::UnixStream;
+
+    /// Go mints `rands.HexString(16)` per watch: 16 hex characters, fresh each time. The id will key
+    /// server-side state, so two connections must never share one.
+    #[test]
+    fn a_watch_session_id_is_sixteen_hex_chars_and_fresh_per_call() {
+        let ids: Vec<String> = (0..64).map(|_| new_session_id().unwrap()).collect();
+        for id in &ids {
+            assert_eq!(id.len(), 16, "Go's rands.HexString(16) shape, got {id:?}");
+            assert!(
+                id.chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+                "lowercase hex, got {id:?}"
+            );
+        }
+        let distinct: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(distinct.len(), ids.len(), "an id was reused: {ids:?}");
+    }
+
+    /// `initial_state` asks for the id: it rides the FIRST frame only (Go's field doc tells clients to
+    /// store it because no later frame repeats it), while `version` rides every frame.
+    #[test]
+    fn the_session_id_rides_only_the_first_frame_and_the_version_rides_all() {
+        let mut session = NotifySession::new(true).unwrap();
+        assert!(session.is_pending());
+
+        let first = session.stamp(crate::localapi::NotifyView {
+            state: Some("Running".into()),
+            ..Default::default()
+        });
+        let id = first
+            .session_id
+            .clone()
+            .expect("the first frame of an initial_state watch carries the session id");
+        assert_eq!(id.len(), 16);
+        assert_eq!(first.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        assert_eq!(
+            first.state.as_deref(),
+            Some("Running"),
+            "stamping keeps the payload"
+        );
+        assert!(!session.is_pending());
+
+        let second = session.stamp(crate::localapi::NotifyView::default());
+        assert_eq!(second.session_id, None, "no later frame repeats the id");
+        assert_eq!(second.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+    }
+
+    /// Go gates `SessionID` on `NotifyInitialState`: a watch that did not ask for it gets no id on
+    /// any frame, but still gets the version on every one.
+    #[test]
+    fn a_watch_without_initial_state_gets_a_version_but_no_session_id() {
+        let mut session = NotifySession::new(false).unwrap();
+        assert!(!session.is_pending());
+        for _ in 0..2 {
+            let frame = session.stamp(crate::localapi::NotifyView::default());
+            assert_eq!(frame.session_id, None);
+            assert_eq!(frame.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        }
+    }
 
     /// Drive `read_capped_line` with `input`: write the bytes into one end of a `UnixStream` pair
     /// (off-task so a write larger than the socket buffer cannot deadlock against the reader), drop
