@@ -863,18 +863,37 @@ fn peer_matches_exit_node_name(
         && want.eq_ignore_ascii_case(base)
 }
 
-/// Whether one of `peer`'s tailnet addresses is `ip` (Go compares against every
-/// `PeerStatus.TailscaleIPs` entry).
-fn peer_has_ip(peer: &PeerReport, ip: std::net::IpAddr) -> bool {
+/// Every tailnet address `peer` holds, in Go's `PeerStatus.TailscaleIPs` order (v4 then v6), with
+/// the fields the netmap left blank skipped. Go's slice is *empty* for a peer control has assigned
+/// no address; the equivalent here is a blank `ipv4` and an absent-or-blank `ipv6`, which is how
+/// `tnet`'s peer rendering reads the pair too. `next()` on this is therefore Go's
+/// `ps.TailscaleIPs[0]`, and `None` is its `len(ps.TailscaleIPs) == 0`.
+fn peer_tailnet_ips(peer: &PeerReport) -> impl Iterator<Item = std::net::IpAddr> + '_ {
     [Some(peer.ipv4.as_str()), peer.ipv6.as_deref()]
         .into_iter()
         .flatten()
         .filter_map(|s| s.parse::<std::net::IpAddr>().ok())
-        .any(|peer_ip| peer_ip == ip)
+}
+
+/// Whether one of `peer`'s tailnet addresses is `ip` (Go compares against every
+/// `PeerStatus.TailscaleIPs` entry).
+fn peer_has_ip(peer: &PeerReport, ip: std::net::IpAddr) -> bool {
+    peer_tailnet_ips(peer).any(|peer_ip| peer_ip == ip)
+}
+
+/// Go's `ExitNodeLocalIPError` for `host_or_ip` — which is the value the OPERATOR typed: the
+/// address in Go's IP branch, the name in its name branch — carrying this fork's one-message hint
+/// (deviation (a) on [`resolve_exit_node_arg`]). One builder, so both branches refuse a local
+/// address in the same words.
+fn exit_node_local_ip_error(host_or_ip: &str) -> anyhow::Error {
+    anyhow!(
+        "cannot use {host_or_ip} as an exit node as it is a local IP address to this machine; \
+         did you mean --advertise-exit-node?"
+    )
 }
 
 /// Resolve an operator-supplied `--exit-node` VALUE against the netmap — the port of Go's
-/// `exitNodeIPOfArg` (`ipn/prefs.go`), which is six refusals in one function.
+/// `exitNodeIPOfArg` (`ipn/prefs.go`), which is nine refusals in one function.
 ///
 /// The engine's `ExitNodeSelector: FromStr` is **infallible** (a bare IP → `Ip`, anything else →
 /// `Name`), so without this every value is accepted, stored, and then silently matches no peer:
@@ -888,13 +907,25 @@ fn peer_has_ip(peer: &PeerReport, ip: std::net::IpAddr) -> bool {
 ///    "cannot use %s as an exit node as it is a local IP address to this machine", which Go's `up`
 ///    and `set` both re-wrap as "%w; did you mean --advertise-exit-node?";
 /// 2. once Running, an IP **no peer** holds — "no node found in netmap with IP %v";
-/// 3. a peer that is **not advertising** an exit node — "node %v is not advertising an exit node";
+/// 3. once Running, the peer holding that IP **not advertising** an exit node — "node %v is not
+///    advertising an exit node", naming the ADDRESS;
 /// 4. a non-IP value while the **peer list is empty** — "cannot resolve exit node by hostname while
 ///    Tailscale is starting up; please use its Tailscale IP address instead" (Go refuses rather than
 ///    attempting a resolution that could only fail);
-/// 5. a name **no peer** answers to — "invalid value %q for --exit-node; must be IP or peer
+/// 5. a named peer with **no tailnet address** — "node %q has no Tailscale IP?", checked before its
+///    advertisement (as Go does): there is nothing to store, and checking the other order would
+///    print an empty address in (6);
+/// 6. a named peer **not advertising** an exit node — "node %q is not advertising an exit node",
+///    naming the ARGUMENT, quoted. Go's two branches word this refusal differently — the IP branch
+///    (3) names the address it was given, the name branch names the name it was given — and both
+///    are reproduced as Go writes them;
+/// 7. a name **no peer** answers to — "invalid value %q for --exit-node; must be IP or peer
 ///    hostname";
-/// 6. a name **more than one** peer answers to — "ambiguous exit node name %q".
+/// 8. a name **more than one** peer answers to — "ambiguous exit node name %q";
+/// 9. a name that resolved to **this machine's own** address — `ExitNodeLocalIPError` again, with
+///    the name in it. Go re-runs the local-IP check on `ps.TailscaleIPs[0]` once the name is known
+///    to be unambiguous, so a netmap entry carrying one of our own addresses is refused by either
+///    spelling; without it a name would be stored as an exit node that cannot route.
 ///
 /// The **staging** is Go's, not a stricter rule: the local-IP refusal (1) and the empty-value
 /// refusal apply always, because they need no netmap; the netmap-backed refusals (2) and (3) apply
@@ -902,16 +933,21 @@ fn peer_has_ip(peer: &PeerReport, ip: std::net::IpAddr) -> bool {
 /// yet"; and a name is refused outright (4) rather than resolved against a peer list that does not
 /// exist.
 ///
-/// Two deliberate, documented deviations from Go. (a) Go re-wraps the local-IP error with
-/// "did you mean --advertise-exit-node?" in the CLI, for `up` and `set` only; the resolution here is
-/// daemon-side and shared, so the hint is part of the one message and `check-prefs` reports it too —
-/// the hint is just as true there. (b) Go's empty-value guard returns the opaque `os.ErrInvalid`
-/// ("invalid argument"); this says what to pass instead.
+/// Two deliberate, documented deviations from Go, both message text only. (a) Go re-wraps the
+/// local-IP error with "did you mean --advertise-exit-node?" in the CLI, for `up` and `set` only;
+/// the resolution here is daemon-side and shared, so the hint is part of the one message and
+/// `check-prefs` reports it too — the hint is just as true there. (b) Go's empty-value guard returns
+/// the opaque `os.ErrInvalid` ("invalid argument"), which names neither the flag nor a remedy; this
+/// says what to pass instead. The guard's *test* is Go's exactly (`s == ""`), so a whitespace-only
+/// value is not caught here: like Go, it falls through to the name branch and is refused there as
+/// the unresolvable name it is.
 ///
 /// Pure: every fact it reads arrives in `facts`, so it can run before a single pref is mutated, and
 /// it is unit-testable without an engine.
 fn resolve_exit_node_arg(arg: &str, facts: &ExitNodeFacts) -> Result<()> {
-    if arg.trim().is_empty() {
+    // Go's `if s == "" { return os.ErrInvalid }` — the exact empty string, and nothing wider. A
+    // whitespace-only value is a value, so it takes the name branch below, exactly as it does in Go.
+    if arg.is_empty() {
         return Err(anyhow!(
             "--exit-node was given an empty value; pass a tailnet IP address or a peer name, or \
              clear the exit node instead"
@@ -924,10 +960,7 @@ fn resolve_exit_node_arg(arg: &str, facts: &ExitNodeFacts) -> Result<()> {
         // about this machine, not about the netmap's completeness. An operator who types it almost
         // always meant to OFFER egress, hence Go's hint.
         if facts.self_ips.contains(&ip) {
-            return Err(anyhow!(
-                "cannot use {arg} as an exit node as it is a local IP address to this machine; \
-                 did you mean --advertise-exit-node?"
-            ));
+            return Err(exit_node_local_ip_error(arg));
         }
         // Before Running there is no authoritative peer list, so an unknown IP is accepted (Go
         // does the same): it may well be a peer this node has not learned about yet.
@@ -954,28 +987,42 @@ fn resolve_exit_node_arg(arg: &str, facts: &ExitNodeFacts) -> Result<()> {
     }
     let suffix = facts.magic_dns_suffix.as_deref();
     let mut matched = 0usize;
+    // The address the matched name resolved to — Go's `ip = ps.TailscaleIPs[0]`, kept because the
+    // local-IP refusal (9) runs on it again once the name is known to be unambiguous.
+    let mut resolved: Option<std::net::IpAddr> = None;
     for peer in &facts.peers {
         if !peer_matches_exit_node_name(peer, arg, suffix) {
             continue;
         }
         matched += 1;
-        // (3) again, by name. Go reports it from inside the match loop — i.e. a named peer that
-        // offers no exit is refused as such even when the name is ambiguous — and reports the
-        // peer's IP, which is the identity the operator has to act on.
+        // (5) A matched peer with no tailnet address at all: nothing to resolve TO. Go checks this
+        // first, before the advertisement, so this refusal is the one that fires.
+        let Some(peer_ip) = peer_tailnet_ips(peer).next() else {
+            return Err(anyhow!("node {arg:?} has no Tailscale IP?"));
+        };
+        // (6) The peer exists but never advertised a default route, so selecting it would route
+        // nothing. Go reports this from inside the match loop — i.e. a named peer that offers no
+        // exit is refused as such even when the name is ambiguous — and quotes the ARGUMENT the
+        // operator typed, which is the identity they can act on; the address is what its IP-branch
+        // sibling (3) names.
         if !peer.is_exit_node {
-            return Err(anyhow!(
-                "node {} is not advertising an exit node",
-                peer.ipv4
-            ));
+            return Err(anyhow!("node {arg:?} is not advertising an exit node"));
         }
+        resolved = Some(peer_ip);
     }
     match matched {
-        // (5) A typo, or a peer that has left the tailnet.
+        // (7) A typo, or a peer that has left the tailnet.
         0 => Err(anyhow!(
             "invalid value {arg:?} for --exit-node; must be IP or peer hostname"
         )),
+        // (9) The name resolved to one of THIS machine's addresses. Routing our own traffic through
+        // ourselves is no more possible by name than by IP, so Go's check covers both branches —
+        // and the refusal names the value the operator actually typed, i.e. the name.
+        1 if resolved.is_some_and(|ip| facts.self_ips.contains(&ip)) => {
+            Err(exit_node_local_ip_error(arg))
+        }
         1 => Ok(()),
-        // (6) Two peers answer to the name; picking one silently would be a coin flip over which
+        // (8) Two peers answer to the name; picking one silently would be a coin flip over which
         // machine sees the operator's traffic.
         _ => Err(anyhow!("ambiguous exit node name {arg:?}")),
     }
@@ -8950,23 +8997,132 @@ mod tests {
     #[test]
     fn resolve_exit_node_arg_refuses_a_peer_advertising_no_exit_node() {
         // The peer exists and is reachable — it just never advertised a default route, so selecting
-        // it would route nothing. Go refuses by IP and by name alike, naming the peer's IP.
+        // it would route nothing. Go refuses by IP and by name alike, but the two sentences are NOT
+        // the same: the IP branch names the address it was handed (`node %v …`), the name branch
+        // quotes the argument it was handed (`node %q …`). Both, as Go writes them.
         let facts = running_facts(vec![exit_peer(
             "plain.tail0123.ts.net",
             "100.64.0.8",
             false,
         )]);
-        for arg in ["100.64.0.8", "plain", "plain.tail0123.ts.net"] {
+        let err = format!(
+            "{:#}",
+            resolve_exit_node_arg("100.64.0.8", &facts)
+                .expect_err("a peer that advertises no exit node must be refused")
+        );
+        assert!(
+            err.contains("node 100.64.0.8 is not advertising an exit node"),
+            "the IP branch must name the address, got {err:?}"
+        );
+
+        for (arg, want) in [
+            ("plain", "node \"plain\" is not advertising an exit node"),
+            (
+                "plain.tail0123.ts.net",
+                "node \"plain.tail0123.ts.net\" is not advertising an exit node",
+            ),
+        ] {
             let err = format!(
                 "{:#}",
                 resolve_exit_node_arg(arg, &facts)
                     .expect_err("a peer that advertises no exit node must be refused")
             );
             assert!(
-                err.contains("node 100.64.0.8 is not advertising an exit node"),
-                "{arg:?} must be refused in Go's words, got {err:?}"
+                err.contains(want),
+                "the name branch must quote the argument ({want:?}), got {err:?}"
+            );
+            assert!(
+                !err.contains("100.64.0.8"),
+                "the name branch must not substitute the peer's address, got {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn resolve_exit_node_arg_refuses_a_named_peer_with_no_tailnet_address() {
+        // Go's `len(ps.TailscaleIPs) == 0` guard, checked BEFORE the exit advertisement. A peer
+        // control has given no address cannot be an exit node whatever it advertises, and there is
+        // nothing to resolve the name TO — so the refusal names the peer, and the sibling
+        // advertisement refusal never gets to render an empty address.
+        let addressless = PeerReport {
+            name: "ghost.tail0123.ts.net".to_string(),
+            ipv4: String::new(),
+            ipv6: None,
+            // Advertising an exit node, so only the no-address guard can refuse this.
+            is_exit_node: true,
+            ..PeerReport::default()
+        };
+        let err = format!(
+            "{:#}",
+            resolve_exit_node_arg("ghost", &running_facts(vec![addressless.clone()]))
+                .expect_err("a peer with no tailnet address cannot be an exit node")
+        );
+        assert!(
+            err.contains("node \"ghost\" has no Tailscale IP?"),
+            "the refusal must be Go's sentence, got {err:?}"
+        );
+
+        // It is checked first: a peer with neither an address nor an advertisement reports the
+        // missing address, which is Go's order.
+        let err = format!(
+            "{:#}",
+            resolve_exit_node_arg(
+                "ghost",
+                &running_facts(vec![PeerReport {
+                    is_exit_node: false,
+                    ..addressless
+                }])
+            )
+            .expect_err("a peer with no tailnet address cannot be an exit node")
+        );
+        assert!(
+            err.contains("has no Tailscale IP?"),
+            "the no-address refusal must come first, got {err:?}"
+        );
+
+        // A peer with only a v6 address still resolves: Go's check is on the whole `TailscaleIPs`
+        // slice, not on the v4 entry.
+        let v6_only = PeerReport {
+            name: "six.tail0123.ts.net".to_string(),
+            ipv4: String::new(),
+            ipv6: Some("fd7a:115c:a1e0::8".to_string()),
+            is_exit_node: true,
+            ..PeerReport::default()
+        };
+        assert!(
+            resolve_exit_node_arg("six", &running_facts(vec![v6_only])).is_ok(),
+            "a v6-only exit node must resolve"
+        );
+    }
+
+    #[test]
+    fn resolve_exit_node_arg_refuses_a_name_that_resolves_to_a_local_address() {
+        // Go re-runs its local-IP check on the address the NAME resolved to (`case 1:`), so the
+        // refusal covers both spellings. Without it, a netmap entry carrying one of this machine's
+        // own addresses is accepted by name and stored as an exit node that cannot route.
+        let facts = running_facts(vec![exit_peer("self.tail0123.ts.net", "100.64.0.1", true)]);
+        for arg in ["self", "self.tail0123.ts.net", "100.64.0.1"] {
+            let err = format!(
+                "{:#}",
+                resolve_exit_node_arg(arg, &facts)
+                    .expect_err("this machine's own address cannot be its exit node, by any name")
+            );
+            assert!(
+                err.contains(&format!(
+                    "cannot use {arg} as an exit node as it is a local IP address to this machine"
+                )),
+                "the refusal must be Go's sentence, naming what was typed, got {err:?}"
+            );
+            assert!(
+                err.contains("--advertise-exit-node"),
+                "the refusal must carry the hint on both branches, got {err:?}"
+            );
+        }
+
+        // The check is on the resolved address, not on the name: a peer with a different address
+        // still resolves even when this machine has one of its own.
+        let remote = running_facts(vec![exit_peer("exit.tail0123.ts.net", "100.64.0.7", true)]);
+        assert!(resolve_exit_node_arg("exit", &remote).is_ok());
     }
 
     #[test]
@@ -9042,14 +9198,35 @@ mod tests {
     fn resolve_exit_node_arg_refuses_an_empty_value() {
         // Go's `os.ErrInvalid` guard at the top of `exitNodeIPOfArg`, said usefully: an empty
         // `--exit-node` would otherwise be stored as a selector matching no peer.
-        for arg in ["", "   "] {
-            let err = resolve_exit_node_arg(arg, &running_facts(vec![]))
-                .expect_err("an empty selector must be refused");
-            assert!(
-                format!("{err:#}").contains("empty value"),
-                "got {err:#} for {arg:?}"
-            );
-        }
+        let err = resolve_exit_node_arg("", &running_facts(vec![]))
+            .expect_err("an empty selector must be refused");
+        assert!(
+            format!("{err:#}").contains("empty value"),
+            "got {err:#} for the empty string"
+        );
+
+        // The guard's test is Go's exact `s == ""` and no wider: a whitespace-only value is a
+        // value, so it takes the name branch and is refused there, as the unresolvable name it is.
+        // (Widening the guard would refuse it earlier and in different words than Go's.)
+        let facts = running_facts(vec![exit_peer("exit.tail0123.ts.net", "100.64.0.7", true)]);
+        let err = format!(
+            "{:#}",
+            resolve_exit_node_arg("   ", &facts).expect_err("no peer answers to a blank name")
+        );
+        assert!(
+            err.contains("invalid value \"   \" for --exit-node; must be IP or peer hostname"),
+            "a whitespace-only value must take Go's name branch, got {err:?}"
+        );
+        // With no peer list at all it is the starting-up refusal, again the name branch's.
+        let err = format!(
+            "{:#}",
+            resolve_exit_node_arg("   ", &ExitNodeFacts::default())
+                .expect_err("a name cannot resolve against an empty peer list")
+        );
+        assert!(
+            err.contains("cannot resolve exit node by hostname"),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
