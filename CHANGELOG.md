@@ -25,6 +25,17 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.63.2](https://github.com/GeiserX/tailscaled-rs/compare/v0.63.1...v0.63.2) (2026-09-22)
+
+
+### Bug Fixes
+
+* a typo in the operator env file must not stop the daemon ([#521](https://github.com/GeiserX/tailscaled-rs/issues/521)) ([e34b40b](https://github.com/GeiserX/tailscaled-rs/commit/e34b40b93d0d983dcabdd09d8a0be14a64e94112))
+* **configure:** stop wrapping kubeconfig read and merge errors Go returns bare ([#516](https://github.com/GeiserX/tailscaled-rs/issues/516)) ([16e5aae](https://github.com/GeiserX/tailscaled-rs/commit/16e5aae1724dd777a22e1f3ecfcd8aae514da4b5))
+* **ipn:** gate SSH on the prefs an edit leaves behind, not on its mask ([#523](https://github.com/GeiserX/tailscaled-rs/issues/523)) ([413fe1b](https://github.com/GeiserX/tailscaled-rs/commit/413fe1b2b8c03eb66093a87369e0d5bfd9045c06))
+* **login:** stop `login --nickname` renaming the logged-in profile ([#514](https://github.com/GeiserX/tailscaled-rs/issues/514)) ([c5e0c08](https://github.com/GeiserX/tailscaled-rs/commit/c5e0c0887d0e77e619c5bc5040f3668631a7e2c9))
+* **prefs:** refuse what Go refuses for --exit-node, in Go's words ([#522](https://github.com/GeiserX/tailscaled-rs/issues/522)) ([052b53d](https://github.com/GeiserX/tailscaled-rs/commit/052b53d8381ffb6bee96694cecbd6c7d90cf19c1))
+
 ## [0.63.1](https://github.com/GeiserX/tailscaled-rs/compare/v0.63.0...v0.63.1) (2026-09-22)
 
 
