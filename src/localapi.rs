@@ -940,9 +940,13 @@ pub enum Request {
     ///    torn down — the same path a SIGTERM takes, so the state file and any live device close the
     ///    way they always do. It is deliberately NOT a `process::exit`.
     ///
-    /// Whether the daemon comes back up is the service manager's decision, not this verb's — which is
-    /// why Go names the key for a *restart* rather than a shutdown. See `tnet shutdown`'s help for
-    /// what the units this fork ships actually do.
+    /// The daemon then exits **non-zero**, and that is the last rung of the port rather than a
+    /// detail: Go's subscriber closes the listener, `hs.Serve` fails on it, the context was never
+    /// cancelled so `run()` does not take its `context.Canceled` escape, and `log.Fatal` ends
+    /// tailscaled with a failure status that its packaged unit's `Restart=on-failure` acts on. The
+    /// restart is the verb's whole purpose — it is why Go names the key `AllowTailscaledRestart` and
+    /// not `AllowShutdown` — and the units this fork ships restart on failure too, so the exit status
+    /// is what carries the intent across. See [`crate::server::StoppedByLocalApi`].
     Shutdown,
 }
 

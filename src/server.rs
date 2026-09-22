@@ -65,10 +65,7 @@ const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// `serveShutdown` (`ipn/localapi/localapi.go`), in the order Go checks them.
 ///
 /// Separate variants (rather than one pre-rendered string) because the ladder's ORDER is the
-/// contract and a test has to be able to name which rung answered. The messages keep Go's exact
-/// phrases as their leading text — an operator or a script grepping `shutdown access denied by
-/// policy` finds the same words here — with this fork's "and here is what to do about it" clause
-/// after the colon, the house style every other refusal on this socket uses.
+/// contract and a test has to be able to name which rung answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShutdownRefusal {
     /// The caller may not write at all: not root, not the uid that owns the daemon. Go: `shutdown
@@ -80,16 +77,32 @@ pub enum ShutdownRefusal {
 }
 
 impl ShutdownRefusal {
-    /// The message the refused caller receives, verbatim.
+    /// The message the refused caller receives — **byte-for-byte what Go's `http.Error` writes** as
+    /// the 403 body, and nothing else.
+    ///
+    /// Go's bodies are the bare phrases, so these are the bare phrases. A remediation clause after a
+    /// colon would still leave Go's words as a prefix, but a consumer comparing the whole body
+    /// against upstream's would stop matching, and this fork has no reason to speak a dialect of
+    /// upstream's error text. The "and here is what to do about it" half is not lost: it goes to the
+    /// daemon's log next to the refusal ([`Self::hint`]), where the operator who can act on it is
+    /// looking anyway, rather than down a socket to a caller that was just told no.
     pub fn message(self) -> &'static str {
         match self {
+            Self::AccessDenied => "shutdown access denied",
+            Self::DeniedByPolicy => "shutdown access denied by policy",
+        }
+    }
+
+    /// What the operator would have to change for this refusal to stop happening — logged beside the
+    /// refusal, never sent on the wire (see [`Self::message`]).
+    pub fn hint(self) -> &'static str {
+        match self {
             Self::AccessDenied => {
-                "shutdown access denied: stopping the daemon requires root or the same user that \
-                 owns the daemon"
+                "stopping the daemon requires root or the same user that owns the daemon"
             }
             Self::DeniedByPolicy => {
-                "shutdown access denied by policy: set AllowTailscaledRestart to true in the \
-                 daemon's system policy file (see `tnet syspolicy list`) to permit it"
+                "set AllowTailscaledRestart to true in the daemon's system policy file (see `tnet \
+                 syspolicy list`) to permit it"
             }
         }
     }
@@ -132,7 +145,48 @@ fn shutdown_allowed_by_policy() -> bool {
     syspolicy::get_boolean(syspolicy::PKEY_ALLOW_TAILSCALED_RESTART, false)
 }
 
+/// The error [`serve`] returns when the LocalAPI `shutdown` verb — and only that verb — ended the
+/// accept loop. It exists to make the daemon exit **non-zero**, which is the whole point of the verb.
+///
+/// Upstream never returns "stopped on request" as a success. `serveShutdown` publishes
+/// `localapi.Shutdown`; the sole subscriber in `ipn/ipnserver/server.go` calls `ln.Close()`;
+/// `hs.Serve(ln)` then fails on the closed listener and `Run` returns that error — and because the
+/// context was NOT cancelled, `cmd/tailscaled/tailscaled.go` does not take its
+/// `errors.Is(err, context.Canceled)` escape and hands the error to `log.Fatal`. Upstream tailscaled
+/// therefore exits 1, its packaged unit's `Restart=on-failure` starts it again, and that is why the
+/// policy key authorising the verb is spelled `AllowTailscaledRestart` and not `AllowShutdown`.
+///
+/// Returning `Ok(())` here instead would invert that on this fork specifically, because the units
+/// `tnet install` writes restart on failure only — `Restart=on-failure` in
+/// `packaging/systemd/tailnetd{,-tun}.service`, `KeepAlive = {Crashed: true, SuccessfulExit: false}`
+/// in `packaging/launchd/cloud.tailscaled-rs.tailnetd.plist`. A clean exit is not a failure to either
+/// of them, so a verb named for a restart would have permanently stopped the daemon.
+///
+/// The SIGINT/SIGTERM path is unaffected and still returns `Ok(())`: that is upstream's cancelled
+/// context, the one case its `run()` deliberately maps to a nil error. So the exit status keeps
+/// saying what it always said — 0 means "someone asked this process to go away", non-zero means
+/// "bring me back" — and the two stops stay distinguishable to the service manager, which is the
+/// only consumer that has to tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoppedByLocalApi;
+
+impl std::fmt::Display for StoppedByLocalApi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "stopped by the LocalAPI `shutdown` verb; exiting non-zero so the service manager \
+             restarts the daemon (the policy key that permits this is AllowTailscaledRestart)"
+        )
+    }
+}
+
+impl std::error::Error for StoppedByLocalApi {}
+
 /// Run the LocalAPI server until `shutdown` resolves, then clean up the socket.
+///
+/// Returns `Ok(())` when the caller-supplied `shutdown` future ended it (SIGINT/SIGTERM) and
+/// [`StoppedByLocalApi`] when the LocalAPI `shutdown` verb did — the teardown is identical, only the
+/// exit status differs, and it differs on purpose. See [`StoppedByLocalApi`].
 pub async fn serve(
     socket_path: &Path,
     backend: Arc<Mutex<Backend>>,
@@ -173,7 +227,9 @@ pub async fn serve(
     // notifies it AFTER acknowledging the request, and the accept loop below treats it exactly like
     // the caller-supplied `shutdown` future (SIGINT/SIGTERM). That is the whole mechanism — no
     // `process::exit`, no second teardown path: the listener is dropped, in-flight connections
-    // drain, the socket is unlinked, `serve` returns `Ok(())` and the daemon's own shutdown runs.
+    // drain, the socket is unlinked and the daemon's own shutdown runs. The ONE difference from the
+    // signal path is the value `serve` finally returns, and hence the process's exit status: see
+    // `StoppedByLocalApi`.
     //
     // `Notify::notify_one` (not `notify_waiters`) is what makes this race-free: it stores a permit
     // when nobody is parked yet, so a stop requested while the loop is inside `accept()` is still
@@ -181,6 +237,12 @@ pub async fn serve(
     let stop_requested = Arc::new(Notify::new());
     let stop_waiter = Arc::clone(&stop_requested);
     let stop_signal = async move { stop_waiter.notified().await };
+
+    // Which arm ended the accept loop. Not a detail: it is the exit status, and the exit status is
+    // what the service manager reads to decide whether to start the daemon again — the difference
+    // between a `shutdown` verb that restarts the daemon (upstream's behaviour, and the name of the
+    // key that permits it) and one that stops it for good.
+    let mut stopped_by_localapi = false;
 
     tokio::pin!(shutdown);
     tokio::pin!(stop_signal);
@@ -191,6 +253,7 @@ pub async fn serve(
             // acknowledged on its own connection, so there is nothing left to do but stop accepting.
             () = &mut stop_signal => {
                 tracing::info!("LocalAPI shutdown requested; stopping");
+                stopped_by_localapi = true;
                 break;
             }
             accepted = listener.accept() => {
@@ -244,6 +307,11 @@ pub async fn serve(
 
     let _ = tokio::fs::remove_file(socket_path).await;
     tracing::info!("LocalAPI stopped");
+    // The teardown above is the same either way — only the answer to "was this a failure?" differs,
+    // and only the service manager is asking.
+    if stopped_by_localapi {
+        return Err(StoppedByLocalApi.into());
+    }
     Ok(())
 }
 
@@ -485,10 +553,13 @@ async fn handle_conn(
                         {
                             // Audit every refused attempt to stop the daemon, naming which rung
                             // answered — an unauthorized caller probing the socket and a permitted
-                            // caller hitting a policy that says no are different events.
+                            // caller hitting a policy that says no are different events. The
+                            // remediation rides here rather than on the wire: the caller gets Go's
+                            // bare phrase, the operator who can act on it gets the whole story.
                             tracing::warn!(
                                 peer_uid = ?peer_uid,
                                 refusal = ?refusal,
+                                hint = refusal.hint(),
                                 "denied LocalAPI shutdown"
                             );
                             write_response(
@@ -2407,29 +2478,44 @@ mod tests {
         );
     }
 
-    /// The two refusals have to be distinguishable, because they are different problems with
-    /// different fixes ("you may not" vs "nobody may"), and each keeps Go's phrase as its leading
-    /// text so an operator or a script grepping for upstream's wording still finds it.
+    /// Each refusal is Go's 403 body and NOTHING ELSE. `http.Error(w, "shutdown access denied",
+    /// …)` writes exactly those bytes, so a consumer that compares a whole body against upstream's
+    /// has to keep matching here. Pinned with `assert_eq!` rather than `starts_with`, because a
+    /// prefix assertion is precisely what let a remediation clause grow onto the end of Go's
+    /// sentence without any test noticing.
     #[test]
-    fn the_two_refusals_carry_gos_distinct_phrases() {
-        let access = ShutdownRefusal::AccessDenied.message();
-        let policy = ShutdownRefusal::DeniedByPolicy.message();
-        assert!(
-            access.starts_with("shutdown access denied:"),
-            "the access refusal must lead with Go's phrase, got: {access}"
+    fn the_two_refusals_are_gos_bodies_verbatim() {
+        assert_eq!(
+            ShutdownRefusal::AccessDenied.message(),
+            "shutdown access denied"
         );
-        assert!(
-            policy.starts_with("shutdown access denied by policy:"),
-            "the policy refusal must lead with Go's phrase, got: {policy}"
+        assert_eq!(
+            ShutdownRefusal::DeniedByPolicy.message(),
+            "shutdown access denied by policy"
         );
-        assert_ne!(
-            access, policy,
-            "a caller must be able to tell `you may not` from `nobody may`"
+    }
+
+    /// The remediation an operator needs did not disappear when it came off the wire — it is on the
+    /// refusal, for the log line to carry. Held here so a future edit cannot quietly empty it and
+    /// leave the log saying only "denied".
+    #[test]
+    fn each_refusal_carries_an_off_the_wire_remediation() {
+        let access = ShutdownRefusal::AccessDenied.hint();
+        let policy = ShutdownRefusal::DeniedByPolicy.hint();
+        assert!(
+            access.contains("root"),
+            "the access hint must say who may stop the daemon, got: {access}"
         );
         assert!(
             policy.contains("AllowTailscaledRestart"),
-            "the policy refusal must name the key that lifts it, got: {policy}"
+            "the policy hint must name the key that lifts the refusal, got: {policy}"
         );
+        for hint in [access, policy] {
+            assert!(
+                !hint.starts_with("shutdown access denied"),
+                "the hint is logged BESIDE the message, not appended to it, got: {hint}"
+            );
+        }
     }
 
     /// `shutdown` is a write for the authorization gate. Pinned through the gate itself (not
