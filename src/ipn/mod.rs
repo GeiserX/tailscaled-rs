@@ -142,14 +142,19 @@ struct ConnectivityHealth {
     /// Whether the engine's net report names a reachable DERP region. `false` is Go's `no-derp-home`
     /// warnable.
     derp_home: Option<bool>,
+    /// Whether the host forwards the routes this node advertises
+    /// ([`crate::ipforward::ip_forwarding_broken`], negated). `false` is Go's `ip-forwarding-off`
+    /// warnable.
+    ip_forwarding: Option<bool>,
 }
 
 impl ConnectivityHealth {
     /// Nothing observed — every signal unknown, so nothing is unhealthy. Used outside `Running`,
-    /// where upstream's loop is not even alive and neither observation is worth paying for.
+    /// where upstream's loop is not even alive and no observation is worth paying for.
     const UNKNOWN: Self = Self {
         any_interface_up: None,
         derp_home: None,
+        ip_forwarding: None,
     };
 }
 
@@ -164,11 +169,14 @@ impl ConnectivityHealth {
 /// captivePortalWarnable.Code }` (`feature/captiveportal/captiveportal.go`), over the members of that
 /// set this daemon can observe.
 ///
-/// When more than one is unhealthy the one with the shortest
-/// [`time_to_visible`](captive::ConnectivityWarnable::time_to_visible) wins. Go breaks on whichever
-/// warning its map iteration reaches first — order it does not care about, because the *event* that
-/// wakes its loop is the first warnable to become visible. Picking the soonest-visible reproduces
-/// that timing and is deterministic, which the map order is not.
+/// When more than one is unhealthy a transient warnable wins over a
+/// [`steady`](captive::ConnectivityWarnable::is_steady) one, and among the rest the one with the
+/// shortest [`time_to_visible`](captive::ConnectivityWarnable::time_to_visible) wins. Go breaks on
+/// whichever warning its map iteration reaches first — order it does not care about, because the
+/// *event* that wakes its loop is the warnable that just changed. A steady warnable that was already
+/// unhealthy is not that event, so it must not hide a network that has just gone down (and the
+/// rechecks that come with it); among transient ones, the soonest-visible reproduces Go's timing and
+/// is deterministic, which the map order is not.
 fn connectivity_impacted_from(
     state: State,
     health: ConnectivityHealth,
@@ -184,11 +192,15 @@ fn connectivity_impacted_from(
             health.any_interface_up,
         ),
         (captive::ConnectivityWarnable::NoDerpHome, health.derp_home),
+        (
+            captive::ConnectivityWarnable::IpForwardingOff,
+            health.ip_forwarding,
+        ),
     ]
     .into_iter()
     .filter(|(_, healthy)| *healthy == Some(false))
     .map(|(warnable, _)| warnable)
-    .min_by_key(|w| w.time_to_visible())
+    .min_by_key(|w| (w.is_steady(), w.time_to_visible()))
 }
 
 /// The captive-portal detection loop — Go `ipn/ipnlocal/captiveportal.go`, its
@@ -2834,6 +2846,40 @@ impl Backend {
         self.activate_profile(id).await
     }
 
+    /// Switch to a new, empty profile: Go's `LocalBackend.NewProfile` (`profileManager.
+    /// SwitchToNewProfile`), which `tailscale login` reaches through `LocalClient.
+    /// SwitchToEmptyProfile` before it logs in. The profile the node was on keeps its prefs, key and
+    /// name; the login that follows lands on the new one.
+    ///
+    /// Two differences from Go, both about when a profile exists. Go gives the new profile an id
+    /// only once it is saved after a login; this daemon registers it straight away, because every
+    /// profile here is a directory keyed by its id. And Go never saves a profile that has not logged
+    /// in (and deletes one on logout), so a current profile that has not logged in
+    /// (`has_logged_in`, Go's `Persist.UserProfile.LoginName != ""`) is already the empty profile Go
+    /// would switch to: it is kept, and reported as [`SwitchOutcome::AlreadyCurrent`], rather than
+    /// left behind as a second, unregistered entry in `switch --list`.
+    ///
+    /// The test is `has_logged_in`, not `has_node_key`. A key exists as soon as an `up` builds its
+    /// config, before control has seen the node, so an interactive login the operator never finished
+    /// still holds one. Keying on it would make every retry of such a login add a profile. Staying
+    /// on that profile is safe: `login` sends `force_reauth`, which discards the key before it
+    /// registers.
+    pub async fn switch_to_empty_profile(&mut self) -> Result<SwitchOutcome> {
+        if !self.prefs.has_logged_in {
+            return Ok(SwitchOutcome::AlreadyCurrent {
+                id: self.current_profile.clone(),
+            });
+        }
+        let meta = profile::load_profiles_file(&self.state_dir).await;
+        let id = profile::unused_profile_id(&meta, || {
+            let mut bytes = [0u8; 2];
+            getrandom::fill(&mut bytes).map(|()| bytes)
+        })
+        .map_err(|e| anyhow!("reading OS randomness for a new profile id: {e}"))?
+        .ok_or_else(|| anyhow!("could not find an unused profile id"))?;
+        self.activate_profile(&id).await
+    }
+
     /// Make profile `target` the active one: tear the current device down, repoint
     /// `prefs`/`prefs_path`/`key_path` at the target, reload its persisted prefs, persist the
     /// `current-profile` pointer, register it in `profiles.json` if new, and bump the generation (so
@@ -4765,6 +4811,10 @@ impl Backend {
     ///   *"Tailscale could not connect to any relay server"*), and the warnable that fires when a
     ///   portal swallows a live node's traffic, since the portal answers the DERP connections instead
     ///   of the relay.
+    /// - `ip-forwarding-off` — a kernel-TUN node advertises routes its host will not forward
+    ///   ([`ip_forwarding_broken`](Backend::ip_forwarding_broken), Go's check from
+    ///   `applyPrefsToHostinfoLocked`). A steady condition, so it earns one probe per onset rather
+    ///   than rechecks ([`captive::ConnectivityWarnable::is_steady`]).
     ///
     /// Reading both matters, and not only for tidiness: the engine's net report is the node's
     /// **last** measurement, so a path that dies under a live session keeps naming its old home
@@ -4816,10 +4866,25 @@ impl Backend {
                         None
                     }
                 },
+                ip_forwarding: Some(!self.ip_forwarding_broken()),
             },
             _ => ConnectivityHealth::UNKNOWN,
         };
         connectivity_impacted_from(state, health)
+    }
+
+    /// Go's `ip-forwarding-off` verdict for this node: the check `applyPrefsToHostinfoLocked` installs
+    /// over the advertised routes (Go `hi.RoutableIPs`, which folds in the exit-node defaults). A
+    /// route set that does not compose advertises nothing, so it is checked as no routes.
+    fn ip_forwarding_broken(&self) -> bool {
+        let routes = crate::routes::calc_advertise_routes(
+            &self.prefs.advertise_routes,
+            self.prefs.advertise_exit_node,
+        )
+        .unwrap_or_default();
+        crate::ipforward::ip_forwarding_broken(self.prefs.tun_enabled, &routes, || {
+            linkmon::interface_ips()
+        })
     }
 
     /// Record the verdict of a captive-portal detection pass (Go's
@@ -5916,6 +5981,7 @@ mod tests {
         ConnectivityHealth {
             any_interface_up: Some(any_interface_up),
             derp_home: Some(derp_home),
+            ip_forwarding: Some(true),
         }
     }
 
@@ -5996,6 +6062,7 @@ mod tests {
                 ConnectivityHealth {
                     any_interface_up: Some(false),
                     derp_home: None,
+                    ip_forwarding: None,
                 },
             ),
             Some(captive::ConnectivityWarnable::NetworkStatus),
@@ -6022,6 +6089,69 @@ mod tests {
             std::time::Duration::from_secs(12),
             "no-derp-home: 10s TimeToVisible + Go's 2s detection interval"
         );
+    }
+
+    #[test]
+    fn captive_detection_triggers_on_ip_forwarding_off() {
+        // health/warnings.go marks `ip-forwarding-off` `ImpactsConnectivity: true`, so a subnet
+        // router whose host will not forward is a node Go's `onHealthChange` probes for.
+        let forwarding_off = ConnectivityHealth {
+            ip_forwarding: Some(false),
+            ..health(true, true)
+        };
+        assert_eq!(
+            connectivity_impacted_from(State::Running, forwarding_off),
+            Some(captive::ConnectivityWarnable::IpForwardingOff),
+            "network and relay healthy, forwarding off: still impacted"
+        );
+        assert_eq!(
+            connectivity_impacted_from(State::Stopped, forwarding_off),
+            None,
+            "outside Running upstream's loop is not alive"
+        );
+
+        // With a transient warnable also unhealthy, the transient one is reported, so a network
+        // that dies under a misconfigured subnet router still gets its settle time and rechecks.
+        assert_eq!(
+            connectivity_impacted_from(
+                State::Running,
+                ConnectivityHealth {
+                    ip_forwarding: Some(false),
+                    ..health(false, true)
+                }
+            ),
+            Some(captive::ConnectivityWarnable::NetworkStatus)
+        );
+        assert_eq!(
+            connectivity_impacted_from(
+                State::Running,
+                ConnectivityHealth {
+                    ip_forwarding: Some(false),
+                    ..health(true, false)
+                }
+            ),
+            Some(captive::ConnectivityWarnable::NoDerpHome)
+        );
+    }
+
+    #[test]
+    fn a_netstack_node_never_reports_ip_forwarding_off() {
+        // Go installs the forwarding check only when `!b.sys.IsNetstackRouter()`: the userspace
+        // netstack forwards, not the kernel, whatever routes are advertised.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-captive-ipforward-{}", std::process::id()));
+        let mut be = backend_for(&dir);
+        be.prefs.tun_enabled = false;
+        be.prefs.advertise_routes = vec!["192.0.2.0/24".to_string()];
+        be.prefs.advertise_exit_node = true;
+        assert!(!be.ip_forwarding_broken());
+
+        // A TUN node that advertises nothing has no check installed either.
+        be.prefs.tun_enabled = true;
+        be.prefs.advertise_routes.clear();
+        be.prefs.advertise_exit_node = false;
+        assert!(!be.ip_forwarding_broken());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -7910,6 +8040,95 @@ mod tests {
                 id: profile::DEFAULT_PROFILE_ID.to_string()
             }
         );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn switch_to_empty_profile_leaves_the_logged_in_profile_and_its_name_alone() {
+        // Go's `tailscale login` calls `SwitchToEmptyProfile` before it logs in, so `login
+        // --nickname=work` names a NEW profile and the one the node was logged in to keeps its name.
+        let dir = std::env::temp_dir().join(format!("tailnetd-prof-empty-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = Backend::load(&dir).await.unwrap();
+
+        // A profile that never logged in is already empty: nothing is created or torn down.
+        assert_eq!(
+            be.switch_to_empty_profile().await.unwrap(),
+            SwitchOutcome::AlreadyCurrent {
+                id: profile::DEFAULT_PROFILE_ID.to_string()
+            }
+        );
+        assert_eq!(be.list_profiles().await.len(), 1);
+
+        // An unfinished login: `up` has minted a node key (a real key file, from the engine's
+        // loader), but the node never registered. Go never saved that profile, so a retried `login`
+        // stays on it instead of leaving it behind as an orphan.
+        let (_, key_path) = profile::profile_paths(&dir, profile::DEFAULT_PROFILE_ID);
+        tailscale::config::load_key_file(&key_path, Default::default())
+            .await
+            .expect("mint a key file for the default profile");
+        let mut be = Backend::load(&dir).await.unwrap();
+        assert!(be.has_node_key, "the fixture must hold a node key");
+        assert!(!be.prefs.has_logged_in);
+        assert_eq!(
+            be.switch_to_empty_profile().await.unwrap(),
+            SwitchOutcome::AlreadyCurrent {
+                id: profile::DEFAULT_PROFILE_ID.to_string()
+            },
+            "a node key without a finished login must not make a new profile"
+        );
+        assert_eq!(be.list_profiles().await.len(), 1);
+
+        // Now the node registers (what `finish_up` records), and the profile is named.
+        be.prefs.has_logged_in = true;
+        be.rename_current_profile("home").await.unwrap();
+
+        let SwitchOutcome::Switched { id, state } = be.switch_to_empty_profile().await.unwrap()
+        else {
+            panic!("a logged-in profile must be switched away from");
+        };
+        assert_eq!(state, State::NoState, "the new profile has never logged in");
+        assert_eq!(id.len(), 4, "Go's newUnusedID shape: {id:?}");
+        assert!(
+            id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+            "Go's newUnusedID shape: {id:?}"
+        );
+        assert_eq!(be.current_profile, id);
+
+        // `login --nickname=work` names the profile it switched to, and only that one.
+        be.rename_current_profile("work").await.unwrap();
+        let profiles = be.list_profiles().await;
+        assert!(
+            profiles
+                .iter()
+                .any(|e| e.id == profile::DEFAULT_PROFILE_ID && e.name == "home" && !e.current),
+            "the profile the node was logged in to keeps its name: {profiles:?}"
+        );
+        assert!(
+            profiles
+                .iter()
+                .any(|e| e.id == id && e.name == "work" && e.current),
+            "{profiles:?}"
+        );
+        assert!(
+            tokio::fs::try_exists(&key_path).await.unwrap(),
+            "the old profile's node key must survive"
+        );
+
+        // A second login before the first one registered stays on that profile, even once the
+        // first login's `up` has minted it a key: switch, `up` (key), switch again.
+        let (_, new_key_path) = profile::profile_paths(&dir, &id);
+        tailscale::config::load_key_file(&new_key_path, Default::default())
+            .await
+            .expect("mint a key file for the new profile");
+        be.has_node_key = true;
+        assert_eq!(
+            be.switch_to_empty_profile().await.unwrap(),
+            SwitchOutcome::AlreadyCurrent { id: id.clone() }
+        );
+        assert_eq!(be.list_profiles().await.len(), 2);
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
