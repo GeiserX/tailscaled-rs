@@ -4,42 +4,51 @@
     "auditedPrs": 10,
     "faithful": 2,
     "gaps": 8,
-    "findings": 11,
+    "findings": 13,
     "upstream": {
       "ref": "v1.102.4",
       "commit": "bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
-      "note": "The revision every upstream citation below was read at, and the ref docs/PARITY_GAP_ANALYSIS.md pins. Cite it with the commit, not the tag: `git show <commit>:cmd/tailscale/cli/ip.go` reproduces the rows, and a reader who resolves a bare path against main instead will find something else there and read the audit as stale."
+      "note": "The revision every upstream citation below was read at, and the ref docs/PARITY_GAP_ANALYSIS.md pins. The tree was cloned shallow at the tag and checked out at the commit; `git show <commit>:ipn/ipnlocal/local.go` reproduces every row. Cite the commit rather than the tag, because a reader who resolves a bare path against main lands on different code and reads the audit as stale.",
+      "clone": "github.com/tailscale/tailscale cloned shallow at tag v1.102.4, sparse over cmd/tailscale/cli, cmd/tailscaled, ipn, client/web, tailcfg and feature. HEAD verified as bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8."
     },
-    "note": "This edition replaces the previous one, which audited the ten CLI parity ports merged after PRs #293-#304. These ten rows are the ports merged after that edition (#459 through #482), each re-read diff-by-diff against a shallow clone of github.com/tailscale/tailscale at v1.102.4. Two are faithful, eight carry at least one divergence from the upstream behaviour their own diff claims to port, and eleven findings are recorded with the Go path and ref each was read at. The previous edition's rows and findings remain in git history."
+    "note": "This edition replaces the previous one, which audited the CLI parity ports before them; these ten rows are the ports merged after it — #459 through #482 — each re-read diff by diff against github.com/tailscale/tailscale at v1.102.4. It reconciles two independent readings of those same ten ports. Where they agreed the rows are merged and the stronger evidence from each is kept; where one recorded a divergence the other read as faithful, the divergence is filed, because a finding carrying a Go citation is evidence and a clean verdict is only the absence of one, and the row's notes then say what the other reading concluded and why the verdict does not follow it. Two rows are faithful, eight carry at least one divergence from the upstream behaviour their own diff claims to port, and thirteen findings are recorded, each with the Go path and the ref it was read at. Counted from the rows below and consistent with them: every `gaps` row has at least one entry in `findings`, every `faithful` row has none. One finding was narrowed rather than filed as written: the kubeconfig read arm it named has since been fixed on main, so only the open-for-write arm remains. The previous editions' rows and findings remain in git history.",
+    "gate": "Recorded in the top-level `gate` block."
+  },
+  "gate": {
+    "ran": true,
+    "pass": true,
+    "detail": "All four steps green on the merge that produced this edition: `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all-targets` (40 test targets, 1213 passed, 0 failed, 5 ignored) and `cargo build --release --bins`, run with CARGO_BUILD_JOBS=4, RUST_TEST_THREADS=4 and TS_RS_EXPERIMENT=this_is_unstable_software. The tests/parity_audit_ledger.rs contract over this file passed 6 of 6 against this edition. Two environment facts were needed to get there, both about the machine and neither about the tree, and both were recorded by the editions this one reconciles. The gate has to be run with an explicit `+1.95.0`: the default toolchain here is a nightly with no clippy component, so `cargo clippy` exits immediately with `'cargo-clippy' is not installed for the toolchain 'nightly-aarch64-apple-darwin'` without compiling anything. And it has to be run with a short temp directory: tailnetd's socket-cleanup tests bind a UnixListener under std::env::temp_dir(), so a long TMPDIR pushes the path past darwin's 104-byte sun_path limit and cleanup_refuses_live_socket panics with `path must be shorter than SUN_LEN`. Under a short one all four pass, and the failure does not reproduce on the Linux CI runner."
   },
   "auditedPrs": [
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/459",
       "verdict": "gaps",
-      "notes": "The three-source auth-key precedence and all four of Go's gates (state != Running, conf == nil, no profiles or NeedsLogin) are ported faithfully, and the fork's whitespace ruling changes no outcome because Go's trimmed value is empty on that path too. The one behavioural divergence is on the reporting surface: the key's Value column carries the literal <redacted>, where Go's syspolicy list prints the decoded value for every key without exception.",
+      "notes": "The guard logic is a correct port. Upstream's `Start` consults the policy AuthKey only when an explicit key is absent, the node is not Running and no config file is in use, then skips it when profiles already exist unless the state is NeedsLogin; the fork reproduces all four conditions and the TrimSpace, and it is right that policy ranks LAST for this one key. The fork's whitespace ruling changes no outcome either, because Go's trimmed value is empty on that path too. Three divergences. On the reporting surface, the key's Value column carries the literal <redacted>, where Go's syspolicy list prints the decoded value for every key without exception. The diff's own quotation of upstream is of a `Start` that does not exist at the pinned ref, so the log text the port advertises as Go's follows the misquote rather than the real `by syspolicy` line and the key length it carries. And the skip guard keys on whether the node has logged in, where upstream keys on pm.Profiles being non-empty, which are not the same predicate for a profile that exists but never completed a login.",
       "divergences": [
-        "<redacted>"
+        "<redacted>",
+        "by syspolicy",
+        "pm.Profiles"
       ]
     },
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/463",
       "verdict": "faithful",
-      "notes": "Test-and-data only: it rewrites PARITY_AUDIT.json and the contract test over it, and claims no port of any Go behaviour. Nothing in the diff touches production code, so there is no upstream behaviour for it to diverge from. The audit content it carried is superseded by this edition rather than re-verified line by line."
+      "notes": "Test-and-data only: it rewrites PARITY_AUDIT.json and the contract test over it, claims no port of any Go behaviour and makes no behavioural claim about Go, so there is no upstream behaviour for it to diverge from. What it does claim is that the ledger contract was unsatisfiable once the audit moved past one edition's pull request numbers, and that holds: the replaced test hard-coded a specific pull request's marker set. The replacement contract is internally consistent and is what this edition was written against — totals recomputed from the rows, a `gaps` row required to carry a finding, a `faithful` row required to carry none, every divergence a row names required to be written up, and every upstream citation required to name a Go file at one pinned commit. The audit content it carried is superseded by this edition rather than re-verified row by row."
     },
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/466",
       "verdict": "gaps",
-      "notes": "The peer and Service arms now match runIP exactly: the empty-list check runs before the family check, and the returned text reaches stderr bare. Three refusals in the same ported function still answer differently. The self arm short-circuits on the daemon's own error reply, so a stopped node reads `error: node is not up` instead of Go's empty-list sentence; --assert prints fork wording; and the mutual-exclusion refusal still goes out through main's Result, so it carries the `Error: ` prefix Go never prints.",
+      "notes": "The central claim checks out exactly. Upstream's `runIP` refuses an empty address list before its match loop with `no current Tailscale IPs; state: %v`, it does so after the peer and Service resolution so an addressless peer is covered too, and it checks the empty list ahead of the per-family messages, so `-6` on an addressless node gets the empty-list sentence and not `no Tailscale IPv6 address`. All three are now reproduced, and the bare-stderr printing matches upstream's `main`. Three refusals in the same ported function still answer differently, and the diff's own body lists them as not fixed. The self arm short-circuits on the daemon's own error reply, so a stopped node reads `error: node is not up` instead of Go's state-carrying sentence. The `--assert` refusal is the fork's own sentence rather than upstream's `assertion failed` form, drops the address list upstream prints, and reaches it through a parse the upstream flag does not do. And the mutual-exclusion refusal still goes out through main's Result, so it carries the `Error: ` prefix Go never prints.",
       "divergences": [
         "node is not up",
-        "--assert",
+        "assertion failed",
         "Error: "
       ]
     },
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/469",
       "verdict": "gaps",
-      "notes": "The central claim holds: an explicit [] now withdraws the routes, an absent or null key leaves them alone, the wrapper is applied once, and the non-masked refusal formats the parsed prefix. The neighbouring arm of the same ToPrefs block is not ported: AdvertiseExitNode with no AdvertiseRoutes key replaces the routes upstream and merely sets a separate bool here. And the refusal set run on the config path is wider than ToPrefs's, because it still includes the net/netutil route rules Go applies only in the CLI.",
+      "notes": "The nil-versus-empty port is exact. Upstream guards the whole advertised-routes block with a non-nil test, and JSON `[]` decodes to a non-nil empty slice, so an explicit empty list really does set the routes empty with the Set flag on and withdraw them; the fork's `Option<Vec<String>>` now carries that distinction and an absent key falls back to the persisted prefs. Both wording fixes hold too: upstream joins the bare route errors and its two callers wrap that join once as `error parsing config to prefs`, which the fork now does once rather than per offending route, and upstream formats the parsed prefix so the reported text is the normalised spelling. Test fixtures use the RFC 5737 and RFC 3849 documentation ranges. Two divergences remain in the same block. The neighbouring arm is not ported: AdvertiseExitNode with no AdvertiseRoutes key replaces the routes upstream and merely sets a separate bool here. And the refusal set run on the config path is wider than ToPrefs's, because it still carries the net/netutil route rules Go applies only in the CLI. The second of those is disclosed in the code the diff adds, with a deployment reason, and one reading of this port recorded it as a stated deviation rather than filing it; this edition files it, because a refusal upstream does not have is a divergence whether or not the diff says so, and the row that hides it reads to the next implementer as agreement with Go.",
       "divergences": [
         "AdvertiseExitNode",
         "net/netutil"
@@ -48,7 +57,7 @@
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/472",
       "verdict": "gaps",
-      "notes": "The ported step is right: status then prefs, the log line and its address rendering, the wrapped failure, setRunWebClient(true) before the mode split, and the interrupt arm gated on listener mode plus a pref this run turned on. What the diff does not carry over is the other half of the flag it introduced: upstream's --readonly also selects ReadOnlyServerMode and its absence selects LoginServerMode, while here the flag only decides whether the daemon pref is touched.",
+      "notes": "The ported step is right, and right where upstream puts it. Upstream's `runWeb` runs it before the CGI branch and before it builds the server: it reads the status for the self address and the prefs for the web-client bit, and unless `--readonly` is set or the bit is already on it logs `starting tailscaled web client at http://<addr>` and turns the pref on, returning `starting web client in tailscaled: %w` if that fails. A failed prefs read leaves the bit false, so a node with no daemon logs the line and then fails, which is what the fork now does. The strings match verbatim, including `invalid AddrPort` for a node with no address, the address is the first entry of the self address list as upstream takes it, and the interrupt arm matches as well: gated on not being in CGI mode and on this run having been the one that turned the bit on, logging a failure to turn it back off rather than returning it, and exiting zero. Pinning the old CGI behaviour as parity was the error, and the test helper now passes `--readonly`, which is the invocation upstream answers that way. What the diff does not carry over is the other half of the flag it introduced: upstream's `--readonly` also selects ReadOnlyServerMode and its absence selects LoginServerMode, while here the flag only decides whether the daemon pref is touched.",
       "divergences": [
         "ReadOnlyServerMode"
       ]
@@ -56,7 +65,7 @@
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/476",
       "verdict": "gaps",
-      "notes": "The framing is now Go's (cause, blank line, help pointer, exit 1), cleanURLPath runs at Go's position with Go's wrapper, the --service build gap moved behind Go's own checks, and the !forService half of the --tun condition is live. But the sequence the diff documents itself as reproducing names verifyFunnelEnabled, and no port of it exists anywhere in the tree, so funnel accepts ports and nodes upstream refuses before it ever looks at the listener flags.",
+      "notes": "The framing fix is right. Upstream singles this one refusal out, printing the cause itself followed by a blank separator and returning the help pointer, whose whole text is the try-help sentence, and `main` prints that bare; three lines of stderr, which is what the fork now produces. Moving this build's own `--service` gap behind upstream's checks is right too, adding the mount-point cleaning ahead of the listener resolution matches upstream with its wrapper text, and the !forService half of the `--tun` condition is live. The order the diff reconstructs is not upstream's, though. It states that upstream runs both `--service` refusals and only then verifyFunnelEnabled, where upstream runs the funnel capability check between them — and the ported sequence has no funnel capability check at any point, because no port of it exists anywhere in the tree.",
       "divergences": [
         "verifyFunnelEnabled"
       ]
@@ -64,15 +73,15 @@
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/479",
       "verdict": "gaps",
-      "notes": "go_io_error_text and go_mkdir_all are accurate ports, and the three reported call sites — the writability probe, the MkdirAll arm and the bare non-NotExist stat arm — are fixed. Two sibling call sites in the very function the diff rewrites were left on Rust's io::Error Display, so `reading kubeconfig` and the final open-for-write still print ` (os error N)` and still use fork wording rather than Go's.",
+      "notes": "All three reported divergences check out against upstream and all three are removed. Upstream builds the refusal from a path error whose text is the C library string in Go's lowercased spelling with no errno number appended, so dropping Rust's trailing os-error suffix is the right shape; upstream's directory creation returns the error of the one mkdir that failed, naming the topmost component it could not create rather than the whole requested path, and the fork now names that component; and upstream does return a stat failure on a parent directory bare, without the cannot-write-kubeconfig wrapper, which the fork now matches. The surrounding walk, the writability probe by temp-file create and remove for a directory and by a write-only open without create or truncate for a file, the wrapper wording and the mode on the final write all agree with upstream as well, and upstream's sandboxed-macOS arm of that wrapper stays omitted with a stated platform reason, which is a legitimate gate. What the diff left behind are sibling call sites in the very function it rewrites, which stayed on Rust's io::Error Display. One of the two, the kubeconfig read, has since been routed through the Go errno speller by a later change on main; the other, opening kubeconfig for writing, still prints Rust's text and fork wording, and is what is filed below.",
       "divergences": [
-        "reading kubeconfig"
+        "opening kubeconfig"
       ]
     },
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/480",
       "verdict": "gaps",
-      "notes": "The verification is sound on the half it checks: the nil-versus-empty rule, the skip-an-undecodable-list error path and the withholding itself all match fillAllowedSuggestions and refreshAllowedSuggestions. The commit is also candid that the ranking half is unbuildable here and files it as an engine ask. That unbuilt half is a behavioural divergence all the same, because suggestExitNodeUsingDERP filters candidates before it ranks them and still returns a permitted node where this build returns nothing.",
+      "notes": "No code change, and the verification it records is accurate on the half it checks. Upstream's allowed-suggestions fill asks the policy client for a string array, returns a nil set when the key is absent, and builds a set from the decoded entries otherwise, so an unset key means no restriction and a configured empty list means nothing is permitted; the fork resolves the key to an optional set with exactly that nil-versus-empty rule and reads the decoded list rather than reparsing a rendered report row, so an identifier containing a space stays one identifier. The error path matches as well and is the half most worth getting right: upstream's caller logs the lookup error and leaves the set nil, which is no restriction, so recording an undecodable list as empty would stop every node with a malformed policy file from ever being suggested an exit node. The commit is also candid that the ranking half is unbuildable here and files it as an engine ask. That unbuilt half is a behavioural divergence all the same: suggestExitNodeUsingDERP applies the allow list to the candidate set before it ranks, so it still answers with the best permitted node where this build answers with nothing. One reading of this port took the withheld suggestion to be the same empty result upstream returns when no candidate passes; a later change in this repository, the one that pinned the allow-list gate's reply, reproduced the reasoning and recorded the divergence as real and engine-side, so it is filed here.",
       "divergences": [
         "suggestExitNodeUsingDERP"
       ]
@@ -80,57 +89,66 @@
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/481",
       "verdict": "faithful",
-      "notes": "Docs, one module-doc note, one guard-test entry and one test over a profile-less state dir. No behaviour changes. The precedence it documents is the order upstream's Start actually uses — the policy key is read only after an explicit key and after the config file's own AuthKey — so the design doc now agrees with both the code and upstream."
+      "notes": "Documentation only — one module-doc note, one guard-test entry and one test over a profile-less state dir — and the precedence claim it corrects is the one upstream implements. Upstream's `Start` takes an explicitly supplied key first, then the config file's own key including its file-path indirection, and only then asks the policy client, and it asks only when no config file is in use at all. So for this one key policy really is consulted last, which is the opposite of how policy ranks for prefs, and the design document saying policy outranks the config file was contradicting both the code and upstream. Pinning the key's definition type in the guard test and pinning the never-enrolled-host case are the right things to hold: the whole failure this port removed was a key that is configured, reported and inert."
     },
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/482",
       "verdict": "gaps",
-      "notes": "The completion and the colon rule are reproduced exactly, clause for clause, including the decision to test for a colon rather than a tag: prefix, and both daemon entry points apply it before anything is persisted. The commit's claim that the message shape is aligned to upstream's `tag: %q` does not hold: every refusal here is reworded, so both the wrapper and all four CheckTag clauses read differently from Go.",
+      "notes": "No code change, and the behaviour the verification records holds against upstream clause for clause. Upstream's up-args conversion splits the flag value on commas and, for any element containing no colon at all, prepends the tag prefix before validating; the condition really is a colon test and not a prefix test, so a value like `foo:bar` reaches the tag checker and is refused by name instead of quietly becoming a doubly-prefixed tag nobody asked for. The tag checker itself matches: cut the prefix, refuse an empty name, refuse a first byte that is not an ASCII letter, refuse any byte that is not a letter, a digit or a hyphen. The refusal quotes the completed value, which is upstream's format, upstream's own flag help documents the prefix as optional, and both daemon entry points apply the completion before anything is persisted. What does not hold is the commit's claim that the message shape is aligned to upstream's `tag: %q` wrapper: every sentence here is reworded, so the wrapper and all four checker clauses read differently from Go even though they refuse exactly the same values.",
       "divergences": [
         "tag: %q"
       ]
     }
   ],
-  "gate": {
-    "ran": true,
-    "pass": true,
-    "detail": "Run on main at b41721d. `cargo fmt --all --check` clean; `cargo clippy --all-targets -- -D warnings` clean; `cargo build --release --bins` finished. `cargo test --all-targets` failed once on this machine only: tests::cleanup_refuses_live_socket panicked with `path must be shorter than SUN_LEN` because the test binds a Unix socket under std::env::temp_dir(), which is 66 characters here and overruns the 104-byte macOS sun_path limit. Re-run with a short TMPDIR the whole suite is green: 1158 passed, 0 failed, 0 targets skipped. The failure is the environment, not the tree."
-  },
   "findings": [
     {
       "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/466",
       "title": "The addressless case the PR is named for is still unreachable on a stopped node",
-      "detail": "Upstream runIP reads Status once and, whatever the node's state, reaches `if len(ips) == 0 { return fmt.Errorf(\"no current Tailscale IPs; state: %v\", st.BackendState) }` — so `tailscale ip` on a stopped node prints `no current Tailscale IPs; state: Stopped` and exits 1. The merged self arm asks the daemon for `Request::Ip` first and, on `Response::Error`, prints `error: <daemon message>` and exits before any of the ported logic runs. A stopped node answers that request with an error, so it reads `error: node is not up` — the daemon's wording, with an `error: ` prefix Go does not use, and without the BackendState Go names. The empty-list sentence the diff added is only reachable when the daemon answers successfully with no addresses.",
-      "upstream": "cmd/tailscale/cli/ip.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
-      "severity": "major"
-    },
-    {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/476",
-      "title": "verifyFunnelEnabled is in the documented order but not in the tree",
-      "detail": "runServeCombined calls `e.verifyFunnelEnabled(ctx, 443)` for the funnel subcommand between its two --service refusals and before cleanURLPath and srvTypeAndPortFromFlags. That call runs enableFeatureInteractive and then ipn.CheckFunnelAccess / ipn.CheckFunnelPort against the self node, so upstream refuses a funnel on a node without the https and funnel attributes, and refuses a port outside the Funnel-allowed set, before it ever looks at the listener flags. check_serve_flags documents itself as running serve_v2.go's checks in serve_v2.go's order and the merge message lists verifyFunnelEnabled in that sequence, but no port of it, of CheckFunnelAccess or of CheckFunnelPort exists in the crate. `tnet funnel --https=9000 3000` is therefore configured and reported as enabled where `tailscale funnel` refuses it; the two --service refusals also sit adjacent here rather than straddling the funnel check.",
-      "upstream": "cmd/tailscale/cli/serve_v2.go (runServeCombined) and cmd/tailscale/cli/funnel.go (verifyFunnelEnabled) @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "detail": "Upstream runIP reads Status once and, whatever the node's state, reaches `if len(ips) == 0 { return fmt.Errorf(\"no current Tailscale IPs; state: %v\", st.BackendState) }` — one sentence for every addressless case, with the backend state read from the same status call. The merged self arm asks the daemon for `Request::Ip` first and, on `Response::Error`, prints `error: <daemon message>` and exits before any of the ported logic runs. A stopped node answers that request with an error, so it reads `error: node is not up` — the daemon's wording, with an `error: ` prefix Go does not use, and without the BackendState Go names. Upstream has no equivalent branch at all. The empty-list sentence the diff added is therefore only reachable when the daemon answers successfully with no addresses, which is not the state that most often produces one. The diff's body lists this under work not fixed here, so it is disclosed, but it is a divergence in the very function the diff claims to port and it is reachable by the command in the subject line. Failure: `tnet ip` on a node brought down with `tnet down` prints `error: node is not up`; `tailscale ip` prints `no current Tailscale IPs; state: Stopped`. A script matching upstream's text, which is what the rest of this change exists to let it do, does not match.",
+      "upstream": "cmd/tailscale/cli/ip.go (runIP) @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
       "severity": "major"
     },
     {
       "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/469",
       "title": "AdvertiseExitNode with no AdvertiseRoutes key does not replace the routes",
-      "detail": "ToPrefs handles the two fields as one masked pref. When AdvertiseExitNode is true and AdvertiseRoutes was absent, `mp.AdvertiseRoutes = tsaddr.ExitRoutes(); mp.AdvertiseRoutesSet = true` — so the node ends up advertising exactly the two default routes and any previously persisted subnet routes are dropped. The merged apply_to_prefs models the exit node as its own boolean and only assigns advertise_routes inside `if let Some(routes) = &c.advertise_routes`, so the same config leaves the persisted subnet routes in place beside the exit-node intent. A node advertising 192.0.2.0/24 that is handed a config of {\"AdvertiseExitNode\": true} keeps advertising 192.0.2.0/24 here and stops advertising it upstream.",
+      "detail": "ToPrefs handles the two fields as one masked pref. When AdvertiseExitNode is true and AdvertiseRoutes was absent, `mp.AdvertiseRoutes = tsaddr.ExitRoutes(); mp.AdvertiseRoutesSet = true` — so the node ends up advertising exactly the two default routes and any previously persisted subnet routes are dropped. The merged apply_to_prefs models the exit node as its own boolean, assigned after and independently of the routes, and only writes advertise_routes inside `if let Some(routes) = &c.advertise_routes`, so the same config leaves the persisted subnet routes in place beside the exit-node intent. A node advertising 192.0.2.0/24 that is handed a config of {\"AdvertiseExitNode\": true} keeps advertising 192.0.2.0/24 here and stops advertising it upstream.",
       "upstream": "ipn/conf.go (ToPrefs) @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
       "severity": "major"
     },
     {
+      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/476",
+      "title": "verifyFunnelEnabled is in the documented order but not in the tree",
+      "detail": "The diff's body states upstream's order as: the two `--service` refusals, `verifyFunnelEnabled`, `cleanURLPath`, then `srvTypeAndPortFromFlags`, and `check_serve_flags` is built to that description. Upstream's `runServeCombined` does not run the two `--service` refusals together. It refuses `--service` with funnel, then runs `verifyFunnelEnabled(ctx, 443)` for the funnel subcommand, then refuses `--service` outside background mode, then cleans the mount point, then resolves the type and port. That call runs enableFeatureInteractive and then ipn.CheckFunnelAccess / ipn.CheckFunnelPort against the self node, so upstream refuses a funnel on a node without the https and funnel attributes, and refuses a port outside the Funnel-allowed set, before it ever looks at the listener flags — a daemon round trip that can refuse the command on its own, ahead of the mount-point cleaning and ahead of the port refusal. Neither verifyFunnelEnabled nor CheckFunnelAccess nor CheckFunnelPort has a counterpart anywhere in this repository's sources, so the step is not merely misordered but absent, and the two `--service` refusals sit adjacent here rather than straddling it. Failure: on a node whose tailnet has not enabled funnel, `tnet funnel --set-path=/a/../b --https=70000` is refused with the mount-point wrapper, and after that is fixed with the too-high-port sentence, where upstream refuses both command lines first with the funnel capability error and never reaches either; the operator fixes two things that were never what stopped them. `tnet funnel --https=9000 3000` is likewise configured and reported as enabled where `tailscale funnel` refuses it.",
+      "upstream": "cmd/tailscale/cli/serve_v2.go (runServeCombined) and cmd/tailscale/cli/funnel.go (verifyFunnelEnabled) @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "severity": "major"
+    },
+    {
       "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/479",
-      "title": "Two call sites in the rewritten function still print Rust's io::Error text",
-      "detail": "setKubeconfigForPeer returns `fmt.Errorf(\"reading kubeconfig: %w\", err)` for a non-NotExist read failure — no path in the wrapper, because the *os.PathError already carries one — and returns the os.WriteFile failure completely bare, as `open <path>: permission denied`. The merged set_kubeconfig_for_peer routes neither through go_io_error_text: the read arm uses `.with_context(|| format!(\"reading kubeconfig {path}\"))` and the write arm `.with_context(|| format!(\"opening kubeconfig {path} for writing\"))`, both over the raw io::Error. A kubeconfig whose parent is readable but whose file is mode 0400 therefore still prints `opening kubeconfig /home/x/.kube/config for writing: Permission denied (os error 13)` — the exact ` (os error N)` suffix and capitalised reason this change exists to remove, on the one line an operator hits most.",
+      "title": "The final open-for-write in the rewritten function still prints Rust's io::Error text",
+      "detail": "setKubeconfigForPeer returns the os.WriteFile failure completely bare, as `open <path>: permission denied` — no wrapper, because the *os.PathError already carries the path and Go's reason string carries no errno number. The merged set_kubeconfig_for_peer does not route that arm through go_io_error_text: it is `.with_context(|| format!(\"opening kubeconfig {path} for writing\"))` over the raw io::Error. A kubeconfig whose parent is readable but whose file is mode 0400 therefore still prints `opening kubeconfig /home/x/.kube/config for writing: Permission denied (os error 13)` — the exact ` (os error N)` suffix and capitalised reason this change exists to remove, on the one line an operator hits most. The sibling read arm had the same defect when this port merged; a later change on main moved it to `reading kubeconfig: <op> <path>: <go errno text>`, so the read is now Go-shaped and the write is the remaining one.",
       "upstream": "cmd/tailscale/cli/configure-kube.go (setKubeconfigForPeer) @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
       "severity": "major"
     },
     {
       "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/480",
       "title": "Upstream filters candidates before ranking; this build withholds the ranked answer",
-      "detail": "suggestExitNodeUsingDERP applies the allow list inside its candidate loop — `if allowList != nil && !allowList.Contains(peer.StableID()) { continue }` — so the ranking runs over the permitted nodes only and returns the best permitted exit node. The merged path lets the engine rank over every candidate and then has diag::permitted_suggestion withhold the answer when the winner is excluded. On a tailnet with an excluded node and a permitted one, upstream suggests the permitted node and this build suggests nothing. The empty result upstream returns is the case where no candidate passes the filter at all, which is not the same case. The commit says so and files the ranking half as an engine ask; the divergence is recorded here because it is still a difference in what an administrator's managed node answers.",
+      "detail": "suggestExitNodeUsingDERP applies the allow list inside its candidate loop — `if allowList != nil && !allowList.Contains(peer.StableID()) { continue }` — so the ranking runs over the permitted nodes only and returns the best permitted exit node. The merged path lets the engine rank over every candidate and then has diag::permitted_suggestion withhold the answer when the winner is excluded. On a tailnet with an excluded node and a permitted one, upstream suggests the permitted node and this build suggests nothing. The empty result upstream returns is the case where no candidate passes the filter at all, which is not the same case, and on a managed fleet with a short allow list the difference is the common case rather than a corner. The commit says so and files the ranking half as an engine ask: the engine's suggest-exit-node entry point takes no allow list and never lets a candidate set cross the API, and the per-peer suggest-exit-node capability the upstream predicate needs does not leave the engine runtime. The divergence is recorded here because it is still a difference in what an administrator's managed node answers, and because the row above it would otherwise read as parity the daemon does not have.",
       "upstream": "ipn/ipnlocal/local.go (suggestExitNodeUsingDERP, fillAllowedSuggestions) @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
       "severity": "major"
+    },
+    {
+      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/459",
+      "title": "The policy auth-key log lines follow a misquoted upstream; the real Start logs \"by syspolicy\" with the key length",
+      "detail": "The merged code and its module documentation both quote upstream's `Start` as logging `Start: setting opts.AuthKey from syspolicy` and `Start: not setting opts.AuthKey from syspolicy; login profiles exist, state=%v`, inside an `if sysak != \"\"` with a nested profiles test. No such code is at the pinned ref. Upstream's block is flattened the other way: the skip case is the leading arm, its text is `not setting opts.AuthKey from syspolicy; login profiles exist, state=%v` with no `Start: ` prefix, and the take case logs `setting opts.AuthKey by syspolicy, len=%v` - `by syspolicy`, not `from syspolicy`, and carrying the key length, which is the only thing upstream reveals about the credential. The comments in `policy_auth_key` say the lines are logged the way upstream logs them and they are not, and the emitted text is a third wording again. Failure: an administrator debugging an MDM enrolment greps the daemon log for upstream's `setting opts.AuthKey by syspolicy` and finds nothing, on a node that took the policy key and enrolled with it; the length field that would tell them whether the key survived the plist round trip is not logged at all.",
+      "upstream": "ipn/ipnlocal/local.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "severity": "minor"
+    },
+    {
+      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/459",
+      "title": "The policy auth-key skip guard keys on having logged in, where upstream keys on pm.Profiles being non-empty",
+      "detail": "Upstream skips the policy auth key when `len(b.pm.Profiles()) > 0 && b.state != ipn.NeedsLogin` - the test is whether any login profile exists in the profile manager, not whether one of them ever completed a login. The merged gate supplies that input as the persisted prefs' logged-in flag. The two predicates differ for a profile that exists but has never enrolled, which is the state a node reaches after a profile is created and the login is abandoned or fails. Upstream treats that node as having profiles and declines the policy key unless the state is NeedsLogin; the fork treats it as not enrolled and uses the key. The direction matters: the guard exists so that dropping a policy file onto a host that already has profiles cannot silently re-register it, and widening the set of nodes that accept the key is the failure the guard is there to prevent. Failure: a host with an abandoned half-created profile and a policy file carrying an AuthKey enrols itself from that key on the next start; upstream logs `not setting opts.AuthKey from syspolicy; login profiles exist` and leaves it alone.",
+      "upstream": "ipn/ipnlocal/local.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "severity": "minor"
     },
     {
       "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/459",
@@ -140,30 +158,9 @@
       "severity": "minor"
     },
     {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/469",
-      "title": "The config path enforces net/netutil route rules ToPrefs does not have",
-      "detail": "ToPrefs's AdvertiseRoutes block refuses exactly one thing — a prefix with non-address bits set — and nothing else, so a Go config of {\"AdvertiseRoutes\": [\"0.0.0.0/0\"]} is accepted and applied. The counterpart rule and the 4-in-6 minimum-length rule live in net/netutil/routes.go, which the CLI's up and set call and ipn/conf.go never does. The merged apply_to_prefs runs validate_advertise_routes, which carries all three, and the same diff puts Go's ToPrefs wrapper `error parsing config to prefs: ` in front of them — so this build refuses a config upstream accepts, and attributes the refusal to a function that never produced it.",
-      "upstream": "ipn/conf.go (ToPrefs) and net/netutil/routes.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
-      "severity": "minor"
-    },
-    {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/482",
-      "title": "The tag refusals are reworded, so `tag: %q` alignment is not what shipped",
-      "detail": "prefsFromUpArgs wraps every CheckTag failure as `fmt.Errorf(\"tag: %q: %s\", tag, err)`, and tailcfg.CheckTag supplies four exact sentences: `tags must start with 'tag:'`, `tag names must not be empty`, `tag names must start with a letter, after 'tag:'` and `tag names can only contain numbers, letters, or dashes`. complete_and_validate_advertise_tags reproduces the completion and the colon rule faithfully but rewrites all five strings — the wrapper reads `invalid tag \"foo:bar\": ` and the clauses read `tags must be of the form tag:<name> (e.g. tag:server)`, `the tag name (after 'tag:') is empty`, `tag names must start with a letter (after 'tag:')` and `tag names may contain only letters, digits, or '-'`. The merge message states that the message shape is aligned and that reading the port found no behavioural difference; the completion claim holds, the wording claim does not.",
-      "upstream": "cmd/tailscale/cli/up.go (prefsFromUpArgs) and tailcfg/tailcfg.go (CheckTag) @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
-      "severity": "minor"
-    },
-    {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/472",
-      "title": "--readonly does not select ReadOnlyServerMode for the served page",
-      "detail": "runWeb builds web.ServerOpts with Mode: web.LoginServerMode and overrides it with `if webArgs.readonly { opts.Mode = web.ReadOnlyServerMode }`, so the flag upstream decides two things: whether the tailscaled web client is started, and which of the two pages is served. The merged run_web threads --readonly only into the first of those; run_web_cgi and run_status_web take no mode and always serve the read-only page. `tnet web` without --readonly therefore turns the daemon pref on and then serves the same page `tnet web --readonly` serves, where `tailscale web` serves the login/management page. The merge message states the reason (this build's page is read-only either way), so this is a disclosed build gap rather than an oversight, but it is a divergence in the function the diff ports.",
-      "upstream": "cmd/tailscale/cli/web.go (runWeb) @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
-      "severity": "minor"
-    },
-    {
       "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/466",
-      "title": "--assert failure text is fork wording, not Go's",
-      "detail": "runIP's assertion failure is `fmt.Errorf(\"assertion failed: IP %q not found among %v\", ipArgs.assert, ips)`, which quotes the value as typed and then lists the addresses the node actually holds — the list is the part that makes the failure diagnosable. The merged run_ip prints `assertion failed: this node does not hold <ip>`, naming neither the typed string nor the addresses. It also parses --assert first and refuses an unparseable value with `--assert: \"x\" is not a valid IP address`, where Go compares `ip.String() == ipArgs.assert` as strings and simply reports the assertion as failed. The diff's own message lists this as a known remainder.",
+      "title": "The --assert refusal replaces upstream's \"assertion failed\" text and matches by parsed address rather than by string",
+      "detail": "Upstream's `--assert` compares the flag value against each of the node's addresses with a plain string comparison and, on no match, returns `assertion failed: IP %q not found among %v` — the value quoted as typed, followed by the list of addresses the node actually holds, which is the part that makes the failure diagnosable. The merged run_ip parses the flag value first, refuses it with `--assert: \"x\" is not a valid IP address` if it does not parse, and on no match prints `assertion failed: this node does not hold <ip>`, naming neither the typed string nor the addresses. Two behaviours move beyond the wording. Upstream never refuses an unparseable assertion; it simply fails the assertion, so `tailscale ip --assert=nonsense` exits 1 with the assertion-failed text where the fork exits with a parse error of its own invention. And because the fork compares parsed addresses, a non-canonical spelling that upstream reports as a failed assertion is reported here as a success. The diff's body lists the text difference under work not fixed here; the parse refusal and the comparison change are not listed. Failure: `tnet ip --assert=100.064.000.001` exits 0 against a node holding 100.64.0.1; `tailscale ip --assert=100.064.000.001` exits 1, because the strings differ.",
       "upstream": "cmd/tailscale/cli/ip.go (runIP) @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
       "severity": "minor"
     },
@@ -172,6 +169,27 @@
       "title": "The mutually-exclusive-flags refusal keeps the `Error: ` prefix this diff removed elsewhere",
       "detail": "cmd/tailscale/tailscale.go's main prints a returned error with `fmt.Fprintln(os.Stderr, err)` and exits 1, so `tailscale ip -1 -4` prints the bare sentence. The whole point of routing the empty-list and family errors through an explicit eprintln plus exit(1) in this diff was to drop the `Error: ` anyhow adds on the way out of main — but ip_usage_refusal is still raised with anyhow::bail!, so the one refusal that runs before any daemon round trip reads `Error: tnet ip -1, -4, and -6 are mutually exclusive`. A script matching on the text gets two different prefixes from the same command depending on which refusal it hit. The diff's own message lists this as a known remainder.",
       "upstream": "cmd/tailscale/cli/ip.go (runIP) and cmd/tailscale/tailscale.go (main) @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "severity": "minor"
+    },
+    {
+      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/469",
+      "title": "The config path enforces net/netutil route rules ToPrefs does not have",
+      "detail": "ToPrefs's AdvertiseRoutes block refuses exactly one thing — a prefix with non-address bits set — and nothing else, so a Go config of {\"AdvertiseRoutes\": [\"0.0.0.0/0\"]} is accepted and applied. The counterpart rule and the 4-in-6 minimum-length rule live in net/netutil/routes.go, which the CLI's up and set call and ipn/conf.go never does. The merged apply_to_prefs runs validate_advertise_routes, which carries all three, and the same diff puts Go's ToPrefs wrapper `error parsing config to prefs: ` in front of them — so this build refuses a config upstream accepts, and attributes the refusal to a function that never produced it. The diff discloses the set-level rules and gives a deployment reason for keeping them; the reason is good and the divergence is still a divergence, so it is filed here rather than left in prose.",
+      "upstream": "ipn/conf.go (ToPrefs) and net/netutil/routes.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "severity": "minor"
+    },
+    {
+      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/472",
+      "title": "--readonly does not select ReadOnlyServerMode for the served page",
+      "detail": "runWeb builds web.ServerOpts with Mode: web.LoginServerMode and overrides it with `if webArgs.readonly { opts.Mode = web.ReadOnlyServerMode }`, so upstream's flag decides two things: whether the tailscaled web client is started, and which of the two pages is served. The merged run_web threads --readonly only into the first of those; run_web_cgi and run_status_web take no mode and always serve the read-only page. `tnet web` without --readonly therefore turns the daemon pref on and then serves the same page `tnet web --readonly` serves, where `tailscale web` serves the login/management page. The merge message states the reason — this build's page is read-only either way — so this is a disclosed build gap rather than an oversight, but it is a divergence in the function the diff ports, and it is why the parity claim for the flag holds for one of its two effects only.",
+      "upstream": "cmd/tailscale/cli/web.go (runWeb) @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "severity": "minor"
+    },
+    {
+      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/482",
+      "title": "The tag refusals are reworded, so `tag: %q` alignment is not what shipped",
+      "detail": "prefsFromUpArgs wraps every CheckTag failure as `fmt.Errorf(\"tag: %q: %s\", tag, err)`, and tailcfg.CheckTag supplies four exact sentences: `tags must start with 'tag:'`, `tag names must not be empty`, `tag names must start with a letter, after 'tag:'` and `tag names can only contain numbers, letters, or dashes`. complete_and_validate_advertise_tags reproduces the completion and the colon rule faithfully but rewrites all five strings — the wrapper reads `invalid tag \"foo:bar\": ` and the clauses read `tags must be of the form tag:<name> (e.g. tag:server)`, `the tag name (after 'tag:') is empty`, `tag names must start with a letter (after 'tag:')` and `tag names may contain only letters, digits, or '-'`. The merge message states that the message shape is aligned and that reading the port found no behavioural difference; the set of values refused is indeed identical, so the second claim holds, and the first does not. An operator's runbook or script keyed to Go's sentence matches none of them.",
+      "upstream": "cmd/tailscale/cli/up.go (prefsFromUpArgs) and tailcfg/tailcfg.go (CheckTag) @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
       "severity": "minor"
     }
   ]

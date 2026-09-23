@@ -1330,3 +1330,125 @@ async fn a_policy_masked_watch_front_loads_the_snapshot_and_is_pushed_on_reload(
 
     harness.shutdown_and_verify().await;
 }
+
+/// Open a masked watch with `request` (one JSON line) and return the still-open write half plus the
+/// reader. The write half must be held for the watch to stay open.
+async fn open_masked_watch(
+    harness: &Harness,
+    request: &[u8],
+) -> (
+    tokio::net::unix::OwnedWriteHalf,
+    BufReader<tokio::net::unix::OwnedReadHalf>,
+) {
+    let stream = UnixStream::connect(&harness.socket_path)
+        .await
+        .expect("CLI connect to LocalAPI socket for a masked watch");
+    let (read_half, mut write_half) = stream.into_split();
+    write_half
+        .write_all(request)
+        .await
+        .expect("write masked watch request");
+    write_half.flush().await.expect("flush watch request");
+    (write_half, BufReader::new(read_half))
+}
+
+/// Read one `Notify` frame within a bounded wait, so a regression fails instead of hanging.
+async fn read_notify(
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    what: &str,
+) -> tailscaled_rs::localapi::NotifyView {
+    match try_read_watch_status(reader, Duration::from_secs(5)).await {
+        Some(Response::Notify(view)) => view,
+        Some(other) => panic!("a masked watch streams Notify frames, got {other:?}"),
+        None => panic!("no frame arrived: {what}"),
+    }
+}
+
+/// The identity fields end to end over the real socket (Go `WatchNotificationsAs` + `sendToLocked`):
+/// an `initial_state` watch gets a session id on its first frame and never again, every frame states
+/// the daemon's version, and a second connection gets a different id.
+///
+/// The device-less daemon is the case that matters: the engine has no initial state to send, and Go's
+/// foreground `serve` reads exactly one frame for its id, so the id must arrive without an `up`.
+#[tokio::test]
+async fn an_initial_state_watch_is_given_a_session_id_once_and_a_version_always() {
+    let harness = Harness::start().await;
+    let Response::Version { version } = harness.round_trip(r#"{"cmd":"version"}"#).await else {
+        panic!("the version verb replies with a version");
+    };
+
+    // (1) `initial_state` alone on a device-less daemon: the first frame carries only identity.
+    let (_w1, mut r1) =
+        open_masked_watch(&harness, b"{\"cmd\":\"watch\",\"initial_state\":true}\n").await;
+    let first = read_notify(
+        &mut r1,
+        "an initial_state watch must send its session id immediately",
+    )
+    .await;
+    let id1 = first
+        .session_id
+        .clone()
+        .expect("the first frame of an initial_state watch carries the session id");
+    assert_eq!(id1.len(), 16, "Go's rands.HexString(16) shape, got {id1:?}");
+    assert_eq!(
+        first.version.as_deref(),
+        Some(version.as_str()),
+        "the frame names the same version `tnet version --daemon` reports"
+    );
+
+    // (2) A second connection is a different session.
+    let (_w2, mut r2) =
+        open_masked_watch(&harness, b"{\"cmd\":\"watch\",\"initial_state\":true}\n").await;
+    let id2 = read_notify(
+        &mut r2,
+        "a second initial_state watch must get its own session id",
+    )
+    .await
+    .session_id
+    .expect("the second connection's first frame carries a session id");
+    assert_ne!(
+        id1, id2,
+        "a session id must not be reused across connections"
+    );
+
+    // (3) With a prefs front-load the id rides that first real frame, and the next frame — pushed by
+    // a `down`, which persists prefs — carries the version but no id. Prefs, not policy: the prefs
+    // tick belongs to this harness's backend, while a policy reload is process-global and would push
+    // frames into the other policy watch test running alongside this one.
+    let (_w3, mut r3) = open_masked_watch(
+        &harness,
+        b"{\"cmd\":\"watch\",\"initial_state\":true,\"prefs\":true}\n",
+    )
+    .await;
+    let snapshot = read_notify(&mut r3, "the prefs front-load").await;
+    assert!(
+        snapshot.prefs.is_some(),
+        "the first frame is the prefs snapshot: {snapshot:?}"
+    );
+    let id3 = snapshot
+        .session_id
+        .expect("the id rides the first frame written, whichever feed produced it");
+    assert!(id3 != id1 && id3 != id2);
+    let Response::Ok { .. } = harness.round_trip(r#"{"cmd":"down"}"#).await else {
+        panic!("down on an offline node replies Ok");
+    };
+    let pushed = read_notify(
+        &mut r3,
+        "a down persists prefs and pushes a fresh prefs frame",
+    )
+    .await;
+    assert!(
+        pushed.prefs.is_some(),
+        "the pushed frame is prefs: {pushed:?}"
+    );
+    assert_eq!(pushed.session_id, None, "no later frame repeats the id");
+    assert_eq!(pushed.version.as_deref(), Some(version.as_str()));
+
+    // (4) Without `initial_state` there is no id, as in Go — but the version is still there.
+    let (_w4, mut r4) = open_masked_watch(&harness, b"{\"cmd\":\"watch\",\"prefs\":true}\n").await;
+    let prefs_only = read_notify(&mut r4, "the prefs front-load").await;
+    assert_eq!(prefs_only.session_id, None);
+    assert_eq!(prefs_only.version.as_deref(), Some(version.as_str()));
+
+    harness.shutdown_and_verify().await;
+}

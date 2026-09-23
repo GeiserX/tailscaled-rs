@@ -25,10 +25,11 @@
 //! Upstream: `cmd/tailscale/cli/down.go` and `cmd/tailscale/cli/risks.go` @
 //! `53a0d659afa51835dd7a9283873cca44261454f8`.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::FromRawFd;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
@@ -369,9 +370,11 @@ fn down_over_tailscale_ssh_is_refused_unless_the_risk_is_accepted() {
         out.contains("To skip this warning, use --accept-risk=lose-ssh"),
         "expected Go's own hint sentence, on stdout: {out}"
     );
-    assert!(
-        err.contains("aborted, no changes made"),
-        "a declined risk must end in Go's errAborted, so the operator reads that nothing changed: {err}"
+    // Go's `main` is `fmt.Fprintln(os.Stderr, err); os.Exit(1)`: stderr is the bare sentence, with
+    // no `Error: ` in front of it, so a script matching the whole line finds it.
+    assert_eq!(
+        err, "aborted, no changes made\n",
+        "a declined risk must end in Go's errAborted, bare, so the operator reads that nothing changed"
     );
     // The warning is the command's output, not a diagnostic: `tnet down 2>/dev/null` must still
     // show it, and `> /dev/null` must not swallow the failure.
@@ -400,6 +403,115 @@ fn down_over_tailscale_ssh_is_refused_unless_the_risk_is_accepted() {
         stderr(&off_tailnet).contains("talking to daemon at"),
         "and the round trip it made is the one that failed: {}",
         stderr(&off_tailnet)
+    );
+}
+
+/// Run the built `tnet` over a Tailscale SSH session with stdin and stdout on a fresh pseudo-terminal,
+/// `answer` already typed into it. Returns the finished run (stderr captured) and everything the
+/// terminal showed, which includes the terminal's echo of `answer`.
+///
+/// The terminal is what matters here: Go's `prompt.YesNo` only asks when stdin and stdout are both
+/// terminals, and every other test in this file runs `tnet` with pipes.
+fn tnet_on_terminal(socket: &PathBuf, args: &[&str], answer: &[u8]) -> (Output, String) {
+    let (mut master_fd, mut slave_fd) = (0, 0);
+    // SAFETY: `openpty` writes two fresh descriptors into the out-params; the null name, termios
+    // and winsize pointers are documented as "use the defaults".
+    let rc = unsafe {
+        libc::openpty(
+            &mut master_fd,
+            &mut slave_fd,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0, "openpty failed: {}", std::io::Error::last_os_error());
+    // SAFETY: both descriptors were just opened by `openpty` and nothing else owns them.
+    let (mut master, slave) = unsafe {
+        (
+            std::fs::File::from_raw_fd(master_fd),
+            std::fs::File::from_raw_fd(slave_fd),
+        )
+    };
+    // The terminal's line discipline holds the typed line until `tnet` reads it.
+    master
+        .write_all(answer)
+        .expect("type the answer into the terminal");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tnet"));
+    cmd.arg("--socket")
+        .arg(socket)
+        .args(args)
+        .env("SSH_CLIENT", "100.64.0.7 12345 22")
+        .stdin(slave.try_clone().expect("clone the terminal for stdin"))
+        .stdout(slave.try_clone().expect("clone the terminal for stdout"))
+        .stderr(Stdio::piped());
+    let child = cmd
+        .spawn()
+        .expect("the `tnet` binary built for this test should run");
+    // Only the child may hold the terminal now, or the reader below never sees it close.
+    drop(cmd);
+    drop(slave);
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut shown = Vec::new();
+        let mut buf = [0u8; 1024];
+        // EOF (macOS) or EIO (Linux) once the child has exited and the terminal is closed.
+        while let Ok(n @ 1..) = master.read(&mut buf) {
+            shown.extend_from_slice(&buf[..n]);
+        }
+        let _ = tx.send(String::from_utf8_lossy(&shown).into_owned());
+    });
+    let out = child
+        .wait_with_output()
+        .expect("wait for the `tnet` run on a terminal");
+    let shown = rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the terminal should close when `tnet` exits");
+    (out, shown)
+}
+
+/// Go's `presentRiskToUser` asks `prompt.YesNo("Continue?", false)` once it has warned. At a
+/// terminal that is a real question: `y` lets the `down` through, and anything else aborts with
+/// Go's bare `aborted, no changes made`. Only a script gets the silent abort.
+#[test]
+fn down_over_tailscale_ssh_asks_before_it_proceeds_at_a_terminal() {
+    let (socket, rx) = stub_daemon(
+        "tty-y",
+        &[
+            r#"{"kind":"status","state":"Running"}"#,
+            r#"{"kind":"ok","message":"node brought down"}"#,
+        ],
+    );
+    let (confirmed, shown) = tnet_on_terminal(&socket, &["down"], b"y\n");
+    let served = requests(&rx);
+    let _ = std::fs::remove_file(&socket);
+    assert!(
+        shown.contains("To skip this warning, use --accept-risk=lose-ssh")
+            && shown.contains("Continue? [y/N] "),
+        "the terminal should show Go's warning and then its question: {shown:?}"
+    );
+    assert!(
+        confirmed.status.success(),
+        "a `y` at the prompt must let `down` run; stderr:\n{}",
+        stderr(&confirmed)
+    );
+    assert!(
+        served.iter().any(|r| r.contains(r#""cmd":"down""#)),
+        "a confirmed `down` must reach the daemon: {served:?}"
+    );
+
+    let watch = SocketWatch::bind("tty-n");
+    let (declined, shown) = tnet_on_terminal(watch.path(), &["down"], b"n\n");
+    let connections = watch.connections();
+    assert!(
+        shown.contains("Continue? [y/N] "),
+        "the question is asked before the answer is read: {shown:?}"
+    );
+    assert_eq!(declined.status.code(), Some(1), "{declined:?}");
+    assert_eq!(stderr(&declined), "aborted, no changes made\n");
+    assert_eq!(
+        connections, 0,
+        "a declined `down` must not reach the daemon"
     );
 }
 
