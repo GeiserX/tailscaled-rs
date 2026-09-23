@@ -24,7 +24,7 @@ use crate::auth::{self, Access, AuthPolicy};
 use crate::ipn::alwayson;
 use crate::ipn::syspolicy;
 use crate::ipn::{self, Backend};
-use crate::localapi::{Request, Response};
+use crate::localapi::{Request, Response, watch_usage_refusal};
 
 /// Max bytes for a single newline-delimited request line. LocalAPI requests are tiny JSON, so this
 /// is generous; its only job is to stop a single newline-less connection from growing the read
@@ -65,10 +65,7 @@ const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// `serveShutdown` (`ipn/localapi/localapi.go`), in the order Go checks them.
 ///
 /// Separate variants (rather than one pre-rendered string) because the ladder's ORDER is the
-/// contract and a test has to be able to name which rung answered. The messages keep Go's exact
-/// phrases as their leading text — an operator or a script grepping `shutdown access denied by
-/// policy` finds the same words here — with this fork's "and here is what to do about it" clause
-/// after the colon, the house style every other refusal on this socket uses.
+/// contract and a test has to be able to name which rung answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShutdownRefusal {
     /// The caller may not write at all: not root, not the uid that owns the daemon. Go: `shutdown
@@ -80,16 +77,32 @@ pub enum ShutdownRefusal {
 }
 
 impl ShutdownRefusal {
-    /// The message the refused caller receives, verbatim.
+    /// The message the refused caller receives — **byte-for-byte what Go's `http.Error` writes** as
+    /// the 403 body, and nothing else.
+    ///
+    /// Go's bodies are the bare phrases, so these are the bare phrases. A remediation clause after a
+    /// colon would still leave Go's words as a prefix, but a consumer comparing the whole body
+    /// against upstream's would stop matching, and this fork has no reason to speak a dialect of
+    /// upstream's error text. The "and here is what to do about it" half is not lost: it goes to the
+    /// daemon's log next to the refusal ([`Self::hint`]), where the operator who can act on it is
+    /// looking anyway, rather than down a socket to a caller that was just told no.
     pub fn message(self) -> &'static str {
         match self {
+            Self::AccessDenied => "shutdown access denied",
+            Self::DeniedByPolicy => "shutdown access denied by policy",
+        }
+    }
+
+    /// What the operator would have to change for this refusal to stop happening — logged beside the
+    /// refusal, never sent on the wire (see [`Self::message`]).
+    pub fn hint(self) -> &'static str {
+        match self {
             Self::AccessDenied => {
-                "shutdown access denied: stopping the daemon requires root or the same user that \
-                 owns the daemon"
+                "stopping the daemon requires root or the same user that owns the daemon"
             }
             Self::DeniedByPolicy => {
-                "shutdown access denied by policy: set AllowTailscaledRestart to true in the \
-                 daemon's system policy file (see `tnet syspolicy list`) to permit it"
+                "set AllowTailscaledRestart to true in the daemon's system policy file (see `tnet \
+                 syspolicy list`) to permit it"
             }
         }
     }
@@ -132,7 +145,48 @@ fn shutdown_allowed_by_policy() -> bool {
     syspolicy::get_boolean(syspolicy::PKEY_ALLOW_TAILSCALED_RESTART, false)
 }
 
+/// The error [`serve`] returns when the LocalAPI `shutdown` verb — and only that verb — ended the
+/// accept loop. It exists to make the daemon exit **non-zero**, which is the whole point of the verb.
+///
+/// Upstream never returns "stopped on request" as a success. `serveShutdown` publishes
+/// `localapi.Shutdown`; the sole subscriber in `ipn/ipnserver/server.go` calls `ln.Close()`;
+/// `hs.Serve(ln)` then fails on the closed listener and `Run` returns that error — and because the
+/// context was NOT cancelled, `cmd/tailscaled/tailscaled.go` does not take its
+/// `errors.Is(err, context.Canceled)` escape and hands the error to `log.Fatal`. Upstream tailscaled
+/// therefore exits 1, its packaged unit's `Restart=on-failure` starts it again, and that is why the
+/// policy key authorising the verb is spelled `AllowTailscaledRestart` and not `AllowShutdown`.
+///
+/// Returning `Ok(())` here instead would invert that on this fork specifically, because the units
+/// `tnet install` writes restart on failure only — `Restart=on-failure` in
+/// `packaging/systemd/tailnetd{,-tun}.service`, `KeepAlive = {Crashed: true, SuccessfulExit: false}`
+/// in `packaging/launchd/cloud.tailscaled-rs.tailnetd.plist`. A clean exit is not a failure to either
+/// of them, so a verb named for a restart would have permanently stopped the daemon.
+///
+/// The SIGINT/SIGTERM path is unaffected and still returns `Ok(())`: that is upstream's cancelled
+/// context, the one case its `run()` deliberately maps to a nil error. So the exit status keeps
+/// saying what it always said — 0 means "someone asked this process to go away", non-zero means
+/// "bring me back" — and the two stops stay distinguishable to the service manager, which is the
+/// only consumer that has to tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoppedByLocalApi;
+
+impl std::fmt::Display for StoppedByLocalApi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "stopped by the LocalAPI `shutdown` verb; exiting non-zero so the service manager \
+             restarts the daemon (the policy key that permits this is AllowTailscaledRestart)"
+        )
+    }
+}
+
+impl std::error::Error for StoppedByLocalApi {}
+
 /// Run the LocalAPI server until `shutdown` resolves, then clean up the socket.
+///
+/// Returns `Ok(())` when the caller-supplied `shutdown` future ended it (SIGINT/SIGTERM) and
+/// [`StoppedByLocalApi`] when the LocalAPI `shutdown` verb did — the teardown is identical, only the
+/// exit status differs, and it differs on purpose. See [`StoppedByLocalApi`].
 pub async fn serve(
     socket_path: &Path,
     backend: Arc<Mutex<Backend>>,
@@ -173,7 +227,9 @@ pub async fn serve(
     // notifies it AFTER acknowledging the request, and the accept loop below treats it exactly like
     // the caller-supplied `shutdown` future (SIGINT/SIGTERM). That is the whole mechanism — no
     // `process::exit`, no second teardown path: the listener is dropped, in-flight connections
-    // drain, the socket is unlinked, `serve` returns `Ok(())` and the daemon's own shutdown runs.
+    // drain, the socket is unlinked and the daemon's own shutdown runs. The ONE difference from the
+    // signal path is the value `serve` finally returns, and hence the process's exit status: see
+    // `StoppedByLocalApi`.
     //
     // `Notify::notify_one` (not `notify_waiters`) is what makes this race-free: it stores a permit
     // when nobody is parked yet, so a stop requested while the loop is inside `accept()` is still
@@ -181,6 +237,12 @@ pub async fn serve(
     let stop_requested = Arc::new(Notify::new());
     let stop_waiter = Arc::clone(&stop_requested);
     let stop_signal = async move { stop_waiter.notified().await };
+
+    // Which arm ended the accept loop. Not a detail: it is the exit status, and the exit status is
+    // what the service manager reads to decide whether to start the daemon again — the difference
+    // between a `shutdown` verb that restarts the daemon (upstream's behaviour, and the name of the
+    // key that permits it) and one that stops it for good.
+    let mut stopped_by_localapi = false;
 
     tokio::pin!(shutdown);
     tokio::pin!(stop_signal);
@@ -191,6 +253,7 @@ pub async fn serve(
             // acknowledged on its own connection, so there is nothing left to do but stop accepting.
             () = &mut stop_signal => {
                 tracing::info!("LocalAPI shutdown requested; stopping");
+                stopped_by_localapi = true;
                 break;
             }
             accepted = listener.accept() => {
@@ -244,6 +307,11 @@ pub async fn serve(
 
     let _ = tokio::fs::remove_file(socket_path).await;
     tracing::info!("LocalAPI stopped");
+    // The teardown above is the same either way — only the answer to "was this a failure?" differs,
+    // and only the service manager is asking.
+    if stopped_by_localapi {
+        return Err(StoppedByLocalApi.into());
+    }
     Ok(())
 }
 
@@ -333,6 +401,23 @@ async fn handle_conn(
                         prefs,
                         policy,
                     }) => {
+                        // Judge the SUBSCRIPTION before subscribing it to anything: Go's
+                        // `serveWatchIPNBus` runs all of its refusals ahead of `WatchNotifications`,
+                        // so a refused watcher never takes a resource and never emits a frame. A
+                        // refusal is a request-level error like a denied `nc` — write the error line
+                        // and keep the request loop alive, because this connection was never
+                        // hijacked. Nothing on today's wire can trigger it (see
+                        // `watch_usage_refusal`); the call sits here so that the day a mask field
+                        // carrying one of Go's refusals lands, the refusal is already wired.
+                        if let Some(message) = watch_usage_refusal(&Request::Watch {
+                            initial_state,
+                            initial_netmap,
+                            prefs,
+                            policy,
+                        }) {
+                            write_response(&mut write_half, &Response::Error { message }).await?;
+                            continue;
+                        }
                         // A long-lived stream: take a permit from the SEPARATE stream budget so a
                         // flood of `Watch` connections can't starve the short-lived control pool. If
                         // the stream budget is exhausted, refuse cleanly (the client can retry) rather
@@ -468,10 +553,13 @@ async fn handle_conn(
                         {
                             // Audit every refused attempt to stop the daemon, naming which rung
                             // answered — an unauthorized caller probing the socket and a permitted
-                            // caller hitting a policy that says no are different events.
+                            // caller hitting a policy that says no are different events. The
+                            // remediation rides here rather than on the wire: the caller gets Go's
+                            // bare phrase, the operator who can act on it gets the whole story.
                             tracing::warn!(
                                 peer_uid = ?peer_uid,
                                 refusal = ?refusal,
+                                hint = refusal.hint(),
                                 "denied LocalAPI shutdown"
                             );
                             write_response(
@@ -646,6 +734,20 @@ async fn stream_watch(
 /// Neither is tied to a device epoch: prefs change on a down node, and policy is resolved from the
 /// process-global registry rather than the netmap, so both are also served on the device-less arm.
 ///
+/// ## A reader that falls behind is NOT told (engine gap, `docs/ENGINE_ASKS.md` #45)
+///
+/// Frames are written to the socket inline, so a slow client stalls `watcher.next()` and the engine's
+/// 128-deep per-watcher queue fills. Go disconnects such a watcher: `sendToLocked` drains its queue,
+/// sends one terminal `Notify` whose `ErrMessage` is `"IPN bus consumer fell behind; closing watch"`,
+/// and closes it, so the client knows to re-subscribe. The engine's bus instead drops the frame and
+/// keeps streaming, and records nothing, so this function cannot tell a gap happened. It does not
+/// guess (a write timeout or a queue-depth estimate would be a facsimile). Once the engine reports
+/// lag, the handling is: drop the watcher (discarding queued frames), write one
+/// [`NotifyView::error`](crate::localapi::NotifyView::error) frame, return — in that order.
+///
+/// The daemon-built prefs and policy feeds are not affected: they ride `tokio::sync::watch`, which
+/// coalesces to the latest full snapshot instead of dropping an entry, so a slow reader loses nothing.
+///
 /// ## Lock discipline (the load-bearing rule)
 ///
 /// The backend guard is held only for the brief `watch_lifecycle()` subscribe and the brief
@@ -654,16 +756,6 @@ async fn stream_watch(
 /// device `Arc` out under the lock, drop the lock, then subscribe + stream off-lock — exactly the
 /// "clone the work out, drop the lock" discipline [`stream_nc`] and the other slow engine calls use —
 /// so a notify watcher never head-of-line blocks a concurrent `up`/`down`/`status`.
-///
-/// ## A reader that falls behind is not told (engine-gated)
-///
-/// Go (`sendToLocked` → `closeLaggingWatchSessionLocked`) disconnects a watcher whose 128-deep queue
-/// fills. It drains the queue, sends one `"IPN bus consumer fell behind; closing watch"` frame, and
-/// closes. This fork's engine drops the frame on a full queue and records nothing, so from
-/// `watcher.next()` a dropped notification looks like no notification. This function therefore cannot
-/// send Go's terminal frame. Guessing at lag here (a write timeout, a queue-depth estimate) would be a
-/// facsimile, so it is not done. See `docs/ENGINE_ASKS.md` ask #45. The prefs and policy feeds are
-/// not affected: they are full snapshots over `watch`, which coalesces instead of dropping.
 async fn stream_notify(
     write_half: &mut tokio::net::unix::OwnedWriteHalf,
     backend: &Arc<Mutex<Backend>>,
@@ -700,15 +792,35 @@ async fn stream_notify(
     // reason: a reload landing between here and the first select must not be lost.
     let mut policy_rx = Backend::watch_policy();
 
+    // One identity per connection, minted before the first frame and kept across device epochs: the
+    // session id goes out once, on whichever frame is written first.
+    let mut session = match NotifySession::new(initial_state) {
+        Ok(session) => session,
+        Err(e) => {
+            let _ = write_response(
+                write_half,
+                &Response::Error {
+                    message: e.to_string(),
+                },
+            )
+            .await;
+            return Ok(());
+        }
+    };
+
     // `prefs` front-load: emit the current prefs as the first frame (Go `NotifyInitialPrefs`). Done
     // once up front (daemon-built, not tied to a device epoch). A write error = client gone.
-    if prefs && emit_prefs_frame(write_half, backend).await.is_err() {
+    if prefs
+        && emit_prefs_frame(write_half, &mut session, backend)
+            .await
+            .is_err()
+    {
         return Ok(());
     }
     // `policy` front-load: Go's `NotifySysPolicyChanges` explicitly makes the FIRST notify — sent
     // immediately — carry the current effective snapshot, so this is part of the bit's contract, not
     // an optimisation. Also daemon-built and epoch-independent.
-    if policy && emit_policy_frame(write_half).await.is_err() {
+    if policy && emit_policy_frame(write_half, &mut session).await.is_err() {
         return Ok(());
     }
 
@@ -720,6 +832,10 @@ async fn stream_notify(
         let dev = { backend.lock().await.device_handle() };
 
         let Some(dev) = dev else {
+            // No engine frame is coming, so a still-unsent session id goes out on its own now.
+            if flush_session_id(write_half, &mut session).await.is_err() {
+                return Ok(()); // client hung up
+            }
             // No device this epoch: nothing to stream from the bus. Wait for the next lifecycle change
             // — but ALSO keep serving prefs ticks if the `prefs` bit is set (prefs can change while the
             // node is down, e.g. a `set` on a down node), so a prefs watcher isn't deaf between epochs.
@@ -734,7 +850,7 @@ async fn stream_notify(
                     if res.is_err() {
                         return Ok(()); // prefs sender dropped (daemon gone)
                     }
-                    if emit_prefs_frame(write_half, backend).await.is_err() {
+                    if emit_prefs_frame(write_half, &mut session, backend).await.is_err() {
                         return Ok(()); // client hung up
                     }
                     continue; // still no device — loop back to the device-derive/wait
@@ -746,7 +862,7 @@ async fn stream_notify(
                     if res.is_err() {
                         return Ok(()); // policy sender dropped (process gone)
                     }
-                    if emit_policy_frame(write_half).await.is_err() {
+                    if emit_policy_frame(write_half, &mut session).await.is_err() {
                         return Ok(()); // client hung up
                     }
                     continue; // still no device — loop back to the device-derive/wait
@@ -761,6 +877,9 @@ async fn stream_notify(
             Ok(w) => w,
             Err(e) => {
                 tracing::debug!(error = %e, "watch_ipn_bus failed; awaiting lifecycle change");
+                if flush_session_id(write_half, &mut session).await.is_err() {
+                    return Ok(()); // client hung up
+                }
                 if life.changed().await.is_err() {
                     return Ok(());
                 }
@@ -790,10 +909,7 @@ async fn stream_notify(
                                 // than emit a meaningless frame.
                                 continue;
                             };
-                            if write_response(write_half, &Response::Notify(view))
-                                .await
-                                .is_err()
-                            {
+                            if write_notify(write_half, &mut session, view).await.is_err() {
                                 return Ok(()); // client hung up
                             }
                         }
@@ -813,7 +929,7 @@ async fn stream_notify(
                     if res.is_err() {
                         return Ok(()); // prefs sender dropped (daemon gone)
                     }
-                    if emit_prefs_frame(write_half, backend).await.is_err() {
+                    if emit_prefs_frame(write_half, &mut session, backend).await.is_err() {
                         return Ok(()); // client hung up
                     }
                 }
@@ -823,7 +939,7 @@ async fn stream_notify(
                     if res.is_err() {
                         return Ok(()); // policy sender dropped (process gone)
                     }
-                    if emit_policy_frame(write_half).await.is_err() {
+                    if emit_policy_frame(write_half, &mut session).await.is_err() {
                         return Ok(()); // client hung up
                     }
                 }
@@ -832,20 +948,96 @@ async fn stream_notify(
     }
 }
 
+/// The version a notify frame states (Go fills `Notify.Version` with `version.Long()`). The same
+/// string the `version` verb answers with, so a watcher and `tnet version --daemon` agree.
+const NOTIFY_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Per-connection identity for a masked watch: the two fields Go's notify path puts on frames that
+/// no feed produces. `version` goes on every frame; the session id goes on the first frame only, and
+/// only when the watch asked for `initial_state` (Go `WatchNotificationsAs` gates `SessionID` on
+/// `NotifyInitialState`). Every frame of a masked watch goes through [`stamp`](Self::stamp), so no
+/// feed can forget either field.
+///
+/// The id is not yet load-bearing — see [`Request::Watch::initial_state`](crate::localapi::Request::Watch).
+struct NotifySession {
+    /// The session id still waiting for its first frame; `None` once sent, or if never asked for.
+    pending_id: Option<String>,
+}
+
+impl NotifySession {
+    /// Mint the session for one connection. Fails only if the OS entropy source does.
+    fn new(initial_state: bool) -> std::io::Result<Self> {
+        let pending_id = if initial_state {
+            Some(new_session_id()?)
+        } else {
+            None
+        };
+        Ok(Self { pending_id })
+    }
+
+    /// Whether the session id has yet to go out.
+    fn is_pending(&self) -> bool {
+        self.pending_id.is_some()
+    }
+
+    /// Fill the identity fields on a frame about to be written.
+    fn stamp(&mut self, mut view: crate::localapi::NotifyView) -> crate::localapi::NotifyView {
+        view.version = Some(NOTIFY_VERSION.to_string());
+        view.session_id = self.pending_id.take();
+        view
+    }
+}
+
+/// A fresh watch session id: 16 hex characters from the OS CSPRNG, the shape of Go's
+/// `rands.HexString(16)`. Random rather than a counter so an id is not reused across daemon restarts
+/// either; 64 random bits makes a repeat among live watches negligible.
+fn new_session_id() -> std::io::Result<String> {
+    let mut bytes = [0u8; 8];
+    getrandom::fill(&mut bytes)
+        .map_err(|e| std::io::Error::other(format!("generating a watch session id: {e}")))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Write one notify frame, stamped with the session's identity fields. Returns `Err` if the client
+/// hung up.
+async fn write_notify(
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    session: &mut NotifySession,
+    view: crate::localapi::NotifyView,
+) -> Result<()> {
+    write_response(write_half, &Response::Notify(session.stamp(view))).await
+}
+
+/// If the session id has not gone out yet, send it now on a frame carrying only the identity fields.
+/// Called before parking where no engine frame is coming (no device, or the bus subscribe failed), so
+/// a client that reads one frame for its id — as Go's foreground `serve` does — is not left waiting
+/// for an `up`. Returns `Err` if the client hung up.
+async fn flush_session_id(
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    session: &mut NotifySession,
+) -> Result<()> {
+    if !session.is_pending() {
+        return Ok(());
+    }
+    write_notify(write_half, session, crate::localapi::NotifyView::default()).await
+}
+
 /// Emit one `Response::Notify { prefs: Some(current prefs) }` frame (the daemon-built prefs feed).
 /// A brief await-free lock reads the projection; returns `Err` if the client hung up (so the caller
 /// returns `Ok(())` and ends the stream). Shared by the front-load + both prefs select arms.
 async fn emit_prefs_frame(
     write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    session: &mut NotifySession,
     backend: &Arc<Mutex<Backend>>,
 ) -> Result<()> {
     let view = { backend.lock().await.prefs_view() };
-    write_response(
+    write_notify(
         write_half,
-        &Response::Notify(crate::localapi::NotifyView {
+        session,
+        crate::localapi::NotifyView {
             prefs: Some(view),
             ..Default::default()
-        }),
+        },
     )
     .await
 }
@@ -858,13 +1050,17 @@ async fn emit_prefs_frame(
 /// so this never touches the lock — and a `syspolicy reload` therefore cannot be head-of-line blocked
 /// by a slow `up`. Returns `Err` if the client hung up (so the caller returns `Ok(())` and ends the
 /// stream). Shared by the front-load + both policy select arms.
-async fn emit_policy_frame(write_half: &mut tokio::net::unix::OwnedWriteHalf) -> Result<()> {
-    write_response(
+async fn emit_policy_frame(
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    session: &mut NotifySession,
+) -> Result<()> {
+    write_notify(
         write_half,
-        &Response::Notify(crate::localapi::NotifyView {
+        session,
+        crate::localapi::NotifyView {
             policy: Some(Backend::policy_snapshot()),
             ..Default::default()
-        }),
+        },
     )
     .await
 }
@@ -897,6 +1093,10 @@ fn project_notify(notify: tailscale::Notify) -> Option<crate::localapi::NotifyVi
     let browse_to_url = notify.browse_to_url.map(|u| u.to_string());
 
     let view = crate::localapi::NotifyView {
+        // The identity fields are not engine fields either: `NotifySession::stamp` sets them on the
+        // way out, so every frame gets them from one place whichever feed produced it.
+        version: None,
+        session_id: None,
         state,
         error,
         browse_to_url,
@@ -1570,6 +1770,12 @@ async fn dispatch(
             let mut be = backend.lock().await;
             switch_outcome_response(be.create_profile(&id).await)
         }
+        // `login`'s first step (Go `LocalClient.SwitchToEmptyProfile`): move to a new, empty profile
+        // so the login and its `--nickname` do not land on the profile the node was already on.
+        Request::SwitchToEmptyProfile => {
+            let mut be = backend.lock().await;
+            switch_outcome_response(be.switch_to_empty_profile().await)
+        }
         // `switch remove <id>` (Go `tailscale switch remove`). Refuses an unknown profile, and the
         // reserved `default` one; the CURRENT profile is left alone and reported as a success, which
         // is what Go's `removeProfile` does (`Already on account %q`, exit 0) — see `DeleteOutcome`.
@@ -2021,6 +2227,65 @@ mod tests {
     use tokio::io::AsyncWriteExt;
     use tokio::net::UnixStream;
 
+    /// Go mints `rands.HexString(16)` per watch: 16 hex characters, fresh each time. The id will key
+    /// server-side state, so two connections must never share one.
+    #[test]
+    fn a_watch_session_id_is_sixteen_hex_chars_and_fresh_per_call() {
+        let ids: Vec<String> = (0..64).map(|_| new_session_id().unwrap()).collect();
+        for id in &ids {
+            assert_eq!(id.len(), 16, "Go's rands.HexString(16) shape, got {id:?}");
+            assert!(
+                id.chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+                "lowercase hex, got {id:?}"
+            );
+        }
+        let distinct: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(distinct.len(), ids.len(), "an id was reused: {ids:?}");
+    }
+
+    /// `initial_state` asks for the id: it rides the FIRST frame only (Go's field doc tells clients to
+    /// store it because no later frame repeats it), while `version` rides every frame.
+    #[test]
+    fn the_session_id_rides_only_the_first_frame_and_the_version_rides_all() {
+        let mut session = NotifySession::new(true).unwrap();
+        assert!(session.is_pending());
+
+        let first = session.stamp(crate::localapi::NotifyView {
+            state: Some("Running".into()),
+            ..Default::default()
+        });
+        let id = first
+            .session_id
+            .clone()
+            .expect("the first frame of an initial_state watch carries the session id");
+        assert_eq!(id.len(), 16);
+        assert_eq!(first.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        assert_eq!(
+            first.state.as_deref(),
+            Some("Running"),
+            "stamping keeps the payload"
+        );
+        assert!(!session.is_pending());
+
+        let second = session.stamp(crate::localapi::NotifyView::default());
+        assert_eq!(second.session_id, None, "no later frame repeats the id");
+        assert_eq!(second.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+    }
+
+    /// Go gates `SessionID` on `NotifyInitialState`: a watch that did not ask for it gets no id on
+    /// any frame, but still gets the version on every one.
+    #[test]
+    fn a_watch_without_initial_state_gets_a_version_but_no_session_id() {
+        let mut session = NotifySession::new(false).unwrap();
+        assert!(!session.is_pending());
+        for _ in 0..2 {
+            let frame = session.stamp(crate::localapi::NotifyView::default());
+            assert_eq!(frame.session_id, None);
+            assert_eq!(frame.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        }
+    }
+
     /// Drive `read_capped_line` with `input`: write the bytes into one end of a `UnixStream` pair
     /// (off-task so a write larger than the socket buffer cannot deadlock against the reader), drop
     /// the writer so EOF is observable, then read exactly one line from the other end's read half.
@@ -2213,29 +2478,44 @@ mod tests {
         );
     }
 
-    /// The two refusals have to be distinguishable, because they are different problems with
-    /// different fixes ("you may not" vs "nobody may"), and each keeps Go's phrase as its leading
-    /// text so an operator or a script grepping for upstream's wording still finds it.
+    /// Each refusal is Go's 403 body and NOTHING ELSE. `http.Error(w, "shutdown access denied",
+    /// …)` writes exactly those bytes, so a consumer that compares a whole body against upstream's
+    /// has to keep matching here. Pinned with `assert_eq!` rather than `starts_with`, because a
+    /// prefix assertion is precisely what let a remediation clause grow onto the end of Go's
+    /// sentence without any test noticing.
     #[test]
-    fn the_two_refusals_carry_gos_distinct_phrases() {
-        let access = ShutdownRefusal::AccessDenied.message();
-        let policy = ShutdownRefusal::DeniedByPolicy.message();
-        assert!(
-            access.starts_with("shutdown access denied:"),
-            "the access refusal must lead with Go's phrase, got: {access}"
+    fn the_two_refusals_are_gos_bodies_verbatim() {
+        assert_eq!(
+            ShutdownRefusal::AccessDenied.message(),
+            "shutdown access denied"
         );
-        assert!(
-            policy.starts_with("shutdown access denied by policy:"),
-            "the policy refusal must lead with Go's phrase, got: {policy}"
+        assert_eq!(
+            ShutdownRefusal::DeniedByPolicy.message(),
+            "shutdown access denied by policy"
         );
-        assert_ne!(
-            access, policy,
-            "a caller must be able to tell `you may not` from `nobody may`"
+    }
+
+    /// The remediation an operator needs did not disappear when it came off the wire — it is on the
+    /// refusal, for the log line to carry. Held here so a future edit cannot quietly empty it and
+    /// leave the log saying only "denied".
+    #[test]
+    fn each_refusal_carries_an_off_the_wire_remediation() {
+        let access = ShutdownRefusal::AccessDenied.hint();
+        let policy = ShutdownRefusal::DeniedByPolicy.hint();
+        assert!(
+            access.contains("root"),
+            "the access hint must say who may stop the daemon, got: {access}"
         );
         assert!(
             policy.contains("AllowTailscaledRestart"),
-            "the policy refusal must name the key that lifts it, got: {policy}"
+            "the policy hint must name the key that lifts the refusal, got: {policy}"
         );
+        for hint in [access, policy] {
+            assert!(
+                !hint.starts_with("shutdown access denied"),
+                "the hint is logged BESIDE the message, not appended to it, got: {hint}"
+            );
+        }
     }
 
     /// `shutdown` is a write for the authorization gate. Pinned through the gate itself (not
