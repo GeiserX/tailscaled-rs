@@ -29,39 +29,40 @@ const PREFS: &str = include_str!("../src/prefs.rs");
 const THREAT_MODEL: &str = include_str!("../docs/THREAT_MODEL.md");
 const SYSPOLICY: &str = include_str!("../src/ipn/syspolicy.rs");
 
-/// Every c2n handler upstream registers, exactly as its `RegisterC2N` call spells the pattern, at
-/// tailscale `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8` (v1.102.4). Found by
-/// `grep -rn 'RegisterC2N(' --include='*.go'` over that tree, tests excluded. The ask scopes the
-/// hook against this census, so a handler missing from it is a decision nobody took.
-const UPSTREAM_C2N_HANDLERS: &[&str] = &[
-    // ipn/ipnlocal/c2n.go
-    "/echo",
-    "POST /logtail/flush",
-    "POST /sockstats",
-    "/debug/pprof/heap",
-    "/debug/pprof/allocs",
-    "/debug/goroutines",
-    "/debug/prefs",
-    "/debug/metrics",
-    "/debug/component-logging",
-    "/debug/logheap",
-    "/debug/netmap",
-    "/debug/health",
-    "POST /netfilter-kind",
-    // ipn/ipnlocal/serve.go, ipn/ipnlocal/cert.go
-    "GET /vip-services",
-    "GET /tls-cert-status",
-    // ssh/tailssh/tailssh.go
-    "/ssh/usernames",
-    // feature/*
-    "GET /conn25/state",
-    "GET /posture/identity",
-    "GET /appconnector/routes",
-    "/debug/tka/log",
-    "POST /wol",
-    "GET /update",
-    "POST /update",
+/// Every c2n handler upstream registers at `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8` (v1.102.4),
+/// method prefix dropped, each with the Go file that registers it. A census that misses one scopes
+/// the hook against a table that is not upstream's.
+const GO_C2N_HANDLERS: &[(&str, &str)] = &[
+    ("/echo", "ipn/ipnlocal/c2n.go"),
+    ("/logtail/flush", "ipn/ipnlocal/c2n.go"),
+    ("/sockstats", "ipn/ipnlocal/c2n.go"),
+    ("/debug/pprof/heap", "ipn/ipnlocal/c2n.go"),
+    ("/debug/pprof/allocs", "ipn/ipnlocal/c2n.go"),
+    ("/debug/goroutines", "ipn/ipnlocal/c2n.go"),
+    ("/debug/prefs", "ipn/ipnlocal/c2n.go"),
+    ("/debug/metrics", "ipn/ipnlocal/c2n.go"),
+    ("/debug/component-logging", "ipn/ipnlocal/c2n.go"),
+    ("/debug/logheap", "ipn/ipnlocal/c2n.go"),
+    ("/debug/netmap", "ipn/ipnlocal/c2n.go"),
+    ("/debug/health", "ipn/ipnlocal/c2n.go"),
+    ("/netfilter-kind", "ipn/ipnlocal/c2n.go"),
+    ("/update", "feature/clientupdate/clientupdate.go"),
+    ("/posture/identity", "feature/posture/posture.go"),
+    (
+        "/appconnector/routes",
+        "feature/appconnectors/appconnectors.go",
+    ),
+    ("/wol", "feature/wakeonlan/wakeonlan.go"),
+    ("/vip-services", "ipn/ipnlocal/serve.go"),
+    ("/tls-cert-status", "ipn/ipnlocal/cert.go"),
+    ("/ssh/usernames", "ssh/tailssh/tailssh.go"),
+    ("/debug/tka/log", "feature/tailnetlock/tailnetlock.go"),
+    ("/conn25/state", "feature/conn25/conn25.go"),
 ];
+
+/// The two paths the engine already answers itself, which the ask keeps engine-side rather than
+/// listing as answered or declined.
+const ENGINE_ANSWERED: &[&str] = &["/echo", "/vip-services"];
 
 /// The ask, matched by its number so a retitle that keeps the ask intact still resolves.
 const ASK_HEADING_PREFIX: &str = "## 43.";
@@ -280,85 +281,84 @@ fn the_reduced_prefs_point_at_an_ask_that_covers_them() {
     }
 }
 
-/// The text of the answered-first bullet that opens with `lead`, up to the next bullet.
-fn answered_bullet(lead: &str) -> &'static str {
-    let answered = subsection(ANSWERED_HEADING);
-    let start = answered
-        .find(lead)
-        .unwrap_or_else(|| panic!("ask #43 should still carry a `{lead}` bullet"));
-    let body = &answered[start..];
-    match body[lead.len()..].find("\n- ") {
-        Some(end) => &body[..lead.len() + end],
-        None => body,
-    }
+/// The bullet of the answered subsection whose bold lead names `path`, up to the next bullet.
+fn answered_bullet(path: &str) -> &'static str {
+    subsection(ANSWERED_HEADING)
+        .split("\n- ")
+        .skip(1)
+        .find(|bullet| {
+            bullet
+                .lines()
+                .next()
+                .is_some_and(|lead| lead.starts_with("**") && lead.contains(path))
+        })
+        .unwrap_or_else(|| panic!("ask #43 should still answer `{path}` in its own bullet"))
 }
 
-/// Every handler upstream registers is placed on one side of the line: answered first (or already
-/// answered by the engine), or declined with a reason. A handler the ask never names is neither
-/// promised nor refused, and whoever implements the hook has no ruling for it.
+/// Every upstream c2n handler is accounted for: named in the ask, and — unless the engine already
+/// answers it — placed on one side of the answered/declined line.
 #[test]
-fn every_upstream_c2n_handler_is_answered_or_declined() {
+fn the_census_names_every_handler_go_registers() {
+    let named = c2n_paths(ask_section());
     let answered = c2n_paths(subsection(ANSWERED_HEADING));
     let declined = c2n_paths(subsection(DECLINED_HEADING));
 
-    let unplaced: Vec<&str> = UPSTREAM_C2N_HANDLERS
-        .iter()
-        .map(|pattern| pattern.split_once(' ').map_or(*pattern, |(_, path)| path))
-        .filter(|path| !answered.iter().chain(&declined).any(|p| p == path))
-        .collect();
-    assert!(
-        unplaced.is_empty(),
-        "ask #43 neither answers nor declines upstream's {unplaced:?} (registered with RegisterC2N \
-         at bbcd7d1); its census is incomplete"
-    );
+    for (path, go_file) in GO_C2N_HANDLERS {
+        assert!(
+            named.iter().any(|p| p == path),
+            "Go registers c2n `{path}` in `{go_file}`, but ask #43 never names it, so its census \
+             of upstream's handlers is incomplete"
+        );
+        if ENGINE_ANSWERED.contains(path) {
+            continue;
+        }
+        assert!(
+            answered.iter().any(|p| p == path) || declined.iter().any(|p| p == path),
+            "Go registers c2n `{path}` in `{go_file}`, but ask #43 neither answers nor declines it"
+        );
+    }
 }
 
-/// Go's `handleC2NUpdatePost` refuses `not enabled` before it ever checks `Supported`, so a node
-/// that never opted in hears `not enabled`, and `not supported` is only the answer once it has.
-/// This fork's `Supported` is always false, so an ask that names only the second string would have
-/// every node answer it — the wrong reason for all of them that left the pref unset.
+/// Go's `handleC2NUpdatePost` checks `Enabled` before `Supported`, so a node with the pref unset or
+/// `false` answers `not enabled`; `not supported` is only the answer once the pref is `true`.
 #[test]
 fn post_update_refuses_not_enabled_before_not_supported() {
-    let bullet = answered_bullet("- **`GET /update` and `POST /update`**");
-
+    let bullet = answered_bullet("/update");
     let not_enabled = bullet.find("\"not enabled\"").unwrap_or_else(|| {
         panic!(
-            "the /update bullet must name Go's first refusal, `Err: \"not enabled\"`, which \
-             `handleC2NUpdatePost` returns while `Enabled` is false"
+            "ask #43's `/update` handler omits Go's `\"not enabled\"` refusal, which is what \
+             `POST /update` answers while `Prefs::auto_update_apply` is unset or false"
         )
     });
     let not_supported = bullet
         .find("\"not supported\"")
-        .expect("the /update bullet should still name `Err: \"not supported\"`");
+        .expect("ask #43's `/update` handler should still carry Go's `\"not supported\"` refusal");
     assert!(
         not_enabled < not_supported,
-        "the /update bullet should give Go's refusals in Go's order: `not enabled`, then \
-         `not supported`"
+        "ask #43 should give `\"not enabled\"` before `\"not supported\"`, in \
+         `handleC2NUpdatePost`'s order"
     );
 }
 
-/// Go decides `PostureDisabled` from the `PostureChecking` syspolicy first and the pref second
-/// (`choice.ShouldEnable(prefs.PostureChecking())` in `feature/posture/posture.go`). An ask that
-/// ties the answer to `Prefs::posture_checking` alone would have a handler ignore an MDM `always`
-/// or `never`, though this daemon already registers the key.
+/// Go decides `PostureDisabled` from the `PostureChecking` policy's `ShouldEnable` over the pref,
+/// not from the pref alone, and the daemon's syspolicy must carry that key for the handler to read.
 #[test]
 fn posture_disabled_honours_the_posture_checking_policy() {
-    let bullet = answered_bullet("- **`GET /posture/identity`**");
-    let spans = code_spans(bullet);
-
+    let bullet = answered_bullet("/posture/identity");
     assert!(
-        spans.contains(&"PostureChecking"),
-        "the /posture/identity bullet must name the `PostureChecking` syspolicy that overrides \
-         `Prefs::posture_checking` in Go's handler"
+        bullet.contains("`PostureChecking` policy") && bullet.contains("should_enable"),
+        "ask #43's `/posture/identity` handler must let the `PostureChecking` policy override \
+         `Prefs::posture_checking` through `PreferenceOption::should_enable`, as Go's \
+         `choice.ShouldEnable(prefs.PostureChecking())` does"
     );
     assert!(
-        bullet.contains("ShouldEnable"),
-        "the /posture/identity bullet should say how the policy combines with the pref (Go's \
-         `ShouldEnable`), not just that a policy exists"
+        bullet.contains("failed policy read"),
+        "ask #43's `/posture/identity` handler must say a failed `PostureChecking` read leaves the \
+         pref to decide, as Go's handler logs the error and falls through to `ShouldEnable`"
     );
     assert!(
         SYSPOLICY.contains("def(\"PostureChecking\", ValueType::PreferenceOption)"),
-        "the ask says src/ipn/syspolicy.rs already registers `PostureChecking` as a \
-         `PreferenceOption`; that is no longer true"
+        "src/ipn/syspolicy.rs should still register `PostureChecking` as a PreferenceOption, the \
+         policy ask #43's posture handler reads"
     );
 }

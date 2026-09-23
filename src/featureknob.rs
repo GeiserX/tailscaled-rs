@@ -1,8 +1,10 @@
 //! Host- and operator-level gates on optional features — Go `envknob/featureknob/featureknob.go`.
 //!
 //! Go's `featureknob.CanRunTailscaleSSH()` is the single answer to "may this machine run the
-//! Tailscale SSH server at all?", and `LocalBackend.checkSSHPrefsLocked` calls it **whenever
-//! `RunSSH` is being set** — so the refusal lands on the pref edit, not on the listener. That
+//! Tailscale SSH server at all?", and `LocalBackend.checkSSHPrefsLocked` calls it **whenever the
+//! prefs an edit leaves behind have `RunSSH` set** — the edit mask does not come into it
+//! (`editPrefsLockedOnEntry` checks the already-merged copy), so the refusal lands on the pref
+//! edit, not on the listener. That
 //! placement is the point: a refused `tailscale set --ssh` tells the operator the server will not
 //! run, where a gate at the accept loop would leave the pref happily persisted and the server
 //! silently absent.
