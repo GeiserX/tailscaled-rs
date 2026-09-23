@@ -131,7 +131,13 @@ Go's hidden `--host-routes` is accepted and does nothing — it has had to be `t
 is refused with Go's own "only 'true' is allowed". `up --nickname` is refused by name, pointing at
 `tnet set --nickname`: no `up` names a login profile, in this fork or in Go, which registers
 `--nickname` on `set` and `login` only. Both refusals exit **2**, the status Go's flag package gives
-a parse failure — upstream decides both inside `flag.Parse`, so only the sentence is this fork's.
+a parse failure: upstream decides both inside `flag.Parse`, so neither ever reaches `runUp`. The
+`--host-routes=false` sentence is Go's own, with only the flag rewritten to this CLI's `--` spelling
+— Go's flag package prints the name it was given, one dash, as `-host-routes`. The `--nickname`
+sentence is this fork's, and it is longer than Go's on purpose — where Go stops at "flag provided but
+not defined", this one names the commands that do take a profile name. Neither refusal prints the
+usage block Go's parser appends to both, for the same reason no other refusal here prints one: the
+message already says what to run.
 
 `tnet set` (Go `tailscale set`) adjusts policy prefs on an already-running node. Changing
 `--exit-node`, `--hostname`, `--accept-routes`, `--advertise-routes`, or `--advertise-exit-node`

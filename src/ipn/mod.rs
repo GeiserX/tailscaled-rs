@@ -142,14 +142,19 @@ struct ConnectivityHealth {
     /// Whether the engine's net report names a reachable DERP region. `false` is Go's `no-derp-home`
     /// warnable.
     derp_home: Option<bool>,
+    /// Whether the host forwards the routes this node advertises
+    /// ([`crate::ipforward::ip_forwarding_broken`], negated). `false` is Go's `ip-forwarding-off`
+    /// warnable.
+    ip_forwarding: Option<bool>,
 }
 
 impl ConnectivityHealth {
     /// Nothing observed — every signal unknown, so nothing is unhealthy. Used outside `Running`,
-    /// where upstream's loop is not even alive and neither observation is worth paying for.
+    /// where upstream's loop is not even alive and no observation is worth paying for.
     const UNKNOWN: Self = Self {
         any_interface_up: None,
         derp_home: None,
+        ip_forwarding: None,
     };
 }
 
@@ -164,11 +169,14 @@ impl ConnectivityHealth {
 /// captivePortalWarnable.Code }` (`feature/captiveportal/captiveportal.go`), over the members of that
 /// set this daemon can observe.
 ///
-/// When more than one is unhealthy the one with the shortest
-/// [`time_to_visible`](captive::ConnectivityWarnable::time_to_visible) wins. Go breaks on whichever
-/// warning its map iteration reaches first — order it does not care about, because the *event* that
-/// wakes its loop is the first warnable to become visible. Picking the soonest-visible reproduces
-/// that timing and is deterministic, which the map order is not.
+/// When more than one is unhealthy a transient warnable wins over a
+/// [`steady`](captive::ConnectivityWarnable::is_steady) one, and among the rest the one with the
+/// shortest [`time_to_visible`](captive::ConnectivityWarnable::time_to_visible) wins. Go breaks on
+/// whichever warning its map iteration reaches first — order it does not care about, because the
+/// *event* that wakes its loop is the warnable that just changed. A steady warnable that was already
+/// unhealthy is not that event, so it must not hide a network that has just gone down (and the
+/// rechecks that come with it); among transient ones, the soonest-visible reproduces Go's timing and
+/// is deterministic, which the map order is not.
 fn connectivity_impacted_from(
     state: State,
     health: ConnectivityHealth,
@@ -184,11 +192,15 @@ fn connectivity_impacted_from(
             health.any_interface_up,
         ),
         (captive::ConnectivityWarnable::NoDerpHome, health.derp_home),
+        (
+            captive::ConnectivityWarnable::IpForwardingOff,
+            health.ip_forwarding,
+        ),
     ]
     .into_iter()
     .filter(|(_, healthy)| *healthy == Some(false))
     .map(|(warnable, _)| warnable)
-    .min_by_key(|w| w.time_to_visible())
+    .min_by_key(|w| (w.is_steady(), w.time_to_visible()))
 }
 
 /// The captive-portal detection loop — Go `ipn/ipnlocal/captiveportal.go`, its
@@ -731,6 +743,20 @@ fn prospective_route_set(
     )
 }
 
+/// The `RunSSH` an edit would LEAVE BEHIND: the named `--ssh` override if the request carries one,
+/// else what the prefs this edit starts from already say. `reset` picks that starting point the same
+/// way [`prospective_route_set`] does — `up --reset` returns every up-managed pref to its default
+/// *before* the overrides land, so `ssh_enabled`'s base is the default rather than the live pref.
+///
+/// This is the whole of Go's `p1 := CurrentPrefs().AsStruct(); p1.ApplyEdits(mp)` that
+/// `checkSSHPrefsLocked` reads (`editPrefsLockedOnEntry`): the gate is a question about the
+/// RESULTING prefs, never about which fields the edit mask happens to mention.
+fn prospective_ssh(named_ssh: Option<bool>, current: &Prefs, reset: bool) -> bool {
+    let defaults = Prefs::default();
+    let base = if reset { &defaults } else { current };
+    named_ssh.unwrap_or(base.ssh_enabled)
+}
+
 /// Reject an `auto:`-prefixed exit-node selector (Go `tailscale up/set --exit-node auto:any`, which
 /// enables *automatic* exit-node selection via `ipn.Prefs.AutoExitNode`).
 ///
@@ -851,18 +877,37 @@ fn peer_matches_exit_node_name(
         && want.eq_ignore_ascii_case(base)
 }
 
-/// Whether one of `peer`'s tailnet addresses is `ip` (Go compares against every
-/// `PeerStatus.TailscaleIPs` entry).
-fn peer_has_ip(peer: &PeerReport, ip: std::net::IpAddr) -> bool {
+/// Every tailnet address `peer` holds, in Go's `PeerStatus.TailscaleIPs` order (v4 then v6), with
+/// the fields the netmap left blank skipped. Go's slice is *empty* for a peer control has assigned
+/// no address; the equivalent here is a blank `ipv4` and an absent-or-blank `ipv6`, which is how
+/// `tnet`'s peer rendering reads the pair too. `next()` on this is therefore Go's
+/// `ps.TailscaleIPs[0]`, and `None` is its `len(ps.TailscaleIPs) == 0`.
+fn peer_tailnet_ips(peer: &PeerReport) -> impl Iterator<Item = std::net::IpAddr> + '_ {
     [Some(peer.ipv4.as_str()), peer.ipv6.as_deref()]
         .into_iter()
         .flatten()
         .filter_map(|s| s.parse::<std::net::IpAddr>().ok())
-        .any(|peer_ip| peer_ip == ip)
+}
+
+/// Whether one of `peer`'s tailnet addresses is `ip` (Go compares against every
+/// `PeerStatus.TailscaleIPs` entry).
+fn peer_has_ip(peer: &PeerReport, ip: std::net::IpAddr) -> bool {
+    peer_tailnet_ips(peer).any(|peer_ip| peer_ip == ip)
+}
+
+/// Go's `ExitNodeLocalIPError` for `host_or_ip` — which is the value the OPERATOR typed: the
+/// address in Go's IP branch, the name in its name branch — carrying this fork's one-message hint
+/// (deviation (a) on [`resolve_exit_node_arg`]). One builder, so both branches refuse a local
+/// address in the same words.
+fn exit_node_local_ip_error(host_or_ip: &str) -> anyhow::Error {
+    anyhow!(
+        "cannot use {host_or_ip} as an exit node as it is a local IP address to this machine; \
+         did you mean --advertise-exit-node?"
+    )
 }
 
 /// Resolve an operator-supplied `--exit-node` VALUE against the netmap — the port of Go's
-/// `exitNodeIPOfArg` (`ipn/prefs.go`), which is six refusals in one function.
+/// `exitNodeIPOfArg` (`ipn/prefs.go`), which is nine refusals in one function.
 ///
 /// The engine's `ExitNodeSelector: FromStr` is **infallible** (a bare IP → `Ip`, anything else →
 /// `Name`), so without this every value is accepted, stored, and then silently matches no peer:
@@ -876,13 +921,25 @@ fn peer_has_ip(peer: &PeerReport, ip: std::net::IpAddr) -> bool {
 ///    "cannot use %s as an exit node as it is a local IP address to this machine", which Go's `up`
 ///    and `set` both re-wrap as "%w; did you mean --advertise-exit-node?";
 /// 2. once Running, an IP **no peer** holds — "no node found in netmap with IP %v";
-/// 3. a peer that is **not advertising** an exit node — "node %v is not advertising an exit node";
+/// 3. once Running, the peer holding that IP **not advertising** an exit node — "node %v is not
+///    advertising an exit node", naming the ADDRESS;
 /// 4. a non-IP value while the **peer list is empty** — "cannot resolve exit node by hostname while
 ///    Tailscale is starting up; please use its Tailscale IP address instead" (Go refuses rather than
 ///    attempting a resolution that could only fail);
-/// 5. a name **no peer** answers to — "invalid value %q for --exit-node; must be IP or peer
+/// 5. a named peer with **no tailnet address** — "node %q has no Tailscale IP?", checked before its
+///    advertisement (as Go does): there is nothing to store, and checking the other order would
+///    print an empty address in (6);
+/// 6. a named peer **not advertising** an exit node — "node %q is not advertising an exit node",
+///    naming the ARGUMENT, quoted. Go's two branches word this refusal differently — the IP branch
+///    (3) names the address it was given, the name branch names the name it was given — and both
+///    are reproduced as Go writes them;
+/// 7. a name **no peer** answers to — "invalid value %q for --exit-node; must be IP or peer
 ///    hostname";
-/// 6. a name **more than one** peer answers to — "ambiguous exit node name %q".
+/// 8. a name **more than one** peer answers to — "ambiguous exit node name %q";
+/// 9. a name that resolved to **this machine's own** address — `ExitNodeLocalIPError` again, with
+///    the name in it. Go re-runs the local-IP check on `ps.TailscaleIPs[0]` once the name is known
+///    to be unambiguous, so a netmap entry carrying one of our own addresses is refused by either
+///    spelling; without it a name would be stored as an exit node that cannot route.
 ///
 /// The **staging** is Go's, not a stricter rule: the local-IP refusal (1) and the empty-value
 /// refusal apply always, because they need no netmap; the netmap-backed refusals (2) and (3) apply
@@ -890,16 +947,21 @@ fn peer_has_ip(peer: &PeerReport, ip: std::net::IpAddr) -> bool {
 /// yet"; and a name is refused outright (4) rather than resolved against a peer list that does not
 /// exist.
 ///
-/// Two deliberate, documented deviations from Go. (a) Go re-wraps the local-IP error with
-/// "did you mean --advertise-exit-node?" in the CLI, for `up` and `set` only; the resolution here is
-/// daemon-side and shared, so the hint is part of the one message and `check-prefs` reports it too —
-/// the hint is just as true there. (b) Go's empty-value guard returns the opaque `os.ErrInvalid`
-/// ("invalid argument"); this says what to pass instead.
+/// Two deliberate, documented deviations from Go, both message text only. (a) Go re-wraps the
+/// local-IP error with "did you mean --advertise-exit-node?" in the CLI, for `up` and `set` only;
+/// the resolution here is daemon-side and shared, so the hint is part of the one message and
+/// `check-prefs` reports it too — the hint is just as true there. (b) Go's empty-value guard returns
+/// the opaque `os.ErrInvalid` ("invalid argument"), which names neither the flag nor a remedy; this
+/// says what to pass instead. The guard's *test* is Go's exactly (`s == ""`), so a whitespace-only
+/// value is not caught here: like Go, it falls through to the name branch and is refused there as
+/// the unresolvable name it is.
 ///
 /// Pure: every fact it reads arrives in `facts`, so it can run before a single pref is mutated, and
 /// it is unit-testable without an engine.
 fn resolve_exit_node_arg(arg: &str, facts: &ExitNodeFacts) -> Result<()> {
-    if arg.trim().is_empty() {
+    // Go's `if s == "" { return os.ErrInvalid }` — the exact empty string, and nothing wider. A
+    // whitespace-only value is a value, so it takes the name branch below, exactly as it does in Go.
+    if arg.is_empty() {
         return Err(anyhow!(
             "--exit-node was given an empty value; pass a tailnet IP address or a peer name, or \
              clear the exit node instead"
@@ -912,10 +974,7 @@ fn resolve_exit_node_arg(arg: &str, facts: &ExitNodeFacts) -> Result<()> {
         // about this machine, not about the netmap's completeness. An operator who types it almost
         // always meant to OFFER egress, hence Go's hint.
         if facts.self_ips.contains(&ip) {
-            return Err(anyhow!(
-                "cannot use {arg} as an exit node as it is a local IP address to this machine; \
-                 did you mean --advertise-exit-node?"
-            ));
+            return Err(exit_node_local_ip_error(arg));
         }
         // Before Running there is no authoritative peer list, so an unknown IP is accepted (Go
         // does the same): it may well be a peer this node has not learned about yet.
@@ -942,28 +1001,42 @@ fn resolve_exit_node_arg(arg: &str, facts: &ExitNodeFacts) -> Result<()> {
     }
     let suffix = facts.magic_dns_suffix.as_deref();
     let mut matched = 0usize;
+    // The address the matched name resolved to — Go's `ip = ps.TailscaleIPs[0]`, kept because the
+    // local-IP refusal (9) runs on it again once the name is known to be unambiguous.
+    let mut resolved: Option<std::net::IpAddr> = None;
     for peer in &facts.peers {
         if !peer_matches_exit_node_name(peer, arg, suffix) {
             continue;
         }
         matched += 1;
-        // (3) again, by name. Go reports it from inside the match loop — i.e. a named peer that
-        // offers no exit is refused as such even when the name is ambiguous — and reports the
-        // peer's IP, which is the identity the operator has to act on.
+        // (5) A matched peer with no tailnet address at all: nothing to resolve TO. Go checks this
+        // first, before the advertisement, so this refusal is the one that fires.
+        let Some(peer_ip) = peer_tailnet_ips(peer).next() else {
+            return Err(anyhow!("node {arg:?} has no Tailscale IP?"));
+        };
+        // (6) The peer exists but never advertised a default route, so selecting it would route
+        // nothing. Go reports this from inside the match loop — i.e. a named peer that offers no
+        // exit is refused as such even when the name is ambiguous — and quotes the ARGUMENT the
+        // operator typed, which is the identity they can act on; the address is what its IP-branch
+        // sibling (3) names.
         if !peer.is_exit_node {
-            return Err(anyhow!(
-                "node {} is not advertising an exit node",
-                peer.ipv4
-            ));
+            return Err(anyhow!("node {arg:?} is not advertising an exit node"));
         }
+        resolved = Some(peer_ip);
     }
     match matched {
-        // (5) A typo, or a peer that has left the tailnet.
+        // (7) A typo, or a peer that has left the tailnet.
         0 => Err(anyhow!(
             "invalid value {arg:?} for --exit-node; must be IP or peer hostname"
         )),
+        // (9) The name resolved to one of THIS machine's addresses. Routing our own traffic through
+        // ourselves is no more possible by name than by IP, so Go's check covers both branches —
+        // and the refusal names the value the operator actually typed, i.e. the name.
+        1 if resolved.is_some_and(|ip| facts.self_ips.contains(&ip)) => {
+            Err(exit_node_local_ip_error(arg))
+        }
         1 => Ok(()),
-        // (6) Two peers answer to the name; picking one silently would be a coin flip over which
+        // (8) Two peers answer to the name; picking one silently would be a coin flip over which
         // machine sees the operator's traffic.
         _ => Err(anyhow!("ambiguous exit node name {arg:?}")),
     }
@@ -2834,6 +2907,40 @@ impl Backend {
         self.activate_profile(id).await
     }
 
+    /// Switch to a new, empty profile: Go's `LocalBackend.NewProfile` (`profileManager.
+    /// SwitchToNewProfile`), which `tailscale login` reaches through `LocalClient.
+    /// SwitchToEmptyProfile` before it logs in. The profile the node was on keeps its prefs, key and
+    /// name; the login that follows lands on the new one.
+    ///
+    /// Two differences from Go, both about when a profile exists. Go gives the new profile an id
+    /// only once it is saved after a login; this daemon registers it straight away, because every
+    /// profile here is a directory keyed by its id. And Go never saves a profile that has not logged
+    /// in (and deletes one on logout), so a current profile that has not logged in
+    /// (`has_logged_in`, Go's `Persist.UserProfile.LoginName != ""`) is already the empty profile Go
+    /// would switch to: it is kept, and reported as [`SwitchOutcome::AlreadyCurrent`], rather than
+    /// left behind as a second, unregistered entry in `switch --list`.
+    ///
+    /// The test is `has_logged_in`, not `has_node_key`. A key exists as soon as an `up` builds its
+    /// config, before control has seen the node, so an interactive login the operator never finished
+    /// still holds one. Keying on it would make every retry of such a login add a profile. Staying
+    /// on that profile is safe: `login` sends `force_reauth`, which discards the key before it
+    /// registers.
+    pub async fn switch_to_empty_profile(&mut self) -> Result<SwitchOutcome> {
+        if !self.prefs.has_logged_in {
+            return Ok(SwitchOutcome::AlreadyCurrent {
+                id: self.current_profile.clone(),
+            });
+        }
+        let meta = profile::load_profiles_file(&self.state_dir).await;
+        let id = profile::unused_profile_id(&meta, || {
+            let mut bytes = [0u8; 2];
+            getrandom::fill(&mut bytes).map(|()| bytes)
+        })
+        .map_err(|e| anyhow!("reading OS randomness for a new profile id: {e}"))?
+        .ok_or_else(|| anyhow!("could not find an unused profile id"))?;
+        self.activate_profile(&id).await
+    }
+
     /// Make profile `target` the active one: tear the current device down, repoint
     /// `prefs`/`prefs_path`/`key_path` at the target, reload its persisted prefs, persist the
     /// `current-profile` pointer, register it in `profiles.json` if new, and bump the generation (so
@@ -3304,7 +3411,21 @@ impl Backend {
     /// Does **no** network I/O for the `Rebuild` case (the slow `Device::new` is the caller's
     /// off-lock job); the only blocking steps here are the quick live setter mailbox round-trips on
     /// the `Live` path.
-    pub async fn begin_set(&mut self, mut opts: SetOptions) -> Result<SetOutcome> {
+    pub async fn begin_set(&mut self, opts: SetOptions) -> Result<SetOutcome> {
+        self.begin_set_gated(opts, crate::featureknob::can_run_tailscale_ssh())
+            .await
+    }
+
+    /// [`begin_set`](Self::begin_set) with this host's SSH verdict passed IN rather than read from
+    /// the process environment, so the refusal it produces is unit-testable — the same injection,
+    /// for the same reason, as [`check_prefs_gated`](Self::check_prefs_gated)'s
+    /// [`CheckPrefsEnv::ssh_gate`] (`set_var` is `unsafe` in edition 2024 and races the parallel
+    /// test harness).
+    async fn begin_set_gated(
+        &mut self,
+        mut opts: SetOptions,
+        ssh_gate: Result<()>,
+    ) -> Result<SetOutcome> {
         // Decide the path BEFORE mutating prefs — `needs_rebuild()` inspects which fields the
         // request named, which the apply below would not change, but reading it first keeps the
         // decision crisply about the *request* rather than post-apply state. Also snapshot which
@@ -3370,15 +3491,20 @@ impl Backend {
         if let Some(Some(sel)) = opts.exit_node.as_ref() {
             self.check_exit_node_arg(sel).await?;
         }
-        // And refuse an SSH-server enable the host or the operator has ruled out (Go
-        // `checkSSHPrefsLocked` → `featureknob.CanRunTailscaleSSH`, run whenever `RunSSH` is being
-        // SET). This is the one gate that MUST live here rather than in `build_config`: on a node
+        // And refuse the edit when the prefs it would LEAVE BEHIND run an SSH server the host or
+        // the operator has ruled out. Go's `editPrefsLockedOnEntry` applies the edit to a COPY of
+        // the current prefs and hands that copy to `checkPrefsLocked` → `checkSSHPrefsLocked`, so
+        // the gate reads the RESULTING `RunSSH` and not the edit mask: where
+        // `TS_DISABLE_SSH_SERVER=1` appeared after `ssh_enabled` was already persisted, upstream
+        // refuses `tailscale set --hostname foo` too, rather than re-persisting a pref it would
+        // refuse to be told. See [`prospective_ssh`]; `set` has no `--reset`, so its base is
+        // always the live prefs.
+        //
+        // This is also the one gate that MUST live here rather than in `build_config`: on a node
         // that is down, `set` is persist-only and never reaches `build_config` at all, so without
         // this `TS_DISABLE_SSH_SERVER=1 tnet set --ssh` would report success and write the pref,
         // and the operator would learn the server is administratively off only at the next `up`.
-        if opts.ssh == Some(true) {
-            crate::featureknob::can_run_tailscale_ssh()?;
-        }
+        self.check_ssh_prefs_gated(opts.ssh, false, ssh_gate)?;
         // Refuse an auto-update OPT-IN this installation could never honour (Go
         // `checkAutoUpdatePrefsLocked`, the fifth child of `checkPrefsLocked` — which in Go guards
         // every prefs write, so the same rule `check_prefs` reports on the dry-run path has to fire
@@ -3714,10 +3840,19 @@ impl Backend {
     /// shutdown (bounded by [`SHUTDOWN_TIMEOUT`]), so on a *reconfigure* (a device was already live)
     /// this phase is not strictly instantaneous under the lock — only the fresh-up case is. The
     /// common, head-of-line-sensitive case (no prior device) returns immediately.
-    pub async fn begin_up(
+    pub async fn begin_up(&mut self, opts: UpOptions, wif: Option<&WifCreds>) -> Result<PendingUp> {
+        self.begin_up_gated(opts, wif, crate::featureknob::can_run_tailscale_ssh())
+            .await
+    }
+
+    /// [`begin_up`](Self::begin_up) with this host's SSH verdict passed IN rather than read from the
+    /// process environment — same injection, and same reason, as
+    /// [`begin_set_gated`](Self::begin_set_gated).
+    async fn begin_up_gated(
         &mut self,
         mut opts: UpOptions,
         wif: Option<&WifCreds>,
+        ssh_gate: Result<()>,
     ) -> Result<PendingUp> {
         // PRE-VALIDATE the advertised route SET FIRST — before tearing down the device, mutating, or
         // persisting prefs. Same persist-before-validate gap as `begin_set`: `build_config` (below,
@@ -3762,16 +3897,18 @@ impl Backend {
         if let Some(Some(sel)) = opts.exit_node.as_ref() {
             self.check_exit_node_arg(sel).await?;
         }
-        // Same discipline for an SSH-server enable: Go's `checkSSHPrefsLocked` runs
-        // `featureknob.CanRunTailscaleSSH()` whenever `RunSSH` is being SET, so a host whose
-        // operator disabled the server with `TS_DISABLE_SSH_SERVER` (or an OS upstream does not
-        // support) refuses the pref rather than accepting it and quietly running no server. Checked
-        // here, before teardown/persist, so the refusal costs neither the live device nor a written
-        // pref; `build_config` re-checks the MERGED pref (it is the final authority, and it also
-        // catches an already-persisted `ssh_enabled` on a host where the knob appeared later).
-        if opts.ssh == Some(true) {
-            crate::featureknob::can_run_tailscale_ssh()?;
-        }
+        // Same discipline — and the same RESULTING-prefs rule — for the SSH server: Go's
+        // `editPrefsLockedOnEntry` gates on the prefs the edit leaves behind
+        // (`checkPrefsLocked` → `checkSSHPrefsLocked` → `featureknob.CanRunTailscaleSSH()`), so a
+        // host whose operator disabled the server with `TS_DISABLE_SSH_SERVER` (or an OS upstream
+        // does not support) refuses the bring-up whether this command NAMES `--ssh` or merely
+        // inherits an `ssh_enabled` that was persisted before the knob appeared. Checked here,
+        // before teardown/persist, so the refusal costs neither the live device nor a written pref;
+        // `build_config` re-checks the merged pref and remains the final authority, but it is only
+        // reached after `stop_device` has already taken a live engine down. `--reset` is honoured
+        // (see [`prospective_ssh`]): it returns `ssh_enabled` to its default before the overrides
+        // land, so `up --reset` is the way back up on such a host.
+        self.check_ssh_prefs_gated(opts.ssh, opts.reset, ssh_gate)?;
 
         // Tear down any existing device first so `up` is idempotent / reconfiguring.
         self.stop_device().await;
@@ -4765,6 +4902,10 @@ impl Backend {
     ///   *"Tailscale could not connect to any relay server"*), and the warnable that fires when a
     ///   portal swallows a live node's traffic, since the portal answers the DERP connections instead
     ///   of the relay.
+    /// - `ip-forwarding-off` — a kernel-TUN node advertises routes its host will not forward
+    ///   ([`ip_forwarding_broken`](Backend::ip_forwarding_broken), Go's check from
+    ///   `applyPrefsToHostinfoLocked`). A steady condition, so it earns one probe per onset rather
+    ///   than rechecks ([`captive::ConnectivityWarnable::is_steady`]).
     ///
     /// Reading both matters, and not only for tidiness: the engine's net report is the node's
     /// **last** measurement, so a path that dies under a live session keeps naming its old home
@@ -4816,10 +4957,25 @@ impl Backend {
                         None
                     }
                 },
+                ip_forwarding: Some(!self.ip_forwarding_broken()),
             },
             _ => ConnectivityHealth::UNKNOWN,
         };
         connectivity_impacted_from(state, health)
+    }
+
+    /// Go's `ip-forwarding-off` verdict for this node: the check `applyPrefsToHostinfoLocked` installs
+    /// over the advertised routes (Go `hi.RoutableIPs`, which folds in the exit-node defaults). A
+    /// route set that does not compose advertises nothing, so it is checked as no routes.
+    fn ip_forwarding_broken(&self) -> bool {
+        let routes = crate::routes::calc_advertise_routes(
+            &self.prefs.advertise_routes,
+            self.prefs.advertise_exit_node,
+        )
+        .unwrap_or_default();
+        crate::ipforward::ip_forwarding_broken(self.prefs.tun_enabled, &routes, || {
+            linkmon::interface_ips()
+        })
     }
 
     /// Record the verdict of a captive-portal detection pass (Go's
@@ -5203,6 +5359,30 @@ impl Backend {
         resolve_exit_node_arg(sel, &self.exit_node_facts().await)
     }
 
+    /// Go `checkSSHPrefsLocked`, as `editPrefsLockedOnEntry` asks it: of the prefs the edit would
+    /// LEAVE BEHIND (see [`prospective_ssh`]), never of the edit mask. `ssh_gate` is this host's
+    /// [`featureknob::can_run_tailscale_ssh`](crate::featureknob::can_run_tailscale_ssh) verdict,
+    /// injected so the refusal is testable.
+    ///
+    /// Consulted only when the resulting prefs actually run SSH — Go's `checkSSHPrefsLocked` is a
+    /// no-op on prefs whose `RunSSH` is clear — so an edit that ends with the server off is never
+    /// refused by a host that cannot run one. That is what lets `set --ssh=false` (and `up --reset`)
+    /// be the way out on a host where the knob arrived after the pref was already persisted.
+    ///
+    /// The one rule behind both edit paths, so `up` and `set` cannot drift from each other or from
+    /// the [`check_prefs`](Self::check_prefs) dry run that is supposed to predict them.
+    fn check_ssh_prefs_gated(
+        &self,
+        named_ssh: Option<bool>,
+        reset: bool,
+        ssh_gate: Result<()>,
+    ) -> Result<()> {
+        if prospective_ssh(named_ssh, &self.prefs, reset) {
+            ssh_gate?;
+        }
+        Ok(())
+    }
+
     /// [`check_prefs`](Self::check_prefs) with the host-derived inputs passed IN rather than read
     /// from the process environment or the engine — see [`CheckPrefsEnv`] for why they are injected.
     /// `auto_update` stays a plain override (rule (5) reads the host's update provenance through
@@ -5227,7 +5407,9 @@ impl Backend {
         let prospective_routes = advertise_routes
             .clone()
             .unwrap_or_else(|| self.prefs.advertise_routes.clone());
-        let prospective_ssh = ssh.unwrap_or(self.prefs.ssh_enabled);
+        // `check_prefs` is always asked about a PATCH (it has no `--reset`), so the prospective
+        // posture is composed against the live prefs.
+        let prospective_ssh = prospective_ssh(ssh, &self.prefs, false);
         let prospective_auto_update = match auto_update {
             Some(v) => Some(v),
             None => self.prefs.auto_update_apply,
@@ -5916,6 +6098,7 @@ mod tests {
         ConnectivityHealth {
             any_interface_up: Some(any_interface_up),
             derp_home: Some(derp_home),
+            ip_forwarding: Some(true),
         }
     }
 
@@ -5996,6 +6179,7 @@ mod tests {
                 ConnectivityHealth {
                     any_interface_up: Some(false),
                     derp_home: None,
+                    ip_forwarding: None,
                 },
             ),
             Some(captive::ConnectivityWarnable::NetworkStatus),
@@ -6022,6 +6206,69 @@ mod tests {
             std::time::Duration::from_secs(12),
             "no-derp-home: 10s TimeToVisible + Go's 2s detection interval"
         );
+    }
+
+    #[test]
+    fn captive_detection_triggers_on_ip_forwarding_off() {
+        // health/warnings.go marks `ip-forwarding-off` `ImpactsConnectivity: true`, so a subnet
+        // router whose host will not forward is a node Go's `onHealthChange` probes for.
+        let forwarding_off = ConnectivityHealth {
+            ip_forwarding: Some(false),
+            ..health(true, true)
+        };
+        assert_eq!(
+            connectivity_impacted_from(State::Running, forwarding_off),
+            Some(captive::ConnectivityWarnable::IpForwardingOff),
+            "network and relay healthy, forwarding off: still impacted"
+        );
+        assert_eq!(
+            connectivity_impacted_from(State::Stopped, forwarding_off),
+            None,
+            "outside Running upstream's loop is not alive"
+        );
+
+        // With a transient warnable also unhealthy, the transient one is reported, so a network
+        // that dies under a misconfigured subnet router still gets its settle time and rechecks.
+        assert_eq!(
+            connectivity_impacted_from(
+                State::Running,
+                ConnectivityHealth {
+                    ip_forwarding: Some(false),
+                    ..health(false, true)
+                }
+            ),
+            Some(captive::ConnectivityWarnable::NetworkStatus)
+        );
+        assert_eq!(
+            connectivity_impacted_from(
+                State::Running,
+                ConnectivityHealth {
+                    ip_forwarding: Some(false),
+                    ..health(true, false)
+                }
+            ),
+            Some(captive::ConnectivityWarnable::NoDerpHome)
+        );
+    }
+
+    #[test]
+    fn a_netstack_node_never_reports_ip_forwarding_off() {
+        // Go installs the forwarding check only when `!b.sys.IsNetstackRouter()`: the userspace
+        // netstack forwards, not the kernel, whatever routes are advertised.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-captive-ipforward-{}", std::process::id()));
+        let mut be = backend_for(&dir);
+        be.prefs.tun_enabled = false;
+        be.prefs.advertise_routes = vec!["192.0.2.0/24".to_string()];
+        be.prefs.advertise_exit_node = true;
+        assert!(!be.ip_forwarding_broken());
+
+        // A TUN node that advertises nothing has no check installed either.
+        be.prefs.tun_enabled = true;
+        be.prefs.advertise_routes.clear();
+        be.prefs.advertise_exit_node = false;
+        assert!(!be.ip_forwarding_broken());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -7915,6 +8162,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn switch_to_empty_profile_leaves_the_logged_in_profile_and_its_name_alone() {
+        // Go's `tailscale login` calls `SwitchToEmptyProfile` before it logs in, so `login
+        // --nickname=work` names a NEW profile and the one the node was logged in to keeps its name.
+        let dir = std::env::temp_dir().join(format!("tailnetd-prof-empty-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = Backend::load(&dir).await.unwrap();
+
+        // A profile that never logged in is already empty: nothing is created or torn down.
+        assert_eq!(
+            be.switch_to_empty_profile().await.unwrap(),
+            SwitchOutcome::AlreadyCurrent {
+                id: profile::DEFAULT_PROFILE_ID.to_string()
+            }
+        );
+        assert_eq!(be.list_profiles().await.len(), 1);
+
+        // An unfinished login: `up` has minted a node key (a real key file, from the engine's
+        // loader), but the node never registered. Go never saved that profile, so a retried `login`
+        // stays on it instead of leaving it behind as an orphan.
+        let (_, key_path) = profile::profile_paths(&dir, profile::DEFAULT_PROFILE_ID);
+        tailscale::config::load_key_file(&key_path, Default::default())
+            .await
+            .expect("mint a key file for the default profile");
+        let mut be = Backend::load(&dir).await.unwrap();
+        assert!(be.has_node_key, "the fixture must hold a node key");
+        assert!(!be.prefs.has_logged_in);
+        assert_eq!(
+            be.switch_to_empty_profile().await.unwrap(),
+            SwitchOutcome::AlreadyCurrent {
+                id: profile::DEFAULT_PROFILE_ID.to_string()
+            },
+            "a node key without a finished login must not make a new profile"
+        );
+        assert_eq!(be.list_profiles().await.len(), 1);
+
+        // Now the node registers (what `finish_up` records), and the profile is named.
+        be.prefs.has_logged_in = true;
+        be.rename_current_profile("home").await.unwrap();
+
+        let SwitchOutcome::Switched { id, state } = be.switch_to_empty_profile().await.unwrap()
+        else {
+            panic!("a logged-in profile must be switched away from");
+        };
+        assert_eq!(state, State::NoState, "the new profile has never logged in");
+        assert_eq!(id.len(), 4, "Go's newUnusedID shape: {id:?}");
+        assert!(
+            id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+            "Go's newUnusedID shape: {id:?}"
+        );
+        assert_eq!(be.current_profile, id);
+
+        // `login --nickname=work` names the profile it switched to, and only that one.
+        be.rename_current_profile("work").await.unwrap();
+        let profiles = be.list_profiles().await;
+        assert!(
+            profiles
+                .iter()
+                .any(|e| e.id == profile::DEFAULT_PROFILE_ID && e.name == "home" && !e.current),
+            "the profile the node was logged in to keeps its name: {profiles:?}"
+        );
+        assert!(
+            profiles
+                .iter()
+                .any(|e| e.id == id && e.name == "work" && e.current),
+            "{profiles:?}"
+        );
+        assert!(
+            tokio::fs::try_exists(&key_path).await.unwrap(),
+            "the old profile's node key must survive"
+        );
+
+        // A second login before the first one registered stays on that profile, even once the
+        // first login's `up` has minted it a key: switch, `up` (key), switch again.
+        let (_, new_key_path) = profile::profile_paths(&dir, &id);
+        tailscale::config::load_key_file(&new_key_path, Default::default())
+            .await
+            .expect("mint a key file for the new profile");
+        be.has_node_key = true;
+        assert_eq!(
+            be.switch_to_empty_profile().await.unwrap(),
+            SwitchOutcome::AlreadyCurrent { id: id.clone() }
+        );
+        assert_eq!(be.list_profiles().await.len(), 2);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
     async fn create_profile_refuses_an_unusable_id_or_one_that_is_already_taken() {
         // `create_profile` (`tnet switch --new`) is where creating a profile moved to once `switch`
         // stopped doing it by accident. It has no upstream counterpart — Go creates profiles through
@@ -8731,23 +9067,132 @@ mod tests {
     #[test]
     fn resolve_exit_node_arg_refuses_a_peer_advertising_no_exit_node() {
         // The peer exists and is reachable — it just never advertised a default route, so selecting
-        // it would route nothing. Go refuses by IP and by name alike, naming the peer's IP.
+        // it would route nothing. Go refuses by IP and by name alike, but the two sentences are NOT
+        // the same: the IP branch names the address it was handed (`node %v …`), the name branch
+        // quotes the argument it was handed (`node %q …`). Both, as Go writes them.
         let facts = running_facts(vec![exit_peer(
             "plain.tail0123.ts.net",
             "100.64.0.8",
             false,
         )]);
-        for arg in ["100.64.0.8", "plain", "plain.tail0123.ts.net"] {
+        let err = format!(
+            "{:#}",
+            resolve_exit_node_arg("100.64.0.8", &facts)
+                .expect_err("a peer that advertises no exit node must be refused")
+        );
+        assert!(
+            err.contains("node 100.64.0.8 is not advertising an exit node"),
+            "the IP branch must name the address, got {err:?}"
+        );
+
+        for (arg, want) in [
+            ("plain", "node \"plain\" is not advertising an exit node"),
+            (
+                "plain.tail0123.ts.net",
+                "node \"plain.tail0123.ts.net\" is not advertising an exit node",
+            ),
+        ] {
             let err = format!(
                 "{:#}",
                 resolve_exit_node_arg(arg, &facts)
                     .expect_err("a peer that advertises no exit node must be refused")
             );
             assert!(
-                err.contains("node 100.64.0.8 is not advertising an exit node"),
-                "{arg:?} must be refused in Go's words, got {err:?}"
+                err.contains(want),
+                "the name branch must quote the argument ({want:?}), got {err:?}"
+            );
+            assert!(
+                !err.contains("100.64.0.8"),
+                "the name branch must not substitute the peer's address, got {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn resolve_exit_node_arg_refuses_a_named_peer_with_no_tailnet_address() {
+        // Go's `len(ps.TailscaleIPs) == 0` guard, checked BEFORE the exit advertisement. A peer
+        // control has given no address cannot be an exit node whatever it advertises, and there is
+        // nothing to resolve the name TO — so the refusal names the peer, and the sibling
+        // advertisement refusal never gets to render an empty address.
+        let addressless = PeerReport {
+            name: "ghost.tail0123.ts.net".to_string(),
+            ipv4: String::new(),
+            ipv6: None,
+            // Advertising an exit node, so only the no-address guard can refuse this.
+            is_exit_node: true,
+            ..PeerReport::default()
+        };
+        let err = format!(
+            "{:#}",
+            resolve_exit_node_arg("ghost", &running_facts(vec![addressless.clone()]))
+                .expect_err("a peer with no tailnet address cannot be an exit node")
+        );
+        assert!(
+            err.contains("node \"ghost\" has no Tailscale IP?"),
+            "the refusal must be Go's sentence, got {err:?}"
+        );
+
+        // It is checked first: a peer with neither an address nor an advertisement reports the
+        // missing address, which is Go's order.
+        let err = format!(
+            "{:#}",
+            resolve_exit_node_arg(
+                "ghost",
+                &running_facts(vec![PeerReport {
+                    is_exit_node: false,
+                    ..addressless
+                }])
+            )
+            .expect_err("a peer with no tailnet address cannot be an exit node")
+        );
+        assert!(
+            err.contains("has no Tailscale IP?"),
+            "the no-address refusal must come first, got {err:?}"
+        );
+
+        // A peer with only a v6 address still resolves: Go's check is on the whole `TailscaleIPs`
+        // slice, not on the v4 entry.
+        let v6_only = PeerReport {
+            name: "six.tail0123.ts.net".to_string(),
+            ipv4: String::new(),
+            ipv6: Some("fd7a:115c:a1e0::8".to_string()),
+            is_exit_node: true,
+            ..PeerReport::default()
+        };
+        assert!(
+            resolve_exit_node_arg("six", &running_facts(vec![v6_only])).is_ok(),
+            "a v6-only exit node must resolve"
+        );
+    }
+
+    #[test]
+    fn resolve_exit_node_arg_refuses_a_name_that_resolves_to_a_local_address() {
+        // Go re-runs its local-IP check on the address the NAME resolved to (`case 1:`), so the
+        // refusal covers both spellings. Without it, a netmap entry carrying one of this machine's
+        // own addresses is accepted by name and stored as an exit node that cannot route.
+        let facts = running_facts(vec![exit_peer("self.tail0123.ts.net", "100.64.0.1", true)]);
+        for arg in ["self", "self.tail0123.ts.net", "100.64.0.1"] {
+            let err = format!(
+                "{:#}",
+                resolve_exit_node_arg(arg, &facts)
+                    .expect_err("this machine's own address cannot be its exit node, by any name")
+            );
+            assert!(
+                err.contains(&format!(
+                    "cannot use {arg} as an exit node as it is a local IP address to this machine"
+                )),
+                "the refusal must be Go's sentence, naming what was typed, got {err:?}"
+            );
+            assert!(
+                err.contains("--advertise-exit-node"),
+                "the refusal must carry the hint on both branches, got {err:?}"
+            );
+        }
+
+        // The check is on the resolved address, not on the name: a peer with a different address
+        // still resolves even when this machine has one of its own.
+        let remote = running_facts(vec![exit_peer("exit.tail0123.ts.net", "100.64.0.7", true)]);
+        assert!(resolve_exit_node_arg("exit", &remote).is_ok());
     }
 
     #[test]
@@ -8823,14 +9268,35 @@ mod tests {
     fn resolve_exit_node_arg_refuses_an_empty_value() {
         // Go's `os.ErrInvalid` guard at the top of `exitNodeIPOfArg`, said usefully: an empty
         // `--exit-node` would otherwise be stored as a selector matching no peer.
-        for arg in ["", "   "] {
-            let err = resolve_exit_node_arg(arg, &running_facts(vec![]))
-                .expect_err("an empty selector must be refused");
-            assert!(
-                format!("{err:#}").contains("empty value"),
-                "got {err:#} for {arg:?}"
-            );
-        }
+        let err = resolve_exit_node_arg("", &running_facts(vec![]))
+            .expect_err("an empty selector must be refused");
+        assert!(
+            format!("{err:#}").contains("empty value"),
+            "got {err:#} for the empty string"
+        );
+
+        // The guard's test is Go's exact `s == ""` and no wider: a whitespace-only value is a
+        // value, so it takes the name branch and is refused there, as the unresolvable name it is.
+        // (Widening the guard would refuse it earlier and in different words than Go's.)
+        let facts = running_facts(vec![exit_peer("exit.tail0123.ts.net", "100.64.0.7", true)]);
+        let err = format!(
+            "{:#}",
+            resolve_exit_node_arg("   ", &facts).expect_err("no peer answers to a blank name")
+        );
+        assert!(
+            err.contains("invalid value \"   \" for --exit-node; must be IP or peer hostname"),
+            "a whitespace-only value must take Go's name branch, got {err:?}"
+        );
+        // With no peer list at all it is the starting-up refusal, again the name branch's.
+        let err = format!(
+            "{:#}",
+            resolve_exit_node_arg("   ", &ExitNodeFacts::default())
+                .expect_err("a name cannot resolve against an empty peer list")
+        );
+        assert!(
+            err.contains("cannot resolve exit node by hostname"),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -10653,6 +11119,146 @@ mod tests {
     // clear, like every other pref), and the `build_config` preflight that fails the bring-up loudly
     // when SSH is impossible. The actual spawn/abort lifecycle needs a live engine (integration
     // territory), so it is NOT unit-tested here. All offline: a device-less backend does no engine I/O.
+
+    #[tokio::test]
+    async fn set_ssh_gate_reads_the_resulting_prefs_not_the_edit_mask() {
+        // Go `ipn/ipnlocal/local.go` @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8 (v1.102.4):
+        // `editPrefsLockedOnEntry` does `p1 := CurrentPrefs().AsStruct(); p1.ApplyEdits(mp)` and
+        // hands *p1* to `checkPrefsLocked` -> `checkSSHPrefsLocked`, so the SSH gate fires on the
+        // prefs the edit LEAVES BEHIND. A host where `TS_DISABLE_SSH_SERVER=1` appeared after
+        // `ssh_enabled` was already persisted therefore refuses `set --hostname foo` as well, even
+        // though that edit never mentions SSH. The host verdict is injected (`set_var` is `unsafe`
+        // in edition 2024 and races this harness), and the refusal is the real sentence
+        // `can_run_tailscale_ssh_in` produces for a set knob.
+        let dir = std::env::temp_dir().join(format!("tailnetd-set-sshgate-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let disabled = || crate::featureknob::can_run_tailscale_ssh_in("linux", Some("1"));
+        assert!(
+            disabled().is_err(),
+            "the injected host verdict must be a refusal"
+        );
+
+        let mut be = backend_for(&dir);
+        // The pref is already on, as it would be on disk from an earlier `set --ssh`.
+        be.prefs.ssh_enabled = true;
+        let before = tokio::fs::read_to_string(&be.prefs_path).await.ok();
+
+        // An edit that says nothing about SSH must still be refused, whole.
+        let err = be
+            .begin_set_gated(
+                SetOptions {
+                    hostname: Some("foo".to_string()),
+                    ..SetOptions::default()
+                },
+                disabled(),
+            )
+            .await
+            .expect_err("an SSH-less edit must be refused while the RESULTING prefs run SSH");
+        assert!(
+            err.to_string()
+                .contains("The Tailscale SSH server has been administratively disabled."),
+            "the refusal must be the host gate's own sentence, got {err:#}"
+        );
+        assert_eq!(
+            be.prefs.hostname, None,
+            "a refused edit must not have mutated prefs"
+        );
+        assert!(be.prefs.ssh_enabled, "nor cleared the pref it refused over");
+        assert_eq!(
+            tokio::fs::read_to_string(&be.prefs_path).await.ok(),
+            before,
+            "a refused edit must not have persisted anything"
+        );
+
+        // The way back out: an edit whose RESULT is SSH-off never consults the gate, so the same
+        // refusing host accepts `set --ssh=false` (Go's `checkSSHPrefsLocked` is a no-op on prefs
+        // whose `RunSSH` is clear).
+        be.begin_set_gated(
+            SetOptions {
+                ssh: Some(false),
+                ..SetOptions::default()
+            },
+            disabled(),
+        )
+        .await
+        .expect("an edit that turns SSH off must not be gated on running SSH");
+        assert!(!be.prefs.ssh_enabled);
+
+        // And with the pref now off, an unrelated edit is accepted on that same host.
+        be.begin_set_gated(
+            SetOptions {
+                hostname: Some("foo".to_string()),
+                ..SetOptions::default()
+            },
+            disabled(),
+        )
+        .await
+        .expect("an SSH-less edit must be accepted once the resulting prefs do not run SSH");
+        assert_eq!(be.prefs.hostname.as_deref(), Some("foo"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn up_ssh_gate_reads_the_resulting_prefs_and_reset_clears_it() {
+        // The `up` half of the same upstream rule: an inherited `ssh_enabled` refuses the bring-up
+        // before `stop_device`/`persist_prefs`, so the refusal costs neither the live device nor a
+        // written pref — where the `build_config` backstop only fires after both. `up --reset`
+        // returns `ssh_enabled` to its default before the overrides land, so the resulting prefs do
+        // not run SSH and the bring-up proceeds: that is the way back up on such a host.
+        let dir = std::env::temp_dir().join(format!("tailnetd-up-sshgate-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let disabled = || crate::featureknob::can_run_tailscale_ssh_in("linux", Some("1"));
+
+        let mut be = backend_for(&dir);
+        be.prefs.ssh_enabled = true;
+        let before = tokio::fs::read_to_string(&be.prefs_path).await.ok();
+
+        // `PendingUp` is not `Debug` (it carries the engine `Config`), so match rather than
+        // `expect_err`.
+        let err = match be
+            .begin_up_gated(UpOptions::default(), None, disabled())
+            .await
+        {
+            Ok(_) => panic!("an up inheriting ssh_enabled must be refused on a barred host"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string()
+                .contains("The Tailscale SSH server has been administratively disabled."),
+            "the refusal must be the host gate's own sentence, got {err:#}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&be.prefs_path).await.ok(),
+            before,
+            "the refusal must land before anything is persisted"
+        );
+        assert_eq!(
+            be.generation, 0,
+            "and before the lifecycle generation moves"
+        );
+
+        // `--reset` wipes `ssh_enabled` first, so the RESULTING prefs do not run SSH: not gated.
+        let _pending = be
+            .begin_up_gated(
+                UpOptions {
+                    reset: true,
+                    ..UpOptions::default()
+                },
+                None,
+                disabled(),
+            )
+            .await
+            .expect("up --reset leaves SSH off, so the host gate must not fire");
+        assert!(
+            !be.prefs.ssh_enabled,
+            "--reset returns ssh_enabled to its default"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
 
     #[tokio::test]
     async fn begin_up_applies_ssh_override() {

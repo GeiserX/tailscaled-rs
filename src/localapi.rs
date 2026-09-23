@@ -109,6 +109,23 @@ pub enum Request {
         /// [`NotifyWatchOpt::INITIAL_STATE`](tailscale::NotifyWatchOpt::INITIAL_STATE). `#[serde(default)]`
         /// makes it `false` when omitted (so a bare watch still parses); `skip_serializing_if` drops it
         /// from the wire when `false`, preserving the exact `{"cmd":"watch"}` legacy encoding.
+        ///
+        /// ## The session id rides on this bit
+        ///
+        /// Setting it also mints a per-connection session id, sent once as
+        /// [`NotifyView::session_id`] on the FIRST frame of the watch and never repeated — the
+        /// analogue of Go's `WatchNotificationsAs`, which sets `Notify.SessionID` only when the
+        /// watcher asked for `NotifyInitialState`. A client that wants the id must store it from that
+        /// first frame. It is fresh for every connection and stable for the life of this one.
+        ///
+        /// On a device-less daemon the engine has no initial state to front-load, so when no
+        /// prefs/policy snapshot is going out first either, the daemon sends a frame carrying only
+        /// the identity fields, so the id still arrives immediately.
+        ///
+        /// **The id is not yet load-bearing.** Go keys a foreground `serve`'s config on it
+        /// (`ServeConfig.Foreground[sessionID]`) and deletes that config when the watch ends. This
+        /// daemon does not model `ServeConfig.Foreground` yet, so nothing server-side is tied to the
+        /// id today: a foreground `tnet serve` still restores its config from its own signal handler.
         #[serde(default, skip_serializing_if = "core::ops::Not::not")]
         initial_state: bool,
         /// Front-load the current peer set as the first [`Response::Notify`] frame's
@@ -610,6 +627,21 @@ pub enum Request {
         /// digits, `-` or `_`; 1-64 characters) that does not already name a profile.
         id: String,
     },
+    /// Switch to a new, empty profile — the first thing `tnet login` does, as Go's `tailscale login`
+    /// calls `LocalClient.SwitchToEmptyProfile` before it runs the login (`cmd/tailscale/cli/
+    /// login.go`). The profile the node was on is left alone, name and key included, so a following
+    /// `--nickname` names the profile being logged in rather than renaming the old one. A WRITE,
+    /// gated like [`SwitchProfile`](Request::SwitchProfile).
+    ///
+    /// The daemon picks the new id (Go's four-hex-digit `newUnusedID`). A current profile that has
+    /// never finished logging in (a node key alone does not count) is already empty in the sense
+    /// Go means — Go never saves a profile that has not logged in, and deletes one on logout — so
+    /// the daemon stays on it and answers `already on profile` instead of leaving a second empty
+    /// profile behind.
+    ///
+    /// Its own command for the reason [`CreateProfile`](Request::CreateProfile) is: a daemon that
+    /// predates it answers `bad request`, and `login` stops there with nothing renamed.
+    SwitchToEmptyProfile,
     /// Delete a profile (Go `tailscale switch remove`). The target may be an id or a display name,
     /// like [`SwitchProfile`](Request::SwitchProfile). Refuses a target that matches no known profile
     /// (Go: `No profile named %q`) and the reserved `default` profile. Naming the profile that is
@@ -908,9 +940,13 @@ pub enum Request {
     ///    torn down — the same path a SIGTERM takes, so the state file and any live device close the
     ///    way they always do. It is deliberately NOT a `process::exit`.
     ///
-    /// Whether the daemon comes back up is the service manager's decision, not this verb's — which is
-    /// why Go names the key for a *restart* rather than a shutdown. See `tnet shutdown`'s help for
-    /// what the units this fork ships actually do.
+    /// The daemon then exits **non-zero**, and that is the last rung of the port rather than a
+    /// detail: Go's subscriber closes the listener, `hs.Serve` fails on it, the context was never
+    /// cancelled so `run()` does not take its `context.Canceled` escape, and `log.Fatal` ends
+    /// tailscaled with a failure status that its packaged unit's `Restart=on-failure` acts on. The
+    /// restart is the verb's whole purpose — it is why Go names the key `AllowTailscaledRestart` and
+    /// not `AllowShutdown` — and the units this fork ships restart on failure too, so the exit status
+    /// is what carries the intent across. See [`crate::server::StoppedByLocalApi`].
     Shutdown,
 }
 
@@ -2057,10 +2093,9 @@ pub struct LockLogEntry {
     /// Go prints tailnet-lock key ids in. Empty for an unsigned AUM (the genesis checkpoint).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub signer_key_ids: Vec<String>,
-    /// The AUM's canonical CBOR serialization (Go `NetworkLockUpdate.Raw`), hex-encoded. Carried so
-    /// an operator can decode the full AUM out-of-band; the daemon itself never decodes it (it has no
-    /// AUM decoder), which is why `tnet lock log`'s human output cannot print Go's per-kind key
-    /// detail. Emitted only by `tnet lock log --json`.
+    /// The AUM's canonical CBOR serialization (Go `NetworkLockUpdate.Raw`), hex-encoded. The daemon
+    /// never decodes it; `tnet lock log --json=1` does, in the CLI as Go does, to expand it into Go's
+    /// schema-1 fields. The human output does not decode it, so it prints no per-kind key detail.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub raw: String,
 }
@@ -2238,6 +2273,18 @@ pub struct ProfileEntry {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct NotifyView {
+    /// The version of the daemon that produced this frame (Go `Notify.Version`). Set on EVERY frame
+    /// the daemon writes, as Go's `sendToLocked` fills it on the way out, because the notify field
+    /// set is not a stable API and a consumer needs to know which backend it is reading. It is the
+    /// same string [`Response::Version`] answers with. `None` only on a frame built but not yet sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// The watch's session id (Go `Notify.SessionID`): set on the FIRST frame of a watch that asked
+    /// for [`initial_state`](Request::Watch::initial_state), and on no other frame. Opaque to the
+    /// client, fresh per connection, stable for its lifetime. Not yet tied to any daemon-side state —
+    /// see [`Request::Watch::initial_state`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     /// The new connection state, if it changed this frame: one of the seven `ipn.State` names
     /// (`NoState` / `NeedsLogin` / `NeedsMachineAuth` / `InUseOtherUser` / `Starting` / `Running` /
     /// `Stopped`) — the SAME string [`StatusReport::state`] uses, derived from the engine's
@@ -2789,6 +2836,39 @@ mod tests {
     }
 
     #[test]
+    fn notify_view_identity_fields_wire_format() {
+        // Go's `Notify` leads with `Version` then `SessionID`; the wire names here are snake_case like
+        // every other field on this stream, and both drop out when unset.
+        let first = NotifyView {
+            version: Some("0.62.2".to_string()),
+            session_id: Some("0123456789abcdef".to_string()),
+            state: Some("NeedsLogin".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&Response::Notify(first.clone())).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"notify","version":"0.62.2","session_id":"0123456789abcdef","state":"NeedsLogin"}"#
+        );
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::Notify(back) => assert_eq!(back, first),
+            other => panic!("expected a notify frame, got {other:?}"),
+        }
+        // An identity-only frame (the device-less first frame) is a valid notify on its own.
+        match serde_json::from_str::<Response>(
+            r#"{"kind":"notify","version":"0.62.2","session_id":"0123456789abcdef"}"#,
+        )
+        .unwrap()
+        {
+            Response::Notify(back) => {
+                assert_eq!(back.session_id.as_deref(), Some("0123456789abcdef"));
+                assert!(back.state.is_none() && back.prefs.is_none() && back.policy.is_none());
+            }
+            other => panic!("expected a notify frame, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn request_debug_capture_wire_format() {
         // Pin the `debug_capture` discriminant + field names so daemon + CLI agree.
         assert_eq!(
@@ -2917,6 +2997,15 @@ mod tests {
             Request::CreateProfile { id } => assert_eq!(id, "work"),
             other => panic!("expected CreateProfile, got {other:?}"),
         }
+        // `login`'s switch to an empty profile carries nothing: the daemon chooses the id.
+        assert_eq!(
+            serde_json::to_string(&Request::SwitchToEmptyProfile).unwrap(),
+            r#"{"cmd":"switch_to_empty_profile"}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<Request>(r#"{"cmd":"switch_to_empty_profile"}"#).unwrap(),
+            Request::SwitchToEmptyProfile
+        ));
         // A `create` key on a switch is NOT a creation: `SwitchProfile` models no such field, so it
         // deserializes as the plain switch it reads as, and the daemon refuses an unknown target.
         match serde_json::from_str::<Request>(
