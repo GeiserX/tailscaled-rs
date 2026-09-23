@@ -633,11 +633,11 @@ pub enum Request {
     /// `--nickname` names the profile being logged in rather than renaming the old one. A WRITE,
     /// gated like [`SwitchProfile`](Request::SwitchProfile).
     ///
-    /// The daemon picks the new id (Go's four-hex-digit `newUnusedID`). A current profile that has
-    /// never finished logging in (a node key alone does not count) is already empty in the sense
-    /// Go means — Go never saves a profile that has not logged in, and deletes one on logout — so
-    /// the daemon stays on it and answers `already on profile` instead of leaving a second empty
-    /// profile behind.
+    /// The daemon picks the new id (Go's four-hex-digit `newUnusedID`) and lists the profile in
+    /// `switch --list` only once it has logged in, as Go saves it only then. A current profile that
+    /// has never finished logging in (a node key alone does not count) is not left behind, since Go
+    /// never saves one: the daemon stays on it and resets its prefs and name to a new profile's, as
+    /// Go's switch gives it `defaultPrefs`.
     ///
     /// Its own command for the reason [`CreateProfile`](Request::CreateProfile) is: a daemon that
     /// predates it answers `bad request`, and `login` stops there with nothing renamed.

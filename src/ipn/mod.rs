@@ -2833,8 +2833,20 @@ impl Backend {
     /// if one exists, so the default profile is renameable like any other. Writes are atomic
     /// (see [`profile::save_profiles_file`]); an unreadable/malformed map is treated as empty by the
     /// loader, so the rename re-establishes it rather than failing.
+    ///
+    /// A profile [`switch_to_empty_profile`](Backend::switch_to_empty_profile) made that has not
+    /// logged in yet is not listed, and a rename does not list it: Go keeps `ProfileName` in the
+    /// unsaved profile's prefs until the login saves it. The name waits in `node_nickname`, which the
+    /// caller has already persisted, and [`register_current_profile`](Backend::register_current_profile)
+    /// carries it over.
     async fn rename_current_profile(&self, name: &str) -> Result<()> {
         let mut meta = profile::load_profiles_file(&self.state_dir).await;
+        if !self.prefs.has_logged_in
+            && self.current_profile != profile::DEFAULT_PROFILE_ID
+            && !meta.profiles.contains_key(&self.current_profile)
+        {
+            return Ok(());
+        }
         meta.profiles
             .entry(self.current_profile.clone())
             .or_default()
@@ -2876,7 +2888,7 @@ impl Backend {
         let meta = profile::load_profiles_file(&self.state_dir).await;
         let resolved = profile::resolve_target_to_id(target, &meta)
             .ok_or_else(|| anyhow!(profile::no_profile_named(target)))?;
-        self.activate_profile(&resolved).await
+        self.activate_profile(&resolved, true).await
     }
 
     /// Create profile `id` and switch to it — the explicit form of what `switch` used to do by
@@ -2904,7 +2916,7 @@ impl Backend {
                 "profile {existing:?} already exists; switch to it without --new"
             ));
         }
-        self.activate_profile(id).await
+        self.activate_profile(id, true).await
     }
 
     /// Switch to a new, empty profile: Go's `LocalBackend.NewProfile` (`profileManager.
@@ -2912,33 +2924,146 @@ impl Backend {
     /// SwitchToEmptyProfile` before it logs in. The profile the node was on keeps its prefs, key and
     /// name; the login that follows lands on the new one.
     ///
-    /// Two differences from Go, both about when a profile exists. Go gives the new profile an id
-    /// only once it is saved after a login; this daemon registers it straight away, because every
-    /// profile here is a directory keyed by its id. And Go never saves a profile that has not logged
-    /// in (and deletes one on logout), so a current profile that has not logged in
-    /// (`has_logged_in`, Go's `Persist.UserProfile.LoginName != ""`) is already the empty profile Go
-    /// would switch to: it is kept, and reported as [`SwitchOutcome::AlreadyCurrent`], rather than
-    /// left behind as a second, unregistered entry in `switch --list`.
+    /// Go never saves a profile that has not logged in (`Persist.UserProfile.LoginName != ""`, this
+    /// daemon's `has_logged_in`), so a current profile that has not logged in is not left behind:
+    /// Go's `SwitchToProfile` drops it and the node carries on with `defaultPrefs`. This daemon keeps
+    /// the profile's id and directory instead, and resets it in place — see
+    /// [`reset_to_empty_profile`](Backend::reset_to_empty_profile). The test is `has_logged_in`, not
+    /// `has_node_key`: a key exists as soon as an `up` builds its config, before control has seen the
+    /// node, so keying on it would make every retry of an unfinished login add a profile.
     ///
-    /// The test is `has_logged_in`, not `has_node_key`. A key exists as soon as an `up` builds its
-    /// config, before control has seen the node, so an interactive login the operator never finished
-    /// still holds one. Keying on it would make every retry of such a login add a profile. Staying
-    /// on that profile is safe: `login` sends `force_reauth`, which discards the key before it
-    /// registers.
+    /// A new profile is NOT registered in `profiles.json` here. Go gives it an id only when it is
+    /// saved after a login (`newUnusedID`, from `SetPrefs`), so an abandoned login leaves nothing in
+    /// `switch --list`. This daemon needs the id at once, because every profile is a directory keyed
+    /// by it, but it lists the profile only once it has logged in
+    /// ([`register_current_profile`](Backend::register_current_profile)). Files an abandoned login
+    /// left under a drawn id are cleared before the id is used, so a new profile starts empty.
     pub async fn switch_to_empty_profile(&mut self) -> Result<SwitchOutcome> {
+        self.switch_to_empty_profile_drawing(|| {
+            let mut bytes = [0u8; 2];
+            getrandom::fill(&mut bytes).map(|()| bytes)
+        })
+        .await
+    }
+
+    /// [`switch_to_empty_profile`](Backend::switch_to_empty_profile) with the id's random bytes
+    /// drawn from `draw`, so a test can pick the id.
+    async fn switch_to_empty_profile_drawing<E: std::fmt::Display>(
+        &mut self,
+        draw: impl FnMut() -> std::result::Result<[u8; 2], E>,
+    ) -> Result<SwitchOutcome> {
         if !self.prefs.has_logged_in {
+            return self.reset_to_empty_profile().await;
+        }
+        let mut meta = profile::load_profiles_file(&self.state_dir).await;
+        // The current profile is taken even when it is not listed, so its files are never cleared.
+        meta.profiles
+            .entry(self.current_profile.clone())
+            .or_default();
+        let id = profile::unused_profile_id(&meta, draw)
+            .map_err(|e| anyhow!("reading OS randomness for a new profile id: {e}"))?
+            .ok_or_else(|| anyhow!("could not find an unused profile id"))?;
+        self.remove_profile_files(&id).await?;
+        self.activate_profile(&id, false).await
+    }
+
+    /// Reset the current profile, which has never logged in, to an empty one: the branch of Go's
+    /// `profileManager.SwitchToProfile` that a `NewProfile` takes from an unsaved profile. Go keeps
+    /// nothing of it — `pm.prefs` becomes `defaultPrefs` — so the hostname, routes, exit node,
+    /// control URL and nickname an unfinished `up` left are gone before the `login` that follows.
+    ///
+    /// Go reports no change only when the profile and its prefs already equal the empty ones. Here
+    /// that is a profile with no prefs file, no name and no device, which is answered as
+    /// [`SwitchOutcome::AlreadyCurrent`] with nothing torn down or written. Otherwise the device is
+    /// torn down (Go's `resetForProfileChangeLocked`), the prefs file is removed so the profile reads
+    /// exactly as a new one does, and its name is cleared.
+    ///
+    /// The node key is kept: `login` sends `force_reauth`, which discards it before it registers.
+    async fn reset_to_empty_profile(&mut self) -> Result<SwitchOutcome> {
+        let mut meta = profile::load_profiles_file(&self.state_dir).await;
+        let named = meta
+            .profiles
+            .get(&self.current_profile)
+            .is_some_and(|m| !m.name.is_empty());
+        if !self.ever_configured && !named && self.device.is_none() {
             return Ok(SwitchOutcome::AlreadyCurrent {
                 id: self.current_profile.clone(),
             });
         }
-        let meta = profile::load_profiles_file(&self.state_dir).await;
-        let id = profile::unused_profile_id(&meta, || {
-            let mut bytes = [0u8; 2];
-            getrandom::fill(&mut bytes).map(|()| bytes)
+        self.stop_device().await;
+        self.bump_generation();
+        if named {
+            if let Some(m) = meta.profiles.get_mut(&self.current_profile) {
+                m.name.clear();
+            }
+            profile::save_profiles_file(&self.state_dir, &meta)
+                .await
+                .with_context(|| "persisting profiles.json")?;
+        }
+        match tokio::fs::remove_file(&self.prefs_path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(anyhow!("removing {}: {e}", self.prefs_path.display())),
+        }
+        self.prefs = Prefs::default();
+        self.ever_configured = false;
+        self.boot_attempted_up = false;
+        // The same profile-change edge as a switch (see `activate_profile`).
+        self.reset_always_on_override("new profile");
+        self.reset_exit_node_policy_override("new profile");
+        self.reconcile_sys_policy("new profile");
+        let _ = self.prefs_tx.send(());
+        Ok(SwitchOutcome::Switched {
+            id: self.current_profile.clone(),
+            state: self.derive_state(false),
         })
-        .map_err(|e| anyhow!("reading OS randomness for a new profile id: {e}"))?
-        .ok_or_else(|| anyhow!("could not find an unused profile id"))?;
-        self.activate_profile(&id).await
+    }
+
+    /// List the current profile in `profiles.json` once it has logged in — the point where Go saves a
+    /// new profile (`profileManager.SetPrefs` gives it an id once `LoginName` is set). Only a profile
+    /// made by [`switch_to_empty_profile`](Backend::switch_to_empty_profile) is ever unlisted; its
+    /// name so far waits in `node_nickname` (see
+    /// [`rename_current_profile`](Backend::rename_current_profile)) and is carried over here. A no-op
+    /// for a profile that is already listed, for `default`, and before the login.
+    async fn register_current_profile(&self) -> Result<()> {
+        if !self.prefs.has_logged_in || self.current_profile == profile::DEFAULT_PROFILE_ID {
+            return Ok(());
+        }
+        let mut meta = profile::load_profiles_file(&self.state_dir).await;
+        if meta.profiles.contains_key(&self.current_profile) {
+            return Ok(());
+        }
+        meta.profiles.insert(
+            self.current_profile.clone(),
+            profile::ProfileMeta {
+                name: self.prefs.node_nickname.clone().unwrap_or_default(),
+            },
+        );
+        profile::save_profiles_file(&self.state_dir, &meta)
+            .await
+            .with_context(|| {
+                format!(
+                    "persisting profiles.json while registering profile {:?}",
+                    self.current_profile
+                )
+            })
+    }
+
+    /// Remove profile `id`'s prefs and key files and, best effort, its then-empty directory.
+    /// Already-absent files are fine. `id` must be a validated profile id other than `default`.
+    async fn remove_profile_files(&self, id: &str) -> Result<()> {
+        let (prefs_path, key_path) = profile::profile_paths(&self.state_dir, id);
+        for p in [&prefs_path, &key_path] {
+            match tokio::fs::remove_file(p).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(anyhow!("removing {}: {e}", p.display())),
+            }
+        }
+        if let Some(dir) = prefs_path.parent() {
+            let _ = tokio::fs::remove_dir(dir).await;
+        }
+        Ok(())
     }
 
     /// Make profile `target` the active one: tear the current device down, repoint
@@ -2952,7 +3077,11 @@ impl Backend {
     /// as a single path component. Both callers guarantee that: [`switch_profile`](Backend::switch_profile)
     /// passes a [`profile::resolve_target_to_id`] result (which only ever returns validated ids) and
     /// [`create_profile`](Backend::create_profile) validates before calling.
-    async fn activate_profile(&mut self, target: &str) -> Result<SwitchOutcome> {
+    ///
+    /// `register` is false only for a new profile from
+    /// [`switch_to_empty_profile`](Backend::switch_to_empty_profile), which is listed once it has
+    /// logged in rather than now.
+    async fn activate_profile(&mut self, target: &str, register: bool) -> Result<SwitchOutcome> {
         if target == self.current_profile {
             // Already on it: nothing is torn down and nothing is written. Say so — reporting this as
             // a switch would claim a teardown that never happened (Go: `Already on account %q`).
@@ -2983,7 +3112,7 @@ impl Backend {
 
         // (1) Register the target in profiles.json (so `--list` shows it) if it is a new named
         // profile — before the pointer, so a crash between them only leaves a harmless extra entry.
-        if target != profile::DEFAULT_PROFILE_ID {
+        if register && target != profile::DEFAULT_PROFILE_ID {
             let mut meta = profile::load_profiles_file(&self.state_dir).await;
             meta.profiles
                 .entry(target.to_string())
@@ -3070,18 +3199,7 @@ impl Backend {
             return Err(anyhow!("the default profile cannot be removed"));
         }
         // Remove the profile's files (tolerate already-absent — idempotent).
-        let (prefs_path, key_path) = profile::profile_paths(&self.state_dir, target);
-        for p in [&prefs_path, &key_path] {
-            match tokio::fs::remove_file(p).await {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(anyhow!("removing {}: {e}", p.display())),
-            }
-        }
-        // Best-effort remove the now-empty profile dir.
-        if let Some(dir) = prefs_path.parent() {
-            let _ = tokio::fs::remove_dir(dir).await;
-        }
+        self.remove_profile_files(target).await?;
         // Drop it from profiles.json. Re-read rather than reusing the map loaded for resolution: the
         // file removals above are `await` points, so the map may be stale by now.
         let mut meta = profile::load_profiles_file(&self.state_dir).await;
@@ -5818,6 +5936,8 @@ impl Backend {
             .save(&self.prefs_path)
             .await
             .with_context(|| format!("saving prefs to {}", self.prefs_path.display()))?;
+        // Every persist of a finished login passes here, so this is where a new profile is listed.
+        self.register_current_profile().await?;
         // Wake any prefs watchers (a masked `Watch` with the `prefs` bit) — this is the single
         // chokepoint every prefs mutation funnels through, so one tick here covers up/set/logout/
         // switch/reload-config. A failed send (no subscribers) is fine — `watch::Sender::send` errors
@@ -8214,9 +8334,27 @@ mod tests {
         );
         assert_eq!(be.current_profile, id);
 
-        // `login --nickname=work` names the profile it switched to, and only that one.
+        // A second login before the first one registered stays on that profile, even once the
+        // first login's `up` has minted it a key: switch, `up` (key), switch again.
+        let (_, new_key_path) = profile::profile_paths(&dir, &id);
+        tailscale::config::load_key_file(&new_key_path, Default::default())
+            .await
+            .expect("mint a key file for the new profile");
+        be.has_node_key = true;
+        assert_eq!(
+            be.switch_to_empty_profile().await.unwrap(),
+            SwitchOutcome::AlreadyCurrent { id: id.clone() }
+        );
+
+        // `login --nickname=work` names the profile it switched to, and only that one. The name
+        // waits in the pref until the login finishes (Go saves the profile only then).
+        be.prefs.node_nickname = Some("work".into());
+        be.persist_prefs().await.unwrap();
         be.rename_current_profile("work").await.unwrap();
+        be.prefs.has_logged_in = true;
+        be.persist_prefs().await.unwrap();
         let profiles = be.list_profiles().await;
+        assert_eq!(profiles.len(), 2, "{profiles:?}");
         assert!(
             profiles
                 .iter()
@@ -8234,18 +8372,133 @@ mod tests {
             "the old profile's node key must survive"
         );
 
-        // A second login before the first one registered stays on that profile, even once the
-        // first login's `up` has minted it a key: switch, `up` (key), switch again.
-        let (_, new_key_path) = profile::profile_paths(&dir, &id);
-        tailscale::config::load_key_file(&new_key_path, Default::default())
-            .await
-            .expect("mint a key file for the new profile");
-        be.has_node_key = true;
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn switch_to_empty_profile_drops_what_an_unfinished_login_left() {
+        // Go's `SwitchToProfile` gives a profile that never logged in `defaultPrefs`, so the prefs an
+        // unfinished `up` left do not carry into the `login` that follows. `tnet login` sends no
+        // prefs of its own to override them, so keeping them here would log in with them.
+        let dir = std::env::temp_dir().join(format!("tailnetd-prof-reset-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = Backend::load(&dir).await.unwrap();
+
+        be.prefs.want_running = true;
+        be.prefs.control_url = Some("https://control.example.com".into());
+        be.prefs.hostname = Some("left-behind".into());
+        be.prefs.advertise_routes = vec!["192.0.2.0/24".into()];
+        be.prefs.exit_node = Some("100.64.0.9".into());
+        be.prefs.node_nickname = Some("half-done".into());
+        be.ever_configured = true;
+        be.persist_prefs().await.unwrap();
+        be.rename_current_profile("half-done").await.unwrap();
+        let generation_before = be.generation;
+
+        let outcome = be.switch_to_empty_profile().await.unwrap();
+        assert_eq!(
+            outcome,
+            SwitchOutcome::Switched {
+                id: profile::DEFAULT_PROFILE_ID.to_string(),
+                state: State::NoState,
+            }
+        );
+        assert!(be.generation > generation_before, "the device is reset");
+        assert!(!be.prefs.want_running);
+        assert_eq!(be.prefs.control_url, None);
+        assert_eq!(be.prefs.hostname, None);
+        assert!(be.prefs.advertise_routes.is_empty());
+        assert_eq!(be.prefs.exit_node, None);
+        assert_eq!(be.prefs.node_nickname, None);
+        let profiles = be.list_profiles().await;
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(
+            profiles[0].name,
+            profile::DEFAULT_PROFILE_ID,
+            "{profiles:?}"
+        );
+
+        // The reset is on disk: a restart does not bring the old prefs back.
+        let be = Backend::load(&dir).await.unwrap();
+        assert_eq!(be.prefs.hostname, None);
+        assert_eq!(be.prefs.control_url, None);
+
+        // Now the profile is empty, so a second login has nothing to reset (Go's no-change case).
+        let mut be = be;
         assert_eq!(
             be.switch_to_empty_profile().await.unwrap(),
-            SwitchOutcome::AlreadyCurrent { id: id.clone() }
+            SwitchOutcome::AlreadyCurrent {
+                id: profile::DEFAULT_PROFILE_ID.to_string()
+            }
         );
-        assert_eq!(be.list_profiles().await.len(), 2);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn a_login_profile_is_listed_only_once_it_has_logged_in() {
+        // Go gives a new login profile an id, and saves it, only after the login succeeds, so an
+        // abandoned `login` leaves nothing in `switch --list`.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-prof-unsaved-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = Backend::load(&dir).await.unwrap();
+        be.prefs.has_logged_in = true;
+        be.ever_configured = true;
+        be.persist_prefs().await.unwrap();
+
+        // Files an earlier abandoned login left under the id this one draws.
+        let (stale_prefs, _) = profile::profile_paths(&dir, "0a0b");
+        tokio::fs::create_dir_all(stale_prefs.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&stale_prefs, br#"{"hostname":"stale"}"#)
+            .await
+            .unwrap();
+
+        let outcome = be
+            .switch_to_empty_profile_drawing(|| Ok::<_, std::convert::Infallible>([0x0a, 0x0b]))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, SwitchOutcome::Switched { ref id, .. } if id == "0a0b"));
+        assert_eq!(be.prefs.hostname, None, "a new profile starts empty");
+        assert!(
+            !profile::load_profiles_file(&dir)
+                .await
+                .profiles
+                .contains_key("0a0b")
+        );
+        assert_eq!(be.list_profiles().await.len(), 1, "not listed before login");
+
+        // `--nickname` before the login does not list it either.
+        be.prefs.node_nickname = Some("work".into());
+        be.persist_prefs().await.unwrap();
+        be.rename_current_profile("work").await.unwrap();
+        assert_eq!(be.list_profiles().await.len(), 1);
+
+        // Abandoned: the operator switches back, and the unfinished profile is not listed.
+        be.switch_profile(profile::DEFAULT_PROFILE_ID)
+            .await
+            .unwrap();
+        assert_eq!(be.list_profiles().await.len(), 1);
+
+        // A login that finishes is listed, under the nickname it was given.
+        be.switch_to_empty_profile_drawing(|| Ok::<_, std::convert::Infallible>([0x0c, 0x0d]))
+            .await
+            .unwrap();
+        be.prefs.node_nickname = Some("work".into());
+        be.prefs.has_logged_in = true;
+        be.persist_prefs().await.unwrap();
+        let profiles = be.list_profiles().await;
+        assert!(
+            profiles
+                .iter()
+                .any(|e| e.id == "0c0d" && e.name == "work" && e.current),
+            "{profiles:?}"
+        );
+        assert_eq!(profiles.len(), 2, "{profiles:?}");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
