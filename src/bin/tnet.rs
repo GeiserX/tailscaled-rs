@@ -15052,8 +15052,8 @@ fn kubeconfig_parent_dir(path: &std::path::Path) -> std::path::PathBuf {
 /// nothing left to ask — and the write itself then reports whatever is really wrong.
 ///
 /// Without this the refusal arrives at the `open()` in [`set_kubeconfig_for_peer`], after the
-/// existing kubeconfig has been read and the merge computed, and it says "opening kubeconfig … for
-/// writing". Nothing is damaged either way; this one answers the question the operator asked, in
+/// existing kubeconfig has been read and the merge computed, and it says only `open <path>: …`.
+/// Nothing is damaged either way; this one answers the question the operator asked, in
 /// Go's words, at the point Go answers it.
 fn check_kubeconfig_writable(path: &str) -> Result<()> {
     let mut probe = std::path::PathBuf::from(path);
@@ -15196,11 +15196,7 @@ fn set_kubeconfig_for_peer(scheme: &str, fqdn: &str, path: &str) -> Result<()> {
         Ok(mut f) => {
             let mut b = Vec::new();
             std::io::Read::read_to_end(&mut f, &mut b).map_err(|e| read_err("read", &e))?;
-            // Go hands the bytes straight to `updateKubeconfig`, whose YAML decoder fails on an
-            // invalid UTF-8 sequence (`invalid leading UTF-8 octet`) and maps that, like every
-            // unmarshal failure, to `errInvalidKubeconfig`. This check stands in for that failure,
-            // so the words are the same.
-            String::from_utf8(b).map_err(|_| anyhow!("invalid kubeconfig"))?
+            decode_kubeconfig_bytes(b)?
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(read_err("open", &e)),
@@ -15208,20 +15204,58 @@ fn set_kubeconfig_for_peer(scheme: &str, fqdn: &str, path: &str) -> Result<()> {
     // Go: `b, err = updateKubeconfig(b, scheme, fqdn); if err != nil { return err }` — returned
     // bare, so a malformed file reads `invalid kubeconfig` and nothing more.
     let merged = update_kubeconfig(&existing, scheme, fqdn)?;
-    // Go: `os.WriteFile(filePath, b, 0600)`. The mode applies on creation; an existing file keeps
-    // whatever mode it had, so this never loosens a kubeconfig the user tightened.
+    // Go: `return os.WriteFile(filePath, b, 0600)` — returned bare, so a failure is WriteFile's
+    // `*os.PathError` and nothing more: `open <path>: permission denied`, `write <path>: …`. The
+    // mode applies on creation; an existing file keeps whatever mode it had, so this never loosens
+    // a kubeconfig the user tightened.
+    let write_err = |op: &str, e: &std::io::Error| {
+        anyhow!(
+            "{op} {}: {}",
+            sanitize_for_terminal(path),
+            go_io_error_text(e)
+        )
+    };
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
         .open(p)
-        .with_context(|| format!("opening kubeconfig {path} for writing"))?;
+        .map_err(|e| write_err("open", &e))?;
     f.write_all(merged.as_bytes())
-        .with_context(|| format!("writing kubeconfig {path}"))?;
-    f.sync_all()
-        .with_context(|| format!("fsync kubeconfig {path}"))?;
+        .map_err(|e| write_err("write", &e))?;
+    // WriteFile ends with `f.Close()` and returns its error, which is where a write deferred by
+    // the filesystem (NFS, a quota) finally surfaces. Dropping a `File` discards that error, so
+    // the sync is what still reports it — spelled as Go's `f.Sync()` would be.
+    f.sync_all().map_err(|e| write_err("sync", &e))?;
     Ok(())
+}
+
+/// The kubeconfig's bytes as the text Go's YAML decoder would read.
+///
+/// Go hands the raw bytes to `updateKubeconfig`, and `sigs.k8s.io/yaml`'s decoder (goyaml's
+/// `yaml_parser_determine_encoding`) looks at the start of the input: `FF FE` is UTF-16LE and
+/// `FE FF` is UTF-16BE, the mark is skipped and the rest decoded; anything else is UTF-8. So a
+/// kubeconfig saved as UTF-16 — which some Windows editors still do — merges in Go, and must merge
+/// here. The merged file is written back as UTF-8, as Go's is.
+///
+/// Anything that does not decode fails as goyaml's reader fails (`invalid leading UTF-8 octet`,
+/// `incomplete UTF-16 character`, an unpaired surrogate), and `updateKubeconfig` maps every
+/// unmarshal failure to `errInvalidKubeconfig` — so the words are Go's, `invalid kubeconfig`.
+fn decode_kubeconfig_bytes(b: Vec<u8>) -> Result<String> {
+    let invalid = || anyhow!("invalid kubeconfig");
+    let utf16 = |body: &[u8], unit: fn([u8; 2]) -> u16| {
+        if !body.len().is_multiple_of(2) {
+            return Err(invalid());
+        }
+        let units: Vec<u16> = body.chunks_exact(2).map(|c| unit([c[0], c[1]])).collect();
+        String::from_utf16(&units).map_err(|_| invalid())
+    };
+    match b.as_slice() {
+        [0xFF, 0xFE, body @ ..] => utf16(body, u16::from_le_bytes),
+        [0xFE, 0xFF, body @ ..] => utf16(body, u16::from_be_bytes),
+        _ => String::from_utf8(b).map_err(|_| invalid()),
+    }
 }
 
 /// Go's `dnsname.ToFQDN`, returning the `WithTrailingDot()` form — the shape Go compares Service
@@ -24987,6 +25021,60 @@ users:
     }
 
     #[test]
+    fn kubeconfig_merge_reads_utf16_like_goyaml() {
+        // goyaml, under Go's `sigs.k8s.io/yaml`, takes `FF FE` / `FE FF` as a UTF-16 byte-order
+        // mark and decodes the file, so Go merges a UTF-16 kubeconfig. It must merge here too, and
+        // come back as UTF-8, as Go writes it.
+        let dir = std::env::temp_dir().join(format!("tnet-kubeutf16-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config");
+        let path_str = path.to_str().unwrap().to_string();
+        let existing = concat!(
+            "apiVersion: v1\nkind: Config\nclusters:\n",
+            "- name: other\n  cluster:\n    server: https://other.example\n",
+        );
+        let utf16 = |bom: [u8; 2], unit: fn(u16) -> [u8; 2]| {
+            let mut b = bom.to_vec();
+            existing.encode_utf16().for_each(|u| b.extend(unit(u)));
+            b
+        };
+        for (what, bytes) in [
+            ("UTF-16LE", utf16([0xFF, 0xFE], u16::to_le_bytes)),
+            ("UTF-16BE", utf16([0xFE, 0xFF], u16::to_be_bytes)),
+        ] {
+            std::fs::write(&path, &bytes).unwrap();
+            set_kubeconfig_for_peer("https://", "foo.tail-scale.ts.net", &path_str)
+                .unwrap_or_else(|e| panic!("a {what} kubeconfig merges in Go: {e:#}"));
+            let merged = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("the {what} merge must be written as UTF-8: {e}"));
+            assert!(
+                merged.contains("server: https://other.example"),
+                "the {what} file's own cluster must survive the merge:\n{merged}"
+            );
+            assert!(
+                merged.contains("server: https://foo.tail-scale.ts.net"),
+                "the {what} file must have gained the new cluster:\n{merged}"
+            );
+        }
+
+        // What goyaml's reader cannot decode is still Go's `invalid kubeconfig`, and the file is
+        // left alone: half a UTF-16 unit, and a low surrogate with no high one before it.
+        for (what, bytes) in [
+            ("an odd byte count", b"\xff\xfea\x00b".to_vec()),
+            ("an unpaired surrogate", b"\xff\xfe\x00\xdca\x00".to_vec()),
+        ] {
+            std::fs::write(&path, &bytes).unwrap();
+            let err = set_kubeconfig_for_peer("https://", "foo.tail-scale.ts.net", &path_str)
+                .expect_err(what);
+            assert_eq!(format!("{err:#}"), "invalid kubeconfig", "{what}");
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "{what}: file touched");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn kubeconfig_merge_writes_the_file_preserving_other_clusters() {
         // The end-to-end of the default path: `set_kubeconfig_for_peer` creates the ~/.kube dir,
         // merges into whatever is there, and writes 0600 — the state Go leaves the machine in.
@@ -25051,7 +25139,7 @@ users:
 
         // Bytes that are not UTF-8 are a malformed file too: Go's YAML decoder fails on them and
         // `updateKubeconfig` says `invalid kubeconfig`. (Not a `\xff\xfe` start — goyaml reads that
-        // as a UTF-16 byte-order mark and decodes it.)
+        // as a UTF-16 byte-order mark and decodes it; see the UTF-16 test below.)
         let not_utf8: &[u8] = b"apiVersion: v1\n\x80\n";
         std::fs::write(&path, not_utf8).unwrap();
         let err = set_kubeconfig_for_peer("https://", "foo.tail-scale.ts.net", &path_str)
@@ -25207,6 +25295,21 @@ users:
                     "cannot write kubeconfig at \"{p}\": open {p}: permission denied",
                     p = ro.display()
                 )
+            );
+            // Past the precheck, the write itself. Go ends `setKubeconfigForPeer` with a bare
+            // `return os.WriteFile(filePath, b, 0600)`, so the error is WriteFile's
+            // `*os.PathError` alone — no "opening kubeconfig … for writing" around it.
+            let err =
+                set_kubeconfig_for_peer("https://", "foo.tail-scale.ts.net", ro.to_str().unwrap())
+                    .expect_err("a read-only kubeconfig cannot be written");
+            assert_eq!(
+                format!("{err:#}"),
+                format!("open {}: permission denied", ro.display())
+            );
+            assert_eq!(
+                std::fs::read_to_string(&ro).unwrap(),
+                "apiVersion: v1\nkind: Config\n",
+                "a refused write must not have touched the file"
             );
         }
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o600)).unwrap();
