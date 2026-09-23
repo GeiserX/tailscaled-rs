@@ -11956,12 +11956,12 @@ struct PortedUpFlags {
 /// package prints the bare sentence. Both are pinned in `tests/tnet_up_go_flag_spellings.rs`.
 ///
 /// For `--nickname` the sentence itself is this fork's: it names where the behaviour does live
-/// instead of stopping at "not defined". `--host-routes` keeps Go's sentence, respelled in one
-/// place only: Go's flag package prints the name it registered, `-host-routes`, and this one prints
-/// the name a `tnet` operator typed. Go's usage block is dropped both times — `failf` prints the
-/// message and then calls `f.usage()`, so upstream's stderr carries the command's whole flag list
-/// after the sentence — for the reason every other refusal here leaves it off: the message already
-/// says what to run.
+/// instead of stopping at "not defined". `--host-routes` keeps Go's sentence byte for byte,
+/// including the one-dash `-host-routes` Go's flag package prints for the name it registered,
+/// whether the operator typed one dash or two. Go's usage block is dropped both times — `failf`
+/// prints the message and then calls `f.usage()`, so upstream's stderr carries the command's whole
+/// flag list after the sentence — for the reason every other refusal here leaves it off: the
+/// message already says what to run.
 fn exit_like_gos_flag_parser(err: &anyhow::Error) -> ! {
     eprintln!("{err}");
     std::process::exit(2)
@@ -12001,12 +12001,13 @@ fn check_ported_up_flags(flags: &PortedUpFlags) -> Result<()> {
 /// status (see [`exit_like_gos_flag_parser`]). Pure → unit-testable.
 fn check_host_routes(value: Option<&str>) -> Result<()> {
     // Go's `notFalseVar.Set` rejects every value but "true", and Go's flag package wraps that in
-    // `invalid boolean value %q for -host-routes: %v`. Same sentence, this CLI's flag spelling.
+    // `invalid boolean value %q for -host-routes: %v`. Same sentence, byte for byte: the flag
+    // package prints the name as registered, one dash, whichever spelling the operator typed.
     if let Some(value) = value
         && value != "true"
     {
         anyhow::bail!(
-            "invalid boolean value {value:?} for --host-routes: unsupported value; only 'true' \
+            "invalid boolean value {value:?} for -host-routes: unsupported value; only 'true' \
              is allowed"
         );
     }
@@ -22817,7 +22818,7 @@ mod tests {
             assert_eq!(
                 err,
                 format!(
-                    "invalid boolean value {value:?} for --host-routes: unsupported value; only \
+                    "invalid boolean value {value:?} for -host-routes: unsupported value; only \
                      'true' is allowed"
                 ),
                 "--host-routes={value}"
@@ -22934,7 +22935,7 @@ mod tests {
             assert_eq!(
                 err,
                 format!(
-                    "invalid boolean value {value:?} for --host-routes: unsupported value; only \
+                    "invalid boolean value {value:?} for -host-routes: unsupported value; only \
                      'true' is allowed"
                 ),
                 "login --host-routes={value}"
