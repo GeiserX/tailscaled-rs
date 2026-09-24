@@ -11506,6 +11506,7 @@ async fn watch_status(socket: &std::path::Path, json: bool, filter: StatusFilter
         initial_netmap: false,
         prefs: false,
         policy: false,
+        initial_status: false,
     })?;
     line.push(b'\n');
     write_half.write_all(&line).await?;
@@ -11565,7 +11566,7 @@ async fn watch_status(socket: &std::path::Path, json: bool, filter: StatusFilter
 
 /// `debug watch-ipn` (Go `tailscale debug watch-ipn-bus`): stream the daemon's IPN notification bus,
 /// printing one JSON [`NotifyView`](tailscaled_rs::localapi::NotifyView) per line. Sends the **masked**
-/// `watch` request with every mask bit set (`initial_state`, `initial_netmap`, `prefs`, `policy`) so
+/// `watch` request with the `initial_state`, `initial_netmap`, `prefs` and `policy` bits set so
 /// the first frames are the current state + peer set + prefs + effective policy, and each later frame
 /// carries only what changed. Reuses `watch_status`'s
 /// streaming-read shape — connect, write the one request line, then read [`Response`] lines until the
@@ -11586,6 +11587,7 @@ async fn run_debug_watch_ipn(socket: &std::path::Path) -> Result<()> {
         initial_netmap: true,
         prefs: true,
         policy: true,
+        initial_status: false,
     })?;
     line.push(b'\n');
     write_half.write_all(&line).await?;
