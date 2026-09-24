@@ -70,7 +70,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 
-use crate::localapi::{PeerReport, StatusReport};
+use crate::localapi::{PeerReport, SelfReport, StatusReport};
 use crate::prefs::Prefs;
 
 pub mod alwayson;
@@ -1213,6 +1213,53 @@ pub(crate) fn peer_report_from_status_node(p: tailscale::StatusNode) -> PeerRepo
 pub(crate) fn notify_state_from_device(ds: tailscale::DeviceState) -> (String, Option<String>) {
     let (state, _auth_url, error) = state_from_device(ds);
     (state.as_str().to_string(), error)
+}
+
+/// Project this node's engine [`NodeInfo`](tailscale::NodeInfo) into the [`SelfReport`] a `watch`
+/// netmap frame carries as `self_change` (Go `Notify.SelfChange`). Name and addresses go through the
+/// engine's own [`StatusNode::from_node`](tailscale::StatusNode::from_node) — the mapping
+/// `Device::status` builds its `self_node` with — so a self frame and [`Backend::status`]'s
+/// `self_name`/`self_ipv4`/`self_ipv6` can never describe this node differently.
+pub(crate) fn self_report_from_node(node: &tailscale::NodeInfo) -> SelfReport {
+    self_report_from_status_node(tailscale::StatusNode::from_node(node), node.node_key_expiry)
+}
+
+/// The pure half of [`self_report_from_node`], split out because an engine `Node` carries real keys
+/// and cannot be built in a unit test, while a `StatusNode` and an expiry can.
+fn self_report_from_status_node(
+    n: tailscale::StatusNode,
+    key_expiry: Option<chrono::DateTime<chrono::Utc>>,
+) -> SelfReport {
+    SelfReport {
+        stable_id: n.stable_id.0,
+        name: n.display_name,
+        ipv4: n.ipv4.to_string(),
+        ipv6: n.ipv6.to_string(),
+        // Go `Node.KeyExpiry`, rendered RFC3339 exactly as `whois` renders `node_key_expiry`. The
+        // engine's `None` is a key that never expires (Go's zero time), not an unknown expiry.
+        key_expiry: key_expiry.map(|t| t.to_rfc3339()),
+    }
+}
+
+/// Fetch this node's [`SelfReport`] for one `watch` netmap frame, or `None` if the engine has no self
+/// node to give. Bounded by [`STATUS_QUERY_TIMEOUT`] like `status`'s netmap query, so a wedged
+/// control actor delays the frame by at most that long instead of stalling the stream; on a miss the
+/// frame still carries its peers, just without a self view (Go likewise leaves `SelfChange` nil when
+/// the netmap has no valid self node).
+pub(crate) async fn fetch_self_report(dev: &tailscale::Device) -> Option<SelfReport> {
+    match tokio::time::timeout(STATUS_QUERY_TIMEOUT, dev.self_node()).await {
+        Ok(Ok(node)) => Some(self_report_from_node(&node)),
+        Ok(Err(e)) => {
+            tracing::debug!(error = %e, "engine self-node query failed; netmap frame sent without self");
+            None
+        }
+        Err(_elapsed) => {
+            tracing::debug!(
+                "engine self-node query exceeded {STATUS_QUERY_TIMEOUT:?}; netmap frame sent without self"
+            );
+            None
+        }
+    }
 }
 
 /// Perform the slow engine handshake for a [`PendingUp`], **without** holding the backend lock.
@@ -6020,6 +6067,43 @@ mod tests {
     // `state_from_device` mapping) and the macOS TUN-name tests moved to `ipn::state` alongside the
     // functions they exercise; the read-only-diagnostics / Taildrop path-hardening predicate tests
     // moved to `ipn::diag`. See those modules' `#[cfg(test)] mod tests`.
+
+    /// The self view a `watch` netmap frame carries (Go `Notify.SelfChange`) takes its name and
+    /// addresses from the same engine `StatusNode` `status` reports `self_*` from, and renders the
+    /// key expiry RFC3339 — with a never-expiring key staying absent rather than becoming a date.
+    #[test]
+    fn self_report_projects_the_status_self_node_and_its_key_expiry() {
+        use chrono::TimeZone;
+        let node = tailscale::StatusNode {
+            stable_id: tailscale::StableNodeId("nSELF1CNTRL".to_string()),
+            display_name: "laptop.tail0123.ts.net".to_string(),
+            ipv4: "100.64.0.1".parse().unwrap(),
+            ipv6: "fd7a:115c:a1e0::1".parse().unwrap(),
+            online: Some(true),
+            last_seen: None,
+            allowed_routes: Vec::new(),
+            is_exit_node: false,
+            cur_addr: None,
+            relay: None,
+            ssh_host_keys: Vec::new(),
+        };
+        let expiry = chrono::Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap();
+
+        let me = self_report_from_status_node(node.clone(), Some(expiry));
+        assert_eq!(
+            me,
+            SelfReport {
+                stable_id: "nSELF1CNTRL".to_string(),
+                name: "laptop.tail0123.ts.net".to_string(),
+                ipv4: "100.64.0.1".to_string(),
+                ipv6: "fd7a:115c:a1e0::1".to_string(),
+                key_expiry: Some("2026-09-01T12:00:00+00:00".to_string()),
+            }
+        );
+
+        let never = self_report_from_status_node(node, None);
+        assert_eq!(never.key_expiry, None);
+    }
 
     // --- has_persisted_node_key ---------------------------------------------------------------
     //
