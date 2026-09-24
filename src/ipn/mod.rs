@@ -2034,6 +2034,27 @@ pub struct Backend {
     /// the single chokepoint EVERY prefs mutation (`up`/`set`/`logout`/`switch`/`reload-config`)
     /// funnels through, so one send-site covers them all. Daemon-owned (the engine has no prefs cell).
     prefs_tx: tokio::sync::watch::Sender<()>,
+    /// The last exit-node suggestion published, AND the channel that publishes it (a masked `Watch`
+    /// with the `suggested_exit_node` bit). The held value is this fork's
+    /// `LocalBackend.lastSuggestedExitNode`: `None` until a suggestion has ever been computed, then
+    /// the stable node id of the most recent one.
+    ///
+    /// Unlike [`prefs_tx`](Backend::prefs_tx) this is a VALUE channel, not a tick. A prefs watcher can
+    /// re-read [`prefs_view`](Backend::prefs_view) for itself; a suggestion watcher cannot re-derive a
+    /// suggestion at all — computing one needs the live device and an engine round-trip — so the value
+    /// rides the channel.
+    ///
+    /// Cell and channel are deliberately ONE object. Go compares `prevSuggestion != res.ID` inside
+    /// `suggestExitNodeLocked`, the only placement that cannot drift from the value actually returned;
+    /// here the compare and the send are both
+    /// [`publish_suggested_exit_node`](Backend::publish_suggested_exit_node), reached only from
+    /// [`suggest_exit_node`](Backend::suggest_exit_node) and never from a request handler. One writer,
+    /// no second copy to fall out of step.
+    ///
+    /// Written with `send_replace`, never `send`: `send` refuses — and, load-bearingly, does NOT store
+    /// — when there are no receivers, which is the common case (nobody is watching), and would leave
+    /// the cell empty so that every later suggestion looked like a change.
+    suggested_exit_node_tx: tokio::sync::watch::Sender<Option<String>>,
     /// Whether **this process** has attempted a boot-time auto-start (set by
     /// [`mark_boot_attempted_up`](Backend::mark_boot_attempted_up)). Process-local and deliberately
     /// NOT persisted: it lets the SIGHUP reload path distinguish "retry a bring-up we already
@@ -2367,6 +2388,9 @@ impl Backend {
             .with_context(|| format!("loading prefs from {}", prefs_path.display()))?;
         let (lifecycle_tx, _) = tokio::sync::watch::channel(0u64);
         let (prefs_tx, _) = tokio::sync::watch::channel(());
+        // No suggestion has been computed yet this process — the cell starts empty, so the first
+        // suggestion of the run always counts as a change and always reaches watchers.
+        let (suggested_exit_node_tx, _) = tokio::sync::watch::channel(None);
         let mut backend = Self {
             prefs,
             state_dir: state_dir.to_path_buf(),
@@ -2388,6 +2412,7 @@ impl Backend {
             boot_attempted_up: false,
             lifecycle_tx,
             prefs_tx,
+            suggested_exit_node_tx,
             // Seed the cache once, at startup, from an actual on-disk check — startup is not the hot
             // path, and every later mutation is tracked at its transition (see the field doc's
             // invariant). `has_persisted_node_key` reads only `key_path`, which is already set above.
@@ -5278,13 +5303,91 @@ impl Backend {
         diag::netcheck(dev).await
     }
 
-    /// Suggest the best available exit node (the `tnet exit-node suggest` path). Thin `pub` shim over
-    /// [`diag::suggest_exit_node`], uniform with the other off-lock diagnostics. See it for the
-    /// `suggest_exit_node()` → [`Response::ExitNodeSuggestion`](crate::localapi::Response) mapping
-    /// (`Ok(None)` = no eligible candidate, an honest empty result, not an error) and for the
-    /// `AllowedSuggestedExitNodes` allow-list the engine's answer is filtered through.
-    pub async fn suggest_exit_node(dev: &tailscale::Device) -> crate::localapi::Response {
-        diag::suggest_exit_node(dev).await
+    /// Suggest the best available exit node (the `tnet exit-node suggest` path, and the
+    /// `suggested_exit_node` watch bit's front-load) **and put the answer on the notify bus if it
+    /// moved**. See [`diag::suggest_exit_node`] for the `suggest_exit_node()` →
+    /// [`Response::ExitNodeSuggestion`](crate::localapi::Response) mapping (`Ok(None)` = no eligible
+    /// candidate, an honest empty result, not an error) and for the `AllowedSuggestedExitNodes`
+    /// allow-list the engine's answer is filtered through.
+    ///
+    /// This is the port of Go's `LocalBackend.suggestExitNodeLocked`, which computes the suggestion
+    /// and, in the same function, notifies every client when the pick differs from the last one.
+    /// Keeping the push HERE rather than in the request handler is the whole point: the comparison
+    /// then reads the value actually returned to the caller, so the two can never disagree — and a
+    /// second caller of the computation (this bit's front-load) gets the notification for free
+    /// instead of having to remember to re-implement it.
+    ///
+    /// It takes the shared backend rather than `&self` because the engine round-trip must run
+    /// OFF-LOCK, like the other diagnostics: compute first with no lock held, then take the lock only
+    /// for the brief compare-and-publish.
+    pub async fn suggest_exit_node(
+        backend: &std::sync::Arc<tokio::sync::Mutex<Backend>>,
+        dev: &tailscale::Device,
+    ) -> crate::localapi::Response {
+        let response = diag::suggest_exit_node(dev).await;
+        backend.lock().await.publish_suggested_exit_node(&response);
+        response
+    }
+
+    /// Publish a freshly-computed exit-node suggestion to every notify watcher — but only if it
+    /// differs from the last one published. Returns whether it published.
+    ///
+    /// The tail of Go's `suggestExitNodeLocked`:
+    ///
+    /// ```go
+    /// if prevSuggestion != res.ID {
+    ///     b.sendToLocked(ipn.Notify{SuggestedExitNode: &res.ID}, allClients)
+    /// }
+    /// b.lastSuggestedExitNode = res.ID
+    /// ```
+    ///
+    /// Three properties come straight across. It is **change-triggered**, so a stable answer costs
+    /// nothing on the bus however often it is recomputed. It goes to **every** watcher, not to the
+    /// session that triggered the computation, because the suggestion describes the node rather than
+    /// the asker (`allClients`) — here that falls out of the channel being on the backend, which every
+    /// watcher subscribes to. And it fires wherever a suggestion is computed, which in this fork means
+    /// `exit-node suggest` and the watch front-load (see
+    /// [`Request::Watch::suggested_exit_node`](crate::localapi::Request::Watch::suggested_exit_node)
+    /// for why that set is narrower than Go's).
+    ///
+    /// An **empty or failed** answer publishes nothing and leaves the remembered value alone. Go's
+    /// error path returns before both the compare and the `lastSuggestedExitNode` assignment, so a
+    /// watcher is never told "no suggestion" — it simply hears nothing further until a real one
+    /// appears. This fork reaches the same place from two directions: `Ok(None)` (no eligible
+    /// candidate, or the pick withheld by `AllowedSuggestedExitNodes`) and an engine error are both
+    /// silence. Leaving the cell untouched is what makes the next real suggestion compare against the
+    /// last value a watcher was actually told, rather than against a gap.
+    ///
+    /// `&self`, not `&mut self`: the cell lives behind a `watch::Sender`, which publishes through a
+    /// shared reference. That is not an accident of the type — it keeps this callable from the brief
+    /// read-style lock the off-lock diagnostics take.
+    pub fn publish_suggested_exit_node(&self, response: &crate::localapi::Response) -> bool {
+        let crate::localapi::Response::ExitNodeSuggestion {
+            suggestion: Some(suggestion),
+        } = response
+        else {
+            return false; // empty result or engine error → silence, and the cell stands
+        };
+        if self.suggested_exit_node_tx.borrow().as_deref() == Some(suggestion.id.as_str()) {
+            return false; // unchanged — Go's `prevSuggestion != res.ID` guard
+        }
+        tracing::debug!(
+            suggested_id = %suggestion.id,
+            "exit-node suggestion changed; publishing to notify watchers"
+        );
+        self.suggested_exit_node_tx
+            .send_replace(Some(suggestion.id.clone()));
+        true
+    }
+
+    /// Subscribe to exit-node-suggestion pushes (a masked `Watch` with the `suggested_exit_node`
+    /// bit). Unlike [`watch_prefs`](Backend::watch_prefs) the value rides the channel, so a receiver
+    /// reads it with `borrow_and_update()` instead of re-deriving it — it has no way to re-derive a
+    /// suggestion of its own. `subscribe()` starts synced, so attaching never replays the current
+    /// value; a watcher's first frame comes from its own
+    /// [`suggest_exit_node`](Backend::suggest_exit_node) front-load.
+    pub fn watch_suggested_exit_node(&self) -> tokio::sync::watch::Receiver<Option<String>> {
+        self.suggested_exit_node_tx.subscribe()
     }
 
     /// Validate a prospective prefs change WITHOUT applying it (the `check-prefs` LocalAPI / Go
@@ -6051,6 +6154,8 @@ mod tests {
             boot_attempted_up: false,
             lifecycle_tx: tokio::sync::watch::channel(0u64).0,
             prefs_tx: tokio::sync::watch::channel(()).0,
+            // No suggestion computed yet, exactly as a freshly-loaded backend starts.
+            suggested_exit_node_tx: tokio::sync::watch::channel(None).0,
             // Cache starts `false` (a fresh backend, no key checked yet). Tests that need a key
             // present drive the real wipe/build paths, which keep the cache consistent on their own.
             has_node_key: false,
@@ -6065,6 +6170,158 @@ mod tests {
             override_exit_node_policy: false,
             exit_node_keys: syspolicy::ExitNodeKeys::default(),
         }
+    }
+
+    // --- exit-node suggestion on the notify bus ----------------------------------------------------
+
+    /// A throwaway `Backend` for the suggestion tests. They exercise only the in-memory suggestion
+    /// cell, so no file is ever read or written and the path deliberately does not exist — nothing
+    /// here needs a temp dir (the module avoids a `tempfile` dependency, see `backend_for`).
+    fn suggestion_backend() -> Backend {
+        backend_for(std::path::Path::new(
+            "/nonexistent/tailnetd-suggestion-tests",
+        ))
+    }
+
+    /// Build a `Response::ExitNodeSuggestion` the way `diag::suggest_exit_node` returns one.
+    fn suggestion_response(id: &str, name: &str) -> crate::localapi::Response {
+        crate::localapi::Response::ExitNodeSuggestion {
+            suggestion: Some(crate::localapi::ExitNodeSuggestionView {
+                id: id.to_string(),
+                name: name.to_string(),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_first_suggestion_of_the_run_reaches_a_watcher() {
+        let be = suggestion_backend();
+        let mut rx = be.watch_suggested_exit_node();
+        // Nothing computed yet: the cell is empty and the receiver starts synced, so a watcher that
+        // attached before any suggestion existed has nothing pending.
+        assert_eq!(*rx.borrow_and_update(), None);
+
+        assert!(
+            be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")),
+            "the first suggestion of the process differs from the empty cell, so it publishes"
+        );
+        assert!(
+            rx.has_changed().unwrap(),
+            "the watcher must have been woken"
+        );
+        assert_eq!(
+            rx.borrow_and_update().as_deref(),
+            Some("nodeid-a"),
+            "the bare stable id rides the channel, as Go's Notify.SuggestedExitNode carries it"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_suggestion_costs_nothing_on_the_bus() {
+        let be = suggestion_backend();
+        let mut rx = be.watch_suggested_exit_node();
+
+        assert!(be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")));
+        rx.borrow_and_update(); // consume the first push
+
+        // Go guards the send with `if prevSuggestion != res.ID`, so recomputing a stable answer —
+        // which this fork does on every `exit-node suggest` and every watch front-load — must not
+        // wake a single watcher.
+        assert!(
+            !be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")),
+            "the same pick must not be republished"
+        );
+        assert!(
+            !rx.has_changed().unwrap(),
+            "an unchanged suggestion must not wake a watcher"
+        );
+
+        // A different pick is a change, and the name moving on its own is not — the id is the value.
+        assert!(be.publish_suggested_exit_node(&suggestion_response("nodeid-b", "berlin")));
+        assert_eq!(rx.borrow_and_update().as_deref(), Some("nodeid-b"));
+    }
+
+    #[tokio::test]
+    async fn an_empty_suggestion_is_silence_and_leaves_the_remembered_pick_alone() {
+        let be = suggestion_backend();
+        let mut rx = be.watch_suggested_exit_node();
+
+        assert!(be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")));
+        rx.borrow_and_update();
+
+        // `Ok(None)` is this fork's honest empty result: no eligible candidate, or the pick withheld
+        // by the administrator's `AllowedSuggestedExitNodes`. Go reaches the same place via an error
+        // from `suggestExitNodeLocked` and sends nothing, leaving `lastSuggestedExitNode` untouched.
+        let empty = crate::localapi::Response::ExitNodeSuggestion { suggestion: None };
+        assert!(
+            !be.publish_suggested_exit_node(&empty),
+            "an empty suggestion must not produce a frame"
+        );
+        // An engine failure is the same silence.
+        let failed = crate::localapi::Response::Error {
+            message: "exit-node suggest failed".to_string(),
+        };
+        assert!(
+            !be.publish_suggested_exit_node(&failed),
+            "an engine error must not produce a frame"
+        );
+        assert!(
+            !rx.has_changed().unwrap(),
+            "neither an empty result nor an error may wake a watcher"
+        );
+        assert_eq!(
+            rx.borrow_and_update().as_deref(),
+            Some("nodeid-a"),
+            "the remembered pick stands, so the next real suggestion is compared against the last \
+             value a watcher was actually told"
+        );
+
+        // ...and because the cell stood, the SAME pick coming back is still not a change.
+        assert!(
+            !be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")),
+            "a pick that went away and came back unchanged must not be republished"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_suggestion_reaches_every_watcher_not_just_the_asker() {
+        let be = suggestion_backend();
+        // Three independent connections watching the bus. Go sends the suggestion to `allClients`
+        // rather than to the session that triggered the computation, because the suggestion is a
+        // property of the node, not of the asker: one `exit-node suggest` informs everyone.
+        let mut watchers: Vec<_> = (0..3).map(|_| be.watch_suggested_exit_node()).collect();
+        for rx in &mut watchers {
+            rx.borrow_and_update();
+        }
+
+        assert!(be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")));
+        for rx in &mut watchers {
+            assert!(
+                rx.has_changed().unwrap(),
+                "every watcher must be woken, not only the connection that asked"
+            );
+            assert_eq!(rx.borrow_and_update().as_deref(), Some("nodeid-a"));
+        }
+    }
+
+    #[tokio::test]
+    async fn publishing_with_no_watchers_still_records_the_pick() {
+        let be = suggestion_backend();
+        // Nobody is watching — the common case. `watch::Sender::send` would refuse here AND leave the
+        // value unstored, so the cell must be written with `send_replace`; otherwise every later
+        // suggestion would look like a change and a watcher attaching afterwards would be told about
+        // a "new" pick that had been stable for hours.
+        assert!(be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")));
+        assert!(
+            !be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")),
+            "the pick must have been recorded even with zero receivers"
+        );
+        let mut rx = be.watch_suggested_exit_node();
+        assert_eq!(
+            rx.borrow_and_update().as_deref(),
+            Some("nodeid-a"),
+            "a watcher attaching later reads the recorded pick for its front-load"
+        );
     }
 
     // --- captive-portal detection (tsd-iqq.5) -----------------------------------------------------
