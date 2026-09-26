@@ -70,7 +70,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 
-use crate::localapi::{PeerReport, StatusReport};
+use crate::localapi::{PeerReport, SelfReport, StatusReport};
 use crate::prefs::Prefs;
 
 pub mod alwayson;
@@ -1213,6 +1213,82 @@ pub(crate) fn peer_report_from_status_node(p: tailscale::StatusNode) -> PeerRepo
 pub(crate) fn notify_state_from_device(ds: tailscale::DeviceState) -> (String, Option<String>) {
     let (state, _auth_url, error) = state_from_device(ds);
     (state.as_str().to_string(), error)
+}
+
+/// Project this node's engine [`NodeInfo`](tailscale::NodeInfo) into the [`SelfReport`] a `watch`
+/// netmap frame carries as `self_change` (Go `Notify.SelfChange`). Name and addresses go through the
+/// engine's own [`StatusNode::from_node`](tailscale::StatusNode::from_node) — the mapping
+/// `Device::status` builds its `self_node` with — so a self frame and [`Backend::status`]'s
+/// `self_name`/`self_ipv4`/`self_ipv6` can never describe this node differently.
+pub(crate) fn self_report_from_node(node: &tailscale::NodeInfo) -> SelfReport {
+    self_report_from_status_node(tailscale::StatusNode::from_node(node), node.node_key_expiry)
+}
+
+/// The pure half of [`self_report_from_node`], split out because an engine `Node` carries real keys
+/// and cannot be built in a unit test, while a `StatusNode` and an expiry can.
+fn self_report_from_status_node(
+    n: tailscale::StatusNode,
+    key_expiry: Option<chrono::DateTime<chrono::Utc>>,
+) -> SelfReport {
+    SelfReport {
+        stable_id: n.stable_id.0,
+        name: n.display_name,
+        ipv4: n.ipv4.to_string(),
+        ipv6: n.ipv6.to_string(),
+        // Go `Node.KeyExpiry`, rendered RFC3339 exactly as `whois` renders `node_key_expiry`. The
+        // engine's `None` is a key that never expires (Go's zero time), not an unknown expiry.
+        key_expiry: key_expiry.map(|t| t.to_rfc3339()),
+    }
+}
+
+/// Whether a `watch` netmap tick should ask the engine for its self node at all.
+///
+/// The engine's `Device::self_node` does not answer "none yet": it **waits** for the control
+/// runner's sticky self-node cell to be filled by the first netmap. Before that, a query always runs
+/// out the whole [`STATUS_QUERY_TIMEOUT`]. So in `Connecting`, `NeedsLogin` and `NeedsMachineAuth` —
+/// the pre-netmap states — the answer is known to be "no self node" and is not asked for. Without
+/// this, a subscribe with `initial_netmap` on an unregistered node would hold its first frame, the
+/// one carrying the interactive-login URL, for half a second just to learn there is no self.
+///
+/// `had_self` is whether this stream already got a self node from the same engine epoch. The cell is
+/// only ever set, never cleared, so once one was seen every later query answers at once. That covers
+/// the one pre-netmap state that can also occur mid-session: control pushing a re-auth URL flips the
+/// state to `NeedsLogin` while the self node is still there, and Go still sends it.
+///
+/// Every other state asks. `Reauthenticating` and `Expired` come from a self node control sent, so
+/// one exists. `Failed` is left to the timeout backstop: it can follow either a first registration
+/// (no self node) or a lost session (a self node), and the state alone does not say which.
+pub(crate) fn should_query_self_node(ds: &tailscale::DeviceState, had_self: bool) -> bool {
+    use tailscale::DeviceState as D;
+    had_self || !matches!(ds, D::Connecting | D::NeedsLogin(_) | D::NeedsMachineAuth)
+}
+
+/// Fetch this node's [`SelfReport`] for one `watch` netmap frame, or `None` if the engine has no self
+/// node to give. Skipped outright when [`should_query_self_node`] says no self node can exist yet;
+/// otherwise bounded by [`STATUS_QUERY_TIMEOUT`] like `status`'s netmap query, so a wedged control
+/// actor delays the frame by at most that long instead of stalling the stream. On a miss the frame
+/// still carries its peers, just without a self view (Go likewise leaves `SelfChange` nil when the
+/// netmap has no valid self node).
+pub(crate) async fn fetch_self_report(
+    dev: &tailscale::Device,
+    had_self: bool,
+) -> Option<SelfReport> {
+    if !should_query_self_node(&dev.device_state(), had_self) {
+        return None;
+    }
+    match tokio::time::timeout(STATUS_QUERY_TIMEOUT, dev.self_node()).await {
+        Ok(Ok(node)) => Some(self_report_from_node(&node)),
+        Ok(Err(e)) => {
+            tracing::debug!(error = %e, "engine self-node query failed; netmap frame sent without self");
+            None
+        }
+        Err(_elapsed) => {
+            tracing::debug!(
+                "engine self-node query exceeded {STATUS_QUERY_TIMEOUT:?}; netmap frame sent without self"
+            );
+            None
+        }
+    }
 }
 
 /// Perform the slow engine handshake for a [`PendingUp`], **without** holding the backend lock.
@@ -6020,6 +6096,79 @@ mod tests {
     // `state_from_device` mapping) and the macOS TUN-name tests moved to `ipn::state` alongside the
     // functions they exercise; the read-only-diagnostics / Taildrop path-hardening predicate tests
     // moved to `ipn::diag`. See those modules' `#[cfg(test)] mod tests`.
+
+    /// The self view a `watch` netmap frame carries (Go `Notify.SelfChange`) takes its name and
+    /// addresses from the same engine `StatusNode` `status` reports `self_*` from, and renders the
+    /// key expiry RFC3339 — with a never-expiring key staying absent rather than becoming a date.
+    #[test]
+    fn self_report_projects_the_status_self_node_and_its_key_expiry() {
+        use chrono::TimeZone;
+        let node = tailscale::StatusNode {
+            stable_id: tailscale::StableNodeId("nSELF1CNTRL".to_string()),
+            display_name: "laptop.tail0123.ts.net".to_string(),
+            ipv4: "100.64.0.1".parse().unwrap(),
+            ipv6: "fd7a:115c:a1e0::1".parse().unwrap(),
+            online: Some(true),
+            last_seen: None,
+            allowed_routes: Vec::new(),
+            is_exit_node: false,
+            cur_addr: None,
+            relay: None,
+            ssh_host_keys: Vec::new(),
+        };
+        let expiry = chrono::Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap();
+
+        let me = self_report_from_status_node(node.clone(), Some(expiry));
+        assert_eq!(
+            me,
+            SelfReport {
+                stable_id: "nSELF1CNTRL".to_string(),
+                name: "laptop.tail0123.ts.net".to_string(),
+                ipv4: "100.64.0.1".to_string(),
+                ipv6: "fd7a:115c:a1e0::1".to_string(),
+                key_expiry: Some("2026-09-01T12:00:00+00:00".to_string()),
+            }
+        );
+
+        let never = self_report_from_status_node(node, None);
+        assert_eq!(never.key_expiry, None);
+    }
+
+    /// The engine's self-node query waits for the first netmap rather than answering "none", so a
+    /// netmap tick must not ask in a pre-netmap state — unless this epoch already produced a self
+    /// node, which the engine never clears (the mid-session re-auth `NeedsLogin`).
+    #[test]
+    fn self_node_is_not_queried_before_one_can_exist() {
+        use tailscale::DeviceState as D;
+        let url: url::Url = "https://login.example.com/a/1".parse().unwrap();
+
+        for pre_netmap in [D::Connecting, D::NeedsLogin(url), D::NeedsMachineAuth] {
+            assert!(
+                !should_query_self_node(&pre_netmap, false),
+                "{pre_netmap:?} has no self node yet; asking only runs out the timeout"
+            );
+            assert!(
+                should_query_self_node(&pre_netmap, true),
+                "{pre_netmap:?} after a self node was seen still has it, and Go still sends it"
+            );
+        }
+
+        for has_or_may_have in [
+            D::Running,
+            D::Reauthenticating,
+            D::Expired,
+            D::Failed(tailscale::RegistrationError::NetworkUnreachable),
+        ] {
+            assert!(
+                should_query_self_node(&has_or_may_have, false),
+                "{has_or_may_have:?}"
+            );
+            assert!(
+                should_query_self_node(&has_or_may_have, true),
+                "{has_or_may_have:?}"
+            );
+        }
+    }
 
     // --- has_persisted_node_key ---------------------------------------------------------------
     //

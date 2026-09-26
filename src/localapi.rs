@@ -2262,7 +2262,10 @@ pub struct ProfileEntry {
 /// engine does not hold at all: [`prefs`](NotifyView::prefs) (this fork's prefs are daemon-owned) and
 /// [`policy`](NotifyView::policy) (the system-policy registry lives in the daemon). Both are Go
 /// `Notify` fields — `Notify.Prefs` and `Notify.Policy` — so carrying them here is a port, not an
-/// invention; only the plumbing that feeds them differs.
+/// invention; only the plumbing that feeds them differs. A third, [`self_change`](NotifyView::self_change)
+/// (Go `Notify.SelfChange`), is daemon-fetched rather than daemon-owned: the engine's bus carries the
+/// peer set but not this node, so the daemon asks the engine for its self node on every `net_map`
+/// frame and rides it on that same frame.
 ///
 /// The richer Go `Notify` fields (`Health`, `PeerChangedPatch`, `Engine`, `FilesWaiting`,
 /// `SuggestedExitNode`, …) are intentionally **absent**: the fork's engine does not surface them on
@@ -2314,6 +2317,28 @@ pub struct NotifyView {
     /// engine has no incremental peer-patch feed). `None` when this frame carried no netmap change.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub net_map: Option<Vec<PeerReport>>,
+    /// This node's own view (Go `Notify.SelfChange`), carried on every frame whose
+    /// [`net_map`](NotifyView::net_map) is set — including the `initial_netmap` front-load, as Go's
+    /// initial notify fills `SelfChange` under `NotifyInitialNetMap`.
+    ///
+    /// A frame carrying it means **"the netmap moved"**, not "self is definitely different": like Go,
+    /// the daemon re-sends the self node with every netmap frame rather than diffing it, so a
+    /// consumer can treat each one as the current truth. It exists so a consumer that only cares
+    /// about this node — its addresses, its MagicDNS name, when its key expires — can follow it on
+    /// the stream it already holds instead of polling `status` on a second connection.
+    ///
+    /// Limit: the engine emits a netmap frame only when the peer set, a peer patch, or peer liveness
+    /// changes. A netmap that changes only this node (an admin extending its key expiry, say)
+    /// produces no frame, so the new self view arrives with the next peer-side change. Go sends
+    /// `SelfChange` on every netmap update. Closing that gap needs the engine to publish on
+    /// self-node changes; until it does, a consumer that must not miss a self-only change still has
+    /// to read `status`.
+    ///
+    /// `None` when the frame carried no netmap change, and also when the engine had no self node to
+    /// give for that netmap (Go leaves `SelfChange` nil when `SelfNode` is invalid). A frame never
+    /// carries `self_change` without `net_map`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub self_change: Option<SelfReport>,
     /// The node's current prefs, if the `prefs` mask bit was set (Go `Notify.Prefs`). A front-loaded
     /// snapshot on subscribe, then a fresh frame on every prefs change. Reuses the same [`PrefsView`]
     /// projection [`StatusReport::prefs`] / `GetPrefs` use, so the watch feed and a one-shot read
@@ -2338,6 +2363,35 @@ pub struct NotifyView {
     /// this frame carried no policy change (or the `policy` bit was unset).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy: Option<PolicyReport>,
+}
+
+/// This node as a `watch` subscriber sees it: the body of [`NotifyView::self_change`], the wire
+/// shape of Go's `Notify.SelfChange`.
+///
+/// Go sends a whole `tailcfg.Node`; this is deliberately a small, fixed subset instead — the self
+/// fields [`StatusReport`] already reports (`self_name`, `self_ipv4`, `self_ipv6`), plus the stable
+/// id that says *which* node this is and the key expiry a consumer needs to re-authenticate in time.
+/// It is its own type rather than a reused [`PeerReport`] because most of a peer's fields (`cur_addr`,
+/// `relay`, `is_exit_node`, `last_seen`) mean nothing for the node itself, and a field that is always
+/// empty on the wire reads as "unknown" rather than "not applicable". The field set is pinned by a
+/// test; growing it is a wire change and should be reviewed as one.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SelfReport {
+    /// The node's stable node ID (Go `Node.StableID`) — the identity a consumer can compare across
+    /// frames to notice the node was replaced (a logout/login or profile switch).
+    pub stable_id: String,
+    /// Display name: the MagicDNS FQDN if the tailnet is known, else the bare hostname. The same
+    /// value [`StatusReport::self_name`] reports.
+    pub name: String,
+    /// The node's tailnet IPv4 address. The same value [`StatusReport::self_ipv4`] reports.
+    pub ipv4: String,
+    /// The node's tailnet IPv6 address. The same value [`StatusReport::self_ipv6`] reports.
+    pub ipv6: String,
+    /// When the node key expires (Go `Node.KeyExpiry`), strict RFC3339 like every other timestamp on
+    /// this wire. `None` means the key never expires (Go's zero `KeyExpiry`), not "unknown".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_expiry: Option<String>,
 }
 
 /// A single peer entry in a [`StatusReport`].
@@ -2863,6 +2917,61 @@ mod tests {
             Response::Notify(back) => {
                 assert_eq!(back.session_id.as_deref(), Some("0123456789abcdef"));
                 assert!(back.state.is_none() && back.prefs.is_none() && back.policy.is_none());
+            }
+            other => panic!("expected a notify frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn notify_self_change_rides_the_netmap_frame_with_a_pinned_field_set() {
+        let me = SelfReport {
+            stable_id: "nSELF1CNTRL".to_string(),
+            name: "laptop.tail0123.ts.net".to_string(),
+            ipv4: "100.64.0.1".to_string(),
+            ipv6: "fd7a:115c:a1e0::1".to_string(),
+            key_expiry: Some("2026-09-01T12:00:00+00:00".to_string()),
+        };
+        // The self view's field set is pinned: this exhaustive destructure stops compiling when a
+        // field is added, so growing the wire type is a deliberate edit here and not a drive-by.
+        let SelfReport {
+            stable_id: _,
+            name: _,
+            ipv4: _,
+            ipv6: _,
+            key_expiry: _,
+        } = &me;
+
+        let frame = NotifyView {
+            net_map: Some(Vec::new()),
+            self_change: Some(me.clone()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&Response::Notify(frame.clone())).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"notify","net_map":[],"self_change":{"stable_id":"nSELF1CNTRL","name":"laptop.tail0123.ts.net","ipv4":"100.64.0.1","ipv6":"fd7a:115c:a1e0::1","key_expiry":"2026-09-01T12:00:00+00:00"}}"#
+        );
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::Notify(back) => assert_eq!(back, frame),
+            other => panic!("expected a notify frame, got {other:?}"),
+        }
+
+        // A key that never expires omits `key_expiry` rather than sending an empty string, so it
+        // cannot be mistaken for an expiry the consumer failed to parse.
+        let never = SelfReport {
+            key_expiry: None,
+            ..me
+        };
+        assert_eq!(
+            serde_json::to_string(&never).unwrap(),
+            r#"{"stable_id":"nSELF1CNTRL","name":"laptop.tail0123.ts.net","ipv4":"100.64.0.1","ipv6":"fd7a:115c:a1e0::1"}"#
+        );
+
+        // A frame from a daemon that predates the field still parses, with no self.
+        match serde_json::from_str::<Response>(r#"{"kind":"notify","net_map":[]}"#).unwrap() {
+            Response::Notify(back) => {
+                assert_eq!(back.net_map, Some(Vec::new()));
+                assert!(back.self_change.is_none());
             }
             other => panic!("expected a notify frame, got {other:?}"),
         }
