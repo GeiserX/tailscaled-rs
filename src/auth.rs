@@ -178,6 +178,7 @@ pub(crate) fn requires_write(request: &crate::localapi::Request) -> bool {
         | Request::Logout { .. }
         | Request::SwitchProfile { .. }
         | Request::CreateProfile { .. }
+        | Request::SwitchToEmptyProfile
         | Request::DeleteProfile { .. }
         | Request::Nc { .. }
         | Request::SetServeConfig { .. }
@@ -533,6 +534,10 @@ mod tests {
         assert!(
             requires_write(&Request::CreateProfile { id: "work".into() }),
             "creating a profile writes even harder — still a write"
+        );
+        assert!(
+            requires_write(&Request::SwitchToEmptyProfile),
+            "`login`'s switch to an empty profile tears the device down — a write"
         );
         assert!(
             requires_write(&Request::DeleteProfile {
