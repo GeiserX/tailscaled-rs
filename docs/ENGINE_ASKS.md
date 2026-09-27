@@ -1685,7 +1685,9 @@ engine hardcodes. Upstream registers around twenty handlers on it: `/echo`, `POS
 (`feature/clientupdate/clientupdate.go`), `GET /posture/identity` (`feature/posture/posture.go`),
 `GET /appconnector/routes` (`feature/appconnectors/appconnectors.go`), `POST /wol`
 (`feature/wakeonlan/wakeonlan.go`), `GET /vip-services` (`ipn/ipnlocal/serve.go`),
-`GET /tls-cert-status` (`ipn/ipnlocal/cert.go`) and `/ssh/usernames` (`ssh/tailssh/tailssh.go`).
+`GET /tls-cert-status` (`ipn/ipnlocal/cert.go`), `/ssh/usernames` (`ssh/tailssh/tailssh.go`),
+`/debug/tka/log` (`feature/tailnetlock/tailnetlock.go`) and `GET /conn25/state`
+(`feature/conn25/conn25.go`).
 
 The absence is already documented here three times, one symptom at a time, without the cause being
 named: `Prefs::posture_checking` (`src/prefs.rs`) records that posture is a c2n *pull* nothing
@@ -1791,9 +1793,19 @@ Two, and both turn a pref this daemon already carries into something with a wire
 - **`GET /posture/identity`** → `tailcfg.C2NPostureIdentityResponse` (`SerialNumbers`,
   `IfaceHardwareAddrs`, `PostureDisabled`). `Prefs::posture_checking` is persisted, threaded into
   `Config.posture_checking` and reported by `tnet get`, and means nothing on the wire because
-  nothing answers the pull. With the hook, the `false` case becomes a real `{"PostureDisabled":
-  true}` — Go's own answer for a node that opted out, sent because the operator opted out rather
-  than because the fork is silent. The `true` case additionally needs serial-number and MAC
+  nothing answers the pull. The pref is not the handler's only input: Go's
+  `handleC2NPostureIdentityGet` first reads the `PostureChecking` policy
+  (`GetPreferenceOption(pkey.PostureChecking, …)`) and collects only when
+  `choice.ShouldEnable(prefs.PostureChecking())`, so an administrator's `always` turns collection
+  on over a `false` pref and `never` turns it off over a `true` one. Go does not fold that policy
+  into prefs (it is not in `preferencePolicies`, `ipn/ipnlocal/local.go`) and neither does this
+  daemon, so the handler must read it itself. `PostureChecking` is already a registered
+  `PreferenceOption` in `src/ipn/syspolicy.rs`, and `PreferenceOption::should_enable` is Go's
+  `ShouldEnable`; what the handler still needs is a public read of a preference-option policy, as
+  `get_boolean` is for booleans. With the hook, the disabled case — policy `never`, or the pref
+  `false` under `user-decides` or no policy — becomes a real `{"PostureDisabled": true}`, Go's own
+  answer, sent because the operator or the administrator opted out rather than because the fork is
+  silent. The enabled case additionally needs serial-number and MAC
   collection (Go's `posture.GetSerialNumbers` / `GetHardwareAddrs`, behind Go's `hwaddrs=true` query
   gate); that is local OS work on the daemon side and a separate piece, so the honest first shape
   reports what it can collect and omits what it cannot.
@@ -1802,9 +1814,12 @@ Two, and both turn a pref this daemon already carries into something with a wire
   advertisement that the console may act on this node, which nothing then honours. `Enabled` is that
   pref (Go: `envknob.AllowsRemoteUpdate() || upPref.Apply.EqualBool(true)`). `Supported` is
   `feature.CanAutoUpdate()` upstream and is honestly `false` here — `tnet update` is a manual,
-  operator-invoked command and there is no updater to trigger — so `POST /update` answers
-  `Err: "not supported"`, which is Go's own string for exactly that state in `handleC2NUpdatePost`,
-  not a fork invention. A node that advertises `AllowsUpdate` and then declines the trigger in
+  operator-invoked command and there is no updater to trigger. `POST /update` then refuses in
+  `handleC2NUpdatePost`'s order, which checks `Enabled` before `Supported`: with the pref unset or
+  `false` it answers `Err: "not enabled"`, and only with the pref `true` does it answer
+  `Err: "not supported"`. Both strings are Go's own for exactly those states, not fork inventions,
+  and the order matters because the default node is the unset one. A node that advertises
+  `AllowsUpdate` and then declines the trigger in
   upstream's words is strictly better than one that advertises it and never answers at all. Running
   an actual update from the trigger is its own piece of work.
 
@@ -1816,7 +1831,9 @@ several high-availability subnet routers is alive.
 
 The `/debug/*` family — `/debug/prefs`, `/debug/metrics`, `/debug/netmap`, `/debug/health`,
 `/debug/goroutines`, `/debug/component-logging`, `/debug/logheap`, `/debug/pprof/heap`,
-`/debug/pprof/allocs` — together with `POST /sockstats`, is a **remote read of daemon internals by
+`/debug/pprof/allocs`, and `/debug/tka/log` (the Tailnet Lock update log, registered from
+`feature/tailnetlock/tailnetlock.go` behind the same `buildfeatures.HasDebug` gate) — together with
+`POST /sockstats`, is a **remote read of daemon internals by
 the control plane**. This fork should not start answering it on the same day it gains the ability
 to, and the hook does not require it to.
 
@@ -1835,7 +1852,9 @@ paragraph, taken after the hook exists rather than bundled into it.
 The rest are declined for plainer reasons: `POST /logtail/flush` (no logtail client here),
 `POST /netfilter-kind` (no netfilter layer at all — ask #21, bead `tsd-m8s`),
 `GET /appconnector/routes` (the c2n half of ask #39, and blocked on the route learning that ask
-asks for), `POST /wol`, `/ssh/usernames` and `GET /tls-cert-status`.
+asks for), `POST /wol`, `/ssh/usernames`, `GET /tls-cert-status`, and `GET /conn25/state` (the
+work-in-progress connectors datapath, which this fork does not have and which upstream itself
+answers `501` outside `envknob.UseWIPCode()`).
 
 **Daemon impact once landed:** one `watch_c2n` task in the daemon's IPN layer with a method+path
 dispatch of its own, and the two handlers above, reading prefs the daemon already holds. The
