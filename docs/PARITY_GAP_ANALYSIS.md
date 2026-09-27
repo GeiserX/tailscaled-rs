@@ -2,40 +2,46 @@
 
 A source-grounded diff of this Rust daemon (`tailnetd` + `tnet`) against Go `tailscaled` + the
 `tailscale` CLI at the pinned upstream tag **v1.102.4** (commit
-`bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`), refreshed **2026-09-12** from a parallel sweep of both
+`bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`), refreshed **2026-09-13** from a parallel sweep of both
 trees (the upstream `cmd/tailscaled`, `cmd/tailscale/cli`, `ipn/`, `net/`, `wgengine/` packages, and
 this crate's `src/bin/{tailnetd,tnet}.rs`, `src/localapi.rs`, `src/ipn/`, `Cargo.toml`,
 `docs/ENGINE_ASKS.md`).
 
-- **Third refresh in a row where the pin cannot move, so this pass swept deeper again.** A fresh
-  `git ls-remote --tags` (2026-09-12) still puts **v1.102.4** at the top of the stable list at the same
+- **Fourth refresh in a row where the pin cannot move, so this pass swept deeper again.** A fresh
+  `git ls-remote --tags` (2026-09-13) still puts **v1.102.4** at the top of the stable list at the same
   commit; the only newer ref is still `v1.103.0-pre`, the marker for the unstable branch, and this
-  ledger tracks stable. The last pass read **who is allowed to ask, and what an administrator can
-  impose**, and the repo answered it fast: five of its six gaps merged inside a day, including the whole
-  of syspolicy *application* (`#445`) and the always-on disconnect gate (`#442`). That answer is what
-  made this pass possible, because it left one question standing that could not be asked before it.
-- **The layer this pass read: the policy client is more than `applySysPolicy`.** Nine upstream files
-  read the policy client at the pin, and the prefs table is only one of the things they ask it. The
-  rest have nothing to do with a pref: may this caller stop the daemon, may this user override
-  the administrator's exit node, how long may a permitted disconnect last, which exit nodes may be
-  *suggested*, is there an enrolment credential in the policy file, and what does a watcher on the
-  notify bus get told when the policy changes. So the exhaustive question this pass asked was not
-  "which keys does this fork parse" — it parses all of them — but **"which keys have a consumer, and
-  does this fork run it."**
-- **Six gaps, and they are the whole of the remainder.** Key by key: `AuthKey`, `ExitNode.AllowOverride`
-  (with the `managed by policy` refusal it relaxes), `ReconnectAfter` (with the `overrideAlwaysOn` flag
-  it needs), `AllowTailscaledRestart` (with the LocalAPI `shutdown` verb it gates),
-  `AllowedSuggestedExitNodes`, and the `NotifySysPolicyChanges` watch bit that pushes the snapshot to a
-  watcher. Every one of them is defined, typed and reported by `src/ipn/syspolicy.rs` today and read by
-  nothing. The rest of upstream's key set is accounted for and needs no bead: `Tailnet` and
-  `MachineCertificateSubject` are consumed inside the control session (engine-owned), `PostureChecking`
-  and `DeviceSerialNumber` answer a c2n pull (ask **#43**), `LogTarget` configures a log uploader this
-  fork does not have, `EnableDNSRegistration` belongs to the Windows DNS manager, and the
-  `ManagedBy*`/visibility/`KeyExpirationNotice` family drives a GUI this repo does not ship. Five of the
-  six are daemon-buildable today; one has a daemon-buildable half and an engine ask behind it.
-- **This crate:** `tailscaled-rs` v0.59.0 — daemon `tailnetd` + CLI `tnet`, over the
-  `geiserx_tailscale` engine. Five of the six gaps the last refresh handed over have already merged
-  (§1).
+  ledger tracks stable. The last pass read **the policy keys whose consumer is not a pref**, and the
+  repo closed the lot: all six merged, and the crate went 0.59.0 → 0.62.2 on them and the batch around
+  them. The policy client is now ported exhaustively, which is what makes this pass's layer legible —
+  the last of those six gaps put a *new field* on the notify stream, and having done it once, the
+  question of what else belongs on that stream can finally be asked as a whole.
+- **The layer this pass read: the IPN bus is a subscription protocol, not a state feed.** Upstream
+  declares **nineteen** `NotifyWatchOpt` bits (`ipn/backend.go`, `1 << 0` through `1 << 18`) and a
+  `Notify` struct with twenty-odd fields, and the two are wired together by a per-session mask: what a
+  watcher gets is decided once, at subscribe time, by what it asked for. This fork ships **four**
+  boolean mask fields and six notify fields. So the exhaustive question this pass asked was not "does
+  this fork have a notify stream" — it has a good one — but **"bit by bit, which of Go's nineteen have
+  a consumer this daemon could serve, and what happens to a watcher when it doesn't."**
+- **Six gaps, and the bits sort cleanly into three piles.** Four are missing *content* a watcher can
+  only get by opening a second connection and polling: the frame envelope (`Notify.SessionID` and
+  `Notify.Version`), `NotifyInitialStatus`, `NotifyInitialSuggestedExitNode`, and the un-gated
+  `Notify.SelfChange`. One is a missing *failure* mode: Go disconnects a watcher that falls behind with
+  a terminal `IPN bus consumer fell behind; closing watch`, where the engine here silently drops the
+  notification and streams on. One is the *shape of the mask itself*, which is where Go's two
+  subscribe-time refusals would have to live and currently cannot. The rest of the nineteen are
+  accounted for and need no bead: `NotifyInitialHealthState`/`NotifyHealthActions` wait on the health
+  tracker (already a §4.5 row), `NotifyPeerChanges`/`NotifyPeerPatches`/`NotifyNoNetMap` are the
+  incremental peer-delta bus (ask **#28**), `NotifyWatchEngineUpdates` and `NotifyPeerWireGuardState`
+  need engine internals, `NotifyInitialDriveShares` belongs to Taildrive (`tsd-eka`),
+  `NotifyInitialOutgoingFiles` needs the Taildrop file-arrival signal (§4.1),
+  `NotifyInitialClientVersion` needs a control-pushed version this fork has no source for,
+  `NotifyNoPrivateKeys` is a documented no-op upstream, `NotifyRateLimit` damps a spam source this
+  build largely does not have (the engine's peer feed is a coalescing `watch` channel, so netmap churn
+  collapses at the source instead of queueing), and `NotifyInProcessNoDisconnect` is the one bit a
+  LocalAPI caller is forbidden to set. Four of the six are daemon-buildable today; one is a
+  decision; one has a daemon-buildable half and an engine ask behind it.
+- **This crate:** `tailscaled-rs` v0.62.2 — daemon `tailnetd` + CLI `tnet`, over the
+  `geiserx_tailscale` engine. All six gaps the last refresh handed over have merged (§1).
 - **Engine pin:** `9d847a6e` — set 2026-08-12 and unchanged through every refresh since. The engine tree *after* the
   released **v0.43.0** (the release cut from this tree is `0.43.1`; the pin exists for a russh
   security bump v0.43.0 predates). The engine is a separate library released independently; the
@@ -86,11 +92,12 @@ mapping, UPnP-IGD discovery)
 behind `tnet debug portmap`, a SOCKS5 + HTTP outbound proxy, a debug-metrics HTTP server,
 systemd/launchd install with `sd_notify(READY=1)` (`Type=notify`), `configure kubeconfig` (with Go's
 writability precheck), the read half of Tailscale **Services** (VIPs), and a read-only loopback web
-UI that can state the origin it is reverse-proxied at. The LocalAPI exposes **47 request** /
-**31 response** verbs over a `SO_PEERCRED`-authorized Unix socket, and `tnet` carries **38**
-top-level subcommands — 35 with a Go counterpart, plus this fork's own `reload-config`, `install` and
-`uninstall` — against upstream's **39** plus the `completion` command `ffcomplete.Inject` adds at
-runtime.
+UI that can state the origin it is reverse-proxied at. The LocalAPI exposes **48 request** /
+**31 response** verbs over a `SO_PEERCRED`-authorized Unix socket, and `tnet` carries **39**
+top-level subcommands — 35 with a Go counterpart, plus this fork's own `reload-config`, `install`,
+`uninstall` and `shutdown` (Go reaches the same LocalAPI verb from `LocalClient.ShutdownTailscaled`
+and gives it no CLI spelling) — against upstream's **39** plus the `completion` command
+`ffcomplete.Inject` adds at runtime.
 
 **What's left, in one breath.** The biggest remaining buckets are: **per-OS platform breadth** (the
 Linux OS-DNS configurator matrix, MagicDNS OS integration, and full **Windows** support);
@@ -103,61 +110,86 @@ into a NAT-traversal win); **distribution** (crates.io, `.deb`/`.rpm`); **live-t
 of paths CI can't reach; and a basket of **small CLI/daemon gaps**, in three flavours: command lines a
 Go user would reasonably type and this fork rejects; command lines this fork accepts and then does
 nothing with, because the value was never checked against anything real; and settings an
-*administrator* configures that this daemon stores, reports, and never acts on. The third flavour is
-the one this pass worked, and it is now down to the keys whose consumer is something other than a
-pref.
+*administrator* configures that this daemon stores, reports, and never acts on. The third flavour was
+the last two passes' work and is now closed. This pass worked a fourth: state the daemon already
+holds and already computes, which a **subscriber** on the notify bus cannot ask for and must poll a
+second connection to see.
 
-**What moved in this repo since the last refresh (2026-09-12, earlier the same day).** Five of the six
-gaps the previous regeneration handed to the tracker merged, and the crate went 0.56.2 → 0.59.0 on them
-alone. In merge order: the macOS operator seam, so a launchd-managed daemon reads
-`/etc/tailnetd/tailnetd-env.txt` for the administrative envknobs it already obeys (`#437`, Go's
-`envknob.ApplyDiskConfig`, refusing at startup with a line number rather than stashing the error for a
-health tracker this fork does not have); the advertised-route **set**, validated as a set, so a lone
-`0.0.0.0/0` and a malformed 4via6 prefix are both refused in Go's own words (`#439`, `src/routes.rs`);
-the `tag:` prefix Go completes for the operator, now completed daemon-side so `up` and `set` keep one
-notion of what a tag is (`#441`); the always-on disconnect gate, so `down`/`logout` are refused when the
-administrator set `AlwaysOn.Enabled` and the reason is required and audited when
-`AlwaysOn.OverrideWithReason` is set (`#442`, `src/ipn/alwayson.rs`); and syspolicy **application**, the
-largest of them, so `LoginURL`, `Hostname`, `ExitNodeIP`, `AlwaysOn.Enabled` and seven of Go's eight
-`preferencePolicies` rows now reach prefs at every point Go's `reconcilePrefs` runs (`#445`). Only
-`--operator` is still open from that batch, and it is still in §4.5. Two deliberate deviations came out
-of those merges and are recorded in §6 rather than re-filed as gaps: the route pairing rule is asked of
-the **composed** set here (Go asks it of the flag's literal argument, so
-`--advertise-routes=0.0.0.0/0 --advertise-exit-node` is an upstream error and an accepted command line
-here), and policy `ExitNodeID` is refused rather than applied, because this fork's exit node is a
-selector with no stable-node-id form and a selector that matches no peer egresses directly — the exact
-leak Go's blackhole id exists to prevent.
+**What moved in this repo since the last refresh (2026-09-12).** **All six** of the gaps the previous
+regeneration handed to the tracker merged, and the crate went 0.59.0 → 0.62.2 on them and the batch
+around them. In merge order: the effective policy on the notify bus, so a watcher sees an
+administrative change instead of having to ask for one (`#448`, Go's `NotifySysPolicyChanges`);
+`exit-node suggest` filtered through `AllowedSuggestedExitNodes`, so a suggestion the administrator
+excluded comes back as Go's honest empty result rather than as a recommendation (`#451`);
+`ReconnectAfter`, so a permitted always-on disconnect is bounded by the window the administrator wrote
+and reconnects on a profile-guarded timer instead of standing until the next reconcile point (`#454`);
+the LocalAPI `shutdown` verb `AllowTailscaledRestart` gates, ported with Go's refusal order intact —
+method, then write access, then policy — so a caller can tell "you may not" from "nobody may" (`#455`);
+the policy-pinned exit node, now **refused** with Go's `exit node cannot be changed: managed by policy`
+rather than accepted and silently overwritten, with `ExitNode.AllowOverride` relaxing it (`#457`); and
+the policy `AuthKey`, so a fleet enrols from the same file that pins its `Hostname`, at Go's precedence
+(last, behind the flag and the config file) and behind Go's two guards (`#459`). The policy client is
+ported exhaustively; that claim was the last pass's stated goal and it now holds. Around them merged a
+batch of command-line fidelity work that closed no §4.5 row but is worth knowing about when reading
+§3: `tnet ip` resolution and its addressless-target failure (`#466`, `#468`), an explicit empty
+`AdvertiseRoutes` in a config file withdrawing the routes (`#469`), `switch`'s bare `No profile named`
+refusal (`#471`), the web client started before it is served and `--origin` kept out of the printed
+URL (`#472`, `#475`), a refused `serve` command line answering the way Go's does (`#476`), and
+kubeconfig write failures worded as Go words them (`#479`).
 
 **What the previous passes handed over and is still open.** Nine rows, all carried in §4.5 below: Go's
 single-dash long-flag spelling, the `--posture-checking` legacy spelling, the missing
 `mac-app-connector` risk, `--exit-node=auto:any`, `--config`'s unenforced and inverted `Locked` default
 (now ruled on — if it is ever honoured it must sit *below* policy, see `#445`), `set --shields-up` while
 Funnel is on, a `--nickname` another profile already holds, `--hostname` accepted as any bytes at all,
-and `--operator`, which is persisted and grants nobody anything.
+and `--operator`, which is persisted and grants nobody anything. Nothing merged against any of the nine
+in this cycle.
 
-**What this sweep found.** Six gaps, one layer, and — unusually for this document — an exhaustive
-answer rather than a sample. Now that `applySysPolicy` is ported, the honest question is what *else*
-upstream asks its policy client, and the answer is finite: nine Go files read it at the pin, and every
-key with a daemon-side consumer this fork does not run is listed below. `AuthKey` is the enrolment
-credential an administrator ships in the policy file so a fleet registers itself; Go reads it in `Start`
-behind two guards (no config file, no existing login profiles or state `NeedsLogin`) and this fork reads
-it nowhere, so the one key that gets a node onto the tailnet is inert. A policy-pinned exit node is
-*applied* here but not *locked*: Go refuses the edit outright with `exit node cannot be changed: managed
-by policy` unless `ExitNode.AllowOverride` says otherwise, where this fork accepts `tnet set
---exit-node=<peer>`, reports success and silently persists the administrator's node instead — and the
-override key is read by nothing, so setting it changes nothing either. `ReconnectAfter` is the duration
-a permitted always-on disconnect is allowed to last; without it, and without the `overrideAlwaysOn` flag
-it pairs with, a disconnect the new gate allowed holds until the next reconcile point and is then undone
-at an arbitrary moment. `AllowTailscaledRestart` gates a LocalAPI `shutdown` verb that has no
-counterpart here at all. `AllowedSuggestedExitNodes` is the allow-list Go applies to suggestion
-candidates *before* ranking them, so `tnet exit-node suggest` can recommend a node the administrator
-excluded. And `NotifySysPolicyChanges` is the watch-mask bit that puts the effective snapshot on the
-notify bus, initially and on every change — this fork's snapshot is readable only by asking, which
-matters more here than upstream now that policy outranks a local `tnet set` on every write. Two things
-the sweep expected to find and did not are worth recording so the next pass does not re-derive them: the
-`envknob.CanSSHD()` arm of Go's `checkEditPrefsAccessLocked` is already ported (`#426`), and every
-remaining policy key either belongs to the control session, to c2n (ask **#43**), to Windows DNS, to a
-log uploader this fork does not have, or to a GUI this repo does not ship.
+**What this sweep found.** Six gaps in one layer, and — as with the last pass — an inventory rather
+than a sample, because the layer is a numbered bit set and can be read to the end. The nineteen
+`NotifyWatchOpt` bits sort into three piles, and only one pile is a gap.
+
+The first pile is **content a watcher cannot subscribe to.** `Notify.SessionID` is the largest of them
+and does not look it: Go mints one hex id per watch session, puts it in the first frame when
+`NotifyInitialState` is set, and registers `defer b.DeleteForegroundSession(sessionID)` for the life of
+that watch — which is the entire mechanism behind foreground `serve`. The CLI opens a bus watch, reads
+the id, keys its nested `ServeConfig` under it, and the *daemon* drops that config when the watch dies.
+§6 already records that this fork's foreground serve is torn down by `tnet`'s own signal handler and so
+survives a `SIGKILL`; the reason it has to be is that the notify frame carries no session identity.
+`NotifyInitialStatus` (`1 << 14`) front-loads a whole `ipnstate.Status`, which upstream's own doc now
+recommends over fetching the netmap — and this daemon builds the exact analogue for `Request::Status`
+already. `NotifyInitialSuggestedExitNode` (`1 << 10`) front-loads the suggestion and pushes a fresh one
+whenever the pick changes, from inside `suggestExitNodeLocked` itself; this fork computes that value,
+policy-filtered since `#451`, and will only hand it over if asked. And `Notify.SelfChange` is not
+mask-gated at all — Go sends the self node on every netmap update, for exactly the reactive consumers
+this daemon is built for — where `NotifyView::net_map` here carries peers and never self.
+
+The second pile is **one missing failure mode**, and it is the interesting one. Go's `sendToLocked`
+does a non-blocking send into a 128-deep per-session channel, and the `default` arm is not a drop:
+it removes the session, throws away the queue on the grounds that a delta stream with a hole in it is
+not trustworthy, sends one terminal `IPN bus consumer fell behind; closing watch`, and closes. The
+engine's `deliver` here treats a full channel as success — drop the notification, keep streaming — so a
+watcher that cannot keep up diverges from the daemon silently and permanently. That is Go's older
+behaviour, and upstream replaced it deliberately; the terminal frame is daemon-buildable but knowing a
+drop occurred is not, so this one is a small consumer waiting on an engine ask.
+
+The third pile is **the shape of the mask**, which is where the other five land. Upstream's
+`WatchIPNBus` takes one decimal `mask` and refuses three ways before subscribing: `bad mask` on a value
+that will not parse, a named refusal for `NotifyInProcessNoDisconnect` (a bit that makes the producer
+block on a slow consumer, so a LocalAPI caller must never hold it), and `ValidateNotifyWatchOpt`
+rejecting `NotifyRateLimit` alongside any stateful delta bit. This fork spells the mask as named
+booleans, which is a better wire format in every way except that an unrepresentable combination cannot
+be refused — there is no value for the daemon to look at. That is a decision, not a defect, and it is
+due now rather than later, because four of the five rows above add a field to the same request.
+
+Two things the sweep expected to find and did not are worth recording so the next pass does not
+re-derive them. `NotifyRateLimit` (`1 << 8`) has little behind it here: Go rate-limits because its bus
+re-sends whole netmaps under churn, and this fork's peer feed is a `tokio::sync::watch` channel, which
+coalesces to the latest value at the source — so the burst never forms. The `mpsc` hop between the
+engine's bus task and the watcher can still hold distinct frames; what cannot happen is the source
+producing a hundred netmaps for one watcher to wade through. And the daemon-built prefs and policy
+feeds are immune to the lagging-watcher problem for the same reason — the drop hazard is the engine's
+`mpsc` bus alone.
 
 ---
 
@@ -211,12 +243,19 @@ The consumed engine capabilities and shipped daemon features:
   `logout` that would disconnect a node under `AlwaysOn.Enabled` is refused first of all (`#442`,
   `src/ipn/alwayson.rs`).
 - **Status / observability:** `status` (+`--json`/`--watch`/filters/`--web`/`--browser`, behind Go's
-  `isRunningOrStarting` gate), WatchNotifications (masked IPN-bus notify stream), `metrics`,
+  `isRunningOrStarting` gate), WatchNotifications (masked IPN-bus notify stream, carrying
+  `state`/`error`/`browse_to_url`/`net_map`/`prefs` and — since `#448` — the effective policy
+  snapshot, Go's `NotifySysPolicyChanges`), `metrics`,
   `bugreport` (incl. `--diagnose`/`--record`), `netcheck` (DERP-latency scope, `--format`/`--every`/
   `--verbose`), `dns status` (incl. `--all`)/`query`, `syspolicy` (`list`/`reload`, over an
   admin-supplied `tailnetd --syspolicy-file` device-scope source — resolved, reported **and applied to
-  prefs** at profile load and on every prefs write (`#445`); the keys whose consumer is not a pref are
-  §4.5), `ip`/`whois` (Go's `ip[:port]` +
+  prefs** at profile load and on every prefs write (`#445`). The keys whose consumer is **not** a pref
+  are ported too, and that set is closed: `AuthKey` enrols a node at Go's precedence and behind Go's
+  two guards (`#459`), `ExitNode.AllowOverride` relaxes a `managed by policy` refusal that is now
+  actually made (`#457`), `ReconnectAfter` bounds a permitted always-on disconnect on a
+  profile-guarded timer (`#454`), `AllowTailscaledRestart` gates a real LocalAPI `shutdown` verb with
+  Go's refusal order (`#455`), `AllowedSuggestedExitNodes` filters suggestion candidates (`#451`), and
+  `NotifySysPolicyChanges` puts the snapshot on the notify bus (`#448`). `ip`/`whois` (Go's `ip[:port]` +
   `--proto` flow arguments)/`ping` (hostname or IP), `licenses`, **captive-portal detection** (Go's
   prober + the `captive-portal-detected` health warnable).
 - **Connectivity:** exit-node use/advertise + **suggest**, advertise-routes, accept-routes/dns,
@@ -338,12 +377,12 @@ would violate the honest-omission rule). Each rides the next pin bump once its a
 
 | Item | Bead | Note |
 | --- | --- | --- |
-| An MDM `AuthKey` never reaches the login path, so a policy file cannot enrol a node | *(new — filed by this pass)* | Go's `Start` (`ipn/ipnlocal/local.go`) resolves an auth key from three sources in order, and the third has no counterpart here: after `opts.AuthKey` and the `--config` file's `AuthKey` (with its `file:<path>` indirection) have both come up empty, and only when the node is not `Running` and no config file is in use, it reads `sysak, _ := b.polc.GetString(pkey.AuthKey, "")`. Two guards travel with it — a non-empty policy key is used only when there are no existing login profiles or the state is `NeedsLogin` (otherwise it logs "not setting opts.AuthKey from syspolicy; login profiles exist"), and the value is `strings.TrimSpace`d, because an MDM payload that round-trips through a plist or a registry string arrives with a trailing newline more often than not. This is the key that makes a policy file self-sufficient: the same file that pins `Hostname` and `ExitNodeIP` also carries the credential that gets the node onto the tailnet. `src/ipn/syspolicy.rs` defines `AuthKey` as a `String`, types it, merges it and reports it, and no code path reads it — the auth key still has to arrive by `tnet up --auth-key`, `TS_AUTH_KEY` or `--config`. Note the precedence inversion to decide deliberately: Go ranks policy LAST here, behind the flag and the config file, the opposite of how policy ranks for prefs. And `tnet syspolicy list` prints configured values, so applying this key means deciding where a credential may be rendered. |
-| A policy-pinned exit node is silently overwritten instead of refused, and `ExitNode.AllowOverride` does nothing | *(new — filed by this pass)* | Applying `ExitNodeIP` is half of Go's exit-node policy; the other half is a refusal. `checkEditPrefsAccessLocked` (`ipn/ipnlocal/local.go`) runs before any edit is applied: when the edit touches `ExitNodeID`/`ExitNodeIP`/`AutoExitNode` and `polc.HasAnyOf(pkey.ExitNodeID, pkey.ExitNodeIP)` says the exit node is managed, the edit is rejected with `exit node cannot be changed: managed by policy` (`errManagedByPolicy`). The one escape is `pkey.AllowExitNodeOverride` (`ExitNode.AllowOverride`, default false): with it set a user may pick a *different* exit node, but `changeDisablesExitNodeLocked` still refuses any edit that would leave `ExitNodeID` empty, so an override can move the egress and never turn it off. A taken override is remembered in `overrideExitNodePolicy`, which suppresses the re-apply, and is cleared both when the node connects or disconnects and when `sysPolicyChanged` sees either exit-node key or the override key change. Here `reconcile_sys_policy` runs *after* the caller's overrides on every prefs write, so `tnet set --exit-node=<peer>` under a pinning policy is accepted, reports success, and persists the administrator's node — indistinguishable from an edit that took effect. `ExitNode.AllowOverride` is defined in `src/ipn/syspolicy.rs` and read by nothing. What counts as "managed" needs a ruling, since this fork refuses policy `ExitNodeID` rather than applying it (§6). |
-| A permitted always-on disconnect has no bounded window, because `ReconnectAfter` is never armed | *(new — filed by this pass)* | Always-on upstream is a loop with three parts, and this fork ships two of them: the refusal gate (`#442`) and the `WantRunning` re-assert (`#445`). The part between them is `onEditPrefsLocked` (`ipn/ipnlocal/local.go`), which fires whenever an edit takes `WantRunning` from true to false, sets `overrideAlwaysOn` so the re-assert stops fighting a disconnect the gate already permitted, then reads `pkey.ReconnectAfter` and arms `startReconnectTimerLocked` when it is greater than zero. That timer stops any predecessor, captures the current profile id, and on firing re-checks both that it is still the live timer and that the profile has not changed before setting `WantRunning` back to true as `ipnauth.Self` (`automatically reconnected as %q after %v`). `sysPolicyChanged` clears the override whenever either always-on key changes. So the administrator's contract is exact: a user with a reason may take the node down for `ReconnectAfter` and no longer. `src/ipn/syspolicy.rs` defines `ReconnectAfter` as a Go-duration key, renders it, and nothing reads it; both `syspolicy.rs` and `alwayson.rs` already say in their own docs that a permitted disconnect instead stands until the next reconcile point and is undone there. The override flag is the prerequisite and is worth landing alone — without it the timer is pointless, because the re-assert can undo the disconnect first. |
-| There is no LocalAPI `shutdown` verb, so `AllowTailscaledRestart` gates nothing | *(new — filed by this pass)* | `ipn/localapi/localapi.go` routes `shutdown` to `serveShutdown`: non-`POST` gets `only POST allowed`; a caller without write access gets `shutdown access denied`; a caller with write access still gets `shutdown access denied by policy` unless `polc.GetBoolean(pkey.AllowTailscaledRestart, false)` is true; only then does it write 200, flush, and publish a `localapi.Shutdown` event. `ipn/ipnserver/server.go` is the sole subscriber and closes the LocalAPI listener, which unwinds `Run` and ends the process so the service manager restarts it — which is why the key is named for a restart rather than a shutdown. The client half is `LocalClient.ShutdownTailscaled`. Default false, so it is opt-in: an administrator handing a management agent one specific, auditable power over the daemon without handing it root. This fork has neither end — no `shutdown` in `Request` (`src/localapi.rs`), no dispatch arm, and `AllowTailscaledRestart` defined in `src/ipn/syspolicy.rs` and read by nothing. The refusal ORDER is the part to port exactly (method, then write access, then policy), so a caller can tell "you may not" from "nobody may" and an unauthorized caller cannot read the policy state. Either port it or decline it in writing next to the key, because silence is what makes the next sweep re-find it. |
-| `exit-node suggest` ignores the administrator's `AllowedSuggestedExitNodes` list | *(new — filed by this pass)* | `fillAllowedSuggestions` (`ipn/ipnlocal/local.go`) reads the key as a string array, turns it into a set of stable node ids, and `refreshAllowedSuggestions` rebuilds it at backend start and again from `sysPolicyChanged` — which then immediately re-runs `SuggestExitNode`, so a policy edit re-picks rather than waiting to be asked. `getAllowedSuggestions` hands the set to both ranking strategies, and the filter runs on CANDIDATES before ranking (`if allowList != nil && !allowList.Contains(peer.StableID()) { continue }`), so the answer is the best node the administrator permits rather than the best node overall filtered afterwards to nothing. The nil-versus-empty distinction is load bearing: an unset key means no restriction, a configured empty array means nothing is allowed. `src/ipn/syspolicy.rs` defines and element-wise validates the key and reports it; `Backend::suggest_exit_node` is a thin shim over the engine's `Device::suggest_exit_node()`, which returns one already-chosen node. Splits cleanly: the daemon holds the returned stable id and the policy set, so refusing a suggestion outside the allow-list (an honest empty result, which is what Go returns when no candidate passes) is buildable today; re-ranking to the best ALLOWED node needs candidates and DERP latencies the engine does not expose, which is an ask to file. |
-| The policy snapshot never reaches the notify bus, so a watcher cannot see policy change | *(new — filed by this pass)* | `ipn/backend.go` declares `NotifySysPolicyChanges` (`1 << 17`): the first Notify, sent immediately, carries the current effective snapshot in `Notify.Policy`, and `Notify.Policy` is included again whenever the effective policy changes — a full snapshot every time, never a delta. The backend half is in `ipn/ipnlocal/local.go`: the initial-state assembly fills `ini.Policy` from `GetPolicySnapshot("")` when the bit is set, and the same watch registers a policy change callback for the life of the session, whose handler sends a fresh snapshot to that one session. It is part of the mask a LocalAPI `WatchIPNBus` caller may request, so a GUI or a management agent learns of an administrative change at the moment it happens. This fork's `Request::Watch` carries `initial_state`, `initial_netmap` and a prefs flag, and `NotifyView` has no policy field; the snapshot is readable only by asking (`tnet syspolicy list`, `syspolicy reload`). That matters more here than upstream now that policy outranks a local `tnet set` on every write: a `set` that appears to do nothing is explained by a policy the watcher cannot see. The honest MVP is the initial snapshot plus a push on `syspolicy reload` — a real change signal, just a coarser one, since the only source is a file read at startup — with the mask bit's doc saying so rather than promising a watch this build cannot perform. |
+| A notify watcher has no session identity, so the daemon cannot own a foreground serve | *(new — filed by this pass)* | Two fields are missing from every frame and the second one is load-bearing. `WatchNotificationsAs` (`ipn/ipnlocal/local.go`) mints `sessionID := rands.HexString(16)` per subscription, sets it on the first frame as `Notify.SessionID` when and only when `NotifyInitialState` is requested (the field's doc tells clients to store it, because no later frame repeats it), and registers `defer b.DeleteForegroundSession(sessionID)` for the life of that watch. `cmd/tailscale/cli/serve_v2.go` is the consumer: a foreground `serve`/`funnel` opens `WatchIPNBus(ipn.NotifyInitialState)`, reads one notify, refuses outright with `missing SessionID` if it is empty, and installs its nested config at `sc.Foreground[n.SessionID]`; `ipn/ipnlocal/serve.go`'s `DeleteForegroundSession` deletes exactly that key when the session ends. So upstream's foreground serve is torn down by the **daemon**, and survives nothing — not a `SIGKILL`, not a dropped SSH session. §6 records this fork's weaker shape (`tnet` restores the previous config from its own signal handler, so a killed foreground serve stays installed until `tnet serve reset`) and `src/ipn/serve.rs` says in its own docs that `ServeConfig.Foreground` is not modelled; the primitive underneath both is the session id, and it is one string on the first frame. The other field is `Notify.Version`: `sendToLocked` fills it with `version.Long()` on every frame that does not already carry one, so a watcher always knows which backend it is talking to. `NotifyView` here has neither. |
+| A watcher cannot get a status snapshot on the bus, so it opens a second connection and races it | *(new — filed by this pass)* | `NotifyInitialStatus` (`1 << 14`, `ipn/backend.go`) makes the first notify carry a whole `ipnstate.Status` in `Notify.InitialStatus`, and upstream's own doc comment now recommends it over `LocalClient.NetMap` for new code: paired with `Notify.SelfChange` and `Notify.PeersChanged` it lets a watcher stitch a continuous view of the node without ever fetching a netmap. The build order in `WatchNotificationsAs` is deliberate and is the part to port rather than invent. The engine half is built FIRST, outside `b.mu` — `statusSB = &ipnstate.StatusBuilder{WantPeers: true}` then `b.e.UpdateStatus(statusSB)` — with a comment giving the reason: the lock order is backend-then-engine and never the reverse. The backend half (`b.updateStatusLocked(statusSB)`) is then filled under `b.mu`, atomically with registering the session in `b.notifyWatchers`, so no event can be delivered to this watcher before its snapshot is. This fork already builds the exact analogue: `Backend::status()` returns a `StatusReport` and `Request::Status` hands it over, and `Backend::status()` is already written to be careful about the same hazard (it bounds `dev.status()` with `STATUS_QUERY_TIMEOUT` so the backend lock is never held indefinitely). A masked `watch` simply cannot ask for it, so today a watcher that wants a snapshot and a stream opens two connections and has no ordering guarantee between them. |
+| `exit-node suggest` never reaches the bus, so a watcher polls for a value the daemon already has | *(new — filed by this pass)* | `NotifyInitialSuggestedExitNode` (`1 << 10`) front-loads `Notify.SuggestedExitNode` — a bare `tailcfg.StableNodeID` — into the first frame when `b.suggestExitNodeLocked()` succeeds. The ongoing half lives inside that same function (`ipn/ipnlocal/local.go`) rather than in a separate watcher: it captures `prevSuggestion := b.lastSuggestedExitNode`, computes the new pick, and only when the two differ does `b.sendToLocked(ipn.Notify{SuggestedExitNode: &res.ID}, allClients)` before storing the new value. Three properties come with that placement and are worth keeping: the push is change-triggered so a stable answer costs nothing, it goes to `allClients` rather than the asking session, and it happens wherever a suggestion is computed — including the re-run `sysPolicyChanged` performs after `AllowedSuggestedExitNodes` moves, so a policy edit re-picks and tells every watcher. This fork ships `tnet exit-node suggest` over `Backend::suggest_exit_node`, and since `#451` the pick is already filtered through the administrator's allow-list, so the value exists and is already correct — it is just unreachable except by asking. §6 lists `SuggestedExitNode` among the absent notify fields without ruling on it; the ranking work that made the *suggestion* hard is the engine's, and the *notification* is not. Cache the last suggestion on the backend and push from the one place the pick is made. |
+| A watcher is told the peer set changed and never that its OWN node did | *(new — filed by this pass)* | `Notify.SelfChange` is not mask-gated: `ipn/ipnlocal/local.go` builds it on every netmap update (`selfChange = st.NetMap.SelfNode.AsStruct()` whenever the self node is valid) and again on the initial frame when `NotifyInitialNetMap` is set. Upstream added it as the scalable replacement for the now-deprecated bus `NetMap` and names the consumers in the field's doc — containerboot, kube agents, sniproxy — reactive processes that need to know their own addresses, MagicDNS name, key expiry or capability set moved without paying for the whole map, and are told to re-fetch the netmap on demand only if they need more. It is also a session boundary rather than a plain field: `watchSession.lastSentSelf` records the self node last delivered, and `selfChangeResetsImplicitState` resets that session's dedup state when the identity changes, because a new self is a new profile. Here `NotifyView::net_map` is `Option<Vec<PeerReport>>` — peers only — so a watcher learns everything about everyone else and nothing about itself, and has to poll `status` to notice its own key is about to expire. Daemon-buildable: the self node is already in reach (`Device::status()`'s `self_node`, which `Backend::status()` projects into `self_ipv4`/`self_name`/`self_ipv6`), so a self frame on each netmap tick is a small addition to `stream_notify`. Decide what "changed" means before building it — Go re-sends on every netmap update rather than diffing, which is the cheap and honest reading and the one a consumer can rely on. |
+| A watcher that falls behind is silently starved instead of being told and disconnected | *(new — filed by this pass)* | `sendToLocked` (`ipn/ipnlocal/local.go`) writes each frame into a 128-deep per-session channel with a non-blocking `select`/`default`, and the `default` arm is emphatically not a drop. Unless the session holds `NotifyInProcessNoDisconnect` — an in-process-only bit, see the mask row below — it calls `closeLaggingWatchSessionLocked`, which removes the session from `b.notifyWatchers`, DRAINS whatever is queued (the comment gives the reason: "the session already fell behind, so the queued delta stream is not trustworthy"), replaces it with a single terminal frame whose `ErrMessage` is `IPN bus consumer fell behind; closing watch`, and closes the channel. A LocalAPI watcher that cannot keep up is therefore told once and disconnected, and knows to re-subscribe and re-snapshot. This fork's `stream_notify` reads the engine's bus, and the engine's `deliver` (`ts_runtime/src/ipn_bus.rs`) treats a full channel as success: `Err(TrySendError::Full(_)) => false` drops the notification and keeps streaming. Its own comment cites Go's non-blocking send as the model, which it was — before upstream replaced the drop with a disconnect. The result here is the worse half of both designs: the watcher's view diverges from the daemon's, permanently, with no signal. Split it honestly. The terminal frame is daemon-buildable — `NotifyView::error` exists and the daemon owns the socket — but *knowing a drop happened* is not, so this needs a lag signal out of the engine's bus (an ask to file) plus a small consumer. The daemon-built prefs and policy feeds need nothing: both ride `tokio::sync::watch`, which coalesces to the latest value rather than dropping an entry, and a full-snapshot feed loses nothing by coalescing. |
+| The watch mask is four booleans, so Go's two subscribe-time refusals have nowhere to land | *(new — filed by this pass)* | `serveWatchIPNBus` (`ipn/localapi/localapi.go`) takes the whole subscription as ONE parameter — a decimal `mask` — and refuses three ways before it subscribes. A value that will not `UnmarshalText` gets `bad mask` (400). A mask containing `NotifyInProcessNoDisconnect` gets `NotifyInProcessNoDisconnect is only valid for in-process IPN bus subscribers` (400), and the reason is in the bit's own doc: it makes the producer BLOCK until a slow consumer catches up, while holding the backend mutex, so a LocalAPI client must never be able to ask for it. And `ipn.ValidateNotifyWatchOpt` refuses `NotifyRateLimit` combined with any of `NotifyPeerChanges`, `NotifyNoNetMap`, `NotifyInitialStatus` or `NotifyPeerPatches` (`NotifyRateLimitIncompatibleBits`) with `NotifyRateLimit is incompatible with new-style IPN bus subscription bits %v`, because delaying or merging messages in a stateful delta stream breaks the consumer's ability to keep a coherent local view. `Request::Watch` here spells the mask as named booleans — `initial_state`, `initial_netmap`, `prefs`, `policy` — which is the better wire format in every respect but this one: an unknown bit is not a value the daemon can see and rule on, it is a field serde ignores, and a forbidden *combination* has no shape in which it can be expressed and refused. This is a decision rather than a defect, and it is due now rather than later, because four of the rows above each add a field to this same request. Either keep the booleans and port each refusal as a cross-field check on the parsed request — the same shape as the `--exit-node-allow-lan-access` "can only be used with" usage refusal this fork already ports — or carry Go's integer mask alongside them. Write the answer next to the request so the next bit does not re-open it. |
 | `--operator` is persisted but grants nobody anything | *(previous pass, filed)* | Go's LocalAPI write gate is `ipnauth.ConnIdentity.IsReadonlyConn`: root writes; a non-root daemon whose uid matches the caller writes; **the uid named by `Prefs.OperatorUser`** writes; a local admin writes (`isLocalAdmin` — the `admin` group on darwin, `administrators` on QNAP); everyone else is read-only, and every arm logs the uid that decided it. `ipnserver`'s `Permissions` feeds that into `PermitRead`/`PermitWrite`, and `userIDFromString` accepts either a username or a numeric uid. `AuthPolicy::access_for_uid` (`src/auth.rs`) implements the first two arms only, and `Prefs::operator_user`'s own rustdoc says setting it "neither widens nor narrows who may drive the daemon". So `sudo tnet set --operator=$USER` — the remedy Go's own access-denied message tells people to run — does nothing, and this daemon's refusal text ("requires root or the same user that owns the daemon") does not mention the pref that is meant to fix it. Not `tsd-euv` (§4.2), which is about the LocalAPI *transport* rather than who may write over it. The local-admin arm *widens* access and wants its own ruling rather than a silent port. |
 | `--hostname` accepts any bytes, where Go validates it as a DNS name | *(previous pass, filed)* | `prefsFromUpArgs` runs `dnsname.ValidHostname` before it builds the prefs: at most 254 bytes overall, every dot-separated label non-empty and at most 63 bytes, first and last byte alphanumeric, interior bytes letters, digits or `-`. Nothing between `tnet`'s flag and the engine `Config.hostname` looks at the value, so `--hostname "my laptop"`, a leading dash and a 300-character name are all accepted — and the value becomes this node's MagicDNS name. `--config` can set it without the CLI running, which argues for the check landing daemon-side rather than where Go puts it. |
 | Every long flag dies unless it is spelled with two dashes | *(previous pass, filed)* | Go's CLI is built on the standard `flag` package, which treats `-hostname` and `--hostname` as the same flag; `cli.go`'s `CleanUpArgs` rewrites both `-authkey` and `--authkey`, which is upstream stating outright that the one-dash form reaches the parser. `tnet` is `Cli::parse()` with no pre-pass, and clap reads `-hostname` as a cluster of short flags, so every single-dash command line copied from Go's own docs fails. Most fail loudly — `tnet up -authkey=x` exits 2 with `unexpected argument '-a' found` — but `-hostname` does not: clap takes the leading `-h` as its own help flag, prints `up`'s help and **exits 0**, so a script that checks the status is told the node came up when nothing ran. |
@@ -436,10 +475,21 @@ not silently weaker than Go. They are surfaced to the user where relevant.
   doesn't retain it), and `--proto` is parsed but not yet honoured as a flow distinction (ask #35).
 - **`dns query`** returns the raw response datagram as hex; answer records are not decoded.
 - **`dns status`** omits the "Use Tailscale DNS" accept-dns line + the system-DNS section.
-- **Notify stream (`watch`)** carries `state`/`error`/`browse_to_url`/`net_map`/`prefs`; `net_map` is
-  always the **full** peer set (no incremental `PeerChangedPatch` — ask #28); Go's
-  Health/Engine/FilesWaiting/SuggestedExitNode notify fields are absent, and so is the
-  `NotifySysPolicyChanges` mask bit that carries `Notify.Policy` (§4.5).
+- **Notify stream (`watch`)** carries `state`/`error`/`browse_to_url`/`net_map`/`prefs`/`policy`
+  (the last since `#448`, Go's `NotifySysPolicyChanges`). `net_map` is always the **full** peer set (no
+  incremental `PeerChangedPatch` — ask #28) and carries **peers only**, never the self node. Of Go's
+  remaining `Notify` fields the split is now explicit rather than a bare list: `SessionID`, `Version`,
+  `InitialStatus`, `SelfChange` and `SuggestedExitNode` are daemon-buildable and are §4.5 rows;
+  `Health` waits on the health tracker (also §4.5); `Engine` (`NotifyWatchEngineUpdates`),
+  `FilesWaiting`/`IncomingFiles`/`OutgoingFiles` (the Taildrop file-arrival signal, §4.1) and
+  `PeerState` (`NotifyPeerWireGuardState`) need engine internals; `ClientVersion` needs a
+  control-pushed version this fork has no source for; `DriveShares` belongs to Taildrive (`tsd-eka`);
+  and `LocalTCPPort` exists only for Go's macOS network extension.
+- **The watch mask is named booleans, not Go's integer `NotifyWatchOpt`.** `Request::Watch` carries
+  `initial_state`/`initial_netmap`/`prefs`/`policy`, each dropped from the wire when false so a bare
+  `{"cmd":"watch"}` stays byte-identical for older clients. It reads better and cannot be mis-typed;
+  what it cannot do is refuse a bit or a combination, which is where Go puts three of its checks
+  (§4.5).
 - **`status --json` peer key:** keyed by **StableNodeID**, where Go keys by the node public key
   (`nodekey:…`).
 - **`up --json`** has no `QR` field (Go gates QR on the `HasQRCodes` build feature).
@@ -469,7 +519,9 @@ not silently weaker than Go. They are surfaced to the user where relevant.
   serve to the CLI's IPN-bus watch session, so the daemon drops the config the moment that connection
   goes away (`SIGKILL`, a lost SSH session); here `tnet` restores the previous config from its own
   `SIGINT`/`SIGTERM` handler, so a killed foreground `tnet serve` leaves its serve installed until
-  `tnet serve reset`.
+  `tnet serve reset`. The missing primitive underneath this is `Notify.SessionID` — Go keys
+  `ServeConfig.Foreground` by the watch session's id and deletes the entry when the session ends — and
+  it is now a §4.5 row of its own.
 - **`funnel <bare-port> off`** keeps this fork's legacy reading (turn the funnel off on
   `<bare-port>`), where Go reads the bare port as a *target* and turns off the funnel on the default
   port 443. Retargeting an existing `tnet funnel 8443 off` at 443 would report success while leaving
@@ -537,31 +589,38 @@ umbrella trackers.
   flag batch · `tsd-eka` Taildrive (engine-gated) · `tsd-iqq.16` reload-config refactor · `tsd-k47`
   configure kubeconfig merge · `tsd-k4q` serve path-mux bug (#30) · `tsd-k97` file-get trust doc ·
   `tsd-rjf` serve redirect expansion (residual, engine-side).
-- **Still open from the last restock's filings:** `tnet completion` · `warnOnAdvertiseRoutes` on
+- **Still open from the earlier restocks' filings:** `tnet completion` · `warnOnAdvertiseRoutes` on
   `up`/`set` · the four bare-integer duration flags · the health tracker · the residual five call
   sites of Go's `isRunningOrStarting` gate, plus `nc`'s two argument refusals (`#405` wired the
   ported state table to `ping` only). `login`'s shared flag set merged outright (`#397`).
-- **Handed to the tracker by the three previous regenerations and still open**, with nothing merged
+- **Handed to the tracker by the four previous regenerations and still open**, with nothing merged
   against them in this repo since: Go's single-dash long-flag spelling · the `--posture-checking`
   legacy spelling · the `mac-app-connector` risk · `--exit-node=auto:any` · `--config`'s unenforced and
   inverted `Locked` default · `set --shields-up` while Funnel is on · a `--nickname` another profile
   already holds · `--hostname` accepted as any bytes · `--operator`, persisted and granting nobody
   anything. All nine are rows in §4.5.
-- **Closed since the last regeneration:** the macOS `tailnetd-env.txt` operator seam (`#437`) · the
-  advertised-route set rules (`#439`) · the `tag:` prefix completion (`#441`) · the always-on
-  disconnect gate (`#442`) · syspolicy application to prefs (`#445`). That is five of the six gaps the
-  last pass filed, merged the same day it filed them; the sixth, `--operator`, is still open.
+- **Closed since the last regeneration:** the effective policy on the notify bus (`#448`) ·
+  `AllowedSuggestedExitNodes` filtering `exit-node suggest` (`#451`) · `ReconnectAfter` bounding a
+  permitted always-on disconnect (`#454`) · the LocalAPI `shutdown` verb `AllowTailscaledRestart`
+  gates (`#455`) · the policy-pinned exit node refused rather than overwritten, with
+  `ExitNode.AllowOverride` (`#457`) · policy `AuthKey` enrolment (`#459`). That is **all six** gaps
+  the last pass filed. Alongside them, and closing no §4.5 row: `tnet ip` resolution and its
+  addressless-target failure (`#466`, `#468`) · an explicit empty `AdvertiseRoutes` withdrawing routes
+  (`#469`) · `switch`'s bare `No profile named` refusal (`#471`) · the web client's start order and
+  `--origin` handling (`#472`, `#475`) · a refused `serve` command line answering as Go's does
+  (`#476`) · kubeconfig write-failure wording (`#479`).
 
 ### Filed by this pass (not yet in the list above)
 The gaps this sweep found that no open bead covered are handed to the tracker in
 [`restock-beads.json`](restock-beads.json), each cited to the one upstream file it was verified in, at
-`bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`: the `AuthKey` policy key that never reaches the login path,
-the policy-pinned exit node that is overwritten instead of refused (with `ExitNode.AllowOverride`), the
-`ReconnectAfter` window a permitted always-on disconnect never gets, and the
-`AllowedSuggestedExitNodes` allow-list `exit-node suggest` ignores (all four `ipn/ipnlocal/local.go`);
-the `shutdown` verb `AllowTailscaledRestart` gates (`ipn/localapi/localapi.go`); and the
-`NotifySysPolicyChanges` watch bit that puts the effective snapshot on the notify bus
-(`ipn/backend.go`).
+`bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`: the missing frame envelope (`Notify.SessionID` and
+`Notify.Version`) and, behind the session id, the daemon-owned teardown of a foreground serve; the
+`NotifyInitialStatus` snapshot a watcher cannot subscribe to; the `NotifyInitialSuggestedExitNode`
+front-load and the change-triggered `Notify.SuggestedExitNode` push; the un-gated `Notify.SelfChange`
+that tells a watcher its own node moved; and the lagging-watcher disconnect, where Go sends a terminal
+`IPN bus consumer fell behind; closing watch` and this build silently drops the frame (all five
+`ipn/ipnlocal/local.go`). The sixth is the shape of the mask itself, and the two subscribe-time
+refusals that have nowhere to land (`ipn/localapi/localapi.go`).
 
 > The authoritative live backlog is the bead set (`bd list --status open`) + `docs/ENGINE_ASKS.md`. This
 > doc is the orienting map; regenerate it after a batch of merges.
@@ -579,39 +638,41 @@ highest-leverage item is **Windows support** (`tsd-1yw`); the highest-frequency 
 pin bump** (each release has converted a filed ask into a shipped feature).
 
 What this refresh changes about that picture is, once again, *where* to sweep — and this time the
-answer is that a layer has been finished rather than opened. The last three passes climbed: whether a
-command line is spelled correctly, whether its values name anything real, and who is allowed to ask.
-The third of those found that this fork carried the **inputs** of every administrative decision and ran
-none of the decisions, and the repo closed five of its six gaps the same day, including the whole of
-`applySysPolicy`. That left one question that could not have been asked before: now that the policy
-keys which are prefs are applied, what does upstream do with the keys that are **not** prefs?
+answer arrived because the previous layer was finished rather than sampled. The four passes so far
+climbed: whether a command line is spelled correctly, whether its values name anything real, who is
+allowed to ask, and what an administrator's non-pref settings are supposed to *do*. The last of those
+closed completely — all six gaps merged, and the policy client is now ported exhaustively — and its
+final row is what opened this one. `#448` put the effective policy snapshot on the notify bus, which
+meant reading, for the first time, how a subscription to that bus is actually negotiated.
 
-The answer is finite, which is why this pass is an inventory rather than a sample. Nine Go files read
-the policy client at the pin, and they sort cleanly. Two are the prefs path — `ipn/ipnlocal/local.go`'s
-`applySysPolicy` and `ipn/prefs.go`'s `ControlURLOrDefault`, both ported by `#445`. Two are inside the
-control session (`control/controlclient/direct.go` for `Tailnet`, `sign_supported.go` for
-`MachineCertificateSubject`) and two answer a c2n pull (`feature/posture/posture.go`,
-`posture/serialnumber_syspolicy.go`), so all four sit behind the engine boundary and ask **#43**. One is
-the Windows DNS manager and one configures a log uploader this fork does not have, and the whole
-`ManagedBy*`/visibility/`KeyExpirationNotice` family drives a GUI this repo does not ship. What is left
-is six keys with a daemon-side consumer that this daemon does not run, and they are §4.5's six new rows:
-`AuthKey`, `ExitNode.AllowOverride`, `ReconnectAfter`, `AllowTailscaledRestart`,
-`AllowedSuggestedExitNodes`, and the `NotifySysPolicyChanges` watch bit. Land those and the policy client
-is ported, not approximately but exhaustively — which is a thing this document has rarely been able to
-say about anything.
+The answer is that the IPN bus is a **subscription protocol**, not a state feed. Nineteen
+`NotifyWatchOpt` bits (`ipn/backend.go`) decide once, at subscribe time, what a session will ever
+receive; the producer then gates every frame per session against that mask. This fork models the mask
+as four booleans and the frame as six fields, and reading the nineteen bit by bit sorts them into
+three piles. Most need nothing: the health bits wait on the health tracker, the three peer-delta bits
+are ask **#28**, the engine-status and WireGuard-state bits need engine internals, Taildrive and
+Taildrop have their own rows, `NotifyNoPrivateKeys` is a documented no-op, `NotifyRateLimit` damps a
+burst this build's coalescing peer feed does not produce, and `NotifyInProcessNoDisconnect` is the one
+bit a LocalAPI caller is forbidden to hold. What is left
+is §4.5's six new rows: the frame envelope, `NotifyInitialStatus`, `NotifyInitialSuggestedExitNode`,
+`Notify.SelfChange`, the lagging-watcher disconnect, and the shape of the mask itself.
 
-The shape worth naming is a variant of last pass's, one step in. Last time the failure was carrying an
-administrator's **inputs** and never running the **decision**. This time it is running the decision in
-the one place it is cheapest to run — the pref — and not in the places where it has to *refuse*
-something. A policy-pinned exit node that is applied but not locked is the clearest case: `tnet set
---exit-node=<peer>` succeeds, prints nothing, and persists the administrator's node instead of the
-operator's. That is not a missing feature; it is a command that lies about what it did. The always-on
-gate that merged alongside it is the counter-example and the model — it refuses, by name, at the one place
-`want_running` goes from true to false — and each of the six new §4.5 rows wants the same
-treatment: find the single place the decision is made, and make it refuse there.
+The shape worth naming is a step sideways from last pass's rather than one further in. Last time the
+failure was running a decision in the one place it was cheapest to run and not in the places where it
+had to *refuse* something. This time it is a daemon that computes the right answer and will only give
+it to a caller who asks the right way. `Backend::status()` already builds the snapshot; the suggestion
+is already computed and already policy-filtered; the self node is already in `Device::status()`. None
+of that is missing — it is unsubscribable, so every consumer is pushed back to polling a second
+connection, which is exactly the pattern upstream's newer bits exist to retire. And the one place the
+bus does fail, it fails quietly: a watcher that falls behind is dropped frame by frame with no signal,
+where Go tells it once and closes. That is the row to read first. A subscriber that has silently
+diverged is worse than one that was refused, for the same reason a `tnet set` that silently loses to a
+policy was worse than one that errored — both report success while the caller's model of the node goes
+wrong.
 
-*Re-derived 2026-09-12 against upstream v1.102.4 (`bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`, still the
-newest stable tag for the third refresh running — the only newer ref, `v1.103.0-pre`, marks the unstable
-branch), engine pin `9d847a6e`, daemon v0.59.0. Regenerate from `bd list` + `docs/ENGINE_ASKS.md` + a
-fresh upstream sweep; when the pin cannot move, sweep deeper instead of reporting no change — and when a
-layer turns out to be finite, enumerate it and say so, so the next pass can start above it.*
+*Re-derived 2026-09-13 against upstream v1.102.4 (`bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`, still the
+newest stable tag for the fourth refresh running — the only newer ref, `v1.103.0-pre`, marks the
+unstable branch), engine pin `9d847a6e`, daemon v0.62.2. Regenerate from `bd list` +
+`docs/ENGINE_ASKS.md` + a fresh upstream sweep; when the pin cannot move, sweep deeper instead of
+reporting no change — and when a layer turns out to be finite, enumerate it and say so, so the next
+pass can start above it.*

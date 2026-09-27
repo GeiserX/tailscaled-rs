@@ -151,6 +151,13 @@ to put those in, and each platform has exactly one:
 
 Both are optional; an absent file simply means no extra environment.
 
+`TS_DEBUG_ENV_FILE=<path>` in the daemon's own environment overrides the table: `tailnetd` reads
+that file instead, before it looks for the one above, exactly as Go's `tailscaled` does. It is
+mainly a debugging seam, but on Linux — where there is deliberately no file of its own, because
+systemd already has one — it is also the way to hand the daemon an env file directly. A file named
+there that cannot be opened is reported at startup instead of passed over in silence: naming it is
+a statement that it should be there.
+
 > [!IMPORTANT]
 > On macOS, do **not** add your keys to the plist's `EnvironmentVariables` dict. That plist is
 > embedded in the `tailnetd` binary and rewritten verbatim by `tnet install` (and by
@@ -175,9 +182,11 @@ Format (the same one Go's `tailscaled-env.txt` uses): one `KEY=value` per line, 
 **first** `=`; blank lines and lines starting with `#` are ignored; both halves are trimmed; a
 value that starts with `"` is unquoted as a Go string literal, so `TS_X="  keep  spaces  "` and
 `TS_X="a # not a comment"` work. A value that starts with a quote but is not a valid literal
-(e.g. an unterminated one) **refuses the whole file**, and the daemon exits at startup naming the
-file, the line number and the line — a half-applied environment would be worse than a daemon that
-does not start.
+(e.g. an unterminated one) **stops the file there**: the lines above it are applied, that line and
+every line below it is not, and the daemon starts anyway, with
+`error reading environment config: error parsing <file>: line 7: …` on stderr naming the file, the
+line number and the line. One typo is not a reason to leave a host unreachable — but do read the
+daemon's log after editing this file, because a line that did not apply says so only there.
 
 ## Talking to the daemon: `tnet` and the LocalAPI socket
 
