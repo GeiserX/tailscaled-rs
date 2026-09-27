@@ -453,10 +453,10 @@ pub(super) async fn netcheck(dev: &tailscale::Device) -> Response {
 /// ([`suggestion_response`]) instead of looking like an empty tailnet.
 pub(super) async fn suggest_exit_node(dev: &tailscale::Device) -> Response {
     match dev.suggest_exit_node().await {
-        Ok(suggestion) => suggestion_response(permitted_suggestion(
+        Ok(suggestion) => suggestion_response(
             suggestion,
             super::syspolicy::allowed_suggested_exit_nodes().as_ref(),
-        )),
+        ),
         Err(e) => Response::Error {
             message: format!("exit-node suggest failed: {e:?}"),
         },
@@ -476,11 +476,21 @@ enum PermittedSuggestion {
     WithheldByPolicy,
 }
 
-/// Render a [`PermittedSuggestion`] as the wire reply. Split out from [`suggest_exit_node`] so the
-/// mapping is testable without a live engine: the empty-because-policy outcome must reach the client
-/// as `withheld_by_policy: true` and not as a bare empty reply.
-fn suggestion_response(outcome: PermittedSuggestion) -> Response {
-    match outcome {
+/// Render the engine's answer into the `SuggestExitNode` reply, applying the allow-list on the way
+/// through — the whole of [`suggest_exit_node`]'s success arm, split out so the policy gate's effect
+/// on the *reply* is reachable from a test (building a `tailscale::Device` needs a live engine, so
+/// the `async` function above is not).
+///
+/// Every outcome is an empty-or-not result, **never** a [`Response::Error`]: Go answers a filter
+/// that leaves nothing with an empty `apitype.ExitNodeSuggestionResponse` and a nil error, so `tnet
+/// exit-node suggest` reports rather than fails. What the reply adds is *which* empty it is: a node
+/// the allow-list excludes comes back as `withheld_by_policy: true`, so it cannot be mistaken for
+/// the engine having nothing eligible to suggest.
+fn suggestion_response(
+    suggestion: Option<tailscale::ExitNodeSuggestion>,
+    allow_list: Option<&std::collections::BTreeSet<String>>,
+) -> Response {
+    match permitted_suggestion(suggestion, allow_list) {
         PermittedSuggestion::Suggest(view) => Response::ExitNodeSuggestion {
             suggestion: Some(view),
             withheld_by_policy: false,
@@ -516,13 +526,20 @@ fn suggestion_response(outcome: PermittedSuggestion) -> Response {
 /// [`PermittedSuggestion::WithheldByPolicy`] is a distinct outcome, reaches the client as
 /// `withheld_by_policy` and reaches the operator as its own message, because "no exit node exists"
 /// and "you may not be steered onto the one that does" are different facts and only the second has a
-/// fix (list the node, or pick a permitted one by hand).
+/// fix (list the node, or pick a permitted one by hand). Engine ask #44 in `docs/ENGINE_ASKS.md`.
 ///
-/// Re-ranking needs the candidate set and the DERP latencies, neither of which the engine exposes —
-/// engine ask #44 in `docs/ENGINE_ASKS.md`; it is deliberately not re-implemented from the peer list,
-/// which would be a different measurement wearing Go's name. The withholding is also logged, for the
-/// operator reading the daemon log rather than the CLI. (The engine's suggestion is *sticky*, so a
-/// withheld node stays withheld across calls rather than flapping.)
+/// The blocking input is the **candidate set**, and specifically each peer's `suggest-exit-node`
+/// node-capability: verified against the pinned engine rev, Go's predicate (online + that capability +
+/// advertises an exit route) lives on `ExitNodeCandidate`, which is built inside
+/// `Runtime::suggest_exit_node` and never crosses `Device`. The daemon's own peer view
+/// (`tailscale::StatusNode`) carries no capability map, and `whois` reads capabilities only one
+/// address at a time. DERP-region latencies, by contrast, *are* reachable here (`Device::netcheck`) —
+/// so latency is not what is missing, and an implementer should not go looking for it. Ranking from
+/// the peer list anyway would mean guessing the eligibility predicate, which risks suggesting a node
+/// Go never would: a different algorithm wearing Go's name, so it is deliberately not written.
+/// The withholding is also logged, for the operator reading the daemon log rather than the CLI. (The
+/// engine's suggestion is *sticky*, so a withheld node stays withheld across calls rather than
+/// flapping.)
 fn permitted_suggestion(
     suggestion: Option<tailscale::ExitNodeSuggestion>,
     allow_list: Option<&std::collections::BTreeSet<String>>,
@@ -2713,6 +2730,58 @@ mod tests {
     }
 
     #[test]
+    fn an_excluded_suggestion_replies_with_an_empty_result_not_an_error() {
+        use super::suggestion_response;
+        // The gate has to be *wired into the reply*, and the reply for an excluded node has to be an
+        // empty result like the one Go sends (an empty ExitNodeSuggestionResponse with a nil error),
+        // so `tnet exit-node suggest` reports instead of failing. Asserting on
+        // `permitted_suggestion` alone would not catch a success arm that skipped the filter.
+        let allowed = allow(&["nodeAAA", "nodeBBB"]);
+        let reply = suggestion_response(
+            Some(suggestion("nodeFORBIDDEN", "exit-9.example.ts.net")),
+            Some(&allowed),
+        );
+        match reply {
+            super::Response::ExitNodeSuggestion {
+                suggestion,
+                withheld_by_policy,
+            } => {
+                assert_eq!(
+                    suggestion, None,
+                    "a node outside the allow-list must not reach the caller"
+                );
+                assert!(
+                    withheld_by_policy,
+                    "and the reply must say policy emptied it"
+                );
+            }
+            other => panic!("an excluded suggestion must stay an empty result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_permitted_suggestion_reaches_the_reply_intact() {
+        use super::suggestion_response;
+        // The other half of the wiring: the gate must not eat a suggestion the administrator allows,
+        // and the id/name must arrive unaltered (the id is the `--exit-node=<id>` selector).
+        let allowed = allow(&["nodeAAA"]);
+        let reply = suggestion_response(
+            Some(suggestion("nodeAAA", "exit-1.example.ts.net")),
+            Some(&allowed),
+        );
+        match reply {
+            super::Response::ExitNodeSuggestion {
+                suggestion: Some(view),
+                withheld_by_policy: false,
+            } => {
+                assert_eq!(view.id, "nodeAAA");
+                assert_eq!(view.name, "exit-1.example.ts.net");
+            }
+            other => panic!("a listed node must be suggested, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn the_allow_list_matches_the_stable_id_exactly() {
         use super::{PermittedSuggestion, permitted_suggestion};
         // Membership is whole-id equality (Go `set.Set[tailcfg.StableNodeID].Contains`), not a prefix
@@ -2732,7 +2801,7 @@ mod tests {
 
     #[test]
     fn a_policy_refusal_does_not_reach_the_client_as_an_empty_tailnet() {
-        use super::{permitted_suggestion, suggestion_response};
+        use super::suggestion_response;
         use crate::localapi::Response;
         // Upstream filters the candidates BEFORE ranking, so its empty answer means "nothing passed
         // the filter". This build filters one already-chosen node afterwards, so its empty answer can
@@ -2741,10 +2810,10 @@ mod tests {
         // client that cannot tell them apart tells the operator the tailnet has no exit node when the
         // truth is that policy, not the tailnet, is what emptied the answer.
         let allowed = allow(&["nodeAAA", "nodeBBB"]);
-        let withheld = suggestion_response(permitted_suggestion(
+        let withheld = suggestion_response(
             Some(suggestion("nodeFORBIDDEN", "exit-9.example.ts.net")),
             Some(&allowed),
-        ));
+        );
         match withheld {
             Response::ExitNodeSuggestion {
                 suggestion: None,
@@ -2754,7 +2823,7 @@ mod tests {
         }
 
         // The engine's own empty answer keeps the plain shape — the flag is not a blanket "empty".
-        match suggestion_response(permitted_suggestion(None, Some(&allowed))) {
+        match suggestion_response(None, Some(&allowed)) {
             Response::ExitNodeSuggestion {
                 suggestion: None,
                 withheld_by_policy: false,
@@ -2763,10 +2832,10 @@ mod tests {
         }
 
         // And a permitted suggestion is carried through unflagged.
-        match suggestion_response(permitted_suggestion(
+        match suggestion_response(
             Some(suggestion("nodeAAA", "exit-1.example.ts.net")),
             Some(&allowed),
-        )) {
+        ) {
             Response::ExitNodeSuggestion {
                 suggestion: Some(view),
                 withheld_by_policy: false,

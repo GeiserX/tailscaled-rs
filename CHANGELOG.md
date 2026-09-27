@@ -25,6 +25,39 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.63.2](https://github.com/GeiserX/tailscaled-rs/compare/v0.63.1...v0.63.2) (2026-09-22)
+
+
+### Bug Fixes
+
+* a typo in the operator env file must not stop the daemon ([#521](https://github.com/GeiserX/tailscaled-rs/issues/521)) ([e34b40b](https://github.com/GeiserX/tailscaled-rs/commit/e34b40b93d0d983dcabdd09d8a0be14a64e94112))
+* **configure:** stop wrapping kubeconfig read and merge errors Go returns bare ([#516](https://github.com/GeiserX/tailscaled-rs/issues/516)) ([16e5aae](https://github.com/GeiserX/tailscaled-rs/commit/16e5aae1724dd777a22e1f3ecfcd8aae514da4b5))
+* **ipn:** gate SSH on the prefs an edit leaves behind, not on its mask ([#523](https://github.com/GeiserX/tailscaled-rs/issues/523)) ([413fe1b](https://github.com/GeiserX/tailscaled-rs/commit/413fe1b2b8c03eb66093a87369e0d5bfd9045c06))
+* **login:** stop `login --nickname` renaming the logged-in profile ([#514](https://github.com/GeiserX/tailscaled-rs/issues/514)) ([c5e0c08](https://github.com/GeiserX/tailscaled-rs/commit/c5e0c0887d0e77e619c5bc5040f3668631a7e2c9))
+* **prefs:** refuse what Go refuses for --exit-node, in Go's words ([#522](https://github.com/GeiserX/tailscaled-rs/issues/522)) ([052b53d](https://github.com/GeiserX/tailscaled-rs/commit/052b53d8381ffb6bee96694cecbd6c7d90cf19c1))
+
+## [0.63.1](https://github.com/GeiserX/tailscaled-rs/compare/v0.63.0...v0.63.1) (2026-09-22)
+
+
+### Bug Fixes
+
+* **captive:** trigger portal detection on ip-forwarding-off like Go ([#513](https://github.com/GeiserX/tailscaled-rs/issues/513)) ([e759491](https://github.com/GeiserX/tailscaled-rs/commit/e7594910b0467d0cde8366e74e0d9fe93e91336d))
+* **down:** ask Go's Continue? at a terminal and print its abort bare ([#511](https://github.com/GeiserX/tailscaled-rs/issues/511)) ([232da7c](https://github.com/GeiserX/tailscaled-rs/commit/232da7ca7f4a63b5bb3e128c2df1f4ba5dbd230b))
+
+## [0.63.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.62.2...v0.63.0) (2026-09-22)
+
+
+### Features
+
+* **watch:** send the session id foreground serve needs, and the version ([#495](https://github.com/GeiserX/tailscaled-rs/issues/495)) ([a01efaf](https://github.com/GeiserX/tailscaled-rs/commit/a01efaf6050b82a01a8125c6a91dcf4d3897422d))
+
+
+### Bug Fixes
+
+* **cli:** give Go's flag-parse refusals Go's exit status, not 1 ([#486](https://github.com/GeiserX/tailscaled-rs/issues/486)) ([c324a67](https://github.com/GeiserX/tailscaled-rs/commit/c324a67b9db5e22f58db34d3e893bc78ccb61c75))
+* **lock:** make `lock log --json=1` emit Go's schema-1 Messages document ([#506](https://github.com/GeiserX/tailscaled-rs/issues/506)) ([d2cd140](https://github.com/GeiserX/tailscaled-rs/commit/d2cd1405e87f281834c42508028a1ac233291b26))
+* **tun:** let the device open judge non-root TUN off macOS at bring-up ([#507](https://github.com/GeiserX/tailscaled-rs/issues/507)) ([b2d9484](https://github.com/GeiserX/tailscaled-rs/commit/b2d9484eb82c59b9a40e317dc85855926cb3b584))
+
 ## [0.62.2](https://github.com/GeiserX/tailscaled-rs/compare/v0.62.1...v0.62.2) (2026-09-13)
 
 
