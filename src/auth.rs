@@ -458,6 +458,7 @@ mod tests {
                 prefs: false,
                 policy: false,
                 suggested_exit_node: false,
+                initial_status: false,
             }),
             "bare watch only streams status snapshots — a read, gated exactly like status"
         );
@@ -470,6 +471,7 @@ mod tests {
                 prefs: true,
                 policy: true,
                 suggested_exit_node: true,
+                initial_status: true,
             }),
             "masked watch only streams notifications — still a read"
         );

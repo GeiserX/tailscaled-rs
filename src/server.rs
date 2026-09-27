@@ -401,6 +401,7 @@ async fn handle_conn(
                         prefs,
                         policy,
                         suggested_exit_node,
+                        initial_status,
                     }) => {
                         // Judge the SUBSCRIPTION before subscribing it to anything: Go's
                         // `serveWatchIPNBus` runs all of its refusals ahead of `WatchNotifications`,
@@ -416,6 +417,7 @@ async fn handle_conn(
                             prefs,
                             policy,
                             suggested_exit_node,
+                            initial_status,
                         }) {
                             write_response(&mut write_half, &Response::Error { message }).await?;
                             continue;
@@ -442,6 +444,7 @@ async fn handle_conn(
                             && !prefs
                             && !policy
                             && !suggested_exit_node
+                            && !initial_status
                         {
                             // Bare watch → the legacy status-stream path, untouched.
                             stream_watch(&mut write_half, &backend).await?;
@@ -455,6 +458,7 @@ async fn handle_conn(
                                 prefs,
                                 policy,
                                 suggested_exit_node,
+                                initial_status,
                             )
                             .await?;
                         }
@@ -747,6 +751,13 @@ async fn stream_watch(
 /// device is in hand, and therefore runs again for a replacement device. That is the right place
 /// anyway: the previous epoch's suggestion was ranked against an engine that no longer exists.
 ///
+/// A fourth daemon-built front-load, the `initial_status` snapshot (Go `NotifyInitialStatus`), goes
+/// out before the prefs and policy front-loads and is never repeated, not even for a replacement
+/// device. It is taken AFTER the lifecycle/prefs/policy subscriptions and BEFORE the first bus
+/// subscription; the window that ordering leaves, and why subscribing to the bus first would not
+/// close it, is documented on
+/// [`NotifyView::initial_status`](crate::localapi::NotifyView::initial_status).
+///
 /// ## A reader that falls behind is NOT told (engine gap, `docs/ENGINE_ASKS.md` #45)
 ///
 /// Frames are written to the socket inline, so a slow client stalls `watcher.next()` and the engine's
@@ -770,6 +781,10 @@ async fn stream_watch(
 /// device `Arc` out under the lock, drop the lock, then subscribe + stream off-lock — exactly the
 /// "clone the work out, drop the lock" discipline [`stream_nc`] and the other slow engine calls use —
 /// so a notify watcher never head-of-line blocks a concurrent `up`/`down`/`status`.
+///
+/// One bool per `Request::Watch` mask field, destructured at the single call site, so the argument
+/// list grows with the mask rather than hiding it behind a struct that would mirror the request.
+#[allow(clippy::too_many_arguments)]
 async fn stream_notify(
     write_half: &mut tokio::net::unix::OwnedWriteHalf,
     backend: &Arc<Mutex<Backend>>,
@@ -778,6 +793,7 @@ async fn stream_notify(
     prefs: bool,
     policy: bool,
     suggested_exit_node: bool,
+    initial_status: bool,
 ) -> Result<()> {
     use tailscale::NotifyWatchOpt;
 
@@ -828,8 +844,27 @@ async fn stream_notify(
         }
     };
 
-    // `prefs` front-load: emit the current prefs as the first frame (Go `NotifyInitialPrefs`). Done
-    // once up front (daemon-built, not tied to a device epoch). A write error = client gone.
+    // `initial_status` front-load (Go `NotifyInitialStatus`): the whole `status` report, peers
+    // included, as the session's first frame (so it also carries the session id when one is owed).
+    // Taken after the subscriptions above (so a lifecycle, prefs or policy change after it is still
+    // delivered) and before the first bus subscription. Go gets atomicity from one mutex; this daemon
+    // cannot, and `NotifyView::initial_status` says which edge that leaves. `status()` bounds its
+    // engine query, so the lock is held briefly — the same call a one-shot `status` makes. Sent once:
+    // Go carries it in the first `Notify` only.
+    if initial_status {
+        let report = { backend.lock().await.status().await };
+        let view = crate::localapi::NotifyView {
+            initial_status: Some(Box::new(report)),
+            ..Default::default()
+        };
+        if write_notify(write_half, &mut session, view).await.is_err() {
+            return Ok(());
+        }
+    }
+
+    // `prefs` front-load: emit the current prefs (Go `NotifyInitialPrefs`), the first frame unless the
+    // status snapshot went out ahead of it. Done once up front (daemon-built, not tied to a device
+    // epoch). A write error = client gone.
     if prefs
         && emit_prefs_frame(write_half, &mut session, backend)
             .await
@@ -1226,13 +1261,14 @@ fn project_notify(
         browse_to_url,
         net_map,
         self_change,
-        // `prefs`, `policy` and `suggested_exit_node` are the daemon-built fields, never sourced from
-        // an engine `Notify` — `project_notify` only maps engine fields, so all three are always
-        // `None` here (those feeds are emitted separately by `emit_prefs_frame`/`emit_policy_frame`/
-        // `emit_suggested_exit_node_frame`).
+        // `prefs`, `policy`, `suggested_exit_node` and `initial_status` are the daemon-built fields,
+        // never sourced from an engine `Notify` — `project_notify` only maps engine fields, so all
+        // four are always `None` here (those feeds are emitted separately by `emit_prefs_frame`/
+        // `emit_policy_frame`/`emit_suggested_exit_node_frame` and `stream_notify`'s front-load).
         prefs: None,
         policy: None,
         suggested_exit_node: None,
+        initial_status: None,
     };
     // The engine never emits an all-`None` Notify, but guard the projection anyway: a frame with no
     // populated field carries nothing for a consumer to apply.
