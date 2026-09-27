@@ -2409,6 +2409,12 @@ mod tests {
         let view = project_notify(netmap.clone(), Some(me.clone())).expect("a netmap tick");
         assert_eq!(view.net_map, Some(Vec::new()));
         assert_eq!(view.self_change, Some(me.clone()));
+        // The status snapshot is a once-per-session front-load, never an engine tick: a netmap
+        // frame carrying self must not also carry one.
+        assert!(
+            view.initial_status.is_none(),
+            "a netmap tick must not carry the initial_status snapshot: {view:?}"
+        );
 
         // No self node to give (none yet, or the bounded fetch failed): the peers still stream.
         let view = project_notify(netmap, None).expect("a netmap tick without self");
