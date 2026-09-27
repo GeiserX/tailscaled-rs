@@ -11507,6 +11507,7 @@ async fn watch_status(socket: &std::path::Path, json: bool, filter: StatusFilter
         prefs: false,
         policy: false,
         suggested_exit_node: false,
+        initial_status: false,
     })?;
     line.push(b'\n');
     write_half.write_all(&line).await?;
@@ -11589,6 +11590,7 @@ async fn run_debug_watch_ipn(socket: &std::path::Path) -> Result<()> {
         prefs: true,
         policy: true,
         suggested_exit_node: true,
+        initial_status: false,
     })?;
     line.push(b'\n');
     write_half.write_all(&line).await?;
