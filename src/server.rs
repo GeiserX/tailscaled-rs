@@ -782,6 +782,11 @@ async fn stream_watch(
 /// so a notify watcher never head-of-line blocks a concurrent `up`/`down`/`status`. The one exception
 /// is the `initial_status` front-load, which holds the guard across `Backend::status` exactly as a
 /// one-shot `status` request does — that call bounds its engine query by `STATUS_QUERY_TIMEOUT`.
+///
+/// The six mask bools are passed one by one, as the dispatch arm destructures them from
+/// `Request::Watch`, so a new bit is a compile error at each call site rather than a field some
+/// wrapper struct silently defaults.
+#[allow(clippy::too_many_arguments)]
 async fn stream_notify(
     write_half: &mut tokio::net::unix::OwnedWriteHalf,
     backend: &Arc<Mutex<Backend>>,
