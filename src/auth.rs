@@ -178,6 +178,7 @@ pub(crate) fn requires_write(request: &crate::localapi::Request) -> bool {
         | Request::Logout { .. }
         | Request::SwitchProfile { .. }
         | Request::CreateProfile { .. }
+        | Request::SwitchToEmptyProfile
         | Request::DeleteProfile { .. }
         | Request::Nc { .. }
         | Request::SetServeConfig { .. }
@@ -457,6 +458,7 @@ mod tests {
                 prefs: false,
                 policy: false,
                 initial_status: false,
+                suggested_exit_node: false,
             }),
             "bare watch only streams status snapshots — a read, gated exactly like status"
         );
@@ -469,6 +471,7 @@ mod tests {
                 prefs: true,
                 policy: true,
                 initial_status: true,
+                suggested_exit_node: true,
             }),
             "masked watch only streams notifications — still a read"
         );
@@ -535,6 +538,10 @@ mod tests {
         assert!(
             requires_write(&Request::CreateProfile { id: "work".into() }),
             "creating a profile writes even harder — still a write"
+        );
+        assert!(
+            requires_write(&Request::SwitchToEmptyProfile),
+            "`login`'s switch to an empty profile tears the device down — a write"
         );
         assert!(
             requires_write(&Request::DeleteProfile {
