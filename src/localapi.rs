@@ -1019,7 +1019,8 @@ pub enum Request {
 /// ## Why it accepts everything today
 ///
 /// Neither of Go's two *content* refusals can be expressed in this fork's wire format, because
-/// neither operand is offered:
+/// each needs an operand this fork does not offer (`NotifyInProcessNoDisconnect` for the first,
+/// `NotifyRateLimit` for the second):
 ///
 /// - `NotifyInProcessNoDisconnect is only valid for in-process IPN bus subscribers` — the bit is
 ///   deliberately not a field at all, for the reasons recorded on [`Request::Watch`].
@@ -2811,6 +2812,30 @@ mod tests {
             .unwrap(),
             r#"{"cmd":"watch","initial_status":true}"#
         );
+        // And that line decodes back with the bit on and nothing else, and it is a subscription the
+        // daemon accepts: `initial_status` alone is one operand of Go's rate-limit refusal, not both.
+        let req =
+            serde_json::from_str::<Request>(r#"{"cmd":"watch","initial_status":true}"#).unwrap();
+        match &req {
+            Request::Watch {
+                initial_state,
+                initial_netmap,
+                prefs,
+                policy,
+                initial_status,
+                suggested_exit_node,
+            } => assert!(
+                *initial_status
+                    && !initial_state
+                    && !initial_netmap
+                    && !prefs
+                    && !policy
+                    && !suggested_exit_node,
+                "a status-only watch line must decode with only `initial_status` on: {req:?}"
+            ),
+            other => panic!("expected masked Watch, got {other:?}"),
+        }
+        assert_eq!(watch_usage_refusal(&req), None);
         // A client that predates the `policy` bit sends the three-field masked line. It must still
         // parse, with `policy` defaulting OFF — a watcher never gets a feed it did not ask for. The
         // same back-compat discipline every earlier mask bit got.

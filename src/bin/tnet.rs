@@ -11570,10 +11570,10 @@ async fn watch_status(socket: &std::path::Path, json: bool, filter: StatusFilter
 /// `watch` request with the `initial_state`, `initial_netmap`, `prefs`, `policy` and
 /// `suggested_exit_node` bits set so the first frames are the current state + peer set + prefs +
 /// effective policy + exit-node suggestion, and each later frame carries only what changed. Reuses
-/// `watch_status`'s
-/// streaming-read shape — connect, write the one request line, then read [`Response`] lines until the
-/// daemon closes the stream — but on the Notify path: `Notify` frames print as JSON, an `Error` frame
-/// exits non-zero, and any other reply (impossible on this connection) is noted and skipped.
+/// `watch_status`'s streaming-read shape — connect, write the one request line, then read
+/// [`Response`] lines until the daemon closes the stream — but on the Notify path: `Notify` frames
+/// print as JSON, an `Error` frame exits non-zero, and any other reply (impossible on this
+/// connection) is noted and skipped.
 async fn run_debug_watch_ipn(socket: &std::path::Path) -> Result<()> {
     let stream = UnixStream::connect(socket)
         .await
