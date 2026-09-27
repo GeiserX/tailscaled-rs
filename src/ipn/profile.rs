@@ -116,6 +116,29 @@ pub(super) fn no_profile_named(target: &str) -> String {
     format!("No profile named {}", super::syspolicy::quoted(target))
 }
 
+/// Pick an id for a new, empty profile — Go's `profileManager.newUnusedID`
+/// (`ipn/ipnlocal/profiles.go`), which formats two random bytes as four lowercase hex digits and
+/// draws again while the id is already known.
+///
+/// "Known" is wider here than in Go: an id that equals another profile's nickname is skipped too,
+/// because [`resolve_target_to_id`] matches ids first and a new id would shadow that profile for
+/// every later `switch`. Go loops without bound; this gives up after a fixed number of draws and
+/// returns `None`, so a hand-edited map cannot hang the daemon. `draw` supplies the random bytes, so
+/// the loop is testable without an entropy source.
+pub(super) fn unused_profile_id<E>(
+    meta: &ProfilesFile,
+    mut draw: impl FnMut() -> Result<[u8; 2], E>,
+) -> Result<Option<String>, E> {
+    for _ in 0..256 {
+        let [hi, lo] = draw()?;
+        let id = format!("{hi:02x}{lo:02x}");
+        if resolve_target_to_id(&id, meta).is_none() {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}
+
 /// The `(prefs.json, node.key.json)` paths for profile `id` under `state_dir`. The default profile
 /// maps to the legacy top-level paths (so existing installs are untouched); every other profile maps
 /// under `profiles/<id>/`. `id` MUST already be validated by [`is_valid_profile_id`] — this joins it
@@ -239,6 +262,35 @@ mod tests {
         assert!(!is_valid_profile_id("a/b"));
         assert!(!is_valid_profile_id("a.b"));
         assert!(!is_valid_profile_id(&"x".repeat(65)));
+    }
+
+    #[test]
+    fn unused_profile_id_is_four_hex_digits_and_skips_taken_ones() {
+        let mut meta = ProfilesFile::default();
+        meta.profiles
+            .insert("beef".to_string(), ProfileMeta::default());
+        meta.profiles.insert(
+            "cafe".to_string(),
+            ProfileMeta {
+                name: "0a0b".to_string(),
+            },
+        );
+        // `beef` is an id and `0a0b` is a nickname, so both draws are skipped.
+        let mut draws = [[0xbe, 0xef], [0x0a, 0x0b], [0x01, 0x2c]].into_iter();
+        let id = unused_profile_id(&meta, || Ok::<_, ()>(draws.next().expect("drew too often")));
+        assert_eq!(id, Ok(Some("012c".to_string())));
+        assert!(is_valid_profile_id("012c"));
+
+        // A source that only ever repeats a taken id gives up instead of looping forever.
+        assert_eq!(
+            unused_profile_id(&meta, || Ok::<_, ()>([0xbe, 0xef])),
+            Ok(None)
+        );
+        // A failed draw is returned, not retried.
+        assert_eq!(
+            unused_profile_id(&meta, || Err("no entropy")),
+            Err("no entropy")
+        );
     }
 
     #[test]
