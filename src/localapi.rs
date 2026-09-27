@@ -2374,6 +2374,13 @@ pub struct NotifyView {
     /// `None` when the frame carried no netmap change, and also when the engine had no self node to
     /// give for that netmap (Go leaves `SelfChange` nil when `SelfNode` is invalid). A frame never
     /// carries `self_change` without `net_map`.
+    ///
+    /// **Narrower than Go (engine gap, `docs/ENGINE_ASKS.md` #46):** the engine's bus ticks `net_map`
+    /// only when the *peer* snapshot is republished, so a netmap update that changes only this node —
+    /// an extended key expiry, a new MagicDNS name, reassigned addresses, with no peer, patch or
+    /// liveness delta in the same response — produces no frame, and so no `self_change`, until the
+    /// next peer-side change carries the current self along. Go sends `SelfChange` on every netmap
+    /// update. A consumer that must see a self-only change promptly still has to read `status`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub self_change: Option<SelfReport>,
     /// The node's current prefs, if the `prefs` mask bit was set (Go `Notify.Prefs`). A front-loaded
