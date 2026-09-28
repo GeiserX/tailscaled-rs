@@ -25488,6 +25488,24 @@ users:
                     p = ro.display()
                 )
             );
+
+            // The same file past the precheck, i.e. the write inside `setKubeconfigForPeer`. Go
+            // returns `os.WriteFile`'s `*os.PathError` BARE — no wrapper naming this port's own
+            // steps — and a refused write leaves the file as it was. The real command's precheck
+            // answers first, so this is what the operator sees when the mode changes between the
+            // two, or when the refusal is one the precheck's probe cannot ask about.
+            let err =
+                set_kubeconfig_for_peer("https://", "foo.tail-scale.ts.net", ro.to_str().unwrap())
+                    .expect_err("a read-only kubeconfig cannot be written");
+            assert_eq!(
+                format!("{err:#}"),
+                format!("open {}: permission denied", ro.display())
+            );
+            assert_eq!(
+                std::fs::read_to_string(&ro).unwrap(),
+                "apiVersion: v1\nkind: Config\n",
+                "a refused write must leave the kubeconfig byte-identical"
+            );
         }
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o600)).unwrap();
 

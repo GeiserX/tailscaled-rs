@@ -6,7 +6,7 @@
 //! that exists, probed for writability — and returns `cannot write kubeconfig at %q: %w` having
 //! touched nothing. Then `setKubeconfigForPeer` calls `os.MkdirAll(dir, 0755)`, which creates every
 //! missing ancestor. This port had neither: an unwritable `~/.kube/config` surfaced at the `open()`
-//! after the merge was already computed, reported as Go's bare `open <path>: permission denied`, and
+//! after the merge was already computed and was reported as "opening kubeconfig … for writing", and
 //! a `$KUBECONFIG` two directories deep failed with a creating-directory error where Go writes the
 //! file.
 //!
