@@ -983,7 +983,10 @@ async fn stream_notify(
         // Release the device Arc before parking on the selects below: holding it would keep the old
         // engine alive across a concurrent `down` (the documented `Arc::into_inner` clone-count
         // concern in `device_handle`). The watcher reads cloned `watch` receivers internally, so it
-        // does not need our `Arc` to keep streaming.
+        // does not need our `Arc` to keep streaming. A `Weak` stays behind so a netmap tick can ask
+        // THIS epoch's device for its self node (Go `Notify.SelfChange`) without keeping the engine
+        // alive between ticks.
+        let epoch_dev = Arc::downgrade(&dev);
         drop(dev);
 
         // Inner loop: stream this epoch's notifications, but also break out on a lifecycle change so a
@@ -997,7 +1000,20 @@ async fn stream_notify(
                         // arm and wait.
                         None => break,
                         Some(notify) => {
-                            let Some(view) = project_notify(notify) else {
+                            // Go re-sends the self node with every netmap update (`SelfChange`) and
+                            // the engine's bus carries only peers, so a netmap tick fetches it here.
+                            // The upgraded `Arc` lives only for the bounded query; a `down` racing it
+                            // sees the benign extra clone `device_handle` documents. A netmap that
+                            // changes only this node sends no tick at all, so it is not fetched here
+                            // either (engine gap, `docs/ENGINE_ASKS.md` #46); no timer polls for it.
+                            let self_change = if notify.net_map.is_none() {
+                                None
+                            } else if let Some(dev) = epoch_dev.upgrade() {
+                                ipn::fetch_self_report(&dev).await
+                            } else {
+                                None
+                            };
+                            let Some(view) = project_notify(notify, self_change) else {
                                 // An all-empty Notify never occurs (the engine's bus skips empties),
                                 // but if one ever arrived there is nothing to send — skip it rather
                                 // than emit a meaningless frame.
@@ -1211,7 +1227,14 @@ async fn emit_suggested_exit_node_frame(
 /// engine carries the interactive-login URL in its own `browse_to_url` field (derived from
 /// `NeedsLogin`), so the auth-URL component of the state mapping is intentionally dropped here — the
 /// URL is sourced from `browse_to_url`, never duplicated out of `state`.
-fn project_notify(notify: tailscale::Notify) -> Option<crate::localapi::NotifyView> {
+///
+/// `self_change` is the self node the caller fetched for this tick (Go `Notify.SelfChange`). It is
+/// attached only to a frame that carries `net_map` — Go builds `SelfChange` on the netmap-update path
+/// and nowhere else — so a state or URL frame never carries a self view, whatever it was handed.
+fn project_notify(
+    notify: tailscale::Notify,
+    self_change: Option<crate::localapi::SelfReport>,
+) -> Option<crate::localapi::NotifyView> {
     let (state, error) = match notify.state {
         Some(ds) => {
             let (state, error) = ipn::notify_state_from_device(ds);
@@ -1226,6 +1249,7 @@ fn project_notify(notify: tailscale::Notify) -> Option<crate::localapi::NotifyVi
             .collect()
     });
     let browse_to_url = notify.browse_to_url.map(|u| u.to_string());
+    let self_change = net_map.as_ref().and(self_change);
 
     let view = crate::localapi::NotifyView {
         // The identity fields are not engine fields either: `NotifySession::stamp` sets them on the
@@ -1236,6 +1260,7 @@ fn project_notify(notify: tailscale::Notify) -> Option<crate::localapi::NotifyVi
         error,
         browse_to_url,
         net_map,
+        self_change,
         // `prefs`, `policy`, `suggested_exit_node` and `initial_status` are the daemon-built fields,
         // never sourced from an engine `Notify` — `project_notify` only maps engine fields, so all
         // four are always `None` here (those feeds are emitted separately by `emit_prefs_frame`/
@@ -2364,6 +2389,48 @@ mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
     use tokio::net::UnixStream;
+
+    /// Go builds `Notify.SelfChange` on the netmap-update path, re-sending the self node every time.
+    /// `project_notify` must therefore put the fetched self on a netmap frame, still stream the peers
+    /// when no self could be fetched, and never let a self view leak onto a frame that is not a
+    /// netmap tick.
+    #[test]
+    fn project_notify_attaches_self_only_to_a_netmap_frame() {
+        let me = crate::localapi::SelfReport {
+            stable_id: "nSELF1CNTRL".to_string(),
+            name: "laptop.tail0123.ts.net".to_string(),
+            ipv4: "100.64.0.1".to_string(),
+            ipv6: "fd7a:115c:a1e0::1".to_string(),
+            key_expiry: None,
+        };
+
+        let mut netmap = tailscale::Notify::default();
+        netmap.net_map = Some(Vec::new());
+        let view = project_notify(netmap.clone(), Some(me.clone())).expect("a netmap tick");
+        assert_eq!(view.net_map, Some(Vec::new()));
+        assert_eq!(view.self_change, Some(me.clone()));
+        // The status snapshot is a once-per-session front-load, never an engine tick: a netmap
+        // frame carrying self must not also carry one.
+        assert!(
+            view.initial_status.is_none(),
+            "a netmap tick must not carry the initial_status snapshot: {view:?}"
+        );
+
+        // No self node to give (none yet, or the bounded fetch failed): the peers still stream.
+        let view = project_notify(netmap, None).expect("a netmap tick without self");
+        assert_eq!(view.net_map, Some(Vec::new()));
+        assert!(view.self_change.is_none());
+
+        // A frame that is not a netmap tick carries no self, even if one was offered.
+        let mut url_only = tailscale::Notify::default();
+        url_only.browse_to_url = Some("https://login.example.com/a/1".parse().unwrap());
+        let view = project_notify(url_only, Some(me)).expect("a URL frame");
+        assert!(view.net_map.is_none());
+        assert!(
+            view.self_change.is_none(),
+            "self must not ride a non-netmap frame: {view:?}"
+        );
+    }
 
     /// Go mints `rands.HexString(16)` per watch: 16 hex characters, fresh each time. The id will key
     /// server-side state, so two connections must never share one.
