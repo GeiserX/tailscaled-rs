@@ -130,7 +130,14 @@ Go's hidden `--host-routes` is accepted and does nothing — it has had to be `t
 1.67, and this build's userspace netstack installs no host routes at all — while `--host-routes=false`
 is refused with Go's own "only 'true' is allowed". `up --nickname` is refused by name, pointing at
 `tnet set --nickname`: no `up` names a login profile, in this fork or in Go, which registers
-`--nickname` on `set` and `login` only.
+`--nickname` on `set` and `login` only. Both refusals exit **2**, the status Go's flag package gives
+a parse failure: upstream decides both inside `flag.Parse`, so neither ever reaches `runUp`. The
+`--host-routes=false` sentence is Go's own, byte for byte, down to the one-dash `-host-routes` Go's
+flag package prints whichever spelling was typed. The `--nickname`
+sentence is this fork's, and it is longer than Go's on purpose — where Go stops at "flag provided but
+not defined", this one names the commands that do take a profile name. Neither refusal prints the
+usage block Go's parser appends to both, for the same reason no other refusal here prints one: the
+message already says what to run.
 
 `tnet set` (Go `tailscale set`) adjusts policy prefs on an already-running node. Changing
 `--exit-node`, `--hostname`, `--accept-routes`, `--advertise-routes`, or `--advertise-exit-node`
@@ -141,7 +148,14 @@ have no in-place engine setter, and the last two are re-advertised to control on
 a package manager owns (`brew upgrade` is the update path there), or a platform with no published
 release artifact — because the pref is advertised to control as `Hostinfo.AllowsUpdate`, so accepting
 it would tell the tailnet admin that a remote update trigger will be honoured by a node that cannot
-honour one. Declining (`--no-auto-update`) is accepted everywhere.
+honour one. Declining (`--no-auto-update`) is accepted everywhere. As in Go, the rule is asked of the
+prefs a write would LEAVE BEHIND rather than of the flags it names, so an opt-in already stored keeps
+failing later `set`s until `--no-auto-update` withdraws it. The same refusal is applied to the
+declarative path — a config file's `"AutoUpdate": {"Apply": true}` fails the load on such an
+installation, because the claim reaching control is the same one whether a command or a file made it.
+That last part is a deliberate divergence, not a port: upstream's config loader does not run this
+check (see `Config::apply_to_prefs`), but a `--config` node is exactly the deployment with nobody
+reading command output, so the claim would otherwise be made silently and forever.
 `--operator`, `--report-posture`, `--webclient`, `--update-check` and
 `--exit-node-allow-lan-access` are **carried prefs**: they are persisted and reported (`tnet get`),
 but nothing in this build acts on them yet — each flag's `--help` says exactly what it does and does

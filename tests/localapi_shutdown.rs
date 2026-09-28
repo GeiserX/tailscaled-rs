@@ -12,6 +12,11 @@
 //!    only then does `serve` unwind: the reply arrives, the accept loop ends, and the socket is
 //!    unlinked on the way out, exactly as it is on SIGINT/SIGTERM. No `process::exit` — which is
 //!    what lets the daemon's own teardown (state file, live device) run at all.
+//! 3. **the exit status**, which is what the policy key is named for. Go's listener close makes
+//!    `hs.Serve` fail, the context was never cancelled, and `log.Fatal` ends tailscaled non-zero so
+//!    `Restart=on-failure` starts it again. So `serve` returns `server::StoppedByLocalApi` on the
+//!    verb and `Ok(())` on the signal, and both halves are asserted here: a `shutdown` that unwound
+//!    the loop but returned success would silently turn this fork's restart into a permanent stop.
 //!
 //! The refusal *ladder* — which rung answers, in which order — is unit-tested against the production
 //! predicate in `src/server.rs` (`shutdown_verdict`), where both rungs are reachable. Here the peer
@@ -53,8 +58,9 @@ struct Harness {
     socket_path: PathBuf,
     /// Fire to ask `serve` to stop the ordinary way (the SIGINT/SIGTERM path).
     shutdown_tx: oneshot::Sender<()>,
-    /// The spawned `serve` task; await it to observe a clean exit.
-    serve_task: tokio::task::JoinHandle<()>,
+    /// The spawned `serve` task. It yields `serve`'s own `Result` rather than unwrapping it, because
+    /// that value IS the daemon's exit status and one of the two cases below is asserting on it.
+    serve_task: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
 
 impl Harness {
@@ -82,7 +88,6 @@ impl Harness {
                 shutdown_rx.await.ok();
             })
             .await
-            .expect("serve returned an error");
         });
 
         wait_for_socket(&socket_path).await;
@@ -119,13 +124,22 @@ impl Harness {
         serde_json::from_str(line.trim()).expect("parse the daemon's reply")
     }
 
-    /// Stop the daemon the ordinary way and confirm `serve` returned cleanly.
+    /// Stop the daemon the ordinary way and confirm `serve` returned cleanly — i.e. that the signal
+    /// path still means exit 0, the one stop Go maps to a nil error (`errors.Is(err,
+    /// context.Canceled)`). This is the control for the `shutdown` verb's non-zero exit below: the
+    /// two stops have to stay distinguishable, or the exit status tells the service manager nothing.
     async fn stop_normally(self) {
         let _ = self.shutdown_tx.send(());
-        tokio::time::timeout(PATIENCE, self.serve_task)
+        let outcome = tokio::time::timeout(PATIENCE, self.serve_task)
             .await
             .expect("serve must return after the shutdown signal")
             .expect("serve task must not panic");
+        assert!(
+            outcome.is_ok(),
+            "a SIGINT/SIGTERM-shaped stop must still be a SUCCESS, or every clean stop would start \
+             asking the service manager for a restart; got: {:?}",
+            outcome.err()
+        );
         let _ = tokio::fs::remove_dir_all(&self.state_dir).await;
     }
 }
@@ -156,14 +170,11 @@ async fn shutdown_is_refused_by_default_and_stops_the_daemon_once_the_policy_all
     let Response::Error { message } = refused else {
         panic!("an unconfigured daemon must REFUSE `shutdown`, got {refused:?}");
     };
-    assert!(
-        message.starts_with("shutdown access denied by policy"),
-        "the owner has write access, so the refusal must be the POLICY one (Go's second rung), \
-         got: {message}"
-    );
-    assert!(
-        message.contains("AllowTailscaledRestart"),
-        "the refusal must name the key that lifts it, got: {message}"
+    assert_eq!(
+        message, "shutdown access denied by policy",
+        "the owner has write access, so the refusal must be the POLICY one (Go's second rung), and \
+         it must be Go's 403 body verbatim — the remediation belongs in the daemon's log, not on \
+         the wire"
     );
 
     // The refusal must be a refusal and nothing else: the daemon is still serving, on a new
@@ -212,10 +223,26 @@ async fn shutdown_is_refused_by_default_and_stops_the_daemon_once_the_policy_all
         shutdown_tx: _shutdown_tx,
         serve_task,
     } = harness;
-    tokio::time::timeout(PATIENCE, serve_task)
+    let outcome = tokio::time::timeout(PATIENCE, serve_task)
         .await
         .expect("`shutdown` must unwind the accept loop without any signal being sent")
         .expect("serve task must not panic");
+
+    // The exit status, which is the whole meaning of `AllowTailscaledRestart`. Upstream ends the
+    // process with `log.Fatal` here — the closed listener fails `hs.Serve`, the context was never
+    // cancelled, so the error is fatal — and a failed exit is what `Restart=on-failure` (systemd)
+    // and `SuccessfulExit=false` (launchd) act on. Both are what `tnet install` writes, so a
+    // success here would stop the daemon for good where upstream restarts it.
+    let err = outcome.expect_err(
+        "a permitted `shutdown` must end `serve` with a FAILURE, or the service manager will not \
+         restart the daemon and the verb its policy key is named for becomes a permanent stop",
+    );
+    assert!(
+        err.downcast_ref::<server::StoppedByLocalApi>().is_some(),
+        "the failure must be the named one, so the daemon's exit can be told from a real fault; \
+         got: {err:?}"
+    );
+
     // A clean stop, not an abort: `serve` unlinked its socket on the way out, exactly as it does on
     // a signal. This is the observable half of "the existing shutdown path ran".
     assert!(

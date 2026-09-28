@@ -452,15 +452,31 @@ pub(super) async fn netcheck(dev: &tailscale::Device) -> Response {
 /// administrator excluded.
 pub(super) async fn suggest_exit_node(dev: &tailscale::Device) -> Response {
     match dev.suggest_exit_node().await {
-        Ok(suggestion) => Response::ExitNodeSuggestion {
-            suggestion: permitted_suggestion(
-                suggestion,
-                super::syspolicy::allowed_suggested_exit_nodes().as_ref(),
-            ),
-        },
+        Ok(suggestion) => suggestion_response(
+            suggestion,
+            super::syspolicy::allowed_suggested_exit_nodes().as_ref(),
+        ),
         Err(e) => Response::Error {
             message: format!("exit-node suggest failed: {e:?}"),
         },
+    }
+}
+
+/// Render the engine's answer into the `SuggestExitNode` reply, applying the allow-list on the way
+/// through — the whole of [`suggest_exit_node`]'s success arm, split out so the policy gate's effect
+/// on the *reply* is reachable from a test (building a `tailscale::Device` needs a live engine, so
+/// the `async` function above is not).
+///
+/// A suggestion the allow-list excludes yields `ExitNodeSuggestion { suggestion: None }` — an honest
+/// empty result, **not** a [`Response::Error`]. That is the shape Go returns when no candidate passes
+/// the filter (an empty `apitype.ExitNodeSuggestionResponse` with a nil error), and it is what lets
+/// `tnet exit-node suggest` print "no suggestion available" rather than failing.
+fn suggestion_response(
+    suggestion: Option<tailscale::ExitNodeSuggestion>,
+    allow_list: Option<&std::collections::BTreeSet<String>>,
+) -> Response {
+    Response::ExitNodeSuggestion {
+        suggestion: permitted_suggestion(suggestion, allow_list),
     }
 }
 
@@ -479,10 +495,18 @@ pub(super) async fn suggest_exit_node(dev: &tailscale::Device) -> Response {
 /// **Refuse, not re-rank.** Go filters the *candidate list* before the DERP-latency ranking, so it
 /// answers with the best node the administrator permits. This daemon is handed one already-chosen
 /// node, so an allow-list that excludes the engine's top pick while permitting a runner-up yields no
-/// suggestion here where Go yields that runner-up. Re-ranking needs the candidate set and the DERP
-/// latencies, neither of which the engine exposes — engine ask #44 in `docs/ENGINE_ASKS.md`; it is
-/// deliberately not re-implemented from the peer list, which would be a different measurement wearing
-/// Go's name. The withholding is logged, because "no suggestion available" for a policy reason and
+/// suggestion here where Go yields that runner-up. Engine ask #44 in `docs/ENGINE_ASKS.md`.
+///
+/// The blocking input is the **candidate set**, and specifically each peer's `suggest-exit-node`
+/// node-capability: verified against the pinned engine rev, Go's predicate (online + that capability +
+/// advertises an exit route) lives on `ExitNodeCandidate`, which is built inside
+/// `Runtime::suggest_exit_node` and never crosses `Device`. The daemon's own peer view
+/// (`tailscale::StatusNode`) carries no capability map, and `whois` reads capabilities only one
+/// address at a time. DERP-region latencies, by contrast, *are* reachable here (`Device::netcheck`) —
+/// so latency is not what is missing, and an implementer should not go looking for it. Ranking from
+/// the peer list anyway would mean guessing the eligibility predicate, which risks suggesting a node
+/// Go never would: a different algorithm wearing Go's name, so it is deliberately not written.
+/// The withholding is logged, because "no suggestion available" for a policy reason and
 /// for an empty tailnet are very different things to the operator reading the daemon log. (The
 /// engine's suggestion is *sticky*, so a withheld node stays withheld across calls rather than
 /// flapping.)
@@ -2656,6 +2680,48 @@ mod tests {
         assert_eq!(permitted_suggestion(None, None), None);
         assert_eq!(permitted_suggestion(None, Some(&allowed)), None);
         assert_eq!(permitted_suggestion(None, Some(&allow(&[]))), None);
+    }
+
+    #[test]
+    fn an_excluded_suggestion_replies_with_an_empty_result_not_an_error() {
+        use super::suggestion_response;
+        // The gate has to be *wired into the reply*, and the reply for an excluded node has to be the
+        // honest empty result Go sends (an empty ExitNodeSuggestionResponse with a nil error), so
+        // `tnet exit-node suggest` prints "no suggestion available" instead of failing. Asserting on
+        // `permitted_suggestion` alone would not catch a success arm that skipped the filter.
+        let allowed = allow(&["nodeAAA", "nodeBBB"]);
+        let reply = suggestion_response(
+            Some(suggestion("nodeFORBIDDEN", "exit-9.example.ts.net")),
+            Some(&allowed),
+        );
+        match reply {
+            super::Response::ExitNodeSuggestion { suggestion } => assert_eq!(
+                suggestion, None,
+                "a node outside the allow-list must not reach the caller"
+            ),
+            other => panic!("an excluded suggestion must stay an empty result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_permitted_suggestion_reaches_the_reply_intact() {
+        use super::suggestion_response;
+        // The other half of the wiring: the gate must not eat a suggestion the administrator allows,
+        // and the id/name must arrive unaltered (the id is the `--exit-node=<id>` selector).
+        let allowed = allow(&["nodeAAA"]);
+        let reply = suggestion_response(
+            Some(suggestion("nodeAAA", "exit-1.example.ts.net")),
+            Some(&allowed),
+        );
+        match reply {
+            super::Response::ExitNodeSuggestion {
+                suggestion: Some(view),
+            } => {
+                assert_eq!(view.id, "nodeAAA");
+                assert_eq!(view.name, "exit-1.example.ts.net");
+            }
+            other => panic!("a listed node must be suggested, got {other:?}"),
+        }
     }
 
     #[test]
