@@ -311,23 +311,19 @@ fn main() -> Result<()> {
     // addition to it does not survive. On Linux there is no such file, exactly as in Go: the packaged
     // unit's `EnvironmentFile=-/etc/default/tailnetd` is the seam there.
     //
-    // A malformed file is FATAL, with the file, the line number and the line (Go stashes the error for
-    // its health tracker; this fork has none yet, and silently ignoring an administrator's typo would
-    // start the daemon under an environment nobody wrote — see the module docs). Absent file, or a
-    // platform with none: nothing happens. Bare message + exit 1 matches the flag refusals below.
-    let applied_env = match tailscaled_rs::envknob::apply_disk_config() {
-        Ok(applied) => applied,
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        }
-    };
+    // A malformed file is NOT fatal, exactly as in Go: `envknob.ApplyDiskConfig()` is called for its
+    // effect there and its error discarded, to be printed later from `run` while the daemon comes up
+    // regardless. The lines above a bad one still apply and the rest of startup continues; whatever
+    // did not apply rides out in `Applied::problems` and is reported below, once flags are parsed.
+    // A daemon that refuses to start over a typo in an optional file strands the operator who would
+    // fix it on the far side of the tailnet. Absent file, or a platform with none: nothing happens.
+    let applied_env = tailscaled_rs::envknob::apply_disk_config();
 
     run(applied_env)
 }
 
 #[tokio::main]
-async fn run(applied_env: Option<tailscaled_rs::envknob::Applied>) -> Result<()> {
+async fn run(applied_env: tailscaled_rs::envknob::Applied) -> Result<()> {
     // Parse flags FIRST: clap handles `--help`/`--version` (print + exit 0) and rejects unknown
     // flags before we touch the experiment gate or any state, matching how Go `tailscaled` parses its
     // flag set up front. The parsed values then override the env-derived defaults below.
@@ -388,7 +384,17 @@ async fn run(applied_env: Option<tailscaled_rs::envknob::Applied>) -> Result<()>
     // cleanup out by hand — so reclaiming a stale socket keeps working with whatever `--tun` the unit
     // file happens to carry. The resolved transport is applied to prefs further down, once the
     // backend has loaded them.
-    let tun_transport = match args.tun.as_deref().filter(|_| !args.cleanup) {
+    //
+    // Go's macOS root refusal goes out first and on its own: `log.SetFlags(0)` + `log.Fatalf` print
+    // that one line with no `error:` prefix, so a script matching Go's stderr matches this one.
+    let tun_value = args.tun.as_deref().filter(|_| !args.cleanup);
+    if let Some(line) = tun_value.and_then(|value| {
+        tailscaled_rs::tunflag::darwin_root_refusal(value, goos(), tailscaled_rs::tunflag::euid())
+    }) {
+        eprintln!("{line}");
+        std::process::exit(1);
+    }
+    let tun_transport = match tun_value {
         Some(value) => match tailscaled_rs::tunflag::resolve(value, goos()) {
             Ok(transport) => Some(transport),
             Err(e) => {
@@ -398,6 +404,17 @@ async fn run(applied_env: Option<tailscaled_rs::envknob::Applied>) -> Result<()>
         },
         None => None,
     };
+
+    // Anything in the operator env file that did NOT apply, said once per problem. HERE, and not at
+    // the `apply_disk_config` call in `main`, for two reasons that are both Go's: `log.Printf("Error
+    // reading environment config: %v", err)` lives in Go's `run`, after its flag parse (so a
+    // `--help`/`--version`/`debug` run is silent about it) and before its `--cleanup` branch (so a
+    // cleanup run still says it) — and a message emitted from `main` would land before clap had a
+    // chance to print help. stderr rather than `tracing`, because the log filter is not built until
+    // after the experiment gate below and this must not be held back behind either.
+    for problem in &applied_env.problems {
+        eprintln!("error reading environment config: {problem}");
+    }
 
     // `--cleanup` (Go `tailscaled --cleanup`): reclaim OS-level network state from a previous run,
     // then exit — WITHOUT running the engine, so it deliberately runs BEFORE the experiment gate
@@ -450,10 +467,10 @@ async fn run(applied_env: Option<tailscaled_rs::envknob::Applied>) -> Result<()>
     // Say that the env file was read, now that there is somewhere to say it. Names only — a value in
     // that file can be a secret (`TS_AUTH_KEY`), and this is the same discipline the prefs logging
     // uses. Silent when there was no file, which is the normal case on nearly every host.
-    if let Some(applied) = &applied_env {
+    if let Some(path) = &applied_env.path {
         tracing::info!(
-            path = %applied.path.display(),
-            keys = %applied.keys.join(","),
+            path = %path.display(),
+            keys = %applied_env.keys.join(","),
             "applied operator environment file"
         );
     }
@@ -754,9 +771,22 @@ async fn run(applied_env: Option<tailscaled_rs::envknob::Applied>) -> Result<()>
     captive_portal_task.abort();
     reconnect_task.abort();
 
-    serve_result?;
-
+    // Tear the backend down BEFORE the error (if any) propagates, and unconditionally. Go's
+    // equivalent is a `defer`: `ipnserver.Server.Run` opens with `defer lb.Shutdown()`, so the
+    // backend is down by the time the error it returns reaches `main`'s `log.Fatal`. Ending on an
+    // error used to skip this, which was invisible while the only error here was a failed bind — but
+    // `serve` now ends with `server::StoppedByLocalApi` on the LocalAPI `shutdown` verb, and that is
+    // the *normal* stop: skipping teardown on it would leave the engine, the state file and any live
+    // device to the process death, which is exactly what the verb exists to avoid.
     backend.lock().await.shutdown().await;
+
+    // Then the exit status. `serve` returns `StoppedByLocalApi` when the LocalAPI `shutdown` verb
+    // stopped the daemon, and `?` turns that into a non-zero exit — upstream's behaviour (its
+    // `hs.Serve` error reaches `log.Fatal` because the context was never cancelled) and the reason
+    // the key permitting the verb is named `AllowTailscaledRestart`: the shipped units restart on
+    // failure, so the non-zero exit IS the restart. SIGINT/SIGTERM still returns `Ok(())` and still
+    // exits 0, matching the one case Go maps to nil (`errors.Is(err, context.Canceled)`).
+    serve_result?;
     Ok(())
 }
 
