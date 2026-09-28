@@ -11,7 +11,9 @@
 //!    sees success on a node where it is off.
 //! 2. `-json` is a `jsonoutput.SchemaVersion`, not a bool. `--json` and `--json=1` both select
 //!    schema version 1, `--json=false` is the human form, and every other version is refused with
-//!    `unrecognised version: %d`. The payload carries the `ResponseEnvelope`'s `SchemaVersion` field.
+//!    `unrecognised version: %d`. Version 1 is `PrintTailnetLockLogJSONV1`'s document
+//!    (`cmd/tailscale/cli/jsonoutput/tailnet-lock-log.go` @
+//!    `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`), which refuses an update that does not decode.
 //! 3. Past the JSON branch, `printTailnetLockLog` ranges over the updates and prints one stanza
 //!    each. An empty chain prints nothing at all — no header, no note, no blank line.
 //!
@@ -19,14 +21,8 @@
 //! themselves. What they cannot see is the surface an operator hits: whether clap accepts Go's flag
 //! spellings at all, what the process exit status is, and whether a refusal reaches the daemon before
 //! it fires. Each test here runs the built `tnet` against a stub daemon on a Unix socket and inspects
-//! both the process result and the requests the daemon actually received.
-//!
-//! HONEST SCOPE: the payload under the envelope is fork-specific, not Go's `Messages`/`AUM` shape —
-//! this daemon has no AUM CBOR decoder, so it cannot fill Go's expanded fields. That is exactly why
-//! the envelope must NOT answer Go's `"1"`: it names this fork's schema
-//! (`SchemaVersion: "tailscaled-rs.1"`), so a consumer written against upstream fails its version
-//! check instead of parsing a document that only looks like the one it asked for. These tests pin the
-//! envelope value and the flag semantics, not upstream's field names.
+//! both the process result and the requests the daemon actually received. The full schema-1
+//! document is pinned byte for byte by the unit tests; here it is enough that it is Go's.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
@@ -128,15 +124,20 @@ fn lock_on_no_history() -> Response {
     })
 }
 
-/// A log reply from a node where the lock is on and one update has synced.
+/// A log reply from a node where the lock is on and one update has synced: a real no-op AUM
+/// (`{1: 3, 2: null}`) and its BLAKE2s-256 hash.
 fn one_update() -> Response {
+    update_with_raw("a2010302f6")
+}
+
+fn update_with_raw(raw: &str) -> Response {
     Response::LockLog(LockLogReport {
         enabled: true,
         entries: vec![LockLogEntry {
-            hash: "AAAAQ".into(),
-            change: "add-key".into(),
-            signer_key_ids: vec!["tlpub:aabb".into()],
-            raw: "a1626b76".into(),
+            hash: "WYIVHDR7JUIXBWAJT5UPSCAILEXB7OMINDFEFEPOPNTUCNXMY2KA".into(),
+            change: "no-op".into(),
+            signer_key_ids: vec![],
+            raw: raw.into(),
         }],
     })
 }
@@ -187,21 +188,34 @@ fn json_takes_gos_schema_version_as_well_as_the_bare_flag() {
         assert!(out.status.success(), "{flag}: {}", stderr(&out));
         let v: serde_json::Value =
             serde_json::from_str(&stdout(&out)).unwrap_or_else(|e| panic!("{flag}: {e}"));
-        // Go's `jsonoutput.ResponseEnvelope`: the schema the payload below it conforms to. It is
-        // this fork's, because the payload is this fork's — a consumer that pinned upstream's `"1"`
-        // must trip here rather than three fields later on a missing `.Messages`.
+        // Go's `jsonoutput.ResponseEnvelope` and `Messages`, so a consumer of
+        // `tailscale lock log --json=1` reads this as it reads upstream's.
+        assert_eq!(v["SchemaVersion"], serde_json::json!("1"), "{flag}");
+        let m = &v["Messages"][0];
         assert_eq!(
-            v["SchemaVersion"],
-            serde_json::json!("tailscaled-rs.1"),
+            m["Hash"],
+            serde_json::json!("WYIVHDR7JUIXBWAJT5UPSCAILEXB7OMINDFEFEPOPNTUCNXMY2KA"),
             "{flag}"
         );
-        assert_ne!(v["SchemaVersion"], serde_json::json!("1"), "{flag}");
         assert_eq!(
-            v["entries"][0]["hash"],
-            serde_json::json!("AAAAQ"),
+            m["AUM"]["MessageKind"],
+            serde_json::json!("no-op"),
             "{flag}"
         );
+        assert_eq!(m["Raw"], serde_json::json!("ogEDAvY="), "{flag}");
+        assert!(v.get("entries").is_none(), "{flag}: {v}");
     }
+}
+
+/// Go decodes every update before printing: one that is not an AUM is `decoding: <err>`, a
+/// non-zero exit, and nothing on stdout.
+#[test]
+fn an_update_that_is_not_an_aum_is_refused_under_json() {
+    let daemon = StubDaemon::start(vec![update_with_raw("a1626b76")]);
+    let out = daemon.tnet(&["lock", "log", "--json=1"]);
+    assert!(!out.status.success(), "{:?}", out.status);
+    assert!(stderr(&out).contains("decoding: "), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
 }
 
 /// `--json=false` clears the flag, exactly as in Go: the human form, not an error and not JSON.
@@ -211,7 +225,8 @@ fn json_false_is_the_human_form() {
     let out = daemon.tnet(&["lock", "log", "--json=false"]);
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(
-        stdout(&out).starts_with("update AAAAQ (add-key)"),
+        stdout(&out)
+            .starts_with("update WYIVHDR7JUIXBWAJT5UPSCAILEXB7OMINDFEFEPOPNTUCNXMY2KA (no-op)"),
         "{}",
         stdout(&out)
     );
