@@ -2105,7 +2105,8 @@ pub struct Backend {
     /// The last exit-node suggestion published, AND the channel that publishes it (a masked `Watch`
     /// with the `suggested_exit_node` bit). The held value is this fork's
     /// `LocalBackend.lastSuggestedExitNode`: `None` until a suggestion has ever been computed, then
-    /// the stable node id of the most recent one.
+    /// the stable node id of the most recent one, and `None` again whenever the node's identity
+    /// changes (see [`forget_suggested_exit_node`](Backend::forget_suggested_exit_node)).
     ///
     /// Unlike [`prefs_tx`](Backend::prefs_tx) this is a VALUE channel, not a tick. A prefs watcher can
     /// re-read [`prefs_view`](Backend::prefs_view) for itself; a suggestion watcher cannot re-derive a
@@ -3104,6 +3105,7 @@ impl Backend {
         // The same profile-change edge as a switch (see `activate_profile`).
         self.reset_always_on_override("new profile");
         self.reset_exit_node_policy_override("new profile");
+        self.forget_suggested_exit_node();
         self.reconcile_sys_policy("new profile");
         let _ = self.prefs_tx.send(());
         Ok(SwitchOutcome::Switched {
@@ -3238,6 +3240,9 @@ impl Backend {
         // An exit-node override belongs to its profile for the same reason and is cleared on the
         // same edge in Go, so the incoming profile is reconciled under the policy as written.
         self.reset_exit_node_policy_override("profile switch");
+        // A different profile is a different node, possibly on a different tailnet, so the last
+        // suggestion is neither its baseline nor something to front-load to its watchers.
+        self.forget_suggested_exit_node();
         // A profile load, exactly like the one in `load`: system policy applies to the newly-active
         // profile's prefs too, so a switch cannot be used to step out from under it. In memory only
         // (the swap above already persisted everything a switch owes to disk).
@@ -4854,6 +4859,8 @@ impl Backend {
         // 2. Tear down the datapath.
         self.stop_device().await;
         self.bump_generation();
+        // The registration is ending, so the last suggestion (a node on this tailnet) goes with it.
+        self.forget_suggested_exit_node();
 
         // 3. Discard the persisted node key BEFORE flipping intent to logged-out — ordering is
         // load-bearing for crash-safety. Both this `remove_file` and the `persist_prefs` below are
@@ -5589,6 +5596,29 @@ impl Backend {
     /// [`suggest_exit_node`](Backend::suggest_exit_node) front-load.
     pub fn watch_suggested_exit_node(&self) -> tokio::sync::watch::Receiver<Option<String>> {
         self.suggested_exit_node_tx.subscribe()
+    }
+
+    /// Forget the last exit-node suggestion WITHOUT telling any watcher. Called wherever the node's
+    /// identity changes: [`logout`](Backend::logout), every profile activation (`switch` and
+    /// `switch --create`) and the empty-profile reset. Go does this in `resetForProfileChangeLocked`
+    /// (`b.lastSuggestedExitNode = ""`), which its `Logout`, `SwitchProfile`, `NewProfile` and
+    /// `ResetAuth` all run.
+    ///
+    /// The id belongs to one tailnet. Left in place it would be the baseline for the next profile's
+    /// first suggestion, so an id from another tailnet could decide whether a real change is
+    /// announced; and because the watch front-load reads this cell, a watcher on the new profile
+    /// whose own computation came back empty would be front-loaded the OLD profile's pick.
+    ///
+    /// Silent, as Go's reset is: an assignment, not a `sendToLocked`. `send_if_modified` returning
+    /// `false` stores the value without waking a receiver.
+    ///
+    /// NOT called from `down`: Go keeps `lastSuggestedExitNode` across a stop and start of the same
+    /// profile, and so does this.
+    fn forget_suggested_exit_node(&self) {
+        self.suggested_exit_node_tx.send_if_modified(|id| {
+            *id = None;
+            false
+        });
     }
 
     /// Validate a prospective prefs change WITHOUT applying it (the `check-prefs` LocalAPI / Go
@@ -6588,6 +6618,96 @@ mod tests {
             Some("nodeid-a"),
             "a watcher attaching later reads the recorded pick for its front-load"
         );
+    }
+
+    #[tokio::test]
+    async fn forgetting_the_suggestion_clears_it_without_waking_a_watcher() {
+        let be = suggestion_backend();
+        let mut rx = be.watch_suggested_exit_node();
+        assert!(be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")));
+        rx.borrow_and_update();
+
+        be.forget_suggested_exit_node();
+        // Go's reset is an assignment, not a send: nobody is told anything because a profile changed.
+        assert!(
+            !rx.has_changed().unwrap(),
+            "forgetting must not wake a watcher"
+        );
+        assert_eq!(
+            *rx.borrow(),
+            None,
+            "a watcher's front-load must not read the forgotten pick"
+        );
+        assert!(
+            be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")),
+            "after a reset the same id is compared against nothing, so it is a change"
+        );
+        assert_eq!(rx.borrow_and_update().as_deref(), Some("nodeid-a"));
+    }
+
+    /// A fresh state dir for a test that drives a real profile or logout path.
+    async fn suggestion_state_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-suggestion-{tag}-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn logout_forgets_the_last_suggestion() {
+        let dir = suggestion_state_dir("logout").await;
+        let mut be = backend_for(&dir);
+        assert!(be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")));
+
+        be.logout(alwayson::Actor::Operator { reason: None })
+            .await
+            .expect("logout with no key file must succeed");
+        assert_eq!(*be.watch_suggested_exit_node().borrow(), None);
+        assert!(
+            be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")),
+            "a logged-out node's old pick must not be the baseline for the next registration"
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn switching_profile_forgets_the_last_suggestion() {
+        let dir = suggestion_state_dir("switch").await;
+        let mut be = backend_for(&dir);
+        assert!(be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")));
+
+        be.create_profile("work").await.expect("create + switch");
+        assert_eq!(*be.watch_suggested_exit_node().borrow(), None);
+        assert!(
+            be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")),
+            "an id from the old profile's tailnet must not be the new profile's baseline"
+        );
+
+        be.switch_profile(profile::DEFAULT_PROFILE_ID)
+            .await
+            .expect("switch back");
+        assert_eq!(
+            *be.watch_suggested_exit_node().borrow(),
+            None,
+            "switching back is a profile change too"
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn switching_to_an_empty_profile_forgets_the_last_suggestion() {
+        let dir = suggestion_state_dir("empty").await;
+        let mut be = backend_for(&dir);
+        // A profile that was set up but never logged in: the reset path, not the no-op answer.
+        be.ever_configured = true;
+        assert!(be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")));
+
+        be.switch_to_empty_profile()
+            .await
+            .expect("switch to a new empty profile");
+        assert_eq!(*be.watch_suggested_exit_node().borrow(), None);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     // --- captive-portal detection (tsd-iqq.5) -----------------------------------------------------
