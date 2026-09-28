@@ -25,6 +25,27 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.65.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.64.0...v0.65.0) (2026-09-28)
+
+
+### Features
+
+* **watch:** let a watcher get its status snapshot on the same stream ([#494](https://github.com/GeiserX/tailscaled-rs/issues/494)) ([0564a18](https://github.com/GeiserX/tailscaled-rs/commit/0564a18197a0c5414112be13df33f30d6040483f))
+
+
+### Bug Fixes
+
+* **prefs:** refuse a dishonest auto-update claim on every ingress ([#530](https://github.com/GeiserX/tailscaled-rs/issues/530)) ([a787db8](https://github.com/GeiserX/tailscaled-rs/commit/a787db875dd190f70a988be9536f43ac9a2ecaf6))
+* **tailnetd:** carry Go's --bird-socket sentence unbroken on line 1 ([#484](https://github.com/GeiserX/tailscaled-rs/issues/484)) ([84f399d](https://github.com/GeiserX/tailscaled-rs/commit/84f399db6b7b618067cdb9335607c3c22f58d3fb))
+* **watch:** tell a notify watcher about its own node, not only its peers ([#497](https://github.com/GeiserX/tailscaled-rs/issues/497)) ([4dce9c2](https://github.com/GeiserX/tailscaled-rs/commit/4dce9c2759adc781b9f646c19d4a966f35ff9d8a))
+
+## [0.64.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.63.2...v0.64.0) (2026-09-27)
+
+
+### Features
+
+* **watch:** put the exit-node suggestion on the notify bus ([#503](https://github.com/GeiserX/tailscaled-rs/issues/503)) ([b405f41](https://github.com/GeiserX/tailscaled-rs/commit/b405f41e3510a9408a8e03a9d8b427bea72e68c1))
+
 ## [0.63.2](https://github.com/GeiserX/tailscaled-rs/compare/v0.63.1...v0.63.2) (2026-09-22)
 
 
