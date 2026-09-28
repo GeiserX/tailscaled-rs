@@ -311,23 +311,19 @@ fn main() -> Result<()> {
     // addition to it does not survive. On Linux there is no such file, exactly as in Go: the packaged
     // unit's `EnvironmentFile=-/etc/default/tailnetd` is the seam there.
     //
-    // A malformed file is FATAL, with the file, the line number and the line (Go stashes the error for
-    // its health tracker; this fork has none yet, and silently ignoring an administrator's typo would
-    // start the daemon under an environment nobody wrote — see the module docs). Absent file, or a
-    // platform with none: nothing happens. Bare message + exit 1 matches the flag refusals below.
-    let applied_env = match tailscaled_rs::envknob::apply_disk_config() {
-        Ok(applied) => applied,
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        }
-    };
+    // A malformed file is NOT fatal, exactly as in Go: `envknob.ApplyDiskConfig()` is called for its
+    // effect there and its error discarded, to be printed later from `run` while the daemon comes up
+    // regardless. The lines above a bad one still apply and the rest of startup continues; whatever
+    // did not apply rides out in `Applied::problems` and is reported below, once flags are parsed.
+    // A daemon that refuses to start over a typo in an optional file strands the operator who would
+    // fix it on the far side of the tailnet. Absent file, or a platform with none: nothing happens.
+    let applied_env = tailscaled_rs::envknob::apply_disk_config();
 
     run(applied_env)
 }
 
 #[tokio::main]
-async fn run(applied_env: Option<tailscaled_rs::envknob::Applied>) -> Result<()> {
+async fn run(applied_env: tailscaled_rs::envknob::Applied) -> Result<()> {
     // Parse flags FIRST: clap handles `--help`/`--version` (print + exit 0) and rejects unknown
     // flags before we touch the experiment gate or any state, matching how Go `tailscaled` parses its
     // flag set up front. The parsed values then override the env-derived defaults below.
@@ -388,7 +384,17 @@ async fn run(applied_env: Option<tailscaled_rs::envknob::Applied>) -> Result<()>
     // cleanup out by hand — so reclaiming a stale socket keeps working with whatever `--tun` the unit
     // file happens to carry. The resolved transport is applied to prefs further down, once the
     // backend has loaded them.
-    let tun_transport = match args.tun.as_deref().filter(|_| !args.cleanup) {
+    //
+    // Go's macOS root refusal goes out first and on its own: `log.SetFlags(0)` + `log.Fatalf` print
+    // that one line with no `error:` prefix, so a script matching Go's stderr matches this one.
+    let tun_value = args.tun.as_deref().filter(|_| !args.cleanup);
+    if let Some(line) = tun_value.and_then(|value| {
+        tailscaled_rs::tunflag::darwin_root_refusal(value, goos(), tailscaled_rs::tunflag::euid())
+    }) {
+        eprintln!("{line}");
+        std::process::exit(1);
+    }
+    let tun_transport = match tun_value {
         Some(value) => match tailscaled_rs::tunflag::resolve(value, goos()) {
             Ok(transport) => Some(transport),
             Err(e) => {
@@ -398,6 +404,17 @@ async fn run(applied_env: Option<tailscaled_rs::envknob::Applied>) -> Result<()>
         },
         None => None,
     };
+
+    // Anything in the operator env file that did NOT apply, said once per problem. HERE, and not at
+    // the `apply_disk_config` call in `main`, for two reasons that are both Go's: `log.Printf("Error
+    // reading environment config: %v", err)` lives in Go's `run`, after its flag parse (so a
+    // `--help`/`--version`/`debug` run is silent about it) and before its `--cleanup` branch (so a
+    // cleanup run still says it) — and a message emitted from `main` would land before clap had a
+    // chance to print help. stderr rather than `tracing`, because the log filter is not built until
+    // after the experiment gate below and this must not be held back behind either.
+    for problem in &applied_env.problems {
+        eprintln!("error reading environment config: {problem}");
+    }
 
     // `--cleanup` (Go `tailscaled --cleanup`): reclaim OS-level network state from a previous run,
     // then exit — WITHOUT running the engine, so it deliberately runs BEFORE the experiment gate
@@ -450,10 +467,10 @@ async fn run(applied_env: Option<tailscaled_rs::envknob::Applied>) -> Result<()>
     // Say that the env file was read, now that there is somewhere to say it. Names only — a value in
     // that file can be a secret (`TS_AUTH_KEY`), and this is the same discipline the prefs logging
     // uses. Silent when there was no file, which is the normal case on nearly every host.
-    if let Some(applied) = &applied_env {
+    if let Some(path) = &applied_env.path {
         tracing::info!(
-            path = %applied.path.display(),
-            keys = %applied.keys.join(","),
+            path = %path.display(),
+            keys = %applied_env.keys.join(","),
             "applied operator environment file"
         );
     }
@@ -754,9 +771,22 @@ async fn run(applied_env: Option<tailscaled_rs::envknob::Applied>) -> Result<()>
     captive_portal_task.abort();
     reconnect_task.abort();
 
-    serve_result?;
-
+    // Tear the backend down BEFORE the error (if any) propagates, and unconditionally. Go's
+    // equivalent is a `defer`: `ipnserver.Server.Run` opens with `defer lb.Shutdown()`, so the
+    // backend is down by the time the error it returns reaches `main`'s `log.Fatal`. Ending on an
+    // error used to skip this, which was invisible while the only error here was a failed bind — but
+    // `serve` now ends with `server::StoppedByLocalApi` on the LocalAPI `shutdown` verb, and that is
+    // the *normal* stop: skipping teardown on it would leave the engine, the state file and any live
+    // device to the process death, which is exactly what the verb exists to avoid.
     backend.lock().await.shutdown().await;
+
+    // Then the exit status. `serve` returns `StoppedByLocalApi` when the LocalAPI `shutdown` verb
+    // stopped the daemon, and `?` turns that into a non-zero exit — upstream's behaviour (its
+    // `hs.Serve` error reaches `log.Fatal` because the context was never cancelled) and the reason
+    // the key permitting the verb is named `AllowTailscaledRestart`: the shipped units restart on
+    // failure, so the non-zero exit IS the restart. SIGINT/SIGTERM still returns `Ok(())` and still
+    // exits 0, matching the one case Go maps to nil (`errors.Is(err, context.Canceled)`).
+    serve_result?;
     Ok(())
 }
 
@@ -1322,16 +1352,38 @@ fn log_resume_decision(resuming: bool, have_authkey: bool, ephemeral: bool) {
 ///   fork has no hook on any platform, so the condition is permanently true and there is nothing to
 ///   test at runtime.
 ///
-/// **The message therefore keeps Go's sentence but not Go's `%s`.** It opens with Go's literal
-/// `--bird-socket is not supported on …`, so an operator or a runbook keyed to Go's wording still
-/// matches; the `%s` becomes "this platform or in this build of tailnetd" rather than a concrete
-/// GOOS, because naming one would invite the false repair of moving to another OS. That is the same
-/// split the neighbouring ported refusals make — [`can_encrypt_state`] reproduces Go's `on %s`
-/// verbatim where the platform arm is as true here as upstream, and
-/// [`can_use_hardware_attestation`] keeps Go's shape while naming the honest scope where the cause
-/// is the build. (Refusals with no Go string behind them, like `debugmode`'s `--derp` and
-/// `--portmap`, use this fork's own "is not supported by tailnetd" instead; this one has an
-/// upstream string to carry.) The paragraph that follows still names the real reason.
+/// **The message keeps Go's sentence but not Go's `%s`.** [`can_use_bird`] holds the sentence on
+/// its own, the way [`can_encrypt_state`] and [`can_use_hardware_attestation`] hold theirs, and this
+/// function does the presenting — the same split [`explicit_tpm_flag_refusal`] makes. The `%s`
+/// becomes "this platform or in this build of tailnetd" rather than a concrete GOOS, because naming
+/// one would invite the false repair of moving to another OS. (Refusals with no Go string behind
+/// them, like `debugmode`'s `--derp` and `--portmap`, use this fork's own "is not supported by
+/// tailnetd" instead; this one has an upstream string to carry.)
+///
+/// **What an operator's `grep` actually matches, stated plainly**, because "keeps Go's wording" has
+/// been read here as more than it is. Go's whole output is one bare line — `log.SetFlags(0)` drops
+/// the date/time prefix `log` would otherwise write, and `log.Fatalf` writes the sentence and exits
+/// 1:
+///
+/// ```text
+/// --bird-socket is not supported on linux
+/// ```
+///
+/// This fork's output differs from that in three deliberate ways:
+///
+/// 1. the `%s` slot carries fork text rather than a GOOS, as above;
+/// 2. it is prefixed `error: ` and closed with a full stop, which is how **every** fatal refusal on
+///    this binary's stderr reads (the experiment gate, both TPM refusals) — one flag opting out of
+///    that would make `tailnetd`'s startup errors inconsistent to gain a prefix match that the `%s`
+///    substitution has already cost;
+/// 3. explanatory paragraphs follow on later lines, since a reader of this message cannot go and
+///    read `feature/bird` to find out what was refused.
+///
+/// So a substring match on `--bird-socket is not supported on ` matches and is what the tests pin;
+/// a match anchored to the start of the line, or one expecting Go's full line including its GOOS,
+/// does not and cannot. What line 1 must *not* do is break Go's sentence up — nothing is
+/// interpolated into the middle of it, and the rejected path is echoed further down rather than
+/// inside it, so the sentence survives whole for the match that does work.
 ///
 /// One Go edge case ports with it: the empty path is **not** a refusal. Go's guard is
 /// `birdSocketPath != ""`, so `--bird-socket=""` means "no BIRD socket" exactly like omitting the
@@ -1341,9 +1393,11 @@ fn log_resume_decision(resuming: bool, have_authkey: bool, ephemeral: bool) {
 fn bird_socket_refusal(path: Option<&str>) -> Option<String> {
     // Go: `args.birdSocketPath != ""` — an unset *or* explicitly empty path is "no BIRD socket".
     let path = path.filter(|p| !p.is_empty())?;
+    // Go: `!wgengine.HookNewBird.IsSet()`. Never satisfied here, but routed through the same shape
+    // as the neighbouring refusals so Go's sentence has one home.
+    let reason = can_use_bird().err()?;
     Some(format!(
-        "error: --bird-socket is not supported on this platform or in this build of tailnetd \
-         (given {path:?}).\n\
+        "error: {reason}.\n\
          Go accepts this flag for a subnet router that hands its advertised routes to a BIRD BGP \
          daemon: it passes the socket path to its engine (`wgengine.Config.BIRDSocket`, built via \
          `wgengine.HookNewBird`), which enables BIRD's `tailscale` protocol while this node is a \
@@ -1355,10 +1409,27 @@ fn bird_socket_refusal(path: Option<&str>) -> Option<String> {
          --bird-socket would leave a \
          subnet router believing its BGP announcements track its primary-route status when nothing \
          was ever connected to BIRD.\n\
-         Drop the flag to start tailnetd. Routes are still advertised to the tailnet with `tnet up \
-         --advertise-routes=<prefix,...>`; driving BIRD from that state needs a BIRD hook in the \
-         engine, and is out of scope here until it has one."
+         Drop the flag (it was given {path:?}) to start tailnetd. Routes are still advertised to \
+         the tailnet with `tnet up --advertise-routes=<prefix,...>`; driving BIRD from that state \
+         needs a BIRD hook in the engine, and is out of scope here until it has one."
     ))
+}
+
+/// Whether a BIRD control socket could be wired up here — this fork's standing answer to Go's
+/// `wgengine.HookNewBird.IsSet()` (`cmd/tailscaled/tailscaled.go`,
+/// `feature/condregister/maybe_bird.go` @ `53a0d659afa51835dd7a9283873cca44261454f8`).
+///
+/// Always `Err`, and the `Err` carries Go's `log.Fatalf` sentence with its `%s` slot filled — see
+/// [`bird_socket_refusal`] for why that slot names the build rather than `runtime.GOOS`, and for
+/// what is and is not added around this sentence before an operator sees it. Upstream the hook is
+/// registered by `feature/bird` on `linux || darwin || freebsd || openbsd`; there is no BIRD code
+/// in this fork and no hook in the `tailscale-rs` engine to register one against, so the answer
+/// does not vary by platform and takes no arguments.
+///
+/// Separate from the message so Go's string is one testable value, the way
+/// [`can_encrypt_state`] and [`can_use_hardware_attestation`] are.
+fn can_use_bird() -> Result<(), String> {
+    Err("--bird-socket is not supported on this platform or in this build of tailnetd".to_string())
 }
 
 /// This host's OS in Go's `runtime.GOOS` spelling, so a message ported from Go names the platform
@@ -1866,8 +1937,8 @@ mod tests {
     // is linked in. This fork is permanently in that case, so the things worth pinning are: the
     // flag PARSES (a Go-shaped command line must reach the refusal, not clap's "unexpected
     // argument"), an omitted or empty path is NOT a refusal (Go's guard is `birdSocketPath != ""`),
-    // a real path IS refused with a message that says why, and the refusal opens with Go's own
-    // sentence while deliberately declining Go's `%s`.
+    // a real path IS refused with a message that says why, and the refusal carries Go's own
+    // sentence whole while deliberately declining Go's `%s`.
 
     #[test]
     fn bird_socket_flag_parses_rather_than_being_an_unknown_argument() {
@@ -1919,7 +1990,8 @@ mod tests {
             message.starts_with("error: --bird-socket is not supported on "),
             "keeps Go's refusal sentence, `on` and all; got {message:?}"
         );
-        // Echoes the rejected path.
+        // Echoes the rejected path — on a later line, see
+        // `bird_socket_refusal_keeps_gos_sentence_whole_on_the_first_line`.
         assert!(
             message.contains("/run/bird.ctl"),
             "names the path it was given; got {message:?}"
@@ -1933,6 +2005,51 @@ mod tests {
         assert!(
             message.contains("--advertise-routes"),
             "points at the route-advertising path that does work; got {message:?}"
+        );
+    }
+
+    /// Go's whole output here is one bare line: `log.SetFlags(0)` drops the date/time prefix and
+    /// `log.Fatalf` writes `--bird-socket is not supported on linux`. This fork wraps that sentence
+    /// — `error: ` in front and a full stop behind, which is how every fatal refusal on this
+    /// binary's stderr reads — and follows it with explanation. What it must never do is break the
+    /// sentence itself up: an earlier revision spliced `(given "/run/bird.ctl")` into the middle of
+    /// line 1, between Go's words and their full stop, which left the ported string reading as a
+    /// prefix rather than as Go's sentence. Pinned here so the wrapping stays exactly what the doc
+    /// comment on [`bird_socket_refusal`] discloses, and the path an operator was given stays off
+    /// Go's line.
+    #[test]
+    fn bird_socket_refusal_keeps_gos_sentence_whole_on_the_first_line() {
+        let message =
+            bird_socket_refusal(Some("/run/bird.ctl")).expect("a non-empty path must be refused");
+        let first_line = message
+            .lines()
+            .next()
+            .expect("the message has a first line");
+
+        // Go's sentence, `%s` slot aside, with nothing but the file-wide `error: ` and a full stop
+        // around it — and, crucially, nothing inside it.
+        let go_sentence = can_use_bird().expect_err("this fork never has a BIRD hook");
+        assert_eq!(
+            first_line,
+            format!("error: {go_sentence}."),
+            "line 1 is Go's sentence and the disclosed wrapping, nothing else; got {first_line:?}"
+        );
+
+        // The path is still reported to the operator, just not from inside Go's sentence.
+        assert!(
+            !first_line.contains("/run/bird.ctl"),
+            "the rejected path must not be spliced into Go's sentence; got {first_line:?}"
+        );
+        assert!(
+            message.lines().skip(1).any(|l| l.contains("/run/bird.ctl")),
+            "the rejected path must still be named further down; got {message:?}"
+        );
+
+        // The substring match the doc comment promises an operator or a runbook — this is the one
+        // that works, and it works because the sentence is unbroken.
+        assert!(
+            message.contains("--bird-socket is not supported on "),
+            "Go's wording must be greppable as one run of text; got {message:?}"
         );
     }
 
