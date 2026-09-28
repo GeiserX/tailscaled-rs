@@ -25,6 +25,14 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.65.1](https://github.com/GeiserX/tailscaled-rs/compare/v0.65.0...v0.65.1) (2026-09-28)
+
+
+### Bug Fixes
+
+* **ipn:** refuse a bad --advertise-tags in Go's words, not our own ([#538](https://github.com/GeiserX/tailscaled-rs/issues/538)) ([a38687b](https://github.com/GeiserX/tailscaled-rs/commit/a38687b3ec6938d0bbef5638aea6312d5666dcd6))
+* **login:** drop an unfinished login's prefs, list a profile once it logs in ([#540](https://github.com/GeiserX/tailscaled-rs/issues/540)) ([2e53d95](https://github.com/GeiserX/tailscaled-rs/commit/2e53d95c899e250adfecde7beb98e9458fb97363))
+
 ## [0.65.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.64.0...v0.65.0) (2026-09-28)
 
 
