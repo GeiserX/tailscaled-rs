@@ -1330,3 +1330,248 @@ async fn a_policy_masked_watch_front_loads_the_snapshot_and_is_pushed_on_reload(
 
     harness.shutdown_and_verify().await;
 }
+
+/// The `initial_status` mask bit (Go `ipn.NotifyInitialStatus`, `1 << 14`) end to end over the real
+/// socket. Before it, a watcher that wanted a snapshot and a stream opened a second connection for
+/// `status` and could not tell which of the two had seen a transition first.
+///
+/// Pinned here: the snapshot is the FIRST frame of the session, ahead of the other daemon-built
+/// front-loads; it is the same report the `status` verb answers with; it is sent once and never
+/// again; and a status-only watch is sent nothing else.
+///
+/// Honest scope. The harness backend never comes up, so the report is a down node's — no netmap,
+/// so no peers — which is also what `status` reports for it. Peers on a `Running` node cannot be
+/// exercised without an engine and a control server; they come from the same `Backend::status` call
+/// by construction.
+#[tokio::test]
+async fn an_initial_status_watch_front_loads_the_status_report_once() {
+    let harness = Harness::start().await;
+
+    let Response::Status(one_shot) = harness.round_trip(r#"{"cmd":"status"}"#).await else {
+        panic!("the status verb must answer with a status report");
+    };
+
+    // Status-only: nothing but the snapshot may arrive, and nothing after it while the node is idle.
+    let stream = UnixStream::connect(&harness.socket_path)
+        .await
+        .expect("CLI connect to LocalAPI socket for a status watch");
+    let (read_half, mut write_half) = stream.into_split();
+    write_half
+        .write_all(b"{\"cmd\":\"watch\",\"initial_status\":true}\n")
+        .await
+        .expect("write masked watch request");
+    write_half.flush().await.expect("flush watch request");
+    let mut reader = BufReader::new(read_half);
+
+    let first = try_read_watch_status(&mut reader, Duration::from_secs(5))
+        .await
+        .expect("an initial_status watch must send its snapshot immediately");
+    let Response::Notify(first) = first else {
+        panic!("a masked watch streams Notify frames, got {first:?}");
+    };
+    assert_eq!(
+        first.initial_status.as_deref(),
+        Some(&one_shot),
+        "the snapshot must be the very report the `status` verb answers with, so watch and status \
+         cannot drift"
+    );
+    assert!(
+        first.state.is_none()
+            && first.net_map.is_none()
+            && first.prefs.is_none()
+            && first.policy.is_none()
+            && first.suggested_exit_node.is_none()
+            && first.session_id.is_none(),
+        "a status-only watch must not be sent fields it did not ask for: {first:?}"
+    );
+    assert!(
+        try_read_watch_status(&mut reader, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "the snapshot is sent once; an idle status-only watcher must stay quiet"
+    );
+    drop(write_half);
+    drop(reader);
+
+    // With every daemon-built bit set, the snapshot still leads, and no later frame repeats it.
+    let stream = UnixStream::connect(&harness.socket_path)
+        .await
+        .expect("CLI connect to LocalAPI socket for a combined watch");
+    let (read_half, mut write_half) = stream.into_split();
+    write_half
+        .write_all(b"{\"cmd\":\"watch\",\"prefs\":true,\"policy\":true,\"initial_status\":true}\n")
+        .await
+        .expect("write masked watch request");
+    write_half.flush().await.expect("flush watch request");
+    let mut reader = BufReader::new(read_half);
+
+    let mut frames = Vec::new();
+    while let Some(resp) = try_read_watch_status(&mut reader, Duration::from_millis(500)).await {
+        let Response::Notify(view) = resp else {
+            panic!("a masked watch streams Notify frames, got {resp:?}");
+        };
+        frames.push(view);
+    }
+    // Not an exact frame count: the policy tick channel is process-global, so a `syspolicy reload`
+    // in a test running alongside this one may legitimately push an extra policy frame.
+    assert_eq!(
+        frames.first().and_then(|f| f.initial_status.as_deref()),
+        Some(&one_shot),
+        "the status snapshot must be the session's first frame: {frames:?}"
+    );
+    assert!(
+        frames[1..].iter().all(|f| f.initial_status.is_none()),
+        "no frame after the first may carry the snapshot again: {frames:?}"
+    );
+    assert!(
+        frames[1..].iter().any(|f| f.prefs.is_some())
+            && frames[1..].iter().any(|f| f.policy.is_some()),
+        "the prefs and policy front-loads follow the snapshot: {frames:?}"
+    );
+
+    // With `initial_state` too, the snapshot is still the first frame written, so the session id
+    // rides it rather than a frame of its own.
+    let stream = UnixStream::connect(&harness.socket_path)
+        .await
+        .expect("CLI connect to LocalAPI socket for a session watch");
+    let (read_half, mut write_half) = stream.into_split();
+    write_half
+        .write_all(b"{\"cmd\":\"watch\",\"initial_state\":true,\"initial_status\":true}\n")
+        .await
+        .expect("write masked watch request");
+    write_half.flush().await.expect("flush watch request");
+    let mut reader = BufReader::new(read_half);
+    let Some(Response::Notify(first)) =
+        try_read_watch_status(&mut reader, Duration::from_secs(5)).await
+    else {
+        panic!("an initial_state + initial_status watch must send a Notify frame immediately");
+    };
+    assert!(
+        first.initial_status.is_some() && first.session_id.is_some(),
+        "the session id must ride the status snapshot, the session's first frame: {first:?}"
+    );
+
+    harness.shutdown_and_verify().await;
+}
+
+/// Open a masked watch with `request` (one JSON line) and return the still-open write half plus the
+/// reader. The write half must be held for the watch to stay open.
+async fn open_masked_watch(
+    harness: &Harness,
+    request: &[u8],
+) -> (
+    tokio::net::unix::OwnedWriteHalf,
+    BufReader<tokio::net::unix::OwnedReadHalf>,
+) {
+    let stream = UnixStream::connect(&harness.socket_path)
+        .await
+        .expect("CLI connect to LocalAPI socket for a masked watch");
+    let (read_half, mut write_half) = stream.into_split();
+    write_half
+        .write_all(request)
+        .await
+        .expect("write masked watch request");
+    write_half.flush().await.expect("flush watch request");
+    (write_half, BufReader::new(read_half))
+}
+
+/// Read one `Notify` frame within a bounded wait, so a regression fails instead of hanging.
+async fn read_notify(
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    what: &str,
+) -> tailscaled_rs::localapi::NotifyView {
+    match try_read_watch_status(reader, Duration::from_secs(5)).await {
+        Some(Response::Notify(view)) => view,
+        Some(other) => panic!("a masked watch streams Notify frames, got {other:?}"),
+        None => panic!("no frame arrived: {what}"),
+    }
+}
+
+/// The identity fields end to end over the real socket (Go `WatchNotificationsAs` + `sendToLocked`):
+/// an `initial_state` watch gets a session id on its first frame and never again, every frame states
+/// the daemon's version, and a second connection gets a different id.
+///
+/// The device-less daemon is the case that matters: the engine has no initial state to send, and Go's
+/// foreground `serve` reads exactly one frame for its id, so the id must arrive without an `up`.
+#[tokio::test]
+async fn an_initial_state_watch_is_given_a_session_id_once_and_a_version_always() {
+    let harness = Harness::start().await;
+    let Response::Version { version } = harness.round_trip(r#"{"cmd":"version"}"#).await else {
+        panic!("the version verb replies with a version");
+    };
+
+    // (1) `initial_state` alone on a device-less daemon: the first frame carries only identity.
+    let (_w1, mut r1) =
+        open_masked_watch(&harness, b"{\"cmd\":\"watch\",\"initial_state\":true}\n").await;
+    let first = read_notify(
+        &mut r1,
+        "an initial_state watch must send its session id immediately",
+    )
+    .await;
+    let id1 = first
+        .session_id
+        .clone()
+        .expect("the first frame of an initial_state watch carries the session id");
+    assert_eq!(id1.len(), 16, "Go's rands.HexString(16) shape, got {id1:?}");
+    assert_eq!(
+        first.version.as_deref(),
+        Some(version.as_str()),
+        "the frame names the same version `tnet version --daemon` reports"
+    );
+
+    // (2) A second connection is a different session.
+    let (_w2, mut r2) =
+        open_masked_watch(&harness, b"{\"cmd\":\"watch\",\"initial_state\":true}\n").await;
+    let id2 = read_notify(
+        &mut r2,
+        "a second initial_state watch must get its own session id",
+    )
+    .await
+    .session_id
+    .expect("the second connection's first frame carries a session id");
+    assert_ne!(
+        id1, id2,
+        "a session id must not be reused across connections"
+    );
+
+    // (3) With a prefs front-load the id rides that first real frame, and the next frame — pushed by
+    // a `down`, which persists prefs — carries the version but no id. Prefs, not policy: the prefs
+    // tick belongs to this harness's backend, while a policy reload is process-global and would push
+    // frames into the other policy watch test running alongside this one.
+    let (_w3, mut r3) = open_masked_watch(
+        &harness,
+        b"{\"cmd\":\"watch\",\"initial_state\":true,\"prefs\":true}\n",
+    )
+    .await;
+    let snapshot = read_notify(&mut r3, "the prefs front-load").await;
+    assert!(
+        snapshot.prefs.is_some(),
+        "the first frame is the prefs snapshot: {snapshot:?}"
+    );
+    let id3 = snapshot
+        .session_id
+        .expect("the id rides the first frame written, whichever feed produced it");
+    assert!(id3 != id1 && id3 != id2);
+    let Response::Ok { .. } = harness.round_trip(r#"{"cmd":"down"}"#).await else {
+        panic!("down on an offline node replies Ok");
+    };
+    let pushed = read_notify(
+        &mut r3,
+        "a down persists prefs and pushes a fresh prefs frame",
+    )
+    .await;
+    assert!(
+        pushed.prefs.is_some(),
+        "the pushed frame is prefs: {pushed:?}"
+    );
+    assert_eq!(pushed.session_id, None, "no later frame repeats the id");
+    assert_eq!(pushed.version.as_deref(), Some(version.as_str()));
+
+    // (4) Without `initial_state` there is no id, as in Go — but the version is still there.
+    let (_w4, mut r4) = open_masked_watch(&harness, b"{\"cmd\":\"watch\",\"prefs\":true}\n").await;
+    let prefs_only = read_notify(&mut r4, "the prefs front-load").await;
+    assert_eq!(prefs_only.session_id, None);
+    assert_eq!(prefs_only.version.as_deref(), Some(version.as_str()));
+
+    harness.shutdown_and_verify().await;
+}
