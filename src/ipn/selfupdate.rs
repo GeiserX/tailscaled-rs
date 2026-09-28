@@ -135,29 +135,43 @@ pub fn can_auto_update() -> bool {
     auto_update_refusal().is_none()
 }
 
-/// Go `checkAutoUpdatePrefsLocked` (`ipn/ipnlocal/local.go`), the fifth child of `checkPrefsLocked`:
+/// The way out of an auto-update refusal, spelled for the ingress that is refusing — the `remedy`
+/// argument of [`check_auto_update_pref`]. An operator reads exactly one sentence, so it has to name
+/// the fix that applies to *them*: `tnet set --no-auto-update` is the answer for a command, and it is
+/// noise at boot, where there is no running daemon to accept it.
+pub const REMEDY_CLI: &str = "Decline it (`--no-auto-update`) or leave it unstated";
+
+/// [`REMEDY_CLI`]'s counterpart for a declarative config file.
+pub const REMEDY_CONFIG: &str =
+    "Decline it (`\"AutoUpdate\": {\"Apply\": false}`) or omit the `AutoUpdate` key";
+
+/// Go `checkAutoUpdatePrefsLocked` (`ipn/ipnlocal/local.go`), a child of `checkPrefsLocked`:
 /// refuse an auto-update **opt-in** that the node could never honour. `Some(message)` = refuse.
 ///
 /// `apply` is the prospective [`AutoUpdate.Apply`](crate::prefs::Prefs::auto_update_apply) tri-state
 /// and `host_refusal` the answer from [`auto_update_refusal`] (passed in, so the rule is pure and a
 /// test can drive both host outcomes anywhere). Like Go, only `EqualBool(true)` is checked: an
 /// explicit decline and a never-stated preference are legal everywhere, because neither claims
-/// anything to the tailnet.
+/// anything to the tailnet. `remedy` closes the message with the withdrawal that works on the
+/// caller's own ingress — [`REMEDY_CLI`] or [`REMEDY_CONFIG`].
 ///
 /// The rule is not about this daemon's own appetite for updating itself — it is about what the pref
 /// *says*. `AutoUpdate.Apply` is not local state: the engine advertises it as `Hostinfo.AllowsUpdate`
 /// on registration and on every map request, which tells the tailnet admin that a remote update
 /// trigger for this node will be honoured. Accepting the claim from an installation that cannot
 /// replace its own binary is how an admin ends up believing a fleet is patched.
-pub fn check_auto_update_pref(apply: Option<bool>, host_refusal: Option<&str>) -> Option<String> {
+pub fn check_auto_update_pref(
+    apply: Option<bool>,
+    host_refusal: Option<&str>,
+    remedy: &str,
+) -> Option<String> {
     if apply != Some(true) {
         return None;
     }
     let reason = host_refusal?;
     Some(format!(
         "{reason}. Enabling auto-update would advertise `Hostinfo.AllowsUpdate` to the tailnet — a \
-         promise that a remote update trigger is honoured — which this node cannot keep. Decline it \
-         (`--no-auto-update`) or leave it unstated"
+         promise that a remote update trigger is honoured — which this node cannot keep. {remedy}"
     ))
 }
 
@@ -288,16 +302,19 @@ mod tests {
         // Go acts on `Apply.EqualBool(true)` alone: declining, and never stating a preference, are
         // legal on every installation — neither promises the tailnet anything.
         let cannot = "Auto-updates are not supported on this platform. …";
-        assert_eq!(check_auto_update_pref(None, Some(cannot)), None);
-        assert_eq!(check_auto_update_pref(Some(false), Some(cannot)), None);
+        assert_eq!(check_auto_update_pref(None, Some(cannot), REMEDY_CLI), None);
+        assert_eq!(
+            check_auto_update_pref(Some(false), Some(cannot), REMEDY_CLI),
+            None
+        );
         // And on a host that CAN update, the opt-in passes.
-        assert_eq!(check_auto_update_pref(Some(true), None), None);
+        assert_eq!(check_auto_update_pref(Some(true), None, REMEDY_CLI), None);
     }
 
     #[test]
     fn an_opt_in_on_an_installation_that_cannot_update_is_refused() {
         let cannot = auto_update_refusal_for(None, None, "macos/aarch64").unwrap();
-        let err = check_auto_update_pref(Some(true), Some(&cannot))
+        let err = check_auto_update_pref(Some(true), Some(&cannot), REMEDY_CLI)
             .expect("opting in on a node that can never apply an update must be refused");
         // The refusal carries the host's reason AND why the pref is not a local preference.
         assert!(
@@ -306,6 +323,31 @@ mod tests {
         );
         assert!(err.contains("Hostinfo.AllowsUpdate"), "{err}");
         assert!(err.contains("--no-auto-update"), "{err}");
+    }
+
+    #[test]
+    fn the_refusal_names_the_withdrawal_that_works_on_the_caller_s_ingress() {
+        // One sentence reaches the operator, and `tnet set --no-auto-update` is not a thing a
+        // `--config` daemon refusing at boot can be told — there is no daemon up yet to accept it.
+        // So the remedy travels with the caller rather than being baked into the rule.
+        let cannot = auto_update_refusal_for(None, None, "macos/aarch64").unwrap();
+        let cli = check_auto_update_pref(Some(true), Some(&cannot), REMEDY_CLI).unwrap();
+        assert!(cli.ends_with(REMEDY_CLI), "{cli}");
+        assert!(
+            !cli.contains("AutoUpdate"),
+            "the CLI answer is a flag: {cli}"
+        );
+
+        let conf = check_auto_update_pref(Some(true), Some(&cannot), REMEDY_CONFIG).unwrap();
+        assert!(conf.ends_with(REMEDY_CONFIG), "{conf}");
+        assert!(
+            conf.contains(r#""AutoUpdate": {"Apply": false}"#),
+            "a config-file refusal must name the config-file fix: {conf}"
+        );
+        assert!(
+            !conf.contains("--no-auto-update"),
+            "and not a flag no config file can carry: {conf}"
+        );
     }
 
     #[test]
