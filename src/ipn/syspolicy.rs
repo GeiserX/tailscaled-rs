@@ -2239,6 +2239,369 @@ mod tests {
         }
     }
 
+    // -------------------------------------------------------------------------------------------
+    // Every registered key has a reader (Go `implicitDefinitions` <-> this build's consumers).
+    // -------------------------------------------------------------------------------------------
+
+    /// A key whose effect is produced somewhere other than [`apply_settings_to_prefs`], named
+    /// together with the production code that gives it that effect.
+    ///
+    /// `sees` **calls** that code over a resolved policy document and answers whether it observed
+    /// the administrator's value, rather than restating what it would say. The test runs it twice —
+    /// once over a document carrying the key, once over the same document with the key gone — and
+    /// requires the two answers to differ. One-sided is not enough: a reader that ignores the
+    /// administrator's value and always answers the same is exactly the failure this test exists to
+    /// catch, and it would pass a positive assertion.
+    ///
+    /// `ExitNode.AllowOverride` is the row this exists for. It is registered, it moves no pref, and
+    /// the only thing that makes it mean anything is the edit gate reading it — so that row calls
+    /// the gate itself, and it needs `also_configured` to do it, because the gate only looks at the
+    /// override key once the policy has already pinned a node.
+    ///
+    /// Where the consumer reads the **process-global** registry and so cannot be called from a unit
+    /// test, `consumer` names the read rather than the refusal behind it, and the row proves that
+    /// read: `tailnetd`'s two TPM refusals live in a binary, and the always-on disconnect gate
+    /// resolves its keys inside `alwayson::check_disconnect_policy`. Both refusals are pure
+    /// decisions over already-resolved values and are tested next to themselves, in `ipn::alwayson`.
+    /// No row claims a call it does not make.
+    struct NamedReader {
+        /// The policy key, spelled as [`DEFINITIONS`] spells it.
+        key: &'static str,
+        /// What reads it — printed by the assertion, so a failure names the wiring that went away.
+        consumer: &'static str,
+        /// Other keys that must be configured before this one means anything, as the body of a JSON
+        /// object (no braces, no trailing comma). Empty for a key whose consumer reads it on its
+        /// own. These stay configured in the key-absent document, so the differential isolates the
+        /// key under test rather than the whole policy.
+        also_configured: &'static str,
+        /// Does that consumer see the value the document configures?
+        sees: fn(&PolicySource) -> bool,
+    }
+
+    /// Every key whose consumer is not the apply path. The apply path's own keys are deliberately
+    /// absent: [`apply_path_acts_on`] proves those by running it.
+    const NAMED_READERS: &[NamedReader] = &[
+        NamedReader {
+            key: PKEY_ALLOW_EXIT_NODE_OVERRIDE,
+            consumer: "the exit-node edit gate, exitnodepolicy::check_exit_node_edit",
+            // The gate's answer is "managed by policy" whatever this key says until a node is
+            // pinned, so the one-key document would make the row untestable — Go reads
+            // `AllowExitNodeOverride` only after `HasAnyOf(ExitNodeID, ExitNodeIP)` has said yes.
+            also_configured: r#""ExitNodeIP": "100.64.0.9""#,
+            sees: |s| {
+                let policy = exit_node_policy_in(&s.settings);
+                // An operator naming a *different* node: refused outright without the key, and the
+                // granted exemption with it.
+                matches!(
+                    crate::ipn::exitnodepolicy::check_exit_node_edit(
+                        Some(Some("100.64.0.3")),
+                        &policy
+                    ),
+                    Ok(crate::ipn::exitnodepolicy::ExitNodeEdit::Override)
+                )
+            },
+        },
+        NamedReader {
+            key: PKEY_ALWAYS_ON_OVERRIDE_WITH_REASON,
+            consumer: "the always-on disconnect gate's read, always_on_keys",
+            also_configured: "",
+            sees: |s| always_on_keys_in(&s.settings).override_with_reason == Some(true),
+        },
+        NamedReader {
+            key: PKEY_RECONNECT_AFTER,
+            consumer: "the reconnect timer's arming read, reconnect_after",
+            also_configured: "",
+            sees: |s| reconnect_after_in(&s.settings).is_some(),
+        },
+        NamedReader {
+            key: PKEY_ENCRYPT_STATE,
+            consumer: "tailnetd's state-at-rest refusal, through the get_boolean read",
+            also_configured: "",
+            sees: |s| boolean_setting(&s.settings, PKEY_ENCRYPT_STATE, false),
+        },
+        NamedReader {
+            key: PKEY_HARDWARE_ATTESTATION,
+            consumer: "tailnetd's hardware-attestation refusal, through the get_boolean read",
+            also_configured: "",
+            sees: |s| boolean_setting(&s.settings, PKEY_HARDWARE_ATTESTATION, false),
+        },
+        NamedReader {
+            key: PKEY_ALLOW_TAILSCALED_RESTART,
+            consumer: "the LocalAPI shutdown verdict, crate::server::shutdown_verdict",
+            also_configured: "",
+            // Chained exactly as the server chains them: the policy read feeds the verdict, and a
+            // caller who may already write is refused until the administrator says otherwise.
+            sees: |s| {
+                crate::server::shutdown_verdict(
+                    crate::auth::Access::ReadWrite,
+                    boolean_setting(&s.settings, PKEY_ALLOW_TAILSCALED_RESTART, false),
+                )
+                .is_ok()
+            },
+        },
+        NamedReader {
+            key: PKEY_AUTH_KEY,
+            consumer: "the registration path, auth_key",
+            also_configured: "",
+            sees: |s| {
+                let gate = AuthKeyGate {
+                    running: false,
+                    needs_login: false,
+                    enrolled: false,
+                    config_in_use: false,
+                };
+                matches!(
+                    auth_key_in(std::slice::from_ref(s), gate),
+                    AuthKeyDecision::Use(_)
+                )
+            },
+        },
+        NamedReader {
+            key: PKEY_ALLOWED_SUGGESTED_EXIT_NODES,
+            consumer: "the exit-node suggestion filter, allowed_suggested_exit_nodes",
+            also_configured: "",
+            sees: |s| allowed_suggestions_in(std::slice::from_ref(s)).is_some(),
+        },
+    ];
+
+    /// The keys this daemon defines and knowingly does not act on, each with its reason.
+    ///
+    /// Defining them is not idle: [`validate`] refuses a file naming a key that is not defined,
+    /// so a fleet-wide payload that also carries the GUI clients' keys would otherwise be rejected
+    /// whole on this host, and `syspolicy list` reports them, which is how an administrator sees
+    /// they arrived. Acting on them is what this daemon has no surface for. One line each, so the
+    /// list stays a set of decisions rather than a dumping ground.
+    const REGISTERED_BUT_NOT_READ: &[(&str, &str)] = &[
+        (
+            "AdminConsole",
+            "shows or hides a GUI menu item; this daemon has no UI",
+        ),
+        (
+            "ApplyUpdates",
+            "shows or hides a GUI menu item; the update PREFERENCE is InstallUpdates, which is \
+             applied",
+        ),
+        (
+            "DeviceSerialNumber",
+            "overrides the serial a posture-reporting client sends; this daemon sends no posture \
+             identity",
+        ),
+        (
+            "EnableDNSRegistration",
+            "registers the tailnet interface with a Windows resolver; this daemon manages no host \
+             resolver registrations",
+        ),
+        (
+            "ExitNodesPicker",
+            "shows or hides a GUI menu item; this daemon has no UI",
+        ),
+        (
+            "FlushDNSOnSessionUnlock",
+            "a Windows session-unlock hook; a system daemon has no user session to unlock",
+        ),
+        (
+            "KeyExpirationNotice",
+            "how long before key expiry a GUI warns; this daemon has no UI to warn in",
+        ),
+        (
+            "LogSCMInteractions",
+            "traces Windows Service Control Manager calls; not how this daemon is supervised",
+        ),
+        (
+            "LogTarget",
+            "an alternate log-upload endpoint; this daemon uploads no logs",
+        ),
+        (
+            "MachineCertificateSubject",
+            "selects a machine certificate to sign control requests with; this daemon signs none",
+        ),
+        (
+            "ManagedByCaption",
+            "GUI text naming the administrator; this daemon has no UI",
+        ),
+        (
+            "ManagedByOrganizationName",
+            "GUI text naming the organization; this daemon has no UI",
+        ),
+        ("ManagedByURL", "a GUI support link; this daemon has no UI"),
+        (
+            "NetworkDevices",
+            "shows or hides a GUI menu item; this daemon has no UI",
+        ),
+        (
+            "OnboardingFlow",
+            "shows or hides a GUI first-run flow; this daemon has no UI",
+        ),
+        (
+            // A recorded GAP, not parity: upstream carries this in `preferencePolicies` and moves
+            // the pref with it.
+            "PostureChecking",
+            "upstream applies this to the posture-checking pref; this build answers no posture \
+             pull at all (c2n, engine ask #43), so applying it would advertise an intent nothing \
+             here serves — the pref is left to the operator until the channel exists",
+        ),
+        (
+            "PreferencesMenu",
+            "shows or hides a GUI menu item; this daemon has no UI",
+        ),
+        (
+            "ResetToDefaults",
+            "shows or hides a GUI menu item; this daemon has no UI",
+        ),
+        (
+            "RunExitNode",
+            "shows or hides a GUI menu item; the exit-node PREFERENCE is AdvertiseExitNode, which \
+             is applied",
+        ),
+        (
+            "SuggestedExitNode",
+            "shows or hides a GUI menu item; this daemon has no UI",
+        ),
+        (
+            "Tailnet",
+            "preselects the tailnet a GUI sign-in offers; this daemon signs in with an auth key \
+             and a control URL, with nothing to preselect",
+        ),
+        (
+            "TestMenu",
+            "shows or hides a GUI menu item; this daemon has no UI",
+        ),
+        (
+            "UpdateMenu",
+            "shows or hides a GUI menu item; this daemon has no UI",
+        ),
+    ];
+
+    /// A configured value of the right type for `ty`, as the JSON a policy file would carry, that a
+    /// consumer can tell apart from "not configured".
+    ///
+    /// More than one where the type has no single such value: a `PreferenceOption` resolves against
+    /// the pref's CURRENT value, so whichever of `always`/`never` already matches the default prefs
+    /// changes nothing and would look like a key nothing reads.
+    fn sample_values(ty: ValueType) -> &'static [&'static str] {
+        match ty {
+            ValueType::Boolean => &["true"],
+            // Parses as an address for ExitNodeIP and is an ordinary opaque string everywhere else.
+            ValueType::String => &["\"100.64.0.9\""],
+            ValueType::StringList => &["[\"100.64.0.9\"]"],
+            ValueType::PreferenceOption => &["\"always\"", "\"never\""],
+            ValueType::Visibility => &["\"hide\"", "\"show\""],
+            ValueType::Duration => &["\"30m\""],
+        }
+    }
+
+    /// Does the apply path give `key` an effect — a pref it writes, or a refusal it reports?
+    ///
+    /// Runs the production [`apply_settings_to_prefs`] over a one-key document, exactly as the
+    /// daemon's reconcile does, and asks what came back.
+    fn apply_path_acts_on(key: &str, json_value: &str) -> bool {
+        let mut prefs = Prefs::default();
+        let applied = apply(&one_key_document(key, json_value), &mut prefs);
+        !applied.is_quiet()
+    }
+
+    /// A policy document configuring exactly `key`.
+    fn one_key_document(key: &str, json_value: &str) -> String {
+        format!("{{{}: {json_value}}}", quoted(key))
+    }
+
+    /// The document a [`NamedReader`] is read over: its `also_configured` context plus the key
+    /// under test, or — when `configured` is false — the same context with the key left out.
+    fn reader_document(reader: &NamedReader, json_value: &str, configured: bool) -> String {
+        let key = match configured {
+            true => format!("{}: {json_value}", quoted(reader.key)),
+            false => String::new(),
+        };
+        let body = match (reader.also_configured, key.as_str()) {
+            ("", key) => key.to_string(),
+            (context, "") => context.to_string(),
+            (context, key) => format!("{context}, {key}"),
+        };
+        format!("{{{body}}}")
+    }
+
+    /// The defect class the `ExitNode.AllowOverride` report named: a key can be added to
+    /// [`DEFINITIONS`] — which is all it takes for a file naming it to load and for `syspolicy
+    /// list` to report it — and then be read by nothing at all, so an administrator's setting is
+    /// rendered back to them while changing nothing.
+    ///
+    /// Every registered key must therefore land in one of three places, and the first two are
+    /// proved by calling the code that does the reading:
+    ///
+    /// 1. the apply path acts on it — a pref it writes or a refusal it reports
+    ///    ([`apply_path_acts_on`]),
+    /// 2. a consumer outside the apply path reads it ([`NAMED_READERS`], whose `sees` calls it and
+    ///    must answer differently with the key configured and without it),
+    /// 3. it is listed in [`REGISTERED_BUT_NOT_READ`] with the reason, so "this daemon does not act
+    ///    on it" is a recorded decision rather than an oversight.
+    #[test]
+    fn every_registered_policy_key_is_read_or_recorded_as_unread() {
+        for def in DEFINITIONS {
+            let applied = sample_values(def.ty)
+                .iter()
+                .any(|value| apply_path_acts_on(def.key, value));
+            let reader = NAMED_READERS.iter().find(|r| r.key == def.key);
+            let unread = REGISTERED_BUT_NOT_READ.iter().find(|(k, _)| *k == def.key);
+
+            if let Some(reader) = reader {
+                // Every key with a named reader is of a type with one telling value; a
+                // `PreferenceOption` (the two-sample case) is applied to a pref, not read here.
+                let value = sample_values(def.ty)[0];
+                let configured = resolve_source(&reader_document(reader, value, true))
+                    .expect("a document of the registered type must load");
+                assert!(
+                    (reader.sees)(&configured),
+                    "{} is recorded as read by {}, but that consumer does not see it — the wiring \
+                     went away and the key is now registered, reported and inert",
+                    def.key,
+                    reader.consumer
+                );
+                let absent = resolve_source(&reader_document(reader, value, false))
+                    .expect("the same document without the key must load");
+                assert!(
+                    !(reader.sees)(&absent),
+                    "{} is recorded as read by {}, but that consumer answers the same with the key \
+                     absent — it is not reading the administrator's value",
+                    def.key,
+                    reader.consumer
+                );
+            }
+
+            assert!(
+                applied || reader.is_some() || unread.is_some(),
+                "{} is a registered policy setting that the apply path does not act on, that no \
+                 named consumer reads, and that REGISTERED_BUT_NOT_READ does not account for: an \
+                 administrator who ships it gets a row in `syspolicy list` and no effect. Wire it \
+                 up, refuse it in PolicyApplication::refused, or record why it does nothing.",
+                def.key
+            );
+
+            if let Some((key, reason)) = unread {
+                assert!(
+                    !applied && reader.is_none(),
+                    "{key} is recorded as unread ({reason}) but something does read it; drop the \
+                     row"
+                );
+            }
+        }
+    }
+
+    /// The reverse direction: neither list may name a key that is not a registered definition. A
+    /// stale row would otherwise sit there accounting for a key nobody can configure, and — for a
+    /// [`NamedReader`] — never run its `sees` against anything.
+    #[test]
+    fn the_key_accounting_names_no_setting_that_is_not_defined() {
+        for key in NAMED_READERS
+            .iter()
+            .map(|r| r.key)
+            .chain(REGISTERED_BUT_NOT_READ.iter().map(|(k, _)| *k))
+        {
+            assert!(
+                definition_of(key).is_some(),
+                "{key} is accounted for but is not a registered policy setting"
+            );
+        }
+    }
     #[test]
     fn an_empty_policy_leaves_every_pref_alone() {
         let mut prefs = Prefs {

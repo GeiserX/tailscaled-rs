@@ -39,6 +39,42 @@ fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
+/// Whether Go's macOS root check fires on this host: macOS, not root. Go makes that check in `main`,
+/// before `createEngine` ever looks at the value, so on such a host every `--tun` that does not
+/// mention `userspace-networking` is refused with that one line instead of its own reason.
+fn go_root_check_fires_here() -> bool {
+    cfg!(target_os = "macos") && tailscaled_rs::tunflag::euid() != 0
+}
+
+/// On a host where Go's macOS root check fires, the refusal must be Go's line alone — bare on
+/// stderr, no `error:` prefix — and exit 1, the way `log.SetFlags(0)` + `log.Fatalf` print it.
+fn assert_gos_root_refusal(out: &Output) {
+    assert_eq!(out.status.code(), Some(1), "stderr:\n{}", stderr(out));
+    assert_eq!(
+        stderr(out),
+        format!("{}\n", tailscaled_rs::tunflag::DARWIN_ROOT_REFUSAL),
+        "a non-root macOS host should get Go's single root line and nothing else"
+    );
+}
+
+/// Go: `if runtime.GOOS == "darwin" && os.Getuid() != 0 && !strings.Contains(args.tunname,
+/// "userspace-networking") && !args.cleanUp { log.SetFlags(0); log.Fatalf("tailscaled requires
+/// root; use sudo tailscaled (or use --tun=userspace-networking)") }`. Only observable on a non-root
+/// macOS host; everywhere else the device name must NOT be met with that line.
+#[test]
+fn a_non_root_macos_host_gets_gos_root_line() {
+    let out = tailnetd(&["--tun=utun"]);
+    if go_root_check_fires_here() {
+        assert_gos_root_refusal(&out);
+    } else {
+        assert!(
+            !stderr(&out).contains(tailscaled_rs::tunflag::DARWIN_ROOT_REFUSAL),
+            "only a non-root macOS host is refused on privilege before the engine; got:\n{}",
+            stderr(&out)
+        );
+    }
+}
+
 /// The flag is on `tailnetd`'s own surface (clap's `--help`), so a command line copied from a unit
 /// file reaches the daemon instead of "unexpected argument".
 #[test]
@@ -95,6 +131,9 @@ fn a_fallback_list_lands_on_userspace_networking() {
 #[test]
 fn a_device_name_without_the_tun_feature_refuses_by_name() {
     let out = tailnetd(&["--tun=tailscale0"]);
+    if go_root_check_fires_here() {
+        return assert_gos_root_refusal(&out);
+    }
     assert_eq!(
         out.status.code(),
         Some(1),
@@ -127,6 +166,9 @@ fn a_device_name_without_the_tun_feature_refuses_by_name() {
 #[test]
 fn tap_is_refused_with_a_named_reason() {
     let out = tailnetd(&["--tun=tap:tap0:br0"]);
+    if go_root_check_fires_here() {
+        return assert_gos_root_refusal(&out);
+    }
     assert_eq!(
         out.status.code(),
         Some(1),
@@ -150,6 +192,10 @@ fn tap_is_refused_with_a_named_reason() {
 #[test]
 fn an_empty_tun_value_is_gos_error() {
     let out = tailnetd(&["--tun="]);
+    // `""` does not contain `userspace-networking`, and Go's root check runs before `createEngine`.
+    if go_root_check_fires_here() {
+        return assert_gos_root_refusal(&out);
+    }
     assert_eq!(
         out.status.code(),
         Some(1),
