@@ -143,7 +143,9 @@ pub struct ConfigVAlpha {
     /// masked prefix — [`Config::apply_to_prefs`] refuses one with host bits set (`192.0.2.5/24`),
     /// as Go's `ToPrefs` does — and the list is checked as a SET
     /// ([`crate::routes::calc_advertise_routes`]): a 4via6 prefix must decode, and a default route
-    /// must appear in both families or in neither (a lone `0.0.0.0/0` is a half exit node).
+    /// must appear in both families or in neither (a lone `0.0.0.0/0` is a half exit node). Those
+    /// last two are this fork's own rules on this path — Go keeps them in its CLI — so they are
+    /// refused in this module's words rather than in `ToPrefs`'.
     ///
     /// `Option`, not a bare `Vec`, because Go guards the whole block with `if c.AdvertiseRoutes !=
     /// nil` and an explicit `"AdvertiseRoutes": []` is a non-nil empty slice: it sets the pref to
@@ -200,6 +202,11 @@ pub struct ConfigVAlpha {
     /// (`ipn.AutoUpdatePrefs`) — self-update policy. Go applies the **whole struct** when the key is
     /// present (`AutoUpdateSet{ApplySet: true, CheckSet: true}`), so a missing inner key means that
     /// inner field's Go zero value, not the pref default — see [`AutoUpdatePrefs`].
+    ///
+    /// `Apply: true` is REFUSED (see [`Config::apply_to_prefs`]) on an installation that could never
+    /// replace its own binary, the same refusal `tnet set --auto-update` gets: the pref is advertised
+    /// to control as `Hostinfo.AllowsUpdate`, and a config file is no more entitled to make that
+    /// claim than an operator is. `Apply: false` and an absent `Apply` are accepted everywhere.
     pub auto_update: Option<AutoUpdatePrefs>,
     /// WARNED. Go `ServeConfigTemp` — an embedded serve config. Set via `tnet serve` in this fork, not
     /// the declarative config; parsed as opaque (`serde_json::Value`) because we never inspect it.
@@ -472,6 +479,27 @@ impl Config {
     /// file (trimmed) — Go's convention for keeping the secret out of the (often world-readable)
     /// config file itself.
     pub fn apply_to_prefs(&self, prefs: &mut Prefs) -> Result<Option<SecretString>> {
+        self.apply_to_prefs_gated(
+            prefs,
+            crate::ipn::selfupdate::auto_update_refusal().as_deref(),
+        )
+    }
+
+    /// [`apply_to_prefs`](Self::apply_to_prefs) with this installation's update provenance passed IN
+    /// rather than read from the running process — `Some(reason)` = this installation can never
+    /// replace its own binary, `None` = it can (Go `feature.CanAutoUpdate()`, decided here by
+    /// [`selfupdate::auto_update_refusal`](crate::ipn::selfupdate::auto_update_refusal)).
+    ///
+    /// Injected for the same reason [`crate::ipn`]'s `check_prefs_gated` injects its host gates: the
+    /// verdict is a property of the machine the code runs on — every Linux x86_64 CI runner answers
+    /// `None`, a macOS developer box answers `Some(..)` — so a test that let the production code read
+    /// it could only ever assert the branch its own host takes, and the refusal below would go
+    /// unexercised wherever CI happens to run.
+    fn apply_to_prefs_gated(
+        &self,
+        prefs: &mut Prefs,
+        host_refusal: Option<&str>,
+    ) -> Result<Option<SecretString>> {
         let c = &self.parsed;
 
         // VALIDATE every field-level value BEFORE mutating `prefs` (all-or-nothing). The daemon's
@@ -504,13 +532,21 @@ impl Config {
         // names an explicit `[]` is judged on the empty set it is about to write.
         //
         // Go's own config loader checks only the masking rule (`ipn/conf.go` `ToPrefs`); the set-level
-        // rules live in its CLI path. They are applied here as well because a declaratively-managed
-        // subnet router is exactly the deployment where nobody reads command output: a half-advertised
-        // default route would otherwise boot silently and leak with no operator on the other end.
-        // Same rules, same messages as `Backend::check_prefs`, so the declarative and interactive
-        // paths refuse the same configs. Every offender is collected (Go `errors.Join`) rather than
-        // only the first: a headless deploy should learn about all its bad routes in one boot, not one
-        // per restart.
+        // rules live in its CLI path (`netutil.CalcAdvertiseRoutes`, reached from `up`/`set`, the k8s
+        // operator and client/web — never from a config file). They are applied here as well because a
+        // declaratively-managed subnet router is exactly the deployment where nobody reads command
+        // output: a half-advertised default route would otherwise boot silently and leak with no
+        // operator on the other end. Same rules, same messages as `Backend::check_prefs`, so the
+        // declarative and interactive paths refuse the same configs. Every offender is collected (Go
+        // `errors.Join`) rather than only the first: a headless deploy should learn about all its bad
+        // routes in one boot, not one per restart.
+        //
+        // Which is why the refusal is reported in TWO blocks, by whose rule each reason is
+        // ([`crate::routes::RouteError::refused_by_go_config_path`]). Go's config-path refusals get
+        // Go's config-path wrapper, verbatim. The rules only this fork asks here get this module's own
+        // `config: ` wording, because telling an operator whose config Go loads that "parsing config to
+        // prefs" failed sends them to a Go message that has no such rule in it, and reads as a syntax
+        // error in a file that has none.
         let prospective_routes = match &c.advertise_routes {
             // Present, even as an explicit `[]`: this list REPLACES the persisted one, so it is the
             // list to judge — an empty one withdraws every route, which is a legal outcome.
@@ -520,16 +556,36 @@ impl Config {
             None => prefs.advertise_routes.clone(),
         };
         let prospective_advertise_exit = c.advertise_exit_node.unwrap_or(prefs.advertise_exit_node);
-        // Wrapped ONCE, in Go's words. Go's `ToPrefs` returns `errors.Join` of the bare route
-        // errors and its two callers (`initPrefsFromConfig`, `setConfigLocked`) put
-        // `error parsing config to prefs: %w` around the whole join. Prefixing every line with
-        // "config: " instead said the same thing once per bad route and in nobody's wording; the
-        // wrapper goes on the front of the joined block, so the lines below it are Go's verbatim.
-        if let Err(e) = crate::routes::validate_advertise_routes(
-            &prospective_routes,
-            prospective_advertise_exit,
-        ) {
-            bail!("error parsing config to prefs: {e}");
+        // Each block is wrapped ONCE. Go's `ToPrefs` returns `errors.Join` of the bare route errors
+        // and its two callers (`initPrefsFromConfig`, `setConfigLocked`) put
+        // `error parsing config to prefs: %w` around the whole join, so that wrapper goes on the front
+        // of the joined block and the lines below it are Go's verbatim. This fork's extra set-level
+        // rules get one wrapper of their own for the same reason — repeating a prefix per line says
+        // the same thing once per bad route. A config that trips both kinds reports both blocks, so a
+        // headless boot still learns everything wrong with it at once.
+        if let Err(errs) =
+            crate::routes::calc_advertise_routes(&prospective_routes, prospective_advertise_exit)
+        {
+            let (go_rules, our_rules): (Vec<_>, Vec<_>) =
+                errs.iter().partition(|e| e.refused_by_go_config_path());
+            let join = |group: Vec<&crate::routes::RouteError>| {
+                group
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            let mut blocks: Vec<String> = Vec::new();
+            if !go_rules.is_empty() {
+                blocks.push(format!("error parsing config to prefs: {}", join(go_rules)));
+            }
+            if !our_rules.is_empty() {
+                blocks.push(format!(
+                    "config: refusing the advertised route set: {}",
+                    join(our_rules)
+                ));
+            }
+            bail!("{}", blocks.join("\n"));
         }
         if let Some(exit) = &c.exit_node {
             // The engine's `ExitNodeSelector::FromStr` is infallible (a non-IP string → a Name that
@@ -547,6 +603,43 @@ impl Config {
                     "config: exitNode {exit:?} uses the auto: form, which this build does not support"
                 );
             }
+        }
+        // An auto-update OPT-IN this installation could never honour is refused here too, so the
+        // declarative ingress cannot make a claim the interactive one refuses. `AutoUpdate.Apply` is
+        // not local state: the engine advertises it as `Hostinfo.AllowsUpdate` at registration and on
+        // every map request, so a `--config` daemon on a host whose binary can never be replaced
+        // would otherwise tell the tailnet admin that a remote update trigger will be honoured —
+        // precisely the dishonest advertisement `Backend::begin_set` and `Backend::check_prefs`
+        // refuse to make. Same rule and same predicate as those two
+        // (`ipn::selfupdate::check_auto_update_pref`, Go `checkAutoUpdatePrefsLocked`), so every
+        // ingress to this pref answers alike; the closing sentence differs because the way out does
+        // (`REMEDY_CONFIG` — there is no daemon up at boot to accept `tnet set --no-auto-update`).
+        //
+        // Upstream does NOT check here — `initPrefsFromConfig` and `setConfigLocked`
+        // (`ipn/ipnlocal/local.go`) apply the config's prefs with `ApplyEdits` + `SetPrefs` and never
+        // reach `checkPrefsLocked`; only `Start`'s `opts.UpdatePrefs` and `EditPrefs` do. This is the
+        // same deliberate divergence the advertised-route rules above already make, for the same
+        // reason: a declaratively-managed node is exactly the deployment where nobody reads command
+        // output, so a claim nothing can keep would be made silently and forever.
+        //
+        // Only what the CONFIG declares is judged, never a pref already on disk: refusing a persisted
+        // opt-in here would stop the daemon booting, and `tnet set --no-auto-update` — the way to
+        // clear it — needs a running daemon. The write paths judge the resulting posture
+        // (`Backend::prospective_auto_update`); this one judges its own input.
+        //
+        // Placement inside this block, not its order within it, is what matters: like every rule
+        // above it this one bails on the first offender (`apply_to_prefs` is fail-fast, where
+        // `check_prefs` accumulates), so a config that is bad in two ways names whichever fault is
+        // checked first. What it guarantees is the all-or-nothing contract — not one pref is mutated
+        // when any of them is refused.
+        if let Some(au) = c.auto_update
+            && let Some(e) = crate::ipn::selfupdate::check_auto_update_pref(
+                au.apply,
+                host_refusal,
+                crate::ipn::selfupdate::REMEDY_CONFIG,
+            )
+        {
+            bail!("config: AutoUpdate.Apply: {e}");
         }
 
         // `Enabled` is special: Go ALWAYS masks `WantRunning` in from a config (`mp.WantRunning =
@@ -976,6 +1069,11 @@ mod tests {
         // The half-exit-node leak, from the path that most needs catching it: a declaratively managed
         // subnet router boots with nobody reading command output. `0.0.0.0/0` alone takes its clients'
         // v4 traffic while their v6 traffic leaves out their own link, and neither end can see it.
+        //
+        // This config LOADS in Go — `ToPrefs` checks only the masking rule, and the pairing rule sits
+        // in `netutil.CalcAdvertiseRoutes`, which no config path calls — so the refusal is this fork's
+        // and says so. Wearing Go's `error parsing config to prefs:` sentence would send an operator
+        // holding a config Go accepts to a Go function that has no such rule in it.
         let c = cfg(r#"{"version":"alpha0","AdvertiseRoutes":["0.0.0.0/0","192.0.2.0/24"]}"#);
         let mut p = Prefs::default();
         let before = p.clone();
@@ -985,8 +1083,8 @@ mod tests {
         };
         assert_eq!(
             e,
-            "error parsing config to prefs: 0.0.0.0/0 advertised without its IPv6 counterpart, \
-             please also advertise ::/0"
+            "config: refusing the advertised route set: 0.0.0.0/0 advertised without its IPv6 \
+             counterpart, please also advertise ::/0"
         );
         // All-or-nothing: the good route in the same list was not written either.
         assert_eq!(p.advertise_routes, before.advertise_routes);
@@ -1001,8 +1099,67 @@ mod tests {
         };
         assert_eq!(
             e6,
-            "error parsing config to prefs: ::/0 advertised without its IPv4 counterpart, please \
-             also advertise 0.0.0.0/0"
+            "config: refusing the advertised route set: ::/0 advertised without its IPv4 \
+             counterpart, please also advertise 0.0.0.0/0"
+        );
+    }
+
+    #[test]
+    fn only_gos_own_config_rules_are_refused_in_gos_config_words() {
+        // Go splits the route rules across two functions and puts only ONE of them on the config
+        // path: `ipn/conf.go` `ToPrefs` checks `route != route.Masked()`, and its callers wrap the
+        // join as `error parsing config to prefs: %w`. The pairing rule and the 4via6 validation live
+        // in `netutil.CalcAdvertiseRoutes`, which at v1.102.4 is reached from `up`, `set`, the k8s
+        // operator and client/web — never from a config file. This fork asks all of them here anyway,
+        // so the one thing that has to be right is WHOSE words each refusal is reported in.
+        let refuse = |json: &str| {
+            let mut p = Prefs::default();
+            match cfg(json).apply_to_prefs(&mut p) {
+                Ok(_) => panic!("expected {json} to be refused"),
+                Err(e) => e.to_string(),
+            }
+        };
+
+        // Go's rule → Go's wrapper, verbatim.
+        let masked = refuse(r#"{"version":"alpha0","AdvertiseRoutes":["192.0.2.5/24"]}"#);
+        assert_eq!(
+            masked,
+            "error parsing config to prefs: route 192.0.2.5/24 has non-address bits set; expected \
+             192.0.2.0/24"
+        );
+
+        // Not Go's rules → not Go's wrapper. Both of these configs load in Go.
+        for json in [
+            r#"{"version":"alpha0","AdvertiseRoutes":["0.0.0.0/0"]}"#,
+            r#"{"version":"alpha0","AdvertiseRoutes":["fd7a:115c:a1e0:b1a::/64"]}"#,
+        ] {
+            let e = refuse(json);
+            assert!(
+                !e.contains("error parsing config to prefs"),
+                "{json} is refused in Go's config-path words for a rule Go's config path does not \
+                 have: {e}"
+            );
+            assert!(
+                e.starts_with("config: refusing the advertised route set: "),
+                "{e}"
+            );
+        }
+
+        // A config that trips both kinds still reports everything wrong with it in one boot: two
+        // blocks, each wrapped once, each under the wrapper that belongs to it.
+        let both = refuse(
+            r#"{"version":"alpha0","AdvertiseRoutes":["192.0.2.5/24","0.0.0.0/0","garbage"]}"#,
+        );
+        assert_eq!(
+            both.lines().collect::<Vec<_>>(),
+            vec![
+                "error parsing config to prefs: route 192.0.2.5/24 has non-address bits set; \
+                 expected 192.0.2.0/24",
+                "\"garbage\" is not a valid IP address or CIDR prefix",
+                "config: refusing the advertised route set: 0.0.0.0/0 advertised without its IPv6 \
+                 counterpart, please also advertise ::/0",
+            ],
+            "got:\n{both}"
         );
     }
 
@@ -1042,7 +1199,9 @@ mod tests {
     fn apply_refuses_a_malformed_4via6_route() {
         // A 4via6 prefix too short to carry the site id it is supposed to encode (Go
         // `netutil.ValidateViaPrefix`, message verbatim). Without this it is advertised as an ordinary
-        // IPv6 route that decodes to no IPv4 CIDR at all.
+        // IPv6 route that decodes to no IPv4 CIDR at all. Go reaches that check from its CLI and not
+        // from a config file, so the reason is Go's but the refusal is this fork's, and the wrapper
+        // around it is this module's rather than `ToPrefs`'.
         let c = cfg(r#"{"version":"alpha0","AdvertiseRoutes":["fd7a:115c:a1e0:b1a::/64"]}"#);
         let mut p = Prefs::default();
         let e = match c.apply_to_prefs(&mut p) {
@@ -1051,8 +1210,8 @@ mod tests {
         };
         assert_eq!(
             e,
-            "error parsing config to prefs: fd7a:115c:a1e0:b1a::/64 4-in-6 prefix must be at least \
-             a /96"
+            "config: refusing the advertised route set: fd7a:115c:a1e0:b1a::/64 4-in-6 prefix must \
+             be at least a /96"
         );
         assert!(p.advertise_routes.is_empty());
 
@@ -1242,7 +1401,10 @@ mod tests {
                 "AutoUpdate":{"Check":true,"Apply":true}
             }"#);
         let mut p = Prefs::default();
-        c.apply_to_prefs(&mut p).unwrap();
+        // The gate is handed in as "this installation can replace its own binary", so the opt-in
+        // mapping is pinned on every host — the refusal it gets elsewhere is a property of the
+        // machine, and it has its own test below.
+        c.apply_to_prefs_gated(&mut p, None).unwrap();
         assert_eq!(p.operator_user.as_deref(), Some("alice"), "--operator");
         assert!(p.exit_node_allow_lan_access, "--exit-node-allow-lan-access");
         assert!(p.posture_checking, "--report-posture");
@@ -1296,7 +1458,9 @@ mod tests {
         let c = cfg(r#"{"version":"alpha0","AutoUpdate":{"Apply":true}}"#);
         let mut p = Prefs::default();
         assert!(p.auto_update_check, "the pref's own default is true");
-        c.apply_to_prefs(&mut p).unwrap();
+        // Updatable installation handed in: this test is about which FIELDS a present `AutoUpdate`
+        // object writes, not about who may opt in.
+        c.apply_to_prefs_gated(&mut p, None).unwrap();
         assert_eq!(p.auto_update_apply, Some(true));
         assert!(
             !p.auto_update_check,
@@ -1324,6 +1488,94 @@ mod tests {
         c.apply_to_prefs(&mut p).unwrap();
         assert_eq!(p.auto_update_apply, Some(false));
         assert!(!p.auto_update_check);
+    }
+
+    /// The declarative ingress may not make a claim the interactive one refuses. `AutoUpdate.Apply`
+    /// is advertised to control as `Hostinfo.AllowsUpdate`, so on an installation whose binary can
+    /// never be replaced, a `--config` opt-in is the same dishonest advertisement `tnet set
+    /// --auto-update` is refused for — reaching the tailnet admin from a file instead of a command.
+    ///
+    /// Both outcomes are driven here, on any host, by handing the update provenance in: the refusal
+    /// arm is the whole point of the rule, and it fires on no CI runner this project owns.
+    #[test]
+    fn auto_update_opt_in_is_refused_when_the_installation_cannot_update() {
+        use crate::ipn::selfupdate;
+
+        let cannot = selfupdate::auto_update_refusal_for(None, None, "macos/aarch64")
+            .expect("a platform with no published artifact can never replace its binary");
+
+        // The opt-in alongside an unrelated pref, so the all-or-nothing contract is visible: a
+        // refused config must not have applied the fields it listed before the bad one.
+        let c = cfg(r#"{"version":"alpha0","Hostname":"node-a","AutoUpdate":{"Apply":true}}"#);
+        let mut p = Prefs::default();
+        let err = c
+            .apply_to_prefs_gated(&mut p, Some(&cannot))
+            .expect_err("a config opt-in on an un-updatable installation must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("Auto-updates are not supported"), "got {msg}");
+        assert!(
+            msg.contains("Hostinfo.AllowsUpdate"),
+            "the refusal must say what the pref claims to the tailnet: {msg}"
+        );
+        assert!(
+            msg.contains(r#""AutoUpdate": {"Apply": false}"#),
+            "a config-file refusal must name the config-file fix, not a flag no file can carry: \
+             {msg}"
+        );
+        assert!(
+            !msg.contains("--no-auto-update"),
+            "there is no daemon up at boot to accept that: {msg}"
+        );
+        assert_eq!(
+            p.auto_update_apply, None,
+            "a refused config must leave the pref never-stated"
+        );
+        assert_eq!(
+            p.hostname, None,
+            "apply_to_prefs is all-or-nothing: nothing may be applied when it bails"
+        );
+
+        // The SAME config on an installation that can replace its own binary is honest, so it
+        // applies in full. This is the half a host-reading test can assert on Linux CI, and it is
+        // the half that proves the refusal above is the rule firing rather than the mapping broken.
+        let mut p = Prefs::default();
+        c.apply_to_prefs_gated(&mut p, None)
+            .expect("an installation that can replace its own binary may opt in");
+        assert_eq!(p.auto_update_apply, Some(true));
+        assert_eq!(p.hostname.as_deref(), Some("node-a"));
+
+        // A DECLINE, and a config that says nothing about auto-update, are legal on every
+        // installation — neither claims anything to the tailnet (Go acts on `EqualBool(true)` alone).
+        let mut p = Prefs::default();
+        cfg(r#"{"version":"alpha0","AutoUpdate":{"Apply":false}}"#)
+            .apply_to_prefs_gated(&mut p, Some(&cannot))
+            .expect("declining auto-update is legal on every installation");
+        assert_eq!(p.auto_update_apply, Some(false));
+
+        // A pref already on DISK is never re-litigated here, whatever this host can do: the write
+        // paths judge the posture a write would leave behind, but a config is read at boot, and a
+        // daemon that refuses to start over a persisted pref cannot be told to stop claiming it —
+        // `tnet set --no-auto-update` needs a running daemon.
+        let mut p = Prefs {
+            auto_update_apply: Some(true),
+            ..Prefs::default()
+        };
+        cfg(r#"{"version":"alpha0","Hostname":"h"}"#)
+            .apply_to_prefs_gated(&mut p, Some(&cannot))
+            .expect("a config that says nothing about auto-update must not judge the stored pref");
+        assert_eq!(p.auto_update_apply, Some(true));
+        assert_eq!(p.hostname.as_deref(), Some("h"));
+
+        // And the public entry point is the same function with this host's own verdict — no second
+        // definition of updatability that could drift from the one `tnet update` asks.
+        let mut a = Prefs::default();
+        let mut b = Prefs::default();
+        let via_wrapper = c.apply_to_prefs(&mut a).is_ok();
+        let via_host_gate = c
+            .apply_to_prefs_gated(&mut b, selfupdate::auto_update_refusal().as_deref())
+            .is_ok();
+        assert_eq!(via_wrapper, via_host_gate);
+        assert_eq!(a.auto_update_apply, b.auto_update_apply);
     }
 
     /// The contract this module lives by, pinned as one test: EVERY field of Go's `ConfigVAlpha`
@@ -1368,7 +1620,10 @@ mod tests {
                 "RelayServerStaticEndpoints":["192.0.2.11:41641"]
             }"#);
         let mut p = Prefs::default();
-        let key = c.apply_to_prefs(&mut p).unwrap();
+        // Updatable installation handed in, so every key below is judged on the same host: the
+        // `AutoUpdate.Apply` opt-in is the one value whose acceptance depends on the machine, and
+        // reading that from the runner would pin this contract on only half the world's CI.
+        let key = c.apply_to_prefs_gated(&mut p, None).unwrap();
 
         // HONORED — 16 keys onto prefs, plus AuthKey returned as a credential.
         assert_eq!(key_str(key).as_deref(), Some("tskey-abc123"));
