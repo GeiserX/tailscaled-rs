@@ -141,8 +141,10 @@ fn an_unwritable_kubeconfig_is_refused_before_the_merge() {
         "Go's words are `cannot write kubeconfig at %q`; got:\n{err}"
     );
     assert!(
-        !err.contains("opening kubeconfig"),
-        "the failure must come from the precheck, not from the open after the merge:\n{err}"
+        err.trim_start()
+            .starts_with("Error: cannot write kubeconfig at"),
+        "the failure must come from the precheck, not from the open after the merge — which \
+         reports Go's bare `open <path>: permission denied`:\n{err}"
     );
     assert!(
         !err.contains("invalid kubeconfig"),
@@ -209,13 +211,13 @@ fn a_readable_but_malformed_kubeconfig_is_refused_by_the_merge() {
         !out.status.success(),
         "a kubeconfig that cannot be parsed must not be merged into:\n{err}"
     );
-    assert!(
-        err.contains("invalid kubeconfig"),
-        "the merge must be what refuses it, in Go's `errInvalidKubeconfig` words; got:\n{err}"
-    );
-    assert!(
-        !err.contains("cannot write kubeconfig at"),
-        "this file is writable, so the precheck must have passed it:\n{err}"
+    // Go's `setKubeconfigForPeer` returns `updateKubeconfig`'s `errInvalidKubeconfig` unwrapped, so
+    // the whole of what the operator reads is those two words. Compared exactly: a wrapper naming
+    // the path or the merge step would still contain them, and is exactly what this must catch.
+    // (`Error: ` is how a Rust `main` returning `Err` prints; Go's CLI prints the error alone.)
+    assert_eq!(
+        err, "Error: invalid kubeconfig\n",
+        "the merge must be what refuses it, in Go's `errInvalidKubeconfig` words and no others"
     );
     assert_eq!(
         std::fs::read_to_string(&path).unwrap(),

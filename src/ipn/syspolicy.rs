@@ -162,11 +162,13 @@
 //! `util/syspolicy/source/json_policy_store.go`, `util/syspolicy/source/policy_reader.go` and
 //! `util/syspolicy/policy_keys.go` @ `53a0d659afa51835dd7a9283873cca44261454f8`; the apply half is
 //! `ipn/ipnlocal/local.go` (`applySysPolicy`, `applyExitNodeSysPolicyLocked`,
-//! `preferencePolicies`) @ `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`.
+//! `preferencePolicies`) @ `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`. The reload/change-callback
+//! half — when a re-resolve is allowed to notify watchers — is
+//! `util/syspolicy/rsop/resultant_policy.go` (`Reload`, `reloadNow`) @ the same ref.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 use serde_json::{Map, Value};
 
@@ -331,13 +333,20 @@ static REGISTERED: RwLock<Vec<PolicySource>> = RwLock::new(Vec::new());
 ///
 /// **What actually ticks it, honestly.** Go registers real change sources (a Windows registry
 /// watcher, a `ReadWriteHandle` a management agent pokes) and its callback fires whenever one of
-/// them moves. This build has exactly one source, a JSON file captured at startup and never
-/// re-read, so the only points at which the effective policy can differ from what a watcher last
-/// saw are [`load_json_policy_file`] (a source appears) and [`reload_effective_policy`] (the
-/// operator asked for a forced re-read). Those are the two send sites. That is a coarser signal
-/// than Go's — a hand edit of `syspolicy.json` is not seen until someone runs `syspolicy reload` —
-/// and the mask bit's documentation says so rather than promising a watch this build cannot
-/// perform. A file watcher would narrow the gap and is deliberately not smuggled in here.
+/// them moves — but *only* when it moves. `rsop.(*Policy).reloadNow` swaps the fresh merge in and
+/// then invokes the callbacks under `if old != nil && !old.EqualItems(new)`, so a re-resolve that
+/// lands on the same items notifies nobody. That guard is ported as [`reload_and_publish`], which
+/// is the only caller of [`notify_policy_changed`].
+///
+/// This build re-resolves at exactly two points — [`load_json_policy_file`] (a source appears) and
+/// [`reload_effective_policy`] (the operator asked for a forced re-read) — and each ticks only if
+/// the merge it produced differs from the one watchers already hold. The one source this daemon
+/// registers is a JSON file captured at startup and never re-read, so in practice **registration is
+/// the only tick that can fire**: a `syspolicy reload` re-resolves the same rows by construction and
+/// is silent. That is a coarser signal than Go's — a hand edit of `syspolicy.json` is not seen until
+/// the daemon restarts — and the mask bit's documentation says so rather than promising a watch this
+/// build cannot perform. A file watcher would narrow the gap and is deliberately not smuggled in
+/// here.
 ///
 /// [`Backend::watch_prefs`]: crate::ipn::Backend::watch_prefs
 static POLICY_CHANGED: std::sync::LazyLock<tokio::sync::watch::Sender<()>> =
@@ -352,10 +361,73 @@ pub fn watch_policy() -> tokio::sync::watch::Receiver<()> {
     POLICY_CHANGED.subscribe()
 }
 
+/// The effective policy every watcher has already been told about — Go's `Policy.effective`, the
+/// pointer `rsop.(*Policy).reloadNow` swaps before it decides whether to invoke the change
+/// callbacks.
+///
+/// Held beside [`REGISTERED`] rather than replacing it: [`effective_policy`] stays a live merge of
+/// the registered sources, and this is only the "what did watchers last see" half. The invariant
+/// that keeps the two from drifting is that **every mutation of [`REGISTERED`] is followed by a
+/// [`reload_and_publish`]** — today that is the single `push` in [`load_json_policy_file`].
+static LAST_PUBLISHED: Mutex<Vec<PolicySetting>> = Mutex::new(Vec::new());
+
 /// Tell every policy watcher to re-read the snapshot. A failed send (zero receivers) is the common
 /// case — nobody is watching policy — and is not an error.
+///
+/// Called from exactly one place, [`reload_and_publish`], so the "only on an actual change" rule
+/// cannot be bypassed by a future send site.
 fn notify_policy_changed() {
     let _ = POLICY_CHANGED.send(());
+}
+
+/// Re-resolve the effective policy and tick the policy watchers **only if it moved** — the tail of
+/// Go `rsop.(*Policy).reloadNow`:
+///
+/// ```go
+/// old := p.effective.Swap(new)
+/// if old != nil && !old.EqualItems(new) {
+///     p.changeCallbacks.Invoke(Change[*setting.Snapshot]{New: new, Old: old})
+/// }
+/// ```
+///
+/// Returns the fresh merge, so the caller reports exactly what it published.
+///
+/// `last` (Go's `p.effective`) and `resolve` (Go's `readAndMerge`) are parameters rather than reads
+/// of the process globals, so the rule is testable without touching the registry — the same split
+/// [`allowed_suggestions_in`] and [`auth_key_in`] use. `resolve` runs while `last` is held so two
+/// concurrent reloads cannot publish their snapshots out of order and leave `last` disagreeing with
+/// what watchers were told; Go gets that for free by funnelling every reload through one goroutine.
+/// The lock order is only ever `last` → [`REGISTERED`] (the read `resolve` takes), never the
+/// inverse, so the one writer of `REGISTERED` — which drops its write guard before calling here —
+/// cannot deadlock against it.
+///
+/// **What is compared.** `Vec<PolicySetting>` is the *reported* row set, in which a configured
+/// `AuthKey` renders as `<redacted>` rather than its value; Go's `EqualItems` compares raw snapshot
+/// items. The two can only disagree if a second source registered under the same origin string and
+/// differed from the first *only* in an `AuthKey` value. Exactly one source is ever registered here
+/// (from `main`, once), so that is unreachable; comparing the rows a watcher would actually receive
+/// is the stronger statement while that holds, because it is precisely "would this frame tell the
+/// watcher anything new?". A build that registers a second source should compare the raw
+/// [`PolicySource`] settings instead.
+///
+/// Go's extra `old != nil` guard suppresses the callbacks for the very first resolution of a scope,
+/// which it can do because `p.effective` starts unset. There is no unset state here: this daemon
+/// resolves the device scope from the first instruction (an empty registry merges to an empty
+/// snapshot, which [`effective_policy`] will happily report), so `last` starts as that empty
+/// snapshot and a registration that configures keys is a real empty→non-empty change. That matches
+/// what Go does whenever a `Policy` for the scope already exists when `RegisterStore` runs, and it
+/// is the only reading under which the registration tick is not a lie.
+fn reload_and_publish(
+    last: &Mutex<Vec<PolicySetting>>,
+    resolve: impl FnOnce() -> Vec<PolicySetting>,
+) -> Vec<PolicySetting> {
+    let mut last = last.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let new = resolve();
+    if *last != new {
+        last.clone_from(&new);
+        notify_policy_changed();
+    }
+    new
 }
 
 /// What [`load_json_policy_file`] did, so the caller can log it honestly.
@@ -416,11 +488,14 @@ pub fn load_json_policy_file(source_name: &str, path: &Path) -> Result<LoadOutco
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .push(source);
-    // A source appeared: the effective policy just moved for anyone holding an older snapshot.
-    // Nothing is watching at daemon start (this runs from `main` before the LocalAPI is served), so
-    // this is for the sake of the invariant rather than any current caller — every mutation of
-    // `REGISTERED` ticks, so a watcher can never silently miss one.
-    notify_policy_changed();
+    // A source appeared: re-resolve, and tick if that moved the effective policy for anyone holding
+    // an older snapshot (it does whenever the file configured at least one key). The `REGISTERED`
+    // write guard above is dropped by the end of that statement, so the read `reload_and_publish`
+    // takes is not nested inside it. Nothing is watching at daemon start (this runs from `main`
+    // before the LocalAPI is served), so this is for the sake of the invariant rather than any
+    // current caller — every mutation of `REGISTERED` is published, so a watcher can never silently
+    // miss one.
+    reload_and_publish(&LAST_PUBLISHED, registered_store_settings);
     Ok(LoadOutcome::Registered { settings: count })
 }
 
@@ -447,17 +522,20 @@ pub(super) fn effective_policy() -> PolicyReport {
 /// `syspolicy.json` after the daemon started — only a restart does. Kept a distinct verb (faithful
 /// to Go, and the place a genuinely re-readable source would be re-read). Never errors.
 ///
-/// It also pushes the re-read snapshot to every policy watcher (see [`POLICY_CHANGED`]). A reload is
-/// the operator saying "the policy may have moved", and it is the only such moment this build can
-/// observe, so it is the change edge the `policy` notify bit is built on — even though, for the JSON
-/// file source, the re-read necessarily resolves to the same rows a watcher already holds.
+/// It pushes the re-read snapshot to every policy watcher (see [`POLICY_CHANGED`]) **only if that
+/// snapshot differs from the one they already hold**, which is Go's contract: `reloadNow` invokes
+/// the change callbacks under `if old != nil && !old.EqualItems(new)`, so `Policy.Reload()` over an
+/// unchanged store notifies nobody. For this build's single source — a JSON file captured at
+/// registration — the re-read *always* resolves the same rows, so a `tnet syspolicy reload` is
+/// silent on the notify bus by construction. That is the honest answer: `Notify.Policy` says the
+/// effective policy CHANGED, and a frame carrying the rows a watcher already has asserts the
+/// opposite of what receiving it would imply.
 pub(super) fn reload_effective_policy() -> PolicyReport {
     // The forced re-read re-merges the registered sources; none of them can have changed underneath
     // us, because each captured its settings at registration (see `PolicySource`).
-    notify_policy_changed();
     PolicyReport {
         scope: DEVICE_SCOPE.to_string(),
-        settings: registered_store_settings(),
+        settings: reload_and_publish(&LAST_PUBLISHED, registered_store_settings),
     }
 }
 
@@ -1799,12 +1877,15 @@ mod tests {
     }
 
     #[test]
-    fn a_reload_pushes_the_snapshot_to_a_policy_watcher() {
+    fn a_reload_that_resolves_the_same_rows_pushes_no_policy_frame() {
         let _serialized = POLICY_TICK_TESTS.lock().unwrap_or_else(|e| e.into_inner());
-        // The change edge the `policy` notify bit is built on. A watcher that subscribed before the
-        // reload must see the tick, and the snapshot it then re-reads must be the one `list` returns —
-        // there is one producer, so the notify stream cannot drift from the report.
-        let mut rx = watch_policy();
+        // Go's `reloadNow` invokes the change callbacks only under `!old.EqualItems(new)`, so
+        // `Policy.Reload()` over a store that has not moved notifies nobody. A forced reload here
+        // re-merges sources that captured their settings at registration, so it can only ever
+        // resolve the rows a watcher already holds — and must therefore stay silent.
+        //
+        // Not `mut`: nothing here ever consumes a tick, because no tick may be produced.
+        let rx = watch_policy();
         assert!(
             !rx.has_changed().unwrap(),
             "`subscribe()` starts synced: a fresh watcher must not see a spurious initial tick, \
@@ -1812,22 +1893,66 @@ mod tests {
         );
 
         let pushed = reload_effective_policy();
-        assert!(
-            rx.has_changed().unwrap(),
-            "a `syspolicy reload` is the one change signal this build can observe; it must reach \
-             the notify bus"
-        );
-        rx.borrow_and_update();
         assert_eq!(
             effective_policy(),
             pushed,
-            "the pushed snapshot and the `list` snapshot are the same rows"
+            "the re-read snapshot and the `list` snapshot are the same rows"
+        );
+        assert!(
+            !rx.has_changed().unwrap(),
+            "a reload that resolved the same rows must not emit a policy frame: `Notify.Policy` \
+             says the effective policy CHANGED, and a frame carrying rows the watcher already has \
+             says the opposite of what receiving it would imply"
         );
 
-        // Ticks are edges, not a queue: after consuming one, a second reload is seen again.
-        assert!(!rx.has_changed().unwrap());
+        // Not a one-shot suppression either: the second reload is silent for the same reason.
         let _ = reload_effective_policy();
-        assert!(rx.has_changed().unwrap());
+        assert!(!rx.has_changed().unwrap());
+    }
+
+    #[test]
+    fn only_a_resolve_that_moves_the_snapshot_pushes_a_policy_frame() {
+        let _serialized = POLICY_TICK_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        // The other half of Go's rule: when the merge DOES move, every watcher is told, exactly
+        // once. Driven through the real publish path over a `last` cell of this test's own, so it
+        // needs no source in the process-global registry (the same split `allowed_suggestions_in`
+        // is tested through). The tick channel is the global one — that is the thing under test —
+        // which is why this holds `POLICY_TICK_TESTS`.
+        let mut rx = watch_policy();
+        assert!(!rx.has_changed().unwrap());
+        let last = Mutex::new(Vec::new());
+
+        let one = resolve(r#"{"Hostname": "documented-node"}"#).expect("a valid file resolves");
+        assert_eq!(reload_and_publish(&last, || one.clone()), one);
+        assert!(
+            rx.has_changed().unwrap(),
+            "empty → one configured key is a real change and must reach the notify bus"
+        );
+        rx.borrow_and_update();
+
+        // Re-resolving the same rows is not a change.
+        assert_eq!(reload_and_publish(&last, || one.clone()), one);
+        assert!(
+            !rx.has_changed().unwrap(),
+            "Go compares items, not identity: an equal re-merge invokes no callback"
+        );
+
+        // A value that moved is one, even though the key set did not — `EqualItems` compares rows.
+        let renamed = resolve(r#"{"Hostname": "renamed-node"}"#).expect("a valid file resolves");
+        assert_eq!(reload_and_publish(&last, || renamed.clone()), renamed);
+        assert!(
+            rx.has_changed().unwrap(),
+            "the same key with a different value is a policy change"
+        );
+        rx.borrow_and_update();
+
+        // ...and so is a key going away.
+        assert!(reload_and_publish(&last, Vec::new).is_empty());
+        assert!(
+            rx.has_changed().unwrap(),
+            "a source's last setting disappearing is a policy change"
+        );
+        rx.borrow_and_update();
     }
 
     #[test]
@@ -2239,6 +2364,369 @@ mod tests {
         }
     }
 
+    // -------------------------------------------------------------------------------------------
+    // Every registered key has a reader (Go `implicitDefinitions` <-> this build's consumers).
+    // -------------------------------------------------------------------------------------------
+
+    /// A key whose effect is produced somewhere other than [`apply_settings_to_prefs`], named
+    /// together with the production code that gives it that effect.
+    ///
+    /// `sees` **calls** that code over a resolved policy document and answers whether it observed
+    /// the administrator's value, rather than restating what it would say. The test runs it twice —
+    /// once over a document carrying the key, once over the same document with the key gone — and
+    /// requires the two answers to differ. One-sided is not enough: a reader that ignores the
+    /// administrator's value and always answers the same is exactly the failure this test exists to
+    /// catch, and it would pass a positive assertion.
+    ///
+    /// `ExitNode.AllowOverride` is the row this exists for. It is registered, it moves no pref, and
+    /// the only thing that makes it mean anything is the edit gate reading it — so that row calls
+    /// the gate itself, and it needs `also_configured` to do it, because the gate only looks at the
+    /// override key once the policy has already pinned a node.
+    ///
+    /// Where the consumer reads the **process-global** registry and so cannot be called from a unit
+    /// test, `consumer` names the read rather than the refusal behind it, and the row proves that
+    /// read: `tailnetd`'s two TPM refusals live in a binary, and the always-on disconnect gate
+    /// resolves its keys inside `alwayson::check_disconnect_policy`. Both refusals are pure
+    /// decisions over already-resolved values and are tested next to themselves, in `ipn::alwayson`.
+    /// No row claims a call it does not make.
+    struct NamedReader {
+        /// The policy key, spelled as [`DEFINITIONS`] spells it.
+        key: &'static str,
+        /// What reads it — printed by the assertion, so a failure names the wiring that went away.
+        consumer: &'static str,
+        /// Other keys that must be configured before this one means anything, as the body of a JSON
+        /// object (no braces, no trailing comma). Empty for a key whose consumer reads it on its
+        /// own. These stay configured in the key-absent document, so the differential isolates the
+        /// key under test rather than the whole policy.
+        also_configured: &'static str,
+        /// Does that consumer see the value the document configures?
+        sees: fn(&PolicySource) -> bool,
+    }
+
+    /// Every key whose consumer is not the apply path. The apply path's own keys are deliberately
+    /// absent: [`apply_path_acts_on`] proves those by running it.
+    const NAMED_READERS: &[NamedReader] = &[
+        NamedReader {
+            key: PKEY_ALLOW_EXIT_NODE_OVERRIDE,
+            consumer: "the exit-node edit gate, exitnodepolicy::check_exit_node_edit",
+            // The gate's answer is "managed by policy" whatever this key says until a node is
+            // pinned, so the one-key document would make the row untestable — Go reads
+            // `AllowExitNodeOverride` only after `HasAnyOf(ExitNodeID, ExitNodeIP)` has said yes.
+            also_configured: r#""ExitNodeIP": "100.64.0.9""#,
+            sees: |s| {
+                let policy = exit_node_policy_in(&s.settings);
+                // An operator naming a *different* node: refused outright without the key, and the
+                // granted exemption with it.
+                matches!(
+                    crate::ipn::exitnodepolicy::check_exit_node_edit(
+                        Some(Some("100.64.0.3")),
+                        &policy
+                    ),
+                    Ok(crate::ipn::exitnodepolicy::ExitNodeEdit::Override)
+                )
+            },
+        },
+        NamedReader {
+            key: PKEY_ALWAYS_ON_OVERRIDE_WITH_REASON,
+            consumer: "the always-on disconnect gate's read, always_on_keys",
+            also_configured: "",
+            sees: |s| always_on_keys_in(&s.settings).override_with_reason == Some(true),
+        },
+        NamedReader {
+            key: PKEY_RECONNECT_AFTER,
+            consumer: "the reconnect timer's arming read, reconnect_after",
+            also_configured: "",
+            sees: |s| reconnect_after_in(&s.settings).is_some(),
+        },
+        NamedReader {
+            key: PKEY_ENCRYPT_STATE,
+            consumer: "tailnetd's state-at-rest refusal, through the get_boolean read",
+            also_configured: "",
+            sees: |s| boolean_setting(&s.settings, PKEY_ENCRYPT_STATE, false),
+        },
+        NamedReader {
+            key: PKEY_HARDWARE_ATTESTATION,
+            consumer: "tailnetd's hardware-attestation refusal, through the get_boolean read",
+            also_configured: "",
+            sees: |s| boolean_setting(&s.settings, PKEY_HARDWARE_ATTESTATION, false),
+        },
+        NamedReader {
+            key: PKEY_ALLOW_TAILSCALED_RESTART,
+            consumer: "the LocalAPI shutdown verdict, crate::server::shutdown_verdict",
+            also_configured: "",
+            // Chained exactly as the server chains them: the policy read feeds the verdict, and a
+            // caller who may already write is refused until the administrator says otherwise.
+            sees: |s| {
+                crate::server::shutdown_verdict(
+                    crate::auth::Access::ReadWrite,
+                    boolean_setting(&s.settings, PKEY_ALLOW_TAILSCALED_RESTART, false),
+                )
+                .is_ok()
+            },
+        },
+        NamedReader {
+            key: PKEY_AUTH_KEY,
+            consumer: "the registration path, auth_key",
+            also_configured: "",
+            sees: |s| {
+                let gate = AuthKeyGate {
+                    running: false,
+                    needs_login: false,
+                    enrolled: false,
+                    config_in_use: false,
+                };
+                matches!(
+                    auth_key_in(std::slice::from_ref(s), gate),
+                    AuthKeyDecision::Use(_)
+                )
+            },
+        },
+        NamedReader {
+            key: PKEY_ALLOWED_SUGGESTED_EXIT_NODES,
+            consumer: "the exit-node suggestion filter, allowed_suggested_exit_nodes",
+            also_configured: "",
+            sees: |s| allowed_suggestions_in(std::slice::from_ref(s)).is_some(),
+        },
+    ];
+
+    /// The keys this daemon defines and knowingly does not act on, each with its reason.
+    ///
+    /// Defining them is not idle: [`validate`] refuses a file naming a key that is not defined,
+    /// so a fleet-wide payload that also carries the GUI clients' keys would otherwise be rejected
+    /// whole on this host, and `syspolicy list` reports them, which is how an administrator sees
+    /// they arrived. Acting on them is what this daemon has no surface for. One line each, so the
+    /// list stays a set of decisions rather than a dumping ground.
+    const REGISTERED_BUT_NOT_READ: &[(&str, &str)] = &[
+        (
+            "AdminConsole",
+            "shows or hides a GUI menu item; this daemon has no UI",
+        ),
+        (
+            "ApplyUpdates",
+            "shows or hides a GUI menu item; the update PREFERENCE is InstallUpdates, which is \
+             applied",
+        ),
+        (
+            "DeviceSerialNumber",
+            "overrides the serial a posture-reporting client sends; this daemon sends no posture \
+             identity",
+        ),
+        (
+            "EnableDNSRegistration",
+            "registers the tailnet interface with a Windows resolver; this daemon manages no host \
+             resolver registrations",
+        ),
+        (
+            "ExitNodesPicker",
+            "shows or hides a GUI menu item; this daemon has no UI",
+        ),
+        (
+            "FlushDNSOnSessionUnlock",
+            "a Windows session-unlock hook; a system daemon has no user session to unlock",
+        ),
+        (
+            "KeyExpirationNotice",
+            "how long before key expiry a GUI warns; this daemon has no UI to warn in",
+        ),
+        (
+            "LogSCMInteractions",
+            "traces Windows Service Control Manager calls; not how this daemon is supervised",
+        ),
+        (
+            "LogTarget",
+            "an alternate log-upload endpoint; this daemon uploads no logs",
+        ),
+        (
+            "MachineCertificateSubject",
+            "selects a machine certificate to sign control requests with; this daemon signs none",
+        ),
+        (
+            "ManagedByCaption",
+            "GUI text naming the administrator; this daemon has no UI",
+        ),
+        (
+            "ManagedByOrganizationName",
+            "GUI text naming the organization; this daemon has no UI",
+        ),
+        ("ManagedByURL", "a GUI support link; this daemon has no UI"),
+        (
+            "NetworkDevices",
+            "shows or hides a GUI menu item; this daemon has no UI",
+        ),
+        (
+            "OnboardingFlow",
+            "shows or hides a GUI first-run flow; this daemon has no UI",
+        ),
+        (
+            // A recorded GAP, not parity: upstream carries this in `preferencePolicies` and moves
+            // the pref with it.
+            "PostureChecking",
+            "upstream applies this to the posture-checking pref; this build answers no posture \
+             pull at all (c2n, engine ask #43), so applying it would advertise an intent nothing \
+             here serves — the pref is left to the operator until the channel exists",
+        ),
+        (
+            "PreferencesMenu",
+            "shows or hides a GUI menu item; this daemon has no UI",
+        ),
+        (
+            "ResetToDefaults",
+            "shows or hides a GUI menu item; this daemon has no UI",
+        ),
+        (
+            "RunExitNode",
+            "shows or hides a GUI menu item; the exit-node PREFERENCE is AdvertiseExitNode, which \
+             is applied",
+        ),
+        (
+            "SuggestedExitNode",
+            "shows or hides a GUI menu item; this daemon has no UI",
+        ),
+        (
+            "Tailnet",
+            "preselects the tailnet a GUI sign-in offers; this daemon signs in with an auth key \
+             and a control URL, with nothing to preselect",
+        ),
+        (
+            "TestMenu",
+            "shows or hides a GUI menu item; this daemon has no UI",
+        ),
+        (
+            "UpdateMenu",
+            "shows or hides a GUI menu item; this daemon has no UI",
+        ),
+    ];
+
+    /// A configured value of the right type for `ty`, as the JSON a policy file would carry, that a
+    /// consumer can tell apart from "not configured".
+    ///
+    /// More than one where the type has no single such value: a `PreferenceOption` resolves against
+    /// the pref's CURRENT value, so whichever of `always`/`never` already matches the default prefs
+    /// changes nothing and would look like a key nothing reads.
+    fn sample_values(ty: ValueType) -> &'static [&'static str] {
+        match ty {
+            ValueType::Boolean => &["true"],
+            // Parses as an address for ExitNodeIP and is an ordinary opaque string everywhere else.
+            ValueType::String => &["\"100.64.0.9\""],
+            ValueType::StringList => &["[\"100.64.0.9\"]"],
+            ValueType::PreferenceOption => &["\"always\"", "\"never\""],
+            ValueType::Visibility => &["\"hide\"", "\"show\""],
+            ValueType::Duration => &["\"30m\""],
+        }
+    }
+
+    /// Does the apply path give `key` an effect — a pref it writes, or a refusal it reports?
+    ///
+    /// Runs the production [`apply_settings_to_prefs`] over a one-key document, exactly as the
+    /// daemon's reconcile does, and asks what came back.
+    fn apply_path_acts_on(key: &str, json_value: &str) -> bool {
+        let mut prefs = Prefs::default();
+        let applied = apply(&one_key_document(key, json_value), &mut prefs);
+        !applied.is_quiet()
+    }
+
+    /// A policy document configuring exactly `key`.
+    fn one_key_document(key: &str, json_value: &str) -> String {
+        format!("{{{}: {json_value}}}", quoted(key))
+    }
+
+    /// The document a [`NamedReader`] is read over: its `also_configured` context plus the key
+    /// under test, or — when `configured` is false — the same context with the key left out.
+    fn reader_document(reader: &NamedReader, json_value: &str, configured: bool) -> String {
+        let key = match configured {
+            true => format!("{}: {json_value}", quoted(reader.key)),
+            false => String::new(),
+        };
+        let body = match (reader.also_configured, key.as_str()) {
+            ("", key) => key.to_string(),
+            (context, "") => context.to_string(),
+            (context, key) => format!("{context}, {key}"),
+        };
+        format!("{{{body}}}")
+    }
+
+    /// The defect class the `ExitNode.AllowOverride` report named: a key can be added to
+    /// [`DEFINITIONS`] — which is all it takes for a file naming it to load and for `syspolicy
+    /// list` to report it — and then be read by nothing at all, so an administrator's setting is
+    /// rendered back to them while changing nothing.
+    ///
+    /// Every registered key must therefore land in one of three places, and the first two are
+    /// proved by calling the code that does the reading:
+    ///
+    /// 1. the apply path acts on it — a pref it writes or a refusal it reports
+    ///    ([`apply_path_acts_on`]),
+    /// 2. a consumer outside the apply path reads it ([`NAMED_READERS`], whose `sees` calls it and
+    ///    must answer differently with the key configured and without it),
+    /// 3. it is listed in [`REGISTERED_BUT_NOT_READ`] with the reason, so "this daemon does not act
+    ///    on it" is a recorded decision rather than an oversight.
+    #[test]
+    fn every_registered_policy_key_is_read_or_recorded_as_unread() {
+        for def in DEFINITIONS {
+            let applied = sample_values(def.ty)
+                .iter()
+                .any(|value| apply_path_acts_on(def.key, value));
+            let reader = NAMED_READERS.iter().find(|r| r.key == def.key);
+            let unread = REGISTERED_BUT_NOT_READ.iter().find(|(k, _)| *k == def.key);
+
+            if let Some(reader) = reader {
+                // Every key with a named reader is of a type with one telling value; a
+                // `PreferenceOption` (the two-sample case) is applied to a pref, not read here.
+                let value = sample_values(def.ty)[0];
+                let configured = resolve_source(&reader_document(reader, value, true))
+                    .expect("a document of the registered type must load");
+                assert!(
+                    (reader.sees)(&configured),
+                    "{} is recorded as read by {}, but that consumer does not see it — the wiring \
+                     went away and the key is now registered, reported and inert",
+                    def.key,
+                    reader.consumer
+                );
+                let absent = resolve_source(&reader_document(reader, value, false))
+                    .expect("the same document without the key must load");
+                assert!(
+                    !(reader.sees)(&absent),
+                    "{} is recorded as read by {}, but that consumer answers the same with the key \
+                     absent — it is not reading the administrator's value",
+                    def.key,
+                    reader.consumer
+                );
+            }
+
+            assert!(
+                applied || reader.is_some() || unread.is_some(),
+                "{} is a registered policy setting that the apply path does not act on, that no \
+                 named consumer reads, and that REGISTERED_BUT_NOT_READ does not account for: an \
+                 administrator who ships it gets a row in `syspolicy list` and no effect. Wire it \
+                 up, refuse it in PolicyApplication::refused, or record why it does nothing.",
+                def.key
+            );
+
+            if let Some((key, reason)) = unread {
+                assert!(
+                    !applied && reader.is_none(),
+                    "{key} is recorded as unread ({reason}) but something does read it; drop the \
+                     row"
+                );
+            }
+        }
+    }
+
+    /// The reverse direction: neither list may name a key that is not a registered definition. A
+    /// stale row would otherwise sit there accounting for a key nobody can configure, and — for a
+    /// [`NamedReader`] — never run its `sees` against anything.
+    #[test]
+    fn the_key_accounting_names_no_setting_that_is_not_defined() {
+        for key in NAMED_READERS
+            .iter()
+            .map(|r| r.key)
+            .chain(REGISTERED_BUT_NOT_READ.iter().map(|(k, _)| *k))
+        {
+            assert!(
+                definition_of(key).is_some(),
+                "{key} is accounted for but is not a registered policy setting"
+            );
+        }
+    }
     #[test]
     fn an_empty_policy_leaves_every_pref_alone() {
         let mut prefs = Prefs {

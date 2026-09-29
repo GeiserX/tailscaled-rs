@@ -299,7 +299,8 @@ enum Command {
         /// Accepted and inert: Go has required this to be `true` since Tailscale 1.67, and this
         /// build's userspace netstack installs no host routes at all, so the only value Go allows is
         /// the state this daemon is always in. `--host-routes=false` is refused with Go's own
-        /// message — see [`check_ported_up_flags`].
+        /// message, at the exit status Go's flag parser refuses it with — see
+        /// [`check_ported_up_flags`].
         //
         // Go types it as a `notFalseVar`, a bool flag whose `Set` accepts only "true". `num_args =
         // 0..=1` + `require_equals` reproduces that shape: bare `--host-routes` is the flag's
@@ -317,8 +318,9 @@ enum Command {
         /// NOT a `tnet up` flag, carried only so a ported command line reaches a refusal that names
         /// where profile naming lives (`tnet set --nickname`) instead of clap's "unexpected
         /// argument". Go does not register `--nickname` on `up` either — `up.go`'s shared flag set
-        /// gates it on `cmd == "login"` — so `up` is not the place this fork is missing it.
-        /// See [`check_ported_up_flags`].
+        /// gates it on `cmd == "login"` — so `up` is not the place this fork is missing it. The
+        /// refusal keeps the exit status Go's flag parser gives an unregistered flag (2), so only
+        /// the sentence differs. See [`check_ported_up_flags`].
         #[arg(long, hide = true, value_name = "NAME")]
         nickname: Option<String>,
     },
@@ -633,22 +635,25 @@ enum Command {
     /// true (`tnet syspolicy list` shows whether it does). Without the policy the request is refused
     /// and nothing happens.
     ///
-    /// The stop is graceful and identical to a SIGTERM: in-flight requests drain, the node is taken
-    /// down cleanly and the state file and socket are closed the way they always are.
+    /// The stop is graceful: in-flight requests drain, the node is taken down cleanly and the state
+    /// file and socket are closed the way they are on a SIGTERM.
     ///
-    /// WHETHER IT COMES BACK is the service manager's decision, not this command's — which is why the
-    /// policy key is named for a restart. The units this fork installs (`tnet install`) restart the
-    /// daemon on failure only, and a `shutdown` is a clean exit, so on a stock install this STOPS the
-    /// daemon until something starts it again. Set `Restart=always` (systemd) or `KeepAlive`
-    /// unconditionally (launchd) if you want the restart behaviour the key's name suggests.
+    /// EXPECT THE DAEMON TO COME BACK — which is why the policy key is named for a restart. The
+    /// daemon exits NON-ZERO after a `shutdown` (a SIGTERM still exits 0), and the units `tnet
+    /// install` writes restart on failure, so on a stock install the daemon is back within seconds
+    /// with a fresh process. That is the point of the verb: it is a restart you can grant to a
+    /// management agent without granting root. To make it a lasting stop instead, stop the service
+    /// (`systemctl stop tailnetd`, `launchctl bootout`) rather than calling this.
     Shutdown,
     /// Authenticate this node with the control plane (Go `tailscale login`). With no `--authkey`, this
     /// is an **interactive login**: the node contacts control, reaches `NeedsLogin`, and the auth URL
     /// is printed for you to open in a browser; the node finishes connecting once you authorize it.
-    /// With `--authkey`/`--authkey-file` (or `$TS_AUTH_KEY`) it registers non-interactively. Like Go's
-    /// `login`, this re-authenticates **without changing any prefs** other than the profile name Go
-    /// gives `login` alone (`--nickname`) — it is `up`'s auth half on its own (use `tnet up <flags>`
-    /// to also change settings). Brings the node up (sets want-running).
+    /// With `--authkey`/`--authkey-file` (or `$TS_AUTH_KEY`) it registers non-interactively.
+    ///
+    /// Like Go's `login`, it first moves to a new, empty profile, so the account you were logged in to
+    /// stays as it was (`tnet switch` back to it); if the current profile has never logged in, it is
+    /// used as is. It changes no prefs other than the profile name Go gives `login` alone
+    /// (`--nickname`), which names the new profile. Brings the node up (sets want-running).
     Login {
         /// Pre-auth key for non-interactive login, or `file:<path>` to read the key from a file.
         /// Prefer `--authkey-file` or `$TS_AUTH_KEY` (a bare `--authkey` is visible in `ps`/shell
@@ -1552,7 +1557,9 @@ enum DebugCmd {
     /// requested, so the first lines are the current state + peer set + prefs + effective system
     /// policy, and each subsequent line carries only what changed (state transitions, the full peer set
     /// on a netmap change, interactive-login / consent URLs, a fresh prefs snapshot on every prefs
-    /// write, and a fresh policy snapshot on every `syspolicy reload`). Read-only and long-lived — it runs until interrupted (Ctrl-C) or the daemon
+    /// write, and a fresh policy snapshot whenever the effective system policy actually changes —
+    /// which, since this daemon's only policy source is read once at startup, means the front-loaded
+    /// one is normally the only policy line you will see). Read-only and long-lived — it runs until interrupted (Ctrl-C) or the daemon
     /// closes the stream (node torn down / shutdown). Distinct from `tnet status --watch`, which stays
     /// on the bare status-stream path.
     WatchIpn,
@@ -1948,9 +1955,8 @@ enum LockCmd {
         /// bool): bare `--json` and `--json=1` both select schema version 1, `--json=false` is the
         /// human form, and any other version is refused by number. The value is parsed by
         /// [`parse_json_schema_version`]; `require_equals` keeps `--json 1` from eating the next
-        /// argument, exactly as Go's `IsBoolFlag` does. The document that comes back is this fork's,
-        /// not upstream's — it says `SchemaVersion: "tailscaled-rs.1"`, because this build has no AUM
-        /// decoder and so cannot fill Go's schema-1 fields.
+        /// argument, exactly as Go's `IsBoolFlag` does. Version 1 is Go's schema-1 document
+        /// (`SchemaVersion: "1"`, `Messages` of decoded AUMs), rendered by [`format_lock_log`].
         #[arg(
             long,
             value_name = "VERSION",
@@ -2509,30 +2515,96 @@ fn risk_accepted(accepted: &str, risk: &str) -> bool {
 /// after a refused risk — and the only part of the exchange that says the node was not touched.
 const RISK_ABORTED: &str = "aborted, no changes made";
 
-/// Go's `presentRiskToUser` (`cmd/tailscale/cli/risks.go`) for a risk the caller has already found
-/// unaccepted: write the risk message and the escape hatch, then hand back Go's `errAborted` for the
-/// caller to `return` (so it reaches the operator on stderr, through the same path as every other
-/// command error).
+/// Go's `prompt.YesNo` (`util/prompt/prompt.go`): ask `msg` and read a yes/no answer — but only when
+/// `interactive`, which the caller sets to Go's `isatty(Stdin) && isatty(Stdout)`. Otherwise it is a
+/// script, and Go returns `dflt` without writing or reading anything.
 ///
-/// Faithful in three ways that are easy to get wrong:
+/// On a terminal it prints `msg` with `[Y/n]` or `[y/N]` (the capital is the default), reads one line,
+/// and lowercases the first word of it the way `fmt.Scanln(&resp)` + `strings.ToLower` do: `y`, `yes`
+/// and `sure` are yes, an empty answer (or EOF, or a read error — Go ignores `Scanln`'s error) is
+/// `dflt`, and anything else is no.
+fn prompt_yes_no(
+    msg: &str,
+    dflt: bool,
+    interactive: bool,
+    input: &mut impl std::io::BufRead,
+    output: &mut impl std::io::Write,
+) -> bool {
+    if !interactive {
+        return dflt;
+    }
+    let choices = if dflt { "[Y/n]" } else { "[y/N]" };
+    let _ = write!(output, "{msg} {choices} ");
+    // `fmt.Print` is unbuffered; flush so the question is on screen before the read blocks.
+    let _ = output.flush();
+    let mut line = String::new();
+    let _ = input.read_line(&mut line);
+    match line
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_lowercase()
+        .as_str()
+    {
+        "y" | "yes" | "sure" => true,
+        "" => dflt,
+        _ => false,
+    }
+}
+
+/// Go's `presentRiskToUser` (`cmd/tailscale/cli/risks.go`) for a risk the caller has already found
+/// unaccepted: write the risk message and the escape hatch, then ask `Continue?` with a `false`
+/// default. `Ok(())` means the operator said yes at a terminal and the command goes ahead, as in Go.
+/// `Err` carries Go's `errAborted` text. The caller prints it bare on stderr and exits 1, because
+/// that is what Go's `main` does (`fmt.Fprintln(os.Stderr, err)`). Returning it through `main`'s
+/// `Result` would add an `Error: ` prefix.
+///
+/// Faithful in four ways that are easy to get wrong:
 /// - **Stream.** Go's `outln(riskMessage)` and `printf("To skip this warning, use --accept-risk=%s\n",
 ///   riskType)` both write to `Stdout`. The warning is the command's *output*, not a diagnostic.
 /// - **Wording.** `To skip this warning, use --accept-risk=<risk>` is Go's sentence, verbatim; the
 ///   operator can paste it out of the terminal and it names the risk that fired.
+/// - **The prompt.** `prompt.YesNo("Continue?", false)` ([`prompt_yes_no`]) only asks when stdin
+///   AND stdout are both terminals. A script, a CI job or a pipe gets the `false` default without
+///   a read, so it still aborts and never hangs waiting for an answer.
 /// - **The abort error.** Go's decline path returns `errAborted`; without it a refusal ends with the
 ///   warning as its last word and nothing that states the outcome.
 ///
-/// What is NOT ported is the prompt: Go follows the two lines with `prompt.YesNo("Continue?", false)`.
-/// That helper returns its `false` default whenever stdin and stdout are not BOTH terminals, so on any
-/// non-interactive run — a script, a CI job, a pipe — Go itself takes exactly this path and aborts.
-/// This CLI has no TTY-prompt path, so it always takes it: fail-closed, and never more permissive than
-/// upstream. Callers keep Go's acceptance check (`isRiskAccepted`, here [`risk_accepted`]) themselves,
-/// because they fold it into a wider gate — `down`'s [`down_ssh_refusal`] also has to be over a
-/// Tailscale SSH session before a risk exists at all.
-fn present_risk_to_user(risk_type: &str, risk_message: &str) -> anyhow::Error {
-    println!("{risk_message}");
-    println!("To skip this warning, use --accept-risk={risk_type}");
-    anyhow::anyhow!(RISK_ABORTED)
+/// Callers keep Go's acceptance check (`isRiskAccepted`, here [`risk_accepted`]) themselves, because
+/// they fold it into a wider gate. For `down`, [`down_ssh_refusal`] also requires a Tailscale SSH
+/// session before a risk exists at all.
+fn present_risk_to_user(
+    risk_type: &str,
+    risk_message: &str,
+    interactive: bool,
+    input: &mut impl std::io::BufRead,
+    output: &mut impl std::io::Write,
+) -> Result<(), &'static str> {
+    let _ = writeln!(output, "{risk_message}");
+    let _ = writeln!(
+        output,
+        "To skip this warning, use --accept-risk={risk_type}"
+    );
+    if prompt_yes_no("Continue?", false, interactive, input, output) {
+        return Ok(());
+    }
+    Err(RISK_ABORTED)
+}
+
+/// [`present_risk_to_user`] on the real stdin and stdout, with Go's `isatty` test on both.
+fn present_risk_to_user_on_terminal(
+    risk_type: &str,
+    risk_message: &str,
+) -> Result<(), &'static str> {
+    use std::io::IsTerminal as _;
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    present_risk_to_user(
+        risk_type,
+        risk_message,
+        interactive,
+        &mut std::io::stdin().lock(),
+        &mut std::io::stdout().lock(),
+    )
 }
 
 /// The pure decision behind the SSH-server-toggle `lose-ssh` risk — the Rust analogue of Go's
@@ -3003,8 +3075,9 @@ async fn main() -> Result<()> {
         // daemon. A dedicated renderer (not `dispatch_simple`) because the connection is EXPECTED to
         // die under a successful call — see `run_shutdown`.
         Command::Shutdown => run_shutdown(&socket).await,
-        // `login` (Go `tailscale login`): interactive (or authkey) (re)authentication that changes no
-        // prefs — `up`'s auth half on its own. Reuses the interactive-login machinery.
+        // `login` (Go `tailscale login`): switch to an empty profile, then interactive (or authkey)
+        // authentication that changes no prefs — `up`'s auth half on its own. Reuses the
+        // interactive-login machinery.
         Command::Login {
             authkey,
             authkey_file,
@@ -3400,11 +3473,11 @@ const DOWN_LOSE_SSH_RISK: &str = "You are connected over Tailscale; this action 
 /// 1. **Leftover arguments** — `down` takes none; [`down_positional_refusal`] carries Go's message.
 /// 2. **The `lose-ssh` risk** — refuse over a Tailscale SSH session unless `--accept-risk=lose-ssh`
 ///    (or `all`). Decided entirely CLI-side from `$SSH_CLIENT`, like Go's `isSSHOverTailscale`, and
-///    before anything reaches the daemon. [`present_risk_to_user`] then renders it exactly as Go
-///    does on a declined risk: warning + `To skip this warning, use --accept-risk=lose-ssh` on
-///    stdout, and Go's `errAborted` (`aborted, no changes made`) as the command's error. Go would
-///    prompt first on a terminal; this CLI has no TTY-prompt path and so always takes Go's own
-///    non-interactive answer, which is to abort.
+///    before anything reaches the daemon. [`present_risk_to_user`] then does what Go does: the
+///    warning and `To skip this warning, use --accept-risk=lose-ssh` go to stdout, then `Continue?
+///    [y/N]` is asked if stdin and stdout are both terminals. A yes lets `down` go ahead. Anything
+///    else, or no terminal, prints Go's `errAborted` (`aborted, no changes made`) bare on stderr
+///    and exits 1.
 /// 3. **Already stopped** — one read-only `status` round-trip; if the node is `Stopped`, say so on
 ///    stderr and exit 0 without a redundant edit (Go's `warnf` + `return nil`).
 /// 4. **The edit** — `Request::Down`, carrying `--reason` for the daemon to record (Go attaches it
@@ -3420,9 +3493,13 @@ async fn run_down(
         anyhow::bail!(message);
     }
     if down_ssh_refusal(is_ssh_over_tailscale(), accept_risk.unwrap_or("")) {
-        // Go: `presentRiskToUser(riskLoseSSH, <message>, downArgs.acceptedRisks)` — warning and hint
-        // on stdout, then `errAborted` returned as the command's error. See [`present_risk_to_user`].
-        return Err(present_risk_to_user("lose-ssh", DOWN_LOSE_SSH_RISK));
+        // Go: `presentRiskToUser(riskLoseSSH, <message>, downArgs.acceptedRisks)`. See
+        // [`present_risk_to_user`]. Go's `main` prints the returned `errAborted` bare, so it is
+        // printed here rather than returned; returning it would add an `Error: ` prefix.
+        if let Err(aborted) = present_risk_to_user_on_terminal("lose-ssh", DOWN_LOSE_SSH_RISK) {
+            eprintln!("{aborted}");
+            std::process::exit(1);
+        }
     }
     // Go's `localClient.Status(ctx)` pre-check. A transport failure is Go's `error fetching current
     // status` — surfaced here with the same "talking to daemon" context every other verb uses, so a
@@ -3655,8 +3732,11 @@ async fn run_up(
     // The two Go `up` spellings this build carries with no pref behind them (see `PortedUpFlags`):
     // Go decides both in its flag parser, before `runUp` looks at anything, so they are gated here
     // ahead of every other check — a `--host-routes=false` command line must not first be told
-    // about some other flag it also got wrong.
-    check_ported_up_flags(&ported)?;
+    // about some other flag it also got wrong. Refused at the flag parser's own exit status, not
+    // this function's (see `exit_like_gos_flag_parser`).
+    if let Err(err) = check_ported_up_flags(&ported) {
+        exit_like_gos_flag_parser(&err);
+    }
     // Go's own flag refusal first (stderr + exit 1), before any risk gate or daemon round-trip —
     // see `up_usage_refusal` for the ported check and why it is `up`-only.
     if let Some(message) = up_usage_refusal(
@@ -3960,10 +4040,11 @@ fn up_json_string(
 /// `StartLoginInteractive`). Reuses `poll_for_auth_url` to surface the URL, exactly like an
 /// interactive `up`.
 ///
-/// `--nickname` is the exception, and it is Go's own: `up.go` registers it on the shared flag set
-/// when `cmd == "login"`, so naming the profile is part of logging in. It is applied first, through
-/// [`login_nickname_request`], and it is deliberately NOT folded into the `up` request below — that
-/// request has to keep mentioning no pref.
+/// Before any of that, as Go's `loginCmd.Exec` does, it switches to an empty profile, then applies
+/// `--nickname` there — the two requests [`login_profile_requests`] lists. `--nickname` is Go's own:
+/// `up.go` registers it on the shared flag set when `cmd == "login"`, so naming the profile is part
+/// of logging in. It is deliberately NOT folded into the `up` request below — that request has to
+/// keep mentioning no pref.
 async fn run_login(
     socket: &std::path::Path,
     authkey: Option<String>,
@@ -3974,8 +4055,11 @@ async fn run_login(
 ) -> Result<()> {
     // `--host-routes` is on `login` because Go's flag set is shared (`newUpFlagSet` registers it for
     // both commands). Go decides it in the flag parser, before `Exec` runs, so — as on `up` — it is
-    // gated ahead of every other check, including the risk gate below.
-    check_host_routes(host_routes.as_deref())?;
+    // gated ahead of every other check, including the risk gate below, and refused at the flag
+    // parser's exit status (see `exit_like_gos_flag_parser`).
+    if let Err(err) = check_host_routes(host_routes.as_deref()) {
+        exit_like_gos_flag_parser(&err);
+    }
     // Refuse a re-auth that could drop the very Tailscale-SSH session we're on (same gate as `up
     // --force-reauth`): `login` re-registers the node. Without an explicit accept-risk flag on
     // `login` (Go's `login` has no such flag — it always StartLoginInteractive), we mirror `up`'s
@@ -3988,28 +4072,28 @@ async fn run_login(
         );
         std::process::exit(1);
     }
-    // Resolve the secret (zeroized `SecretString`); `None` → interactive login. Before the
-    // `--nickname` half, so a `file:`/`--authkey-file` that cannot be read fails with nothing renamed.
+    // Resolve the secret (zeroized `SecretString`); `None` → interactive login. Before the profile
+    // switch, so a `file:`/`--authkey-file` that cannot be read fails with the node untouched.
     let authkey = resolve_authkey(authkey, authkey_file).await?;
     let interactive = authkey.is_none();
-    // Go `login --nickname`: `ipn.Prefs.ProfileName` is part of the prefs the login applies, so it
-    // lands BEFORE the node re-authenticates (as it does upstream, where the name is in the prefs
-    // handed to `Start` and survives an auth the operator never completes). A failure here aborts
-    // the login rather than half-applying it.
-    if let Some(request) = login_nickname_request(nickname) {
+    // Go `login`: `SwitchToEmptyProfile`, then `runUp`, whose prefs carry `ipn.Prefs.ProfileName`.
+    // So the switch comes first and the nickname lands on the profile being logged in, before it
+    // authenticates. A failure at either step aborts the login rather than half-applying it.
+    for request in login_profile_requests(nickname) {
         match round_trip(socket, &request)
             .await
             .with_context(|| format!("talking to daemon at {}", socket.display()))?
         {
-            // The rename is a step of `login`, not a command of its own: its "preferences updated"
-            // line would only be noise before the login's own `ok:`. Go prints nothing for it either.
+            // Both are steps of `login`, not commands of their own: their lines would only be noise
+            // before the login's own `ok:`. Go prints nothing for them either.
             Response::Ok { .. } => {}
             Response::Error { message } => {
                 eprintln!("error: {message}");
                 std::process::exit(1);
             }
+            // Neither step can draw another reply: the switch answers `Ok` or `Error` only, and
             // `set --nickname` names one pref and reverts none, so the guard cannot fire on it.
-            other => anyhow::bail!("unexpected response to login --nickname: {other:?}"),
+            other => anyhow::bail!("unexpected response to login: {other:?}"),
         }
     }
     // An `up` that mentions NO pref (every override `None`) + force_reauth: just (re)authenticate.
@@ -6013,13 +6097,40 @@ async fn run_whoami(socket: &std::path::Path, json: bool) -> Result<()> {
 /// `-4 -6` is the same Go check, which is why this is NOT a clap `conflicts_with`: clap would answer
 /// that one pair with its own stderr + exit 2 text while the other two pairs got Go's, and one
 /// upstream check should have one message. Go's is returned as an error (stderr, exit 1) rather than
-/// `outln`-ed, so the caller `bail!`s it instead of following [`switch_usage_refusal`]'s stdout path.
+/// `outln`-ed, so the caller prints it to stderr and exits 1 rather than following
+/// [`switch_usage_refusal`]'s stdout path. It does NOT go back through `main`'s `Result`: Go's `main`
+/// prints a returned error with `fmt.Fprintln(os.Stderr, err)`, so the text stands alone, and
+/// returning it here would put anyhow's `Error: ` in front of the one line a script greps for.
 /// Pure (no I/O, no process exit) so the whole refusal table is unit-testable.
 fn ip_usage_refusal(v4: bool, v6: bool, first: bool) -> Option<&'static str> {
     if [first, v4, v6].into_iter().filter(|b| *b).count() > 1 {
         return Some("tnet ip -1, -4, and -6 are mutually exclusive");
     }
     None
+}
+
+/// Go's `--assert` refusal, rendered the way Go renders it:
+///
+/// ```go
+/// return fmt.Errorf("assertion failed: IP %q not found among %v", ipArgs.assert, ips)
+/// ```
+///
+/// Both operands carry information the operator needs and the old text dropped. `%q` is the
+/// asserted address **as typed**, quoted — not a re-spelling of it — so an assertion that failed
+/// because of how the address was written still shows what was written. `%v` over Go's
+/// `[]netip.Addr` is the whole list it was compared against, space-separated inside brackets, and
+/// `[]` when the node holds nothing: on an addressless node that empty list IS the finding, and
+/// naming only the wanted address left the operator unable to tell "wrong address" from "no
+/// addresses at all".
+///
+/// Rust's `{:?}` on a `&str` and Go's `%q` agree on every byte an IP argument can contain (ASCII,
+/// no escapes), so the quoting needs no hand-rolling. Pure, so the text is unit-testable without a
+/// daemon.
+fn assert_failure_message(want: &str, ips: &[&str]) -> String {
+    format!(
+        "assertion failed: IP {want:?} not found among [{}]",
+        ips.join(" ")
+    )
 }
 
 /// One netmap node's tailnet addresses — Go's `ipnstate.PeerStatus.TailscaleIPs`, which this fork
@@ -6145,13 +6256,32 @@ async fn run_ip(
 ) -> Result<()> {
     // Go's flag refusal runs before `--assert` and before the `Status` call, so an unusable
     // invocation costs no daemon round trip and says the same thing whether the daemon is up.
+    // Printed and exited here, not returned: this was the last of GO'S OWN refusals in `runIP`
+    // still going out through `main`, which puts anyhow's `Error: ` in front of it where Go's
+    // `fmt.Fprintln(os.Stderr, err)` prints the text bare. Two paths in this function still return
+    // through `main`, both fork-local: the `--assert` parse failure below, and the `unexpected
+    // response to ...` bails. Neither has an upstream text to match — Go cannot produce either —
+    // so the prefix costs nothing there.
     if let Some(message) = ip_usage_refusal(v4, v6, first) {
-        anyhow::bail!(message);
+        eprintln!("{message}");
+        std::process::exit(1);
     }
     let sel = IpSelect { v4, v6, first };
     // `--assert <ip>`: verify one of this node's own IPs matches; exit 0 on a match, 1 otherwise.
-    // Prints nothing on success (Go's behavior) — it is a script predicate, not a display. Compares
-    // by parsed `IpAddr` so `100.64.0.1` and `100.064.000.001`-style spellings normalize.
+    // Prints nothing on success (Go's behavior) — it is a script predicate, not a display. Runs
+    // before the peer argument and before the empty-list check, as Go orders it, so `--assert` on a
+    // node with no address at all reports the assertion, not the missing addresses.
+    //
+    // Compares by parsed `IpAddr`, which normalises IPv6 spelling and case: `FD7A:115C:A1E0::1`
+    // and `fd7a:115c:a1e0:0::1` both parse to the address a netmap spells `fd7a:115c:a1e0::1`, and
+    // all three assert alike where Go's string comparison against `ip.String()` would accept only
+    // the canonical one. The comparison is pre-existing and stays; what it does NOT accept is an
+    // argument that is no address at all — Rust's parser rejects leading-zero octets
+    // (`100.064.000.001`) and zone suffixes, and that fails the `parse` below and returns through
+    // `main`, so such an argument still gets this fork's text behind anyhow's `Error: ` rather than
+    // Go's assertion refusal. That one path is unported. On every argument that does parse, the
+    // refusal below quotes it as typed, so a normalising match and a Go run describe the same
+    // addresses.
     if let Some(want) = assert {
         let want_ip: std::net::IpAddr = want
             .parse()
@@ -6167,15 +6297,20 @@ async fn run_ip(
                 return Err(e).with_context(|| format!("querying ip at {}", socket.display()));
             }
         };
-        let matches = [ipv4.as_deref(), ipv6.as_deref()]
+        // Go's `ips` at this point: the whole list `runIP` compares against, which it also prints
+        // on a miss. Kept as one slice so the comparison and the refusal see the same addresses.
+        let ips: Vec<&str> = [ipv4.as_deref(), ipv6.as_deref()]
             .into_iter()
             .flatten()
+            .collect();
+        let matches = ips
+            .iter()
             .filter_map(|s| s.parse::<std::net::IpAddr>().ok())
             .any(|ip| ip == want_ip);
         if matches {
             return Ok(());
         }
-        eprintln!("assertion failed: this node does not hold {want_ip}");
+        eprintln!("{}", assert_failure_message(&want, &ips));
         std::process::exit(1);
     }
     let out: Result<String, String> = if let Some(peer) = peer {
@@ -6265,7 +6400,12 @@ async fn run_ip(
         // Go's `BackendState` comes from this same `Status` read, so no second round trip.
         resolved.map_err(|why| why.message(&status.state))
     } else {
-        // Self addresses.
+        // Self addresses. `Request::Ip` answers an EMPTY pair on a node with no engine rather than
+        // refusing (see the `Request::Ip` dispatch arm in `src/server.rs`), which is what keeps the
+        // `NoCurrentIps` branch below reachable in production: Go's `ips` are just a field of the
+        // one `Status` it reads, and an addressless node is an empty list there, never an error.
+        // While the daemon refused instead, this arm printed `error: node is not up` and a real
+        // Stopped/NeedsLogin node never saw Go's state line.
         let resolved = match round_trip(socket, &Request::Ip).await {
             Ok(Response::Ip { ipv4, ipv6 }) => {
                 format_ip_filtered(ipv4.as_deref(), ipv6.as_deref(), sel)
@@ -9246,7 +9386,7 @@ fn format_lock_status(r: &tailscaled_rs::localapi::LockReport, json: bool) -> St
 /// each update's raw AUM CBOR and prints what the change did (the added key's kind/id/metadata, the
 /// removed key id). This build carries the raw CBOR on the wire but does not decode it — the daemon
 /// has no AUM decoder — so a stanza reports the hash, the change kind and the ids of the keys that
-/// signed it. `--json` emits the raw CBOR (hex) so the full AUM can still be decoded out-of-band.
+/// signed it. `--json` does decode it (see below).
 ///
 /// Two refusals are Go's and are reproduced here rather than rendered around:
 ///
@@ -9259,19 +9399,16 @@ fn format_lock_status(r: &tailscaled_rs::localapi::LockReport, json: bool) -> St
 /// - **An unknown `--json` version is refused by number.** Go's `printTailnetLockLog` serves schema
 ///   version 1 and answers anything else with `unrecognised version: %d`.
 ///
-/// The `--json` payload is NOT Go's schema 1, and no longer claims to be. Upstream
-/// `PrintTailnetLockLogJSONV1` (`cmd/tailscale/cli/jsonoutput/tailnet-lock-log.go`) emits
-/// `{"SchemaVersion": "1", "Messages": [...]}`, each message a `logMessageV1` expanding the update's
-/// decoded AUM into named fields (`MessageKind`, `PrevAUMHash`, ...). Decoding an AUM needs the CBOR
-/// decoder this daemon does not have, so what this build can honestly serve is `enabled` + `entries`
-/// (hash, change, signing key ids, raw CBOR as hex). The `jsonoutput.ResponseEnvelope` field name is
-/// kept, but its value names THIS fork's schema — `SchemaVersion: "tailscaled-rs.1"` — so a consumer
-/// written against `tailscale lock log --json=1` fails its version check on the very field it
-/// checks, rather than being told `"1"` and then reading a `.Messages` that is not there. The flag
-/// still behaves as Go's: `--json=1` selects this command's version 1 and any other version is
-/// refused by number; the envelope only says which version-1 document came back. `enabled` is always
-/// `true` now that the disabled case exits before printing; it is kept so the object does not change
-/// shape from the pre-refusal builds.
+/// The `--json=1` payload is Go's schema 1: upstream `PrintTailnetLockLogJSONV1`
+/// (`cmd/tailscale/cli/jsonoutput/tailnet-lock-log.go` @ `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`)
+/// ported whole — `{"SchemaVersion": "1", "Messages": [...]}`, one [`LockLogMessageV1`] per update,
+/// each AUM decoded with the engine's `ts_tka` decoder and expanded into Go's named fields. Its two
+/// refusals come with it, and either one fails the whole command with nothing printed:
+///
+/// - `decoding: <err>` when an update's raw bytes are not an AUM.
+/// - `incorrect AUM hash: got <hash>, want <update>` when the decoded AUM does not hash to the
+///   update's hash. Go's `want` is the `%v` of the whole `ipnstate.TailnetLockUpdate`, and so is ours
+///   ([`go_lock_update_value`]).
 ///
 /// Pure (returns the string incl. its trailing newline, or Go's refusal) → unit-testable.
 fn format_lock_log(
@@ -9288,30 +9425,20 @@ fn format_lock_log(
         if json.version != 1 {
             anyhow::bail!("unrecognised version: {}", json.version);
         }
-        use serde_json::{Map, Value, json};
-        let entries: Vec<Value> = r
+        // Go decodes every update before printing any, so one bad update prints nothing at all.
+        let messages = r
             .entries
             .iter()
-            .map(|e| {
-                let mut m = Map::new();
-                m.insert("hash".into(), json!(e.hash));
-                m.insert("change".into(), json!(e.change));
-                m.insert("signer_key_ids".into(), json!(e.signer_key_ids));
-                m.insert("raw".into(), json!(e.raw));
-                Value::Object(m)
-            })
-            .collect();
-        let mut root = Map::new();
-        // Go's `ResponseEnvelope.SchemaVersion` — a string, as upstream types it — but carrying this
-        // fork's schema name rather than Go's `"1"`. The document below is not Go's version 1, so it
-        // must not answer `"1"` to a script that pinned Go's.
-        root.insert("SchemaVersion".into(), json!("tailscaled-rs.1"));
-        root.insert("enabled".into(), json!(r.enabled));
-        root.insert("entries".into(), Value::Array(entries));
-        return Ok(format!(
-            "{}\n",
-            serde_json::to_string_pretty(&root).unwrap_or_else(|_| "{}".to_string())
-        ));
+            .map(lock_log_message_v1)
+            .collect::<Result<Vec<_>>>()?;
+        let doc = LockLogDocumentV1 {
+            schema_version: "1",
+            messages,
+        };
+        // Go's `json.Encoder` with `SetIndent("", "  ")`: serde_json's pretty form is the same
+        // layout, and `Encode` ends the document with a newline.
+        let body = serde_json::to_string_pretty(&doc).context("encoding the lock log")?;
+        return Ok(format!("{}\n", go_json_escape_html(&body)));
     }
     // Lock on but nothing synced: Go's `printTailnetLockLog` ranges over an empty slice and returns,
     // so it prints nothing at all. Nothing here either — the loop below is simply empty. The silence
@@ -9343,6 +9470,241 @@ fn format_lock_log(
         out.push('\n');
     }
     Ok(out)
+}
+
+/// Go's schema-1 `lock log` document: the embedded `jsonoutput.ResponseEnvelope`, then `Messages`.
+/// The envelope's `_WARNING` is `omitzero` and Go leaves it empty here, so it never appears. Every
+/// struct below serializes its fields in declaration order, which is Go's struct order.
+#[derive(serde::Serialize)]
+struct LockLogDocumentV1 {
+    #[serde(rename = "SchemaVersion")]
+    schema_version: &'static str,
+    #[serde(rename = "Messages")]
+    messages: Vec<LockLogMessageV1>,
+}
+
+/// Go's `logMessageV1`: the AUM hash (base32), the expanded AUM, and the raw CBOR (base64).
+#[derive(serde::Serialize)]
+struct LockLogMessageV1 {
+    #[serde(rename = "Hash")]
+    hash: String,
+    #[serde(rename = "AUM")]
+    aum: ExpandedAumV1,
+    #[serde(rename = "Raw")]
+    raw: String,
+}
+
+/// Go's `expandedAUMV1`. Each `omitzero` field in Go is skipped here when it holds its zero value.
+#[derive(serde::Serialize)]
+struct ExpandedAumV1 {
+    #[serde(rename = "MessageKind")]
+    message_kind: String,
+    #[serde(rename = "PrevAUMHash", skip_serializing_if = "String::is_empty")]
+    prev_aum_hash: String,
+    #[serde(rename = "Key", skip_serializing_if = "Option::is_none")]
+    key: Option<TkaKeyV1>,
+    #[serde(rename = "KeyID", skip_serializing_if = "String::is_empty")]
+    key_id: String,
+    #[serde(rename = "State", skip_serializing_if = "Option::is_none")]
+    state: Option<ExpandedStateV1>,
+    #[serde(rename = "Votes", skip_serializing_if = "go_omitzero_uint")]
+    votes: u64,
+    #[serde(
+        rename = "Meta",
+        skip_serializing_if = "std::collections::BTreeMap::is_empty"
+    )]
+    meta: std::collections::BTreeMap<String, String>,
+    #[serde(rename = "Signatures", skip_serializing_if = "Vec::is_empty")]
+    signatures: Vec<ExpandedSignatureV1>,
+}
+
+/// Go's `tkaKeyV1`. `Meta` is a map, so its keys come out sorted, as Go's `encoding/json` sorts them.
+#[derive(serde::Serialize)]
+struct TkaKeyV1 {
+    #[serde(rename = "Kind", skip_serializing_if = "String::is_empty")]
+    kind: String,
+    #[serde(rename = "Votes")]
+    votes: u64,
+    #[serde(rename = "Public")]
+    public: String,
+    #[serde(
+        rename = "Meta",
+        skip_serializing_if = "std::collections::BTreeMap::is_empty"
+    )]
+    meta: std::collections::BTreeMap<String, String>,
+}
+
+/// Go's `expandedStateV1`. `DisablementValues` and `Keys` are not `omitzero`, and Go builds them by
+/// appending to a nil slice, so an empty list is `null`, not `[]`.
+#[derive(serde::Serialize)]
+struct ExpandedStateV1 {
+    #[serde(rename = "LastAUMHash", skip_serializing_if = "String::is_empty")]
+    last_aum_hash: String,
+    #[serde(rename = "DisablementValues")]
+    disablement_values: Option<Vec<String>>,
+    #[serde(rename = "Keys")]
+    keys: Option<Vec<TkaKeyV1>>,
+    #[serde(rename = "StateID1")]
+    state_id1: u64,
+    #[serde(rename = "StateID2")]
+    state_id2: u64,
+}
+
+/// Go's `expandedSignatureV1`.
+#[derive(serde::Serialize)]
+struct ExpandedSignatureV1 {
+    #[serde(rename = "KeyID")]
+    key_id: String,
+    #[serde(rename = "Signature")]
+    signature: String,
+}
+
+fn go_omitzero_uint(n: &u64) -> bool {
+    *n == 0
+}
+
+/// Decode one update and expand it — Go's loop body in `PrintTailnetLockLogJSONV1` plus
+/// `toLogMessageV1`. The hash check compares against the AUM's re-serialized hash, exactly as Go's
+/// `aum.Hash()` does, not against a hash of the bytes as received.
+fn lock_log_message_v1(e: &tailscaled_rs::localapi::LockLogEntry) -> Result<LockLogMessageV1> {
+    // The daemon carries `Raw` as hex; bytes that are not hex never were an AUM.
+    let raw = hex_decode_lower(&e.raw).map_err(|err| anyhow!("decoding: {err}"))?;
+    let aum = ts_tka::Aum::from_cbor(&raw).map_err(|err| anyhow!("decoding: {err}"))?;
+    let got = aum.hash();
+    let want = ts_tka::AumHash::from_base32(&e.hash);
+    if want != Some(got) {
+        anyhow::bail!(
+            "incorrect AUM hash: got {}, want {}",
+            got.to_base32(),
+            go_lock_update_value(e, want, &raw)
+        );
+    }
+
+    let tlpub = |id: &[u8]| format!("tlpub:{}", lower_hex(id));
+    let state = aum.state.as_ref().map(|s| ExpandedStateV1 {
+        last_aum_hash: s.last_aum_hash.map(|h| h.to_base32()).unwrap_or_default(),
+        disablement_values: s
+            .disablement_values
+            .as_deref()
+            .filter(|v| !v.is_empty())
+            .map(|v| v.iter().map(|d| lower_hex(d)).collect()),
+        keys: s
+            .keys
+            .as_deref()
+            .filter(|k| !k.is_empty())
+            .map(|k| k.iter().map(tka_key_v1).collect()),
+        state_id1: s.state_id1,
+        state_id2: s.state_id2,
+    });
+    // `State` is `omitzero` on a struct: Go drops it when every field of the expansion is zero.
+    let state = state.filter(|s| {
+        !(s.last_aum_hash.is_empty()
+            && s.disablement_values.is_none()
+            && s.keys.is_none()
+            && s.state_id1 == 0
+            && s.state_id2 == 0)
+    });
+    Ok(LockLogMessageV1 {
+        hash: got.to_base32(),
+        aum: ExpandedAumV1 {
+            message_kind: aum.message_kind.as_str().to_string(),
+            prev_aum_hash: aum.prev_aum_hash.map(|h| h.to_base32()).unwrap_or_default(),
+            key: aum.key.as_ref().map(tka_key_v1),
+            key_id: if aum.key_id.is_empty() {
+                String::new()
+            } else {
+                tlpub(&aum.key_id)
+            },
+            state,
+            votes: aum.votes.map(u64::from).unwrap_or_default(),
+            meta: aum.meta.iter().cloned().collect(),
+            signatures: aum
+                .signatures
+                .iter()
+                .map(|s| ExpandedSignatureV1 {
+                    key_id: tlpub(&s.key_id),
+                    signature: base64_url_padded(&s.signature),
+                })
+                .collect(),
+        },
+        raw: base64_url_padded(&raw),
+    })
+}
+
+/// Go's `toTKAKeyV1`: `Kind` is `KeyKind.String()` (`"25519"`), `Public` is `tlpub:%x`.
+fn tka_key_v1(key: &ts_tka::AumKey) -> TkaKeyV1 {
+    TkaKeyV1 {
+        kind: match key.kind {
+            ts_tka::KeyKind::Ed25519 => "25519".to_string(),
+        },
+        votes: u64::from(key.votes),
+        public: format!("tlpub:{}", lower_hex(&key.public)),
+        meta: key.meta.iter().cloned().collect(),
+    }
+}
+
+/// Go's `%v` of an `ipnstate.TailnetLockUpdate{Hash [32]byte; Change string; Raw []byte}`, the
+/// `want` in `incorrect AUM hash`: `{[1 2 …] add-key [161 …]}`. Go's hash is a byte array and cannot
+/// be malformed; ours arrives as base32 text, so text that is not a 32-byte hash is shown as sent.
+fn go_lock_update_value(
+    e: &tailscaled_rs::localapi::LockLogEntry,
+    want: Option<ts_tka::AumHash>,
+    raw: &[u8],
+) -> String {
+    let bytes = |b: &[u8]| b.iter().map(u8::to_string).collect::<Vec<_>>().join(" ");
+    let hash = match want {
+        Some(h) => format!("[{}]", bytes(&h.0)),
+        None => sanitize_for_terminal(&e.hash),
+    };
+    format!(
+        "{{{hash} {} [{}]}}",
+        sanitize_for_terminal(&e.change),
+        bytes(raw)
+    )
+}
+
+/// Lowercase hex, Go's `%x` over a byte slice.
+fn lower_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Go's `base64.URLEncoding.EncodeToString`: the RFC 4648 URL-safe alphabet, WITH `=` padding.
+fn base64_url_padded(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        let n = (u32::from(chunk[0]) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+        // A chunk of k bytes carries k+1 symbols; the rest of the quantum is padding.
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 0x3f) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// Go's `json.Encoder` escapes `<`, `>` and `&` (its default `SetEscapeHTML(true)`) and always
+/// escapes U+2028 and U+2029; serde_json escapes none of them. Every other escape the two share.
+/// None of these characters can occur in JSON outside a string, so escaping the whole document is
+/// escaping exactly the strings in it.
+fn go_json_escape_html(json: &str) -> String {
+    let mut out = String::with_capacity(json.len());
+    for c in json.chars() {
+        match c {
+            '<' => out.push_str("\\u003c"),
+            '>' => out.push_str("\\u003e"),
+            '&' => out.push_str("\\u0026"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Render `tnet dns status` from a [`DnsStatusReport`](tailscaled_rs::localapi::DnsStatusReport)
@@ -11202,6 +11564,8 @@ async fn watch_status(socket: &std::path::Path, json: bool, filter: StatusFilter
         initial_netmap: false,
         prefs: false,
         policy: false,
+        suggested_exit_node: false,
+        initial_status: false,
     })?;
     line.push(b'\n');
     write_half.write_all(&line).await?;
@@ -11261,9 +11625,9 @@ async fn watch_status(socket: &std::path::Path, json: bool, filter: StatusFilter
 
 /// `debug watch-ipn` (Go `tailscale debug watch-ipn-bus`): stream the daemon's IPN notification bus,
 /// printing one JSON [`NotifyView`](tailscaled_rs::localapi::NotifyView) per line. Sends the **masked**
-/// `watch` request with every mask bit set (`initial_state`, `initial_netmap`, `prefs`, `policy`) so
-/// the first frames are the current state + peer set + prefs + effective policy, and each later frame
-/// carries only what changed. Reuses `watch_status`'s
+/// `watch` request with every mask bit set (`initial_state`, `initial_netmap`, `prefs`, `policy`,
+/// `suggested_exit_node`) so the first frames are the current state + peer set + prefs + effective
+/// policy + exit-node suggestion, and each later frame carries only what changed. Reuses `watch_status`'s
 /// streaming-read shape — connect, write the one request line, then read [`Response`] lines until the
 /// daemon closes the stream — but on the Notify path: `Notify` frames print as JSON, an `Error` frame
 /// exits non-zero, and any other reply (impossible on this connection) is noted and skipped.
@@ -11274,14 +11638,19 @@ async fn run_debug_watch_ipn(socket: &std::path::Path) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
 
     // The MASKED watch: all snapshots requested → the daemon streams `Response::Notify` frames (not
-    // `Response::Status`), front-loading the current state + peer set + prefs + effective policy, then
-    // streaming each change (a fresh prefs frame on every up/set/logout/switch/reload-config, and a
-    // fresh policy snapshot on every `syspolicy reload`).
+    // `Response::Status`), front-loading the current state + peer set + prefs + effective policy +
+    // exit-node suggestion, then streaming each change (a fresh prefs frame on every
+    // up/set/logout/switch/reload-config, a fresh policy snapshot whenever the effective policy
+    // actually moves — a `syspolicy reload` that re-resolves the same rows pushes nothing, matching
+    // Go's `reloadNow` change-callback guard — and the exit-node suggestion whenever a computed one
+    // differs from the last published).
     let mut line = serde_json::to_vec(&Request::Watch {
         initial_state: true,
         initial_netmap: true,
         prefs: true,
         policy: true,
+        suggested_exit_node: true,
+        initial_status: false,
     })?;
     line.push(b'\n');
     write_half.write_all(&line).await?;
@@ -11626,8 +11995,41 @@ struct PortedUpFlags {
     /// `IsBoolFlag` default); any other value is Go's `notFalseVar` refusal.
     host_routes: Option<String>,
     /// `--nickname <NAME>`, hidden. Carried only to be refused by name: neither this fork's `up`
-    /// nor Go's takes a profile name.
+    /// nor Go's takes a profile name. Go's own answer is its flag parser's `flag provided but not
+    /// defined: -nickname`, so the refusal keeps that answer's exit status and its bare, unprefixed
+    /// shape. What it does not keep is that sentence, nor the usage block Go's parser prints after
+    /// it — both departures, and the reasons for both, are in [`exit_like_gos_flag_parser`].
     nickname: Option<String>,
+}
+
+/// Print a refusal that Go decides in its **flag parser**, and exit the way that parser exits.
+///
+/// `newFlagSet` (`cmd/tailscale/cli/cli.go`) builds its flag sets with `flag.ExitOnError` — every
+/// one a native build makes, its `runtime.GOOS == "js"` case being the lone exception — so a
+/// flag that is not in the set (`flag provided but not defined: -nickname`) and a `Var` whose `Set`
+/// returns an error (`notFalseVar` on `--host-routes`) both print to stderr and exit **2** — `runUp`
+/// never runs. That is deliberately a different status from the exit 1 the other refusals here end
+/// at (`up_usage_refusal`, `switch_usage_refusal`, `sysext_refusal`), and the difference is the part
+/// worth keeping: a wrapper script can tell a command line it typed wrong from a node that would not
+/// come up. It is also the status clap gives its own parse errors, so a ported command line gets one
+/// answer whether or not this CLI happens to carry the flag — which leaves the message as the whole
+/// of what the hidden `--nickname` buys over clap's "unexpected argument", and the message is why
+/// the flag is carried at all.
+///
+/// Printing here rather than returning the error also drops the `Error: ` prefix `main`'s
+/// `Result` return would have `Termination` add, which is the second half of matching Go: its flag
+/// package prints the bare sentence. Both are pinned in `tests/tnet_up_go_flag_spellings.rs`.
+///
+/// For `--nickname` the sentence itself is this fork's: it names where the behaviour does live
+/// instead of stopping at "not defined". `--host-routes` keeps Go's sentence byte for byte,
+/// including the one-dash `-host-routes` Go's flag package prints for the name it registered,
+/// whether the operator typed one dash or two. Go's usage block is dropped both times — `failf`
+/// prints the message and then calls `f.usage()`, so upstream's stderr carries the command's whole
+/// flag list after the sentence — for the reason every other refusal here leaves it off: the
+/// message already says what to run.
+fn exit_like_gos_flag_parser(err: &anyhow::Error) -> ! {
+    eprintln!("{err}");
+    std::process::exit(2)
 }
 
 /// Gate the Go `up` spellings that carry no pref (see [`PortedUpFlags`]). `Ok(())` means the
@@ -11635,8 +12037,9 @@ struct PortedUpFlags {
 ///
 /// Ordering is Go's: both are decided in the flag parser (`notFalseVar.Set` for `--host-routes`;
 /// `--nickname` is simply not in `up`'s flag set), which runs before `runUp` reads the daemon's
-/// status or validates any other flag. So this runs before every other `up` check. Pure →
-/// unit-testable.
+/// status or validates any other flag. So this runs before every other `up` check. An `Err` is
+/// Go's flag-parse failure and its callers answer it as one — stderr, exit 2, via
+/// [`exit_like_gos_flag_parser`]. Pure (no I/O, no process exit) → unit-testable.
 fn check_ported_up_flags(flags: &PortedUpFlags) -> Result<()> {
     check_host_routes(flags.host_routes.as_deref())?;
     if flags.nickname.is_some() {
@@ -11659,19 +12062,34 @@ fn check_ported_up_flags(flags: &PortedUpFlags) -> Result<()> {
 /// `None` = the flag was absent; `Some("true")` = its presence (Go's `IsBoolFlag` default) or an
 /// explicit `--host-routes=true`, the one value Go allows — accepted and inert, because this build's
 /// userspace netstack installs no host routes and Go has required `true` since Tailscale 1.67.
-/// Pure → unit-testable.
+/// An `Err` is a failure of `flag.Parse` upstream, so both callers answer it at that parser's exit
+/// status (see [`exit_like_gos_flag_parser`]). Pure → unit-testable.
 fn check_host_routes(value: Option<&str>) -> Result<()> {
     // Go's `notFalseVar.Set` rejects every value but "true", and Go's flag package wraps that in
-    // `invalid boolean value %q for -host-routes: %v`. Same sentence, this CLI's flag spelling.
+    // `invalid boolean value %q for -host-routes: %v`. Same sentence, byte for byte: the flag
+    // package prints the name as registered, one dash, whichever spelling the operator typed.
     if let Some(value) = value
         && value != "true"
     {
         anyhow::bail!(
-            "invalid boolean value {value:?} for --host-routes: unsupported value; only 'true' \
+            "invalid boolean value {value:?} for -host-routes: unsupported value; only 'true' \
              is allowed"
         );
     }
     Ok(())
+}
+
+/// The requests `login` sends before it authenticates, in order: Go `loginCmd.Exec`'s
+/// `localClient.SwitchToEmptyProfile` ([`Request::SwitchToEmptyProfile`]), then, only when
+/// `--nickname` was given, [`login_nickname_request`]. The order is the whole point: the rename
+/// goes to the current profile, so sent first it would rename the account the node was already
+/// logged in to (upstream, `runUp` only sets `ProfileName` after the switch).
+///
+/// Pure → unit-testable.
+fn login_profile_requests(nickname: Option<Option<String>>) -> Vec<Request> {
+    std::iter::once(Request::SwitchToEmptyProfile)
+        .chain(login_nickname_request(nickname))
+        .collect()
 }
 
 /// Build the one-pref `set` request that carries Go `login --nickname` (`ipn.Prefs.ProfileName`), or
@@ -12254,6 +12672,11 @@ fn cgi_response(status: &str, body: &str) -> String {
 /// too — which is why only `--readonly` (or a pref that is already on) reaches a CGI response with
 /// nothing on stderr. Go turns the pref back off on interrupt only in listener mode; a CGI request
 /// leaves it on.
+///
+/// Whichever mode runs, it runs under the same interrupt arm ([`serve_until_interrupt`]): Go arms
+/// `signal.NotifyContext` before any of this and ends every interrupted run at `os.Exit(0)`, so
+/// what the pref state changes is [`web_interrupt_stops_web_client`], never whether Ctrl-C is
+/// handled at all.
 async fn run_web(
     socket: &std::path::Path,
     listen: Option<String>,
@@ -12263,10 +12686,15 @@ async fn run_web(
     cgi: bool,
 ) -> Result<()> {
     let started_web_client = !readonly && start_tailscaled_web_client(socket).await?;
+    // Whether an interrupt of THIS run has a pref to put back — the only conditional part of Go's
+    // interrupt goroutine. The arm itself is not conditional: every run gets one.
+    let stop_web_client = web_interrupt_stops_web_client(cgi, started_web_client);
     if cgi {
         // CGI mode owns stdout: the response IS this process's stdout, so nothing may be printed
         // alongside it (no startup line) and no browser is opened (there is no server to browse).
-        return run_web_cgi(socket, &normalize_served_path(&prefix)).await;
+        let served_path = normalize_served_path(&prefix);
+        let serve = run_web_cgi(socket, &served_path);
+        return serve_until_interrupt(serve, web_interrupt(), std::future::ready(())).await;
     }
     let listen = listen.unwrap_or_else(|| DEFAULT_WEB_LISTEN.to_string());
     let serve = async {
@@ -12274,11 +12702,6 @@ async fn run_web(
             .await
             .with_context(|| format!("serving web UI on {listen}"))
     };
-    if !started_web_client {
-        return serve.await;
-    }
-    // Go shuts down the web client it started when the CLI is interrupted, then exits 0.
-    //
     // Interruption is the ONLY path that turns the pref back off. A serving failure — the bind
     // that finds the port taken — returns the error with the pref left on, which is what Go does
     // too: its `setRunWebClient(false)` lives in the goroutine parked on `signal.NotifyContext`'s
@@ -12288,13 +12711,59 @@ async fn run_web(
     // run where it won, it would `os.Exit(0)` and swallow the failure. Turning the pref off here
     // would deterministically pick half of a race Go never meant to have, so a failed `web` leaves
     // the pref as Go leaves it: on, for `tnet set --webclient=false` to clear.
-    tokio::select! {
-        served = serve => served,
-        _ = tokio::signal::ctrl_c() => {
+    let on_interrupt = async {
+        if stop_web_client {
             eprintln!("stopping tailscaled web client");
             if let Err(e) = set_run_web_client(socket, false).await {
                 eprintln!("stopping tailscaled web client: {e:#}");
             }
+        }
+    };
+    serve_until_interrupt(serve, web_interrupt(), on_interrupt).await
+}
+
+/// Whether an interrupted `web` run turns the daemon's `RunWebClient` pref back off: only a
+/// listener run that itself turned the pref on does.
+///
+/// This is the whole of what Go's interrupt goroutine makes conditional —
+/// `if !webArgs.cgi && startedManagementClient` guards the `setRunWebClient(false)` step and
+/// nothing else. Every other interrupted run (`--readonly`, a daemon whose pref was already on, a
+/// `--cgi` request) still stops the server and ends at `os.Exit(0)`; it just has no pref of its own
+/// to put back. Pure → unit-testable.
+fn web_interrupt_stops_web_client(cgi: bool, started_web_client: bool) -> bool {
+    !cgi && started_web_client
+}
+
+/// The interrupt source for a `web` run: Go's `signal.NotifyContext(ctx, os.Interrupt)`, which
+/// `runWeb` arms as its first statement — before the pref step, before the mode split, for every
+/// run the command has.
+///
+/// Completing this future means "interrupted". If the handler cannot be installed at all, park
+/// forever instead of completing: a run that reported an interrupt it never received would tear
+/// down a healthy server the moment it started serving.
+async fn web_interrupt() {
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Serve until the work finishes or an interrupt arrives, which is the shape of Go's `runWeb`: the
+/// command's return value is whatever serving returned, but an interrupt runs `on_interrupt` and
+/// then ends the run SUCCESSFULLY — Go's goroutine finishes `<-ctx.Done()` with `os.Exit(0)` for
+/// every interrupted run, so a supervisor that stops a `web` listener reads a clean exit, not the
+/// 130 a default SIGINT disposition would leave.
+///
+/// The signal is a parameter rather than a call inside, so the ordering this encodes can be tested
+/// without raising a real SIGINT at the test process.
+async fn serve_until_interrupt(
+    serve: impl std::future::Future<Output = Result<()>>,
+    interrupt: impl std::future::Future<Output = ()>,
+    on_interrupt: impl std::future::Future<Output = ()>,
+) -> Result<()> {
+    tokio::select! {
+        served = serve => served,
+        _ = interrupt => {
+            on_interrupt.await;
             Ok(())
         }
     }
@@ -13393,16 +13862,80 @@ impl std::fmt::Display for ServeUsageError {
 
 impl std::error::Error for ServeUsageError {}
 
-/// [`check_serve_flags`] as `runServeCombined` performs it: a [`ServeUsageError`] is written to
-/// stderr with Go's framing and exits 1, rather than propagating to `main` to be printed as one
-/// `Error: …` line. Every other refusal propagates untouched.
+/// A `runServeCombined` refusal whose Go text carries no prefix of its own.
+///
+/// Go's `main` prints whatever `cli.Run` returns with a bare `fmt.Fprintln(os.Stderr, err)` and
+/// exits 1 — no `Error: `, no `error: `, just the sentence. `anyhow` does not work that way: a `main`
+/// returning `Result` renders its error as `Error: {err:?}`, so every refusal that simply propagates
+/// picks up bytes Go never wrote.
+///
+/// The rule that decides which refusals need this type is whether Go's own text already begins with
+/// `Error: `. Four of `runServeCombined`'s do not, so they are tagged:
+///
+/// * `fmt.Errorf("failed to clean the mount point: %w", err)`
+/// * `fmt.Errorf("PROXY protocol is only supported for TCP forwarding, not HTTP/HTTPS")`
+/// * `fmt.Errorf("invalid PROXY protocol version %d; must be 1 or 2", …)`
+/// * `errors.New("tun mode is only supported for services")`
+///
+/// The other two do: Go spells the prefix into the literal itself —
+/// `errors.New("Error: --service flag is not supported with funnel")` and its background-mode twin
+/// — so the literals here are written without one and must NOT be tagged, or the prefix doubles
+/// into `Error: Error: …`. (What those two print today is not Go's line either, but for an
+/// unrelated reason: `main` wraps every serve/funnel result in a `via <socket>` context, so the
+/// sentence lands under `Caused by:`. That is a different divergence with a different cause;
+/// `tests/serve_refusal_stderr_framing.rs` records the bytes it produces so the shape is on record.)
+///
+/// Prefixing the four literals to "match Go" is not the same fix and is actively wrong for that
+/// reason. Whether a refusal is byte-correct is a property of the process, so the rendering path is
+/// where it belongs.
+///
+/// Like [`ServeUsageError`] this is a type rather than a pre-rendered string, so [`check_serve_flags`]
+/// stays pure: the refusal keeps its plain [`Display`](std::fmt::Display) text for callers that only
+/// want the sentence, and [`ServeBareError::go_stderr`] renders the exact bytes Go's process writes.
+#[derive(Debug)]
+struct ServeBareError(String);
+
+impl ServeBareError {
+    fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+
+    /// Exactly what Go's process writes to stderr for this refusal: the sentence and the newline
+    /// `fmt.Fprintln` adds, with nothing in front of it.
+    fn go_stderr(&self) -> String {
+        format!("{}\n", self.0)
+    }
+}
+
+impl std::fmt::Display for ServeBareError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ServeBareError {}
+
+/// [`check_serve_flags`] as `runServeCombined` performs it: a refusal Go's process writes itself —
+/// a [`ServeUsageError`] with Go's `error: ` + help-hint framing, or a [`ServeBareError`] with no
+/// framing at all — goes to stderr here and exits 1, rather than propagating to `main` to be printed
+/// as one `Error: …` line. A refusal whose Go text already begins with Go's own `Error: ` is left to
+/// propagate, since adding a prefix to it here would only double Go's.
 fn check_serve_flags_or_exit(flags: &ServeFlags, funnel: bool) -> Result<(ServeKind, u16)> {
-    check_serve_flags(flags, funnel).map_err(|e| match e.downcast::<ServeUsageError>() {
-        Ok(usage) => {
-            eprint!("{}", usage.go_stderr());
-            std::process::exit(1);
+    check_serve_flags(flags, funnel).map_err(|e| {
+        let go_stderr = e
+            .downcast_ref::<ServeUsageError>()
+            .map(ServeUsageError::go_stderr)
+            .or_else(|| {
+                e.downcast_ref::<ServeBareError>()
+                    .map(ServeBareError::go_stderr)
+            });
+        match go_stderr {
+            Some(bytes) => {
+                eprint!("{bytes}");
+                std::process::exit(1);
+            }
+            None => e,
         }
-        Err(other) => other,
     })
 }
 
@@ -13437,8 +13970,12 @@ fn check_serve_flags(flags: &ServeFlags, funnel: bool) -> Result<(ServeKind, u16
     // ORDER: `--set-path=/a/../b --https=70000` has two things wrong with it, and the one Go names
     // is the mount point.
     if let Some(set_path) = flags.set_path.as_deref() {
-        clean_url_path(set_path)
-            .map_err(|e| anyhow::anyhow!("failed to clean the mount point: {e}"))?;
+        // An unprefixed `fmt.Errorf`, returned from `runServeCombined` — see [`ServeBareError`].
+        if let Err(e) = clean_url_path(set_path) {
+            return Err(
+                ServeBareError::new(format!("failed to clean the mount point: {e}")).into(),
+            );
+        }
     }
 
     // Go frames a `srvTypeAndPortFromFlags` failure unlike every other refusal in
@@ -13448,11 +13985,18 @@ fn check_serve_flags(flags: &ServeFlags, funnel: bool) -> Result<(ServeKind, u16
     // Go's `uint` zero is "unset", so --proxy-protocol=0 asks for nothing and is not refused.
     let proxy_protocol = flags.proxy_protocol.filter(|v| *v != 0);
     if let Some(version) = proxy_protocol {
+        // Both of Go's PROXY-protocol refusals print bare — see [`ServeBareError`].
         if kind.is_web() {
-            anyhow::bail!("PROXY protocol is only supported for TCP forwarding, not HTTP/HTTPS");
+            return Err(ServeBareError::new(
+                "PROXY protocol is only supported for TCP forwarding, not HTTP/HTTPS",
+            )
+            .into());
         }
         if version != 1 && version != 2 {
-            anyhow::bail!("invalid PROXY protocol version {version}; must be 1 or 2");
+            return Err(ServeBareError::new(format!(
+                "invalid PROXY protocol version {version}; must be 1 or 2"
+            ))
+            .into());
         }
     }
 
@@ -13461,7 +14005,8 @@ fn check_serve_flags(flags: &ServeFlags, funnel: bool) -> Result<(ServeKind, u16
     // is a shape Go accepts, so it must reach the build gap rather than a sentence saying a service
     // is what it is missing.
     if kind == ServeKind::Tun && flags.service.is_none() {
-        anyhow::bail!("tun mode is only supported for services");
+        // `errors.New`, unprefixed, printed bare by Go's `main` — see [`ServeBareError`].
+        return Err(ServeBareError::new("tun mode is only supported for services").into());
     }
 
     // Everything above is Go's. From here down the command line is one Go would have ACCEPTED, and
@@ -14441,20 +14986,16 @@ fn validate_kube_fqdn(fqdn: &str) -> Result<()> {
 ///
 /// Refuses (Go's `errInvalidKubeconfig`) a document that does not parse, or that is not an
 /// `apiVersion: v1` / `kind: Config` mapping. That refusal is what keeps a merge from turning into a
-/// silent overwrite of a file this build did not understand.
+/// silent overwrite of a file this build did not understand. The error is Go's text and nothing
+/// else, `invalid kubeconfig`, and [`set_kubeconfig_for_peer`] passes it on unwrapped as Go does.
 ///
 /// `scheme` is Go's `"https://"` / `"http://"` (see [`kube_scheme`] and [`kubeconfig_inputs`]). The
 /// caller has already run [`validate_kube_fqdn`], so the name is a plain DNS name.
 fn update_kubeconfig(cfg_yaml: &str, scheme: &str, fqdn: &str) -> Result<String> {
     use serde_json::{Map, Value, json};
 
-    let invalid = || {
-        anyhow!(
-            "configure kubeconfig: invalid kubeconfig — it is not an `apiVersion: v1` / `kind: \
-             Config` YAML document. Refusing to touch it (Go refuses the same way): merging into a \
-             file this build cannot read would mean overwriting it."
-        )
-    };
+    // Go: `var errInvalidKubeconfig = errors.New("invalid kubeconfig")`.
+    let invalid = || anyhow!("invalid kubeconfig");
     // Go unmarshals into a `map[string]any` and treats a nil map (empty input, or a document that is
     // only comments / an explicit `null`) as "start a fresh config"; anything that is not a mapping
     // fails to unmarshal at all.
@@ -14607,6 +15148,20 @@ fn go_io_error_text(e: &std::io::Error) -> String {
     }
 }
 
+/// Go's `*os.PathError` as Go prints it: `<syscall> <path>: <reason>`.
+///
+/// Those three pieces are what a reader needs in order to act — which call refused, on which path,
+/// and why — and a Rust `io::Error` carries only the last of them, so every caller here supplies
+/// the other two. The path is sanitized because it can come from `$KUBECONFIG`, i.e. from outside
+/// this program.
+fn go_path_error(op: &str, path: &std::path::Path, e: &std::io::Error) -> String {
+    format!(
+        "{op} {}: {}",
+        sanitize_for_terminal(&path.display().to_string()),
+        go_io_error_text(e)
+    )
+}
+
 /// Go's `kubeconfigAccessErr`: one wording for every reason the kubeconfig cannot be written, so
 /// the precheck below and a failed directory creation read the same to whoever hits them.
 ///
@@ -14704,9 +15259,10 @@ fn kubeconfig_parent_dir(path: &std::path::Path) -> std::path::PathBuf {
 /// nothing left to ask — and the write itself then reports whatever is really wrong.
 ///
 /// Without this the refusal arrives at the `open()` in [`set_kubeconfig_for_peer`], after the
-/// existing kubeconfig has been read and the merge computed, and it says "opening kubeconfig … for
-/// writing". Nothing is damaged either way; this one answers the question the operator asked, in
-/// Go's words, at the point Go answers it.
+/// existing kubeconfig has been read and the merge computed, and all it says is `open <path>:
+/// permission denied` — the syscall that refused, not the thing the operator asked for. Nothing is
+/// damaged either way; this one answers the question the operator asked, in Go's words, at the
+/// point Go answers it.
 fn check_kubeconfig_writable(path: &str) -> Result<()> {
     let mut probe = std::path::PathBuf::from(path);
     loop {
@@ -14825,28 +15381,38 @@ fn set_kubeconfig_for_peer(scheme: &str, fqdn: &str, path: &str) -> Result<()> {
             // — the directory is there and cannot even be looked at, which is a different problem
             // from a kubeconfig that will not take a write — so adding a wrapper here would answer
             // a question the operator did not ask.
-            Err(e) => {
-                return Err(anyhow!(
-                    "stat {}: {}",
-                    sanitize_for_terminal(&dir.display().to_string()),
-                    go_io_error_text(&e)
-                ));
-            }
+            Err(e) => return Err(anyhow!("{}", go_path_error("stat", dir, &e))),
         }
     }
-    let existing = match std::fs::read(p) {
-        Ok(b) => String::from_utf8(b).map_err(|_| {
-            anyhow!(
-                "configure kubeconfig: {path} is not valid UTF-8, so it is not a kubeconfig this \
-                 build can merge into. Refusing to overwrite it."
-            )
-        })?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e).with_context(|| format!("reading kubeconfig {path}")),
+    // Go: `os.ReadFile` then `fmt.Errorf("reading kubeconfig: %w", err)`. ReadFile's error is the
+    // `*os.PathError` of whichever syscall failed, so the open and the read are kept apart here to
+    // name the right one: a `$KUBECONFIG` that is a directory opens fine and fails at `read`.
+    let read_err = |op: &str, e: &std::io::Error| {
+        anyhow!(
+            "reading kubeconfig: {op} {}: {}",
+            sanitize_for_terminal(path),
+            go_io_error_text(e)
+        )
     };
-    let merged = update_kubeconfig(&existing, scheme, fqdn)
-        .with_context(|| format!("merging the auth-proxy cluster into {path}"))?;
-    // Go: `os.WriteFile(filePath, b, 0600)`. The mode applies on creation; an existing file keeps
+    let existing = match std::fs::File::open(p) {
+        Ok(mut f) => {
+            let mut b = Vec::new();
+            std::io::Read::read_to_end(&mut f, &mut b).map_err(|e| read_err("read", &e))?;
+            // Go hands the bytes straight to `updateKubeconfig`, whose YAML decoder fails on an
+            // invalid UTF-8 sequence (`invalid leading UTF-8 octet`) and maps that, like every
+            // unmarshal failure, to `errInvalidKubeconfig`. This check stands in for that failure,
+            // so the words are the same.
+            String::from_utf8(b).map_err(|_| anyhow!("invalid kubeconfig"))?
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(read_err("open", &e)),
+    };
+    // Go: `b, err = updateKubeconfig(b, scheme, fqdn); if err != nil { return err }` — returned
+    // bare, so a malformed file reads `invalid kubeconfig` and nothing more.
+    let merged = update_kubeconfig(&existing, scheme, fqdn)?;
+    // Go: `return os.WriteFile(filePath, b, 0600)` — the error comes back BARE, the `*os.PathError`
+    // of whichever step refused and nothing wrapped around it, so each step here is spelled the way
+    // Go's `os` package spells its own. The mode applies on creation; an existing file keeps
     // whatever mode it had, so this never loosens a kubeconfig the user tightened.
     let mut f = std::fs::OpenOptions::new()
         .write(true)
@@ -14854,11 +15420,15 @@ fn set_kubeconfig_for_peer(scheme: &str, fqdn: &str, path: &str) -> Result<()> {
         .truncate(true)
         .mode(0o600)
         .open(p)
-        .with_context(|| format!("opening kubeconfig {path} for writing"))?;
+        .map_err(|e| anyhow!("{}", go_path_error("open", p, &e)))?;
     f.write_all(merged.as_bytes())
-        .with_context(|| format!("writing kubeconfig {path}"))?;
+        .map_err(|e| anyhow!("{}", go_path_error("write", p, &e)))?;
+    // Go's `os.WriteFile` closes without an fsync; this port keeps the fsync, so that a kubeconfig
+    // half-written across a crash is not what kubectl finds next. It is the one step with no Go
+    // counterpart in this function, so it borrows the wording of the one Go does have for it —
+    // `(*os.File).Sync`, whose `Op` is `sync`.
     f.sync_all()
-        .with_context(|| format!("fsync kubeconfig {path}"))?;
+        .map_err(|e| anyhow!("{}", go_path_error("sync", p, &e)))?;
     Ok(())
 }
 
@@ -15506,14 +16076,79 @@ mod tests {
         // Go `presentRiskToUser`: the decline path returns `errAborted`, and upstream `main` prints
         // the returned error before exiting 1 — so `aborted, no changes made` is the sentence that
         // actually tells the operator nothing was changed. A refusal that only warns loses it.
-        let err = present_risk_to_user("lose-ssh", DOWN_LOSE_SSH_RISK);
-        assert_eq!(err.to_string(), "aborted, no changes made");
+        //
+        // Not a terminal (a script): Go's `prompt.YesNo` returns its `false` default without
+        // asking or reading, so the output is the two lines and nothing else.
+        let mut out = Vec::new();
+        let mut input = std::io::Cursor::new(b"y\n".to_vec());
+        let err = present_risk_to_user("lose-ssh", DOWN_LOSE_SSH_RISK, false, &mut input, &mut out)
+            .unwrap_err();
+        assert_eq!(err, "aborted, no changes made");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("{DOWN_LOSE_SSH_RISK}\nTo skip this warning, use --accept-risk=lose-ssh\n")
+        );
+        assert_eq!(
+            input.position(),
+            0,
+            "no terminal: the answer must not be read"
+        );
         // The message `down` hands it is Go's, verbatim: one sentence, single-spaced (the source
         // literal is written with a line continuation, which is easy to get wrong by a space).
         assert_eq!(
             DOWN_LOSE_SSH_RISK,
             "You are connected over Tailscale; this action will disable Tailscale and result in your session disconnecting."
         );
+    }
+
+    #[test]
+    fn a_risk_at_a_terminal_asks_gos_continue_prompt() {
+        // Go `presentRiskToUser` then `prompt.YesNo("Continue?", false)`: on a terminal the operator
+        // is asked, and a yes lets the command go ahead instead of forcing a re-run with
+        // `--accept-risk`.
+        let run = |answer: &str| {
+            let mut out = Vec::new();
+            let mut input = std::io::Cursor::new(answer.as_bytes().to_vec());
+            let result =
+                present_risk_to_user("lose-ssh", DOWN_LOSE_SSH_RISK, true, &mut input, &mut out);
+            (result, String::from_utf8(out).unwrap())
+        };
+        let (result, out) = run("y\n");
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            out,
+            format!(
+                "{DOWN_LOSE_SSH_RISK}\nTo skip this warning, use --accept-risk=lose-ssh\nContinue? [y/N] "
+            )
+        );
+        // Go's yes words, lowercased first; `fmt.Scanln` skips leading blanks and takes one word.
+        for yes in ["yes\n", "sure\n", "Y\n", "YES\n", "  y\n", "y extra\n", "y"] {
+            assert_eq!(run(yes).0, Ok(()), "{yes:?} is a yes in Go");
+        }
+        // The default is `false`: an empty line, EOF, or any other word aborts.
+        for no in ["\n", "", "n\n", "no\n", "yep\n", "continue\n"] {
+            assert_eq!(run(no).0, Err(RISK_ABORTED), "{no:?} must abort");
+        }
+    }
+
+    #[test]
+    fn go_yes_no_shows_its_default_and_skips_the_read_off_a_terminal() {
+        let ask = |dflt: bool, interactive: bool, answer: &str| {
+            let mut out = Vec::new();
+            let mut input = std::io::Cursor::new(answer.as_bytes().to_vec());
+            let yes = prompt_yes_no("Continue?", dflt, interactive, &mut input, &mut out);
+            (yes, String::from_utf8(out).unwrap(), input.position())
+        };
+        // The capital letter marks the default, and an empty answer takes it.
+        assert_eq!(ask(true, true, "\n"), (true, "Continue? [Y/n] ".into(), 1));
+        assert_eq!(
+            ask(false, true, "\n"),
+            (false, "Continue? [y/N] ".into(), 1)
+        );
+        assert!(!ask(true, true, "nope\n").0);
+        // Not a terminal: the default comes back with nothing written and nothing read.
+        assert_eq!(ask(true, false, "n\n"), (true, String::new(), 0));
+        assert_eq!(ask(false, false, "y\n"), (false, String::new(), 0));
     }
 
     #[test]
@@ -17716,9 +18351,9 @@ mod tests {
     }
 
     /// `lock log` (Go `tailscale lock log`) over a synthesised daemon report: the stanza shape,
-    /// newest-first order, the unsigned (genesis) row, and the JSON object.
+    /// newest-first order, and the unsigned (genesis) row.
     #[test]
-    fn format_lock_log_human_and_json() {
+    fn format_lock_log_human() {
         use tailscaled_rs::localapi::{LockLogEntry, LockLogReport};
         let report = LockLogReport {
             enabled: true,
@@ -17752,33 +18387,228 @@ mod tests {
         // The raw CBOR is deliberately NOT in the human output (Go prints decoded detail, which this
         // build cannot produce; the bytes are `--json`-only).
         assert!(!h.contains("a1626b76"), "{h}");
+    }
 
-        let j = format_lock_log(&report, parse_json_schema_version("1").unwrap()).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&j).unwrap();
-        // Go's `jsonoutput.ResponseEnvelope` field, so a script can pin the schema it parses — but
-        // naming this fork's schema. The document below is `enabled` + `entries`, not Go's
-        // `Messages` of expanded AUMs, so claiming Go's `"1"` would hand a consumer a version string
-        // it can only misread.
-        assert_eq!(v["SchemaVersion"], serde_json::json!("tailscaled-rs.1"));
-        assert_ne!(
-            v["SchemaVersion"],
-            serde_json::json!("1"),
-            "this document is not upstream `PrintTailnetLockLogJSONV1`'s schema 1 and must not \
-             claim to be"
-        );
-        // The corollary: none of Go's schema-1 key names may appear on a document that cannot fill
-        // them.
-        assert!(v.get("Messages").is_none(), "{v}");
-        assert_eq!(v["enabled"], serde_json::json!(true));
-        assert_eq!(v["entries"].as_array().unwrap().len(), 2);
-        assert_eq!(v["entries"][0]["hash"], serde_json::json!("AAAAQ"));
-        assert_eq!(v["entries"][0]["change"], serde_json::json!("add-key"));
+    /// Three canonical AUMs, newest first, hand-encoded as CBOR: a genesis checkpoint (a key with
+    /// metadata that needs Go's HTML escaping, a disablement value, state ids), an add-key whose
+    /// parent is that checkpoint, and an update-key (key id, votes, metadata) on top. The hashes
+    /// are BLAKE2s-256 of these exact bytes, computed outside this code.
+    fn lock_log_fixture() -> tailscaled_rs::localapi::LockLogReport {
+        use tailscaled_rs::localapi::{LockLogEntry, LockLogReport};
+        let entry = |hash: &str, change: &str, raw: &str| LockLogEntry {
+            hash: hash.into(),
+            change: change.into(),
+            signer_key_ids: vec![format!("tlpub:{}", "11".repeat(32))],
+            raw: raw.into(),
+        };
+        LockLogReport {
+            enabled: true,
+            entries: vec![
+                entry(
+                    "JZX5MOFWWXSBUZSZSNMQSKGRHLPDZG3EVUBGZMCCOKIYF5SU3JIQ",
+                    "update-key",
+                    "a6010402582061b0ba7a89d2583a40700d1846848da6b40fdd2aa70ee0a60747e48f58a27d940458204444444444444444444444444444444444444444444444444444444444444444060307a1616161621781a2015820111111111111111111111111111111111111111111111111111111111111111102584066666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666",
+                ),
+                entry(
+                    "MGYLU6UJ2JMDUQDQBUMENBENU22A7XJKU4HOBJQHI7SI6WFCPWKA",
+                    "add-key",
+                    "a40101025820b4646bd7042ad79b531d65f500d17e056f1679f5c88158b45b3f205b8fa6393503a30101020103582044444444444444444444444444444444444444444444444444444444444444441781a2015820111111111111111111111111111111111111111111111111111111111111111102584055555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555",
+                ),
+                entry(
+                    "WRSGXVYEFLLZWUY5MX2QBUL6AVXRM6PVZCAVRNC3H4QFXD5GHE2Q",
+                    "checkpoint",
+                    "a4010502f605a501f60281582022222222222222222222222222222222222222222222222222222222222222220381a40101020203582011111111111111111111111111111111111111111111111111111111111111110ca1646e616d65693c6f7073267365633e040705091781a2015820111111111111111111111111111111111111111111111111111111111111111102584033333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333",
+                ),
+            ],
+        }
+    }
+
+    /// What Go's `PrintTailnetLockLogJSONV1` prints for [`lock_log_fixture`], byte for byte: field
+    /// order, `omitzero` omissions, the nil-slice `null`s it does not hit here, `tlpub:` hex, URL-safe
+    /// padded base64, `json.Encoder`'s HTML escaping, and the trailing newline.
+    const LOCK_LOG_FIXTURE_GO_JSON_V1: &str = r#"{
+  "SchemaVersion": "1",
+  "Messages": [
+    {
+      "Hash": "JZX5MOFWWXSBUZSZSNMQSKGRHLPDZG3EVUBGZMCCOKIYF5SU3JIQ",
+      "AUM": {
+        "MessageKind": "update-key",
+        "PrevAUMHash": "MGYLU6UJ2JMDUQDQBUMENBENU22A7XJKU4HOBJQHI7SI6WFCPWKA",
+        "KeyID": "tlpub:4444444444444444444444444444444444444444444444444444444444444444",
+        "Votes": 3,
+        "Meta": {
+          "a": "b"
+        },
+        "Signatures": [
+          {
+            "KeyID": "tlpub:1111111111111111111111111111111111111111111111111111111111111111",
+            "Signature": "ZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZg=="
+          }
+        ]
+      },
+      "Raw": "pgEEAlggYbC6eonSWDpAcA0YRoSNprQP3SqnDuCmB0fkj1iifZQEWCBERERERERERERERERERERERERERERERERERERERERERAYDB6FhYWFiF4GiAVggERERERERERERERERERERERERERERERERERERERERERECWEBmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZm"
+    },
+    {
+      "Hash": "MGYLU6UJ2JMDUQDQBUMENBENU22A7XJKU4HOBJQHI7SI6WFCPWKA",
+      "AUM": {
+        "MessageKind": "add-key",
+        "PrevAUMHash": "WRSGXVYEFLLZWUY5MX2QBUL6AVXRM6PVZCAVRNC3H4QFXD5GHE2Q",
+        "Key": {
+          "Kind": "25519",
+          "Votes": 1,
+          "Public": "tlpub:4444444444444444444444444444444444444444444444444444444444444444"
+        },
+        "Signatures": [
+          {
+            "KeyID": "tlpub:1111111111111111111111111111111111111111111111111111111111111111",
+            "Signature": "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVQ=="
+          }
+        ]
+      },
+      "Raw": "pAEBAlggtGRr1wQq15tTHWX1ANF-BW8WefXIgVi0Wz8gW4-mOTUDowEBAgEDWCBERERERERERERERERERERERERERERERERERERERERERBeBogFYIBERERERERERERERERERERERERERERERERERERERERERAlhAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVQ=="
+    },
+    {
+      "Hash": "WRSGXVYEFLLZWUY5MX2QBUL6AVXRM6PVZCAVRNC3H4QFXD5GHE2Q",
+      "AUM": {
+        "MessageKind": "checkpoint",
+        "State": {
+          "DisablementValues": [
+            "2222222222222222222222222222222222222222222222222222222222222222"
+          ],
+          "Keys": [
+            {
+              "Kind": "25519",
+              "Votes": 2,
+              "Public": "tlpub:1111111111111111111111111111111111111111111111111111111111111111",
+              "Meta": {
+                "name": "\u003cops\u0026sec\u003e"
+              }
+            }
+          ],
+          "StateID1": 7,
+          "StateID2": 9
+        },
+        "Signatures": [
+          {
+            "KeyID": "tlpub:1111111111111111111111111111111111111111111111111111111111111111",
+            "Signature": "MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMw=="
+          }
+        ]
+      },
+      "Raw": "pAEFAvYFpQH2AoFYICIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiA4GkAQECAgNYIBERERERERERERERERERERERERERERERERERERERERERDKFkbmFtZWk8b3BzJnNlYz4EBwUJF4GiAVggERERERERERERERERERERERERERERERERERERERERERECWEAzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMz"
+    }
+  ]
+}
+"#;
+
+    /// `--json=1` is Go's schema-1 document (`PrintTailnetLockLogJSONV1`), not a fork-specific one:
+    /// every update decoded and expanded, in the order the daemon sent them.
+    #[test]
+    fn format_lock_log_json_is_gos_schema_1_document() {
+        let j =
+            format_lock_log(&lock_log_fixture(), parse_json_schema_version("1").unwrap()).unwrap();
+        assert_eq!(j, LOCK_LOG_FIXTURE_GO_JSON_V1);
+    }
+
+    /// Go's first refusal: an update whose bytes do not decode as an AUM fails the whole command
+    /// with `decoding: <err>`, and nothing is printed, not even the updates before it.
+    #[test]
+    fn format_lock_log_json_refuses_an_update_that_is_not_an_aum() {
+        use tailscaled_rs::localapi::LockLogEntry;
+        let json = parse_json_schema_version("1").unwrap();
+        let noop = |raw: &str| LockLogEntry {
+            hash: "WYIVHDR7JUIXBWAJT5UPSCAILEXB7OMINDFEFEPOPNTUCNXMY2KA".into(),
+            change: "no-op".into(),
+            signer_key_ids: vec![],
+            raw: raw.into(),
+        };
+        // The well-formed no-op AUM decodes, so the refusals below are about the bytes alone.
+        let mut report = lock_log_fixture();
+        report.entries = vec![noop("a2010302f6")];
+        assert!(format_lock_log(&report, json).is_ok());
+
+        for (raw, want) in [
+            // One byte past the AUM: the decoder refuses rather than ignoring it.
+            (
+                "a2010302f600",
+                "decoding: TKA decode error: trailing bytes after AUM",
+            ),
+            // Not CBOR an AUM can be (a text-keyed map, cut short).
+            ("a1626b76", "decoding: "),
+            // Not even hex, so not bytes at all.
+            ("zz", "decoding: "),
+            ("", "decoding: "),
+        ] {
+            // A good update first: Go decodes all of them before printing any.
+            let mut report = lock_log_fixture();
+            report.entries.push(noop(raw));
+            let e = format_lock_log(&report, json).unwrap_err().to_string();
+            assert!(e.starts_with(want), "raw {raw:?}: {e}");
+        }
+    }
+
+    /// Go's second refusal: the decoded AUM must hash to the update's hash, and the error prints
+    /// Go's `%v` of the whole update as `want`.
+    #[test]
+    fn format_lock_log_json_refuses_an_aum_that_does_not_match_its_hash() {
+        use tailscaled_rs::localapi::{LockLogEntry, LockLogReport};
+        let json = parse_json_schema_version("1").unwrap();
+        let report = |hash: &str| LockLogReport {
+            enabled: true,
+            entries: vec![LockLogEntry {
+                hash: hash.into(),
+                change: "no-op".into(),
+                signer_key_ids: vec![],
+                raw: "a2010302f6".into(),
+            }],
+        };
+        let e = format_lock_log(
+            &report("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            json,
+        )
+        .unwrap_err()
+        .to_string();
         assert_eq!(
-            v["entries"][0]["signer_key_ids"],
-            serde_json::json!(["tlpub:aabb", "tlpub:ccdd"])
+            e,
+            "incorrect AUM hash: got WYIVHDR7JUIXBWAJT5UPSCAILEXB7OMINDFEFEPOPNTUCNXMY2KA, want \
+             {[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0] no-op [162 1 3 2 246]}"
         );
-        // Raw CBOR IS carried in JSON, so the full AUM can be decoded out-of-band.
-        assert_eq!(v["entries"][0]["raw"], serde_json::json!("a1626b76"));
+        // Another update's real hash is just as wrong.
+        let e = format_lock_log(
+            &report("WRSGXVYEFLLZWUY5MX2QBUL6AVXRM6PVZCAVRNC3H4QFXD5GHE2Q"),
+            json,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.starts_with("incorrect AUM hash: got WYIV"), "{e}");
+        // A hash that is not 32 bytes of base32 cannot match; it is shown as it was sent.
+        let e = format_lock_log(&report("not-a-hash"), json)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.ends_with("want {not-a-hash no-op [162 1 3 2 246]}"),
+            "{e}"
+        );
+    }
+
+    /// Go's base64 is `URLEncoding`: `-`/`_` in place of `+`/`/`, and padded.
+    #[test]
+    fn base64_url_padded_matches_gos_url_encoding() {
+        assert_eq!(base64_url_padded(b""), "");
+        assert_eq!(base64_url_padded(b"f"), "Zg==");
+        assert_eq!(base64_url_padded(b"fo"), "Zm8=");
+        assert_eq!(base64_url_padded(b"foo"), "Zm9v");
+        assert_eq!(base64_url_padded(&[0xfb, 0xff, 0xbf]), "-_-_");
+    }
+
+    /// Go's `json.Encoder` escapes HTML characters and the two JS line separators; nothing else
+    /// changes.
+    #[test]
+    fn go_json_escape_html_matches_gos_encoder() {
+        assert_eq!(
+            go_json_escape_html("\"a<b>&c\u{2028}\u{2029}é\\n\""),
+            r#""a\u003cb\u003e\u0026c\u2028\u2029é\n""#
+        );
     }
 
     /// A lock-disabled node is Go's error, not output. `runTailnetLockLog` reads the status first and
@@ -17812,14 +18642,11 @@ mod tests {
         };
         let h = format_lock_log(&on_but_empty, JsonSchemaVersion::default()).unwrap();
         assert_eq!(h, "", "Go prints no stanzas and no commentary here");
-        // JSON stays a well-formed, envelope-carrying object with an empty list (no null, no bare
-        // array).
-        let v: serde_json::Value = serde_json::from_str(
-            &format_lock_log(&on_but_empty, parse_json_schema_version("1").unwrap()).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(v["SchemaVersion"], serde_json::json!("tailscaled-rs.1"));
-        assert_eq!(v["entries"], serde_json::json!([]));
+        // Go `make`s the messages slice, so an empty history is `[]`, never `null`.
+        assert_eq!(
+            format_lock_log(&on_but_empty, parse_json_schema_version("1").unwrap()).unwrap(),
+            "{\n  \"SchemaVersion\": \"1\",\n  \"Messages\": []\n}\n"
+        );
     }
 
     /// Go's `--json` on `lock log` is a `jsonoutput.SchemaVersion`, not a bool: integer first, boolean
@@ -19553,6 +20380,62 @@ mod tests {
     }
 
     #[test]
+    fn gos_unprefixed_refusals_are_tagged_to_be_written_bare() {
+        // Go's `main` prints `cli.Run`'s error with a bare `fmt.Fprintln(os.Stderr, err)`, so a
+        // refusal whose Go literal carries no prefix of its own must not reach this build's
+        // `Result`-returning `main` — `anyhow` would put `Error: ` in front of it. All four are
+        // tagged as they come out, and `go_stderr` is the bytes Go's process writes.
+        for (argv, want) in [
+            (
+                vec!["--set-path=/a/../b", "3000"],
+                r#"failed to clean the mount point: invalid mount point "/a/../b""#,
+            ),
+            (
+                vec!["--proxy-protocol=1", "3000"],
+                "PROXY protocol is only supported for TCP forwarding, not HTTP/HTTPS",
+            ),
+            (
+                vec!["--tcp=443", "--proxy-protocol=3", "3000"],
+                "invalid PROXY protocol version 3; must be 1 or 2",
+            ),
+            (
+                vec!["--tun", "3000"],
+                "tun mode is only supported for services",
+            ),
+        ] {
+            let (_, flags) = parse_serve(&argv);
+            let err = check_serve_flags(&flags, false).expect_err("still a refusal");
+            let bare = err
+                .downcast_ref::<ServeBareError>()
+                .unwrap_or_else(|| panic!("{argv:?}: Go prints this one bare: {err}"));
+            assert_eq!(bare.go_stderr(), format!("{want}\n"), "{argv:?}");
+            // The sentence itself is untouched, so a caller that only wants the text still has it.
+            assert_eq!(err.to_string(), want, "{argv:?}");
+        }
+
+        // The other half of the rule: Go spells `Error: ` into these two literals itself, so they
+        // must NOT be tagged — and the four above must not be prefixed to "match Go" — or the
+        // prefix ends up doubled. (What these two actually print is a separate matter: `main` wraps
+        // every serve/funnel error in a `via <socket>` context, so neither reaches a plain render.
+        // That divergence is not this change's; `tests/serve_refusal_stderr_framing.rs` pins it.)
+        for (argv, funnel) in [
+            (vec!["--service=svc:web", "--bg=false", "3000"], false),
+            (vec!["--service=svc:web", "3000"], true),
+        ] {
+            let flags = if funnel {
+                parse_funnel(&argv).1
+            } else {
+                parse_serve(&argv).1
+            };
+            let err = check_serve_flags(&flags, funnel).expect_err("still a refusal");
+            assert!(
+                err.downcast_ref::<ServeBareError>().is_none(),
+                "{argv:?} already carries Go's own `Error: `: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn gos_checks_all_run_before_this_builds_service_gap() {
         // runServeCombined's order is: the two --service refusals, cleanURLPath, then
         // srvTypeAndPortFromFlags. A command line Go would have rejected must be rejected here for
@@ -20562,6 +21445,28 @@ mod tests {
     }
 
     #[test]
+    fn ip_assert_failure_names_the_address_and_the_list_like_go() {
+        // Go: `fmt.Errorf("assertion failed: IP %q not found among %v", ipArgs.assert, ips)`.
+        // `%q` quotes the argument AS TYPED, and `%v` prints the whole `[]netip.Addr` it was
+        // compared against, space-separated in brackets.
+        assert_eq!(
+            assert_failure_message("203.0.113.9", &["100.64.0.1", "fd7a:115c:a1e0::1"]),
+            r#"assertion failed: IP "203.0.113.9" not found among [100.64.0.1 fd7a:115c:a1e0::1]"#
+        );
+        // A node that holds nothing: Go's `%v` of an empty slice is `[]`, and that empty list is
+        // the whole finding — the old text named only the wanted address and so could not say it.
+        assert_eq!(
+            assert_failure_message("100.64.0.1", &[]),
+            r#"assertion failed: IP "100.64.0.1" not found among []"#
+        );
+        // One address is not wrapped in any extra separator.
+        assert_eq!(
+            assert_failure_message("100.64.0.2", &["100.64.0.1"]),
+            r#"assertion failed: IP "100.64.0.2" not found among [100.64.0.1]"#
+        );
+    }
+
+    #[test]
     fn ip_refusal_covers_the_service_arm_that_would_answer_emptily() {
         // The refusal matters most on `tnet ip <service-VIP>`: a Service carries a LIST of addresses,
         // so `-6 -1` reads like "the Service's IPv6 address". It is not — Go truncates to the first
@@ -21089,6 +21994,82 @@ mod tests {
         assert!(
             cgi_response("404 Not Found", WEB_NOT_FOUND_BODY).starts_with("Status: 404 Not Found")
         );
+    }
+
+    #[test]
+    fn web_interrupt_stops_web_client_only_when_this_run_started_it() {
+        // A listener run that turned the pref on is the single case Go's interrupt goroutine puts
+        // it back: `if !webArgs.cgi && startedManagementClient`.
+        assert!(web_interrupt_stops_web_client(false, true));
+        // `--readonly`, or a daemon whose `RunWebClient` pref was already on: this run changed no
+        // pref, so an interrupt leaves the pref exactly as it found it.
+        assert!(!web_interrupt_stops_web_client(false, false));
+        // CGI mode never puts it back, even when it was the run that turned it on.
+        assert!(!web_interrupt_stops_web_client(true, true));
+        assert!(!web_interrupt_stops_web_client(true, false));
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_web_run_ends_successfully_with_no_pref_to_restore() {
+        // The `--readonly` (and already-on) shape: serving never returns on its own, the interrupt
+        // arrives, and there is no web client of ours to stop. Go's goroutine reaches `os.Exit(0)`
+        // on this path exactly as it does when it started one, so the command must report success —
+        // a supervisor that stops the listener it started reads a clean exit, not the 130 that an
+        // unhandled SIGINT leaves behind.
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let result = serve_until_interrupt(
+            std::future::pending::<Result<()>>(),
+            std::future::ready(()),
+            async {
+                if web_interrupt_stops_web_client(false, false) {
+                    stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            },
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            !stopped.load(std::sync::atomic::Ordering::SeqCst),
+            "a run that started no web client has no pref to turn back off"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_web_run_that_started_the_web_client_stops_it() {
+        // The other half: the same clean exit, with the pref this run turned on turned back off.
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let result = serve_until_interrupt(
+            std::future::pending::<Result<()>>(),
+            std::future::ready(()),
+            async {
+                if web_interrupt_stops_web_client(false, true) {
+                    stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            },
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(stopped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_web_serving_failure_is_returned_and_skips_the_interrupt_step() {
+        // The bind that finds the port taken: the error is what the command returns, and the
+        // interrupt step never runs — so the pref is left on, as Go leaves it after a failed `web`.
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let result = serve_until_interrupt(
+            std::future::ready(Err(anyhow::anyhow!("serving web UI on localhost:8088"))),
+            std::future::pending::<()>(),
+            async {
+                stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .await;
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "serving web UI on localhost:8088"
+        );
+        assert!(!stopped.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]
@@ -22198,7 +23179,7 @@ mod tests {
             assert_eq!(
                 err,
                 format!(
-                    "invalid boolean value {value:?} for --host-routes: unsupported value; only \
+                    "invalid boolean value {value:?} for -host-routes: unsupported value; only \
                      'true' is allowed"
                 ),
                 "--host-routes={value}"
@@ -22315,7 +23296,7 @@ mod tests {
             assert_eq!(
                 err,
                 format!(
-                    "invalid boolean value {value:?} for --host-routes: unsupported value; only \
+                    "invalid boolean value {value:?} for -host-routes: unsupported value; only \
                      'true' is allowed"
                 ),
                 "login --host-routes={value}"
@@ -22404,6 +23385,34 @@ mod tests {
         assert!(
             login_nickname_request(parse_login(&[]).1).is_none(),
             "an absent --nickname must not send a `set` at all"
+        );
+    }
+
+    #[test]
+    fn login_switches_to_an_empty_profile_before_it_names_one() {
+        // Go's `loginCmd.Exec` calls `SwitchToEmptyProfile` before `runUp`, so `--nickname` names the
+        // new profile. The rename goes to whichever profile is current, so the switch must come first.
+        let (_, nickname, _) = parse_login(&["--nickname=work"]);
+        let requests = login_profile_requests(nickname);
+        assert!(
+            matches!(
+                &requests[..],
+                [
+                    Request::SwitchToEmptyProfile,
+                    Request::Set {
+                        nickname: Some(Some(name)),
+                        ..
+                    },
+                ] if name == "work"
+            ),
+            "{requests:?}"
+        );
+
+        // Without `--nickname` Go still switches: every `login` starts from an empty profile.
+        let requests = login_profile_requests(parse_login(&[]).1);
+        assert!(
+            matches!(&requests[..], [Request::SwitchToEmptyProfile]),
+            "{requests:?}"
         );
     }
 
@@ -24325,16 +25334,10 @@ users:
         // overwriting: a merge that cannot read the file would replace it and lose every cluster.
         let err = update_kubeconfig("apiVersion: v1\nkind: ,asdf", "https://", "foo.example.com")
             .expect_err("invalid YAML must not be merged into");
-        assert!(
-            err.to_string().contains("invalid kubeconfig"),
-            "unhelpful refusal: {err}"
-        );
+        assert_eq!(format!("{err:#}"), "invalid kubeconfig", "Go's exact words");
         let err = update_kubeconfig("apiVersion: v1\nkind: Pod", "https://", "foo.example.com")
             .expect_err("a non-kubeconfig document must not be merged into");
-        assert!(
-            err.to_string().contains("invalid kubeconfig"),
-            "unhelpful refusal: {err}"
-        );
+        assert_eq!(format!("{err:#}"), "invalid kubeconfig", "Go's exact words");
         // A YAML mapping that is not a kubeconfig at all (no apiVersion/kind) is refused too — Go
         // compares the missing keys against "v1"/"Config" and they are unequal.
         assert!(
@@ -24400,13 +25403,25 @@ users:
         std::fs::write(&path, "not: a kubeconfig\n").unwrap();
         let err = set_kubeconfig_for_peer("https://", "foo.tail-scale.ts.net", &path_str)
             .expect_err("an unreadable kubeconfig must not be overwritten");
-        assert!(
-            format!("{err:#}").contains("invalid kubeconfig"),
-            "unhelpful refusal: {err:#}"
-        );
+        // Go's `setKubeconfigForPeer` returns `updateKubeconfig`'s error bare: no path, no wrapper.
+        assert_eq!(format!("{err:#}"), "invalid kubeconfig");
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "not: a kubeconfig\n",
+            "a refused merge must not have touched the file"
+        );
+
+        // Bytes that are not UTF-8 are a malformed file too: Go's YAML decoder fails on them and
+        // `updateKubeconfig` says `invalid kubeconfig`. (Not a `\xff\xfe` start — goyaml reads that
+        // as a UTF-16 byte-order mark and decodes it.)
+        let not_utf8: &[u8] = b"apiVersion: v1\n\x80\n";
+        std::fs::write(&path, not_utf8).unwrap();
+        let err = set_kubeconfig_for_peer("https://", "foo.tail-scale.ts.net", &path_str)
+            .expect_err("a kubeconfig that is not UTF-8 must not be overwritten");
+        assert_eq!(format!("{err:#}"), "invalid kubeconfig");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            not_utf8,
             "a refused merge must not have touched the file"
         );
 
@@ -24555,6 +25570,24 @@ users:
                     p = ro.display()
                 )
             );
+
+            // The same file past the precheck, i.e. the write inside `setKubeconfigForPeer`. Go
+            // returns `os.WriteFile`'s `*os.PathError` BARE — no wrapper naming this port's own
+            // steps — and a refused write leaves the file as it was. The real command's precheck
+            // answers first, so this is what the operator sees when the mode changes between the
+            // two, or when the refusal is one the precheck's probe cannot ask about.
+            let err =
+                set_kubeconfig_for_peer("https://", "foo.tail-scale.ts.net", ro.to_str().unwrap())
+                    .expect_err("a read-only kubeconfig cannot be written");
+            assert_eq!(
+                format!("{err:#}"),
+                format!("open {}: permission denied", ro.display())
+            );
+            assert_eq!(
+                std::fs::read_to_string(&ro).unwrap(),
+                "apiVersion: v1\nkind: Config\n",
+                "a refused write must leave the kubeconfig byte-identical"
+            );
         }
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o600)).unwrap();
 
@@ -24603,6 +25636,40 @@ users:
             );
         }
         std::fs::set_permissions(&nostat, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        // A kubeconfig that exists but cannot be read. Go: `reading kubeconfig: %w` around
+        // `os.ReadFile`'s `*os.PathError`, which names the syscall that failed.
+        let wo = root.join("writeonly");
+        std::fs::write(&wo, "apiVersion: v1\nkind: Config\n").unwrap();
+        std::fs::set_permissions(&wo, std::fs::Permissions::from_mode(0o200)).unwrap();
+        if std::fs::File::open(&wo).is_err() {
+            let err =
+                set_kubeconfig_for_peer("https://", "foo.tail-scale.ts.net", wo.to_str().unwrap())
+                    .expect_err("an unreadable kubeconfig is a refusal");
+            assert_eq!(
+                format!("{err:#}"),
+                format!(
+                    "reading kubeconfig: open {}: permission denied",
+                    wo.display()
+                )
+            );
+        }
+        std::fs::set_permissions(&wo, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        // A kubeconfig path that is a directory opens, then fails at the read — so Go's error names
+        // `read`, not `open`. Root cannot read a directory either, so this runs everywhere.
+        let isdir = root.join("isdir");
+        std::fs::create_dir(&isdir).unwrap();
+        let err =
+            set_kubeconfig_for_peer("https://", "foo.tail-scale.ts.net", isdir.to_str().unwrap())
+                .expect_err("a directory is not a kubeconfig");
+        assert_eq!(
+            format!("{err:#}"),
+            format!(
+                "reading kubeconfig: read {}: is a directory",
+                isdir.display()
+            )
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
