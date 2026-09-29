@@ -25,6 +25,54 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.66.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.65.1...v0.66.0) (2026-09-29)
+
+
+### Features
+
+* **watch:** tell watchers the exit-node suggestion instead of making them poll ([#546](https://github.com/GeiserX/tailscaled-rs/issues/546)) ([7a49eb0](https://github.com/GeiserX/tailscaled-rs/commit/7a49eb0f2c0a82413f9ae21295902910bd263dd1))
+
+
+### Bug Fixes
+
+* **cli:** print Go's --host-routes refusal as Go does, one dash included ([#543](https://github.com/GeiserX/tailscaled-rs/issues/543)) ([d52fa09](https://github.com/GeiserX/tailscaled-rs/commit/d52fa092a3d949ec4b61e1133327106d30a623c0))
+* **conffile:** stop attributing our route refusals to upstream's parser ([#551](https://github.com/GeiserX/tailscaled-rs/issues/551)) ([ff89050](https://github.com/GeiserX/tailscaled-rs/commit/ff89050963e7492fb0faf6c3453ca0cec5b24c6b))
+* **configure:** report kubeconfig io failures in Go's words, not Rust's ([#539](https://github.com/GeiserX/tailscaled-rs/issues/539)) ([c9c2f14](https://github.com/GeiserX/tailscaled-rs/commit/c9c2f147a89aa4e9518641804fb4dc7e5eb031c1))
+* **ip:** report an addressless node's state instead of "node is not up" ([#552](https://github.com/GeiserX/tailscaled-rs/issues/552)) ([469d45e](https://github.com/GeiserX/tailscaled-rs/commit/469d45e38b700ee137ff6a8cf852aafede141436))
+* **localapi:** keep the watch ruling true now initial_status is in Go's set ([#562](https://github.com/GeiserX/tailscaled-rs/issues/562)) ([d790bd5](https://github.com/GeiserX/tailscaled-rs/commit/d790bd51b050a34fb06beb264b19f2b4e9f267b7))
+* **serve:** drop anyhow's `Error: ` from the refusals Go prints bare ([#544](https://github.com/GeiserX/tailscaled-rs/issues/544)) ([a8b5fbf](https://github.com/GeiserX/tailscaled-rs/commit/a8b5fbfdd66203c5d210d377f9f53d37bc2b65ee))
+* **syspolicy:** only push a policy frame when the policy changed ([#531](https://github.com/GeiserX/tailscaled-rs/issues/531)) ([3977ad9](https://github.com/GeiserX/tailscaled-rs/commit/3977ad9aefbb7dbcb019f4ca570b7525dbb95f42))
+* **web:** end an interrupted web run at exit 0, not 130 ([#547](https://github.com/GeiserX/tailscaled-rs/issues/547)) ([c872cca](https://github.com/GeiserX/tailscaled-rs/commit/c872ccaa0b9b19fc565737c32986568e3d100e31))
+
+## [0.65.1](https://github.com/GeiserX/tailscaled-rs/compare/v0.65.0...v0.65.1) (2026-09-28)
+
+
+### Bug Fixes
+
+* **ipn:** refuse a bad --advertise-tags in Go's words, not our own ([#538](https://github.com/GeiserX/tailscaled-rs/issues/538)) ([a38687b](https://github.com/GeiserX/tailscaled-rs/commit/a38687b3ec6938d0bbef5638aea6312d5666dcd6))
+* **login:** drop an unfinished login's prefs, list a profile once it logs in ([#540](https://github.com/GeiserX/tailscaled-rs/issues/540)) ([2e53d95](https://github.com/GeiserX/tailscaled-rs/commit/2e53d95c899e250adfecde7beb98e9458fb97363))
+
+## [0.65.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.64.0...v0.65.0) (2026-09-28)
+
+
+### Features
+
+* **watch:** let a watcher get its status snapshot on the same stream ([#494](https://github.com/GeiserX/tailscaled-rs/issues/494)) ([0564a18](https://github.com/GeiserX/tailscaled-rs/commit/0564a18197a0c5414112be13df33f30d6040483f))
+
+
+### Bug Fixes
+
+* **prefs:** refuse a dishonest auto-update claim on every ingress ([#530](https://github.com/GeiserX/tailscaled-rs/issues/530)) ([a787db8](https://github.com/GeiserX/tailscaled-rs/commit/a787db875dd190f70a988be9536f43ac9a2ecaf6))
+* **tailnetd:** carry Go's --bird-socket sentence unbroken on line 1 ([#484](https://github.com/GeiserX/tailscaled-rs/issues/484)) ([84f399d](https://github.com/GeiserX/tailscaled-rs/commit/84f399db6b7b618067cdb9335607c3c22f58d3fb))
+* **watch:** tell a notify watcher about its own node, not only its peers ([#497](https://github.com/GeiserX/tailscaled-rs/issues/497)) ([4dce9c2](https://github.com/GeiserX/tailscaled-rs/commit/4dce9c2759adc781b9f646c19d4a966f35ff9d8a))
+
+## [0.64.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.63.2...v0.64.0) (2026-09-27)
+
+
+### Features
+
+* **watch:** put the exit-node suggestion on the notify bus ([#503](https://github.com/GeiserX/tailscaled-rs/issues/503)) ([b405f41](https://github.com/GeiserX/tailscaled-rs/commit/b405f41e3510a9408a8e03a9d8b427bea72e68c1))
+
 ## [0.63.2](https://github.com/GeiserX/tailscaled-rs/compare/v0.63.1...v0.63.2) (2026-09-22)
 
 
