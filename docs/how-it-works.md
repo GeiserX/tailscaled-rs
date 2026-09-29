@@ -1,6 +1,8 @@
-# Status and architecture
+# How it works
 
-## What works today (MVP)
+## Status
+
+### What works today (MVP)
 
 - **Joins a real tailnet** non-interactively with a pre-auth key, obtains a tailnet IP, and
   reaches `Running` over DERP-relayed connectivity.
@@ -11,7 +13,7 @@
 - **LocalAPI over a Unix domain socket** — the daemon (`tailnetd`) serves a local control surface;
   the CLI (`tnet up` / `down` / `status`) is a thin client over it.
 
-## Not yet (the road to a full daemon)
+### Not yet (the road to a full daemon)
 
 TUN-mode by default and per-OS routing/DNS programming, interactive (browser) login,
 `netmon`-driven endpoint re-binding on network change, service installation
