@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.66.1](https://github.com/GeiserX/tailscaled-rs/compare/v0.66.0...v0.66.1) (2026-09-29)
+
+
+### Bug Fixes
+
+* **configure:** report kubeconfig write errors bare and merge UTF-16 files as Go does ([#541](https://github.com/GeiserX/tailscaled-rs/issues/541)) ([daf30a0](https://github.com/GeiserX/tailscaled-rs/commit/daf30a0f383c6f34b836e453c417d2b73bac5361))
+
 ## [0.66.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.65.1...v0.66.0) (2026-09-29)
 
 
