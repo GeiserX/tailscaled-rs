@@ -1557,7 +1557,9 @@ enum DebugCmd {
     /// requested, so the first lines are the current state + peer set + prefs + effective system
     /// policy, and each subsequent line carries only what changed (state transitions, the full peer set
     /// on a netmap change, interactive-login / consent URLs, a fresh prefs snapshot on every prefs
-    /// write, and a fresh policy snapshot on every `syspolicy reload`). Read-only and long-lived — it runs until interrupted (Ctrl-C) or the daemon
+    /// write, and a fresh policy snapshot whenever the effective system policy actually changes —
+    /// which, since this daemon's only policy source is read once at startup, means the front-loaded
+    /// one is normally the only policy line you will see). Read-only and long-lived — it runs until interrupted (Ctrl-C) or the daemon
     /// closes the stream (node torn down / shutdown). Distinct from `tnet status --watch`, which stays
     /// on the bare status-stream path.
     WatchIpn,
@@ -11582,8 +11584,10 @@ async fn run_debug_watch_ipn(socket: &std::path::Path) -> Result<()> {
     // The MASKED watch: all snapshots requested → the daemon streams `Response::Notify` frames (not
     // `Response::Status`), front-loading the current state + peer set + prefs + effective policy +
     // exit-node suggestion, then streaming each change (a fresh prefs frame on every
-    // up/set/logout/switch/reload-config, a fresh policy snapshot on every `syspolicy reload`, and the
-    // exit-node suggestion whenever a computed one differs from the last published).
+    // up/set/logout/switch/reload-config, a fresh policy snapshot whenever the effective policy
+    // actually moves — a `syspolicy reload` that re-resolves the same rows pushes nothing, matching
+    // Go's `reloadNow` change-callback guard — and the exit-node suggestion whenever a computed one
+    // differs from the last published).
     let mut line = serde_json::to_vec(&Request::Watch {
         initial_state: true,
         initial_netmap: true,
