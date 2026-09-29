@@ -1109,6 +1109,29 @@ const SPLICE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// always answers well within it.
 const STATUS_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// Run a suggestion front-load's engine call only in `Running`, and for at most
+/// [`STATUS_QUERY_TIMEOUT`]; `None` when it was not run or did not answer in time. Split out of
+/// [`Backend::front_load_suggested_exit_node`] so the gate and the bound are testable without a
+/// live engine. `compute` is a lazy future, so outside `Running` the engine is never asked at all.
+async fn bounded_front_load<F>(state: State, compute: F) -> Option<crate::localapi::Response>
+where
+    F: std::future::Future<Output = crate::localapi::Response>,
+{
+    if state != State::Running {
+        return None;
+    }
+    match tokio::time::timeout(STATUS_QUERY_TIMEOUT, compute).await {
+        Ok(response) => Some(response),
+        Err(_) => {
+            tracing::debug!(
+                "exit-node suggestion for a new watcher exceeded {STATUS_QUERY_TIMEOUT:?}; \
+                 front-loading what the cell already holds"
+            );
+            None
+        }
+    }
+}
+
 /// An in-progress bring-up handed between [`Backend::begin_up`] (locked, fast) and
 /// [`Backend::finish_up`] (locked, fast), across the unlocked [`build_device`] handshake.
 ///
@@ -2106,7 +2129,8 @@ pub struct Backend {
     /// The last exit-node suggestion published, AND the channel that publishes it (a masked `Watch`
     /// with the `suggested_exit_node` bit). The held value is this fork's
     /// `LocalBackend.lastSuggestedExitNode`: `None` until a suggestion has ever been computed, then
-    /// the stable node id of the most recent one.
+    /// the stable node id of the most recent one, and `None` again whenever the node's identity
+    /// changes (see [`forget_suggested_exit_node`](Backend::forget_suggested_exit_node)).
     ///
     /// Unlike [`prefs_tx`](Backend::prefs_tx) this is a VALUE channel, not a tick. A prefs watcher can
     /// re-read [`prefs_view`](Backend::prefs_view) for itself; a suggestion watcher cannot re-derive a
@@ -2117,8 +2141,9 @@ pub struct Backend {
     /// `suggestExitNodeLocked`, the only placement that cannot drift from the value actually returned;
     /// here the compare and the send are both
     /// [`publish_suggested_exit_node`](Backend::publish_suggested_exit_node), reached only from
-    /// [`suggest_exit_node`](Backend::suggest_exit_node) and never from a request handler. One writer,
-    /// no second copy to fall out of step.
+    /// [`suggest_exit_node`](Backend::suggest_exit_node) and its bounded twin
+    /// [`front_load_suggested_exit_node`](Backend::front_load_suggested_exit_node), right after each
+    /// computes, and never from a request handler. One writer, no second copy to fall out of step.
     ///
     /// Written with `send_replace`, never `send`: `send` refuses — and, load-bearingly, does NOT store
     /// — when there are no receivers, which is the common case (nobody is watching), and would leave
@@ -3105,6 +3130,7 @@ impl Backend {
         // The same profile-change edge as a switch (see `activate_profile`).
         self.reset_always_on_override("new profile");
         self.reset_exit_node_policy_override("new profile");
+        self.forget_suggested_exit_node();
         self.reconcile_sys_policy("new profile");
         let _ = self.prefs_tx.send(());
         Ok(SwitchOutcome::Switched {
@@ -3239,6 +3265,9 @@ impl Backend {
         // An exit-node override belongs to its profile for the same reason and is cleared on the
         // same edge in Go, so the incoming profile is reconciled under the policy as written.
         self.reset_exit_node_policy_override("profile switch");
+        // A different profile is a different node, possibly on a different tailnet, so the last
+        // suggestion is neither its baseline nor something to front-load to its watchers.
+        self.forget_suggested_exit_node();
         // A profile load, exactly like the one in `load`: system policy applies to the newly-active
         // profile's prefs too, so a switch cannot be used to step out from under it. In memory only
         // (the swap above already persisted everything a switch owes to disk).
@@ -4855,6 +4884,8 @@ impl Backend {
         // 2. Tear down the datapath.
         self.stop_device().await;
         self.bump_generation();
+        // The registration is ending, so the last suggestion (a node on this tailnet) goes with it.
+        self.forget_suggested_exit_node();
 
         // 3. Discard the persisted node key BEFORE flipping intent to logged-out — ordering is
         // load-bearing for crash-safety. Both this `remove_file` and the `persist_prefs` below are
@@ -5507,9 +5538,10 @@ impl Backend {
         diag::netcheck(dev).await
     }
 
-    /// Suggest the best available exit node (the `tnet exit-node suggest` path, and the
-    /// `suggested_exit_node` watch bit's front-load) **and put the answer on the notify bus if it
-    /// moved**. See [`diag::suggest_exit_node`] for the `suggest_exit_node()` →
+    /// Suggest the best available exit node (the `tnet exit-node suggest` path; the
+    /// `suggested_exit_node` watch bit's front-load is the bounded
+    /// [`front_load_suggested_exit_node`](Backend::front_load_suggested_exit_node)) **and put the
+    /// answer on the notify bus if it moved**. See [`diag::suggest_exit_node`] for the `suggest_exit_node()` →
     /// [`Response::ExitNodeSuggestion`](crate::localapi::Response) mapping (`Ok(None)` = no eligible
     /// candidate, an honest empty result, not an error) and for the `AllowedSuggestedExitNodes`
     /// allow-list the engine's answer is filtered through — a suggestion that list excludes comes
@@ -5519,9 +5551,8 @@ impl Backend {
     /// This is the port of Go's `LocalBackend.suggestExitNodeLocked`, which computes the suggestion
     /// and, in the same function, notifies every client when the pick differs from the last one.
     /// Keeping the push HERE rather than in the request handler is the whole point: the comparison
-    /// then reads the value actually returned to the caller, so the two can never disagree — and a
-    /// second caller of the computation (this bit's front-load) gets the notification for free
-    /// instead of having to remember to re-implement it.
+    /// then reads the value actually returned to the caller, so the two can never disagree. The
+    /// front-load ends the same way, in the same `publish_suggested_exit_node` call.
     ///
     /// It takes the shared backend rather than `&self` because the engine round-trip must run
     /// OFF-LOCK, like the other diagnostics: compute first with no lock held, then take the lock only
@@ -5533,6 +5564,34 @@ impl Backend {
         let response = diag::suggest_exit_node(dev).await;
         backend.lock().await.publish_suggested_exit_node(&response);
         response
+    }
+
+    /// The `suggested_exit_node` watch bit's front-load (Go `NotifyInitialSuggestedExitNode`): the
+    /// same compute-then-publish as [`suggest_exit_node`](Backend::suggest_exit_node), but it never
+    /// holds a new watcher's stream open for long.
+    ///
+    /// `Device::suggest_exit_node` starts with an actor ask to the control runner for the last
+    /// netcheck report. While the node is still registering (`NeedsLogin` above all) that actor is
+    /// inside its `on_start` auth-retry loop and reads no mailbox, so the ask waits until someone
+    /// authorises the machine — the hazard [`status`](Backend::status) documents. `stream_notify`
+    /// awaits this before it attaches the engine watcher, so an unguarded call would keep a watcher
+    /// from seeing even the state frame and login URL that would let the operator end the wait. Go
+    /// never waits here: its error arm (`ErrNoPreferredDERP`, no report yet) returns at once, and
+    /// the initial notify is sent without a suggestion.
+    ///
+    /// So this takes the two guards [`connectivity_impacted`](Backend::connectivity_impacted) takes
+    /// for the same ask: nothing is computed unless the device is `Running`, and the engine call is
+    /// bounded by [`STATUS_QUERY_TIMEOUT`]. Either way out publishes nothing, the analogue of Go's
+    /// error arm. Only the engine call is bounded, not the lock taken to publish: an answer the
+    /// engine did give still reaches the cell.
+    pub async fn front_load_suggested_exit_node(
+        backend: &std::sync::Arc<tokio::sync::Mutex<Backend>>,
+        dev: &tailscale::Device,
+    ) {
+        let state = state_from_device(dev.device_state()).0;
+        if let Some(response) = bounded_front_load(state, diag::suggest_exit_node(dev)).await {
+            backend.lock().await.publish_suggested_exit_node(&response);
+        }
     }
 
     /// Publish a freshly-computed exit-node suggestion to every notify watcher — but only if it
@@ -5592,9 +5651,32 @@ impl Backend {
     /// reads it with `borrow_and_update()` instead of re-deriving it — it has no way to re-derive a
     /// suggestion of its own. `subscribe()` starts synced, so attaching never replays the current
     /// value; a watcher's first frame comes from its own
-    /// [`suggest_exit_node`](Backend::suggest_exit_node) front-load.
+    /// [`front_load_suggested_exit_node`](Backend::front_load_suggested_exit_node).
     pub fn watch_suggested_exit_node(&self) -> tokio::sync::watch::Receiver<Option<String>> {
         self.suggested_exit_node_tx.subscribe()
+    }
+
+    /// Forget the last exit-node suggestion WITHOUT telling any watcher. Called wherever the node's
+    /// identity changes: [`logout`](Backend::logout), every profile activation (`switch` and
+    /// `switch --create`) and the empty-profile reset. Go does this in `resetForProfileChangeLocked`
+    /// (`b.lastSuggestedExitNode = ""`), which its `Logout`, `SwitchProfile`, `NewProfile` and
+    /// `ResetAuth` all run.
+    ///
+    /// The id belongs to one tailnet. Left in place it would be the baseline for the next profile's
+    /// first suggestion, so an id from another tailnet could decide whether a real change is
+    /// announced; and because the watch front-load reads this cell, a watcher on the new profile
+    /// whose own computation came back empty would be front-loaded the OLD profile's pick.
+    ///
+    /// Silent, as Go's reset is: an assignment, not a `sendToLocked`. `send_if_modified` returning
+    /// `false` stores the value without waking a receiver.
+    ///
+    /// NOT called from `down`: Go keeps `lastSuggestedExitNode` across a stop and start of the same
+    /// profile, and so does this.
+    fn forget_suggested_exit_node(&self) {
+        self.suggested_exit_node_tx.send_if_modified(|id| {
+            *id = None;
+            false
+        });
     }
 
     /// Validate a prospective prefs change WITHOUT applying it (the `check-prefs` LocalAPI / Go
@@ -6607,6 +6689,143 @@ mod tests {
             Some("nodeid-a"),
             "a watcher attaching later reads the recorded pick for its front-load"
         );
+    }
+
+    #[tokio::test]
+    async fn forgetting_the_suggestion_clears_it_without_waking_a_watcher() {
+        let be = suggestion_backend();
+        let mut rx = be.watch_suggested_exit_node();
+        assert!(be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")));
+        rx.borrow_and_update();
+
+        be.forget_suggested_exit_node();
+        // Go's reset is an assignment, not a send: nobody is told anything because a profile changed.
+        assert!(
+            !rx.has_changed().unwrap(),
+            "forgetting must not wake a watcher"
+        );
+        assert_eq!(
+            *rx.borrow(),
+            None,
+            "a watcher's front-load must not read the forgotten pick"
+        );
+        assert!(
+            be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")),
+            "after a reset the same id is compared against nothing, so it is a change"
+        );
+        assert_eq!(rx.borrow_and_update().as_deref(), Some("nodeid-a"));
+    }
+
+    #[tokio::test]
+    async fn the_front_load_never_asks_an_engine_that_is_not_running() {
+        // A pending future is the engine's control runner in its auth loop: it never answers. Outside
+        // `Running` the front-load must return at once without polling it, as Go's error arm does.
+        for state in [
+            State::NoState,
+            State::NeedsLogin,
+            State::NeedsMachineAuth,
+            State::InUseOtherUser,
+            State::Starting,
+            State::Stopped,
+        ] {
+            let answer = tokio::time::timeout(
+                Duration::from_secs(5),
+                bounded_front_load(state, std::future::pending()),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("the front-load waited on the engine in {state:?}"));
+            assert!(answer.is_none(), "{state:?} computes nothing");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_front_load_gives_up_on_a_running_engine_that_does_not_answer() {
+        let answer = tokio::time::timeout(
+            STATUS_QUERY_TIMEOUT * 10,
+            bounded_front_load(State::Running, std::future::pending()),
+        )
+        .await
+        .expect("the front-load must be bounded even in Running");
+        assert!(answer.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_front_load_passes_a_running_engine_answer_through() {
+        let answer = bounded_front_load(
+            State::Running,
+            std::future::ready(suggestion_response("nodeid-a", "berlin")),
+        )
+        .await;
+        assert!(matches!(
+            answer,
+            Some(crate::localapi::Response::ExitNodeSuggestion { suggestion: Some(s) })
+                if s.id == "nodeid-a"
+        ));
+    }
+
+    /// A fresh state dir for a test that drives a real profile or logout path.
+    async fn suggestion_state_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-suggestion-{tag}-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn logout_forgets_the_last_suggestion() {
+        let dir = suggestion_state_dir("logout").await;
+        let mut be = backend_for(&dir);
+        assert!(be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")));
+
+        be.logout(alwayson::Actor::Operator { reason: None })
+            .await
+            .expect("logout with no key file must succeed");
+        assert_eq!(*be.watch_suggested_exit_node().borrow(), None);
+        assert!(
+            be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")),
+            "a logged-out node's old pick must not be the baseline for the next registration"
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn switching_profile_forgets_the_last_suggestion() {
+        let dir = suggestion_state_dir("switch").await;
+        let mut be = backend_for(&dir);
+        assert!(be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")));
+
+        be.create_profile("work").await.expect("create + switch");
+        assert_eq!(*be.watch_suggested_exit_node().borrow(), None);
+        assert!(
+            be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")),
+            "an id from the old profile's tailnet must not be the new profile's baseline"
+        );
+
+        be.switch_profile(profile::DEFAULT_PROFILE_ID)
+            .await
+            .expect("switch back");
+        assert_eq!(
+            *be.watch_suggested_exit_node().borrow(),
+            None,
+            "switching back is a profile change too"
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn switching_to_an_empty_profile_forgets_the_last_suggestion() {
+        let dir = suggestion_state_dir("empty").await;
+        let mut be = backend_for(&dir);
+        // A profile that was set up but never logged in: the reset path, not the no-op answer.
+        be.ever_configured = true;
+        assert!(be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")));
+
+        be.switch_to_empty_profile()
+            .await
+            .expect("switch to a new empty profile");
+        assert_eq!(*be.watch_suggested_exit_node().borrow(), None);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     // --- captive-portal detection (tsd-iqq.5) -----------------------------------------------------
