@@ -4,9 +4,9 @@
 # reimplementation of the Tailscale control server. Running the daemon against it exercises the real
 # register / map-poll (netmap) flow WITHOUT touching production Tailscale infrastructure (no ToS or
 # rate-limit exposure). NOTE: headscale lags upstream Tailscale's capability version, so green here
-# is NOT proof of full Tailscale compatibility — see ../../docs/TESTING.md and ../../docs/ENGINE.md.
+# is NOT proof of full Tailscale compatibility — see ../../docs/development.md and ../../docs/ENGINE.md.
 #
-# Usage (full loop in ../../docs/TESTING.md):
+# Usage (full loop in ../../docs/development.md):
 #   docker compose -f test-support/headscale/docker-compose.yml up -d
 #   docker compose -f test-support/headscale/docker-compose.yml exec headscale headscale users create test
 #   # 0.28.0's `preauthkeys --user` takes the numeric user ID, NOT the name, so resolve it first:

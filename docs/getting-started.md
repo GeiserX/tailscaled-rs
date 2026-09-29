@@ -1,4 +1,4 @@
-# Installation
+# Getting started
 
 ## Install as a system service
 
@@ -15,7 +15,7 @@ sudo brew services start tailscaled-rs      # sets TS_RS_EXPERIMENT for the daem
 > The tap repository is not published yet — the formula is ready ahead of it. Until then it installs
 > from a checkout: `brew install --build-from-source packaging/homebrew/tailscaled-rs.rb`.
 
-See [`packaging/homebrew/README.md`](../packaging/homebrew/README.md) for what the formula builds, where
+See [`packaging/homebrew/README.md`](https://github.com/GeiserX/tailscaled-rs/blob/main/packaging/homebrew/README.md) for what the formula builds, where
 state and logs go, and how the tap is refreshed for a release. Otherwise, install the daemon
 straight from a checkout (systemd on Linux, launchd on macOS):
 
