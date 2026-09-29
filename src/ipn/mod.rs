@@ -128,6 +128,185 @@ async fn link_monitor_loop(device: std::sync::Arc<tailscale::Device>) {
     }
 }
 
+/// The `SuggestedExitNode` a computed suggestion puts on the notify bus, or `None` when it puts
+/// nothing there — the value Go's `suggestExitNodeLocked` compares and sends, and the one its initial
+/// notify carries (`if en, err := b.suggestExitNodeLocked(); err == nil { ini.SuggestedExitNode =
+/// &en.ID }`).
+///
+/// Go's split is by `err`, not by whether a node was found. A computation that succeeds with no
+/// eligible candidate returns an empty response and a nil error, so its id is the empty string, and
+/// that empty id is sent: it is how a watcher learns the suggestion went away. This fork's empty
+/// [`Response::ExitNodeSuggestion`](crate::localapi::Response) covers that case and a pick
+/// `AllowedSuggestedExitNodes` withholds, which Go reaches the same way (its allow-list filters the
+/// candidates, and none are left). Only an error (Go's `ErrNoPreferredDERP`, before any netcheck)
+/// carries nothing.
+pub fn suggested_exit_node_id(response: &crate::localapi::Response) -> Option<&str> {
+    match response {
+        crate::localapi::Response::ExitNodeSuggestion { suggestion } => {
+            Some(suggestion.as_ref().map_or("", |s| s.id.as_str()))
+        }
+        _ => None,
+    }
+}
+
+/// Publish a freshly-computed exit-node suggestion to every notify watcher — but only if it
+/// differs from the last one published. Returns whether it published.
+///
+/// The tail of Go's `suggestExitNodeLocked`:
+///
+/// ```go
+/// if prevSuggestion != res.ID {
+///     b.sendToLocked(ipn.Notify{SuggestedExitNode: &res.ID}, allClients)
+/// }
+/// b.lastSuggestedExitNode = res.ID
+/// ```
+///
+/// It is **change-triggered**, so a stable answer costs nothing on the bus however often it is
+/// recomputed. It goes to **every** watcher, not to the session that triggered the computation,
+/// because the suggestion describes the node rather than the asker (`allClients`); here that falls
+/// out of the channel being on the backend, which every masked watcher subscribes to.
+///
+/// What is compared is [`suggested_exit_node_id`]: an empty answer is a value like any other, so a
+/// pick going away publishes `""` once and leaves the cell empty, as Go's assignment does. Only an
+/// error publishes nothing and leaves the cell alone, because Go's error path returns before both
+/// the compare and the assignment.
+///
+/// Written with `send_replace`, never `send`: `send` refuses — and does NOT store — when there are
+/// no receivers, which is the common case, and would make every later suggestion look like a change.
+fn publish_suggested_exit_node(
+    cell: &tokio::sync::watch::Sender<String>,
+    response: &crate::localapi::Response,
+) -> bool {
+    let Some(id) = suggested_exit_node_id(response) else {
+        return false; // an engine error: Go returns before the compare and the assignment
+    };
+    if *cell.borrow() == id {
+        return false; // unchanged — Go's `prevSuggestion != res.ID` guard
+    }
+    tracing::debug!(
+        suggested_id = %id,
+        "exit-node suggestion changed; publishing to notify watchers"
+    );
+    cell.send_replace(id.to_string());
+    true
+}
+
+/// Why [`suggested_exit_node_loop`] recomputes the suggestion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SuggestionTrigger {
+    /// A netmap arrived. Go recomputes on every full netmap ("This will recalculate the suggested
+    /// exit node cache the value and push any changes to the IPN bus") and on a delta that
+    /// `mutationsAreWorthyOfRecalculatingSuggestedExitNode` accepts.
+    NetMap,
+    /// `AllowedSuggestedExitNodes` resolved to a different set (Go's `sysPolicyChanged`:
+    /// `refreshAllowedSuggestions`, then `SuggestExitNode`).
+    AllowListChanged,
+}
+
+/// A stream of engine notifications. The engine's
+/// [`IpnBusWatcher`](tailscale::IpnBusWatcher) in production; a plain channel in the tests, since a
+/// watcher cannot be built without a live engine.
+trait NotifySource {
+    async fn next_notify(&mut self) -> Option<tailscale::Notify>;
+}
+
+impl NotifySource for tailscale::IpnBusWatcher {
+    async fn next_notify(&mut self) -> Option<tailscale::Notify> {
+        self.next().await
+    }
+}
+
+/// Wait for the next reason to recompute the exit-node suggestion. `None` when the bus has closed
+/// (the device is going away), which ends the loop.
+///
+/// Two triggers, the two of Go's that this build has an input for:
+///
+/// - any notification carrying a netmap. The engine's bus does not say whether a netmap was full or a
+///   delta, so every one counts. That is a superset of Go's triggers, and it costs a watcher nothing:
+///   [`publish_suggested_exit_node`] sends only when the pick moves.
+/// - a policy change that moves the resolved `AllowedSuggestedExitNodes` set. `allowed` holds the set
+///   as last seen and `read_allowed` resolves it now, so a reload that touched some other key is
+///   ignored, as Go's `HasChanged(pkey.AllowedSuggestedExitNodes)` ignores it. A closed policy bus
+///   (unreachable in a running daemon) only stops this trigger.
+///
+/// Go's fourth caller, resolving an `auto:` exit node, has no counterpart: this build refuses
+/// `auto:` selectors.
+async fn next_suggestion_trigger(
+    bus: &mut impl NotifySource,
+    policy_rx: &mut Option<tokio::sync::watch::Receiver<()>>,
+    allowed: &mut Option<std::collections::BTreeSet<String>>,
+    read_allowed: impl Fn() -> Option<std::collections::BTreeSet<String>>,
+) -> Option<SuggestionTrigger> {
+    loop {
+        tokio::select! {
+            // Policy first, so a test that queues both sees them in a fixed order.
+            biased;
+            changed = async {
+                match policy_rx.as_mut() {
+                    Some(rx) => rx.changed().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if changed.is_err() {
+                    *policy_rx = None;
+                    continue;
+                }
+                let now = read_allowed();
+                if now != *allowed {
+                    *allowed = now;
+                    return Some(SuggestionTrigger::AllowListChanged);
+                }
+            }
+            notify = bus.next_notify() => match notify {
+                None => return None,
+                Some(notify) if notify.net_map.is_some() => return Some(SuggestionTrigger::NetMap),
+                Some(_) => {}
+            },
+        }
+    }
+}
+
+/// The exit-node suggestion recompute loop for one device: Go's `suggestExitNodeLocked` calls from
+/// the netmap path and from `sysPolicyChanged`, so a watcher learns of a new pick — or of the pick
+/// going away — without any client having to ask. Runs until the device's bus closes or the task is
+/// aborted (in `stop_device`).
+///
+/// Subscribes with `INITIAL_NETMAP`, so the netmap the device already holds counts as the first
+/// trigger: Go computes on that netmap when it arrives, and this task may start after it did.
+///
+/// The engine call is not bounded. While the node is registering the engine answers nothing until
+/// login completes, and this task is the only thing that waits: it holds no lock, and `stop_device`
+/// aborts it.
+async fn suggested_exit_node_loop(
+    device: std::sync::Arc<tailscale::Device>,
+    cell: tokio::sync::watch::Sender<String>,
+) {
+    let mut bus = match device
+        .watch_ipn_bus(tailscale::NotifyWatchOpt::INITIAL_NETMAP)
+        .await
+    {
+        Ok(bus) => bus,
+        Err(e) => {
+            tracing::debug!(error = %e, "exit-node suggestion: could not watch the engine bus");
+            return;
+        }
+    };
+    let mut policy_rx = Some(syspolicy::watch_policy());
+    let mut allowed = syspolicy::allowed_suggested_exit_nodes();
+    while let Some(trigger) = next_suggestion_trigger(
+        &mut bus,
+        &mut policy_rx,
+        &mut allowed,
+        syspolicy::allowed_suggested_exit_nodes,
+    )
+    .await
+    {
+        let response = diag::recompute_exit_node_suggestion(&device).await;
+        tracing::trace!(?trigger, "exit-node suggestion recomputed");
+        publish_suggested_exit_node(&cell, &response);
+    }
+}
+
 /// What this daemon can observe of Go's `ImpactsConnectivity` warnables — one field per member of
 /// [`captive::ConnectivityWarnable`], carrying the raw fact rather than the verdict.
 ///
@@ -2102,10 +2281,13 @@ pub struct Backend {
     /// the single chokepoint EVERY prefs mutation (`up`/`set`/`logout`/`switch`/`reload-config`)
     /// funnels through, so one send-site covers them all. Daemon-owned (the engine has no prefs cell).
     prefs_tx: tokio::sync::watch::Sender<()>,
-    /// The last exit-node suggestion published, AND the channel that publishes it (a masked `Watch`
-    /// with the `suggested_exit_node` bit). The held value is this fork's
-    /// `LocalBackend.lastSuggestedExitNode`: `None` until a suggestion has ever been computed, then
-    /// the stable node id of the most recent one.
+    /// The last exit-node suggestion published, AND the channel that publishes it to every masked
+    /// `Watch`. The held value is this fork's `LocalBackend.lastSuggestedExitNode`, a
+    /// `tailcfg.StableNodeID` with Go's zero value: the empty string until a suggestion has been
+    /// computed, the stable node id of the most recent one after that, and empty again when a
+    /// computation finds no eligible candidate (a change like any other, so watchers are told) or the
+    /// node's identity changes (silently, see
+    /// [`forget_suggested_exit_node`](Backend::forget_suggested_exit_node)).
     ///
     /// Unlike [`prefs_tx`](Backend::prefs_tx) this is a VALUE channel, not a tick. A prefs watcher can
     /// re-read [`prefs_view`](Backend::prefs_view) for itself; a suggestion watcher cannot re-derive a
@@ -2114,15 +2296,22 @@ pub struct Backend {
     ///
     /// Cell and channel are deliberately ONE object. Go compares `prevSuggestion != res.ID` inside
     /// `suggestExitNodeLocked`, the only placement that cannot drift from the value actually returned;
-    /// here the compare and the send are both
-    /// [`publish_suggested_exit_node`](Backend::publish_suggested_exit_node), reached only from
-    /// [`suggest_exit_node`](Backend::suggest_exit_node) and never from a request handler. One writer,
+    /// here the compare and the send are both [`publish_suggested_exit_node`], reached from
+    /// [`suggest_exit_node`](Backend::suggest_exit_node) and from the per-device recompute task
+    /// ([`suggestion_task`](Backend::suggestion_task)), never from a request handler. One compare,
     /// no second copy to fall out of step.
     ///
     /// Written with `send_replace`, never `send`: `send` refuses — and, load-bearingly, does NOT store
     /// — when there are no receivers, which is the common case (nobody is watching), and would leave
     /// the cell empty so that every later suggestion looked like a change.
-    suggested_exit_node_tx: tokio::sync::watch::Sender<Option<String>>,
+    suggested_exit_node_tx: tokio::sync::watch::Sender<String>,
+    /// The exit-node suggestion recompute task ([`suggested_exit_node_loop`]): Go's
+    /// `suggestExitNodeLocked` calls from the netmap path and from `sysPolicyChanged`. Like
+    /// [`monitor_task`](Backend::monitor_task) it holds an [`Arc`](std::sync::Arc) clone of the
+    /// device and is bound to the device lifecycle: spawned in [`finish_up`](Backend::finish_up) and
+    /// **aborted + awaited** in [`stop_device`](Backend::stop_device) before the device `Arc` is
+    /// reclaimed. `None` when down.
+    suggestion_task: Option<tokio::task::JoinHandle<()>>,
     /// Whether **this process** has attempted a boot-time auto-start (set by
     /// [`mark_boot_attempted_up`](Backend::mark_boot_attempted_up)). Process-local and deliberately
     /// NOT persisted: it lets the SIGHUP reload path distinguish "retry a bring-up we already
@@ -2456,9 +2645,9 @@ impl Backend {
             .with_context(|| format!("loading prefs from {}", prefs_path.display()))?;
         let (lifecycle_tx, _) = tokio::sync::watch::channel(0u64);
         let (prefs_tx, _) = tokio::sync::watch::channel(());
-        // No suggestion has been computed yet this process — the cell starts empty, so the first
-        // suggestion of the run always counts as a change and always reaches watchers.
-        let (suggested_exit_node_tx, _) = tokio::sync::watch::channel(None);
+        // No suggestion has been computed yet this process — the cell starts at Go's zero value, so
+        // the first real suggestion of the run always counts as a change and always reaches watchers.
+        let (suggested_exit_node_tx, _) = tokio::sync::watch::channel(String::new());
         let mut backend = Self {
             prefs,
             state_dir: state_dir.to_path_buf(),
@@ -2481,6 +2670,7 @@ impl Backend {
             lifecycle_tx,
             prefs_tx,
             suggested_exit_node_tx,
+            suggestion_task: None,
             // Seed the cache once, at startup, from an actual on-disk check — startup is not the hot
             // path, and every later mutation is tracked at its transition (see the field doc's
             // invariant). `has_persisted_node_key` reads only `key_path`, which is already set above.
@@ -3104,6 +3294,7 @@ impl Backend {
         // The same profile-change edge as a switch (see `activate_profile`).
         self.reset_always_on_override("new profile");
         self.reset_exit_node_policy_override("new profile");
+        self.forget_suggested_exit_node();
         self.reconcile_sys_policy("new profile");
         let _ = self.prefs_tx.send(());
         Ok(SwitchOutcome::Switched {
@@ -3238,6 +3429,9 @@ impl Backend {
         // An exit-node override belongs to its profile for the same reason and is cleared on the
         // same edge in Go, so the incoming profile is reconciled under the policy as written.
         self.reset_exit_node_policy_override("profile switch");
+        // A different profile is a different node, possibly on a different tailnet, so the last
+        // suggestion is not a baseline its first suggestion should be compared against.
+        self.forget_suggested_exit_node();
         // A profile load, exactly like the one in `load`: system policy applies to the newly-active
         // profile's prefs too, so a switch cannot be used to step out from under it. In memory only
         // (the swap above already persisted everything a switch owes to disk).
@@ -4393,6 +4587,10 @@ impl Backend {
         // interface addresses and re-bind the engine when the network path changes (Wi-Fi switch /
         // sleep-wake). Bound to the device lifecycle like the SSH task (torn down in `stop_device`).
         self.spawn_link_monitor(device.clone());
+        // Recompute the exit-node suggestion on every netmap and on an `AllowedSuggestedExitNodes`
+        // change, as Go does, so a watcher learns of a new pick without anyone asking. Bound to the
+        // device lifecycle like the link monitor (torn down in `stop_device`).
+        self.spawn_suggestion_task(device.clone());
         // Arm the `serve` accept loops from the persisted serve config (Go `tailscale serve --tcp`).
         // Like the SSH task, these are bound to the device lifecycle (torn down in `stop_device`).
         self.spawn_serve(device);
@@ -4498,6 +4696,18 @@ impl Backend {
     fn spawn_link_monitor(&mut self, device: std::sync::Arc<tailscale::Device>) {
         let handle = tokio::spawn(link_monitor_loop(device));
         self.monitor_task = Some(handle);
+    }
+
+    /// Spawn the exit-node suggestion recompute task ([`suggested_exit_node_loop`]) for a
+    /// freshly-installed `device`. Stores the handle in [`suggestion_task`](Backend::suggestion_task)
+    /// so [`stop_device`](Backend::stop_device) can abort it. Sync, like
+    /// [`spawn_link_monitor`](Backend::spawn_link_monitor), so it fits `finish_up`. The task publishes
+    /// through a clone of the suggestion cell's sender rather than the backend lock, so a slow engine
+    /// answer never holds up an `up`, `down` or `status`.
+    fn spawn_suggestion_task(&mut self, device: std::sync::Arc<tailscale::Device>) {
+        let cell = self.suggested_exit_node_tx.clone();
+        let handle = tokio::spawn(suggested_exit_node_loop(device, cell));
+        self.suggestion_task = Some(handle);
     }
 
     /// Spawn the `serve` runtime for the current profile's serve config (Go `tailscale serve`), in
@@ -4854,6 +5064,9 @@ impl Backend {
         // 2. Tear down the datapath.
         self.stop_device().await;
         self.bump_generation();
+        // The registration is ending, so the last suggestion (a node on this tailnet) goes with it.
+        // After `stop_device`, so the recompute task cannot publish once more behind it.
+        self.forget_suggested_exit_node();
 
         // 3. Discard the persisted node key BEFORE flipping intent to logged-out — ordering is
         // load-bearing for crash-safety. Both this `remove_file` and the `persist_prefs` below are
@@ -5514,9 +5727,7 @@ impl Backend {
     /// This is the port of Go's `LocalBackend.suggestExitNodeLocked`, which computes the suggestion
     /// and, in the same function, notifies every client when the pick differs from the last one.
     /// Keeping the push HERE rather than in the request handler is the whole point: the comparison
-    /// then reads the value actually returned to the caller, so the two can never disagree — and a
-    /// second caller of the computation (this bit's front-load) gets the notification for free
-    /// instead of having to remember to re-implement it.
+    /// then reads the value actually returned to the caller, so the two can never disagree.
     ///
     /// It takes the shared backend rather than `&self` because the engine round-trip must run
     /// OFF-LOCK, like the other diagnostics: compute first with no lock held, then take the lock only
@@ -5530,65 +5741,43 @@ impl Backend {
         response
     }
 
-    /// Publish a freshly-computed exit-node suggestion to every notify watcher — but only if it
-    /// differs from the last one published. Returns whether it published.
-    ///
-    /// The tail of Go's `suggestExitNodeLocked`:
-    ///
-    /// ```go
-    /// if prevSuggestion != res.ID {
-    ///     b.sendToLocked(ipn.Notify{SuggestedExitNode: &res.ID}, allClients)
-    /// }
-    /// b.lastSuggestedExitNode = res.ID
-    /// ```
-    ///
-    /// Three properties come straight across. It is **change-triggered**, so a stable answer costs
-    /// nothing on the bus however often it is recomputed. It goes to **every** watcher, not to the
-    /// session that triggered the computation, because the suggestion describes the node rather than
-    /// the asker (`allClients`) — here that falls out of the channel being on the backend, which every
-    /// watcher subscribes to. And it fires wherever a suggestion is computed, which in this fork means
-    /// `exit-node suggest` and the watch front-load (see
-    /// [`Request::Watch::suggested_exit_node`](crate::localapi::Request::Watch::suggested_exit_node)
-    /// for why that set is narrower than Go's).
-    ///
-    /// An **empty or failed** answer publishes nothing and leaves the remembered value alone. Go's
-    /// error path returns before both the compare and the `lastSuggestedExitNode` assignment, so a
-    /// watcher is never told "no suggestion" — it simply hears nothing further until a real one
-    /// appears. This fork reaches the same place from two directions: `Ok(None)` (no eligible
-    /// candidate, or the pick withheld by `AllowedSuggestedExitNodes`) and an engine error are both
-    /// silence. Leaving the cell untouched is what makes the next real suggestion compare against the
-    /// last value a watcher was actually told, rather than against a gap.
-    ///
-    /// `&self`, not `&mut self`: the cell lives behind a `watch::Sender`, which publishes through a
-    /// shared reference. That is not an accident of the type — it keeps this callable from the brief
-    /// read-style lock the off-lock diagnostics take.
+    /// Publish a freshly-computed exit-node suggestion to every notify watcher, if it differs from
+    /// the last one. Returns whether it published. The backend-held form of
+    /// [`publish_suggested_exit_node`]; see there for the rules.
     pub fn publish_suggested_exit_node(&self, response: &crate::localapi::Response) -> bool {
-        let crate::localapi::Response::ExitNodeSuggestion {
-            suggestion: Some(suggestion),
-        } = response
-        else {
-            return false; // empty result or engine error → silence, and the cell stands
-        };
-        if self.suggested_exit_node_tx.borrow().as_deref() == Some(suggestion.id.as_str()) {
-            return false; // unchanged — Go's `prevSuggestion != res.ID` guard
-        }
-        tracing::debug!(
-            suggested_id = %suggestion.id,
-            "exit-node suggestion changed; publishing to notify watchers"
-        );
-        self.suggested_exit_node_tx
-            .send_replace(Some(suggestion.id.clone()));
-        true
+        publish_suggested_exit_node(&self.suggested_exit_node_tx, response)
     }
 
-    /// Subscribe to exit-node-suggestion pushes (a masked `Watch` with the `suggested_exit_node`
-    /// bit). Unlike [`watch_prefs`](Backend::watch_prefs) the value rides the channel, so a receiver
-    /// reads it with `borrow_and_update()` instead of re-deriving it — it has no way to re-derive a
-    /// suggestion of its own. `subscribe()` starts synced, so attaching never replays the current
-    /// value; a watcher's first frame comes from its own
-    /// [`suggest_exit_node`](Backend::suggest_exit_node) front-load.
-    pub fn watch_suggested_exit_node(&self) -> tokio::sync::watch::Receiver<Option<String>> {
+    /// Subscribe to exit-node-suggestion pushes. Every masked `Watch` holds one: Go sends a changed
+    /// suggestion to `allClients`, whatever mask they subscribed with. The value rides the channel, so
+    /// a receiver reads it with `borrow_and_update()` instead of re-deriving it — it has no way to
+    /// re-derive a suggestion of its own. `subscribe()` starts synced, so attaching never replays the
+    /// current value; a watcher that asked for a front-load gets it from its own
+    /// [`suggest_exit_node`](Backend::suggest_exit_node) call.
+    pub fn watch_suggested_exit_node(&self) -> tokio::sync::watch::Receiver<String> {
         self.suggested_exit_node_tx.subscribe()
+    }
+
+    /// Forget the last exit-node suggestion WITHOUT telling any watcher. Called wherever the node's
+    /// identity changes: [`logout`](Backend::logout), every profile activation (`switch` and
+    /// `switch --create`) and the empty-profile reset. Go does this in `resetForProfileChangeLocked`
+    /// (`b.lastSuggestedExitNode = ""`), which its `Logout`, `SwitchProfile`, `NewProfile` and
+    /// `ResetAuth` all run.
+    ///
+    /// The id names a node on one tailnet. Left in place it would be the baseline for the next
+    /// profile's first suggestion, so an id from another tailnet could decide whether a real change is
+    /// announced.
+    ///
+    /// Silent, as Go's reset is: an assignment, not a `sendToLocked`. `send_if_modified` returning
+    /// `false` stores the value without waking a receiver.
+    ///
+    /// NOT called from `down`: Go keeps `lastSuggestedExitNode` across a stop and start of the same
+    /// profile, and so does this.
+    fn forget_suggested_exit_node(&self) {
+        self.suggested_exit_node_tx.send_if_modified(|id| {
+            id.clear();
+            false
+        });
     }
 
     /// Validate a prospective prefs change WITHOUT applying it (the `check-prefs` LocalAPI / Go
@@ -6115,6 +6304,12 @@ impl Backend {
             task.abort();
             let _ = task.await;
         }
+        // Step 1b': and the exit-node suggestion recompute task, which holds a device `Arc` clone
+        // for the same reason.
+        if let Some(task) = self.suggestion_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
         // Step 1c: likewise stop every `serve` accept-loop task — they also hold device `Arc` clones,
         // so they must be gone before `into_inner` can reclaim the sole `Device`.
         self.stop_serve_tasks().await;
@@ -6421,7 +6616,8 @@ mod tests {
             lifecycle_tx: tokio::sync::watch::channel(0u64).0,
             prefs_tx: tokio::sync::watch::channel(()).0,
             // No suggestion computed yet, exactly as a freshly-loaded backend starts.
-            suggested_exit_node_tx: tokio::sync::watch::channel(None).0,
+            suggested_exit_node_tx: tokio::sync::watch::channel(String::new()).0,
+            suggestion_task: None,
             // Cache starts `false` (a fresh backend, no key checked yet). Tests that need a key
             // present drive the real wipe/build paths, which keep the cache consistent on their own.
             has_node_key: false,
@@ -6459,13 +6655,26 @@ mod tests {
         }
     }
 
+    /// An `ExitNodeSuggestion` reply for a computation that found no eligible candidate (or had its
+    /// pick withheld by `AllowedSuggestedExitNodes`) — Go's empty response with a nil error.
+    fn empty_suggestion() -> crate::localapi::Response {
+        crate::localapi::Response::ExitNodeSuggestion { suggestion: None }
+    }
+
+    /// An engine failure, the shape `diag::suggest_exit_node` returns for Go's `ErrNoPreferredDERP`.
+    fn failed_suggestion() -> crate::localapi::Response {
+        crate::localapi::Response::Error {
+            message: "exit-node suggest failed: NoPreferredDerp".to_string(),
+        }
+    }
+
     #[tokio::test]
     async fn the_first_suggestion_of_the_run_reaches_a_watcher() {
         let be = suggestion_backend();
         let mut rx = be.watch_suggested_exit_node();
-        // Nothing computed yet: the cell is empty and the receiver starts synced, so a watcher that
-        // attached before any suggestion existed has nothing pending.
-        assert_eq!(*rx.borrow_and_update(), None);
+        // Nothing computed yet: the cell holds Go's zero value and the receiver starts synced, so a
+        // watcher that attached before any suggestion existed has nothing pending.
+        assert_eq!(*rx.borrow_and_update(), "");
 
         assert!(
             be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")),
@@ -6476,8 +6685,8 @@ mod tests {
             "the watcher must have been woken"
         );
         assert_eq!(
-            rx.borrow_and_update().as_deref(),
-            Some("nodeid-a"),
+            *rx.borrow_and_update(),
+            "nodeid-a",
             "the bare stable id rides the channel, as Go's Notify.SuggestedExitNode carries it"
         );
     }
@@ -6491,8 +6700,8 @@ mod tests {
         rx.borrow_and_update(); // consume the first push
 
         // Go guards the send with `if prevSuggestion != res.ID`, so recomputing a stable answer —
-        // which this fork does on every `exit-node suggest` and every watch front-load — must not
-        // wake a single watcher.
+        // which this fork does on every netmap and every `exit-node suggest` — must not wake a
+        // single watcher.
         assert!(
             !be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")),
             "the same pick must not be republished"
@@ -6504,48 +6713,85 @@ mod tests {
 
         // A different pick is a change, and the name moving on its own is not — the id is the value.
         assert!(be.publish_suggested_exit_node(&suggestion_response("nodeid-b", "berlin")));
-        assert_eq!(rx.borrow_and_update().as_deref(), Some("nodeid-b"));
+        assert_eq!(*rx.borrow_and_update(), "nodeid-b");
     }
 
     #[tokio::test]
-    async fn an_empty_suggestion_is_silence_and_leaves_the_remembered_pick_alone() {
+    async fn no_eligible_candidate_clears_the_suggestion_for_every_watcher() {
         let be = suggestion_backend();
         let mut rx = be.watch_suggested_exit_node();
 
         assert!(be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")));
         rx.borrow_and_update();
 
-        // `Ok(None)` is this fork's honest empty result: no eligible candidate, or the pick withheld
-        // by the administrator's `AllowedSuggestedExitNodes`. Go reaches the same place via an error
-        // from `suggestExitNodeLocked` and sends nothing, leaving `lastSuggestedExitNode` untouched.
-        let empty = crate::localapi::Response::ExitNodeSuggestion { suggestion: None };
+        // Go's `suggestExitNode` returns an empty response and a NIL error when no candidate is
+        // left, so `suggestExitNodeLocked` compares "" against the last pick, sends
+        // `Notify{SuggestedExitNode: &""}` to every client and remembers "".
         assert!(
-            !be.publish_suggested_exit_node(&empty),
-            "an empty suggestion must not produce a frame"
+            be.publish_suggested_exit_node(&empty_suggestion()),
+            "a pick going away is a change, and watchers must be told"
         );
-        // An engine failure is the same silence.
-        let failed = crate::localapi::Response::Error {
-            message: "exit-node suggest failed".to_string(),
-        };
+        assert!(rx.has_changed().unwrap(), "the watcher must be woken");
+        assert_eq!(
+            *rx.borrow_and_update(),
+            "",
+            "the cleared suggestion is Go's empty StableNodeID"
+        );
+
+        // Remembered as "", so a second empty answer is not a change...
+        assert!(!be.publish_suggested_exit_node(&empty_suggestion()));
+        assert!(!rx.has_changed().unwrap());
+        // ...and the old pick coming back is one.
         assert!(
-            !be.publish_suggested_exit_node(&failed),
+            be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")),
+            "a pick that went away and came back must be announced again"
+        );
+        assert_eq!(*rx.borrow_and_update(), "nodeid-a");
+    }
+
+    #[tokio::test]
+    async fn an_engine_error_is_silence_and_leaves_the_remembered_pick_alone() {
+        let be = suggestion_backend();
+        let mut rx = be.watch_suggested_exit_node();
+
+        assert!(be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")));
+        rx.borrow_and_update();
+
+        // Go's error path (`ErrNoPreferredDERP`) returns before both the compare and the
+        // `lastSuggestedExitNode` assignment.
+        assert!(
+            !be.publish_suggested_exit_node(&failed_suggestion()),
             "an engine error must not produce a frame"
         );
         assert!(
             !rx.has_changed().unwrap(),
-            "neither an empty result nor an error may wake a watcher"
+            "an engine error must not wake a watcher"
         );
-        assert_eq!(
-            rx.borrow_and_update().as_deref(),
-            Some("nodeid-a"),
-            "the remembered pick stands, so the next real suggestion is compared against the last \
-             value a watcher was actually told"
-        );
-
-        // ...and because the cell stood, the SAME pick coming back is still not a change.
+        assert_eq!(*rx.borrow_and_update(), "nodeid-a");
         assert!(
             !be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")),
-            "a pick that went away and came back unchanged must not be republished"
+            "the pick stood through the error, so the same pick after it is not a change"
+        );
+    }
+
+    #[test]
+    fn the_bus_value_of_a_suggestion_follows_gos_err_split() {
+        // Go's initial notify: `if en, err := b.suggestExitNodeLocked(); err == nil {
+        // ini.SuggestedExitNode = &en.ID }`. The watch front-load sends exactly this value, so a
+        // failed computation sends nothing rather than some earlier pick.
+        assert_eq!(
+            suggested_exit_node_id(&suggestion_response("nodeid-a", "berlin")),
+            Some("nodeid-a")
+        );
+        assert_eq!(
+            suggested_exit_node_id(&empty_suggestion()),
+            Some(""),
+            "no candidate is a nil error in Go, so its empty id is sent"
+        );
+        assert_eq!(
+            suggested_exit_node_id(&failed_suggestion()),
+            None,
+            "an error carries no SuggestedExitNode at all"
         );
     }
 
@@ -6566,7 +6812,7 @@ mod tests {
                 rx.has_changed().unwrap(),
                 "every watcher must be woken, not only the connection that asked"
             );
-            assert_eq!(rx.borrow_and_update().as_deref(), Some("nodeid-a"));
+            assert_eq!(*rx.borrow_and_update(), "nodeid-a");
         }
     }
 
@@ -6575,18 +6821,197 @@ mod tests {
         let be = suggestion_backend();
         // Nobody is watching — the common case. `watch::Sender::send` would refuse here AND leave the
         // value unstored, so the cell must be written with `send_replace`; otherwise every later
-        // suggestion would look like a change and a watcher attaching afterwards would be told about
-        // a "new" pick that had been stable for hours.
+        // suggestion would look like a change.
         assert!(be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")));
         assert!(
             !be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")),
             "the pick must have been recorded even with zero receivers"
         );
+    }
+
+    #[tokio::test]
+    async fn forgetting_the_suggestion_clears_it_without_waking_a_watcher() {
+        let be = suggestion_backend();
         let mut rx = be.watch_suggested_exit_node();
+        assert!(be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")));
+        rx.borrow_and_update();
+
+        be.forget_suggested_exit_node();
+        // Go's reset is an assignment, not a send: nobody is told anything because a profile changed.
+        assert!(
+            !rx.has_changed().unwrap(),
+            "forgetting must not wake a watcher"
+        );
+        assert_eq!(*rx.borrow(), "");
+        assert!(
+            be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")),
+            "after a reset the same id is compared against nothing, so it is a change"
+        );
+    }
+
+    /// A fresh state dir for a test that drives a real profile or logout path.
+    async fn suggestion_state_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-suggestion-{tag}-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn logout_forgets_the_last_suggestion() {
+        let dir = suggestion_state_dir("logout").await;
+        let mut be = backend_for(&dir);
+        assert!(be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")));
+
+        be.logout(alwayson::Actor::Operator { reason: None })
+            .await
+            .expect("logout with no key file must succeed");
+        assert_eq!(*be.watch_suggested_exit_node().borrow(), "");
+        assert!(
+            be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")),
+            "a logged-out node's old pick must not be the baseline for the next registration"
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn switching_profile_forgets_the_last_suggestion() {
+        let dir = suggestion_state_dir("switch").await;
+        let mut be = backend_for(&dir);
+        assert!(be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")));
+
+        be.create_profile("work").await.expect("create + switch");
+        assert_eq!(*be.watch_suggested_exit_node().borrow(), "");
+        assert!(
+            be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")),
+            "an id from the old profile's tailnet must not be the new profile's baseline"
+        );
+
+        be.switch_profile(profile::DEFAULT_PROFILE_ID)
+            .await
+            .expect("switch back");
         assert_eq!(
-            rx.borrow_and_update().as_deref(),
-            Some("nodeid-a"),
-            "a watcher attaching later reads the recorded pick for its front-load"
+            *be.watch_suggested_exit_node().borrow(),
+            "",
+            "switching back is a profile change too"
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn switching_to_an_empty_profile_forgets_the_last_suggestion() {
+        let dir = suggestion_state_dir("empty").await;
+        let mut be = backend_for(&dir);
+        // A profile that was set up but never logged in: the reset path, not the no-op answer.
+        be.ever_configured = true;
+        assert!(be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")));
+
+        be.switch_to_empty_profile()
+            .await
+            .expect("switch to a new empty profile");
+        assert_eq!(*be.watch_suggested_exit_node().borrow(), "");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// The engine bus stand-in for [`next_suggestion_trigger`]: a channel of notifications, closed
+    /// by dropping the sender, as the engine closes its bus when the device goes away.
+    impl NotifySource for tokio::sync::mpsc::UnboundedReceiver<tailscale::Notify> {
+        async fn next_notify(&mut self) -> Option<tailscale::Notify> {
+            self.recv().await
+        }
+    }
+
+    fn netmap_notify() -> tailscale::Notify {
+        let mut notify = tailscale::Notify::default();
+        notify.net_map = Some(Vec::new());
+        notify
+    }
+
+    fn state_notify() -> tailscale::Notify {
+        let mut notify = tailscale::Notify::default();
+        notify.state = Some(tailscale::DeviceState::Running);
+        notify
+    }
+
+    fn allow(ids: &[&str]) -> std::collections::BTreeSet<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn every_netmap_triggers_a_recompute_and_nothing_else_on_the_bus_does() {
+        let (tx, mut bus) = tokio::sync::mpsc::unbounded_channel();
+        let mut policy_rx = None;
+        let mut allowed = None;
+        tx.send(state_notify()).unwrap();
+        tx.send(netmap_notify()).unwrap();
+        tx.send(state_notify()).unwrap();
+        tx.send(netmap_notify()).unwrap();
+        drop(tx);
+
+        let mut triggers = Vec::new();
+        while let Some(trigger) =
+            next_suggestion_trigger(&mut bus, &mut policy_rx, &mut allowed, || None).await
+        {
+            triggers.push(trigger);
+        }
+        // Go recomputes on every netmap. A state change on its own is not one of its triggers.
+        assert_eq!(
+            triggers,
+            [SuggestionTrigger::NetMap, SuggestionTrigger::NetMap],
+            "one recompute per netmap, none for a state-only notification, and the loop ends when \
+             the bus closes"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_moved_allow_list_triggers_a_policy_recompute() {
+        let (tx, mut bus) = tokio::sync::mpsc::unbounded_channel::<tailscale::Notify>();
+        let (policy_tx, policy_rx) = tokio::sync::watch::channel(());
+        let mut policy_rx = Some(policy_rx);
+        let mut allowed = Some(allow(&["nodeid-a"]));
+        let resolved = std::sync::Mutex::new(Some(allow(&["nodeid-a"])));
+        let read_allowed = || resolved.lock().unwrap().clone();
+
+        // A reload that did not touch AllowedSuggestedExitNodes: Go's
+        // `HasChanged(pkey.AllowedSuggestedExitNodes)` is false, so nothing is recomputed. The netmap
+        // queued behind it is the next trigger, which proves the tick was consumed and skipped.
+        policy_tx.send(()).unwrap();
+        tx.send(netmap_notify()).unwrap();
+        assert_eq!(
+            next_suggestion_trigger(&mut bus, &mut policy_rx, &mut allowed, read_allowed).await,
+            Some(SuggestionTrigger::NetMap)
+        );
+
+        // The allow-list moved: recompute, and remember the new set.
+        *resolved.lock().unwrap() = Some(allow(&["nodeid-b"]));
+        policy_tx.send(()).unwrap();
+        assert_eq!(
+            next_suggestion_trigger(&mut bus, &mut policy_rx, &mut allowed, read_allowed).await,
+            Some(SuggestionTrigger::AllowListChanged)
+        );
+        assert_eq!(allowed, Some(allow(&["nodeid-b"])));
+
+        // Unset is a change too (a nil set in Go: no restriction).
+        *resolved.lock().unwrap() = None;
+        policy_tx.send(()).unwrap();
+        assert_eq!(
+            next_suggestion_trigger(&mut bus, &mut policy_rx, &mut allowed, read_allowed).await,
+            Some(SuggestionTrigger::AllowListChanged)
+        );
+
+        // A closed policy bus stops only the policy trigger; netmaps still count.
+        drop(policy_tx);
+        tx.send(netmap_notify()).unwrap();
+        assert_eq!(
+            next_suggestion_trigger(&mut bus, &mut policy_rx, &mut allowed, read_allowed).await,
+            Some(SuggestionTrigger::NetMap)
+        );
+        assert!(policy_rx.is_none());
+        drop(tx);
+        assert_eq!(
+            next_suggestion_trigger(&mut bus, &mut policy_rx, &mut allowed, read_allowed).await,
+            None
         );
     }
 
