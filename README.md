@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/images/banner.svg" alt="tailscaled-rs" width="100%">
+  <img src="https://raw.githubusercontent.com/GeiserX/tailscaled-rs/main/docs/images/banner.svg" alt="tailscaled-rs" width="100%">
 </p>
 
 <h1 align="center">tailscaled-rs</h1>
