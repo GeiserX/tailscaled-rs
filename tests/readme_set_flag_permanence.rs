@@ -18,7 +18,8 @@
 //! it describes. Which flags are asked-for and which are declined is PARSED out of §34, not
 //! hard-coded, so landing the engine support (or declining another flag) moves this test with it.
 
-const README: &str = include_str!("../README.md");
+/// The paragraph lives in `docs/USAGE.md` since the README was cut down to an overview.
+const README: &str = include_str!("../docs/USAGE.md");
 const ENGINE_ASKS: &str = include_str!("../docs/ENGINE_ASKS.md");
 
 /// The §34 heading, matched by its number and lead so a retitle that keeps the section intact
@@ -106,7 +107,7 @@ fn asked_for_flags() -> Vec<String> {
 /// the declined flag: `.0` covers the engine-gated ones, `.1` covers the declined one.
 fn readme_halves() -> (&'static str, &'static str) {
     let start = README.find(PARAGRAPH_LEAD).unwrap_or_else(|| {
-        panic!("README.md should still contain a paragraph opening `{PARAGRAPH_LEAD}`")
+        panic!("docs/USAGE.md should still contain a paragraph opening `{PARAGRAPH_LEAD}`")
     });
     let body = &README[start..];
     let paragraph = match body.find("\n\n") {

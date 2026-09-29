@@ -50,10 +50,18 @@ const DOCS: &[(&str, &str)] = &[
     ("CONTRIBUTING.md", include_str!("../CONTRIBUTING.md")),
     ("SECURITY.md", include_str!("../SECURITY.md")),
     (
+        "docs/ARCHITECTURE.md",
+        include_str!("../docs/ARCHITECTURE.md"),
+    ),
+    (
         "docs/CONFIGURE_SCOPE.md",
         include_str!("../docs/CONFIGURE_SCOPE.md"),
     ),
     ("docs/DESIGN.md", include_str!("../docs/DESIGN.md")),
+    (
+        "docs/DEVELOPMENT.md",
+        include_str!("../docs/DEVELOPMENT.md"),
+    ),
     ("docs/ENGINE.md", include_str!("../docs/ENGINE.md")),
     (
         "docs/ENGINE_ASKS.md",
@@ -64,6 +72,10 @@ const DOCS: &[(&str, &str)] = &[
         include_str!("../docs/FILE_CP_PARITY.md"),
     ),
     (
+        "docs/INSTALLATION.md",
+        include_str!("../docs/INSTALLATION.md"),
+    ),
+    (
         "docs/PARITY_GAP_ANALYSIS.md",
         include_str!("../docs/PARITY_GAP_ANALYSIS.md"),
     ),
@@ -72,6 +84,7 @@ const DOCS: &[(&str, &str)] = &[
         "docs/THREAT_MODEL.md",
         include_str!("../docs/THREAT_MODEL.md"),
     ),
+    ("docs/USAGE.md", include_str!("../docs/USAGE.md")),
     (
         "packaging/README.md",
         include_str!("../packaging/README.md"),
