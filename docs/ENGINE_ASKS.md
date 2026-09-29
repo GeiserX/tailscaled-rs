@@ -1803,10 +1803,11 @@ Two, and both turn a pref this daemon already carries into something with a wire
   `PreferenceOption` in `src/ipn/syspolicy.rs`, and `PreferenceOption::should_enable` is Go's
   `ShouldEnable`; what the handler still needs is a public read of a preference-option policy, as
   `get_boolean` is for booleans. With the hook, the disabled case — policy `never`, or the pref
-  `false` under `user-decides` or no policy — becomes a real `{"PostureDisabled": true}`, Go's own
-  answer, sent because the operator or the administrator opted out rather than because the fork is
-  silent. The enabled case additionally needs serial-number and MAC
-  collection (Go's `posture.GetSerialNumbers` / `GetHardwareAddrs`, behind Go's `hwaddrs=true` query
+  `false` under `user-decides`, no policy, or a failed policy read — becomes a real
+  `{"PostureDisabled": true}`, Go's own answer, sent because the operator or the administrator opted
+  out rather than because the fork is silent. A failed read is not a refusal: Go logs it and falls
+  back to the `ShowChoiceByPolicy` default the call passes, which leaves the pref to decide. The
+  enabled case additionally needs serial-number and MAC collection (Go's `posture.GetSerialNumbers` / `GetHardwareAddrs`, behind Go's `hwaddrs=true` query
   gate); that is local OS work on the daemon side and a separate piece, so the honest first shape
   reports what it can collect and omits what it cannot.
 - **`GET /update` and `POST /update`** → `tailcfg.C2NUpdateResponse` (`Err`, `Enabled`, `Supported`,
@@ -2033,3 +2034,41 @@ watcher, writes one `Response::Notify(NotifyView { error: Some("IPN bus consumer
 closing watch"), .. })` frame, and returns. That is Go's terminal frame, and `NotifyView::error`
 already exists. The ordering and the message get a test that drives the bus past 128 frames.
 Consumed via a pin bump. — engine lane
+
+## 46. A `net_map` tick on a self-node change — so `Notify.SelfChange` reaches a watcher when only this node moved
+
+**Why:** Go's `SelfChange` (`ipn/ipnlocal/local.go` @ `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`)
+is built from `NetMap.SelfNode` on every netmap update, so a watcher learns about its own node even
+when no peer changed: a key-expiry extension, a MagicDNS rename, reassigned addresses. The daemon
+fills `NotifyView::self_change` on each `net_map` frame, but at pin `9d847a6e` a self-only update
+produces no `net_map` frame:
+
+- `run_bus` (`ts_runtime/src/ipn_bus.rs`) emits `net_map` only from `peer_rx.changed()`, a `watch`
+  of `Vec<StatusNode>`.
+- `PeerTracker`'s netmap `handle` (`ts_runtime/src/peer_tracker/mod.rs`) returns early when the
+  response has no `peer_update`, no `peer_patches` and no liveness delta, before
+  `peer_watch.send_replace`. The self node never enters `peer_db`.
+- The self node goes to the control runner's `self_node` cell instead
+  (`ts_runtime/src/control_runner.rs`, `self.self_node.send_replace(Some(node.clone()))`), which the
+  bus does not watch.
+
+**Why not a daemon-side facsimile.** The daemon could poll `Device::self_node()` on a timer and
+emit a frame when it differs. That is a guess at when the netmap moved, not the event: it lags by the
+poll period, costs an engine round-trip per watcher per tick, and diffs where Go re-sends. Refused
+under the honest-omission rule; the gap is documented on `NotifyView::self_change` instead.
+
+**Ask (either is sufficient; the first is preferred):**
+
+1. Have `run_bus` also watch the control runner's `self_node` cell and emit a `net_map` tick (the
+   current peer snapshot) when it changes. A consumer then sees one frame per self-only update, as
+   Go's `SelfChange` does. An engine test drives a self-node `send_replace` with an unchanged peer
+   set and asserts one `net_map` notify arrives.
+2. Or add `self_node: Option<StatusNode>` to the engine's `Notify`, set on the same trigger. The
+   daemon would then read it off the frame instead of fetching it, and the extra
+   `STATUS_QUERY_TIMEOUT`-bounded round-trip in `stream_notify` goes away.
+
+**Daemon impact once landed:** with (1), nothing changes in `stream_notify` (`src/server.rs`): the
+existing netmap arm already fetches and attaches the self node. A test beside the existing
+`stream_notify` tests pins that a self-only change delivers a frame with `self_change` set, and the
+"Narrower than Go" paragraph on `NotifyView::self_change` is deleted. With (2), `project_notify`
+takes the self node from the engine `Notify`. Consumed via a pin bump. — engine lane

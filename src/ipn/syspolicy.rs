@@ -162,11 +162,13 @@
 //! `util/syspolicy/source/json_policy_store.go`, `util/syspolicy/source/policy_reader.go` and
 //! `util/syspolicy/policy_keys.go` @ `53a0d659afa51835dd7a9283873cca44261454f8`; the apply half is
 //! `ipn/ipnlocal/local.go` (`applySysPolicy`, `applyExitNodeSysPolicyLocked`,
-//! `preferencePolicies`) @ `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`.
+//! `preferencePolicies`) @ `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`. The reload/change-callback
+//! half — when a re-resolve is allowed to notify watchers — is
+//! `util/syspolicy/rsop/resultant_policy.go` (`Reload`, `reloadNow`) @ the same ref.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 use serde_json::{Map, Value};
 
@@ -331,13 +333,20 @@ static REGISTERED: RwLock<Vec<PolicySource>> = RwLock::new(Vec::new());
 ///
 /// **What actually ticks it, honestly.** Go registers real change sources (a Windows registry
 /// watcher, a `ReadWriteHandle` a management agent pokes) and its callback fires whenever one of
-/// them moves. This build has exactly one source, a JSON file captured at startup and never
-/// re-read, so the only points at which the effective policy can differ from what a watcher last
-/// saw are [`load_json_policy_file`] (a source appears) and [`reload_effective_policy`] (the
-/// operator asked for a forced re-read). Those are the two send sites. That is a coarser signal
-/// than Go's — a hand edit of `syspolicy.json` is not seen until someone runs `syspolicy reload` —
-/// and the mask bit's documentation says so rather than promising a watch this build cannot
-/// perform. A file watcher would narrow the gap and is deliberately not smuggled in here.
+/// them moves — but *only* when it moves. `rsop.(*Policy).reloadNow` swaps the fresh merge in and
+/// then invokes the callbacks under `if old != nil && !old.EqualItems(new)`, so a re-resolve that
+/// lands on the same items notifies nobody. That guard is ported as [`reload_and_publish`], which
+/// is the only caller of [`notify_policy_changed`].
+///
+/// This build re-resolves at exactly two points — [`load_json_policy_file`] (a source appears) and
+/// [`reload_effective_policy`] (the operator asked for a forced re-read) — and each ticks only if
+/// the merge it produced differs from the one watchers already hold. The one source this daemon
+/// registers is a JSON file captured at startup and never re-read, so in practice **registration is
+/// the only tick that can fire**: a `syspolicy reload` re-resolves the same rows by construction and
+/// is silent. That is a coarser signal than Go's — a hand edit of `syspolicy.json` is not seen until
+/// the daemon restarts — and the mask bit's documentation says so rather than promising a watch this
+/// build cannot perform. A file watcher would narrow the gap and is deliberately not smuggled in
+/// here.
 ///
 /// [`Backend::watch_prefs`]: crate::ipn::Backend::watch_prefs
 static POLICY_CHANGED: std::sync::LazyLock<tokio::sync::watch::Sender<()>> =
@@ -352,10 +361,73 @@ pub fn watch_policy() -> tokio::sync::watch::Receiver<()> {
     POLICY_CHANGED.subscribe()
 }
 
+/// The effective policy every watcher has already been told about — Go's `Policy.effective`, the
+/// pointer `rsop.(*Policy).reloadNow` swaps before it decides whether to invoke the change
+/// callbacks.
+///
+/// Held beside [`REGISTERED`] rather than replacing it: [`effective_policy`] stays a live merge of
+/// the registered sources, and this is only the "what did watchers last see" half. The invariant
+/// that keeps the two from drifting is that **every mutation of [`REGISTERED`] is followed by a
+/// [`reload_and_publish`]** — today that is the single `push` in [`load_json_policy_file`].
+static LAST_PUBLISHED: Mutex<Vec<PolicySetting>> = Mutex::new(Vec::new());
+
 /// Tell every policy watcher to re-read the snapshot. A failed send (zero receivers) is the common
 /// case — nobody is watching policy — and is not an error.
+///
+/// Called from exactly one place, [`reload_and_publish`], so the "only on an actual change" rule
+/// cannot be bypassed by a future send site.
 fn notify_policy_changed() {
     let _ = POLICY_CHANGED.send(());
+}
+
+/// Re-resolve the effective policy and tick the policy watchers **only if it moved** — the tail of
+/// Go `rsop.(*Policy).reloadNow`:
+///
+/// ```go
+/// old := p.effective.Swap(new)
+/// if old != nil && !old.EqualItems(new) {
+///     p.changeCallbacks.Invoke(Change[*setting.Snapshot]{New: new, Old: old})
+/// }
+/// ```
+///
+/// Returns the fresh merge, so the caller reports exactly what it published.
+///
+/// `last` (Go's `p.effective`) and `resolve` (Go's `readAndMerge`) are parameters rather than reads
+/// of the process globals, so the rule is testable without touching the registry — the same split
+/// [`allowed_suggestions_in`] and [`auth_key_in`] use. `resolve` runs while `last` is held so two
+/// concurrent reloads cannot publish their snapshots out of order and leave `last` disagreeing with
+/// what watchers were told; Go gets that for free by funnelling every reload through one goroutine.
+/// The lock order is only ever `last` → [`REGISTERED`] (the read `resolve` takes), never the
+/// inverse, so the one writer of `REGISTERED` — which drops its write guard before calling here —
+/// cannot deadlock against it.
+///
+/// **What is compared.** `Vec<PolicySetting>` is the *reported* row set, in which a configured
+/// `AuthKey` renders as `<redacted>` rather than its value; Go's `EqualItems` compares raw snapshot
+/// items. The two can only disagree if a second source registered under the same origin string and
+/// differed from the first *only* in an `AuthKey` value. Exactly one source is ever registered here
+/// (from `main`, once), so that is unreachable; comparing the rows a watcher would actually receive
+/// is the stronger statement while that holds, because it is precisely "would this frame tell the
+/// watcher anything new?". A build that registers a second source should compare the raw
+/// [`PolicySource`] settings instead.
+///
+/// Go's extra `old != nil` guard suppresses the callbacks for the very first resolution of a scope,
+/// which it can do because `p.effective` starts unset. There is no unset state here: this daemon
+/// resolves the device scope from the first instruction (an empty registry merges to an empty
+/// snapshot, which [`effective_policy`] will happily report), so `last` starts as that empty
+/// snapshot and a registration that configures keys is a real empty→non-empty change. That matches
+/// what Go does whenever a `Policy` for the scope already exists when `RegisterStore` runs, and it
+/// is the only reading under which the registration tick is not a lie.
+fn reload_and_publish(
+    last: &Mutex<Vec<PolicySetting>>,
+    resolve: impl FnOnce() -> Vec<PolicySetting>,
+) -> Vec<PolicySetting> {
+    let mut last = last.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let new = resolve();
+    if *last != new {
+        last.clone_from(&new);
+        notify_policy_changed();
+    }
+    new
 }
 
 /// What [`load_json_policy_file`] did, so the caller can log it honestly.
@@ -416,11 +488,14 @@ pub fn load_json_policy_file(source_name: &str, path: &Path) -> Result<LoadOutco
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .push(source);
-    // A source appeared: the effective policy just moved for anyone holding an older snapshot.
-    // Nothing is watching at daemon start (this runs from `main` before the LocalAPI is served), so
-    // this is for the sake of the invariant rather than any current caller — every mutation of
-    // `REGISTERED` ticks, so a watcher can never silently miss one.
-    notify_policy_changed();
+    // A source appeared: re-resolve, and tick if that moved the effective policy for anyone holding
+    // an older snapshot (it does whenever the file configured at least one key). The `REGISTERED`
+    // write guard above is dropped by the end of that statement, so the read `reload_and_publish`
+    // takes is not nested inside it. Nothing is watching at daemon start (this runs from `main`
+    // before the LocalAPI is served), so this is for the sake of the invariant rather than any
+    // current caller — every mutation of `REGISTERED` is published, so a watcher can never silently
+    // miss one.
+    reload_and_publish(&LAST_PUBLISHED, registered_store_settings);
     Ok(LoadOutcome::Registered { settings: count })
 }
 
@@ -447,17 +522,20 @@ pub(super) fn effective_policy() -> PolicyReport {
 /// `syspolicy.json` after the daemon started — only a restart does. Kept a distinct verb (faithful
 /// to Go, and the place a genuinely re-readable source would be re-read). Never errors.
 ///
-/// It also pushes the re-read snapshot to every policy watcher (see [`POLICY_CHANGED`]). A reload is
-/// the operator saying "the policy may have moved", and it is the only such moment this build can
-/// observe, so it is the change edge the `policy` notify bit is built on — even though, for the JSON
-/// file source, the re-read necessarily resolves to the same rows a watcher already holds.
+/// It pushes the re-read snapshot to every policy watcher (see [`POLICY_CHANGED`]) **only if that
+/// snapshot differs from the one they already hold**, which is Go's contract: `reloadNow` invokes
+/// the change callbacks under `if old != nil && !old.EqualItems(new)`, so `Policy.Reload()` over an
+/// unchanged store notifies nobody. For this build's single source — a JSON file captured at
+/// registration — the re-read *always* resolves the same rows, so a `tnet syspolicy reload` is
+/// silent on the notify bus by construction. That is the honest answer: `Notify.Policy` says the
+/// effective policy CHANGED, and a frame carrying the rows a watcher already has asserts the
+/// opposite of what receiving it would imply.
 pub(super) fn reload_effective_policy() -> PolicyReport {
     // The forced re-read re-merges the registered sources; none of them can have changed underneath
     // us, because each captured its settings at registration (see `PolicySource`).
-    notify_policy_changed();
     PolicyReport {
         scope: DEVICE_SCOPE.to_string(),
-        settings: registered_store_settings(),
+        settings: reload_and_publish(&LAST_PUBLISHED, registered_store_settings),
     }
 }
 
@@ -1799,12 +1877,15 @@ mod tests {
     }
 
     #[test]
-    fn a_reload_pushes_the_snapshot_to_a_policy_watcher() {
+    fn a_reload_that_resolves_the_same_rows_pushes_no_policy_frame() {
         let _serialized = POLICY_TICK_TESTS.lock().unwrap_or_else(|e| e.into_inner());
-        // The change edge the `policy` notify bit is built on. A watcher that subscribed before the
-        // reload must see the tick, and the snapshot it then re-reads must be the one `list` returns —
-        // there is one producer, so the notify stream cannot drift from the report.
-        let mut rx = watch_policy();
+        // Go's `reloadNow` invokes the change callbacks only under `!old.EqualItems(new)`, so
+        // `Policy.Reload()` over a store that has not moved notifies nobody. A forced reload here
+        // re-merges sources that captured their settings at registration, so it can only ever
+        // resolve the rows a watcher already holds — and must therefore stay silent.
+        //
+        // Not `mut`: nothing here ever consumes a tick, because no tick may be produced.
+        let rx = watch_policy();
         assert!(
             !rx.has_changed().unwrap(),
             "`subscribe()` starts synced: a fresh watcher must not see a spurious initial tick, \
@@ -1812,22 +1893,66 @@ mod tests {
         );
 
         let pushed = reload_effective_policy();
-        assert!(
-            rx.has_changed().unwrap(),
-            "a `syspolicy reload` is the one change signal this build can observe; it must reach \
-             the notify bus"
-        );
-        rx.borrow_and_update();
         assert_eq!(
             effective_policy(),
             pushed,
-            "the pushed snapshot and the `list` snapshot are the same rows"
+            "the re-read snapshot and the `list` snapshot are the same rows"
+        );
+        assert!(
+            !rx.has_changed().unwrap(),
+            "a reload that resolved the same rows must not emit a policy frame: `Notify.Policy` \
+             says the effective policy CHANGED, and a frame carrying rows the watcher already has \
+             says the opposite of what receiving it would imply"
         );
 
-        // Ticks are edges, not a queue: after consuming one, a second reload is seen again.
-        assert!(!rx.has_changed().unwrap());
+        // Not a one-shot suppression either: the second reload is silent for the same reason.
         let _ = reload_effective_policy();
-        assert!(rx.has_changed().unwrap());
+        assert!(!rx.has_changed().unwrap());
+    }
+
+    #[test]
+    fn only_a_resolve_that_moves_the_snapshot_pushes_a_policy_frame() {
+        let _serialized = POLICY_TICK_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        // The other half of Go's rule: when the merge DOES move, every watcher is told, exactly
+        // once. Driven through the real publish path over a `last` cell of this test's own, so it
+        // needs no source in the process-global registry (the same split `allowed_suggestions_in`
+        // is tested through). The tick channel is the global one — that is the thing under test —
+        // which is why this holds `POLICY_TICK_TESTS`.
+        let mut rx = watch_policy();
+        assert!(!rx.has_changed().unwrap());
+        let last = Mutex::new(Vec::new());
+
+        let one = resolve(r#"{"Hostname": "documented-node"}"#).expect("a valid file resolves");
+        assert_eq!(reload_and_publish(&last, || one.clone()), one);
+        assert!(
+            rx.has_changed().unwrap(),
+            "empty → one configured key is a real change and must reach the notify bus"
+        );
+        rx.borrow_and_update();
+
+        // Re-resolving the same rows is not a change.
+        assert_eq!(reload_and_publish(&last, || one.clone()), one);
+        assert!(
+            !rx.has_changed().unwrap(),
+            "Go compares items, not identity: an equal re-merge invokes no callback"
+        );
+
+        // A value that moved is one, even though the key set did not — `EqualItems` compares rows.
+        let renamed = resolve(r#"{"Hostname": "renamed-node"}"#).expect("a valid file resolves");
+        assert_eq!(reload_and_publish(&last, || renamed.clone()), renamed);
+        assert!(
+            rx.has_changed().unwrap(),
+            "the same key with a different value is a policy change"
+        );
+        rx.borrow_and_update();
+
+        // ...and so is a key going away.
+        assert!(reload_and_publish(&last, Vec::new).is_empty());
+        assert!(
+            rx.has_changed().unwrap(),
+            "a source's last setting disappearing is a policy change"
+        );
+        rx.borrow_and_update();
     }
 
     #[test]
