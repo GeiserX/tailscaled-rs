@@ -6758,8 +6758,10 @@ mod tests {
         .await;
         assert!(matches!(
             answer,
-            Some(crate::localapi::Response::ExitNodeSuggestion { suggestion: Some(s) })
-                if s.id == "nodeid-a"
+            Some(crate::localapi::Response::ExitNodeSuggestion {
+                suggestion: Some(s),
+                withheld_by_policy: false,
+            }) if s.id == "nodeid-a"
         ));
     }
 
