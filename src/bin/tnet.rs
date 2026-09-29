@@ -15378,10 +15378,11 @@ fn set_kubeconfig_for_peer(scheme: &str, fqdn: &str, path: &str) -> Result<()> {
 fn decode_kubeconfig_bytes(b: Vec<u8>) -> Result<String> {
     let invalid = || anyhow!("invalid kubeconfig");
     let utf16 = |body: &[u8], unit: fn([u8; 2]) -> u16| {
-        if !body.len().is_multiple_of(2) {
+        let (pairs, odd) = body.as_chunks::<2>();
+        if !odd.is_empty() {
             return Err(invalid());
         }
-        let units: Vec<u16> = body.chunks_exact(2).map(|c| unit([c[0], c[1]])).collect();
+        let units: Vec<u16> = pairs.iter().map(|&c| unit(c)).collect();
         String::from_utf16(&units).map_err(|_| invalid())
     };
     match b.as_slice() {
