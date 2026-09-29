@@ -141,8 +141,10 @@ fn an_unwritable_kubeconfig_is_refused_before_the_merge() {
         "Go's words are `cannot write kubeconfig at %q`; got:\n{err}"
     );
     assert!(
-        !err.contains("opening kubeconfig"),
-        "the failure must come from the precheck, not from the open after the merge:\n{err}"
+        err.trim_start()
+            .starts_with("Error: cannot write kubeconfig at"),
+        "the failure must come from the precheck, not from the open after the merge — which \
+         reports Go's bare `open <path>: permission denied`:\n{err}"
     );
     assert!(
         !err.contains("invalid kubeconfig"),
