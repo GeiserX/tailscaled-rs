@@ -1989,6 +1989,13 @@ and `IpnBusWatcher::next() -> Option<Notify>` has no way to say a frame was drop
 pager, an agent doing synchronous work per frame) is exactly what fills that queue. The watcher then
 loses frames one at a time, the connection stays open, and neither side knows its view diverged.
 
+The drop costs more than one frame. `run_bus` calls `borrow_and_update()` on the source `watch` cell
+before `deliver`, so the dropped value counts as *seen*. The frames still in the queue are **older**
+values of that cell. A consumer that catches up ends on a stale state or peer set, and stays there
+until that cell next changes. On a quiet node that can be indefinitely. Once ask #28 lands and
+`net_map` carries deltas instead of full sets, a dropped delta would corrupt the watcher's view for
+good. So this ask should land before, or with, #28.
+
 **Why not a daemon-side facsimile.** The daemon cannot see a drop, because the engine records none.
 A write timeout or a queue-depth estimate would guess at lag. It would disconnect readers that never
 lost a frame and miss ones that did. Refused under the honest-omission rule; hence this ask.
@@ -2033,7 +2040,9 @@ impl IpnBusWatcher {
 watcher, writes one `Response::Notify(NotifyView { error: Some("IPN bus consumer fell behind;
 closing watch"), .. })` frame, and returns. That is Go's terminal frame, and `NotifyView::error`
 already exists. The ordering and the message get a test that drives the bus past 128 frames.
-Consumed via a pin bump. — engine lane
+`NotifyView::error` today means "terminal registration failure, alongside a `NeedsLogin` state".
+The lag frame carries `error` with no `state`, which is how Go overloads `Notify.ErrMessage` too, so
+the field's doc comment has to say so. Consumed via a pin bump. — engine lane
 
 ## 46. A `net_map` tick on a self-node change — so `Notify.SelfChange` reaches a watcher when only this node moved
 
