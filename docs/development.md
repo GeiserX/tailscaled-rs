@@ -1,7 +1,26 @@
-# Testing tiers
+# Development
+
+The crate uses Rust edition 2024.
+
+## Developing against a local engine
+
+`tailscaled-rs` depends on a pinned revision of `tailscale-rs` (see `Cargo.toml`), and `Cargo.lock`
+is committed so every build is reproducible. If you are co-developing the engine, point Cargo at a
+local checkout with a **gitignored** `.cargo/config.toml`:
+
+```toml
+# .cargo/config.toml  (gitignored — never committed)
+paths = ["/path/to/your/tailscale-rs"]
+```
+
+Cargo transparently substitutes the local source when its version matches the pinned one — edit the
+engine, rebuild the daemon, no manifest change. To bump the pinned engine deliberately, update the
+`rev` in `Cargo.toml` and run `cargo update -p tailscale-rs`.
+
+## Testing
 
 `tailscaled-rs` is a daemon that speaks a live, evolving control protocol, so "does it work" has
-three different answers at three different costs. This document lays out the **three test tiers**,
+three different answers at three different costs. This section lays out the **three test tiers**,
 what each proves, and how to run them. Only the first runs in CI; the other two are opt-in.
 
 ```mermaid
@@ -23,10 +42,10 @@ is necessary but **not sufficient** for real-Tailscale compatibility. See
 
 ---
 
-## Tier A — unit + offline integration (what CI runs)
+### Tier A — unit + offline integration (what CI runs)
 
 The default, always-on tier. **No network, no control server, no auth key, no root.** This is the
-exact gate CI enforces ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)).
+exact gate CI enforces ([`.github/workflows/ci.yml`](https://github.com/GeiserX/tailscaled-rs/blob/main/.github/workflows/ci.yml)).
 
 ```bash
 export TS_RS_EXPERIMENT=this_is_unstable_software   # the engine refuses to link/run without it
@@ -39,11 +58,11 @@ cargo build --release --bins
 
 What it covers:
 
-- **Unit tests** — the pure state machine ([`src/ipn.rs`](../src/ipn.rs) `derive_state_from`), prefs
-  load/save, the LocalAPI wire format ([`src/localapi.rs`](../src/localapi.rs)), and the control-URL
-  parse/scheme contract ([`tests/control_url.rs`](../tests/control_url.rs)).
+- **Unit tests** — the pure state machine ([`src/ipn.rs`](https://github.com/GeiserX/tailscaled-rs/blob/main/src/ipn.rs) `derive_state_from`), prefs
+  load/save, the LocalAPI wire format ([`src/localapi.rs`](https://github.com/GeiserX/tailscaled-rs/blob/main/src/localapi.rs)), and the control-URL
+  parse/scheme contract ([`tests/control_url.rs`](https://github.com/GeiserX/tailscaled-rs/blob/main/tests/control_url.rs)).
 - **Offline integration** — the real daemon⇄CLI Unix-socket IPC loop
-  ([`tests/localapi_loop.rs`](../tests/localapi_loop.rs)), driven against a real `Backend` that is
+  ([`tests/localapi_loop.rs`](https://github.com/GeiserX/tailscaled-rs/blob/main/tests/localapi_loop.rs)), driven against a real `Backend` that is
   deliberately never brought `up`: the node sits in `NoState`/`Stopped`, so the IPC contract and the
   unauthenticated read path are exercised with zero connectivity.
 
@@ -51,13 +70,13 @@ What it deliberately does **not** cover: a real control handshake, registration,
 test in this tier ever opens a network socket to a control plane — that is what keeps `cargo test`
 hermetic and CI ToS-clean. The two tiers below fill that gap.
 
-> The Headscale-backed test file ([`tests/headscale_e2e.rs`](../tests/headscale_e2e.rs)) is **compiled**
+> The Headscale-backed test file ([`tests/headscale_e2e.rs`](https://github.com/GeiserX/tailscaled-rs/blob/main/tests/headscale_e2e.rs)) is **compiled**
 > by `cargo test --all-targets` (so it can't bit-rot) but is marked `#[ignore]` **and** env-gated, so
 > it never runs — and cannot make a network call — in this tier. See Tier B.
 
 ---
 
-## Tier B — Headscale-backed e2e (self-hosted, ToS-clean)
+### Tier B — Headscale-backed e2e (self-hosted, ToS-clean)
 
 The tier this scaffold ([bead `tsd-7ie`](#)) adds. It runs the **real** join → netmap → down flow
 against a self-hosted [Headscale](https://github.com/juanfont/headscale) control server — a
@@ -65,7 +84,7 @@ protocol-compatible, independent reimplementation of Tailscale's control plane �
 registration and map-polling **without touching production Tailscale** (no ToS or rate-limit
 exposure). The daemon already supports a custom control server; this tier points it at the local one.
 
-Everything lives in [`test-support/headscale/`](../test-support/headscale/): a pinned
+Everything lives in [`test-support/headscale/`](https://github.com/GeiserX/tailscaled-rs/tree/main/test-support/headscale): a pinned
 `docker-compose.yml` (image `headscale/headscale:0.28.0` — a real, recent **stable** tag, never
 `:latest`) and the smallest `config.yaml` that boots a single tailnet (sqlite, auto-generated noise
 key, `100.64.0.0/10` pool, embedded DERP region — 0.28.0 refuses to boot with an empty DERPMap — no
@@ -76,7 +95,7 @@ update check).
 > time. So the real readiness test is bringing the container up and waiting for the healthcheck
 > (`headscale nodes list` succeeding over the unix socket), not `configtest`.
 
-### The full local loop
+#### The full local loop
 
 ```bash
 export TS_RS_EXPERIMENT=this_is_unstable_software
@@ -112,12 +131,12 @@ cargo test --test headscale_e2e -- --ignored --nocapture
 docker compose -f test-support/headscale/docker-compose.yml down -v
 ```
 
-See [`test-support/headscale/README.md`](../test-support/headscale/README.md) for the same loop kept
+See [`test-support/headscale/README.md`](https://github.com/GeiserX/tailscaled-rs/blob/main/test-support/headscale/README.md) for the same loop kept
 next to the compose file.
 
-### How the gated test stays out of CI
+#### How the gated test stays out of CI
 
-[`tests/headscale_e2e.rs`](../tests/headscale_e2e.rs) is guarded **two** ways so it can never break
+[`tests/headscale_e2e.rs`](https://github.com/GeiserX/tailscaled-rs/blob/main/tests/headscale_e2e.rs) is guarded **two** ways so it can never break
 the offline Tier A run:
 
 1. `#[ignore]` — excluded from `cargo test` (and CI's `cargo test --all-targets`); it only runs when
@@ -131,7 +150,7 @@ committed file.
 
 ---
 
-## Tier C — live e2e against real Tailscale (highest fidelity, manual)
+### Tier C — live e2e against real Tailscale (highest fidelity, manual)
 
 The genuine article: join an actual Tailscale tailnet with a real pre-auth key. This is the only
 tier that proves compatibility with the **real** control plane, and it is therefore the smoke test
@@ -152,7 +171,7 @@ opt-in and credential-gated for the same ToS reason.
 
 ---
 
-## Why Headscale-green ≠ Tailscale-green
+### Why Headscale-green ≠ Tailscale-green
 
 Tier B is ToS-clean, but it tests the daemon against a **reimplementation** of the control protocol,
 not the genuine one — and the two can disagree.
