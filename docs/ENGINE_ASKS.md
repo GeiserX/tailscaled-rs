@@ -1803,10 +1803,11 @@ Two, and both turn a pref this daemon already carries into something with a wire
   `PreferenceOption` in `src/ipn/syspolicy.rs`, and `PreferenceOption::should_enable` is Go's
   `ShouldEnable`; what the handler still needs is a public read of a preference-option policy, as
   `get_boolean` is for booleans. With the hook, the disabled case — policy `never`, or the pref
-  `false` under `user-decides` or no policy — becomes a real `{"PostureDisabled": true}`, Go's own
-  answer, sent because the operator or the administrator opted out rather than because the fork is
-  silent. The enabled case additionally needs serial-number and MAC
-  collection (Go's `posture.GetSerialNumbers` / `GetHardwareAddrs`, behind Go's `hwaddrs=true` query
+  `false` under `user-decides`, no policy, or a failed policy read — becomes a real
+  `{"PostureDisabled": true}`, Go's own answer, sent because the operator or the administrator opted
+  out rather than because the fork is silent. A failed read is not a refusal: Go logs it and falls
+  back to the `ShowChoiceByPolicy` default the call passes, which leaves the pref to decide. The
+  enabled case additionally needs serial-number and MAC collection (Go's `posture.GetSerialNumbers` / `GetHardwareAddrs`, behind Go's `hwaddrs=true` query
   gate); that is local OS work on the daemon side and a separate piece, so the honest first shape
   reports what it can collect and omits what it cannot.
 - **`GET /update` and `POST /update`** → `tailcfg.C2NUpdateResponse` (`Err`, `Enabled`, `Supported`,
