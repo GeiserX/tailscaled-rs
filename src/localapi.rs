@@ -192,7 +192,7 @@ pub enum Request {
         /// Like [`prefs`](Request::Watch::prefs) and [`policy`](Request::Watch::policy) — and unlike
         /// `initial_state`/`initial_netmap` — this is **daemon-built**, not an engine `NotifyWatchOpt`
         /// bit: the engine's bus has no `SuggestedExitNode` field, so the daemon pushes from the one
-        /// place that computes a suggestion (`Backend::suggest_exit_node`).
+        /// place a computed suggestion is published (`Backend::publish_suggested_exit_node`).
         ///
         /// The push goes to EVERY watcher, not only the connection whose request triggered the
         /// computation — Go sends it to `allClients` because the suggestion is a property of the
@@ -203,8 +203,8 @@ pub enum Request {
         /// Go recomputes the suggestion from several places — a fresh net-report, a netmap update,
         /// and the re-run `sysPolicyChanged` performs after `AllowedSuggestedExitNodes` moves — so a
         /// Go watcher learns of a new pick without anyone asking. This fork computes the suggestion
-        /// **on demand only**: `Backend::suggest_exit_node` is reached from `exit-node suggest` and
-        /// from this bit's own front-load, and nothing else calls it. So the honest contract here is
+        /// **on demand only**: `exit-node suggest` and this bit's own front-load are the only
+        /// computations. So the honest contract here is
         /// **front-loaded when the watch attaches to a device (and again on each later device epoch,
         /// i.e. after a `down`+`up`), then re-sent whenever a suggestion is computed and differs from
         /// the last one published**. That is narrower than Go's, deliberately: closing the gap means
@@ -221,6 +221,13 @@ pub enum Request {
         /// keeps the last id it was given; and the front-load carries that same remembered id, so a
         /// watcher attaching after an empty computation sees what every other watcher holds rather
         /// than a gap only it has.
+        ///
+        /// The front-load computes only while the node is `Running`, and gives the engine a bounded
+        /// time to answer (Go's error arm returns at once, and a `NeedsLogin` engine here would not
+        /// answer until the node was authorised). Otherwise it computes nothing, and the watcher is
+        /// front-loaded the remembered id, if any. That id is forgotten, silently, on `logout` and on
+        /// every profile change (Go's `resetForProfileChangeLocked`), so a pick from one tailnet is
+        /// never front-loaded to a watcher on another.
         #[serde(default, skip_serializing_if = "core::ops::Not::not")]
         suggested_exit_node: bool,
         /// Front-load a whole [`StatusReport`] as the session's first [`Response::Notify`] frame, in
