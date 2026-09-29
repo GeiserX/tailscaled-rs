@@ -911,8 +911,9 @@ async fn stream_notify(
                     continue; // still no device — loop back to the device-derive/wait
                 }
                 // Policy ticks are served on the device-less path too: policy is resolved from the
-                // registry, not the netmap, so a `syspolicy reload` on a down node is just as real a
-                // change as one on a running node.
+                // registry, not the netmap, so a policy change on a down node is just as real as one
+                // on a running node. (A tick only ever means the effective policy MOVED — see
+                // `syspolicy::reload_and_publish` — so every frame emitted here carries new rows.)
                 res = policy_rx.changed(), if policy => {
                     if res.is_err() {
                         return Ok(()); // policy sender dropped (process gone)
@@ -942,9 +943,12 @@ async fn stream_notify(
         };
 
         // `suggested_exit_node` front-load (Go `NotifyInitialSuggestedExitNode`): compute this
-        // device's suggestion and send it to this client. `Backend::suggest_exit_node` also publishes
-        // it to EVERY watcher when it differs from the last one — that is where the ongoing half of
-        // this feed lives, so the front-load and the broadcast can never disagree.
+        // device's suggestion and send it to this client. The computation also publishes it to EVERY
+        // watcher when it differs from the last one — that is where the ongoing half of this feed
+        // lives, so the front-load and the broadcast can never disagree. It computes only in
+        // `Running` and is time-bounded, because it runs before the bus watcher below is attached: a
+        // `NeedsLogin` engine would otherwise hold back the state frame and the login URL until the
+        // node was authorised (see `Backend::front_load_suggested_exit_node`).
         //
         // Read the value back off our own receiver rather than out of the response: `borrow_and_update`
         // both takes the current published value and marks it seen, so our own compute's push does not
@@ -953,7 +957,7 @@ async fn stream_notify(
         // response — is the right thing to front-load: a watcher joining after a withheld suggestion
         // sees the same value every other watcher holds, instead of a gap only it has.
         if suggested_exit_node {
-            Backend::suggest_exit_node(backend, &dev).await;
+            Backend::front_load_suggested_exit_node(backend, &dev).await;
             let id = suggested_rx.borrow_and_update().clone();
             if let Some(id) = id
                 && emit_suggested_exit_node_frame(write_half, &mut session, &id)
