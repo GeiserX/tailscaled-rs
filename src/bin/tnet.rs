@@ -1557,7 +1557,9 @@ enum DebugCmd {
     /// requested, so the first lines are the current state + peer set + prefs + effective system
     /// policy, and each subsequent line carries only what changed (state transitions, the full peer set
     /// on a netmap change, interactive-login / consent URLs, a fresh prefs snapshot on every prefs
-    /// write, and a fresh policy snapshot on every `syspolicy reload`). Read-only and long-lived — it runs until interrupted (Ctrl-C) or the daemon
+    /// write, and a fresh policy snapshot whenever the effective system policy actually changes —
+    /// which, since this daemon's only policy source is read once at startup, means the front-loaded
+    /// one is normally the only policy line you will see). Read-only and long-lived — it runs until interrupted (Ctrl-C) or the daemon
     /// closes the stream (node torn down / shutdown). Distinct from `tnet status --watch`, which stays
     /// on the bare status-stream path.
     WatchIpn,
@@ -11506,6 +11508,8 @@ async fn watch_status(socket: &std::path::Path, json: bool, filter: StatusFilter
         initial_netmap: false,
         prefs: false,
         policy: false,
+        suggested_exit_node: false,
+        initial_status: false,
     })?;
     line.push(b'\n');
     write_half.write_all(&line).await?;
@@ -11565,9 +11569,9 @@ async fn watch_status(socket: &std::path::Path, json: bool, filter: StatusFilter
 
 /// `debug watch-ipn` (Go `tailscale debug watch-ipn-bus`): stream the daemon's IPN notification bus,
 /// printing one JSON [`NotifyView`](tailscaled_rs::localapi::NotifyView) per line. Sends the **masked**
-/// `watch` request with every mask bit set (`initial_state`, `initial_netmap`, `prefs`, `policy`) so
-/// the first frames are the current state + peer set + prefs + effective policy, and each later frame
-/// carries only what changed. Reuses `watch_status`'s
+/// `watch` request with every mask bit set (`initial_state`, `initial_netmap`, `prefs`, `policy`,
+/// `suggested_exit_node`) so the first frames are the current state + peer set + prefs + effective
+/// policy + exit-node suggestion, and each later frame carries only what changed. Reuses `watch_status`'s
 /// streaming-read shape — connect, write the one request line, then read [`Response`] lines until the
 /// daemon closes the stream — but on the Notify path: `Notify` frames print as JSON, an `Error` frame
 /// exits non-zero, and any other reply (impossible on this connection) is noted and skipped.
@@ -11578,14 +11582,19 @@ async fn run_debug_watch_ipn(socket: &std::path::Path) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
 
     // The MASKED watch: all snapshots requested → the daemon streams `Response::Notify` frames (not
-    // `Response::Status`), front-loading the current state + peer set + prefs + effective policy, then
-    // streaming each change (a fresh prefs frame on every up/set/logout/switch/reload-config, and a
-    // fresh policy snapshot on every `syspolicy reload`).
+    // `Response::Status`), front-loading the current state + peer set + prefs + effective policy +
+    // exit-node suggestion, then streaming each change (a fresh prefs frame on every
+    // up/set/logout/switch/reload-config, a fresh policy snapshot whenever the effective policy
+    // actually moves — a `syspolicy reload` that re-resolves the same rows pushes nothing, matching
+    // Go's `reloadNow` change-callback guard — and the exit-node suggestion whenever a computed one
+    // differs from the last published).
     let mut line = serde_json::to_vec(&Request::Watch {
         initial_state: true,
         initial_netmap: true,
         prefs: true,
         policy: true,
+        suggested_exit_node: true,
+        initial_status: false,
     })?;
     line.push(b'\n');
     write_half.write_all(&line).await?;
@@ -11956,12 +11965,12 @@ struct PortedUpFlags {
 /// package prints the bare sentence. Both are pinned in `tests/tnet_up_go_flag_spellings.rs`.
 ///
 /// For `--nickname` the sentence itself is this fork's: it names where the behaviour does live
-/// instead of stopping at "not defined". `--host-routes` keeps Go's sentence, respelled in one
-/// place only: Go's flag package prints the name it registered, `-host-routes`, and this one prints
-/// the name a `tnet` operator typed. Go's usage block is dropped both times — `failf` prints the
-/// message and then calls `f.usage()`, so upstream's stderr carries the command's whole flag list
-/// after the sentence — for the reason every other refusal here leaves it off: the message already
-/// says what to run.
+/// instead of stopping at "not defined". `--host-routes` keeps Go's sentence byte for byte,
+/// including the one-dash `-host-routes` Go's flag package prints for the name it registered,
+/// whether the operator typed one dash or two. Go's usage block is dropped both times — `failf`
+/// prints the message and then calls `f.usage()`, so upstream's stderr carries the command's whole
+/// flag list after the sentence — for the reason every other refusal here leaves it off: the
+/// message already says what to run.
 fn exit_like_gos_flag_parser(err: &anyhow::Error) -> ! {
     eprintln!("{err}");
     std::process::exit(2)
@@ -12001,12 +12010,13 @@ fn check_ported_up_flags(flags: &PortedUpFlags) -> Result<()> {
 /// status (see [`exit_like_gos_flag_parser`]). Pure → unit-testable.
 fn check_host_routes(value: Option<&str>) -> Result<()> {
     // Go's `notFalseVar.Set` rejects every value but "true", and Go's flag package wraps that in
-    // `invalid boolean value %q for -host-routes: %v`. Same sentence, this CLI's flag spelling.
+    // `invalid boolean value %q for -host-routes: %v`. Same sentence, byte for byte: the flag
+    // package prints the name as registered, one dash, whichever spelling the operator typed.
     if let Some(value) = value
         && value != "true"
     {
         anyhow::bail!(
-            "invalid boolean value {value:?} for --host-routes: unsupported value; only 'true' \
+            "invalid boolean value {value:?} for -host-routes: unsupported value; only 'true' \
              is allowed"
         );
     }
@@ -12606,6 +12616,11 @@ fn cgi_response(status: &str, body: &str) -> String {
 /// too — which is why only `--readonly` (or a pref that is already on) reaches a CGI response with
 /// nothing on stderr. Go turns the pref back off on interrupt only in listener mode; a CGI request
 /// leaves it on.
+///
+/// Whichever mode runs, it runs under the same interrupt arm ([`serve_until_interrupt`]): Go arms
+/// `signal.NotifyContext` before any of this and ends every interrupted run at `os.Exit(0)`, so
+/// what the pref state changes is [`web_interrupt_stops_web_client`], never whether Ctrl-C is
+/// handled at all.
 async fn run_web(
     socket: &std::path::Path,
     listen: Option<String>,
@@ -12615,10 +12630,15 @@ async fn run_web(
     cgi: bool,
 ) -> Result<()> {
     let started_web_client = !readonly && start_tailscaled_web_client(socket).await?;
+    // Whether an interrupt of THIS run has a pref to put back — the only conditional part of Go's
+    // interrupt goroutine. The arm itself is not conditional: every run gets one.
+    let stop_web_client = web_interrupt_stops_web_client(cgi, started_web_client);
     if cgi {
         // CGI mode owns stdout: the response IS this process's stdout, so nothing may be printed
         // alongside it (no startup line) and no browser is opened (there is no server to browse).
-        return run_web_cgi(socket, &normalize_served_path(&prefix)).await;
+        let served_path = normalize_served_path(&prefix);
+        let serve = run_web_cgi(socket, &served_path);
+        return serve_until_interrupt(serve, web_interrupt(), std::future::ready(())).await;
     }
     let listen = listen.unwrap_or_else(|| DEFAULT_WEB_LISTEN.to_string());
     let serve = async {
@@ -12626,11 +12646,6 @@ async fn run_web(
             .await
             .with_context(|| format!("serving web UI on {listen}"))
     };
-    if !started_web_client {
-        return serve.await;
-    }
-    // Go shuts down the web client it started when the CLI is interrupted, then exits 0.
-    //
     // Interruption is the ONLY path that turns the pref back off. A serving failure — the bind
     // that finds the port taken — returns the error with the pref left on, which is what Go does
     // too: its `setRunWebClient(false)` lives in the goroutine parked on `signal.NotifyContext`'s
@@ -12640,13 +12655,59 @@ async fn run_web(
     // run where it won, it would `os.Exit(0)` and swallow the failure. Turning the pref off here
     // would deterministically pick half of a race Go never meant to have, so a failed `web` leaves
     // the pref as Go leaves it: on, for `tnet set --webclient=false` to clear.
-    tokio::select! {
-        served = serve => served,
-        _ = tokio::signal::ctrl_c() => {
+    let on_interrupt = async {
+        if stop_web_client {
             eprintln!("stopping tailscaled web client");
             if let Err(e) = set_run_web_client(socket, false).await {
                 eprintln!("stopping tailscaled web client: {e:#}");
             }
+        }
+    };
+    serve_until_interrupt(serve, web_interrupt(), on_interrupt).await
+}
+
+/// Whether an interrupted `web` run turns the daemon's `RunWebClient` pref back off: only a
+/// listener run that itself turned the pref on does.
+///
+/// This is the whole of what Go's interrupt goroutine makes conditional —
+/// `if !webArgs.cgi && startedManagementClient` guards the `setRunWebClient(false)` step and
+/// nothing else. Every other interrupted run (`--readonly`, a daemon whose pref was already on, a
+/// `--cgi` request) still stops the server and ends at `os.Exit(0)`; it just has no pref of its own
+/// to put back. Pure → unit-testable.
+fn web_interrupt_stops_web_client(cgi: bool, started_web_client: bool) -> bool {
+    !cgi && started_web_client
+}
+
+/// The interrupt source for a `web` run: Go's `signal.NotifyContext(ctx, os.Interrupt)`, which
+/// `runWeb` arms as its first statement — before the pref step, before the mode split, for every
+/// run the command has.
+///
+/// Completing this future means "interrupted". If the handler cannot be installed at all, park
+/// forever instead of completing: a run that reported an interrupt it never received would tear
+/// down a healthy server the moment it started serving.
+async fn web_interrupt() {
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Serve until the work finishes or an interrupt arrives, which is the shape of Go's `runWeb`: the
+/// command's return value is whatever serving returned, but an interrupt runs `on_interrupt` and
+/// then ends the run SUCCESSFULLY — Go's goroutine finishes `<-ctx.Done()` with `os.Exit(0)` for
+/// every interrupted run, so a supervisor that stops a `web` listener reads a clean exit, not the
+/// 130 a default SIGINT disposition would leave.
+///
+/// The signal is a parameter rather than a call inside, so the ordering this encodes can be tested
+/// without raising a real SIGINT at the test process.
+async fn serve_until_interrupt(
+    serve: impl std::future::Future<Output = Result<()>>,
+    interrupt: impl std::future::Future<Output = ()>,
+    on_interrupt: impl std::future::Future<Output = ()>,
+) -> Result<()> {
+    tokio::select! {
+        served = serve => served,
+        _ = interrupt => {
+            on_interrupt.await;
             Ok(())
         }
     }
@@ -13745,16 +13806,80 @@ impl std::fmt::Display for ServeUsageError {
 
 impl std::error::Error for ServeUsageError {}
 
-/// [`check_serve_flags`] as `runServeCombined` performs it: a [`ServeUsageError`] is written to
-/// stderr with Go's framing and exits 1, rather than propagating to `main` to be printed as one
-/// `Error: …` line. Every other refusal propagates untouched.
+/// A `runServeCombined` refusal whose Go text carries no prefix of its own.
+///
+/// Go's `main` prints whatever `cli.Run` returns with a bare `fmt.Fprintln(os.Stderr, err)` and
+/// exits 1 — no `Error: `, no `error: `, just the sentence. `anyhow` does not work that way: a `main`
+/// returning `Result` renders its error as `Error: {err:?}`, so every refusal that simply propagates
+/// picks up bytes Go never wrote.
+///
+/// The rule that decides which refusals need this type is whether Go's own text already begins with
+/// `Error: `. Four of `runServeCombined`'s do not, so they are tagged:
+///
+/// * `fmt.Errorf("failed to clean the mount point: %w", err)`
+/// * `fmt.Errorf("PROXY protocol is only supported for TCP forwarding, not HTTP/HTTPS")`
+/// * `fmt.Errorf("invalid PROXY protocol version %d; must be 1 or 2", …)`
+/// * `errors.New("tun mode is only supported for services")`
+///
+/// The other two do: Go spells the prefix into the literal itself —
+/// `errors.New("Error: --service flag is not supported with funnel")` and its background-mode twin
+/// — so the literals here are written without one and must NOT be tagged, or the prefix doubles
+/// into `Error: Error: …`. (What those two print today is not Go's line either, but for an
+/// unrelated reason: `main` wraps every serve/funnel result in a `via <socket>` context, so the
+/// sentence lands under `Caused by:`. That is a different divergence with a different cause;
+/// `tests/serve_refusal_stderr_framing.rs` records the bytes it produces so the shape is on record.)
+///
+/// Prefixing the four literals to "match Go" is not the same fix and is actively wrong for that
+/// reason. Whether a refusal is byte-correct is a property of the process, so the rendering path is
+/// where it belongs.
+///
+/// Like [`ServeUsageError`] this is a type rather than a pre-rendered string, so [`check_serve_flags`]
+/// stays pure: the refusal keeps its plain [`Display`](std::fmt::Display) text for callers that only
+/// want the sentence, and [`ServeBareError::go_stderr`] renders the exact bytes Go's process writes.
+#[derive(Debug)]
+struct ServeBareError(String);
+
+impl ServeBareError {
+    fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+
+    /// Exactly what Go's process writes to stderr for this refusal: the sentence and the newline
+    /// `fmt.Fprintln` adds, with nothing in front of it.
+    fn go_stderr(&self) -> String {
+        format!("{}\n", self.0)
+    }
+}
+
+impl std::fmt::Display for ServeBareError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ServeBareError {}
+
+/// [`check_serve_flags`] as `runServeCombined` performs it: a refusal Go's process writes itself —
+/// a [`ServeUsageError`] with Go's `error: ` + help-hint framing, or a [`ServeBareError`] with no
+/// framing at all — goes to stderr here and exits 1, rather than propagating to `main` to be printed
+/// as one `Error: …` line. A refusal whose Go text already begins with Go's own `Error: ` is left to
+/// propagate, since adding a prefix to it here would only double Go's.
 fn check_serve_flags_or_exit(flags: &ServeFlags, funnel: bool) -> Result<(ServeKind, u16)> {
-    check_serve_flags(flags, funnel).map_err(|e| match e.downcast::<ServeUsageError>() {
-        Ok(usage) => {
-            eprint!("{}", usage.go_stderr());
-            std::process::exit(1);
+    check_serve_flags(flags, funnel).map_err(|e| {
+        let go_stderr = e
+            .downcast_ref::<ServeUsageError>()
+            .map(ServeUsageError::go_stderr)
+            .or_else(|| {
+                e.downcast_ref::<ServeBareError>()
+                    .map(ServeBareError::go_stderr)
+            });
+        match go_stderr {
+            Some(bytes) => {
+                eprint!("{bytes}");
+                std::process::exit(1);
+            }
+            None => e,
         }
-        Err(other) => other,
     })
 }
 
@@ -13789,8 +13914,12 @@ fn check_serve_flags(flags: &ServeFlags, funnel: bool) -> Result<(ServeKind, u16
     // ORDER: `--set-path=/a/../b --https=70000` has two things wrong with it, and the one Go names
     // is the mount point.
     if let Some(set_path) = flags.set_path.as_deref() {
-        clean_url_path(set_path)
-            .map_err(|e| anyhow::anyhow!("failed to clean the mount point: {e}"))?;
+        // An unprefixed `fmt.Errorf`, returned from `runServeCombined` — see [`ServeBareError`].
+        if let Err(e) = clean_url_path(set_path) {
+            return Err(
+                ServeBareError::new(format!("failed to clean the mount point: {e}")).into(),
+            );
+        }
     }
 
     // Go frames a `srvTypeAndPortFromFlags` failure unlike every other refusal in
@@ -13800,11 +13929,18 @@ fn check_serve_flags(flags: &ServeFlags, funnel: bool) -> Result<(ServeKind, u16
     // Go's `uint` zero is "unset", so --proxy-protocol=0 asks for nothing and is not refused.
     let proxy_protocol = flags.proxy_protocol.filter(|v| *v != 0);
     if let Some(version) = proxy_protocol {
+        // Both of Go's PROXY-protocol refusals print bare — see [`ServeBareError`].
         if kind.is_web() {
-            anyhow::bail!("PROXY protocol is only supported for TCP forwarding, not HTTP/HTTPS");
+            return Err(ServeBareError::new(
+                "PROXY protocol is only supported for TCP forwarding, not HTTP/HTTPS",
+            )
+            .into());
         }
         if version != 1 && version != 2 {
-            anyhow::bail!("invalid PROXY protocol version {version}; must be 1 or 2");
+            return Err(ServeBareError::new(format!(
+                "invalid PROXY protocol version {version}; must be 1 or 2"
+            ))
+            .into());
         }
     }
 
@@ -13813,7 +13949,8 @@ fn check_serve_flags(flags: &ServeFlags, funnel: bool) -> Result<(ServeKind, u16
     // is a shape Go accepts, so it must reach the build gap rather than a sentence saying a service
     // is what it is missing.
     if kind == ServeKind::Tun && flags.service.is_none() {
-        anyhow::bail!("tun mode is only supported for services");
+        // `errors.New`, unprefixed, printed bare by Go's `main` — see [`ServeBareError`].
+        return Err(ServeBareError::new("tun mode is only supported for services").into());
     }
 
     // Everything above is Go's. From here down the command line is one Go would have ACCEPTED, and
@@ -14955,6 +15092,20 @@ fn go_io_error_text(e: &std::io::Error) -> String {
     }
 }
 
+/// Go's `*os.PathError` as Go prints it: `<syscall> <path>: <reason>`.
+///
+/// Those three pieces are what a reader needs in order to act — which call refused, on which path,
+/// and why — and a Rust `io::Error` carries only the last of them, so every caller here supplies
+/// the other two. The path is sanitized because it can come from `$KUBECONFIG`, i.e. from outside
+/// this program.
+fn go_path_error(op: &str, path: &std::path::Path, e: &std::io::Error) -> String {
+    format!(
+        "{op} {}: {}",
+        sanitize_for_terminal(&path.display().to_string()),
+        go_io_error_text(e)
+    )
+}
+
 /// Go's `kubeconfigAccessErr`: one wording for every reason the kubeconfig cannot be written, so
 /// the precheck below and a failed directory creation read the same to whoever hits them.
 ///
@@ -15052,9 +15203,10 @@ fn kubeconfig_parent_dir(path: &std::path::Path) -> std::path::PathBuf {
 /// nothing left to ask — and the write itself then reports whatever is really wrong.
 ///
 /// Without this the refusal arrives at the `open()` in [`set_kubeconfig_for_peer`], after the
-/// existing kubeconfig has been read and the merge computed, and it says "opening kubeconfig … for
-/// writing". Nothing is damaged either way; this one answers the question the operator asked, in
-/// Go's words, at the point Go answers it.
+/// existing kubeconfig has been read and the merge computed, and all it says is `open <path>:
+/// permission denied` — the syscall that refused, not the thing the operator asked for. Nothing is
+/// damaged either way; this one answers the question the operator asked, in Go's words, at the
+/// point Go answers it.
 fn check_kubeconfig_writable(path: &str) -> Result<()> {
     let mut probe = std::path::PathBuf::from(path);
     loop {
@@ -15173,13 +15325,7 @@ fn set_kubeconfig_for_peer(scheme: &str, fqdn: &str, path: &str) -> Result<()> {
             // — the directory is there and cannot even be looked at, which is a different problem
             // from a kubeconfig that will not take a write — so adding a wrapper here would answer
             // a question the operator did not ask.
-            Err(e) => {
-                return Err(anyhow!(
-                    "stat {}: {}",
-                    sanitize_for_terminal(&dir.display().to_string()),
-                    go_io_error_text(&e)
-                ));
-            }
+            Err(e) => return Err(anyhow!("{}", go_path_error("stat", dir, &e))),
         }
     }
     // Go: `os.ReadFile` then `fmt.Errorf("reading kubeconfig: %w", err)`. ReadFile's error is the
@@ -15208,7 +15354,9 @@ fn set_kubeconfig_for_peer(scheme: &str, fqdn: &str, path: &str) -> Result<()> {
     // Go: `b, err = updateKubeconfig(b, scheme, fqdn); if err != nil { return err }` — returned
     // bare, so a malformed file reads `invalid kubeconfig` and nothing more.
     let merged = update_kubeconfig(&existing, scheme, fqdn)?;
-    // Go: `os.WriteFile(filePath, b, 0600)`. The mode applies on creation; an existing file keeps
+    // Go: `return os.WriteFile(filePath, b, 0600)` — the error comes back BARE, the `*os.PathError`
+    // of whichever step refused and nothing wrapped around it, so each step here is spelled the way
+    // Go's `os` package spells its own. The mode applies on creation; an existing file keeps
     // whatever mode it had, so this never loosens a kubeconfig the user tightened.
     let mut f = std::fs::OpenOptions::new()
         .write(true)
@@ -15216,11 +15364,15 @@ fn set_kubeconfig_for_peer(scheme: &str, fqdn: &str, path: &str) -> Result<()> {
         .truncate(true)
         .mode(0o600)
         .open(p)
-        .with_context(|| format!("opening kubeconfig {path} for writing"))?;
+        .map_err(|e| anyhow!("{}", go_path_error("open", p, &e)))?;
     f.write_all(merged.as_bytes())
-        .with_context(|| format!("writing kubeconfig {path}"))?;
+        .map_err(|e| anyhow!("{}", go_path_error("write", p, &e)))?;
+    // Go's `os.WriteFile` closes without an fsync; this port keeps the fsync, so that a kubeconfig
+    // half-written across a crash is not what kubectl finds next. It is the one step with no Go
+    // counterpart in this function, so it borrows the wording of the one Go does have for it —
+    // `(*os.File).Sync`, whose `Op` is `sync`.
     f.sync_all()
-        .with_context(|| format!("fsync kubeconfig {path}"))?;
+        .map_err(|e| anyhow!("{}", go_path_error("sync", p, &e)))?;
     Ok(())
 }
 
@@ -20172,6 +20324,62 @@ mod tests {
     }
 
     #[test]
+    fn gos_unprefixed_refusals_are_tagged_to_be_written_bare() {
+        // Go's `main` prints `cli.Run`'s error with a bare `fmt.Fprintln(os.Stderr, err)`, so a
+        // refusal whose Go literal carries no prefix of its own must not reach this build's
+        // `Result`-returning `main` — `anyhow` would put `Error: ` in front of it. All four are
+        // tagged as they come out, and `go_stderr` is the bytes Go's process writes.
+        for (argv, want) in [
+            (
+                vec!["--set-path=/a/../b", "3000"],
+                r#"failed to clean the mount point: invalid mount point "/a/../b""#,
+            ),
+            (
+                vec!["--proxy-protocol=1", "3000"],
+                "PROXY protocol is only supported for TCP forwarding, not HTTP/HTTPS",
+            ),
+            (
+                vec!["--tcp=443", "--proxy-protocol=3", "3000"],
+                "invalid PROXY protocol version 3; must be 1 or 2",
+            ),
+            (
+                vec!["--tun", "3000"],
+                "tun mode is only supported for services",
+            ),
+        ] {
+            let (_, flags) = parse_serve(&argv);
+            let err = check_serve_flags(&flags, false).expect_err("still a refusal");
+            let bare = err
+                .downcast_ref::<ServeBareError>()
+                .unwrap_or_else(|| panic!("{argv:?}: Go prints this one bare: {err}"));
+            assert_eq!(bare.go_stderr(), format!("{want}\n"), "{argv:?}");
+            // The sentence itself is untouched, so a caller that only wants the text still has it.
+            assert_eq!(err.to_string(), want, "{argv:?}");
+        }
+
+        // The other half of the rule: Go spells `Error: ` into these two literals itself, so they
+        // must NOT be tagged — and the four above must not be prefixed to "match Go" — or the
+        // prefix ends up doubled. (What these two actually print is a separate matter: `main` wraps
+        // every serve/funnel error in a `via <socket>` context, so neither reaches a plain render.
+        // That divergence is not this change's; `tests/serve_refusal_stderr_framing.rs` pins it.)
+        for (argv, funnel) in [
+            (vec!["--service=svc:web", "--bg=false", "3000"], false),
+            (vec!["--service=svc:web", "3000"], true),
+        ] {
+            let flags = if funnel {
+                parse_funnel(&argv).1
+            } else {
+                parse_serve(&argv).1
+            };
+            let err = check_serve_flags(&flags, funnel).expect_err("still a refusal");
+            assert!(
+                err.downcast_ref::<ServeBareError>().is_none(),
+                "{argv:?} already carries Go's own `Error: `: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn gos_checks_all_run_before_this_builds_service_gap() {
         // runServeCombined's order is: the two --service refusals, cleanURLPath, then
         // srvTypeAndPortFromFlags. A command line Go would have rejected must be rejected here for
@@ -21711,6 +21919,82 @@ mod tests {
     }
 
     #[test]
+    fn web_interrupt_stops_web_client_only_when_this_run_started_it() {
+        // A listener run that turned the pref on is the single case Go's interrupt goroutine puts
+        // it back: `if !webArgs.cgi && startedManagementClient`.
+        assert!(web_interrupt_stops_web_client(false, true));
+        // `--readonly`, or a daemon whose `RunWebClient` pref was already on: this run changed no
+        // pref, so an interrupt leaves the pref exactly as it found it.
+        assert!(!web_interrupt_stops_web_client(false, false));
+        // CGI mode never puts it back, even when it was the run that turned it on.
+        assert!(!web_interrupt_stops_web_client(true, true));
+        assert!(!web_interrupt_stops_web_client(true, false));
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_web_run_ends_successfully_with_no_pref_to_restore() {
+        // The `--readonly` (and already-on) shape: serving never returns on its own, the interrupt
+        // arrives, and there is no web client of ours to stop. Go's goroutine reaches `os.Exit(0)`
+        // on this path exactly as it does when it started one, so the command must report success —
+        // a supervisor that stops the listener it started reads a clean exit, not the 130 that an
+        // unhandled SIGINT leaves behind.
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let result = serve_until_interrupt(
+            std::future::pending::<Result<()>>(),
+            std::future::ready(()),
+            async {
+                if web_interrupt_stops_web_client(false, false) {
+                    stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            },
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            !stopped.load(std::sync::atomic::Ordering::SeqCst),
+            "a run that started no web client has no pref to turn back off"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_web_run_that_started_the_web_client_stops_it() {
+        // The other half: the same clean exit, with the pref this run turned on turned back off.
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let result = serve_until_interrupt(
+            std::future::pending::<Result<()>>(),
+            std::future::ready(()),
+            async {
+                if web_interrupt_stops_web_client(false, true) {
+                    stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            },
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(stopped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_web_serving_failure_is_returned_and_skips_the_interrupt_step() {
+        // The bind that finds the port taken: the error is what the command returns, and the
+        // interrupt step never runs — so the pref is left on, as Go leaves it after a failed `web`.
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let result = serve_until_interrupt(
+            std::future::ready(Err(anyhow::anyhow!("serving web UI on localhost:8088"))),
+            std::future::pending::<()>(),
+            async {
+                stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .await;
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "serving web UI on localhost:8088"
+        );
+        assert!(!stopped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
     fn render_status_html_states_no_url_of_its_own() {
         use tailscaled_rs::localapi::StatusReport;
         let report = StatusReport {
@@ -22817,7 +23101,7 @@ mod tests {
             assert_eq!(
                 err,
                 format!(
-                    "invalid boolean value {value:?} for --host-routes: unsupported value; only \
+                    "invalid boolean value {value:?} for -host-routes: unsupported value; only \
                      'true' is allowed"
                 ),
                 "--host-routes={value}"
@@ -22934,7 +23218,7 @@ mod tests {
             assert_eq!(
                 err,
                 format!(
-                    "invalid boolean value {value:?} for --host-routes: unsupported value; only \
+                    "invalid boolean value {value:?} for -host-routes: unsupported value; only \
                      'true' is allowed"
                 ),
                 "login --host-routes={value}"
@@ -25207,6 +25491,24 @@ users:
                     "cannot write kubeconfig at \"{p}\": open {p}: permission denied",
                     p = ro.display()
                 )
+            );
+
+            // The same file past the precheck, i.e. the write inside `setKubeconfigForPeer`. Go
+            // returns `os.WriteFile`'s `*os.PathError` BARE — no wrapper naming this port's own
+            // steps — and a refused write leaves the file as it was. The real command's precheck
+            // answers first, so this is what the operator sees when the mode changes between the
+            // two, or when the refusal is one the precheck's probe cannot ask about.
+            let err =
+                set_kubeconfig_for_peer("https://", "foo.tail-scale.ts.net", ro.to_str().unwrap())
+                    .expect_err("a read-only kubeconfig cannot be written");
+            assert_eq!(
+                format!("{err:#}"),
+                format!("open {}: permission denied", ro.display())
+            );
+            assert_eq!(
+                std::fs::read_to_string(&ro).unwrap(),
+                "apiVersion: v1\nkind: Config\n",
+                "a refused write must leave the kubeconfig byte-identical"
             );
         }
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o600)).unwrap();
