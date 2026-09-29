@@ -7,8 +7,8 @@
 <p align="center">
   <a href="https://github.com/GeiserX/tailscaled-rs/releases"><img src="https://img.shields.io/github/v/release/GeiserX/tailscaled-rs" alt="Release"></a>
   <a href="https://github.com/GeiserX/tailscaled-rs/actions/workflows/ci.yml"><img src="https://github.com/GeiserX/tailscaled-rs/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-BSD--3--Clause-blue.svg" alt="License: BSD-3-Clause"></a>
-  <img src="https://img.shields.io/badge/status-experimental-orange.svg" alt="Status: experimental">
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/GeiserX/tailscaled-rs" alt="License"></a>
+  <a href="docs/how-it-works.md#status"><img src="https://img.shields.io/badge/status-experimental-orange.svg" alt="Status: experimental"></a>
 </p>
 
 An independent, from-scratch **Rust system daemon** that joins a WireGuard-based mesh
@@ -38,23 +38,25 @@ reconcilable state machine, persisted preferences, and a local control socket th
 
 ## Quick start
 
+Rust 1.95 or newer, on macOS or Linux, from a checkout of this repository:
+
 ```bash
 cargo build --release
 TS_RS_EXPERIMENT=this_is_unstable_software ./target/release/tailnetd
 ./target/release/tnet up --authkey tskey-auth-XXXX --hostname my-node   # in another shell
 ```
 
-`tnet status` shows the node, and `tnet status --web` serves a live status page. [USAGE.md](docs/USAGE.md) covers every flag.
+`tnet status` shows the node, and `tnet status --web` serves a live status page. [Usage](docs/usage.md) covers every flag, and [Getting started](docs/getting-started.md) installs it as a service.
 
 ## Documentation
 
-- [Usage](docs/USAGE.md): `tailnetd` flags, `tailnetd debug`, and what each `tnet` command and flag does
-- [Installation](docs/INSTALLATION.md): Homebrew, `tnet install`, the systemd and launchd units
-- [Status and architecture](docs/ARCHITECTURE.md): what works, what doesn't yet, and how the daemon and engine split
-- [Design](docs/DESIGN.md), [threat model](docs/THREAT_MODEL.md), [testing](docs/TESTING.md), [engine asks](docs/ENGINE_ASKS.md)
-- [Development](docs/DEVELOPMENT.md): building against a local `tailscale-rs` checkout
+- [Getting started](docs/getting-started.md): Homebrew, `tnet install`, the systemd and launchd units
+- [Usage](docs/usage.md): `tailnetd` flags, `tailnetd debug`, and what each `tnet` command and flag does
+- [How it works](docs/how-it-works.md): what works, what doesn't yet, and how the daemon and engine split
+- [Development](docs/development.md): building against a local `tailscale-rs` checkout, and the three test tiers
+- Design notes: [design](docs/DESIGN.md), [threat model](docs/THREAT_MODEL.md), [engine asks](docs/ENGINE_ASKS.md)
 
-## Relationship to Tailscale and WireGuard
+## Legal
 
 This is an **independent, unofficial** project. It is **not affiliated with, endorsed by, or
 sponsored by Tailscale Inc.** "Tailscale" is a trademark of Tailscale Inc.; this project uses the

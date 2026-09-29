@@ -11,7 +11,7 @@
 //! `cargo test -- --ignored` (which would un-skip the `#[ignore]`) makes no network call and cannot
 //! fail. The default `cargo test` regime stays fully offline.
 //!
-//! ## Running it (the full local loop is in `docs/TESTING.md`)
+//! ## Running it (the full local loop is in `docs/development.md`)
 //!
 //! ```bash
 //! export TS_RS_EXPERIMENT=this_is_unstable_software
@@ -58,7 +58,7 @@ fn unique_state_dir() -> PathBuf {
 /// it a clean *skip* (not a failure) when the control server / key are not provided — so it is inert
 /// under `cargo test -- --ignored` too, and only truly executes when an operator has set both vars.
 #[tokio::test]
-#[ignore = "requires a running headscale (test-support/headscale) + TAILNETD_HS_URL/TAILNETD_HS_AUTHKEY; see docs/TESTING.md"]
+#[ignore = "requires a running headscale (test-support/headscale) + TAILNETD_HS_URL/TAILNETD_HS_AUTHKEY; see docs/development.md"]
 async fn headscale_join_netmap_down() {
     // Env gate: both the control URL and a pre-auth key must be present, or we skip cleanly.
     let (hs_url, hs_authkey) = match (
@@ -72,7 +72,7 @@ async fn headscale_join_netmap_down() {
                  run this. Bring up the control server with \
                  `docker compose -f test-support/headscale/docker-compose.yml up -d`, then create a \
                  user + reusable pre-auth key and export the two env vars. The exact commands \
-                 (headscale 0.28's `--user` takes a numeric id) are in docs/TESTING.md and \
+                 (headscale 0.28's `--user` takes a numeric id) are in docs/development.md and \
                  test-support/headscale/README.md."
             );
             return;
@@ -84,7 +84,7 @@ async fn headscale_join_netmap_down() {
     assert!(
         std::env::var("TS_RS_EXPERIMENT").as_deref() == Ok("this_is_unstable_software"),
         "the engine requires TS_RS_EXPERIMENT=this_is_unstable_software; export it before running \
-         this test (see docs/TESTING.md)"
+         this test (see docs/development.md)"
     );
 
     // Fresh, isolated state dir so the run starts from no prefs / no node key.
@@ -172,7 +172,7 @@ async fn headscale_join_netmap_down() {
 /// classic LE magic `0xA1B2C3D4`) larger than the 24-byte global header (i.e. ≥1 record was written).
 /// Same `#[ignore]` + env gate as the join test — compiles in CI, runs only against a real tailnet.
 #[tokio::test]
-#[ignore = "requires a running headscale (test-support/headscale) + TAILNETD_HS_URL/TAILNETD_HS_AUTHKEY; see docs/TESTING.md"]
+#[ignore = "requires a running headscale (test-support/headscale) + TAILNETD_HS_URL/TAILNETD_HS_AUTHKEY; see docs/development.md"]
 async fn headscale_debug_capture_writes_pcap() {
     let (hs_url, hs_authkey) = match (
         std::env::var("TAILNETD_HS_URL"),
@@ -182,7 +182,7 @@ async fn headscale_debug_capture_writes_pcap() {
         _ => {
             eprintln!(
                 "SKIP headscale_debug_capture_writes_pcap: set TAILNETD_HS_URL and \
-                 TAILNETD_HS_AUTHKEY to run it (see docs/TESTING.md)"
+                 TAILNETD_HS_AUTHKEY to run it (see docs/development.md)"
             );
             return;
         }
@@ -315,7 +315,7 @@ async fn headscale_debug_capture_writes_pcap() {
 /// node stays Running — rebind must be non-disruptive (magicsock re-binds its sockets without
 /// tearing down the registration). Same `#[ignore]` + env gate as the join test.
 #[tokio::test]
-#[ignore = "requires a running headscale (test-support/headscale) + TAILNETD_HS_URL/TAILNETD_HS_AUTHKEY; see docs/TESTING.md"]
+#[ignore = "requires a running headscale (test-support/headscale) + TAILNETD_HS_URL/TAILNETD_HS_AUTHKEY; see docs/development.md"]
 async fn headscale_rebind_is_non_disruptive() {
     let (hs_url, hs_authkey) = match (
         std::env::var("TAILNETD_HS_URL"),
@@ -325,7 +325,7 @@ async fn headscale_rebind_is_non_disruptive() {
         _ => {
             eprintln!(
                 "SKIP headscale_rebind_is_non_disruptive: set TAILNETD_HS_URL and \
-                 TAILNETD_HS_AUTHKEY to run it (see docs/TESTING.md)"
+                 TAILNETD_HS_AUTHKEY to run it (see docs/development.md)"
             );
             return;
         }
@@ -414,7 +414,7 @@ async fn headscale_rebind_is_non_disruptive() {
 /// live netmap — the dispatch that unit tests can only check in isolation. Same `#[ignore]` + env
 /// gate as the join test — compiles in CI, runs only against a real tailnet.
 #[tokio::test]
-#[ignore = "requires a running headscale (test-support/headscale) + TAILNETD_HS_URL/TAILNETD_HS_AUTHKEY; see docs/TESTING.md"]
+#[ignore = "requires a running headscale (test-support/headscale) + TAILNETD_HS_URL/TAILNETD_HS_AUTHKEY; see docs/development.md"]
 async fn headscale_set_live_vs_rebuild_dispatch() {
     let (hs_url, hs_authkey) = match (
         std::env::var("TAILNETD_HS_URL"),
@@ -424,7 +424,7 @@ async fn headscale_set_live_vs_rebuild_dispatch() {
         _ => {
             eprintln!(
                 "SKIP headscale_set_live_vs_rebuild_dispatch: set TAILNETD_HS_URL and \
-                 TAILNETD_HS_AUTHKEY to run it (see docs/TESTING.md)"
+                 TAILNETD_HS_AUTHKEY to run it (see docs/development.md)"
             );
             return;
         }
@@ -554,7 +554,7 @@ async fn headscale_set_live_vs_rebuild_dispatch() {
 /// it proves each diagnostic returns a well-shaped, non-error response when driven against a real
 /// engine (not just that the wire types round-trip). Same `#[ignore]` + env gate as the join test.
 #[tokio::test]
-#[ignore = "requires a running headscale (test-support/headscale) + TAILNETD_HS_URL/TAILNETD_HS_AUTHKEY; see docs/TESTING.md"]
+#[ignore = "requires a running headscale (test-support/headscale) + TAILNETD_HS_URL/TAILNETD_HS_AUTHKEY; see docs/development.md"]
 async fn headscale_readonly_diagnostics_on_running_node() {
     let (hs_url, hs_authkey) = match (
         std::env::var("TAILNETD_HS_URL"),
@@ -564,7 +564,7 @@ async fn headscale_readonly_diagnostics_on_running_node() {
         _ => {
             eprintln!(
                 "SKIP headscale_readonly_diagnostics_on_running_node: set TAILNETD_HS_URL and \
-                 TAILNETD_HS_AUTHKEY to run it (see docs/TESTING.md)"
+                 TAILNETD_HS_AUTHKEY to run it (see docs/development.md)"
             );
             return;
         }

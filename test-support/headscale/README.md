@@ -3,7 +3,7 @@
 A minimal, self-hosted [Headscale](https://github.com/juanfont/headscale) control server for
 exercising the `tailscaled-rs` daemon's **real** join → netmap → down flow **without touching
 production Tailscale** (no ToS or rate-limit exposure). This is "Tier B" in
-[`../../docs/TESTING.md`](../../docs/TESTING.md), which is the canonical reference — this file is the
+[`../../docs/development.md`](../../docs/development.md#testing), which is the canonical reference — this file is the
 quick loop kept next to the compose stack.
 
 ## Files
@@ -54,5 +54,5 @@ docker compose -f test-support/headscale/docker-compose.yml down -v
   state (sqlite db, noise key) lives in named docker volumes, not in the repo tree.
 - **Green here is not full Tailscale compatibility.** Headscale lags upstream's capability version,
   so this tier proves the daemon works against *Headscale's* understanding of the protocol, not the
-  genuine control plane. See [`../../docs/TESTING.md`](../../docs/TESTING.md) and
+  genuine control plane. See [`../../docs/development.md`](../../docs/development.md#testing) and
   [`../../docs/ENGINE.md`](../../docs/ENGINE.md) for the capver / fidelity-gap discipline.

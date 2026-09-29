@@ -1,6 +1,6 @@
 # Usage
 
-How to build and run `tailnetd` and drive it with `tnet`, and what each `tnet` flag does and does not do. Installing it as a system service is in [INSTALLATION.md](INSTALLATION.md).
+How to build and run `tailnetd` and drive it with `tnet`, and what each `tnet` flag does and does not do. Installing it as a system service is in [Getting started](getting-started.md).
 
 ## Build and run
 
