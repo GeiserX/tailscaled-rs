@@ -15442,10 +15442,12 @@ fn set_kubeconfig_for_peer(scheme: &str, fqdn: &str, path: &str) -> Result<()> {
 fn decode_kubeconfig_bytes(b: Vec<u8>) -> Result<String> {
     let invalid = || anyhow!("invalid kubeconfig");
     let utf16 = |body: &[u8], unit: fn([u8; 2]) -> u16| {
-        if !body.len().is_multiple_of(2) {
+        // A trailing odd byte is half a unit: goyaml's `incomplete UTF-16 character`.
+        let (pairs, rest) = body.as_chunks::<2>();
+        if !rest.is_empty() {
             return Err(invalid());
         }
-        let units: Vec<u16> = body.chunks_exact(2).map(|c| unit([c[0], c[1]])).collect();
+        let units: Vec<u16> = pairs.iter().map(|&pair| unit(pair)).collect();
         String::from_utf16(&units).map_err(|_| invalid())
     };
     match b.as_slice() {
@@ -25490,7 +25492,8 @@ users:
 
         // Bytes that are not UTF-8 are a malformed file too: Go's YAML decoder fails on them and
         // `updateKubeconfig` says `invalid kubeconfig`. (Not a `\xff\xfe` start — goyaml reads that
-        // as a UTF-16 byte-order mark and decodes it; see `kubeconfig_merge_reads_utf16_like_goyaml`.)
+        // as a UTF-16 byte-order mark and decodes it; `kubeconfig_merge_reads_utf16_like_goyaml`
+        // covers that.)
         let not_utf8: &[u8] = b"apiVersion: v1\n\x80\n";
         std::fs::write(&path, not_utf8).unwrap();
         let err = set_kubeconfig_for_peer("https://", "foo.tail-scale.ts.net", &path_str)
