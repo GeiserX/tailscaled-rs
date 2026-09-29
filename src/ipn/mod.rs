@@ -70,7 +70,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 
-use crate::localapi::{PeerReport, StatusReport};
+use crate::localapi::{PeerReport, SelfReport, StatusReport};
 use crate::prefs::Prefs;
 
 pub mod alwayson;
@@ -665,9 +665,20 @@ async fn arm_funnel_lane(
 /// **starts with an ASCII letter**, and contains only `[A-Za-z0-9-]`. Matching Go's gate exactly
 /// matters because the engine does NOT re-validate — it ships `requested_tags` straight to control —
 /// so this is the *only* client-side check; a too-lax gate lets a malformed tag reach control and be
-/// rejected there with a confusing error instead of failing locally with a precise one. Returns the
-/// first offender, quoting the COMPLETED value (Go's `tag: %q`) so the operator is shown the tag as
-/// the daemon would have seen it rather than the shorthand they typed.
+/// rejected there with a confusing error instead of failing locally with a precise one.
+///
+/// The REFUSAL is ported too, not just the gate: the first offender comes back as Go's
+/// `fmt.Errorf("tag: %q: %s", tag, err)` — the frame `tag: `, the COMPLETED value quoted (so the
+/// operator is shown the tag as the daemon would have seen it rather than the shorthand they
+/// typed), then one of `CheckTag`'s four reason strings verbatim:
+///
+/// - `tags must start with 'tag:'`
+/// - `tag names must not be empty`
+/// - `tag names must start with a letter, after 'tag:'`
+/// - `tag names can only contain numbers, letters, or dashes`
+///
+/// Rewording them would be a silent divergence: operators and scripts that key off `tailscale up`'s
+/// output are the reason the text is part of the port, not decoration on top of it.
 ///
 /// Go completes in the CLI and validates in `tailcfg`; this fork does both here, daemon-side, so
 /// that `up` and `set` keep sharing one notion of what a tag is — a direct LocalAPI caller gets the
@@ -683,19 +694,20 @@ fn complete_and_validate_advertise_tags(tags: &[String]) -> Result<Vec<String>> 
         } else {
             format!("tag:{t}")
         };
-        let name = t.strip_prefix("tag:").ok_or_else(|| {
-            anyhow!("invalid tag {t:?}: tags must be of the form tag:<name> (e.g. tag:server)")
-        })?;
+        // Each refusal below is Go's `tag: %q: %s` frame over `tailcfg.CheckTag`'s own reason
+        // string, verbatim and in CheckTag's order, so an operator (or a script) reading this
+        // daemon's refusal reads what `tailscale up` prints.
+        let name = t
+            .strip_prefix("tag:")
+            .ok_or_else(|| anyhow!("tag: {t:?}: tags must start with 'tag:'"))?;
         match name.bytes().next() {
             None => {
-                return Err(anyhow!(
-                    "invalid tag {t:?}: the tag name (after 'tag:') is empty"
-                ));
+                return Err(anyhow!("tag: {t:?}: tag names must not be empty"));
             }
             // Go requires the first name char to be a letter.
             Some(b) if !b.is_ascii_alphabetic() => {
                 return Err(anyhow!(
-                    "invalid tag {t:?}: tag names must start with a letter (after 'tag:')"
+                    "tag: {t:?}: tag names must start with a letter, after 'tag:'"
                 ));
             }
             _ => {}
@@ -706,7 +718,7 @@ fn complete_and_validate_advertise_tags(tags: &[String]) -> Result<Vec<String>> 
             .any(|b| !b.is_ascii_alphanumeric() && b != b'-')
         {
             return Err(anyhow!(
-                "invalid tag {t:?}: tag names may contain only letters, digits, or '-'"
+                "tag: {t:?}: tag names can only contain numbers, letters, or dashes"
             ));
         }
         out.push(t);
@@ -838,6 +850,15 @@ struct CheckPrefsEnv<'a> {
     /// The netmap view a NAMED exit-node selector is resolved against (see
     /// [`resolve_exit_node_arg`]). [`ExitNodeFacts::default`] when the request names none.
     exit_node_facts: &'a ExitNodeFacts,
+    /// [`selfupdate::auto_update_refusal`]'s verdict for this host: `Some(reason)` = this
+    /// installation can never replace its own binary, `None` = it can (Go `feature.CanAutoUpdate()`).
+    /// Consulted only for an auto-update OPT-IN, matching Go's `checkAutoUpdatePrefsLocked`.
+    ///
+    /// Injected for the same reason as `ssh_gate`: the verdict is a property of the host the tests
+    /// run on — every Linux x86_64 CI runner answers `None`, a macOS developer box answers
+    /// `Some(..)` — so a test that read it from the process could only ever assert the branch its
+    /// own host takes, and the rule would go unexercised wherever it happens not to fire.
+    auto_update_gate: Option<&'a str>,
 }
 
 /// Whether `arg` names `peer`, in any of the three spellings Go's `exitNodeIPOfArg` accepts: the
@@ -1213,6 +1234,53 @@ pub(crate) fn peer_report_from_status_node(p: tailscale::StatusNode) -> PeerRepo
 pub(crate) fn notify_state_from_device(ds: tailscale::DeviceState) -> (String, Option<String>) {
     let (state, _auth_url, error) = state_from_device(ds);
     (state.as_str().to_string(), error)
+}
+
+/// Project this node's engine [`NodeInfo`](tailscale::NodeInfo) into the [`SelfReport`] a `watch`
+/// netmap frame carries as `self_change` (Go `Notify.SelfChange`). Name and addresses go through the
+/// engine's own [`StatusNode::from_node`](tailscale::StatusNode::from_node) — the mapping
+/// `Device::status` builds its `self_node` with — so a self frame and [`Backend::status`]'s
+/// `self_name`/`self_ipv4`/`self_ipv6` can never describe this node differently.
+pub(crate) fn self_report_from_node(node: &tailscale::NodeInfo) -> SelfReport {
+    self_report_from_status_node(tailscale::StatusNode::from_node(node), node.node_key_expiry)
+}
+
+/// The pure half of [`self_report_from_node`], split out because an engine `Node` carries real keys
+/// and cannot be built in a unit test, while a `StatusNode` and an expiry can.
+fn self_report_from_status_node(
+    n: tailscale::StatusNode,
+    key_expiry: Option<chrono::DateTime<chrono::Utc>>,
+) -> SelfReport {
+    SelfReport {
+        stable_id: n.stable_id.0,
+        name: n.display_name,
+        ipv4: n.ipv4.to_string(),
+        ipv6: n.ipv6.to_string(),
+        // Go `Node.KeyExpiry`, rendered RFC3339 exactly as `whois` renders `node_key_expiry`. The
+        // engine's `None` is a key that never expires (Go's zero time), not an unknown expiry.
+        key_expiry: key_expiry.map(|t| t.to_rfc3339()),
+    }
+}
+
+/// Fetch this node's [`SelfReport`] for one `watch` netmap frame, or `None` if the engine has no self
+/// node to give. Bounded by [`STATUS_QUERY_TIMEOUT`] like `status`'s netmap query, so a wedged
+/// control actor delays the frame by at most that long instead of stalling the stream; on a miss the
+/// frame still carries its peers, just without a self view (Go likewise leaves `SelfChange` nil when
+/// the netmap has no valid self node).
+pub(crate) async fn fetch_self_report(dev: &tailscale::Device) -> Option<SelfReport> {
+    match tokio::time::timeout(STATUS_QUERY_TIMEOUT, dev.self_node()).await {
+        Ok(Ok(node)) => Some(self_report_from_node(&node)),
+        Ok(Err(e)) => {
+            tracing::debug!(error = %e, "engine self-node query failed; netmap frame sent without self");
+            None
+        }
+        Err(_elapsed) => {
+            tracing::debug!(
+                "engine self-node query exceeded {STATUS_QUERY_TIMEOUT:?}; netmap frame sent without self"
+            );
+            None
+        }
+    }
 }
 
 /// Perform the slow engine handshake for a [`PendingUp`], **without** holding the backend lock.
@@ -2034,6 +2102,27 @@ pub struct Backend {
     /// the single chokepoint EVERY prefs mutation (`up`/`set`/`logout`/`switch`/`reload-config`)
     /// funnels through, so one send-site covers them all. Daemon-owned (the engine has no prefs cell).
     prefs_tx: tokio::sync::watch::Sender<()>,
+    /// The last exit-node suggestion published, AND the channel that publishes it (a masked `Watch`
+    /// with the `suggested_exit_node` bit). The held value is this fork's
+    /// `LocalBackend.lastSuggestedExitNode`: `None` until a suggestion has ever been computed, then
+    /// the stable node id of the most recent one.
+    ///
+    /// Unlike [`prefs_tx`](Backend::prefs_tx) this is a VALUE channel, not a tick. A prefs watcher can
+    /// re-read [`prefs_view`](Backend::prefs_view) for itself; a suggestion watcher cannot re-derive a
+    /// suggestion at all — computing one needs the live device and an engine round-trip — so the value
+    /// rides the channel.
+    ///
+    /// Cell and channel are deliberately ONE object. Go compares `prevSuggestion != res.ID` inside
+    /// `suggestExitNodeLocked`, the only placement that cannot drift from the value actually returned;
+    /// here the compare and the send are both
+    /// [`publish_suggested_exit_node`](Backend::publish_suggested_exit_node), reached only from
+    /// [`suggest_exit_node`](Backend::suggest_exit_node) and never from a request handler. One writer,
+    /// no second copy to fall out of step.
+    ///
+    /// Written with `send_replace`, never `send`: `send` refuses — and, load-bearingly, does NOT store
+    /// — when there are no receivers, which is the common case (nobody is watching), and would leave
+    /// the cell empty so that every later suggestion looked like a change.
+    suggested_exit_node_tx: tokio::sync::watch::Sender<Option<String>>,
     /// Whether **this process** has attempted a boot-time auto-start (set by
     /// [`mark_boot_attempted_up`](Backend::mark_boot_attempted_up)). Process-local and deliberately
     /// NOT persisted: it lets the SIGHUP reload path distinguish "retry a bring-up we already
@@ -2367,6 +2456,9 @@ impl Backend {
             .with_context(|| format!("loading prefs from {}", prefs_path.display()))?;
         let (lifecycle_tx, _) = tokio::sync::watch::channel(0u64);
         let (prefs_tx, _) = tokio::sync::watch::channel(());
+        // No suggestion has been computed yet this process — the cell starts empty, so the first
+        // suggestion of the run always counts as a change and always reaches watchers.
+        let (suggested_exit_node_tx, _) = tokio::sync::watch::channel(None);
         let mut backend = Self {
             prefs,
             state_dir: state_dir.to_path_buf(),
@@ -2388,6 +2480,7 @@ impl Backend {
             boot_attempted_up: false,
             lifecycle_tx,
             prefs_tx,
+            suggested_exit_node_tx,
             // Seed the cache once, at startup, from an actual on-disk check — startup is not the hot
             // path, and every later mutation is tracked at its transition (see the field doc's
             // invariant). `has_persisted_node_key` reads only `key_path`, which is already set above.
@@ -2833,8 +2926,20 @@ impl Backend {
     /// if one exists, so the default profile is renameable like any other. Writes are atomic
     /// (see [`profile::save_profiles_file`]); an unreadable/malformed map is treated as empty by the
     /// loader, so the rename re-establishes it rather than failing.
+    ///
+    /// A profile [`switch_to_empty_profile`](Backend::switch_to_empty_profile) made that has not
+    /// logged in yet is not listed, and a rename does not list it: Go keeps `ProfileName` in the
+    /// unsaved profile's prefs until the login saves it. The name waits in `node_nickname`, which the
+    /// caller has already persisted, and [`register_current_profile`](Backend::register_current_profile)
+    /// carries it over.
     async fn rename_current_profile(&self, name: &str) -> Result<()> {
         let mut meta = profile::load_profiles_file(&self.state_dir).await;
+        if !self.prefs.has_logged_in
+            && self.current_profile != profile::DEFAULT_PROFILE_ID
+            && !meta.profiles.contains_key(&self.current_profile)
+        {
+            return Ok(());
+        }
         meta.profiles
             .entry(self.current_profile.clone())
             .or_default()
@@ -2876,7 +2981,7 @@ impl Backend {
         let meta = profile::load_profiles_file(&self.state_dir).await;
         let resolved = profile::resolve_target_to_id(target, &meta)
             .ok_or_else(|| anyhow!(profile::no_profile_named(target)))?;
-        self.activate_profile(&resolved).await
+        self.activate_profile(&resolved, true).await
     }
 
     /// Create profile `id` and switch to it — the explicit form of what `switch` used to do by
@@ -2904,7 +3009,7 @@ impl Backend {
                 "profile {existing:?} already exists; switch to it without --new"
             ));
         }
-        self.activate_profile(id).await
+        self.activate_profile(id, true).await
     }
 
     /// Switch to a new, empty profile: Go's `LocalBackend.NewProfile` (`profileManager.
@@ -2912,33 +3017,146 @@ impl Backend {
     /// SwitchToEmptyProfile` before it logs in. The profile the node was on keeps its prefs, key and
     /// name; the login that follows lands on the new one.
     ///
-    /// Two differences from Go, both about when a profile exists. Go gives the new profile an id
-    /// only once it is saved after a login; this daemon registers it straight away, because every
-    /// profile here is a directory keyed by its id. And Go never saves a profile that has not logged
-    /// in (and deletes one on logout), so a current profile that has not logged in
-    /// (`has_logged_in`, Go's `Persist.UserProfile.LoginName != ""`) is already the empty profile Go
-    /// would switch to: it is kept, and reported as [`SwitchOutcome::AlreadyCurrent`], rather than
-    /// left behind as a second, unregistered entry in `switch --list`.
+    /// Go never saves a profile that has not logged in (`Persist.UserProfile.LoginName != ""`, this
+    /// daemon's `has_logged_in`), so a current profile that has not logged in is not left behind:
+    /// Go's `SwitchToProfile` drops it and the node carries on with `defaultPrefs`. This daemon keeps
+    /// the profile's id and directory instead, and resets it in place — see
+    /// [`reset_to_empty_profile`](Backend::reset_to_empty_profile). The test is `has_logged_in`, not
+    /// `has_node_key`: a key exists as soon as an `up` builds its config, before control has seen the
+    /// node, so keying on it would make every retry of an unfinished login add a profile.
     ///
-    /// The test is `has_logged_in`, not `has_node_key`. A key exists as soon as an `up` builds its
-    /// config, before control has seen the node, so an interactive login the operator never finished
-    /// still holds one. Keying on it would make every retry of such a login add a profile. Staying
-    /// on that profile is safe: `login` sends `force_reauth`, which discards the key before it
-    /// registers.
+    /// A new profile is NOT registered in `profiles.json` here. Go gives it an id only when it is
+    /// saved after a login (`newUnusedID`, from `SetPrefs`), so an abandoned login leaves nothing in
+    /// `switch --list`. This daemon needs the id at once, because every profile is a directory keyed
+    /// by it, but it lists the profile only once it has logged in
+    /// ([`register_current_profile`](Backend::register_current_profile)). Files an abandoned login
+    /// left under a drawn id are cleared before the id is used, so a new profile starts empty.
     pub async fn switch_to_empty_profile(&mut self) -> Result<SwitchOutcome> {
+        self.switch_to_empty_profile_drawing(|| {
+            let mut bytes = [0u8; 2];
+            getrandom::fill(&mut bytes).map(|()| bytes)
+        })
+        .await
+    }
+
+    /// [`switch_to_empty_profile`](Backend::switch_to_empty_profile) with the id's random bytes
+    /// drawn from `draw`, so a test can pick the id.
+    async fn switch_to_empty_profile_drawing<E: std::fmt::Display>(
+        &mut self,
+        draw: impl FnMut() -> std::result::Result<[u8; 2], E>,
+    ) -> Result<SwitchOutcome> {
         if !self.prefs.has_logged_in {
+            return self.reset_to_empty_profile().await;
+        }
+        let mut meta = profile::load_profiles_file(&self.state_dir).await;
+        // The current profile is taken even when it is not listed, so its files are never cleared.
+        meta.profiles
+            .entry(self.current_profile.clone())
+            .or_default();
+        let id = profile::unused_profile_id(&meta, draw)
+            .map_err(|e| anyhow!("reading OS randomness for a new profile id: {e}"))?
+            .ok_or_else(|| anyhow!("could not find an unused profile id"))?;
+        self.remove_profile_files(&id).await?;
+        self.activate_profile(&id, false).await
+    }
+
+    /// Reset the current profile, which has never logged in, to an empty one: the branch of Go's
+    /// `profileManager.SwitchToProfile` that a `NewProfile` takes from an unsaved profile. Go keeps
+    /// nothing of it — `pm.prefs` becomes `defaultPrefs` — so the hostname, routes, exit node,
+    /// control URL and nickname an unfinished `up` left are gone before the `login` that follows.
+    ///
+    /// Go reports no change only when the profile and its prefs already equal the empty ones. Here
+    /// that is a profile with no prefs file, no name and no device, which is answered as
+    /// [`SwitchOutcome::AlreadyCurrent`] with nothing torn down or written. Otherwise the device is
+    /// torn down (Go's `resetForProfileChangeLocked`), the prefs file is removed so the profile reads
+    /// exactly as a new one does, and its name is cleared.
+    ///
+    /// The node key is kept: `login` sends `force_reauth`, which discards it before it registers.
+    async fn reset_to_empty_profile(&mut self) -> Result<SwitchOutcome> {
+        let mut meta = profile::load_profiles_file(&self.state_dir).await;
+        let named = meta
+            .profiles
+            .get(&self.current_profile)
+            .is_some_and(|m| !m.name.is_empty());
+        if !self.ever_configured && !named && self.device.is_none() {
             return Ok(SwitchOutcome::AlreadyCurrent {
                 id: self.current_profile.clone(),
             });
         }
-        let meta = profile::load_profiles_file(&self.state_dir).await;
-        let id = profile::unused_profile_id(&meta, || {
-            let mut bytes = [0u8; 2];
-            getrandom::fill(&mut bytes).map(|()| bytes)
+        self.stop_device().await;
+        self.bump_generation();
+        if named {
+            if let Some(m) = meta.profiles.get_mut(&self.current_profile) {
+                m.name.clear();
+            }
+            profile::save_profiles_file(&self.state_dir, &meta)
+                .await
+                .with_context(|| "persisting profiles.json")?;
+        }
+        match tokio::fs::remove_file(&self.prefs_path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(anyhow!("removing {}: {e}", self.prefs_path.display())),
+        }
+        self.prefs = Prefs::default();
+        self.ever_configured = false;
+        self.boot_attempted_up = false;
+        // The same profile-change edge as a switch (see `activate_profile`).
+        self.reset_always_on_override("new profile");
+        self.reset_exit_node_policy_override("new profile");
+        self.reconcile_sys_policy("new profile");
+        let _ = self.prefs_tx.send(());
+        Ok(SwitchOutcome::Switched {
+            id: self.current_profile.clone(),
+            state: self.derive_state(false),
         })
-        .map_err(|e| anyhow!("reading OS randomness for a new profile id: {e}"))?
-        .ok_or_else(|| anyhow!("could not find an unused profile id"))?;
-        self.activate_profile(&id).await
+    }
+
+    /// List the current profile in `profiles.json` once it has logged in — the point where Go saves a
+    /// new profile (`profileManager.SetPrefs` gives it an id once `LoginName` is set). Only a profile
+    /// made by [`switch_to_empty_profile`](Backend::switch_to_empty_profile) is ever unlisted; its
+    /// name so far waits in `node_nickname` (see
+    /// [`rename_current_profile`](Backend::rename_current_profile)) and is carried over here. A no-op
+    /// for a profile that is already listed, for `default`, and before the login.
+    async fn register_current_profile(&self) -> Result<()> {
+        if !self.prefs.has_logged_in || self.current_profile == profile::DEFAULT_PROFILE_ID {
+            return Ok(());
+        }
+        let mut meta = profile::load_profiles_file(&self.state_dir).await;
+        if meta.profiles.contains_key(&self.current_profile) {
+            return Ok(());
+        }
+        meta.profiles.insert(
+            self.current_profile.clone(),
+            profile::ProfileMeta {
+                name: self.prefs.node_nickname.clone().unwrap_or_default(),
+            },
+        );
+        profile::save_profiles_file(&self.state_dir, &meta)
+            .await
+            .with_context(|| {
+                format!(
+                    "persisting profiles.json while registering profile {:?}",
+                    self.current_profile
+                )
+            })
+    }
+
+    /// Remove profile `id`'s prefs and key files and, best effort, its then-empty directory.
+    /// Already-absent files are fine. `id` must be a validated profile id other than `default`.
+    async fn remove_profile_files(&self, id: &str) -> Result<()> {
+        let (prefs_path, key_path) = profile::profile_paths(&self.state_dir, id);
+        for p in [&prefs_path, &key_path] {
+            match tokio::fs::remove_file(p).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(anyhow!("removing {}: {e}", p.display())),
+            }
+        }
+        if let Some(dir) = prefs_path.parent() {
+            let _ = tokio::fs::remove_dir(dir).await;
+        }
+        Ok(())
     }
 
     /// Make profile `target` the active one: tear the current device down, repoint
@@ -2952,7 +3170,11 @@ impl Backend {
     /// as a single path component. Both callers guarantee that: [`switch_profile`](Backend::switch_profile)
     /// passes a [`profile::resolve_target_to_id`] result (which only ever returns validated ids) and
     /// [`create_profile`](Backend::create_profile) validates before calling.
-    async fn activate_profile(&mut self, target: &str) -> Result<SwitchOutcome> {
+    ///
+    /// `register` is false only for a new profile from
+    /// [`switch_to_empty_profile`](Backend::switch_to_empty_profile), which is listed once it has
+    /// logged in rather than now.
+    async fn activate_profile(&mut self, target: &str, register: bool) -> Result<SwitchOutcome> {
         if target == self.current_profile {
             // Already on it: nothing is torn down and nothing is written. Say so — reporting this as
             // a switch would claim a teardown that never happened (Go: `Already on account %q`).
@@ -2983,7 +3205,7 @@ impl Backend {
 
         // (1) Register the target in profiles.json (so `--list` shows it) if it is a new named
         // profile — before the pointer, so a crash between them only leaves a harmless extra entry.
-        if target != profile::DEFAULT_PROFILE_ID {
+        if register && target != profile::DEFAULT_PROFILE_ID {
             let mut meta = profile::load_profiles_file(&self.state_dir).await;
             meta.profiles
                 .entry(target.to_string())
@@ -3070,18 +3292,7 @@ impl Backend {
             return Err(anyhow!("the default profile cannot be removed"));
         }
         // Remove the profile's files (tolerate already-absent — idempotent).
-        let (prefs_path, key_path) = profile::profile_paths(&self.state_dir, target);
-        for p in [&prefs_path, &key_path] {
-            match tokio::fs::remove_file(p).await {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(anyhow!("removing {}: {e}", p.display())),
-            }
-        }
-        // Best-effort remove the now-empty profile dir.
-        if let Some(dir) = prefs_path.parent() {
-            let _ = tokio::fs::remove_dir(dir).await;
-        }
+        self.remove_profile_files(target).await?;
         // Drop it from profiles.json. Re-read rather than reusing the map loaded for resolution: the
         // file removals above are `await` points, so the map may be stale by now.
         let mut meta = profile::load_profiles_file(&self.state_dir).await;
@@ -3412,19 +3623,28 @@ impl Backend {
     /// off-lock job); the only blocking steps here are the quick live setter mailbox round-trips on
     /// the `Live` path.
     pub async fn begin_set(&mut self, opts: SetOptions) -> Result<SetOutcome> {
-        self.begin_set_gated(opts, crate::featureknob::can_run_tailscale_ssh())
-            .await
+        let auto_update_gate = selfupdate::auto_update_refusal();
+        self.begin_set_gated(
+            opts,
+            crate::featureknob::can_run_tailscale_ssh(),
+            auto_update_gate.as_deref(),
+        )
+        .await
     }
 
-    /// [`begin_set`](Self::begin_set) with this host's SSH verdict passed IN rather than read from
-    /// the process environment, so the refusal it produces is unit-testable — the same injection,
-    /// for the same reason, as [`check_prefs_gated`](Self::check_prefs_gated)'s
-    /// [`CheckPrefsEnv::ssh_gate`] (`set_var` is `unsafe` in edition 2024 and races the parallel
-    /// test harness).
+    /// [`begin_set`](Self::begin_set) with this host's verdicts passed IN rather than read from the
+    /// running process, so the refusals they produce are unit-testable — the same injection, for the
+    /// same reasons, as [`check_prefs_gated`](Self::check_prefs_gated)'s [`CheckPrefsEnv`]:
+    /// - `ssh_gate` is this host's SSH verdict ([`CheckPrefsEnv::ssh_gate`]; `set_var` is `unsafe`
+    ///   in edition 2024 and races the parallel test harness).
+    /// - `auto_update_gate` is this installation's update provenance — `Some(reason)` = it can never
+    ///   replace its own binary, `None` = it can ([`CheckPrefsEnv::auto_update_gate`]; the verdict is
+    ///   a property of the machine, so the refusal is only testable everywhere if it can be named).
     async fn begin_set_gated(
         &mut self,
         mut opts: SetOptions,
         ssh_gate: Result<()>,
+        auto_update_gate: Option<&str>,
     ) -> Result<SetOutcome> {
         // Decide the path BEFORE mutating prefs — `needs_rebuild()` inspects which fields the
         // request named, which the apply below would not change, but reading it first keeps the
@@ -3512,11 +3732,17 @@ impl Backend {
         // `Hostinfo.AllowsUpdate` on registration and on every map request, so setting it tells the
         // tailnet admin that a remote update trigger will be honoured. Same "before a single pref is
         // mutated" discipline as the checks above — a refused `set` leaves prefs.json untouched, and
-        // it is asked after the SSH gate so the two refusals report in `check_prefs`'s (4)-then-(5)
+        // it is asked after the SSH gate so the two refusals report in `check_prefs`'s (3)-then-(4)
         // order.
+        //
+        // Asked about the pref this `set` would LEAVE BEHIND, not about the edit mask: Go validates
+        // `p1` after `ApplyEdits` (see [`Backend::prospective_auto_update`]), so an opt-in already
+        // persisted on a node that can never apply an update fails every later prefs write until it
+        // is declined — and the dry-run verb, which composes the same value, answers the same.
         if let Some(e) = selfupdate::check_auto_update_pref(
-            opts.auto_update,
-            selfupdate::auto_update_refusal().as_deref(),
+            self.prospective_auto_update(opts.auto_update),
+            auto_update_gate,
+            selfupdate::REMEDY_CLI,
         ) {
             return Err(anyhow!(e));
         }
@@ -5278,13 +5504,91 @@ impl Backend {
         diag::netcheck(dev).await
     }
 
-    /// Suggest the best available exit node (the `tnet exit-node suggest` path). Thin `pub` shim over
-    /// [`diag::suggest_exit_node`], uniform with the other off-lock diagnostics. See it for the
-    /// `suggest_exit_node()` → [`Response::ExitNodeSuggestion`](crate::localapi::Response) mapping
-    /// (`Ok(None)` = no eligible candidate, an honest empty result, not an error) and for the
-    /// `AllowedSuggestedExitNodes` allow-list the engine's answer is filtered through.
-    pub async fn suggest_exit_node(dev: &tailscale::Device) -> crate::localapi::Response {
-        diag::suggest_exit_node(dev).await
+    /// Suggest the best available exit node (the `tnet exit-node suggest` path, and the
+    /// `suggested_exit_node` watch bit's front-load) **and put the answer on the notify bus if it
+    /// moved**. See [`diag::suggest_exit_node`] for the `suggest_exit_node()` →
+    /// [`Response::ExitNodeSuggestion`](crate::localapi::Response) mapping (`Ok(None)` = no eligible
+    /// candidate, an honest empty result, not an error) and for the `AllowedSuggestedExitNodes`
+    /// allow-list the engine's answer is filtered through.
+    ///
+    /// This is the port of Go's `LocalBackend.suggestExitNodeLocked`, which computes the suggestion
+    /// and, in the same function, notifies every client when the pick differs from the last one.
+    /// Keeping the push HERE rather than in the request handler is the whole point: the comparison
+    /// then reads the value actually returned to the caller, so the two can never disagree — and a
+    /// second caller of the computation (this bit's front-load) gets the notification for free
+    /// instead of having to remember to re-implement it.
+    ///
+    /// It takes the shared backend rather than `&self` because the engine round-trip must run
+    /// OFF-LOCK, like the other diagnostics: compute first with no lock held, then take the lock only
+    /// for the brief compare-and-publish.
+    pub async fn suggest_exit_node(
+        backend: &std::sync::Arc<tokio::sync::Mutex<Backend>>,
+        dev: &tailscale::Device,
+    ) -> crate::localapi::Response {
+        let response = diag::suggest_exit_node(dev).await;
+        backend.lock().await.publish_suggested_exit_node(&response);
+        response
+    }
+
+    /// Publish a freshly-computed exit-node suggestion to every notify watcher — but only if it
+    /// differs from the last one published. Returns whether it published.
+    ///
+    /// The tail of Go's `suggestExitNodeLocked`:
+    ///
+    /// ```go
+    /// if prevSuggestion != res.ID {
+    ///     b.sendToLocked(ipn.Notify{SuggestedExitNode: &res.ID}, allClients)
+    /// }
+    /// b.lastSuggestedExitNode = res.ID
+    /// ```
+    ///
+    /// Three properties come straight across. It is **change-triggered**, so a stable answer costs
+    /// nothing on the bus however often it is recomputed. It goes to **every** watcher, not to the
+    /// session that triggered the computation, because the suggestion describes the node rather than
+    /// the asker (`allClients`) — here that falls out of the channel being on the backend, which every
+    /// watcher subscribes to. And it fires wherever a suggestion is computed, which in this fork means
+    /// `exit-node suggest` and the watch front-load (see
+    /// [`Request::Watch::suggested_exit_node`](crate::localapi::Request::Watch::suggested_exit_node)
+    /// for why that set is narrower than Go's).
+    ///
+    /// An **empty or failed** answer publishes nothing and leaves the remembered value alone. Go's
+    /// error path returns before both the compare and the `lastSuggestedExitNode` assignment, so a
+    /// watcher is never told "no suggestion" — it simply hears nothing further until a real one
+    /// appears. This fork reaches the same place from two directions: `Ok(None)` (no eligible
+    /// candidate, or the pick withheld by `AllowedSuggestedExitNodes`) and an engine error are both
+    /// silence. Leaving the cell untouched is what makes the next real suggestion compare against the
+    /// last value a watcher was actually told, rather than against a gap.
+    ///
+    /// `&self`, not `&mut self`: the cell lives behind a `watch::Sender`, which publishes through a
+    /// shared reference. That is not an accident of the type — it keeps this callable from the brief
+    /// read-style lock the off-lock diagnostics take.
+    pub fn publish_suggested_exit_node(&self, response: &crate::localapi::Response) -> bool {
+        let crate::localapi::Response::ExitNodeSuggestion {
+            suggestion: Some(suggestion),
+        } = response
+        else {
+            return false; // empty result or engine error → silence, and the cell stands
+        };
+        if self.suggested_exit_node_tx.borrow().as_deref() == Some(suggestion.id.as_str()) {
+            return false; // unchanged — Go's `prevSuggestion != res.ID` guard
+        }
+        tracing::debug!(
+            suggested_id = %suggestion.id,
+            "exit-node suggestion changed; publishing to notify watchers"
+        );
+        self.suggested_exit_node_tx
+            .send_replace(Some(suggestion.id.clone()));
+        true
+    }
+
+    /// Subscribe to exit-node-suggestion pushes (a masked `Watch` with the `suggested_exit_node`
+    /// bit). Unlike [`watch_prefs`](Backend::watch_prefs) the value rides the channel, so a receiver
+    /// reads it with `borrow_and_update()` instead of re-deriving it — it has no way to re-derive a
+    /// suggestion of its own. `subscribe()` starts synced, so attaching never replays the current
+    /// value; a watcher's first frame comes from its own
+    /// [`suggest_exit_node`](Backend::suggest_exit_node) front-load.
+    pub fn watch_suggested_exit_node(&self) -> tokio::sync::watch::Receiver<Option<String>> {
+        self.suggested_exit_node_tx.subscribe()
     }
 
     /// Validate a prospective prefs change WITHOUT applying it (the `check-prefs` LocalAPI / Go
@@ -5299,18 +5603,26 @@ impl Backend {
     /// peer that exists, a peer that actually advertises an exit node, an unambiguous name);
     /// (2) **exit-node-vs-advertise
     /// conflict** — cannot use an exit node and advertise as one simultaneously (Go
-    /// `checkExitNodePrefsLocked`); (3) the advertised-route SET is one Go would send: every entry a
-    /// masked CIDR, every 4via6 prefix decodable, and a default route present in both families or in
-    /// neither (Go `netutil.CalcAdvertiseRoutes`, via [`crate::routes`]); (4) SSH-server enable requires the `ssh` build feature (the local
+    /// `checkExitNodePrefsLocked`); (3) SSH-server enable requires the `ssh` build feature (the local
     /// analogue of Go's capability gate — a faithful, build-time check) **and** must clear the
     /// host/operator gate Go's `checkSSHPrefsLocked` applies,
     /// [`featureknob::can_run_tailscale_ssh`](crate::featureknob::can_run_tailscale_ssh) — chiefly
     /// its `TS_DISABLE_SSH_SERVER` administrative off-switch, which is how an image build or a
     /// configuration-managed host holds the SSH server down whatever the tailnet or the user asks
-    /// for; (5) an auto-update **opt-in** requires an installation that can replace its own binary
+    /// for; (4) an auto-update **opt-in** requires an installation that can replace its own binary
     /// (Go `checkAutoUpdatePrefsLocked` → `feature.CanAutoUpdate()`, decided here by
-    /// [`selfupdate::auto_update_refusal`]). Go's operator/profile-name/config-lock/Funnel-shields
-    /// rules reference prefs this fork does not model, so they are correctly N/A.
+    /// [`selfupdate::auto_update_refusal`]); (5) the advertised-route SET is one Go would send: every
+    /// entry a masked CIDR, every 4via6 prefix decodable, and a default route present in both
+    /// families or in neither (Go `netutil.CalcAdvertiseRoutes`, via [`crate::routes`]). Go's
+    /// operator/profile-name/config-lock/Funnel-shields rules reference prefs this fork does not
+    /// model, so they are correctly N/A.
+    ///
+    /// The last two are in that order because Go's is: `checkPrefsLocked` accumulates with
+    /// `errors.Join` in a fixed sequence that ends `checkAutoUpdatePrefsLocked` then
+    /// `checkAdvertiseRoutes`, so a posture failing both reports the auto-update sentence first.
+    /// Both sides report every violation, so this is only the order the operator reads them in —
+    /// but it is free to match, and an answer that reads like the one upstream gives is one less
+    /// diff for anyone comparing the two daemons.
     pub async fn check_prefs(
         &self,
         exit_node: Option<Option<String>>,
@@ -5326,6 +5638,7 @@ impl Backend {
             Some(Some(_)) => self.exit_node_facts().await,
             _ => ExitNodeFacts::default(),
         };
+        let auto_update_refusal = selfupdate::auto_update_refusal();
         self.check_prefs_gated(
             exit_node,
             advertise_exit_node,
@@ -5335,8 +5648,25 @@ impl Backend {
             CheckPrefsEnv {
                 ssh_gate: crate::featureknob::can_run_tailscale_ssh(),
                 exit_node_facts: &facts,
+                auto_update_gate: auto_update_refusal.as_deref(),
             },
         )
+    }
+
+    /// The `AutoUpdate.Apply` a request would LEAVE BEHIND: the value it names, else the one already
+    /// persisted. Go's edit path composes exactly this before it validates — `editPrefsLocked` does
+    /// `p1 := b.pm.CurrentPrefs().AsStruct(); p1.ApplyEdits(mp); b.checkPrefsLocked(p1)`
+    /// (`ipn/ipnlocal/local.go`) — so the rule is asked about the resulting posture, not about the
+    /// edit mask.
+    ///
+    /// Having one helper both paths call is the point: an opt-in already sitting in `prefs.json`
+    /// (persisted before this rule existed, or carried over from a host that could update) keeps
+    /// claiming `Hostinfo.AllowsUpdate` on every map request, so on an installation that can never
+    /// apply an update it must fail the NEXT prefs write too, exactly as it does upstream — not only
+    /// a write that happens to name `--auto-update`. The way out is the same as Go's: name the pref
+    /// and decline it (`tnet set --no-auto-update`), because the named value wins here.
+    fn prospective_auto_update(&self, named: Option<bool>) -> Option<bool> {
+        named.or(self.prefs.auto_update_apply)
     }
 
     /// One [`status`](Backend::status) snapshot, projected into the facts an exit-node selector is
@@ -5385,9 +5715,6 @@ impl Backend {
 
     /// [`check_prefs`](Self::check_prefs) with the host-derived inputs passed IN rather than read
     /// from the process environment or the engine — see [`CheckPrefsEnv`] for why they are injected.
-    /// `auto_update` stays a plain override (rule (5) reads the host's update provenance through
-    /// [`selfupdate::auto_update_refusal`], which needs no injection to be testable — its own pure
-    /// predicate takes the facts as arguments).
     fn check_prefs_gated(
         &self,
         exit_node: Option<Option<String>>,
@@ -5410,10 +5737,7 @@ impl Backend {
         // `check_prefs` is always asked about a PATCH (it has no `--reset`), so the prospective
         // posture is composed against the live prefs.
         let prospective_ssh = prospective_ssh(ssh, &self.prefs, false);
-        let prospective_auto_update = match auto_update {
-            Some(v) => Some(v),
-            None => self.prefs.auto_update_apply,
-        };
+        let prospective_auto_update = self.prospective_auto_update(auto_update);
 
         let mut errors: Vec<String> = Vec::new();
 
@@ -5442,18 +5766,7 @@ impl Backend {
                 "Cannot advertise an exit node and use an exit node at the same time.".into(),
             );
         }
-        // (3) the advertised-route SET (Go `netutil.CalcAdvertiseRoutes`): every entry is a parseable,
-        // MASKED CIDR, every 4via6 prefix actually decodes, and a default route is advertised in BOTH
-        // families or in neither. Asked of the set the two inputs COMPOSE — `prospective_advertise_exit`
-        // contributes the two default routes, exactly as Go's `advertiseDefaultRoute` argument does —
-        // because the set is what this node will offer control, and a lone default route there is a
-        // half exit node whichever input produced it. See [`crate::routes`] for each rule.
-        if let Err(errs) =
-            crate::routes::calc_advertise_routes(&prospective_routes, prospective_advertise_exit)
-        {
-            errors.extend(errs.iter().map(ToString::to_string));
-        }
-        // (4) SSH-server enable requires the `ssh` build feature (local analogue of Go's
+        // (3) SSH-server enable requires the `ssh` build feature (local analogue of Go's
         // capability gate — a faithful build-time check; the netmap-capability check is engine-gated)
         // AND must clear the host/operator gate (Go `checkSSHPrefsLocked` → `CanRunTailscaleSSH`).
         // Both are reported when both fail: this call exists to tell the caller everything that is
@@ -5472,15 +5785,32 @@ impl Backend {
             }
         }
 
-        // (5) an auto-update opt-in on an installation that can never apply one (Go
+        // (4) an auto-update opt-in on an installation that can never apply one (Go
         // `checkAutoUpdatePrefsLocked`). `AutoUpdate.Apply` is advertised to control as
         // `Hostinfo.AllowsUpdate`, so accepting it here would let the node tell the tailnet admin
-        // that a remote update trigger will be honoured when nothing could honour it.
+        // that a remote update trigger will be honoured when nothing could honour it. Asked BEFORE
+        // the route rule below because Go asks it there: `checkPrefsLocked` joins
+        // `checkAutoUpdatePrefsLocked` and then `checkAdvertiseRoutes`, so a posture that fails both
+        // reads the same way here as it does upstream.
         if let Some(e) = selfupdate::check_auto_update_pref(
             prospective_auto_update,
-            selfupdate::auto_update_refusal().as_deref(),
+            env.auto_update_gate,
+            selfupdate::REMEDY_CLI,
         ) {
             errors.push(e);
+        }
+
+        // (5) the advertised-route SET (Go `netutil.CalcAdvertiseRoutes`, joined LAST by
+        // `checkPrefsLocked` as it is here): every entry is a parseable, MASKED CIDR, every 4via6
+        // prefix actually decodes, and a default route is advertised in BOTH families or in neither.
+        // Asked of the set the two inputs COMPOSE — `prospective_advertise_exit` contributes the two
+        // default routes, exactly as Go's `advertiseDefaultRoute` argument does — because the set is
+        // what this node will offer control, and a lone default route there is a half exit node
+        // whichever input produced it. See [`crate::routes`] for each rule.
+        if let Err(errs) =
+            crate::routes::calc_advertise_routes(&prospective_routes, prospective_advertise_exit)
+        {
+            errors.extend(errs.iter().map(ToString::to_string));
         }
 
         if errors.is_empty() {
@@ -5818,6 +6148,8 @@ impl Backend {
             .save(&self.prefs_path)
             .await
             .with_context(|| format!("saving prefs to {}", self.prefs_path.display()))?;
+        // Every persist of a finished login passes here, so this is where a new profile is listed.
+        self.register_current_profile().await?;
         // Wake any prefs watchers (a masked `Watch` with the `prefs` bit) — this is the single
         // chokepoint every prefs mutation funnels through, so one tick here covers up/set/logout/
         // switch/reload-config. A failed send (no subscribers) is fine — `watch::Sender::send` errors
@@ -6021,6 +6353,43 @@ mod tests {
     // functions they exercise; the read-only-diagnostics / Taildrop path-hardening predicate tests
     // moved to `ipn::diag`. See those modules' `#[cfg(test)] mod tests`.
 
+    /// The self view a `watch` netmap frame carries (Go `Notify.SelfChange`) takes its name and
+    /// addresses from the same engine `StatusNode` `status` reports `self_*` from, and renders the
+    /// key expiry RFC3339 — with a never-expiring key staying absent rather than becoming a date.
+    #[test]
+    fn self_report_projects_the_status_self_node_and_its_key_expiry() {
+        use chrono::TimeZone;
+        let node = tailscale::StatusNode {
+            stable_id: tailscale::StableNodeId("nSELF1CNTRL".to_string()),
+            display_name: "laptop.tail0123.ts.net".to_string(),
+            ipv4: "100.64.0.1".parse().unwrap(),
+            ipv6: "fd7a:115c:a1e0::1".parse().unwrap(),
+            online: Some(true),
+            last_seen: None,
+            allowed_routes: Vec::new(),
+            is_exit_node: false,
+            cur_addr: None,
+            relay: None,
+            ssh_host_keys: Vec::new(),
+        };
+        let expiry = chrono::Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap();
+
+        let me = self_report_from_status_node(node.clone(), Some(expiry));
+        assert_eq!(
+            me,
+            SelfReport {
+                stable_id: "nSELF1CNTRL".to_string(),
+                name: "laptop.tail0123.ts.net".to_string(),
+                ipv4: "100.64.0.1".to_string(),
+                ipv6: "fd7a:115c:a1e0::1".to_string(),
+                key_expiry: Some("2026-09-01T12:00:00+00:00".to_string()),
+            }
+        );
+
+        let never = self_report_from_status_node(node, None);
+        assert_eq!(never.key_expiry, None);
+    }
+
     // --- has_persisted_node_key ---------------------------------------------------------------
     //
     // The auto-start "resume vs. fresh-auth" decision hinges on this probe: it must read `false` for
@@ -6051,6 +6420,8 @@ mod tests {
             boot_attempted_up: false,
             lifecycle_tx: tokio::sync::watch::channel(0u64).0,
             prefs_tx: tokio::sync::watch::channel(()).0,
+            // No suggestion computed yet, exactly as a freshly-loaded backend starts.
+            suggested_exit_node_tx: tokio::sync::watch::channel(None).0,
             // Cache starts `false` (a fresh backend, no key checked yet). Tests that need a key
             // present drive the real wipe/build paths, which keep the cache consistent on their own.
             has_node_key: false,
@@ -6065,6 +6436,158 @@ mod tests {
             override_exit_node_policy: false,
             exit_node_keys: syspolicy::ExitNodeKeys::default(),
         }
+    }
+
+    // --- exit-node suggestion on the notify bus ----------------------------------------------------
+
+    /// A throwaway `Backend` for the suggestion tests. They exercise only the in-memory suggestion
+    /// cell, so no file is ever read or written and the path deliberately does not exist — nothing
+    /// here needs a temp dir (the module avoids a `tempfile` dependency, see `backend_for`).
+    fn suggestion_backend() -> Backend {
+        backend_for(std::path::Path::new(
+            "/nonexistent/tailnetd-suggestion-tests",
+        ))
+    }
+
+    /// Build a `Response::ExitNodeSuggestion` the way `diag::suggest_exit_node` returns one.
+    fn suggestion_response(id: &str, name: &str) -> crate::localapi::Response {
+        crate::localapi::Response::ExitNodeSuggestion {
+            suggestion: Some(crate::localapi::ExitNodeSuggestionView {
+                id: id.to_string(),
+                name: name.to_string(),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_first_suggestion_of_the_run_reaches_a_watcher() {
+        let be = suggestion_backend();
+        let mut rx = be.watch_suggested_exit_node();
+        // Nothing computed yet: the cell is empty and the receiver starts synced, so a watcher that
+        // attached before any suggestion existed has nothing pending.
+        assert_eq!(*rx.borrow_and_update(), None);
+
+        assert!(
+            be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")),
+            "the first suggestion of the process differs from the empty cell, so it publishes"
+        );
+        assert!(
+            rx.has_changed().unwrap(),
+            "the watcher must have been woken"
+        );
+        assert_eq!(
+            rx.borrow_and_update().as_deref(),
+            Some("nodeid-a"),
+            "the bare stable id rides the channel, as Go's Notify.SuggestedExitNode carries it"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_suggestion_costs_nothing_on_the_bus() {
+        let be = suggestion_backend();
+        let mut rx = be.watch_suggested_exit_node();
+
+        assert!(be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")));
+        rx.borrow_and_update(); // consume the first push
+
+        // Go guards the send with `if prevSuggestion != res.ID`, so recomputing a stable answer —
+        // which this fork does on every `exit-node suggest` and every watch front-load — must not
+        // wake a single watcher.
+        assert!(
+            !be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")),
+            "the same pick must not be republished"
+        );
+        assert!(
+            !rx.has_changed().unwrap(),
+            "an unchanged suggestion must not wake a watcher"
+        );
+
+        // A different pick is a change, and the name moving on its own is not — the id is the value.
+        assert!(be.publish_suggested_exit_node(&suggestion_response("nodeid-b", "berlin")));
+        assert_eq!(rx.borrow_and_update().as_deref(), Some("nodeid-b"));
+    }
+
+    #[tokio::test]
+    async fn an_empty_suggestion_is_silence_and_leaves_the_remembered_pick_alone() {
+        let be = suggestion_backend();
+        let mut rx = be.watch_suggested_exit_node();
+
+        assert!(be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")));
+        rx.borrow_and_update();
+
+        // `Ok(None)` is this fork's honest empty result: no eligible candidate, or the pick withheld
+        // by the administrator's `AllowedSuggestedExitNodes`. Go reaches the same place via an error
+        // from `suggestExitNodeLocked` and sends nothing, leaving `lastSuggestedExitNode` untouched.
+        let empty = crate::localapi::Response::ExitNodeSuggestion { suggestion: None };
+        assert!(
+            !be.publish_suggested_exit_node(&empty),
+            "an empty suggestion must not produce a frame"
+        );
+        // An engine failure is the same silence.
+        let failed = crate::localapi::Response::Error {
+            message: "exit-node suggest failed".to_string(),
+        };
+        assert!(
+            !be.publish_suggested_exit_node(&failed),
+            "an engine error must not produce a frame"
+        );
+        assert!(
+            !rx.has_changed().unwrap(),
+            "neither an empty result nor an error may wake a watcher"
+        );
+        assert_eq!(
+            rx.borrow_and_update().as_deref(),
+            Some("nodeid-a"),
+            "the remembered pick stands, so the next real suggestion is compared against the last \
+             value a watcher was actually told"
+        );
+
+        // ...and because the cell stood, the SAME pick coming back is still not a change.
+        assert!(
+            !be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")),
+            "a pick that went away and came back unchanged must not be republished"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_suggestion_reaches_every_watcher_not_just_the_asker() {
+        let be = suggestion_backend();
+        // Three independent connections watching the bus. Go sends the suggestion to `allClients`
+        // rather than to the session that triggered the computation, because the suggestion is a
+        // property of the node, not of the asker: one `exit-node suggest` informs everyone.
+        let mut watchers: Vec<_> = (0..3).map(|_| be.watch_suggested_exit_node()).collect();
+        for rx in &mut watchers {
+            rx.borrow_and_update();
+        }
+
+        assert!(be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")));
+        for rx in &mut watchers {
+            assert!(
+                rx.has_changed().unwrap(),
+                "every watcher must be woken, not only the connection that asked"
+            );
+            assert_eq!(rx.borrow_and_update().as_deref(), Some("nodeid-a"));
+        }
+    }
+
+    #[tokio::test]
+    async fn publishing_with_no_watchers_still_records_the_pick() {
+        let be = suggestion_backend();
+        // Nobody is watching — the common case. `watch::Sender::send` would refuse here AND leave the
+        // value unstored, so the cell must be written with `send_replace`; otherwise every later
+        // suggestion would look like a change and a watcher attaching afterwards would be told about
+        // a "new" pick that had been stable for hours.
+        assert!(be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")));
+        assert!(
+            !be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")),
+            "the pick must have been recorded even with zero receivers"
+        );
+        let mut rx = be.watch_suggested_exit_node();
+        assert_eq!(
+            rx.borrow_and_update().as_deref(),
+            Some("nodeid-a"),
+            "a watcher attaching later reads the recorded pick for its front-load"
+        );
     }
 
     // --- captive-portal detection (tsd-iqq.5) -----------------------------------------------------
@@ -6434,6 +6957,7 @@ mod tests {
                 CheckPrefsEnv {
                     ssh_gate: disabled(),
                     exit_node_facts: &ExitNodeFacts::default(),
+                    auto_update_gate: None,
                 },
             )
             .expect_err("TS_DISABLE_SSH_SERVER must refuse an SSH-server enable");
@@ -6456,6 +6980,7 @@ mod tests {
                 CheckPrefsEnv {
                     ssh_gate: disabled(),
                     exit_node_facts: &ExitNodeFacts::default(),
+                    auto_update_gate: None,
                 },
             )
             .is_ok(),
@@ -6471,6 +6996,7 @@ mod tests {
                 CheckPrefsEnv {
                     ssh_gate: disabled(),
                     exit_node_facts: &ExitNodeFacts::default(),
+                    auto_update_gate: None,
                 },
             )
             .is_ok(),
@@ -6488,6 +7014,7 @@ mod tests {
             CheckPrefsEnv {
                 ssh_gate: allowed(),
                 exit_node_facts: &ExitNodeFacts::default(),
+                auto_update_gate: None,
             },
         );
         if cfg!(feature = "ssh") {
@@ -6500,6 +7027,51 @@ mod tests {
                 "only the build-feature refusal applies when the knob is clear, got {msg:?}"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_prefs_reports_the_auto_update_rule_before_the_route_rule() {
+        // Go's `checkPrefsLocked` accumulates with `errors.Join` in a fixed sequence whose last two
+        // children are `checkAutoUpdatePrefsLocked` and then `checkAdvertiseRoutes`
+        // (`ipn/ipnlocal/local.go`). Both daemons report every violation, so this is only the order
+        // the operator READS them in — but an answer that reads like upstream's is one less diff for
+        // anyone comparing the two, and nothing but the order of two pushes decides it.
+        //
+        // The host's update provenance is handed in, so this asserts the same thing on a machine
+        // that can replace its own binary and on one that cannot — the ordering is invisible to any
+        // test that lets the rule stay silent.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-checkprefs-order-{}", std::process::id()));
+        let be = backend_for(&dir);
+        let cannot = selfupdate::auto_update_refusal_for(None, None, "macos/aarch64")
+            .expect("a platform with no published artifact can never update");
+
+        let err = be
+            .check_prefs_gated(
+                None,
+                None,
+                Some(vec!["10.0.0.5/24".into()]),
+                None,
+                Some(true),
+                CheckPrefsEnv {
+                    ssh_gate: Ok(()),
+                    exit_node_facts: &ExitNodeFacts::default(),
+                    auto_update_gate: Some(&cannot),
+                },
+            )
+            .expect_err("an opt-in plus an unmasked route fails two rules");
+        let msg = format!("{err:#}");
+        let auto_at = msg
+            .find("Auto-updates are not supported")
+            .unwrap_or_else(|| panic!("the auto-update refusal must be reported: {msg}"));
+        let route_at = msg
+            .find("has non-address bits set")
+            .unwrap_or_else(|| panic!("the route refusal must be reported: {msg}"));
+        assert!(
+            auto_at < route_at,
+            "Go joins the auto-update rule BEFORE the advertise-routes rule; got {msg}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -8214,9 +8786,27 @@ mod tests {
         );
         assert_eq!(be.current_profile, id);
 
-        // `login --nickname=work` names the profile it switched to, and only that one.
+        // A second login before the first one registered stays on that profile, even once the
+        // first login's `up` has minted it a key: switch, `up` (key), switch again.
+        let (_, new_key_path) = profile::profile_paths(&dir, &id);
+        tailscale::config::load_key_file(&new_key_path, Default::default())
+            .await
+            .expect("mint a key file for the new profile");
+        be.has_node_key = true;
+        assert_eq!(
+            be.switch_to_empty_profile().await.unwrap(),
+            SwitchOutcome::AlreadyCurrent { id: id.clone() }
+        );
+
+        // `login --nickname=work` names the profile it switched to, and only that one. The name
+        // waits in the pref until the login finishes (Go saves the profile only then).
+        be.prefs.node_nickname = Some("work".into());
+        be.persist_prefs().await.unwrap();
         be.rename_current_profile("work").await.unwrap();
+        be.prefs.has_logged_in = true;
+        be.persist_prefs().await.unwrap();
         let profiles = be.list_profiles().await;
+        assert_eq!(profiles.len(), 2, "{profiles:?}");
         assert!(
             profiles
                 .iter()
@@ -8234,18 +8824,133 @@ mod tests {
             "the old profile's node key must survive"
         );
 
-        // A second login before the first one registered stays on that profile, even once the
-        // first login's `up` has minted it a key: switch, `up` (key), switch again.
-        let (_, new_key_path) = profile::profile_paths(&dir, &id);
-        tailscale::config::load_key_file(&new_key_path, Default::default())
-            .await
-            .expect("mint a key file for the new profile");
-        be.has_node_key = true;
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn switch_to_empty_profile_drops_what_an_unfinished_login_left() {
+        // Go's `SwitchToProfile` gives a profile that never logged in `defaultPrefs`, so the prefs an
+        // unfinished `up` left do not carry into the `login` that follows. `tnet login` sends no
+        // prefs of its own to override them, so keeping them here would log in with them.
+        let dir = std::env::temp_dir().join(format!("tailnetd-prof-reset-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = Backend::load(&dir).await.unwrap();
+
+        be.prefs.want_running = true;
+        be.prefs.control_url = Some("https://control.example.com".into());
+        be.prefs.hostname = Some("left-behind".into());
+        be.prefs.advertise_routes = vec!["192.0.2.0/24".into()];
+        be.prefs.exit_node = Some("100.64.0.9".into());
+        be.prefs.node_nickname = Some("half-done".into());
+        be.ever_configured = true;
+        be.persist_prefs().await.unwrap();
+        be.rename_current_profile("half-done").await.unwrap();
+        let generation_before = be.generation;
+
+        let outcome = be.switch_to_empty_profile().await.unwrap();
+        assert_eq!(
+            outcome,
+            SwitchOutcome::Switched {
+                id: profile::DEFAULT_PROFILE_ID.to_string(),
+                state: State::NoState,
+            }
+        );
+        assert!(be.generation > generation_before, "the device is reset");
+        assert!(!be.prefs.want_running);
+        assert_eq!(be.prefs.control_url, None);
+        assert_eq!(be.prefs.hostname, None);
+        assert!(be.prefs.advertise_routes.is_empty());
+        assert_eq!(be.prefs.exit_node, None);
+        assert_eq!(be.prefs.node_nickname, None);
+        let profiles = be.list_profiles().await;
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(
+            profiles[0].name,
+            profile::DEFAULT_PROFILE_ID,
+            "{profiles:?}"
+        );
+
+        // The reset is on disk: a restart does not bring the old prefs back.
+        let be = Backend::load(&dir).await.unwrap();
+        assert_eq!(be.prefs.hostname, None);
+        assert_eq!(be.prefs.control_url, None);
+
+        // Now the profile is empty, so a second login has nothing to reset (Go's no-change case).
+        let mut be = be;
         assert_eq!(
             be.switch_to_empty_profile().await.unwrap(),
-            SwitchOutcome::AlreadyCurrent { id: id.clone() }
+            SwitchOutcome::AlreadyCurrent {
+                id: profile::DEFAULT_PROFILE_ID.to_string()
+            }
         );
-        assert_eq!(be.list_profiles().await.len(), 2);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn a_login_profile_is_listed_only_once_it_has_logged_in() {
+        // Go gives a new login profile an id, and saves it, only after the login succeeds, so an
+        // abandoned `login` leaves nothing in `switch --list`.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-prof-unsaved-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = Backend::load(&dir).await.unwrap();
+        be.prefs.has_logged_in = true;
+        be.ever_configured = true;
+        be.persist_prefs().await.unwrap();
+
+        // Files an earlier abandoned login left under the id this one draws.
+        let (stale_prefs, _) = profile::profile_paths(&dir, "0a0b");
+        tokio::fs::create_dir_all(stale_prefs.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&stale_prefs, br#"{"hostname":"stale"}"#)
+            .await
+            .unwrap();
+
+        let outcome = be
+            .switch_to_empty_profile_drawing(|| Ok::<_, std::convert::Infallible>([0x0a, 0x0b]))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, SwitchOutcome::Switched { ref id, .. } if id == "0a0b"));
+        assert_eq!(be.prefs.hostname, None, "a new profile starts empty");
+        assert!(
+            !profile::load_profiles_file(&dir)
+                .await
+                .profiles
+                .contains_key("0a0b")
+        );
+        assert_eq!(be.list_profiles().await.len(), 1, "not listed before login");
+
+        // `--nickname` before the login does not list it either.
+        be.prefs.node_nickname = Some("work".into());
+        be.persist_prefs().await.unwrap();
+        be.rename_current_profile("work").await.unwrap();
+        assert_eq!(be.list_profiles().await.len(), 1);
+
+        // Abandoned: the operator switches back, and the unfinished profile is not listed.
+        be.switch_profile(profile::DEFAULT_PROFILE_ID)
+            .await
+            .unwrap();
+        assert_eq!(be.list_profiles().await.len(), 1);
+
+        // A login that finishes is listed, under the nickname it was given.
+        be.switch_to_empty_profile_drawing(|| Ok::<_, std::convert::Infallible>([0x0c, 0x0d]))
+            .await
+            .unwrap();
+        be.prefs.node_nickname = Some("work".into());
+        be.prefs.has_logged_in = true;
+        be.persist_prefs().await.unwrap();
+        let profiles = be.list_profiles().await;
+        assert!(
+            profiles
+                .iter()
+                .any(|e| e.id == "0c0d" && e.name == "work" && e.current),
+            "{profiles:?}"
+        );
+        assert_eq!(profiles.len(), 2, "{profiles:?}");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -8923,8 +9628,10 @@ mod tests {
             "`up` must persist the completed tag, exactly as `set` does"
         );
 
-        // And an illegal name is still refused — quoting the COMPLETED value, as Go's `tag: %q`
-        // does, so the operator is shown the tag as the daemon would have seen it.
+        // And an illegal name is still refused — with Go's whole refusal, `tag: %q: %s` over
+        // `tailcfg.CheckTag`'s reason, quoting the COMPLETED value so the operator is shown the tag
+        // as the daemon would have seen it. Asserted here and not only on the pure helper because
+        // this is the path a LocalAPI caller is on: the message has to survive the trip out.
         let mut be = backend_for(&dir);
         // `PendingUp` is not `Debug`, so match rather than `expect_err` (as the other `begin_up`
         // tests do).
@@ -8941,9 +9648,9 @@ mod tests {
             Ok(_) => panic!("a completed tag with an illegal name must still be refused"),
             Err(e) => {
                 let msg = format!("{e:#}");
-                assert!(
-                    msg.contains("\"tag:9server\""),
-                    "the refusal must quote the completed value, got {msg:?}"
+                assert_eq!(
+                    msg, r#"tag: "tag:9server": tag names must start with a letter, after 'tag:'"#,
+                    "`begin_up` must surface Go's refusal verbatim, got {msg:?}"
                 );
             }
         }
@@ -9404,6 +10111,7 @@ mod tests {
                 CheckPrefsEnv {
                     ssh_gate: Ok(()),
                     exit_node_facts: &facts,
+                    auto_update_gate: None,
                 },
             )
             .expect_err("a peer advertising no exit node must be reported");
@@ -9426,6 +10134,7 @@ mod tests {
                     "100.64.0.7",
                     true,
                 )]),
+                auto_update_gate: None,
             },
         );
         assert!(ok.is_ok(), "a real exit node must be accepted: {ok:?}");
@@ -9442,6 +10151,7 @@ mod tests {
                 CheckPrefsEnv {
                     ssh_gate: Ok(()),
                     exit_node_facts: &facts,
+                    auto_update_gate: None,
                 },
             )
             .expect_err("auto: selection is unsupported")
@@ -10862,8 +11572,118 @@ mod tests {
             ..SetOptions::default()
         })
         .await
-        .expect("a set that never names auto-update is unaffected by the rule");
+        .expect(
+            "a set that names nothing is judged on the posture it leaves behind, and a stored \
+             decline claims nothing",
+        );
         assert_eq!(be.prefs.auto_update_apply, Some(false));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn set_and_check_prefs_agree_on_a_stored_auto_update_opt_in() {
+        // The dry run and the real write must give the same verdict for the same posture — that is
+        // the whole contract of a `check-prefs` verb, and Go gets it by construction: `CheckPrefs`
+        // and `EditPrefs` both hand `checkPrefsLocked` the prefs that would RESULT (`p1` after
+        // `ApplyEdits`), never the edit mask. Here both paths compose the value through one helper
+        // ([`Backend::prospective_auto_update`]) for the same reason.
+        //
+        // The case that separates the two is an opt-in already in `prefs.json` with a `set` that
+        // does not mention auto-update: reading the mask, the write sees `None` and proceeds, while
+        // the dry run — which always merged — refuses. The installation's update provenance is
+        // handed to both, so the disagreement is asserted on every host rather than only where the
+        // rule happens to fire.
+        let dir = std::env::temp_dir().join(format!(
+            "tailnetd-set-autoupdate-agree-{}",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = backend_for(&dir);
+        let cannot = selfupdate::auto_update_refusal_for(None, None, "macos/aarch64")
+            .expect("a platform with no published artifact can never update");
+        let facts = ExitNodeFacts::default();
+        let env = || CheckPrefsEnv {
+            ssh_gate: Ok(()),
+            exit_node_facts: &facts,
+            auto_update_gate: Some(&cannot),
+        };
+
+        // Nothing stored, nothing named → nothing claimed, so nothing to refuse, even here.
+        assert!(
+            be.check_prefs_gated(None, None, None, None, None, env())
+                .is_ok(),
+            "a node that never stated the pref is valid on any installation"
+        );
+
+        // Now the posture that used to split the two verbs: the claim is on disk and the request is
+        // about something else entirely.
+        be.prefs.auto_update_apply = Some(true);
+        let dry_run = be.check_prefs_gated(None, None, None, None, None, env());
+        let write = be
+            .begin_set_gated(
+                SetOptions {
+                    hostname: Some("unrelated".to_string()),
+                    ..SetOptions::default()
+                },
+                Ok(()),
+                Some(&cannot),
+            )
+            .await;
+        assert_eq!(
+            dry_run.is_err(),
+            write.is_err(),
+            "check-prefs and set must agree: dry run {dry_run:?}, write {write:?}"
+        );
+        let err = write.expect_err(
+            "a stored opt-in on an installation that can never update must fail the write",
+        );
+        assert!(
+            format!("{err:#}").contains("Hostinfo.AllowsUpdate"),
+            "got {err:#}"
+        );
+        assert_eq!(
+            be.prefs.hostname, None,
+            "a refused set must not have applied the pref it named"
+        );
+        assert!(
+            !tokio::fs::try_exists(&be.prefs_path).await.unwrap(),
+            "a refused set must not have persisted anything"
+        );
+
+        // The way out is the one Go leaves: name the pref and decline it. The named value wins over
+        // the stored one, exactly as `ApplyEdits` overwrites the field it masks — so this write is
+        // about a posture that claims nothing, and both verbs say so.
+        assert!(
+            be.check_prefs_gated(None, None, None, None, Some(false), env())
+                .is_ok(),
+            "declining the stored opt-in must be a valid posture"
+        );
+        be.begin_set_gated(
+            SetOptions {
+                auto_update: Some(false),
+                ..SetOptions::default()
+            },
+            Ok(()),
+            Some(&cannot),
+        )
+        .await
+        .expect("declining the stored opt-in must be accepted");
+        assert_eq!(be.prefs.auto_update_apply, Some(false));
+
+        // With the claim withdrawn, the unrelated edit that was refused above goes through.
+        be.begin_set_gated(
+            SetOptions {
+                hostname: Some("unrelated".to_string()),
+                ..SetOptions::default()
+            },
+            Ok(()),
+            Some(&cannot),
+        )
+        .await
+        .expect("with the claim withdrawn, unrelated edits work again");
+        assert_eq!(be.prefs.hostname.as_deref(), Some("unrelated"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -11152,6 +11972,7 @@ mod tests {
                     ..SetOptions::default()
                 },
                 disabled(),
+                None,
             )
             .await
             .expect_err("an SSH-less edit must be refused while the RESULTING prefs run SSH");
@@ -11180,6 +12001,7 @@ mod tests {
                 ..SetOptions::default()
             },
             disabled(),
+            None,
         )
         .await
         .expect("an edit that turns SSH off must not be gated on running SSH");
@@ -11192,6 +12014,7 @@ mod tests {
                 ..SetOptions::default()
             },
             disabled(),
+            None,
         )
         .await
         .expect("an SSH-less edit must be accepted once the resulting prefs do not run SSH");
