@@ -15092,6 +15092,20 @@ fn go_io_error_text(e: &std::io::Error) -> String {
     }
 }
 
+/// Go's `*os.PathError` as Go prints it: `<syscall> <path>: <reason>`.
+///
+/// Those three pieces are what a reader needs in order to act — which call refused, on which path,
+/// and why — and a Rust `io::Error` carries only the last of them, so every caller here supplies
+/// the other two. The path is sanitized because it can come from `$KUBECONFIG`, i.e. from outside
+/// this program.
+fn go_path_error(op: &str, path: &std::path::Path, e: &std::io::Error) -> String {
+    format!(
+        "{op} {}: {}",
+        sanitize_for_terminal(&path.display().to_string()),
+        go_io_error_text(e)
+    )
+}
+
 /// Go's `kubeconfigAccessErr`: one wording for every reason the kubeconfig cannot be written, so
 /// the precheck below and a failed directory creation read the same to whoever hits them.
 ///
@@ -15189,9 +15203,10 @@ fn kubeconfig_parent_dir(path: &std::path::Path) -> std::path::PathBuf {
 /// nothing left to ask — and the write itself then reports whatever is really wrong.
 ///
 /// Without this the refusal arrives at the `open()` in [`set_kubeconfig_for_peer`], after the
-/// existing kubeconfig has been read and the merge computed, and it says "opening kubeconfig … for
-/// writing". Nothing is damaged either way; this one answers the question the operator asked, in
-/// Go's words, at the point Go answers it.
+/// existing kubeconfig has been read and the merge computed, and all it says is `open <path>:
+/// permission denied` — the syscall that refused, not the thing the operator asked for. Nothing is
+/// damaged either way; this one answers the question the operator asked, in Go's words, at the
+/// point Go answers it.
 fn check_kubeconfig_writable(path: &str) -> Result<()> {
     let mut probe = std::path::PathBuf::from(path);
     loop {
@@ -15310,13 +15325,7 @@ fn set_kubeconfig_for_peer(scheme: &str, fqdn: &str, path: &str) -> Result<()> {
             // — the directory is there and cannot even be looked at, which is a different problem
             // from a kubeconfig that will not take a write — so adding a wrapper here would answer
             // a question the operator did not ask.
-            Err(e) => {
-                return Err(anyhow!(
-                    "stat {}: {}",
-                    sanitize_for_terminal(&dir.display().to_string()),
-                    go_io_error_text(&e)
-                ));
-            }
+            Err(e) => return Err(anyhow!("{}", go_path_error("stat", dir, &e))),
         }
     }
     // Go: `os.ReadFile` then `fmt.Errorf("reading kubeconfig: %w", err)`. ReadFile's error is the
@@ -15345,7 +15354,9 @@ fn set_kubeconfig_for_peer(scheme: &str, fqdn: &str, path: &str) -> Result<()> {
     // Go: `b, err = updateKubeconfig(b, scheme, fqdn); if err != nil { return err }` — returned
     // bare, so a malformed file reads `invalid kubeconfig` and nothing more.
     let merged = update_kubeconfig(&existing, scheme, fqdn)?;
-    // Go: `os.WriteFile(filePath, b, 0600)`. The mode applies on creation; an existing file keeps
+    // Go: `return os.WriteFile(filePath, b, 0600)` — the error comes back BARE, the `*os.PathError`
+    // of whichever step refused and nothing wrapped around it, so each step here is spelled the way
+    // Go's `os` package spells its own. The mode applies on creation; an existing file keeps
     // whatever mode it had, so this never loosens a kubeconfig the user tightened.
     let mut f = std::fs::OpenOptions::new()
         .write(true)
@@ -15353,11 +15364,15 @@ fn set_kubeconfig_for_peer(scheme: &str, fqdn: &str, path: &str) -> Result<()> {
         .truncate(true)
         .mode(0o600)
         .open(p)
-        .with_context(|| format!("opening kubeconfig {path} for writing"))?;
+        .map_err(|e| anyhow!("{}", go_path_error("open", p, &e)))?;
     f.write_all(merged.as_bytes())
-        .with_context(|| format!("writing kubeconfig {path}"))?;
+        .map_err(|e| anyhow!("{}", go_path_error("write", p, &e)))?;
+    // Go's `os.WriteFile` closes without an fsync; this port keeps the fsync, so that a kubeconfig
+    // half-written across a crash is not what kubectl finds next. It is the one step with no Go
+    // counterpart in this function, so it borrows the wording of the one Go does have for it —
+    // `(*os.File).Sync`, whose `Op` is `sync`.
     f.sync_all()
-        .with_context(|| format!("fsync kubeconfig {path}"))?;
+        .map_err(|e| anyhow!("{}", go_path_error("sync", p, &e)))?;
     Ok(())
 }
 
@@ -25476,6 +25491,24 @@ users:
                     "cannot write kubeconfig at \"{p}\": open {p}: permission denied",
                     p = ro.display()
                 )
+            );
+
+            // The same file past the precheck, i.e. the write inside `setKubeconfigForPeer`. Go
+            // returns `os.WriteFile`'s `*os.PathError` BARE — no wrapper naming this port's own
+            // steps — and a refused write leaves the file as it was. The real command's precheck
+            // answers first, so this is what the operator sees when the mode changes between the
+            // two, or when the refusal is one the precheck's probe cannot ask about.
+            let err =
+                set_kubeconfig_for_peer("https://", "foo.tail-scale.ts.net", ro.to_str().unwrap())
+                    .expect_err("a read-only kubeconfig cannot be written");
+            assert_eq!(
+                format!("{err:#}"),
+                format!("open {}: permission denied", ro.display())
+            );
+            assert_eq!(
+                std::fs::read_to_string(&ro).unwrap(),
+                "apiVersion: v1\nkind: Config\n",
+                "a refused write must leave the kubeconfig byte-identical"
             );
         }
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o600)).unwrap();
