@@ -751,11 +751,16 @@ async fn stream_watch(
 /// device is in hand, and therefore runs again for a replacement device. That is the right place
 /// anyway: the previous epoch's suggestion was ranked against an engine that no longer exists.
 ///
-/// A fourth daemon-built front-load, the `initial_status` snapshot (Go `NotifyInitialStatus`), goes
-/// out before the prefs and policy front-loads and is never repeated, not even for a replacement
-/// device. It is taken AFTER the lifecycle/prefs/policy subscriptions and BEFORE the first bus
-/// subscription; the window that ordering leaves, and why subscribing to the bus first would not
-/// close it, is documented on
+/// A fourth daemon-built front-load, the `initial_status` snapshot (Go `NotifyInitialStatus`), is
+/// ordered against the engine's bus rather than ahead of it, and is never repeated, not even for a
+/// replacement device. While it is owed, the first epoch subscribes the bus widened to
+/// `INITIAL_STATE | INITIAL_NETMAP`, waits for that subscription's initial frame (the point at which
+/// the bus task has read the engine's cells), and only then takes the snapshot. It goes out on the
+/// same frame as the requested part of that engine front-load, as the session's first frame, so it
+/// carries the owed session id. The prefs, policy and exit-node-suggestion front-loads are held
+/// back until after it. With no device, or when the bus subscribe fails, there is no bus to order
+/// against and the snapshot goes out at once. What that order guarantees, and the one window it
+/// leaves, is documented on
 /// [`NotifyView::initial_status`](crate::localapi::NotifyView::initial_status).
 ///
 /// ## A reader that falls behind is NOT told (engine gap, `docs/ENGINE_ASKS.md` #45)
@@ -844,28 +849,15 @@ async fn stream_notify(
         }
     };
 
-    // `initial_status` front-load (Go `NotifyInitialStatus`): the whole `status` report, peers
-    // included, as the session's first frame (so it also carries the session id when one is owed).
-    // Taken after the subscriptions above (so a lifecycle, prefs or policy change after it is still
-    // delivered) and before the first bus subscription. Go gets atomicity from one mutex; this daemon
-    // cannot, and `NotifyView::initial_status` says which edge that leaves. `status()` bounds its
-    // engine query, so the lock is held briefly — the same call a one-shot `status` makes. Sent once:
-    // Go carries it in the first `Notify` only.
-    if initial_status {
-        let report = { backend.lock().await.status().await };
-        let view = crate::localapi::NotifyView {
-            initial_status: Some(Box::new(report)),
-            ..Default::default()
-        };
-        if write_notify(write_half, &mut session, view).await.is_err() {
-            return Ok(());
-        }
-    }
+    // `initial_status` front-load (Go `NotifyInitialStatus`): owed until the first epoch sends it,
+    // then never again (Go carries it in the first `Notify` only). While it is owed, the prefs and
+    // policy front-loads below wait for it, so the snapshot stays the session's first frame.
+    let mut status_pending = initial_status;
 
-    // `prefs` front-load: emit the current prefs (Go `NotifyInitialPrefs`), the first frame unless the
-    // status snapshot went out ahead of it. Done once up front (daemon-built, not tied to a device
-    // epoch). A write error = client gone.
+    // `prefs` front-load: emit the current prefs (Go `NotifyInitialPrefs`) as the first frame. Done
+    // once up front (daemon-built, not tied to a device epoch). A write error = client gone.
     if prefs
+        && !status_pending
         && emit_prefs_frame(write_half, &mut session, backend)
             .await
             .is_err()
@@ -875,7 +867,7 @@ async fn stream_notify(
     // `policy` front-load: Go's `NotifySysPolicyChanges` explicitly makes the FIRST notify — sent
     // immediately — carry the current effective snapshot, so this is part of the bit's contract, not
     // an optimisation. Also daemon-built and epoch-independent.
-    if policy && emit_policy_frame(write_half, &mut session).await.is_err() {
+    if policy && !status_pending && emit_policy_frame(write_half, &mut session).await.is_err() {
         return Ok(());
     }
 
@@ -887,7 +879,17 @@ async fn stream_notify(
         let dev = { backend.lock().await.device_handle() };
 
         let Some(dev) = dev else {
-            // No engine frame is coming, so a still-unsent session id goes out on its own now.
+            // No bus to order an owed status snapshot against, so it goes out now. An `up` landing
+            // after it still wakes `life`, which was subscribed before the snapshot was taken.
+            if std::mem::take(&mut status_pending)
+                && emit_status_front_loads(write_half, &mut session, backend, None, prefs, policy)
+                    .await
+                    .is_err()
+            {
+                return Ok(()); // client hung up
+            }
+            // No engine frame is coming, so a still-unsent session id goes out on its own now. A
+            // no-op when the snapshot above already carried it.
             if flush_session_id(write_half, &mut session).await.is_err() {
                 return Ok(()); // client hung up
             }
@@ -956,25 +958,72 @@ async fn stream_notify(
         // untouched (see `publish_suggested_exit_node`), which is exactly why the cell — not the
         // response — is the right thing to front-load: a watcher joining after a withheld suggestion
         // sees the same value every other watcher holds, instead of a gap only it has.
-        if suggested_exit_node {
-            Backend::front_load_suggested_exit_node(backend, &dev).await;
-            let id = suggested_rx.borrow_and_update().clone();
-            if let Some(id) = id
-                && emit_suggested_exit_node_frame(write_half, &mut session, &id)
-                    .await
-                    .is_err()
-            {
-                return Ok(()); // client hung up
-            }
+        //
+        // While the status snapshot is owed it runs after the snapshot instead (below), so that the
+        // snapshot is the session's first frame.
+        if suggested_exit_node
+            && !status_pending
+            && emit_suggested_exit_node_front_load(
+                write_half,
+                &mut session,
+                backend,
+                &dev,
+                &mut suggested_rx,
+            )
+            .await
+            .is_err()
+        {
+            return Ok(()); // client hung up
         }
 
         // Attach a fresh IPN-bus watcher OFF-LOCK. The mask front-loads this device's current
         // state/peer set as the first `Notify` (so a replacement device re-snapshots). On failure the
         // device is already gone/closing — fall through to wait on the next lifecycle change.
-        let mut watcher = match dev.watch_ipn_bus(mask).await {
+        //
+        // While the status snapshot is owed, the engine is also asked for its initial state and
+        // netmap. The engine always sends that frame, because the state is always set, and it sends
+        // it once its bus task has read the engine's cells: every change after that point is queued
+        // on this watcher. `watch_ipn_bus` returning means only that the task was spawned, so this
+        // frame is the one signal that a snapshot taken now cannot lose a later transition.
+        let bus_mask = if status_pending {
+            mask | NotifyWatchOpt::INITIAL_STATE | NotifyWatchOpt::INITIAL_NETMAP
+        } else {
+            mask
+        };
+        let mut watcher = match dev.watch_ipn_bus(bus_mask).await {
             Ok(w) => w,
             Err(e) => {
                 tracing::debug!(error = %e, "watch_ipn_bus failed; awaiting lifecycle change");
+                // No bus to order against: an owed snapshot does not wait for the next change.
+                if std::mem::take(&mut status_pending) {
+                    if emit_status_front_loads(
+                        write_half,
+                        &mut session,
+                        backend,
+                        None,
+                        prefs,
+                        policy,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return Ok(()); // client hung up
+                    }
+                    if suggested_exit_node
+                        && emit_suggested_exit_node_front_load(
+                            write_half,
+                            &mut session,
+                            backend,
+                            &dev,
+                            &mut suggested_rx,
+                        )
+                        .await
+                        .is_err()
+                    {
+                        return Ok(()); // client hung up
+                    }
+                }
+                // No engine frame is coming either. A no-op when the snapshot carried the id.
                 if flush_session_id(write_half, &mut session).await.is_err() {
                     return Ok(()); // client hung up
                 }
@@ -991,6 +1040,55 @@ async fn stream_notify(
         // THIS epoch's device for its self node (Go `Notify.SelfChange`) without keeping the engine
         // alive between ticks.
         let epoch_dev = Arc::downgrade(&dev);
+
+        if std::mem::take(&mut status_pending) {
+            // Prompt by construction: the bus task pushes its initial frame into a fresh channel as
+            // soon as it runs, or ends (closing the channel) if the runtime is already shutting down.
+            let first = watcher.next().await;
+            let bus_closed = first.is_none();
+            // Forward only the parts of the engine's front-load this client asked for.
+            let engine_initial = match first {
+                Some(notify) => {
+                    let notify = retain_requested_initial(notify, initial_state, initial_netmap);
+                    let self_change = if notify.net_map.is_some() {
+                        ipn::fetch_self_report(&dev).await
+                    } else {
+                        None
+                    };
+                    project_notify(notify, self_change)
+                }
+                None => None,
+            };
+            if emit_status_front_loads(
+                write_half,
+                &mut session,
+                backend,
+                engine_initial,
+                prefs,
+                policy,
+            )
+            .await
+            .is_err()
+            {
+                return Ok(()); // client hung up
+            }
+            if suggested_exit_node
+                && emit_suggested_exit_node_front_load(
+                    write_half,
+                    &mut session,
+                    backend,
+                    &dev,
+                    &mut suggested_rx,
+                )
+                .await
+                .is_err()
+            {
+                return Ok(()); // client hung up
+            }
+            if bus_closed {
+                continue; // re-derive at the top, exactly as the inner loop does on a closed bus
+            }
+        }
         drop(dev);
 
         // Inner loop: stream this epoch's notifications, but also break out on a lifecycle change so a
@@ -1221,6 +1319,91 @@ async fn emit_suggested_exit_node_frame(
         },
     )
     .await
+}
+
+/// The per-epoch `suggested_exit_node` front-load: compute this device's suggestion, then send this
+/// client the value its own receiver now holds, if any. See the call site in [`stream_notify`] for why
+/// the value is read back off the receiver rather than out of the computation. Returns `Err` if the
+/// client hung up.
+async fn emit_suggested_exit_node_front_load(
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    session: &mut NotifySession,
+    backend: &Arc<Mutex<Backend>>,
+    dev: &tailscale::Device,
+    suggested_rx: &mut tokio::sync::watch::Receiver<Option<String>>,
+) -> Result<()> {
+    Backend::front_load_suggested_exit_node(backend, dev).await;
+    let id = suggested_rx.borrow_and_update().clone();
+    match id {
+        Some(id) => emit_suggested_exit_node_frame(write_half, session, &id).await,
+        None => Ok(()),
+    }
+}
+
+/// Send the session's opening frames for a watch that set `initial_status`: the status snapshot,
+/// then the prefs and policy front-loads the watch asked for.
+///
+/// The snapshot is taken HERE, after the caller has received `engine_initial` from the bus, never
+/// before it: that is what makes a transition landing after it streamed rather than lost. It goes out
+/// on the same frame as `engine_initial` (the requested part of the engine's own front-load, if any),
+/// so the session's first frame carries both, and the session id when one is owed. `status()` bounds
+/// its engine query, so the backend lock is held briefly, as for a one-shot `status`. Returns `Err`
+/// if the client hung up.
+async fn emit_status_front_loads(
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    session: &mut NotifySession,
+    backend: &Arc<Mutex<Backend>>,
+    engine_initial: Option<crate::localapi::NotifyView>,
+    prefs: bool,
+    policy: bool,
+) -> Result<()> {
+    let report = { backend.lock().await.status().await };
+    write_notify(
+        write_half,
+        session,
+        with_initial_status(engine_initial, report),
+    )
+    .await?;
+    if prefs {
+        emit_prefs_frame(write_half, session, backend).await?;
+    }
+    if policy {
+        emit_policy_frame(write_half, session).await?;
+    }
+    Ok(())
+}
+
+/// The session's first frame for an `initial_status` watch: the requested part of the engine's
+/// initial frame, if any, with the status snapshot on it.
+fn with_initial_status(
+    engine_initial: Option<crate::localapi::NotifyView>,
+    report: crate::localapi::StatusReport,
+) -> crate::localapi::NotifyView {
+    crate::localapi::NotifyView {
+        initial_status: Some(Box::new(report)),
+        ..engine_initial.unwrap_or_default()
+    }
+}
+
+/// Strip from the engine's initial frame the front-loads this client did not ask for.
+///
+/// While a status snapshot is owed, `stream_notify` widens the engine mask to
+/// `INITIAL_STATE | INITIAL_NETMAP` so it can tell when the bus has read the engine. A watcher that
+/// did not set those bits must still not be sent those snapshots. `browse_to_url` goes with `state`:
+/// in the initial frame the engine derives it from `NeedsLogin`, and only under `INITIAL_STATE`.
+fn retain_requested_initial(
+    mut notify: tailscale::Notify,
+    initial_state: bool,
+    initial_netmap: bool,
+) -> tailscale::Notify {
+    if !initial_state {
+        notify.state = None;
+        notify.browse_to_url = None;
+    }
+    if !initial_netmap {
+        notify.net_map = None;
+    }
+    notify
 }
 
 /// Project one engine [`Notify`](tailscale::Notify) into the LocalAPI [`NotifyView`] wire shape,
@@ -2450,6 +2633,85 @@ mod tests {
             view.self_change.is_none(),
             "self must not ride a non-netmap frame: {view:?}"
         );
+    }
+
+    /// While a status snapshot is owed, `stream_notify` widens the engine mask to
+    /// `INITIAL_STATE | INITIAL_NETMAP` so it can tell when the bus has read the engine. The widened
+    /// frame must still reach the client carrying only the front-loads the client asked for.
+    #[test]
+    fn widened_initial_frame_forwards_only_the_requested_front_loads() {
+        let url = url::Url::parse("https://login.example.com/a/nodekey").unwrap();
+        let widened = || {
+            let mut n = tailscale::Notify::default();
+            n.state = Some(tailscale::DeviceState::NeedsLogin(url.clone()));
+            n.net_map = Some(Vec::new());
+            n.browse_to_url = Some(url.clone());
+            n
+        };
+
+        // Status only: nothing of the engine's front-load is forwarded, so no engine view at all.
+        assert_eq!(
+            project_notify(retain_requested_initial(widened(), false, false), None),
+            None
+        );
+
+        // Netmap only: the peer set, and no state or login URL riding along with it.
+        let netmap_only = project_notify(retain_requested_initial(widened(), false, true), None)
+            .expect("a netmap front-load was requested");
+        assert_eq!(netmap_only.net_map, Some(Vec::new()));
+        assert_eq!(netmap_only.state, None);
+        assert_eq!(netmap_only.browse_to_url, None);
+
+        // State only: the state and the login URL derived from it, and no peer set.
+        let state_only = project_notify(retain_requested_initial(widened(), true, false), None)
+            .expect("a state front-load was requested");
+        assert_eq!(state_only.state.as_deref(), Some("NeedsLogin"));
+        assert_eq!(state_only.browse_to_url, Some(url.to_string()));
+        assert_eq!(state_only.net_map, None);
+
+        // Both: the frame is forwarded whole.
+        assert_eq!(
+            retain_requested_initial(widened(), true, true),
+            widened(),
+            "nothing is stripped from a frame whose every front-load was asked for"
+        );
+    }
+
+    /// The snapshot rides the session's first frame together with whatever part of the engine's
+    /// initial frame the client asked for, and a client that asked for none of it is sent the
+    /// snapshot alone.
+    #[test]
+    fn the_status_snapshot_shares_the_first_frame_with_the_requested_engine_front_load() {
+        let report = crate::localapi::StatusReport {
+            state: "Starting".to_string(),
+            ..Default::default()
+        };
+        let mut engine = tailscale::Notify::default();
+        engine.state = Some(tailscale::DeviceState::Connecting);
+        engine.net_map = Some(Vec::new());
+
+        // Neither `initial_state` nor `initial_netmap`: the widened engine frame contributes nothing.
+        let status_only = with_initial_status(
+            project_notify(retain_requested_initial(engine.clone(), false, false), None),
+            report.clone(),
+        );
+        assert_eq!(
+            status_only,
+            crate::localapi::NotifyView {
+                initial_status: Some(Box::new(report.clone())),
+                ..Default::default()
+            },
+            "a status-only watcher must get the snapshot and no engine front-load"
+        );
+
+        // `initial_state` too: one frame carries the state and the snapshot.
+        let with_state = with_initial_status(
+            project_notify(retain_requested_initial(engine, true, false), None),
+            report.clone(),
+        );
+        assert_eq!(with_state.state.as_deref(), Some("Starting"));
+        assert_eq!(with_state.net_map, None);
+        assert_eq!(with_state.initial_status.as_deref(), Some(&report));
     }
 
     /// Go mints `rands.HexString(16)` per watch: 16 hex characters, fresh each time. The id will key
