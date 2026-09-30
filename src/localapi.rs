@@ -2619,26 +2619,40 @@ pub struct NotifyView {
     /// `WantPeers: true` includes them; on a node that is not `Running` the list is empty because
     /// there is no netmap, exactly as a one-shot `status` reports it.
     ///
-    /// ## Ordering: snapshot first, then subscribe — and the window that leaves
+    /// ## Ordering: subscribe to the bus, wait for its baseline, then snapshot
     ///
     /// Go assembles `InitialStatus` under `b.mu` in the same critical section that registers the
     /// watcher, so no event can reach the watcher before its snapshot and none can fall between the
-    /// two. This daemon has no single lock spanning its backend and the engine bus, so it does not
-    /// claim that. What it does:
+    /// two. This daemon has no single lock spanning its backend and the engine bus. It gets the
+    /// same "nothing falls between" result by ordering instead:
     ///
-    /// - The lifecycle, prefs and policy subscriptions are taken BEFORE the snapshot, so an
-    ///   `up`/`down`, a prefs write or a policy change landing after it is still delivered.
-    /// - The snapshot is then the first frame written, ahead of every other front-load and every
-    ///   engine event. Nothing on this connection precedes it.
-    /// - Only then is the engine's IPN bus subscribed. A connection-state or peer-set change that
-    ///   lands between the snapshot and that subscription is NOT delivered as its own frame.
+    /// - The lifecycle, prefs, policy and exit-node-suggestion subscriptions are taken first, so an
+    ///   `up`/`down`, a prefs write, a policy change or a new suggestion landing after the snapshot
+    ///   is still delivered.
+    /// - With a device, the engine's IPN bus is subscribed next, widened to
+    ///   `INITIAL_STATE | INITIAL_NETMAP`. The daemon waits for that subscription's initial frame.
+    ///   The engine sends it once its bus task has read its state and peer cells, so every change
+    ///   after that point is queued for this watcher. `watch_ipn_bus` returning is not that
+    ///   point: it only means the task was spawned.
+    /// - Only then is the snapshot taken. It goes out on the session's first frame, together with
+    ///   the part of the engine's initial frame the client asked for (`state` for `initial_state`,
+    ///   `net_map` for `initial_netmap`, nothing otherwise). The prefs, policy and suggestion
+    ///   front-loads follow it.
     ///
-    /// Subscribing to the bus first would not close that window from here: the engine's bus
-    /// watcher records its baseline inside a task it spawns, after `watch_ipn_bus` has returned,
-    /// so the daemon cannot observe the moment it became current. Closing it needs an engine-side
-    /// change. A watcher that must not miss that edge also sets `initial_state` / `initial_netmap`:
-    /// the engine front-loads the state and peer set as of its own subscription, which is never
-    /// older than this snapshot and supersedes it.
+    /// So a connection-state or peer-set change landing after the snapshot is streamed as its own
+    /// frame. One landing between the engine's baseline and the snapshot can show up twice: in the
+    /// snapshot, then again as a frame. That is harmless, because frames carry whole values, not
+    /// deltas. For the same reason, the `state`/`net_map` sharing the first frame can be older than
+    /// the snapshot; the frame that moves them on follows.
+    ///
+    /// The window this order still leaves: with no device, or when the bus subscribe fails, there
+    /// is no bus to order against, so the snapshot is the device-less state, sent at once. The
+    /// device that a later `up` installs gets a fresh bus subscription with the client's own mask,
+    /// as every masked watch does. A client that did not set `initial_state` / `initial_netmap`
+    /// is not sent that device's state or peers as of that subscription, only the changes after
+    /// it. Setting those bits closes that window too. Apart from that, "streamed" assumes the
+    /// client keeps up: the engine drops frames for a reader that falls behind and does not say
+    /// so. That gap is engine-side (`docs/ENGINE_ASKS.md` #45, see `stream_notify`).
     ///
     /// DAEMON-built (not an engine `Notify` field). `None` on every frame but the first, and on
     /// every frame when the bit was unset.
