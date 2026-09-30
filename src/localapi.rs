@@ -3525,6 +3525,14 @@ mod tests {
             }
             other => panic!("expected a notify frame, got {other:?}"),
         }
+        // A frame from an older daemon has neither field and must still parse.
+        match serde_json::from_str::<Response>(r#"{"kind":"notify","state":"Running"}"#).unwrap() {
+            Response::Notify(back) => {
+                assert_eq!(back.version, None);
+                assert_eq!(back.session_id, None);
+            }
+            other => panic!("expected a notify frame, got {other:?}"),
+        }
     }
 
     #[test]

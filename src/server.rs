@@ -1208,9 +1208,12 @@ impl NotifySession {
         self.pending_id.is_some()
     }
 
-    /// Fill the identity fields on a frame about to be written.
+    /// Fill the identity fields on a frame about to be written. A version already on the frame is
+    /// kept, as Go's `sendToLocked` only fills an empty `Version`.
     fn stamp(&mut self, mut view: crate::localapi::NotifyView) -> crate::localapi::NotifyView {
-        view.version = Some(NOTIFY_VERSION.to_string());
+        if view.version.is_none() {
+            view.version = Some(NOTIFY_VERSION.to_string());
+        }
         view.session_id = self.pending_id.take();
         view
     }
@@ -2768,6 +2771,19 @@ mod tests {
             assert_eq!(frame.session_id, None);
             assert_eq!(frame.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
         }
+    }
+
+    /// Go's `sendToLocked` fills `Notify.Version` only when it is empty, so a version already on the
+    /// frame survives the stamp.
+    #[test]
+    fn stamping_keeps_a_version_the_frame_already_has() {
+        let kept = NotifySession::new(false)
+            .unwrap()
+            .stamp(crate::localapi::NotifyView {
+                version: Some("other".to_string()),
+                ..Default::default()
+            });
+        assert_eq!(kept.version.as_deref(), Some("other"));
     }
 
     /// The suggestion feed is a masked-watch feed like prefs and policy, so its frames are stamped
