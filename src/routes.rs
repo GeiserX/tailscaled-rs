@@ -25,7 +25,13 @@
 //!
 //! Every caller in the daemon asks this module — `up`, `set`, `check-prefs`
 //! ([`crate::ipn::Backend`]) and the `--config` loader ([`crate::conffile`]) — so the declarative
-//! and interactive paths refuse the same route sets with the same words.
+//! and interactive paths refuse the same route sets, giving each reason in Go's words.
+//!
+//! The `up`/`set`/`check-prefs` callers are Go's own callers of `CalcAdvertiseRoutes`, so for them
+//! every rule above is upstream's and the whole message is Go's. The `--config` loader is not: Go's
+//! config path checks only the masking rule, so that caller asks
+//! [`RouteError::refused_by_go_config_path`] which reasons it may report in Go's config-path wording
+//! and which are this fork's own.
 
 /// The Tailscale 4via6 range, `fd7a:115c:a1e0:b1a::/64` (Go `tsaddr.TailscaleViaRange`; mnemonic:
 /// "b1a" sounds like "via"), as its leading 8 bytes. A 4via6 route packs an IPv4 CIDR plus a 32-bit
@@ -116,6 +122,38 @@ pub enum RouteError {
         /// The other family's default route, which must be advertised with it.
         want: ipnet::IpNet,
     },
+}
+
+impl RouteError {
+    /// Whether Go's `--config` path refuses this route too — the question a caller that loads a
+    /// config FILE has to answer before it picks the words to report the refusal in.
+    ///
+    /// Go splits these rules across two functions and only one of them is on the config path.
+    /// `ipn/conf.go` `ToPrefs` checks `route != route.Masked()` and nothing else; the default-route
+    /// pairing and the 4via6 validation live in `netutil.CalcAdvertiseRoutes`, which the config path
+    /// never calls (at v1.102.4 its callers are `cmd/tailscale/cli/up.go`, `cmd/tailscale/cli/set.go`,
+    /// the k8s operator and `client/web`). So `{"AdvertiseRoutes": ["0.0.0.0/0", "192.0.2.0/24"]}`
+    /// loads in Go and advertises both prefixes.
+    ///
+    /// This fork asks the whole set on the config path anyway — see [`crate::conffile`]: a
+    /// declaratively managed subnet router boots with nobody reading command output, and a lone
+    /// default route leaks its clients' other-family traffic silently. But a refusal Go's config path
+    /// does not make must not be dressed in Go's config-path wording, or an operator holding a config
+    /// Go accepts is told, in Go's sentence, that parsing their config into prefs failed.
+    pub fn refused_by_go_config_path(&self) -> bool {
+        match self {
+            // `ipn/conf.go` `ToPrefs`, verbatim: the rule and the message, "route " and all.
+            Self::NonMasked { .. } => true,
+            // Go's `AdvertiseRoutes` is a `[]netip.Prefix`, so an entry that is not a prefix never
+            // reaches `ToPrefs` — the JSON decode refuses the file first. A different message, but
+            // the same verdict on the same file: it does not load. It belongs with Go's refusal,
+            // not with the two rules Go's config path genuinely has no opinion about.
+            Self::Unparsable(_) => true,
+            // `netutil.CalcAdvertiseRoutes` only, i.e. Go's `up`/`set` path. Both of these load fine
+            // from a Go config file.
+            Self::LoneDefault { .. } | Self::Via(_) => false,
+        }
+    }
 }
 
 impl std::fmt::Display for RouteError {
@@ -468,6 +506,51 @@ mod tests {
         assert!(!is_via_prefix(
             &"192.0.2.0/24".parse::<ipnet::IpNet>().unwrap()
         ));
+    }
+
+    /// Which of these rules Go's `--config` path makes itself, asked of the errors this module
+    /// actually produces rather than of hand-built variants: only `ipn/conf.go` `ToPrefs`' masking
+    /// rule (and the parse the JSON decode does for it) is on that path. The `--config` loader reads
+    /// this to decide whose wording to report a refusal in.
+    #[test]
+    fn go_config_path_owns_only_the_masking_and_parse_rules() {
+        let errs = calc_advertise_routes(
+            &routes(&[
+                "nope",
+                "192.0.2.5/24",
+                "fd7a:115c:a1e0:b1a::/64",
+                "0.0.0.0/0",
+            ]),
+            false,
+        )
+        .unwrap_err();
+        let owned: Vec<(bool, String)> = errs
+            .iter()
+            .map(|e| (e.refused_by_go_config_path(), e.to_string()))
+            .collect();
+        assert_eq!(
+            owned,
+            vec![
+                (
+                    true,
+                    "\"nope\" is not a valid IP address or CIDR prefix".to_string()
+                ),
+                (
+                    true,
+                    "route 192.0.2.5/24 has non-address bits set; expected 192.0.2.0/24"
+                        .to_string()
+                ),
+                (
+                    false,
+                    "fd7a:115c:a1e0:b1a::/64 4-in-6 prefix must be at least a /96".to_string()
+                ),
+                (
+                    false,
+                    "0.0.0.0/0 advertised without its IPv6 counterpart, please also advertise ::/0"
+                        .to_string()
+                ),
+            ]
+        );
     }
 
     /// No routes and no exit node is the empty set, not an error.

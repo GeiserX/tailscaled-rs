@@ -82,6 +82,17 @@ fn bird_socket_path_refuses_with_a_named_reason() {
         err.contains("--bird-socket is not supported on "),
         "should refuse in Go's own wording; got:\n{err}"
     );
+    // Go calls `log.SetFlags(0)` before this fatal precisely so the line is bare — no
+    // `2009/11/10 23:00:00` in front of it. The refusal fires before the tracing subscriber is
+    // built and goes out through `eprintln!`, so what the operator reads must likewise be Go's
+    // sentence starting the line, with only the `error: ` this binary puts on every fatal refusal.
+    let first_line = err.lines().next().unwrap_or_default();
+    assert_eq!(
+        first_line,
+        "error: --bird-socket is not supported on this platform or in this build of tailnetd.",
+        "stderr line 1 should be the bare refusal, with no timestamp, level or module prefix; \
+         got:\n{err}"
+    );
     assert!(
         err.contains("/run/bird.ctl"),
         "should echo the rejected path; got:\n{err}"
