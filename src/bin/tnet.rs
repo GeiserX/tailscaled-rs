@@ -6097,13 +6097,40 @@ async fn run_whoami(socket: &std::path::Path, json: bool) -> Result<()> {
 /// `-4 -6` is the same Go check, which is why this is NOT a clap `conflicts_with`: clap would answer
 /// that one pair with its own stderr + exit 2 text while the other two pairs got Go's, and one
 /// upstream check should have one message. Go's is returned as an error (stderr, exit 1) rather than
-/// `outln`-ed, so the caller `bail!`s it instead of following [`switch_usage_refusal`]'s stdout path.
+/// `outln`-ed, so the caller prints it to stderr and exits 1 rather than following
+/// [`switch_usage_refusal`]'s stdout path. It does NOT go back through `main`'s `Result`: Go's `main`
+/// prints a returned error with `fmt.Fprintln(os.Stderr, err)`, so the text stands alone, and
+/// returning it here would put anyhow's `Error: ` in front of the one line a script greps for.
 /// Pure (no I/O, no process exit) so the whole refusal table is unit-testable.
 fn ip_usage_refusal(v4: bool, v6: bool, first: bool) -> Option<&'static str> {
     if [first, v4, v6].into_iter().filter(|b| *b).count() > 1 {
         return Some("tnet ip -1, -4, and -6 are mutually exclusive");
     }
     None
+}
+
+/// Go's `--assert` refusal, rendered the way Go renders it:
+///
+/// ```go
+/// return fmt.Errorf("assertion failed: IP %q not found among %v", ipArgs.assert, ips)
+/// ```
+///
+/// Both operands carry information the operator needs and the old text dropped. `%q` is the
+/// asserted address **as typed**, quoted — not a re-spelling of it — so an assertion that failed
+/// because of how the address was written still shows what was written. `%v` over Go's
+/// `[]netip.Addr` is the whole list it was compared against, space-separated inside brackets, and
+/// `[]` when the node holds nothing: on an addressless node that empty list IS the finding, and
+/// naming only the wanted address left the operator unable to tell "wrong address" from "no
+/// addresses at all".
+///
+/// Rust's `{:?}` on a `&str` and Go's `%q` agree on every byte an IP argument can contain (ASCII,
+/// no escapes), so the quoting needs no hand-rolling. Pure, so the text is unit-testable without a
+/// daemon.
+fn assert_failure_message(want: &str, ips: &[&str]) -> String {
+    format!(
+        "assertion failed: IP {want:?} not found among [{}]",
+        ips.join(" ")
+    )
 }
 
 /// One netmap node's tailnet addresses — Go's `ipnstate.PeerStatus.TailscaleIPs`, which this fork
@@ -6229,13 +6256,32 @@ async fn run_ip(
 ) -> Result<()> {
     // Go's flag refusal runs before `--assert` and before the `Status` call, so an unusable
     // invocation costs no daemon round trip and says the same thing whether the daemon is up.
+    // Printed and exited here, not returned: this was the last of GO'S OWN refusals in `runIP`
+    // still going out through `main`, which puts anyhow's `Error: ` in front of it where Go's
+    // `fmt.Fprintln(os.Stderr, err)` prints the text bare. Two paths in this function still return
+    // through `main`, both fork-local: the `--assert` parse failure below, and the `unexpected
+    // response to ...` bails. Neither has an upstream text to match — Go cannot produce either —
+    // so the prefix costs nothing there.
     if let Some(message) = ip_usage_refusal(v4, v6, first) {
-        anyhow::bail!(message);
+        eprintln!("{message}");
+        std::process::exit(1);
     }
     let sel = IpSelect { v4, v6, first };
     // `--assert <ip>`: verify one of this node's own IPs matches; exit 0 on a match, 1 otherwise.
-    // Prints nothing on success (Go's behavior) — it is a script predicate, not a display. Compares
-    // by parsed `IpAddr` so `100.64.0.1` and `100.064.000.001`-style spellings normalize.
+    // Prints nothing on success (Go's behavior) — it is a script predicate, not a display. Runs
+    // before the peer argument and before the empty-list check, as Go orders it, so `--assert` on a
+    // node with no address at all reports the assertion, not the missing addresses.
+    //
+    // Compares by parsed `IpAddr`, which normalises IPv6 spelling and case: `FD7A:115C:A1E0::1`
+    // and `fd7a:115c:a1e0:0::1` both parse to the address a netmap spells `fd7a:115c:a1e0::1`, and
+    // all three assert alike where Go's string comparison against `ip.String()` would accept only
+    // the canonical one. The comparison is pre-existing and stays; what it does NOT accept is an
+    // argument that is no address at all — Rust's parser rejects leading-zero octets
+    // (`100.064.000.001`) and zone suffixes, and that fails the `parse` below and returns through
+    // `main`, so such an argument still gets this fork's text behind anyhow's `Error: ` rather than
+    // Go's assertion refusal. That one path is unported. On every argument that does parse, the
+    // refusal below quotes it as typed, so a normalising match and a Go run describe the same
+    // addresses.
     if let Some(want) = assert {
         let want_ip: std::net::IpAddr = want
             .parse()
@@ -6251,15 +6297,20 @@ async fn run_ip(
                 return Err(e).with_context(|| format!("querying ip at {}", socket.display()));
             }
         };
-        let matches = [ipv4.as_deref(), ipv6.as_deref()]
+        // Go's `ips` at this point: the whole list `runIP` compares against, which it also prints
+        // on a miss. Kept as one slice so the comparison and the refusal see the same addresses.
+        let ips: Vec<&str> = [ipv4.as_deref(), ipv6.as_deref()]
             .into_iter()
             .flatten()
+            .collect();
+        let matches = ips
+            .iter()
             .filter_map(|s| s.parse::<std::net::IpAddr>().ok())
             .any(|ip| ip == want_ip);
         if matches {
             return Ok(());
         }
-        eprintln!("assertion failed: this node does not hold {want_ip}");
+        eprintln!("{}", assert_failure_message(&want, &ips));
         std::process::exit(1);
     }
     let out: Result<String, String> = if let Some(peer) = peer {
@@ -6349,7 +6400,12 @@ async fn run_ip(
         // Go's `BackendState` comes from this same `Status` read, so no second round trip.
         resolved.map_err(|why| why.message(&status.state))
     } else {
-        // Self addresses.
+        // Self addresses. `Request::Ip` answers an EMPTY pair on a node with no engine rather than
+        // refusing (see the `Request::Ip` dispatch arm in `src/server.rs`), which is what keeps the
+        // `NoCurrentIps` branch below reachable in production: Go's `ips` are just a field of the
+        // one `Status` it reads, and an addressless node is an empty list there, never an error.
+        // While the daemon refused instead, this arm printed `error: node is not up` and a real
+        // Stopped/NeedsLogin node never saw Go's state line.
         let resolved = match round_trip(socket, &Request::Ip).await {
             Ok(Response::Ip { ipv4, ipv6 }) => {
                 format_ip_filtered(ipv4.as_deref(), ipv6.as_deref(), sel)
@@ -15092,6 +15148,20 @@ fn go_io_error_text(e: &std::io::Error) -> String {
     }
 }
 
+/// Go's `*os.PathError` as Go prints it: `<syscall> <path>: <reason>`.
+///
+/// Those three pieces are what a reader needs in order to act — which call refused, on which path,
+/// and why — and a Rust `io::Error` carries only the last of them, so every caller here supplies
+/// the other two. The path is sanitized because it can come from `$KUBECONFIG`, i.e. from outside
+/// this program.
+fn go_path_error(op: &str, path: &std::path::Path, e: &std::io::Error) -> String {
+    format!(
+        "{op} {}: {}",
+        sanitize_for_terminal(&path.display().to_string()),
+        go_io_error_text(e)
+    )
+}
+
 /// Go's `kubeconfigAccessErr`: one wording for every reason the kubeconfig cannot be written, so
 /// the precheck below and a failed directory creation read the same to whoever hits them.
 ///
@@ -15189,9 +15259,10 @@ fn kubeconfig_parent_dir(path: &std::path::Path) -> std::path::PathBuf {
 /// nothing left to ask — and the write itself then reports whatever is really wrong.
 ///
 /// Without this the refusal arrives at the `open()` in [`set_kubeconfig_for_peer`], after the
-/// existing kubeconfig has been read and the merge computed, and it says "opening kubeconfig … for
-/// writing". Nothing is damaged either way; this one answers the question the operator asked, in
-/// Go's words, at the point Go answers it.
+/// existing kubeconfig has been read and the merge computed, and all it says is `open <path>:
+/// permission denied` — the syscall that refused, not the thing the operator asked for. Nothing is
+/// damaged either way; this one answers the question the operator asked, in Go's words, at the
+/// point Go answers it.
 fn check_kubeconfig_writable(path: &str) -> Result<()> {
     let mut probe = std::path::PathBuf::from(path);
     loop {
@@ -15310,13 +15381,7 @@ fn set_kubeconfig_for_peer(scheme: &str, fqdn: &str, path: &str) -> Result<()> {
             // — the directory is there and cannot even be looked at, which is a different problem
             // from a kubeconfig that will not take a write — so adding a wrapper here would answer
             // a question the operator did not ask.
-            Err(e) => {
-                return Err(anyhow!(
-                    "stat {}: {}",
-                    sanitize_for_terminal(&dir.display().to_string()),
-                    go_io_error_text(&e)
-                ));
-            }
+            Err(e) => return Err(anyhow!("{}", go_path_error("stat", dir, &e))),
         }
     }
     // Go: `os.ReadFile` then `fmt.Errorf("reading kubeconfig: %w", err)`. ReadFile's error is the
@@ -15345,7 +15410,9 @@ fn set_kubeconfig_for_peer(scheme: &str, fqdn: &str, path: &str) -> Result<()> {
     // Go: `b, err = updateKubeconfig(b, scheme, fqdn); if err != nil { return err }` — returned
     // bare, so a malformed file reads `invalid kubeconfig` and nothing more.
     let merged = update_kubeconfig(&existing, scheme, fqdn)?;
-    // Go: `os.WriteFile(filePath, b, 0600)`. The mode applies on creation; an existing file keeps
+    // Go: `return os.WriteFile(filePath, b, 0600)` — the error comes back BARE, the `*os.PathError`
+    // of whichever step refused and nothing wrapped around it, so each step here is spelled the way
+    // Go's `os` package spells its own. The mode applies on creation; an existing file keeps
     // whatever mode it had, so this never loosens a kubeconfig the user tightened.
     let mut f = std::fs::OpenOptions::new()
         .write(true)
@@ -15353,11 +15420,15 @@ fn set_kubeconfig_for_peer(scheme: &str, fqdn: &str, path: &str) -> Result<()> {
         .truncate(true)
         .mode(0o600)
         .open(p)
-        .with_context(|| format!("opening kubeconfig {path} for writing"))?;
+        .map_err(|e| anyhow!("{}", go_path_error("open", p, &e)))?;
     f.write_all(merged.as_bytes())
-        .with_context(|| format!("writing kubeconfig {path}"))?;
+        .map_err(|e| anyhow!("{}", go_path_error("write", p, &e)))?;
+    // Go's `os.WriteFile` closes without an fsync; this port keeps the fsync, so that a kubeconfig
+    // half-written across a crash is not what kubectl finds next. It is the one step with no Go
+    // counterpart in this function, so it borrows the wording of the one Go does have for it —
+    // `(*os.File).Sync`, whose `Op` is `sync`.
     f.sync_all()
-        .with_context(|| format!("fsync kubeconfig {path}"))?;
+        .map_err(|e| anyhow!("{}", go_path_error("sync", p, &e)))?;
     Ok(())
 }
 
@@ -21374,6 +21445,28 @@ mod tests {
     }
 
     #[test]
+    fn ip_assert_failure_names_the_address_and_the_list_like_go() {
+        // Go: `fmt.Errorf("assertion failed: IP %q not found among %v", ipArgs.assert, ips)`.
+        // `%q` quotes the argument AS TYPED, and `%v` prints the whole `[]netip.Addr` it was
+        // compared against, space-separated in brackets.
+        assert_eq!(
+            assert_failure_message("203.0.113.9", &["100.64.0.1", "fd7a:115c:a1e0::1"]),
+            r#"assertion failed: IP "203.0.113.9" not found among [100.64.0.1 fd7a:115c:a1e0::1]"#
+        );
+        // A node that holds nothing: Go's `%v` of an empty slice is `[]`, and that empty list is
+        // the whole finding — the old text named only the wanted address and so could not say it.
+        assert_eq!(
+            assert_failure_message("100.64.0.1", &[]),
+            r#"assertion failed: IP "100.64.0.1" not found among []"#
+        );
+        // One address is not wrapped in any extra separator.
+        assert_eq!(
+            assert_failure_message("100.64.0.2", &["100.64.0.1"]),
+            r#"assertion failed: IP "100.64.0.2" not found among [100.64.0.1]"#
+        );
+    }
+
+    #[test]
     fn ip_refusal_covers_the_service_arm_that_would_answer_emptily() {
         // The refusal matters most on `tnet ip <service-VIP>`: a Service carries a LIST of addresses,
         // so `-6 -1` reads like "the Service's IPv6 address". It is not — Go truncates to the first
@@ -25476,6 +25569,24 @@ users:
                     "cannot write kubeconfig at \"{p}\": open {p}: permission denied",
                     p = ro.display()
                 )
+            );
+
+            // The same file past the precheck, i.e. the write inside `setKubeconfigForPeer`. Go
+            // returns `os.WriteFile`'s `*os.PathError` BARE — no wrapper naming this port's own
+            // steps — and a refused write leaves the file as it was. The real command's precheck
+            // answers first, so this is what the operator sees when the mode changes between the
+            // two, or when the refusal is one the precheck's probe cannot ask about.
+            let err =
+                set_kubeconfig_for_peer("https://", "foo.tail-scale.ts.net", ro.to_str().unwrap())
+                    .expect_err("a read-only kubeconfig cannot be written");
+            assert_eq!(
+                format!("{err:#}"),
+                format!("open {}: permission denied", ro.display())
+            );
+            assert_eq!(
+                std::fs::read_to_string(&ro).unwrap(),
+                "apiVersion: v1\nkind: Config\n",
+                "a refused write must leave the kubeconfig byte-identical"
             );
         }
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o600)).unwrap();

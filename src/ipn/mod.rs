@@ -1308,6 +1308,29 @@ const SPLICE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// always answers well within it.
 const STATUS_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// Run a suggestion front-load's engine call only in `Running`, and for at most
+/// [`STATUS_QUERY_TIMEOUT`]; `None` when it was not run or did not answer in time. Split out of
+/// [`Backend::front_load_suggested_exit_node`] so the gate and the bound are testable without a
+/// live engine. `compute` is a lazy future, so outside `Running` the engine is never asked at all.
+async fn bounded_front_load<F>(state: State, compute: F) -> Option<crate::localapi::Response>
+where
+    F: std::future::Future<Output = crate::localapi::Response>,
+{
+    if state != State::Running {
+        return None;
+    }
+    match tokio::time::timeout(STATUS_QUERY_TIMEOUT, compute).await {
+        Ok(response) => Some(response),
+        Err(_) => {
+            tracing::debug!(
+                "exit-node suggestion for a new watcher exceeded {STATUS_QUERY_TIMEOUT:?}; \
+                 sending no suggestion front-load"
+            );
+            None
+        }
+    }
+}
+
 /// An in-progress bring-up handed between [`Backend::begin_up`] (locked, fast) and
 /// [`Backend::finish_up`] (locked, fast), across the unlocked [`build_device`] handshake.
 ///
@@ -2318,8 +2341,10 @@ pub struct Backend {
     /// Cell and channel are deliberately ONE object. Go compares `prevSuggestion != res.ID` inside
     /// `suggestExitNodeLocked`, the only placement that cannot drift from the value actually returned;
     /// here the compare and the send are both [`publish_suggested_exit_node`], reached from
-    /// [`suggest_exit_node`](Backend::suggest_exit_node) and from the per-device recompute task
-    /// ([`suggestion_task`](Backend::suggestion_task)), never from a request handler. One compare,
+    /// [`suggest_exit_node`](Backend::suggest_exit_node), from its bounded twin for the watch
+    /// front-load ([`front_load_suggested_exit_node`](Backend::front_load_suggested_exit_node)) and
+    /// from the per-device recompute task ([`suggestion_task`](Backend::suggestion_task)), never from
+    /// a request handler. One compare,
     /// no second copy to fall out of step.
     ///
     /// Written with `send_if_modified`, never `send`: `send` refuses — and, load-bearingly, does NOT
@@ -5740,9 +5765,10 @@ impl Backend {
         diag::netcheck(dev).await
     }
 
-    /// Suggest the best available exit node (the `tnet exit-node suggest` path, and the
-    /// `suggested_exit_node` watch bit's front-load) **and put the answer on the notify bus if it
-    /// moved**. See [`diag::suggest_exit_node`] for the `suggest_exit_node()` →
+    /// Suggest the best available exit node (the `tnet exit-node suggest` path; the
+    /// `suggested_exit_node` watch bit's front-load is the bounded
+    /// [`front_load_suggested_exit_node`](Backend::front_load_suggested_exit_node)) **and put the
+    /// answer on the notify bus if it moved**. See [`diag::suggest_exit_node`] for the `suggest_exit_node()` →
     /// [`Response::ExitNodeSuggestion`](crate::localapi::Response) mapping (`Ok(None)` = no eligible
     /// candidate, an honest empty result, not an error) and for the `AllowedSuggestedExitNodes`
     /// allow-list the engine's answer is filtered through.
@@ -5766,6 +5792,38 @@ impl Backend {
         response
     }
 
+    /// The `suggested_exit_node` watch bit's front-load (Go `NotifyInitialSuggestedExitNode`): the
+    /// same compute-then-publish as [`suggest_exit_node`](Backend::suggest_exit_node), but it never
+    /// holds a new watcher's stream open for long. The only computation a watch front-load runs;
+    /// `stream_notify` sends what it returns.
+    ///
+    /// `Device::suggest_exit_node` starts with an actor ask to the control runner for the last
+    /// netcheck report. While the node is still registering (`NeedsLogin` above all) that actor is
+    /// inside its `on_start` auth-retry loop and reads no mailbox, so the ask waits until someone
+    /// authorises the machine — the hazard [`status`](Backend::status) documents. `stream_notify`
+    /// awaits this before it attaches the engine watcher, so an unguarded call would keep a watcher
+    /// from seeing even the state frame and login URL that would let the operator end the wait. Go
+    /// never waits here: its error arm (`ErrNoPreferredDERP`, no report yet) returns at once, and
+    /// the initial notify is sent without a suggestion.
+    ///
+    /// So this takes the two guards [`connectivity_impacted`](Backend::connectivity_impacted) takes
+    /// for the same ask: nothing is computed unless the device is `Running`, and the engine call is
+    /// bounded by [`STATUS_QUERY_TIMEOUT`]. Either way out returns `None` and publishes nothing, the
+    /// analogue of Go's error arm. Only the engine call is bounded, not the lock taken to publish:
+    /// an answer the engine did give still reaches the cell.
+    ///
+    /// Returns this computation's own answer, never the cell, because Go's initial notify carries
+    /// `&en.ID` from the call it just made.
+    pub async fn front_load_suggested_exit_node(
+        backend: &std::sync::Arc<tokio::sync::Mutex<Backend>>,
+        dev: &tailscale::Device,
+    ) -> Option<crate::localapi::Response> {
+        let state = state_from_device(dev.device_state()).0;
+        let response = bounded_front_load(state, diag::suggest_exit_node(dev)).await?;
+        backend.lock().await.publish_suggested_exit_node(&response);
+        Some(response)
+    }
+
     /// Publish a freshly-computed exit-node suggestion to every notify watcher, if it differs from
     /// the last one. Returns whether it published. The backend-held form of
     /// [`publish_suggested_exit_node`]; see there for the rules.
@@ -5781,7 +5839,7 @@ impl Backend {
     /// a receiver reads it with `borrow_and_update()` instead of re-deriving it — it has no way to
     /// re-derive a suggestion of its own. `subscribe()` starts synced, so attaching never replays the
     /// current value; a watcher that asked for a front-load gets it from its own
-    /// [`suggest_exit_node`](Backend::suggest_exit_node) call.
+    /// [`front_load_suggested_exit_node`](Backend::front_load_suggested_exit_node) call.
     pub fn watch_suggested_exit_node(&self) -> tokio::sync::watch::Receiver<String> {
         self.suggested_exit_node_tx.subscribe()
     }
@@ -7056,6 +7114,53 @@ mod tests {
             next_suggestion_trigger(&mut bus, &mut policy_rx, &mut allowed, read_allowed).await,
             None
         );
+    }
+
+    #[tokio::test]
+    async fn the_front_load_never_asks_an_engine_that_is_not_running() {
+        // A pending future is the engine's control runner in its auth loop: it never answers. Outside
+        // `Running` the front-load must return at once without polling it, as Go's error arm does.
+        for state in [
+            State::NoState,
+            State::NeedsLogin,
+            State::NeedsMachineAuth,
+            State::InUseOtherUser,
+            State::Starting,
+            State::Stopped,
+        ] {
+            let answer = tokio::time::timeout(
+                Duration::from_secs(5),
+                bounded_front_load(state, std::future::pending()),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("the front-load waited on the engine in {state:?}"));
+            assert!(answer.is_none(), "{state:?} computes nothing");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_front_load_gives_up_on_a_running_engine_that_does_not_answer() {
+        let answer = tokio::time::timeout(
+            STATUS_QUERY_TIMEOUT * 10,
+            bounded_front_load(State::Running, std::future::pending()),
+        )
+        .await
+        .expect("the front-load must be bounded even in Running");
+        assert!(answer.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_front_load_passes_a_running_engine_answer_through() {
+        let answer = bounded_front_load(
+            State::Running,
+            std::future::ready(suggestion_response("nodeid-a", "berlin")),
+        )
+        .await;
+        assert!(matches!(
+            answer,
+            Some(crate::localapi::Response::ExitNodeSuggestion { suggestion: Some(s) })
+                if s.id == "nodeid-a"
+        ));
     }
 
     // --- captive-portal detection (tsd-iqq.5) -----------------------------------------------------
@@ -12737,18 +12842,22 @@ mod tests {
     // After the lock-across-await fix (tsd), the `ip_report`/`whois`/`ping`/`file_cp`/`file_list`/
     // `file_get` free fns take `&tailscale::Device` (see `ipn::diag`) and the LocalAPI server runs
     // them OFF the backend lock: it clones the engine handle via `device_handle()` under a brief
-    // lock, drops the lock, and only calls the method when that handle is `Some`. The "node is not
-    // up" branch therefore lives in the dispatch arm, keyed on `device_handle()` being `None` — so
-    // the device-less precondition is unit-tested here as `device_handle().is_none()` (the single
-    // fact every "not up" reply derives from). The bad-IP-parse and path-hardening predicate tests
-    // moved to `ipn::diag` alongside the diagnostics they pin.
+    // lock, drops the lock, and only calls the method when that handle is `Some`. What a `None`
+    // handle produces therefore lives in the dispatch arm — the "node is not up" refusal for
+    // `whois`/`ping`/`file_cp`/`file_list`/`file_get`, and for `ip` an EMPTY `Response::Ip`, since a
+    // node with no engine holds no addresses and that is an answer rather than a failure. Either
+    // way the precondition is the same bit, so it is unit-tested here as `device_handle().is_none()`
+    // (the single fact every device-less reply derives from). The bad-IP-parse and path-hardening
+    // predicate tests moved to `ipn::diag` alongside the diagnostics they pin.
 
     #[tokio::test]
     async fn device_handle_is_none_without_device() {
-        // The shared precondition for every "node is not up" LocalAPI reply: with no engine up, the
-        // server's brief-lock `device_handle()` clone yields `None`, and the dispatch arm turns that
-        // into the "not up" Error WITHOUT calling the (now `&Device`-taking) engine method. One
-        // assertion covers ip/whois/ping/file_cp/file_list/file_get, which all gate on this same bit.
+        // The shared precondition for every device-less LocalAPI reply: with no engine up, the
+        // server's brief-lock `device_handle()` clone yields `None`, and the dispatch arm answers
+        // WITHOUT calling the (now `&Device`-taking) engine method. One assertion covers
+        // whois/ping/file_cp/file_list/file_get, which turn that into the "not up" Error, and `ip`,
+        // which gates on the same bit but answers an empty `Response::Ip` — pinned end to end in
+        // `tests/tnet_ip_go_errors.rs::the_real_addressless_daemon_reports_gos_state_line`.
         let dir = std::env::temp_dir().join(format!("tailnetd-diag-nodev-{}", std::process::id()));
         let be = backend_for(&dir);
         assert!(
