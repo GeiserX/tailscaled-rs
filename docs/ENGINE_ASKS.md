@@ -1803,10 +1803,11 @@ Two, and both turn a pref this daemon already carries into something with a wire
   `PreferenceOption` in `src/ipn/syspolicy.rs`, and `PreferenceOption::should_enable` is Go's
   `ShouldEnable`; what the handler still needs is a public read of a preference-option policy, as
   `get_boolean` is for booleans. With the hook, the disabled case — policy `never`, or the pref
-  `false` under `user-decides` or no policy — becomes a real `{"PostureDisabled": true}`, Go's own
-  answer, sent because the operator or the administrator opted out rather than because the fork is
-  silent. The enabled case additionally needs serial-number and MAC
-  collection (Go's `posture.GetSerialNumbers` / `GetHardwareAddrs`, behind Go's `hwaddrs=true` query
+  `false` under `user-decides`, no policy, or a failed policy read — becomes a real
+  `{"PostureDisabled": true}`, Go's own answer, sent because the operator or the administrator opted
+  out rather than because the fork is silent. A failed read is not a refusal: Go logs it and falls
+  back to the `ShowChoiceByPolicy` default the call passes, which leaves the pref to decide. The
+  enabled case additionally needs serial-number and MAC collection (Go's `posture.GetSerialNumbers` / `GetHardwareAddrs`, behind Go's `hwaddrs=true` query
   gate); that is local OS work on the daemon side and a separate piece, so the honest first shape
   reports what it can collect and omits what it cannot.
 - **`GET /update` and `POST /update`** → `tailcfg.C2NUpdateResponse` (`Err`, `Enabled`, `Supported`,
@@ -1988,6 +1989,13 @@ and `IpnBusWatcher::next() -> Option<Notify>` has no way to say a frame was drop
 pager, an agent doing synchronous work per frame) is exactly what fills that queue. The watcher then
 loses frames one at a time, the connection stays open, and neither side knows its view diverged.
 
+The drop costs more than one frame. `run_bus` calls `borrow_and_update()` on the source `watch` cell
+before `deliver`, so the dropped value counts as *seen*. The frames still in the queue are **older**
+values of that cell. A consumer that catches up ends on a stale state or peer set, and stays there
+until that cell next changes. On a quiet node that can be indefinitely. Once ask #28 lands and
+`net_map` carries deltas instead of full sets, a dropped delta would corrupt the watcher's view for
+good. So this ask should land before, or with, #28.
+
 **Why not a daemon-side facsimile.** The daemon cannot see a drop, because the engine records none.
 A write timeout or a queue-depth estimate would guess at lag. It would disconnect readers that never
 lost a frame and miss ones that did. Refused under the honest-omission rule; hence this ask.
@@ -2032,7 +2040,9 @@ impl IpnBusWatcher {
 watcher, writes one `Response::Notify(NotifyView { error: Some("IPN bus consumer fell behind;
 closing watch"), .. })` frame, and returns. That is Go's terminal frame, and `NotifyView::error`
 already exists. The ordering and the message get a test that drives the bus past 128 frames.
-Consumed via a pin bump. — engine lane
+`NotifyView::error` today means "terminal registration failure, alongside a `NeedsLogin` state".
+The lag frame carries `error` with no `state`, which is how Go overloads `Notify.ErrMessage` too, so
+the field's doc comment has to say so. Consumed via a pin bump. — engine lane
 
 ## 46. A `net_map` tick on a self-node change — so `Notify.SelfChange` reaches a watcher when only this node moved
 
