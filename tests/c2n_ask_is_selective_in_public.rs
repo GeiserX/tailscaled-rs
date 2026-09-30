@@ -352,6 +352,11 @@ fn posture_disabled_honours_the_posture_checking_policy() {
          `choice.ShouldEnable(prefs.PostureChecking())` does"
     );
     assert!(
+        bullet.contains("failed policy read"),
+        "ask #43's `/posture/identity` handler must say a failed `PostureChecking` read leaves the \
+         pref to decide, as Go's handler logs the error and falls through to `ShouldEnable`"
+    );
+    assert!(
         SYSPOLICY.contains("def(\"PostureChecking\", ValueType::PreferenceOption)"),
         "src/ipn/syspolicy.rs should still register `PostureChecking` as a PreferenceOption, the \
          policy ask #43's posture handler reads"
