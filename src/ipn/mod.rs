@@ -6449,6 +6449,10 @@ mod tests {
             display_name: "laptop.tail0123.ts.net".to_string(),
             ipv4: "100.64.0.1".parse().unwrap(),
             ipv6: "fd7a:115c:a1e0::1".parse().unwrap(),
+            tailscale_ips: vec![
+                "100.64.0.1".parse().unwrap(),
+                "fd7a:115c:a1e0::1".parse().unwrap(),
+            ],
             online: Some(true),
             last_seen: None,
             allowed_routes: Vec::new(),
@@ -6456,6 +6460,7 @@ mod tests {
             cur_addr: None,
             relay: None,
             ssh_host_keys: Vec::new(),
+            expired: false,
         };
         let expiry = chrono::Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap();
 

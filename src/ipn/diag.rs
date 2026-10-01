@@ -657,7 +657,7 @@ pub(super) async fn whois(
                 found: true,
                 node_name: Some(node.display_name),
                 node_ipv4: Some(node.ipv4.to_string()),
-                user: w.user,
+                user: w.user(),
                 // Keep just the capability names for the summary; drop the verbose args.
                 capabilities: w.capabilities.into_iter().map(|(cap, _args)| cap).collect(),
                 // Flow-scoped peer-cap grants (Go `WhoIsResponse.CapMap`): surfaced verbatim
