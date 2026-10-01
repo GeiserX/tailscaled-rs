@@ -25,6 +25,14 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.67.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.66.1...v0.67.0) (2026-09-30)
+
+
+### Features
+
+* **localapi:** land the notify identity fields on top of main's version ([#569](https://github.com/GeiserX/tailscaled-rs/issues/569)) ([ba180be](https://github.com/GeiserX/tailscaled-rs/commit/ba180bec12753b9d2438a47f7a655c077efffbe2))
+* **watch:** let a watcher get its status snapshot on the same stream ([#580](https://github.com/GeiserX/tailscaled-rs/issues/580)) ([8048737](https://github.com/GeiserX/tailscaled-rs/commit/8048737462474569276588108a6aa98ca19f7474))
+
 ## [0.66.1](https://github.com/GeiserX/tailscaled-rs/compare/v0.66.0...v0.66.1) (2026-09-29)
 
 
