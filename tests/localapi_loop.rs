@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tailscaled_rs::ipn::Backend;
-use tailscaled_rs::localapi::{Request, Response};
+use tailscaled_rs::localapi::{ExitNodeSuggestionView, Request, Response};
 use tailscaled_rs::server;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -1237,7 +1237,10 @@ async fn debug_portmap_refuses_an_unknown_type() {
 
 /// The `policy` mask bit (Go `ipn.NotifySysPolicyChanges`, `1 << 17`) end to end over the real
 /// socket: a masked `Watch` asking only for policy must get the effective snapshot as its FIRST
-/// frame, and a fresh snapshot pushed to it whenever the policy may have moved.
+/// frame, and a fresh snapshot pushed to it whenever the policy actually CHANGES — and nothing
+/// otherwise. Go's `rsop.(*Policy).reloadNow` invokes the change callbacks under
+/// `if old != nil && !old.EqualItems(new)`, so a forced `Policy.Reload()` over a store that has not
+/// moved notifies no watcher. This test owns the *negative* half of that rule.
 ///
 /// Why this matters here more than upstream: policy outranks local prefs on every write in this
 /// fork, so a `tnet set` that appears to do nothing is explained by a policy row. Before this bit the
@@ -1250,11 +1253,16 @@ async fn debug_portmap_refuses_an_unknown_type() {
 /// real file produces are pinned where a source is actually registered (tests/syspolicy_file.rs),
 /// and they are the same rows by construction: both come from `Backend::policy_snapshot`.
 ///
-/// The `syspolicy reload` that drives the change edge is invoked on the backend API rather than over
-/// a second socket connection purely so the assertion is about the notify path and nothing else; it
-/// is the identical call `server::serve` dispatches the `syspolicy_reload` verb to.
+/// The *positive* edge — a real change waking a parked socket watcher and producing a second frame —
+/// is `tests/syspolicy_watch.rs`, which is its own test binary because the only thing in this build
+/// that moves the effective policy is registering a source, and the registry is process-global: a
+/// registration here would change the empty snapshot the other tests in this binary resolve.
+///
+/// The `syspolicy reload` below is invoked on the backend API rather than over a second socket
+/// connection purely so the assertion is about the notify path and nothing else; it is the identical
+/// call `server::serve` dispatches the `syspolicy_reload` verb to.
 #[tokio::test]
-async fn a_policy_masked_watch_front_loads_the_snapshot_and_is_pushed_on_reload() {
+async fn a_policy_masked_watch_front_loads_the_snapshot_and_stays_quiet_on_an_unchanged_reload() {
     let harness = Harness::start().await;
 
     let stream = UnixStream::connect(&harness.socket_path)
@@ -1296,8 +1304,7 @@ async fn a_policy_masked_watch_front_loads_the_snapshot_and_is_pushed_on_reload(
         "a policy-only watch must not be sent fields it did not ask for: {first:?}"
     );
 
-    // Nothing has changed, so nothing more may arrive: this is what makes the push below meaningful
-    // (it is the reload that produces the frame, not a chatty stream).
+    // Nothing has changed, so nothing more may arrive.
     assert!(
         try_read_watch_status(&mut reader, Duration::from_millis(300))
             .await
@@ -1305,27 +1312,163 @@ async fn a_policy_masked_watch_front_loads_the_snapshot_and_is_pushed_on_reload(
         "a parked policy watcher must stay quiet while the policy does not move"
     );
 
-    // The change edge. `syspolicy reload` is the operator saying "the policy may have moved", and the
-    // only such moment this build can observe (the JSON source is captured at startup and never
-    // re-read), so it is the signal the bit is built on.
+    // A forced re-read. It answers with the snapshot — and must leave the parked watcher exactly as
+    // quiet as it was, because it re-resolved the rows that watcher already holds. `Notify.Policy`
+    // means "the effective policy changed"; a frame here would assert a change that did not happen,
+    // and a management agent acting on policy frames would re-apply on every operator `reload`.
     let Response::Policy(reloaded) = Backend::syspolicy_reload() else {
         panic!("syspolicy_reload must reply with a policy report");
     };
-
-    let second = try_read_watch_status(&mut reader, Duration::from_secs(5))
-        .await
-        .expect(
-            "a `syspolicy reload` must push a fresh snapshot to a parked policy watcher — without \
-             it a watcher cannot tell 'unchanged' from 'changed and I have not asked again'",
-        );
-    let Response::Notify(second) = second else {
-        panic!("a masked watch streams Notify frames, got {second:?}");
-    };
     assert_eq!(
-        second.policy.as_ref(),
-        Some(&reloaded),
-        "the pushed frame carries the SAME report the `syspolicy reload` verb answered with — one \
-         producer, so the notify stream cannot drift from the one-shot read"
+        &reloaded, snapshot,
+        "the reload re-resolved the very rows the front-loaded frame carried — one producer, so the \
+         notify stream cannot drift from the one-shot read"
+    );
+
+    assert!(
+        try_read_watch_status(&mut reader, Duration::from_secs(1))
+            .await
+            .is_none(),
+        "a `syspolicy reload` that resolved the same rows must push no policy frame: Go invokes the \
+         change callbacks only under `!old.EqualItems(new)`"
+    );
+
+    harness.shutdown_and_verify().await;
+}
+
+/// The `suggested_exit_node` mask bit (Go `ipn.NotifyInitialSuggestedExitNode`, `1 << 10`) end to
+/// end over the real socket. The unit tests in `src/ipn/mod.rs` pin the cell and the ones in
+/// `src/server.rs` pin the frame writer; this is the wiring between them — a
+/// `Backend::publish_suggested_exit_node` call reaching a watcher parked in `server::serve`.
+///
+/// Pinned here, on a device-less daemon:
+///
+/// 1. **Nothing is front-loaded.** `prefs` and `policy` are daemon-owned and go out before the first
+///    epoch; a suggestion has to be ranked by a live engine, so a watcher on a down node is told
+///    nothing — not an empty frame — and waits. That silence is what gives the next frame meaning.
+/// 2. **A publish reaches the parked watcher** with the bare stable id (Go's
+///    `Notify.SuggestedExitNode` is the `StableNodeID`, not the display name) and no field the
+///    watch did not ask for.
+/// 3. **The same pick again is not a frame.** Go's `suggestExitNodeLocked` sends only under
+///    `prevSuggestion != res.ID`, so recomputing a stable answer costs nothing on the bus. A moved
+///    pick afterwards does produce a frame, which shows the silence came from that guard and not
+///    from a stream that had stopped delivering.
+///
+/// Out of reach here, and why:
+///
+/// - **The front-load itself.** Go's `NotifyInitialSuggestedExitNode` computes a suggestion when
+///   the watch opens. Here that is `Backend::front_load_suggested_exit_node`, which runs only
+///   against a `Running` engine device; this harness has no engine and no tailnet, so it cannot
+///   reach that code at all. The frame it writes is the one `emit_suggested_exit_node_frame`
+///   writes, which the emitter test in `src/server.rs` pins.
+/// - **An empty answer.** Today an empty suggestion publishes nothing and leaves the cell alone. In
+///   Go, "no eligible candidate" is an empty response with a nil error, so `suggestExitNodeLocked`
+///   compares `""` with the last pick and sends `SuggestedExitNode: &""`. When the daemon does the
+///   same, a fourth step belongs here: publish `ExitNodeSuggestion { suggestion: None }` after a
+///   pick and read a frame whose id is empty.
+///
+/// The publish goes through the backend API rather than an `exit-node suggest` on a second
+/// connection because the engine call that verb wraps needs a live device. It is the same
+/// `publish_suggested_exit_node` call `Backend::suggest_exit_node` makes with the engine's answer,
+/// so everything after the engine is the path a real suggestion takes.
+#[tokio::test]
+async fn a_suggestion_masked_watch_is_quiet_until_a_pick_moves() {
+    fn picked(id: &str, name: &str) -> Response {
+        Response::ExitNodeSuggestion {
+            suggestion: Some(ExitNodeSuggestionView {
+                id: id.to_string(),
+                name: name.to_string(),
+            }),
+        }
+    }
+
+    let harness = Harness::start().await;
+
+    // Only the `suggested_exit_node` bit: a client that wants to show "we recommend X" asks for
+    // nothing else.
+    let (_w, mut r) = open_masked_watch(
+        &harness,
+        b"{\"cmd\":\"watch\",\"suggested_exit_node\":true}\n",
+    )
+    .await;
+
+    // (1) No device, so no suggestion to front-load, and no `initial_state`, so no session id: the
+    // stream is silent. The wait also gives `serve` time to subscribe this watcher before the
+    // publish below.
+    assert!(
+        try_read_watch_status(&mut r, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "a suggestion-only watch on a device-less daemon must be sent nothing, not an empty frame"
+    );
+
+    // (2) The first pick of the run is a change, so every watcher hears it.
+    assert!(
+        harness
+            .backend
+            .lock()
+            .await
+            .publish_suggested_exit_node(&picked("nStableAms1CNTRL", "amsterdam")),
+        "the first pick of the run is a change and must publish"
+    );
+    let frame = read_notify(
+        &mut r,
+        "a published exit-node suggestion must reach a parked suggestion watcher",
+    )
+    .await;
+    assert_eq!(
+        frame.suggested_exit_node.as_deref(),
+        Some("nStableAms1CNTRL"),
+        "the frame carries the bare stable id, not the display name: {frame:?}"
+    );
+    assert!(
+        frame.state.is_none()
+            && frame.error.is_none()
+            && frame.browse_to_url.is_none()
+            && frame.net_map.is_none()
+            && frame.self_change.is_none()
+            && frame.prefs.is_none()
+            && frame.policy.is_none()
+            && frame.initial_status.is_none()
+            && frame.session_id.is_none(),
+        "a suggestion-only watch must not be sent fields it did not ask for: {frame:?}"
+    );
+
+    // (3) The same pick recomputed is not news. Without the guard every `exit-node suggest` and
+    // every other watcher's front-load would wake this one with a value it already holds.
+    assert!(
+        !harness
+            .backend
+            .lock()
+            .await
+            .publish_suggested_exit_node(&picked("nStableAms1CNTRL", "amsterdam")),
+        "an unchanged pick must not republish"
+    );
+    assert!(
+        try_read_watch_status(&mut r, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "an unchanged pick must not produce a second frame"
+    );
+
+    // The pick moves: the stream is still live, and the silence above was the guard.
+    assert!(
+        harness
+            .backend
+            .lock()
+            .await
+            .publish_suggested_exit_node(&picked("nStableFra2CNTRL", "frankfurt")),
+        "a different pick is a change and must publish"
+    );
+    let moved = read_notify(
+        &mut r,
+        "a moved exit-node suggestion must reach the same parked watcher",
+    )
+    .await;
+    assert_eq!(
+        moved.suggested_exit_node.as_deref(),
+        Some("nStableFra2CNTRL"),
+        "the frame carries the new pick: {moved:?}"
     );
 
     harness.shutdown_and_verify().await;
@@ -1412,8 +1555,8 @@ async fn an_initial_status_watch_front_loads_the_status_report_once() {
         };
         frames.push(view);
     }
-    // Not an exact frame count: the policy tick channel is process-global, so a `syspolicy reload`
-    // in a test running alongside this one may legitimately push an extra policy frame.
+    // Not an exact frame count: the policy tick channel is process-global, so a policy change in a
+    // test running alongside this one may legitimately push an extra policy frame.
     assert_eq!(
         frames.first().and_then(|f| f.initial_status.as_deref()),
         Some(&one_shot),
