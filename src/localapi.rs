@@ -210,51 +210,35 @@ pub enum Request {
         /// gets that row without a second round trip.
         #[serde(default, skip_serializing_if = "core::ops::Not::not")]
         policy: bool,
-        /// Stream the node's exit-node suggestion as [`NotifyView::suggested_exit_node`] — the stable
-        /// node id of the best exit node available to this node. The analogue of Go's
-        /// `ipn.NotifyInitialSuggestedExitNode` (`1 << 10`), which front-loads
-        /// `Notify.SuggestedExitNode` on subscribe, plus the ongoing push that
-        /// `LocalBackend.suggestExitNodeLocked` performs to `allClients` whenever the answer moves.
+        /// Front-load the node's exit-node suggestion as [`NotifyView::suggested_exit_node`] — the
+        /// stable node id of the best exit node available to this node. The analogue of Go's
+        /// `ipn.NotifyInitialSuggestedExitNode` (`1 << 10`), which only asks for the FIRST notify to
+        /// carry `Notify.SuggestedExitNode`.
         ///
         /// Like [`prefs`](Request::Watch::prefs) and [`policy`](Request::Watch::policy) — and unlike
         /// `initial_state`/`initial_netmap` — this is **daemon-built**, not an engine `NotifyWatchOpt`
-        /// bit: the engine's bus has no `SuggestedExitNode` field, so the daemon pushes from the one
-        /// place a computed suggestion is published (`Backend::publish_suggested_exit_node`).
+        /// bit: the engine's bus has no `SuggestedExitNode` field.
         ///
-        /// The push goes to EVERY watcher, not only the connection whose request triggered the
-        /// computation — Go sends it to `allClients` because the suggestion is a property of the
-        /// node, not of the asker. So one `tnet exit-node suggest` informs every subscriber at once.
+        /// The front-load is computed once, when the watch subscribes, and carries that
+        /// computation's answer: the id, or `""` when no candidate is eligible. When the computation
+        /// fails (no device yet, or no netcheck report — Go's `ErrNoPreferredDERP`), no front-load is
+        /// sent. It is its own frame, after the `initial_status`, `prefs` and `policy` front-loads,
+        /// and it is not repeated when a later `up` brings a new device. The computation runs only
+        /// while the node is `Running` and gives the engine a bounded time to answer: a `NeedsLogin`
+        /// engine here would not answer until the node was authorised, and Go's error arm returns at
+        /// once. A computation skipped or given up on is that error arm, so no front-load is sent.
         ///
-        /// ## What "on change" means in THIS build — read before relying on it
+        /// The ongoing half does NOT depend on this bit. Go's `suggestExitNodeLocked` sends a changed
+        /// suggestion to `allClients`, so every masked watch receives it whatever its mask. The daemon
+        /// recomputes the suggestion on every netmap from the engine and whenever
+        /// `AllowedSuggestedExitNodes` resolves to a different set, as Go does, as well as on each
+        /// `exit-node suggest`; a frame goes out only when the answer differs from the last one. An
+        /// empty id is such a change: it tells the watcher that no exit node is suggested any more.
         ///
-        /// Go recomputes the suggestion from several places — a fresh net-report, a netmap update,
-        /// and the re-run `sysPolicyChanged` performs after `AllowedSuggestedExitNodes` moves — so a
-        /// Go watcher learns of a new pick without anyone asking. This fork computes the suggestion
-        /// **on demand only**: `exit-node suggest` and this bit's own front-load are the only
-        /// computations. So the honest contract here is
-        /// **front-loaded when the watch attaches to a device (and again on each later device epoch,
-        /// i.e. after a `down`+`up`), then re-sent whenever a suggestion is computed and differs from
-        /// the last one published**. That is narrower than Go's, deliberately: closing the gap means
-        /// a timer that re-probes the engine on a schedule, which is a different and larger decision
-        /// than putting the value the daemon already has on the bus.
-        ///
-        /// An empty answer is **silence**, never a frame. This fork models "no eligible candidate"
-        /// and "withheld by the administrator's `AllowedSuggestedExitNodes`" as the same honest empty
-        /// [`Response::ExitNodeSuggestion`], and Go likewise sends nothing when `suggestExitNodeLocked`
-        /// returns an error. The remembered value is left alone in that case, exactly as Go leaves
-        /// `lastSuggestedExitNode` untouched on its error path, so the next real suggestion is
-        /// compared against the last value a watcher was actually told. Two consequences worth
-        /// stating plainly: there is no frame that CLEARS a suggestion, so a consumer's running view
-        /// keeps the last id it was given; and the front-load carries that same remembered id, so a
-        /// watcher attaching after an empty computation sees what every other watcher holds rather
-        /// than a gap only it has.
-        ///
-        /// The front-load computes only while the node is `Running`, and gives the engine a bounded
-        /// time to answer (Go's error arm returns at once, and a `NeedsLogin` engine here would not
-        /// answer until the node was authorised). Otherwise it computes nothing, and the watcher is
-        /// front-loaded the remembered id, if any. That id is forgotten, silently, on `logout` and on
-        /// every profile change (Go's `resetForProfileChangeLocked`), so a pick from one tailnet is
-        /// never front-loaded to a watcher on another.
+        /// One departure from Go: when `AllowedSuggestedExitNodes` excludes the engine's top pick but
+        /// permits an eligible runner-up, Go announces the runner-up and this build announces `""`.
+        /// The engine hands the daemon one already-ranked node, so it cannot re-rank
+        /// (`docs/ENGINE_ASKS.md` #44).
         #[serde(default, skip_serializing_if = "core::ops::Not::not")]
         suggested_exit_node: bool,
         /// Front-load a whole [`StatusReport`] as the session's first [`Response::Notify`] frame, in
@@ -2594,8 +2578,8 @@ pub struct NotifyView {
     /// this frame carried no policy change (or the `policy` bit was unset).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy: Option<PolicyReport>,
-    /// The stable node id of the node's exit-node suggestion, if the `suggested_exit_node` mask bit
-    /// was set and a suggestion arrived this frame (Go `Notify.SuggestedExitNode`, a bare
+    /// The stable node id of the node's exit-node suggestion, if this frame is the
+    /// `suggested_exit_node` front-load or the suggestion changed (Go `Notify.SuggestedExitNode`, a bare
     /// `tailcfg.StableNodeID`). It is the `--exit-node=<id>` selector that would engage the node — a
     /// recommendation, never an engagement.
     ///
@@ -2603,10 +2587,9 @@ pub struct NotifyView {
     /// reply ([`ExitNodeSuggestionView`]), which answers a question, where this announces a fact.
     ///
     /// DAEMON-built (the engine's bus has no `SuggestedExitNode` field). `None` when this frame
-    /// carried no suggestion (or the bit was unset). It never means "the suggestion was withdrawn":
-    /// an empty suggestion is silence rather than a frame, so a consumer's running view keeps the
-    /// last id it was told. See [`Request::Watch::suggested_exit_node`] for the full contract and how
-    /// it is narrower than Go's.
+    /// carried no suggestion, which means "unchanged". `Some("")` means the suggestion was withdrawn:
+    /// no candidate is eligible any more (Go sends the empty `StableNodeID` the same way). See
+    /// [`Request::Watch::suggested_exit_node`] for when frames are sent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggested_exit_node: Option<String>,
     /// A whole status snapshot, if the `initial_status` mask bit was set (Go `Notify.InitialStatus`,
@@ -3475,9 +3458,19 @@ mod tests {
             other => panic!("expected a notify frame, got {other:?}"),
         }
 
-        // An ABSENT `suggested_exit_node` means "unchanged", never "the suggestion was withdrawn" —
-        // an empty suggestion is silence on this bus, so there is no frame that clears it. A
-        // state-only frame must therefore leave a consumer's remembered suggestion alone.
+        // A withdrawn suggestion is an empty id, as Go's `SuggestedExitNode: &""` — present, not
+        // absent, so it cannot be confused with "unchanged".
+        let cleared = NotifyView {
+            suggested_exit_node: Some(String::new()),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&Response::Notify(cleared)).unwrap(),
+            r#"{"kind":"notify","suggested_exit_node":""}"#
+        );
+
+        // An ABSENT `suggested_exit_node` means "unchanged". A state-only frame must therefore leave
+        // a consumer's remembered suggestion alone.
         let state_only = NotifyView {
             state: Some("Running".to_string()),
             ..Default::default()
