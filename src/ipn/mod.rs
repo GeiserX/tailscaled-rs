@@ -5544,7 +5544,9 @@ impl Backend {
     /// answer on the notify bus if it moved**. See [`diag::suggest_exit_node`] for the `suggest_exit_node()` →
     /// [`Response::ExitNodeSuggestion`](crate::localapi::Response) mapping (`Ok(None)` = no eligible
     /// candidate, an honest empty result, not an error) and for the `AllowedSuggestedExitNodes`
-    /// allow-list the engine's answer is filtered through.
+    /// allow-list the engine's answer is filtered through — a suggestion that list excludes comes
+    /// back empty *and flagged* (`withheld_by_policy`), because unlike Go this build cannot re-rank to
+    /// the best permitted node and must not pass its refusal off as an empty tailnet.
     ///
     /// This is the port of Go's `LocalBackend.suggestExitNodeLocked`, which computes the suggestion
     /// and, in the same function, notifies every client when the pick differs from the last one.
@@ -5627,6 +5629,7 @@ impl Backend {
     pub fn publish_suggested_exit_node(&self, response: &crate::localapi::Response) -> bool {
         let crate::localapi::Response::ExitNodeSuggestion {
             suggestion: Some(suggestion),
+            ..
         } = response
         else {
             return false; // empty result or engine error → silence, and the cell stands
@@ -6541,6 +6544,7 @@ mod tests {
                 id: id.to_string(),
                 name: name.to_string(),
             }),
+            withheld_by_policy: false,
         }
     }
 
@@ -6603,10 +6607,22 @@ mod tests {
         // `Ok(None)` is this fork's honest empty result: no eligible candidate, or the pick withheld
         // by the administrator's `AllowedSuggestedExitNodes`. Go reaches the same place via an error
         // from `suggestExitNodeLocked` and sends nothing, leaving `lastSuggestedExitNode` untouched.
-        let empty = crate::localapi::Response::ExitNodeSuggestion { suggestion: None };
+        let empty = crate::localapi::Response::ExitNodeSuggestion {
+            suggestion: None,
+            withheld_by_policy: false,
+        };
         assert!(
             !be.publish_suggested_exit_node(&empty),
             "an empty suggestion must not produce a frame"
+        );
+        // The policy-withheld empty is flagged on the reply but is still an empty answer: silence.
+        let withheld = crate::localapi::Response::ExitNodeSuggestion {
+            suggestion: None,
+            withheld_by_policy: true,
+        };
+        assert!(
+            !be.publish_suggested_exit_node(&withheld),
+            "a suggestion withheld by policy must not produce a frame"
         );
         // An engine failure is the same silence.
         let failed = crate::localapi::Response::Error {
@@ -6742,8 +6758,10 @@ mod tests {
         .await;
         assert!(matches!(
             answer,
-            Some(crate::localapi::Response::ExitNodeSuggestion { suggestion: Some(s) })
-                if s.id == "nodeid-a"
+            Some(crate::localapi::Response::ExitNodeSuggestion {
+                suggestion: Some(s),
+                withheld_by_policy: false,
+            }) if s.id == "nodeid-a"
         ));
     }
 
