@@ -747,9 +747,12 @@ async fn stream_watch(
 /// process-global registry rather than the netmap, so both are also served on the device-less arm.
 ///
 /// The third — the exit-node suggestion (Go `NotifyInitialSuggestedExitNode`) — is the exception: it
-/// cannot be computed without a live device, so its front-load runs INSIDE the epoch loop, once the
-/// device is in hand, and therefore runs again for a replacement device. That is the right place
-/// anyway: the previous epoch's suggestion was ranked against an engine that no longer exists.
+/// cannot be computed without a live device, so its front-load runs INSIDE the first epoch, once the
+/// device is in hand. It runs once per subscription, as Go builds its initial notify once, and only
+/// if that first epoch has a device: no device means no netmap, which is Go's `ErrNoPreferredDERP`,
+/// so the field is absent. A replacement device is not front-loaded again; its recompute task pushes
+/// the pick if it moved. Later suggestion changes reach EVERY masked watch, whatever its mask, as Go
+/// sends them to `allClients`.
 ///
 /// A fourth daemon-built front-load, the `initial_status` snapshot (Go `NotifyInitialStatus`), is
 /// ordered against the engine's bus rather than ahead of it, and is never repeated, not even for a
@@ -814,12 +817,14 @@ async fn stream_notify(
         mask = mask | NotifyWatchOpt::INITIAL_NETMAP;
     }
 
-    // Subscribe to lifecycle (and, when their bits are set, prefs-change ticks and exit-node-suggestion
-    // pushes) BEFORE deriving the first device so a change landing between the device clone and the
-    // subscribe is never lost (`subscribe()` starts synced) — the same ordering `stream_watch` relies
-    // on. Both daemon-built watchers are independent of the device epoch (prefs change whether or not
-    // the node is up, and a suggestion published by another connection outlives this epoch), so they
-    // live across the outer loop and are selected in BOTH the device-present and device-absent arms.
+    // Subscribe to lifecycle, prefs-change ticks and exit-node-suggestion pushes BEFORE deriving the
+    // first device so a change landing between the device clone and the subscribe is never lost
+    // (`subscribe()` starts synced) — the same ordering `stream_watch` relies on. Both daemon-built
+    // watchers are independent of the device epoch (prefs change whether or not the node is up, and a
+    // suggestion published by another connection outlives this epoch), so they live across the outer
+    // loop and are selected in BOTH the device-present and device-absent arms. Prefs ticks are only
+    // served when the `prefs` bit is set; suggestion pushes are served to every masked watcher,
+    // because Go sends a changed suggestion to `allClients` whatever their mask.
     let (mut life, mut prefs_rx, mut suggested_rx) = {
         let be = backend.lock().await;
         (
@@ -853,6 +858,9 @@ async fn stream_notify(
     // then never again (Go carries it in the first `Notify` only). While it is owed, the prefs and
     // policy front-loads below wait for it, so the snapshot stays the session's first frame.
     let mut status_pending = initial_status;
+    // `suggested_exit_node` front-load (Go `NotifyInitialSuggestedExitNode`): owed until the first
+    // epoch settles it, then never again. Go builds its initial notify once per subscription.
+    let mut suggestion_pending = suggested_exit_node;
 
     // `prefs` front-load: emit the current prefs (Go `NotifyInitialPrefs`) as the first frame. Done
     // once up front (daemon-built, not tied to a device epoch). A write error = client gone.
@@ -893,6 +901,9 @@ async fn stream_notify(
             if flush_session_id(write_half, &mut session).await.is_err() {
                 return Ok(()); // client hung up
             }
+            // No device, so no netmap: Go's `suggestExitNodeLocked` fails with `ErrNoPreferredDERP`
+            // and its initial notify carries no suggestion. The front-load is settled as absent.
+            suggestion_pending = false;
             // No device this epoch: nothing to stream from the bus. Wait for the next lifecycle change
             // — but ALSO keep serving prefs ticks if the `prefs` bit is set (prefs can change while the
             // node is down, e.g. a `set` on a down node), so a prefs watcher isn't deaf between epochs.
@@ -926,17 +937,15 @@ async fn stream_notify(
                     continue; // still no device — loop back to the device-derive/wait
                 }
                 // Suggestion pushes are served here too. Nothing can compute a suggestion while this
-                // watcher has no device, but the backend is shared: a concurrent `up` plus another
-                // connection's `exit-node suggest` can publish before this loop re-derives, and a
-                // watcher that was deaf between epochs would miss it.
-                res = suggested_rx.changed(), if suggested_exit_node => {
+                // watcher has no device, but the backend is shared: a concurrent `up` can publish
+                // before this loop re-derives, and a watcher that was deaf between epochs would miss
+                // it.
+                res = suggested_rx.changed() => {
                     if res.is_err() {
                         return Ok(()); // suggestion sender dropped (daemon gone)
                     }
                     let id = suggested_rx.borrow_and_update().clone();
-                    if let Some(id) = id
-                        && emit_suggested_exit_node_frame(write_half, &mut session, &id).await.is_err()
-                    {
+                    if emit_suggested_exit_node_frame(write_half, &mut session, &id).await.is_err() {
                         return Ok(()); // client hung up
                     }
                     continue; // still no device — loop back to the device-derive/wait
@@ -945,25 +954,19 @@ async fn stream_notify(
         };
 
         // `suggested_exit_node` front-load (Go `NotifyInitialSuggestedExitNode`): compute this
-        // device's suggestion and send it to this client. The computation also publishes it to EVERY
-        // watcher when it differs from the last one — that is where the ongoing half of this feed
-        // lives, so the front-load and the broadcast can never disagree. It computes only in
-        // `Running` and is time-bounded, because it runs before the bus watcher below is attached: a
-        // `NeedsLogin` engine would otherwise hold back the state frame and the login URL until the
-        // node was authorised (see `Backend::front_load_suggested_exit_node`).
-        //
-        // Read the value back off our own receiver rather than out of the response: `borrow_and_update`
-        // both takes the current published value and marks it seen, so our own compute's push does not
-        // come round again as a duplicate frame on the select below. An empty answer leaves the cell
-        // untouched (see `publish_suggested_exit_node`), which is exactly why the cell — not the
-        // response — is the right thing to front-load: a watcher joining after a withheld suggestion
-        // sees the same value every other watcher holds, instead of a gap only it has.
+        // device's suggestion and send this client THAT computation's answer — the id, `""` when no
+        // candidate is eligible, nothing when the computation failed — as Go's initial notify does
+        // (`if en, err := b.suggestExitNodeLocked(); err == nil { ini.SuggestedExitNode = &en.ID }`).
+        // The computation also publishes to EVERY watcher when the answer differs from the last one.
+        // It computes only in `Running` and is time-bounded, because it runs before the bus watcher
+        // below is attached: a `NeedsLogin` engine would otherwise hold back the state frame and the
+        // login URL until the node was authorised (see `Backend::front_load_suggested_exit_node`).
         //
         // While the status snapshot is owed it runs after the snapshot instead (below), so that the
         // snapshot is the session's first frame.
-        if suggested_exit_node
-            && !status_pending
-            && emit_suggested_exit_node_front_load(
+        if suggestion_pending && !status_pending {
+            suggestion_pending = false;
+            if emit_suggested_exit_node_front_load(
                 write_half,
                 &mut session,
                 backend,
@@ -972,8 +975,9 @@ async fn stream_notify(
             )
             .await
             .is_err()
-        {
-            return Ok(()); // client hung up
+            {
+                return Ok(()); // client hung up
+            }
         }
 
         // Attach a fresh IPN-bus watcher OFF-LOCK. The mask front-loads this device's current
@@ -1009,7 +1013,7 @@ async fn stream_notify(
                     {
                         return Ok(()); // client hung up
                     }
-                    if suggested_exit_node
+                    if std::mem::take(&mut suggestion_pending)
                         && emit_suggested_exit_node_front_load(
                             write_half,
                             &mut session,
@@ -1072,7 +1076,7 @@ async fn stream_notify(
             {
                 return Ok(()); // client hung up
             }
-            if suggested_exit_node
+            if std::mem::take(&mut suggestion_pending)
                 && emit_suggested_exit_node_front_load(
                     write_half,
                     &mut session,
@@ -1155,19 +1159,17 @@ async fn stream_notify(
                         return Ok(()); // client hung up
                     }
                 }
-                // Exit-node-suggestion pushes (only armed when the `suggested_exit_node` bit is set).
-                // The channel fires only when a computed suggestion DIFFERS from the last published
-                // one, so a stable answer never reaches here however often it is recomputed — and the
-                // computation that fired it may well have been another connection's `exit-node
-                // suggest`, which is the point (Go sends to `allClients`).
-                res = suggested_rx.changed(), if suggested_exit_node => {
+                // Exit-node-suggestion pushes, armed for every masked watcher (Go sends them to
+                // `allClients`; the `suggested_exit_node` bit only asks for the front-load). The
+                // channel fires only when a computed suggestion DIFFERS from the last published one,
+                // so a stable answer never reaches here however often it is recomputed. An empty id
+                // is a change too: it tells the watcher the suggestion went away.
+                res = suggested_rx.changed() => {
                     if res.is_err() {
                         return Ok(()); // suggestion sender dropped (daemon gone)
                     }
                     let id = suggested_rx.borrow_and_update().clone();
-                    if let Some(id) = id
-                        && emit_suggested_exit_node_frame(write_half, &mut session, &id).await.is_err()
-                    {
+                    if emit_suggested_exit_node_frame(write_half, &mut session, &id).await.is_err() {
                         return Ok(()); // client hung up
                     }
                 }
@@ -1300,11 +1302,11 @@ async fn emit_policy_frame(
 /// suggestion feed; Go's `b.sendToLocked(ipn.Notify{SuggestedExitNode: &res.ID}, allClients)`).
 ///
 /// Carries the bare stable node id, as Go does — the human-facing name belongs to the `exit-node
-/// suggest` reply. Takes no backend: the id has already been read off the suggestion channel by the
-/// caller, so this never touches the lock. Like every other feed it goes out through
-/// [`write_notify`], so it carries the version, and the session id when it is the watch's first frame
-/// (the per-epoch front-load can be). Returns `Err` if the client hung up (so the caller returns
-/// `Ok(())` and ends the stream). Shared by the per-epoch front-load + both suggestion select arms.
+/// suggest` reply. An empty `id` is sent as `""`, Go's cleared suggestion. Takes no backend: the id
+/// has already been read by the caller, so this never touches the lock. Like every other feed it
+/// goes out through [`write_notify`], so it carries the version, and the session id when it is the
+/// watch's first frame (the front-load can be). Returns `Err` if the client hung up (so the caller
+/// returns `Ok(())` and ends the stream). Shared by the front-load + both suggestion select arms.
 async fn emit_suggested_exit_node_frame(
     write_half: &mut tokio::net::unix::OwnedWriteHalf,
     session: &mut NotifySession,
@@ -1321,23 +1323,32 @@ async fn emit_suggested_exit_node_frame(
     .await
 }
 
-/// The per-epoch `suggested_exit_node` front-load: compute this device's suggestion, then send this
-/// client the value its own receiver now holds, if any. See the call site in [`stream_notify`] for why
-/// the value is read back off the receiver rather than out of the computation. Returns `Err` if the
-/// client hung up.
+/// The `suggested_exit_node` front-load: compute this device's suggestion, then send this client that
+/// computation's answer ([`ipn::suggested_exit_node_id`]) — nothing when it failed or was not run.
+/// Returns `Err` if the client hung up.
+///
+/// The computation also publishes to every watcher when the answer moved, this one included. Go
+/// builds its initial notify before registering the new session, so that session never receives
+/// the push as well. Here the push is marked seen when the cell still holds the value just sent, for
+/// the same effect. If something else published in between, the newer value stays pending and the
+/// select arm sends it after this frame.
 async fn emit_suggested_exit_node_front_load(
     write_half: &mut tokio::net::unix::OwnedWriteHalf,
     session: &mut NotifySession,
     backend: &Arc<Mutex<Backend>>,
     dev: &tailscale::Device,
-    suggested_rx: &mut tokio::sync::watch::Receiver<Option<String>>,
+    suggested_rx: &mut tokio::sync::watch::Receiver<String>,
 ) -> Result<()> {
-    Backend::front_load_suggested_exit_node(backend, dev).await;
-    let id = suggested_rx.borrow_and_update().clone();
-    match id {
-        Some(id) => emit_suggested_exit_node_frame(write_half, session, &id).await,
-        None => Ok(()),
+    let Some(response) = Backend::front_load_suggested_exit_node(backend, dev).await else {
+        return Ok(()); // not computed: Go's error arm, no field
+    };
+    let Some(id) = ipn::suggested_exit_node_id(&response) else {
+        return Ok(()); // the engine failed: Go's error arm, no field
+    };
+    if *suggested_rx.borrow() == id {
+        suggested_rx.mark_unchanged();
     }
+    emit_suggested_exit_node_frame(write_half, session, id).await
 }
 
 /// Send the session's opening frames for a watch that set `initial_status`: the status snapshot,
@@ -2787,7 +2798,7 @@ mod tests {
     }
 
     /// The suggestion feed is a masked-watch feed like prefs and policy, so its frames are stamped
-    /// too. Its per-epoch front-load can be the FIRST frame of a watch (an `initial_state` +
+    /// too. Its front-load can be the FIRST frame of a watch (an `initial_state` +
     /// `suggested_exit_node` watch with no prefs/policy bit writes it before the engine's first
     /// frame), and then it is the frame that must carry the session id.
     #[tokio::test]
@@ -2828,6 +2839,94 @@ mod tests {
         assert_eq!(second.suggested_exit_node.as_deref(), Some("nodeid-second"));
         assert_eq!(second.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
         assert_eq!(second.session_id, None, "no later frame repeats the id");
+    }
+
+    /// Read one notify frame off `reader`, failing the test rather than hanging if none arrives.
+    async fn next_notify_frame(
+        reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    ) -> crate::localapi::NotifyView {
+        let mut line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader.read_line(&mut line),
+        )
+        .await
+        .expect("a notify frame within 5s")
+        .expect("read a frame");
+        match serde_json::from_str::<Response>(&line).expect("a Response line") {
+            Response::Notify(view) => view,
+            other => panic!("expected a notify frame, got {other:?}"),
+        }
+    }
+
+    /// Go's `NotifyInitialSuggestedExitNode` only asks for the first notify to carry the suggestion;
+    /// a later change goes out with `sendToLocked(..., allClients)`, and no mask strips it. So a watch
+    /// that subscribed for prefs alone still hears the suggestion move — including it going away,
+    /// which Go sends as an empty id.
+    #[tokio::test]
+    async fn a_suggestion_change_reaches_a_watch_that_did_not_set_the_suggestion_bit() {
+        let dir = std::env::temp_dir().join(format!(
+            "tailnetd-suggestion-watch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let backend = Arc::new(Mutex::new(
+            Backend::load(&dir).await.expect("load an empty state dir"),
+        ));
+
+        let (client, server) = UnixStream::pair().expect("UnixStream::pair");
+        let (_server_read, mut write_half) = server.into_split();
+        let (client_read, _client_write) = client.into_split();
+        let mut reader = BufReader::new(client_read);
+
+        let stream_backend = Arc::clone(&backend);
+        let stream = tokio::spawn(async move {
+            // A prefs-only masked watch: every other bit, `suggested_exit_node` included, unset.
+            stream_notify(
+                &mut write_half,
+                &stream_backend,
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+            )
+            .await
+        });
+
+        // The prefs front-load comes first; after it the watch is subscribed and parked (no device).
+        let first = next_notify_frame(&mut reader).await;
+        assert!(first.prefs.is_some(), "the prefs front-load: {first:?}");
+        assert_eq!(first.suggested_exit_node, None);
+
+        let pick = Response::ExitNodeSuggestion {
+            suggestion: Some(crate::localapi::ExitNodeSuggestionView {
+                id: "nodeid-a".to_string(),
+                name: "berlin".to_string(),
+            }),
+        };
+        assert!(backend.lock().await.publish_suggested_exit_node(&pick));
+        let frame = next_notify_frame(&mut reader).await;
+        assert_eq!(frame.suggested_exit_node.as_deref(), Some("nodeid-a"));
+
+        // No eligible candidate any more: Go sends `SuggestedExitNode: ""`, and so does this.
+        let none = Response::ExitNodeSuggestion { suggestion: None };
+        assert!(backend.lock().await.publish_suggested_exit_node(&none));
+        let frame = next_notify_frame(&mut reader).await;
+        assert_eq!(
+            frame.suggested_exit_node.as_deref(),
+            Some(""),
+            "the cleared suggestion must reach the wire as an empty id, not be dropped"
+        );
+
+        stream.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Drive `read_capped_line` with `input`: write the bytes into one end of a `UnixStream` pair
