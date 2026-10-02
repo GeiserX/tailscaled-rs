@@ -142,7 +142,9 @@
 //! out. Go filters *candidates* before the latency ranking and so answers with the best permitted
 //! node; this daemon is handed the engine's already-chosen one, so it can refuse but not re-rank.
 //! The missing half — an allow-list that excludes only the engine's top pick, where Go would answer
-//! with the runner-up — is engine ask #44 in `docs/ENGINE_ASKS.md`.
+//! with the runner-up — is engine ask #44 in `docs/ENGINE_ASKS.md`; until it lands, the refusal is
+//! reported as a refusal (`withheld_by_policy` on the reply, its own `tnet` notice) rather than as
+//! Go's "no candidate" empty, which it only matches when the permitted set is empty.
 //!
 //! Two consequences worth stating. The applied values are **persisted** into `prefs.json` by
 //! whichever write follows (a profile load applies in memory only and writes nothing, so merely
