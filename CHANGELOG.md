@@ -25,6 +25,40 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.67.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.66.1...v0.67.0) (2026-09-30)
+
+
+### Features
+
+* **localapi:** land the notify identity fields on top of main's version ([#569](https://github.com/GeiserX/tailscaled-rs/issues/569)) ([ba180be](https://github.com/GeiserX/tailscaled-rs/commit/ba180bec12753b9d2438a47f7a655c077efffbe2))
+* **watch:** let a watcher get its status snapshot on the same stream ([#580](https://github.com/GeiserX/tailscaled-rs/issues/580)) ([8048737](https://github.com/GeiserX/tailscaled-rs/commit/8048737462474569276588108a6aa98ca19f7474))
+
+## [0.66.1](https://github.com/GeiserX/tailscaled-rs/compare/v0.66.0...v0.66.1) (2026-09-29)
+
+
+### Bug Fixes
+
+* **configure:** report kubeconfig write errors bare and merge UTF-16 files as Go does ([#541](https://github.com/GeiserX/tailscaled-rs/issues/541)) ([daf30a0](https://github.com/GeiserX/tailscaled-rs/commit/daf30a0f383c6f34b836e453c417d2b73bac5361))
+
+## [0.66.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.65.1...v0.66.0) (2026-09-29)
+
+
+### Features
+
+* **watch:** tell watchers the exit-node suggestion instead of making them poll ([#546](https://github.com/GeiserX/tailscaled-rs/issues/546)) ([7a49eb0](https://github.com/GeiserX/tailscaled-rs/commit/7a49eb0f2c0a82413f9ae21295902910bd263dd1))
+
+
+### Bug Fixes
+
+* **cli:** print Go's --host-routes refusal as Go does, one dash included ([#543](https://github.com/GeiserX/tailscaled-rs/issues/543)) ([d52fa09](https://github.com/GeiserX/tailscaled-rs/commit/d52fa092a3d949ec4b61e1133327106d30a623c0))
+* **conffile:** stop attributing our route refusals to upstream's parser ([#551](https://github.com/GeiserX/tailscaled-rs/issues/551)) ([ff89050](https://github.com/GeiserX/tailscaled-rs/commit/ff89050963e7492fb0faf6c3453ca0cec5b24c6b))
+* **configure:** report kubeconfig io failures in Go's words, not Rust's ([#539](https://github.com/GeiserX/tailscaled-rs/issues/539)) ([c9c2f14](https://github.com/GeiserX/tailscaled-rs/commit/c9c2f147a89aa4e9518641804fb4dc7e5eb031c1))
+* **ip:** report an addressless node's state instead of "node is not up" ([#552](https://github.com/GeiserX/tailscaled-rs/issues/552)) ([469d45e](https://github.com/GeiserX/tailscaled-rs/commit/469d45e38b700ee137ff6a8cf852aafede141436))
+* **localapi:** keep the watch ruling true now initial_status is in Go's set ([#562](https://github.com/GeiserX/tailscaled-rs/issues/562)) ([d790bd5](https://github.com/GeiserX/tailscaled-rs/commit/d790bd51b050a34fb06beb264b19f2b4e9f267b7))
+* **serve:** drop anyhow's `Error: ` from the refusals Go prints bare ([#544](https://github.com/GeiserX/tailscaled-rs/issues/544)) ([a8b5fbf](https://github.com/GeiserX/tailscaled-rs/commit/a8b5fbfdd66203c5d210d377f9f53d37bc2b65ee))
+* **syspolicy:** only push a policy frame when the policy changed ([#531](https://github.com/GeiserX/tailscaled-rs/issues/531)) ([3977ad9](https://github.com/GeiserX/tailscaled-rs/commit/3977ad9aefbb7dbcb019f4ca570b7525dbb95f42))
+* **web:** end an interrupted web run at exit 0, not 130 ([#547](https://github.com/GeiserX/tailscaled-rs/issues/547)) ([c872cca](https://github.com/GeiserX/tailscaled-rs/commit/c872ccaa0b9b19fc565737c32986568e3d100e31))
+
 ## [0.65.1](https://github.com/GeiserX/tailscaled-rs/compare/v0.65.0...v0.65.1) (2026-09-28)
 
 

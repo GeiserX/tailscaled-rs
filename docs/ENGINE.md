@@ -133,8 +133,7 @@ A maintainer can follow this on every bump:
 
 When you are editing the engine and the daemon at the same time, you do **not** keep bumping the
 `rev`. Point Cargo at a local checkout with a **gitignored** `.cargo/config.toml` source override —
-this is documented in the README's [**"Developing against a local engine"**](../README.md#developing-against-a-local-engine)
-section. In short:
+this is documented in [**"Developing against a local engine"**](development.md#developing-against-a-local-engine). In short:
 
 ```toml
 # .cargo/config.toml  (gitignored — never committed)

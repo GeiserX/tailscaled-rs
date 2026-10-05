@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tailscaled_rs::ipn::Backend;
-use tailscaled_rs::localapi::{Request, Response};
+use tailscaled_rs::localapi::{ExitNodeSuggestionView, Request, Response};
 use tailscaled_rs::server;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -1373,6 +1373,145 @@ async fn a_policy_masked_watch_front_loads_the_snapshot_and_stays_quiet_on_an_un
             .is_none(),
         "a `syspolicy reload` that resolved the same rows must push no policy frame: Go invokes the \
          change callbacks only under `!old.EqualItems(new)`"
+    );
+
+    harness.shutdown_and_verify().await;
+}
+
+/// The `suggested_exit_node` mask bit (Go `ipn.NotifyInitialSuggestedExitNode`, `1 << 10`) end to
+/// end over the real socket. The unit tests in `src/ipn/mod.rs` pin the cell and the ones in
+/// `src/server.rs` pin the frame writer; this is the wiring between them — a
+/// `Backend::publish_suggested_exit_node` call reaching a watcher parked in `server::serve`.
+///
+/// Pinned here, on a device-less daemon:
+///
+/// 1. **Nothing is front-loaded.** `prefs` and `policy` are daemon-owned and go out before the first
+///    epoch; a suggestion has to be ranked by a live engine, so a watcher on a down node is told
+///    nothing — not an empty frame — and waits. That silence is what gives the next frame meaning.
+/// 2. **A publish reaches the parked watcher** with the bare stable id (Go's
+///    `Notify.SuggestedExitNode` is the `StableNodeID`, not the display name) and no field the
+///    watch did not ask for.
+/// 3. **The same pick again is not a frame.** Go's `suggestExitNodeLocked` sends only under
+///    `prevSuggestion != res.ID`, so recomputing a stable answer costs nothing on the bus. A moved
+///    pick afterwards does produce a frame, which shows the silence came from that guard and not
+///    from a stream that had stopped delivering.
+///
+/// Out of reach here, and why:
+///
+/// - **The front-load itself.** Go's `NotifyInitialSuggestedExitNode` computes a suggestion when
+///   the watch opens. Here that is `Backend::front_load_suggested_exit_node`, which runs only
+///   against a `Running` engine device; this harness has no engine and no tailnet, so it cannot
+///   reach that code at all. The frame it writes is the one `emit_suggested_exit_node_frame`
+///   writes, which the emitter test in `src/server.rs` pins.
+/// - **An empty answer.** Today an empty suggestion publishes nothing and leaves the cell alone. In
+///   Go, "no eligible candidate" is an empty response with a nil error, so `suggestExitNodeLocked`
+///   compares `""` with the last pick and sends `SuggestedExitNode: &""`. When the daemon does the
+///   same, a fourth step belongs here: publish `ExitNodeSuggestion { suggestion: None }` after a
+///   pick and read a frame whose id is empty.
+///
+/// The publish goes through the backend API rather than an `exit-node suggest` on a second
+/// connection because the engine call that verb wraps needs a live device. It is the same
+/// `publish_suggested_exit_node` call `Backend::suggest_exit_node` makes with the engine's answer,
+/// so everything after the engine is the path a real suggestion takes.
+#[tokio::test]
+async fn a_suggestion_masked_watch_is_quiet_until_a_pick_moves() {
+    fn picked(id: &str, name: &str) -> Response {
+        Response::ExitNodeSuggestion {
+            suggestion: Some(ExitNodeSuggestionView {
+                id: id.to_string(),
+                name: name.to_string(),
+            }),
+            withheld_by_policy: false,
+        }
+    }
+
+    let harness = Harness::start().await;
+
+    // Only the `suggested_exit_node` bit: a client that wants to show "we recommend X" asks for
+    // nothing else.
+    let (_w, mut r) = open_masked_watch(
+        &harness,
+        b"{\"cmd\":\"watch\",\"suggested_exit_node\":true}\n",
+    )
+    .await;
+
+    // (1) No device, so no suggestion to front-load, and no `initial_state`, so no session id: the
+    // stream is silent. The wait also gives `serve` time to subscribe this watcher before the
+    // publish below.
+    assert!(
+        try_read_watch_status(&mut r, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "a suggestion-only watch on a device-less daemon must be sent nothing, not an empty frame"
+    );
+
+    // (2) The first pick of the run is a change, so every watcher hears it.
+    assert!(
+        harness
+            .backend
+            .lock()
+            .await
+            .publish_suggested_exit_node(&picked("nStableAms1CNTRL", "amsterdam")),
+        "the first pick of the run is a change and must publish"
+    );
+    let frame = read_notify(
+        &mut r,
+        "a published exit-node suggestion must reach a parked suggestion watcher",
+    )
+    .await;
+    assert_eq!(
+        frame.suggested_exit_node.as_deref(),
+        Some("nStableAms1CNTRL"),
+        "the frame carries the bare stable id, not the display name: {frame:?}"
+    );
+    assert!(
+        frame.state.is_none()
+            && frame.error.is_none()
+            && frame.browse_to_url.is_none()
+            && frame.net_map.is_none()
+            && frame.self_change.is_none()
+            && frame.prefs.is_none()
+            && frame.policy.is_none()
+            && frame.initial_status.is_none()
+            && frame.session_id.is_none(),
+        "a suggestion-only watch must not be sent fields it did not ask for: {frame:?}"
+    );
+
+    // (3) The same pick recomputed is not news. Without the guard every `exit-node suggest` and
+    // every other watcher's front-load would wake this one with a value it already holds.
+    assert!(
+        !harness
+            .backend
+            .lock()
+            .await
+            .publish_suggested_exit_node(&picked("nStableAms1CNTRL", "amsterdam")),
+        "an unchanged pick must not republish"
+    );
+    assert!(
+        try_read_watch_status(&mut r, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "an unchanged pick must not produce a second frame"
+    );
+
+    // The pick moves: the stream is still live, and the silence above was the guard.
+    assert!(
+        harness
+            .backend
+            .lock()
+            .await
+            .publish_suggested_exit_node(&picked("nStableFra2CNTRL", "frankfurt")),
+        "a different pick is a change and must publish"
+    );
+    let moved = read_notify(
+        &mut r,
+        "a moved exit-node suggestion must reach the same parked watcher",
+    )
+    .await;
+    assert_eq!(
+        moved.suggested_exit_node.as_deref(),
+        Some("nStableFra2CNTRL"),
+        "the frame carries the new pick: {moved:?}"
     );
 
     harness.shutdown_and_verify().await;
