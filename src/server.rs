@@ -2927,6 +2927,7 @@ mod tests {
                 id: id.to_string(),
                 name: "berlin".to_string(),
             }),
+            withheld_by_policy: false,
         }
     }
 
@@ -2960,7 +2961,10 @@ mod tests {
             backend
                 .lock()
                 .await
-                .publish_suggested_exit_node(&Response::ExitNodeSuggestion { suggestion: None })
+                .publish_suggested_exit_node(&Response::ExitNodeSuggestion {
+                    suggestion: None,
+                    withheld_by_policy: false,
+                })
         );
         let cleared = next_notify_within(&mut reader, FRAME_WAIT)
             .await
@@ -3048,7 +3052,10 @@ mod tests {
         );
 
         // No eligible candidate is a nil error in Go: the front-load carries the empty id.
-        let empty = Response::ExitNodeSuggestion { suggestion: None };
+        let empty = Response::ExitNodeSuggestion {
+            suggestion: None,
+            withheld_by_policy: false,
+        };
         assert!(be.publish_suggested_exit_node(&empty));
         assert_eq!(run_front_load(&empty, &mut rx).await, [Some(String::new())]);
 

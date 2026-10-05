@@ -144,10 +144,11 @@ async fn link_monitor_loop(device: std::sync::Arc<tailscale::Device>) {
 /// eligible. When the engine's top pick is outside the list but an allowed runner-up is eligible, Go
 /// announces the runner-up and this build announces `""`, because the engine hands the daemon one
 /// already-ranked node (`docs/ENGINE_ASKS.md` #44). The two agree whenever no allowed node is
-/// eligible.
+/// eligible. The reply's `withheld_by_policy` flag tells `exit-node suggest` which empty it is; the
+/// bus carries only the id, as Go's `Notify.SuggestedExitNode` does, so both empties send `""`.
 pub fn suggested_exit_node_id(response: &crate::localapi::Response) -> Option<&str> {
     match response {
-        crate::localapi::Response::ExitNodeSuggestion { suggestion } => {
+        crate::localapi::Response::ExitNodeSuggestion { suggestion, .. } => {
             Some(suggestion.as_ref().map_or("", |s| s.id.as_str()))
         }
         _ => None,
@@ -5771,7 +5772,9 @@ impl Backend {
     /// answer on the notify bus if it moved**. See [`diag::suggest_exit_node`] for the `suggest_exit_node()` →
     /// [`Response::ExitNodeSuggestion`](crate::localapi::Response) mapping (`Ok(None)` = no eligible
     /// candidate, an honest empty result, not an error) and for the `AllowedSuggestedExitNodes`
-    /// allow-list the engine's answer is filtered through.
+    /// allow-list the engine's answer is filtered through — a suggestion that list excludes comes
+    /// back empty *and flagged* (`withheld_by_policy`), because unlike Go this build cannot re-rank to
+    /// the best permitted node and must not pass its refusal off as an empty tailnet.
     ///
     /// This is the port of Go's `LocalBackend.suggestExitNodeLocked`, which computes the suggestion
     /// and, in the same function, notifies every client when the pick differs from the last one.
@@ -6738,13 +6741,26 @@ mod tests {
                 id: id.to_string(),
                 name: name.to_string(),
             }),
+            withheld_by_policy: false,
         }
     }
 
-    /// An `ExitNodeSuggestion` reply for a computation that found no eligible candidate (or had its
-    /// pick withheld by `AllowedSuggestedExitNodes`) — Go's empty response with a nil error.
+    /// An `ExitNodeSuggestion` reply for a computation that found no eligible candidate — Go's empty
+    /// response with a nil error.
     fn empty_suggestion() -> crate::localapi::Response {
-        crate::localapi::Response::ExitNodeSuggestion { suggestion: None }
+        crate::localapi::Response::ExitNodeSuggestion {
+            suggestion: None,
+            withheld_by_policy: false,
+        }
+    }
+
+    /// An `ExitNodeSuggestion` reply whose pick `AllowedSuggestedExitNodes` withheld — empty, with
+    /// the reply's `withheld_by_policy` flag set.
+    fn withheld_suggestion() -> crate::localapi::Response {
+        crate::localapi::Response::ExitNodeSuggestion {
+            suggestion: None,
+            withheld_by_policy: true,
+        }
     }
 
     /// An engine failure, the shape `diag::suggest_exit_node` returns for Go's `ErrNoPreferredDERP`.
@@ -6833,6 +6849,27 @@ mod tests {
             "a pick that went away and came back must be announced again"
         );
         assert_eq!(*rx.borrow_and_update(), "nodeid-a");
+    }
+
+    #[tokio::test]
+    async fn a_pick_withheld_by_policy_clears_the_suggestion_too() {
+        let be = suggestion_backend();
+        let mut rx = be.watch_suggested_exit_node();
+
+        assert!(be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")));
+        rx.borrow_and_update();
+
+        // `withheld_by_policy` is for the `exit-node suggest` reply; Go's notify has no such field.
+        // On the bus a withheld pick is an empty answer like any other, so an allow-list that stops
+        // permitting the last pick takes it off every watcher instead of leaving it showing.
+        assert!(
+            be.publish_suggested_exit_node(&withheld_suggestion()),
+            "a pick the allow-list now excludes must be withdrawn"
+        );
+        assert_eq!(*rx.borrow_and_update(), "");
+        // Remembered as "", the same as an empty tailnet, so the plain empty answer is no change.
+        assert!(!be.publish_suggested_exit_node(&empty_suggestion()));
+        assert!(!rx.has_changed().unwrap());
     }
 
     #[tokio::test]
@@ -7158,8 +7195,10 @@ mod tests {
         .await;
         assert!(matches!(
             answer,
-            Some(crate::localapi::Response::ExitNodeSuggestion { suggestion: Some(s) })
-                if s.id == "nodeid-a"
+            Some(crate::localapi::Response::ExitNodeSuggestion {
+                suggestion: Some(s),
+                withheld_by_policy: false,
+            }) if s.id == "nodeid-a"
         ));
     }
 
