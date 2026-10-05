@@ -2,7 +2,7 @@
 #
 # This is the SMALLEST config that boots a usable single-tailnet control server — not a
 # production config. It is loaded by the headscale container in this directory's
-# docker-compose.yml (mounted read-only at /etc/headscale/config.yaml). See ../../docs/TESTING.md
+# docker-compose.yml (mounted read-only at /etc/headscale/config.yaml). See ../../docs/development.md
 # for the full local loop (create a user + pre-auth key, then point the daemon at this server).
 #
 # Schema tracks the `config-example.yaml` shipped with the pinned headscale image

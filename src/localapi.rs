@@ -238,10 +238,12 @@ pub enum Request {
         /// a timer that re-probes the engine on a schedule, which is a different and larger decision
         /// than putting the value the daemon already has on the bus.
         ///
-        /// An empty answer is **silence**, never a frame. This fork models "no eligible candidate"
-        /// and "withheld by the administrator's `AllowedSuggestedExitNodes`" as the same honest empty
-        /// [`Response::ExitNodeSuggestion`], and Go likewise sends nothing when `suggestExitNodeLocked`
-        /// returns an error. The remembered value is left alone in that case, exactly as Go leaves
+        /// An empty answer is **silence**, never a frame. That holds for both empties this fork can
+        /// return: "no eligible candidate" and "withheld by the administrator's
+        /// `AllowedSuggestedExitNodes`". The `exit-node suggest` reply tells them apart with
+        /// `withheld_by_policy`, but neither carries a node id, and Go likewise sends nothing when
+        /// `suggestExitNodeLocked` returns an error. The remembered value is left alone in that
+        /// case, exactly as Go leaves
         /// `lastSuggestedExitNode` untouched on its error path, so the next real suggestion is
         /// compared against the last value a watcher was actually told. Two consequences worth
         /// stating plainly: there is no frame that CLEARS a suggestion, so a consumer's running view
@@ -558,9 +560,10 @@ pub enum Request {
     Netcheck,
     /// Ask the daemon to suggest the best available exit node (Go `tailscale exit-node suggest` →
     /// `LocalClient.SuggestExitNode`). Replies with [`Response::ExitNodeSuggestion`] carrying the
-    /// suggested node (or `None` when there is no eligible candidate, or when the administrator's
-    /// `AllowedSuggestedExitNodes` policy excludes the one the engine picked — NOT an error,
-    /// mirroring Go's empty response). Read-only — it computes a suggestion from the netmap + latency, mutating
+    /// suggested node — or no node, either because there is no eligible candidate (Go's empty
+    /// response) or because the administrator's `AllowedSuggestedExitNodes` policy excludes the one
+    /// the engine picked, which the reply flags as `withheld_by_policy`. Neither is an error.
+    /// Read-only — it computes a suggestion from the netmap + latency, mutating
     /// nothing (gated like [`Status`](Request::Status)). Requires the node to be up.
     SuggestExitNode,
     /// Report the Tailscale **Services** (VIPs) this node can reach (Go `tailscale service list` →
@@ -1342,16 +1345,32 @@ pub enum Response {
     /// `tnet netcheck`.
     Netcheck(NetcheckReport),
     /// The suggested exit node (reply to [`Request::SuggestExitNode`]), rendered by `tnet exit-node
-    /// suggest`. `suggestion` is `None` when the engine found no eligible candidate, and when the
-    /// administrator's `AllowedSuggestedExitNodes` allow-list excludes the node it picked — an honest
-    /// empty result either way, not an error (mirroring Go's empty `SuggestExitNode` response, which
-    /// is also what Go returns when its allow-list leaves no candidate). A **struct** variant
-    /// (not a newtype over `Option`): the `Response` enum is internally tagged (`tag = "kind"`), which
-    /// cannot merge its tag into a bare `Option`/`null` content, so the optional payload is carried as
-    /// a named field instead.
+    /// suggest`. `suggestion` is `None` in two very different situations, which
+    /// [`withheld_by_policy`](Response::ExitNodeSuggestion::withheld_by_policy) tells apart:
+    ///
+    /// - `withheld_by_policy: false` — the engine found no eligible candidate. This is Go's empty
+    ///   `SuggestExitNode` response: an honest empty result, not an error.
+    /// - `withheld_by_policy: true` — the engine DID pick a node and the administrator's
+    ///   `AllowedSuggestedExitNodes` allow-list excludes it. Go does not answer this way: it filters
+    ///   the candidates *before* ranking them, so it answers with the best node the allow-list
+    ///   permits, and only empties when no candidate passes at all. This build is handed one
+    ///   already-chosen node and cannot re-rank (engine ask #44), so it withholds — and says so,
+    ///   rather than dressing the refusal up as "the tailnet has no exit node".
+    ///
+    /// Still not an error in either case (the reply is a suggestion, and there is none). A
+    /// **struct** variant (not a newtype over `Option`): the `Response` enum is internally tagged
+    /// (`tag = "kind"`), which cannot merge its tag into a bare `Option`/`null` content, so the
+    /// optional payload is carried as a named field instead.
     ExitNodeSuggestion {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         suggestion: Option<ExitNodeSuggestionView>,
+        /// `true` when `suggestion` is empty **because** `AllowedSuggestedExitNodes` excludes the
+        /// node the engine picked, rather than because there was nothing to pick. Only ever `true`
+        /// alongside `suggestion: None`. `#[serde(default)]` + `skip_serializing_if` keep the wire
+        /// backward-compatible: a reply from a daemon that predates the flag omits the key and reads
+        /// back as `false`, which is the old meaning of a bare empty reply.
+        #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+        withheld_by_policy: bool,
     },
     /// The Tailscale Services (VIPs) this node can reach (reply to [`Request::Services`]), rendered
     /// by `tnet service list`. Sorted by [`ServiceReport::name`], one entry per Service (Go returns a
@@ -2619,26 +2638,40 @@ pub struct NotifyView {
     /// `WantPeers: true` includes them; on a node that is not `Running` the list is empty because
     /// there is no netmap, exactly as a one-shot `status` reports it.
     ///
-    /// ## Ordering: snapshot first, then subscribe — and the window that leaves
+    /// ## Ordering: subscribe to the bus, wait for its baseline, then snapshot
     ///
     /// Go assembles `InitialStatus` under `b.mu` in the same critical section that registers the
     /// watcher, so no event can reach the watcher before its snapshot and none can fall between the
-    /// two. This daemon has no single lock spanning its backend and the engine bus, so it does not
-    /// claim that. What it does:
+    /// two. This daemon has no single lock spanning its backend and the engine bus. It gets the
+    /// same "nothing falls between" result by ordering instead:
     ///
-    /// - The lifecycle, prefs and policy subscriptions are taken BEFORE the snapshot, so an
-    ///   `up`/`down`, a prefs write or a policy change landing after it is still delivered.
-    /// - The snapshot is then the first frame written, ahead of every other front-load and every
-    ///   engine event. Nothing on this connection precedes it.
-    /// - Only then is the engine's IPN bus subscribed. A connection-state or peer-set change that
-    ///   lands between the snapshot and that subscription is NOT delivered as its own frame.
+    /// - The lifecycle, prefs, policy and exit-node-suggestion subscriptions are taken first, so an
+    ///   `up`/`down`, a prefs write, a policy change or a new suggestion landing after the snapshot
+    ///   is still delivered.
+    /// - With a device, the engine's IPN bus is subscribed next, widened to
+    ///   `INITIAL_STATE | INITIAL_NETMAP`. The daemon waits for that subscription's initial frame.
+    ///   The engine sends it once its bus task has read its state and peer cells, so every change
+    ///   after that point is queued for this watcher. `watch_ipn_bus` returning is not that
+    ///   point: it only means the task was spawned.
+    /// - Only then is the snapshot taken. It goes out on the session's first frame, together with
+    ///   the part of the engine's initial frame the client asked for (`state` for `initial_state`,
+    ///   `net_map` for `initial_netmap`, nothing otherwise). The prefs, policy and suggestion
+    ///   front-loads follow it.
     ///
-    /// Subscribing to the bus first would not close that window from here: the engine's bus
-    /// watcher records its baseline inside a task it spawns, after `watch_ipn_bus` has returned,
-    /// so the daemon cannot observe the moment it became current. Closing it needs an engine-side
-    /// change. A watcher that must not miss that edge also sets `initial_state` / `initial_netmap`:
-    /// the engine front-loads the state and peer set as of its own subscription, which is never
-    /// older than this snapshot and supersedes it.
+    /// So a connection-state or peer-set change landing after the snapshot is streamed as its own
+    /// frame. One landing between the engine's baseline and the snapshot can show up twice: in the
+    /// snapshot, then again as a frame. That is harmless, because frames carry whole values, not
+    /// deltas. For the same reason, the `state`/`net_map` sharing the first frame can be older than
+    /// the snapshot; the frame that moves them on follows.
+    ///
+    /// The window this order still leaves: with no device, or when the bus subscribe fails, there
+    /// is no bus to order against, so the snapshot is the device-less state, sent at once. The
+    /// device that a later `up` installs gets a fresh bus subscription with the client's own mask,
+    /// as every masked watch does. A client that did not set `initial_state` / `initial_netmap`
+    /// is not sent that device's state or peers as of that subscription, only the changes after
+    /// it. Setting those bits closes that window too. Apart from that, "streamed" assumes the
+    /// client keeps up: the engine drops frames for a reader that falls behind and does not say
+    /// so. That gap is engine-side (`docs/ENGINE_ASKS.md` #45, see `stream_notify`).
     ///
     /// DAEMON-built (not an engine `Notify` field). `None` on every frame but the first, and on
     /// every frame when the bit was unset.
@@ -3508,6 +3541,14 @@ mod tests {
             Response::Notify(back) => {
                 assert_eq!(back.session_id.as_deref(), Some("0123456789abcdef"));
                 assert!(back.state.is_none() && back.prefs.is_none() && back.policy.is_none());
+            }
+            other => panic!("expected a notify frame, got {other:?}"),
+        }
+        // A frame from an older daemon has neither field and must still parse.
+        match serde_json::from_str::<Response>(r#"{"kind":"notify","state":"Running"}"#).unwrap() {
+            Response::Notify(back) => {
+                assert_eq!(back.version, None);
+                assert_eq!(back.session_id, None);
             }
             other => panic!("expected a notify frame, got {other:?}"),
         }
@@ -4584,27 +4625,68 @@ mod tests {
             serde_json::from_str::<Request>(r#"{"cmd":"suggest_exit_node"}"#).unwrap(),
             Request::SuggestExitNode
         ));
-        // Some(suggestion) round-trips with both fields.
+        // Some(suggestion) round-trips with both fields, and carries no policy flag.
         let sugg = ExitNodeSuggestionView {
             id: "nABC123".to_string(),
             name: "exit-fra-1".to_string(),
         };
         let resp = Response::ExitNodeSuggestion {
             suggestion: Some(sugg.clone()),
+            withheld_by_policy: false,
         };
         let json = serde_json::to_string(&resp).unwrap();
+        assert!(
+            !json.contains("withheld_by_policy"),
+            "a false flag must not reach the wire (skip_serializing_if): {json}"
+        );
         match serde_json::from_str::<Response>(&json).unwrap() {
             Response::ExitNodeSuggestion {
                 suggestion: Some(s),
+                withheld_by_policy: false,
             } => assert_eq!(s, sugg),
             other => panic!("expected ExitNodeSuggestion(Some), got {other:?}"),
         }
         // None (no candidate) round-trips as a distinct, non-error empty result.
-        let none = Response::ExitNodeSuggestion { suggestion: None };
+        let none = Response::ExitNodeSuggestion {
+            suggestion: None,
+            withheld_by_policy: false,
+        };
         let none_json = serde_json::to_string(&none).unwrap();
         match serde_json::from_str::<Response>(&none_json).unwrap() {
-            Response::ExitNodeSuggestion { suggestion: None } => {}
+            Response::ExitNodeSuggestion {
+                suggestion: None,
+                withheld_by_policy: false,
+            } => {}
             other => panic!("expected ExitNodeSuggestion(None), got {other:?}"),
+        }
+        // The policy refusal is a THIRD outcome and must survive the wire as itself: an empty
+        // suggestion that says why it is empty. Collapsing it back into the plain empty reply is the
+        // bug this flag exists to prevent — "no exit node exists" and "you may not be steered onto
+        // the one that does" are different facts for the operator reading the answer.
+        let withheld = Response::ExitNodeSuggestion {
+            suggestion: None,
+            withheld_by_policy: true,
+        };
+        let withheld_json = serde_json::to_string(&withheld).unwrap();
+        assert!(
+            withheld_json.contains(r#""withheld_by_policy":true"#),
+            "the refusal reason must be on the wire: {withheld_json}"
+        );
+        match serde_json::from_str::<Response>(&withheld_json).unwrap() {
+            Response::ExitNodeSuggestion {
+                suggestion: None,
+                withheld_by_policy: true,
+            } => {}
+            other => panic!("expected a withheld ExitNodeSuggestion, got {other:?}"),
+        }
+        // Back-compat: a reply from a daemon that predates the flag omits the key, and must read
+        // back as the plain empty result rather than failing to parse.
+        match serde_json::from_str::<Response>(r#"{"kind":"exit_node_suggestion"}"#).unwrap() {
+            Response::ExitNodeSuggestion {
+                suggestion: None,
+                withheld_by_policy: false,
+            } => {}
+            other => panic!("expected a legacy empty ExitNodeSuggestion, got {other:?}"),
         }
     }
 

@@ -9008,11 +9008,40 @@ fn check_exit_node_suggest_flags(force_probe: bool) -> Result<()> {
     Ok(())
 }
 
+/// The notice `exit-node suggest` prints when the daemon has no node to suggest — one string per
+/// reason, because the two reasons are not the same news.
+///
+/// `withheld_by_policy: false` is the ordinary empty answer (Go's empty `SuggestExitNode` response):
+/// nothing on this tailnet is an eligible exit-node candidate right now, and there is nothing the
+/// operator can do about it here.
+///
+/// `withheld_by_policy: true` is this build's own outcome and must not borrow the other's wording.
+/// The engine did pick a node; `AllowedSuggestedExitNodes` excludes it; and, unlike upstream, this
+/// build cannot re-rank the candidates to answer with the best *permitted* one — it is handed a
+/// single already-chosen node (engine ask #44). Printing "no eligible exit-node peer right now"
+/// there would be a plain falsehood, and it would hide the two things that DO work: list that node
+/// in the policy, or choose a permitted exit node by hand.
+///
+/// Pure (a `bool` in, a `&'static str` out) so both notices are pinned by unit tests rather than by
+/// reading the terminal.
+fn exit_node_suggest_empty_notice(withheld_by_policy: bool) -> &'static str {
+    if withheld_by_policy {
+        "No exit node suggestion available: the AllowedSuggestedExitNodes policy does not list the \
+         node this build picked.\nThis build cannot re-rank to the best permitted node, so it \
+         suggests none. List that node in the policy, or choose a permitted one with `tnet \
+         exit-node list` and `tnet set --exit-node=<id>`."
+    } else {
+        "No exit node suggestion available (no eligible exit-node peer right now)."
+    }
+}
+
 /// `exit-node suggest` (Go `tailscale exit-node suggest`): ask the daemon for the best available exit
 /// node and print it with the `tnet set --exit-node=<id>` command to engage it. A `None` suggestion
-/// (no eligible candidate) prints a clear notice and exits 0 (not an error — there was simply nothing
-/// to suggest, matching Go's empty response). The suggested name is control-supplied text, so it is
-/// run through `sanitize_for_terminal` before printing.
+/// prints a clear notice and exits 0 (not an error — there was simply nothing to suggest, matching
+/// Go's empty response); *which* notice depends on why the answer is empty — see
+/// [`exit_node_suggest_empty_notice`], which keeps the policy refusal from being read as an empty
+/// tailnet. The suggested name is control-supplied text, so it is run through
+/// `sanitize_for_terminal` before printing.
 ///
 /// `--force-probe` is refused first, before the socket is touched — the flag asks for a measurement
 /// this build cannot take, so there is nothing to ask the daemon for. See
@@ -9025,6 +9054,7 @@ async fn run_exit_node_suggest(socket: &std::path::Path, force_probe: bool) -> R
     match response {
         Response::ExitNodeSuggestion {
             suggestion: Some(s),
+            ..
         } => {
             // Name is control-supplied — sanitize before printing. The id is a stable node id
             // (`[A-Za-z0-9]`-ish), echoed verbatim as the selector for `set --exit-node`.
@@ -9032,9 +9062,13 @@ async fn run_exit_node_suggest(socket: &std::path::Path, force_probe: bool) -> R
             println!("To use it, run: tnet set --exit-node={}", s.id);
             Ok(())
         }
-        Response::ExitNodeSuggestion { suggestion: None } => {
-            // No eligible candidate — an honest empty result, not an error. Exit 0.
-            println!("No exit node suggestion available (no eligible exit-node peer right now).");
+        Response::ExitNodeSuggestion {
+            suggestion: None,
+            withheld_by_policy,
+        } => {
+            // Empty — an honest empty result, not an error. Exit 0 either way; the notice names
+            // which of the two empties this is.
+            println!("{}", exit_node_suggest_empty_notice(withheld_by_policy));
             Ok(())
         }
         Response::Error { message } => {
@@ -15398,11 +15432,7 @@ fn set_kubeconfig_for_peer(scheme: &str, fqdn: &str, path: &str) -> Result<()> {
         Ok(mut f) => {
             let mut b = Vec::new();
             std::io::Read::read_to_end(&mut f, &mut b).map_err(|e| read_err("read", &e))?;
-            // Go hands the bytes straight to `updateKubeconfig`, whose YAML decoder fails on an
-            // invalid UTF-8 sequence (`invalid leading UTF-8 octet`) and maps that, like every
-            // unmarshal failure, to `errInvalidKubeconfig`. This check stands in for that failure,
-            // so the words are the same.
-            String::from_utf8(b).map_err(|_| anyhow!("invalid kubeconfig"))?
+            decode_kubeconfig_bytes(b)?
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(read_err("open", &e)),
@@ -15430,6 +15460,35 @@ fn set_kubeconfig_for_peer(scheme: &str, fqdn: &str, path: &str) -> Result<()> {
     f.sync_all()
         .map_err(|e| anyhow!("{}", go_path_error("sync", p, &e)))?;
     Ok(())
+}
+
+/// The kubeconfig's bytes as the text Go's YAML decoder would read.
+///
+/// Go hands the raw bytes to `updateKubeconfig`, and `sigs.k8s.io/yaml`'s decoder (goyaml's
+/// `yaml_parser_determine_encoding`) looks at the start of the input: `FF FE` is UTF-16LE and
+/// `FE FF` is UTF-16BE, the mark is skipped and the rest decoded; anything else is UTF-8. So a
+/// kubeconfig saved as UTF-16 — which some Windows editors still do — merges in Go, and must merge
+/// here. The merged file is written back as UTF-8, as Go's is.
+///
+/// Anything that does not decode fails as goyaml's reader fails (`invalid leading UTF-8 octet`,
+/// `incomplete UTF-16 character`, an unpaired surrogate), and `updateKubeconfig` maps every
+/// unmarshal failure to `errInvalidKubeconfig` — so the words are Go's, `invalid kubeconfig`.
+fn decode_kubeconfig_bytes(b: Vec<u8>) -> Result<String> {
+    let invalid = || anyhow!("invalid kubeconfig");
+    let utf16 = |body: &[u8], unit: fn([u8; 2]) -> u16| {
+        // A trailing odd byte is half a unit: goyaml's `incomplete UTF-16 character`.
+        let (pairs, rest) = body.as_chunks::<2>();
+        if !rest.is_empty() {
+            return Err(invalid());
+        }
+        let units: Vec<u16> = pairs.iter().map(|&pair| unit(pair)).collect();
+        String::from_utf16(&units).map_err(|_| invalid())
+    };
+    match b.as_slice() {
+        [0xFF, 0xFE, body @ ..] => utf16(body, u16::from_le_bytes),
+        [0xFE, 0xFF, body @ ..] => utf16(body, u16::from_be_bytes),
+        _ => String::from_utf8(b).map_err(|_| invalid()),
+    }
 }
 
 /// Go's `dnsname.ToFQDN`, returning the `WithTrailingDot()` form — the shape Go compares Service
@@ -19530,6 +19589,43 @@ mod tests {
         assert!(!force_probe, "the flag must default off");
         check_exit_node_suggest_flags(force_probe)
             .expect("the unprobed suggestion is what this build serves");
+    }
+
+    #[test]
+    fn an_empty_suggestion_says_which_empty_it_is() {
+        // Upstream filters the candidates before ranking them, so its empty answer means "nothing
+        // passed the filter" and it otherwise suggests the best PERMITTED node. This build is handed
+        // one already-chosen node and can only refuse it, so its empty answer has a second cause the
+        // operator can act on. Printing one notice for both would tell an administrator whose policy
+        // excluded the top pick that the tailnet has no exit node, which is false and points nowhere.
+        let withheld = exit_node_suggest_empty_notice(true);
+        assert!(
+            withheld.contains("AllowedSuggestedExitNodes"),
+            "the policy refusal must name the policy: {withheld}"
+        );
+        assert!(
+            withheld.contains("cannot re-rank"),
+            "it must admit why it has no permitted node to offer instead: {withheld}"
+        );
+        assert!(
+            withheld.contains("tnet set --exit-node=<id>"),
+            "it must point at the way out: {withheld}"
+        );
+        assert!(
+            !withheld.contains("no eligible exit-node peer"),
+            "the policy refusal must not borrow the empty-tailnet wording: {withheld}"
+        );
+
+        // The ordinary empty answer is unchanged — Go's empty response, nothing to act on.
+        let no_candidate = exit_node_suggest_empty_notice(false);
+        assert_eq!(
+            no_candidate,
+            "No exit node suggestion available (no eligible exit-node peer right now)."
+        );
+        assert_ne!(
+            withheld, no_candidate,
+            "the two empties must not read the same"
+        );
     }
 
     #[test]
@@ -25349,6 +25445,60 @@ users:
     }
 
     #[test]
+    fn kubeconfig_merge_reads_utf16_like_goyaml() {
+        // goyaml, under Go's `sigs.k8s.io/yaml`, takes `FF FE` / `FE FF` as a UTF-16 byte-order
+        // mark and decodes the file, so Go merges a UTF-16 kubeconfig. It must merge here too, and
+        // come back as UTF-8, as Go writes it.
+        let dir = std::env::temp_dir().join(format!("tnet-kubeutf16-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config");
+        let path_str = path.to_str().unwrap().to_string();
+        let existing = concat!(
+            "apiVersion: v1\nkind: Config\nclusters:\n",
+            "- name: other\n  cluster:\n    server: https://other.example\n",
+        );
+        let utf16 = |bom: [u8; 2], unit: fn(u16) -> [u8; 2]| {
+            let mut b = bom.to_vec();
+            existing.encode_utf16().for_each(|u| b.extend(unit(u)));
+            b
+        };
+        for (what, bytes) in [
+            ("UTF-16LE", utf16([0xFF, 0xFE], u16::to_le_bytes)),
+            ("UTF-16BE", utf16([0xFE, 0xFF], u16::to_be_bytes)),
+        ] {
+            std::fs::write(&path, &bytes).unwrap();
+            set_kubeconfig_for_peer("https://", "foo.tail-scale.ts.net", &path_str)
+                .unwrap_or_else(|e| panic!("a {what} kubeconfig merges in Go: {e:#}"));
+            let merged = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("the {what} merge must be written as UTF-8: {e}"));
+            assert!(
+                merged.contains("server: https://other.example"),
+                "the {what} file's own cluster must survive the merge:\n{merged}"
+            );
+            assert!(
+                merged.contains("server: https://foo.tail-scale.ts.net"),
+                "the {what} file must have gained the new cluster:\n{merged}"
+            );
+        }
+
+        // What goyaml's reader cannot decode is still Go's `invalid kubeconfig`, and the file is
+        // left alone: half a UTF-16 unit, and a low surrogate with no high one before it.
+        for (what, bytes) in [
+            ("an odd byte count", b"\xff\xfea\x00b".to_vec()),
+            ("an unpaired surrogate", b"\xff\xfe\x00\xdca\x00".to_vec()),
+        ] {
+            std::fs::write(&path, &bytes).unwrap();
+            let err = set_kubeconfig_for_peer("https://", "foo.tail-scale.ts.net", &path_str)
+                .expect_err(what);
+            assert_eq!(format!("{err:#}"), "invalid kubeconfig", "{what}");
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "{what}: file touched");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn kubeconfig_merge_writes_the_file_preserving_other_clusters() {
         // The end-to-end of the default path: `set_kubeconfig_for_peer` creates the ~/.kube dir,
         // merges into whatever is there, and writes 0600 — the state Go leaves the machine in.
@@ -25413,7 +25563,8 @@ users:
 
         // Bytes that are not UTF-8 are a malformed file too: Go's YAML decoder fails on them and
         // `updateKubeconfig` says `invalid kubeconfig`. (Not a `\xff\xfe` start — goyaml reads that
-        // as a UTF-16 byte-order mark and decodes it.)
+        // as a UTF-16 byte-order mark and decodes it; `kubeconfig_merge_reads_utf16_like_goyaml`
+        // covers that.)
         let not_utf8: &[u8] = b"apiVersion: v1\n\x80\n";
         std::fs::write(&path, not_utf8).unwrap();
         let err = set_kubeconfig_for_peer("https://", "foo.tail-scale.ts.net", &path_str)
