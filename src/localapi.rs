@@ -148,8 +148,8 @@ pub enum Request {
         /// first frame. It is fresh for every connection and stable for the life of this one.
         ///
         /// On a device-less daemon the engine has no initial state to front-load, so when no
-        /// prefs/policy snapshot is going out first either, the daemon sends a frame carrying only
-        /// the identity fields, so the id still arrives immediately.
+        /// status/prefs/policy snapshot is going out first either, the daemon sends a frame
+        /// carrying only the identity fields, so the id still arrives immediately.
         ///
         /// **The id is not yet load-bearing.** Go keys a foreground `serve`'s config on it
         /// (`ServeConfig.Foreground[sessionID]`) and deletes that config when the watch ends. This
@@ -3208,6 +3208,60 @@ mod tests {
                 );
             }
             other => panic!("expected masked Watch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn notify_initial_status_frame_carries_the_status_report() {
+        // Go's `Notify.InitialStatus` is the `ipnstate.Status` a `status` call returns. Ours is the
+        // very `StatusReport` `Response::Status` carries, so a status frame decodes back to the
+        // identical report — peers included — and carries nothing else.
+        let report = StatusReport {
+            state: "Running".to_string(),
+            want_running: true,
+            self_ipv4: Some("100.64.0.1".to_string()),
+            self_name: Some("node-a.tail0123.ts.net".to_string()),
+            magic_dns_suffix: Some("tail0123.ts.net".to_string()),
+            peers: vec![PeerReport {
+                name: "node-b.tail0123.ts.net".to_string(),
+                ipv4: "100.64.0.2".to_string(),
+                stable_id: "nB".to_string(),
+                online: Some(true),
+                cur_addr: Some("192.0.2.7:41641".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let frame = NotifyView {
+            initial_status: Some(Box::new(report.clone())),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&Response::Notify(frame.clone())).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let object = value.as_object().unwrap();
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["initial_status", "kind"],
+            "a status frame is nil-means-unchanged for every other field"
+        );
+        assert_eq!(
+            object["initial_status"],
+            serde_json::to_value(&report).unwrap(),
+            "the snapshot must serialize exactly as the status report itself does"
+        );
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::Notify(back) => {
+                assert_eq!(back, frame);
+                assert_eq!(back.initial_status.unwrap().peers, report.peers);
+            }
+            other => panic!("expected a notify frame, got {other:?}"),
+        }
+        // A frame that predates the field (or any later frame) decodes with the snapshot absent.
+        match serde_json::from_str::<Response>(r#"{"kind":"notify","state":"Running"}"#).unwrap() {
+            Response::Notify(back) => assert!(back.initial_status.is_none()),
+            other => panic!("expected a notify frame, got {other:?}"),
         }
     }
 
