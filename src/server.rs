@@ -1037,8 +1037,10 @@ async fn stream_notify(
         // concern in `device_handle`). The watcher reads cloned `watch` receivers internally, so it
         // does not need our `Arc` to keep streaming. A `Weak` stays behind so a netmap tick can ask
         // THIS epoch's device for its self node (Go `Notify.SelfChange`) without keeping the engine
-        // alive between ticks.
+        // alive between ticks. `had_self` records whether this epoch has already given us one: the
+        // engine's self-node cell is never cleared once set, so from then on the query cannot wait.
         let epoch_dev = Arc::downgrade(&dev);
+        let mut had_self = false;
 
         if std::mem::take(&mut status_pending) {
             // Prompt by construction: the bus task pushes its initial frame into a fresh channel as
@@ -1050,10 +1052,11 @@ async fn stream_notify(
                 Some(notify) => {
                     let notify = retain_requested_initial(notify, initial_state, initial_netmap);
                     let self_change = if notify.net_map.is_some() {
-                        ipn::fetch_self_report(&dev).await
+                        ipn::fetch_self_report(&dev, had_self).await
                     } else {
                         None
                     };
+                    had_self |= self_change.is_some();
                     project_notify(notify, self_change)
                 }
                 None => None,
@@ -1110,10 +1113,11 @@ async fn stream_notify(
                             let self_change = if notify.net_map.is_none() {
                                 None
                             } else if let Some(dev) = epoch_dev.upgrade() {
-                                ipn::fetch_self_report(&dev).await
+                                ipn::fetch_self_report(&dev, had_self).await
                             } else {
                                 None
                             };
+                            had_self |= self_change.is_some();
                             let Some(view) = project_notify(notify, self_change) else {
                                 // An all-empty Notify never occurs (the engine's bus skips empties),
                                 // but if one ever arrived there is nothing to send — skip it rather
