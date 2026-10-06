@@ -1286,12 +1286,41 @@ fn self_report_from_status_node(
     }
 }
 
+/// Whether a `watch` netmap tick should ask the engine for its self node at all.
+///
+/// The engine's `Device::self_node` does not answer "none yet": it **waits** for the control
+/// runner's sticky self-node cell to be filled by the first netmap. Before that, a query always runs
+/// out the whole [`STATUS_QUERY_TIMEOUT`]. So in `Connecting`, `NeedsLogin` and `NeedsMachineAuth` —
+/// the pre-netmap states — the answer is known to be "no self node" and is not asked for. Without
+/// this, a subscribe with `initial_netmap` on an unregistered node would hold its first frame, the
+/// one carrying the interactive-login URL, for half a second just to learn there is no self.
+///
+/// `had_self` is whether this stream already got a self node from the same engine epoch. The cell is
+/// only ever set, never cleared, so once one was seen every later query answers at once. That covers
+/// the one pre-netmap state that can also occur mid-session: control pushing a re-auth URL flips the
+/// state to `NeedsLogin` while the self node is still there, and Go still sends it.
+///
+/// Every other state asks. `Reauthenticating` and `Expired` come from a self node control sent, so
+/// one exists. `Failed` is left to the timeout backstop: it can follow either a first registration
+/// (no self node) or a lost session (a self node), and the state alone does not say which.
+pub(crate) fn should_query_self_node(ds: &tailscale::DeviceState, had_self: bool) -> bool {
+    use tailscale::DeviceState as D;
+    had_self || !matches!(ds, D::Connecting | D::NeedsLogin(_) | D::NeedsMachineAuth)
+}
+
 /// Fetch this node's [`SelfReport`] for one `watch` netmap frame, or `None` if the engine has no self
-/// node to give. Bounded by [`STATUS_QUERY_TIMEOUT`] like `status`'s netmap query, so a wedged
-/// control actor delays the frame by at most that long instead of stalling the stream; on a miss the
-/// frame still carries its peers, just without a self view (Go likewise leaves `SelfChange` nil when
-/// the netmap has no valid self node).
-pub(crate) async fn fetch_self_report(dev: &tailscale::Device) -> Option<SelfReport> {
+/// node to give. Skipped outright when [`should_query_self_node`] says no self node can exist yet;
+/// otherwise bounded by [`STATUS_QUERY_TIMEOUT`] like `status`'s netmap query, so a wedged control
+/// actor delays the frame by at most that long instead of stalling the stream. On a miss the frame
+/// still carries its peers, just without a self view (Go likewise leaves `SelfChange` nil when the
+/// netmap has no valid self node).
+pub(crate) async fn fetch_self_report(
+    dev: &tailscale::Device,
+    had_self: bool,
+) -> Option<SelfReport> {
+    if !should_query_self_node(&dev.device_state(), had_self) {
+        return None;
+    }
     match tokio::time::timeout(STATUS_QUERY_TIMEOUT, dev.self_node()).await {
         Ok(Ok(node)) => Some(self_report_from_node(&node)),
         Ok(Err(e)) => {
@@ -5544,7 +5573,9 @@ impl Backend {
     /// answer on the notify bus if it moved**. See [`diag::suggest_exit_node`] for the `suggest_exit_node()` →
     /// [`Response::ExitNodeSuggestion`](crate::localapi::Response) mapping (`Ok(None)` = no eligible
     /// candidate, an honest empty result, not an error) and for the `AllowedSuggestedExitNodes`
-    /// allow-list the engine's answer is filtered through.
+    /// allow-list the engine's answer is filtered through — a suggestion that list excludes comes
+    /// back empty *and flagged* (`withheld_by_policy`), because unlike Go this build cannot re-rank to
+    /// the best permitted node and must not pass its refusal off as an empty tailnet.
     ///
     /// This is the port of Go's `LocalBackend.suggestExitNodeLocked`, which computes the suggestion
     /// and, in the same function, notifies every client when the pick differs from the last one.
@@ -5627,6 +5658,7 @@ impl Backend {
     pub fn publish_suggested_exit_node(&self, response: &crate::localapi::Response) -> bool {
         let crate::localapi::Response::ExitNodeSuggestion {
             suggestion: Some(suggestion),
+            ..
         } = response
         else {
             return false; // empty result or engine error → silence, and the cell stands
@@ -6475,6 +6507,42 @@ mod tests {
         assert_eq!(never.key_expiry, None);
     }
 
+    /// The engine's self-node query waits for the first netmap rather than answering "none", so a
+    /// netmap tick must not ask in a pre-netmap state — unless this epoch already produced a self
+    /// node, which the engine never clears (the mid-session re-auth `NeedsLogin`).
+    #[test]
+    fn self_node_is_not_queried_before_one_can_exist() {
+        use tailscale::DeviceState as D;
+        let url: url::Url = "https://login.example.com/a/1".parse().unwrap();
+
+        for pre_netmap in [D::Connecting, D::NeedsLogin(url), D::NeedsMachineAuth] {
+            assert!(
+                !should_query_self_node(&pre_netmap, false),
+                "{pre_netmap:?} has no self node yet; asking only runs out the timeout"
+            );
+            assert!(
+                should_query_self_node(&pre_netmap, true),
+                "{pre_netmap:?} after a self node was seen still has it, and Go still sends it"
+            );
+        }
+
+        for has_or_may_have in [
+            D::Running,
+            D::Reauthenticating,
+            D::Expired,
+            D::Failed(tailscale::RegistrationError::NetworkUnreachable),
+        ] {
+            assert!(
+                should_query_self_node(&has_or_may_have, false),
+                "{has_or_may_have:?}"
+            );
+            assert!(
+                should_query_self_node(&has_or_may_have, true),
+                "{has_or_may_have:?}"
+            );
+        }
+    }
+
     // --- has_persisted_node_key ---------------------------------------------------------------
     //
     // The auto-start "resume vs. fresh-auth" decision hinges on this probe: it must read `false` for
@@ -6541,6 +6609,7 @@ mod tests {
                 id: id.to_string(),
                 name: name.to_string(),
             }),
+            withheld_by_policy: false,
         }
     }
 
@@ -6603,10 +6672,22 @@ mod tests {
         // `Ok(None)` is this fork's honest empty result: no eligible candidate, or the pick withheld
         // by the administrator's `AllowedSuggestedExitNodes`. Go reaches the same place via an error
         // from `suggestExitNodeLocked` and sends nothing, leaving `lastSuggestedExitNode` untouched.
-        let empty = crate::localapi::Response::ExitNodeSuggestion { suggestion: None };
+        let empty = crate::localapi::Response::ExitNodeSuggestion {
+            suggestion: None,
+            withheld_by_policy: false,
+        };
         assert!(
             !be.publish_suggested_exit_node(&empty),
             "an empty suggestion must not produce a frame"
+        );
+        // The policy-withheld empty is flagged on the reply but is still an empty answer: silence.
+        let withheld = crate::localapi::Response::ExitNodeSuggestion {
+            suggestion: None,
+            withheld_by_policy: true,
+        };
+        assert!(
+            !be.publish_suggested_exit_node(&withheld),
+            "a suggestion withheld by policy must not produce a frame"
         );
         // An engine failure is the same silence.
         let failed = crate::localapi::Response::Error {
@@ -6742,8 +6823,10 @@ mod tests {
         .await;
         assert!(matches!(
             answer,
-            Some(crate::localapi::Response::ExitNodeSuggestion { suggestion: Some(s) })
-                if s.id == "nodeid-a"
+            Some(crate::localapi::Response::ExitNodeSuggestion {
+                suggestion: Some(s),
+                withheld_by_policy: false,
+            }) if s.id == "nodeid-a"
         ));
     }
 

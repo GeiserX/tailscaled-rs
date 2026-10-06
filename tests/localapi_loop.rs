@@ -238,6 +238,48 @@ async fn try_read_watch_status(
     }
 }
 
+/// `initial_status` (Go `NotifyInitialStatus`) edges that
+/// `an_initial_status_watch_front_loads_the_status_report_once` does not cover: a watch that did not
+/// set the bit never receives a snapshot, and when the session id rides the snapshot it is not
+/// repeated on the prefs frame that follows (Go puts `SessionID` on the same first Notify that carries
+/// `InitialStatus`).
+#[tokio::test]
+async fn initial_status_is_only_sent_when_asked_for_and_carries_the_id_once() {
+    let harness = Harness::start().await;
+
+    // Without the bit: the same front-loads, and no snapshot anywhere.
+    let (_write, mut reader) = open_masked_watch(
+        &harness,
+        b"{\"cmd\":\"watch\",\"prefs\":true,\"policy\":true}\n",
+    )
+    .await;
+    for what in ["the prefs front-load", "the policy front-load"] {
+        let view = read_notify(&mut reader, what).await;
+        assert!(
+            view.initial_status.is_none(),
+            "a watch that did not ask for the snapshot must not get one, got {view:?}"
+        );
+    }
+
+    // With `initial_state` as well, the session id rides the snapshot — the first frame written —
+    // and is not repeated on the prefs frame that follows.
+    let (_write, mut reader) = open_masked_watch(
+        &harness,
+        b"{\"cmd\":\"watch\",\"initial_state\":true,\"prefs\":true,\"initial_status\":true}\n",
+    )
+    .await;
+    let first = read_notify(&mut reader, "the status front-load").await;
+    assert!(
+        first.initial_status.is_some() && first.session_id.is_some(),
+        "the session id rides the first frame written, here the snapshot: {first:?}"
+    );
+    let next = read_notify(&mut reader, "the prefs front-load").await;
+    assert!(next.prefs.is_some(), "prefs follows the snapshot: {next:?}");
+    assert_eq!(next.session_id, None, "the id is not repeated");
+
+    harness.shutdown_and_verify().await;
+}
+
 /// 1. status round-trip: a fresh, never-configured node reports an unauthenticated, not-running
 ///    snapshot, and the server shuts down cleanly (socket removed).
 #[tokio::test]
@@ -1379,6 +1421,7 @@ async fn a_suggestion_masked_watch_is_quiet_until_a_pick_moves() {
                 id: id.to_string(),
                 name: name.to_string(),
             }),
+            withheld_by_policy: false,
         }
     }
 
