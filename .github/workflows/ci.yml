@@ -5,6 +5,21 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Lets this workflow be run against a ref on demand, which is the only way some pull requests can ever get
+  # the check that gates them.
+  #
+  # GitHub does not trigger workflows from events created with a workflow's own GITHUB_TOKEN — the recursion
+  # guard. release-please opens its release pull request with that token, so `pull_request` never fires for it
+  # and `fmt · clippy · test · build` never reports. That check is required by branch protection on `main`, so
+  # those pull requests are unmergeable forever: not failing, just never checked. Two of them sat for days.
+  #
+  # This file already documents the same guard for the TAG push, in release-please.yml, and works around it by
+  # dispatching the release build explicitly. One guard, two affected events; this is the second one.
+  #
+  # A dispatched run's check runs attach to the head commit of the ref it ran against, and branch protection
+  # matches a required check by CONTEXT NAME, not by which event produced it — so a run dispatched against a
+  # release branch satisfies the same requirement a pull_request run would have.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
