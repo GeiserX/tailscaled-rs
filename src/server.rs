@@ -17,12 +17,14 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::auth::{self, Access, AuthPolicy};
+use crate::ipn::alwayson;
+use crate::ipn::syspolicy;
 use crate::ipn::{self, Backend};
-use crate::localapi::{Request, Response};
+use crate::localapi::{Request, Response, watch_usage_refusal};
 
 /// Max bytes for a single newline-delimited request line. LocalAPI requests are tiny JSON, so this
 /// is generous; its only job is to stop a single newline-less connection from growing the read
@@ -59,7 +61,132 @@ const NC_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 /// aborted. Bounds shutdown latency so a wedged handler can't keep the daemon from exiting.
 const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Why a [`Request::Shutdown`] was refused — one variant per rung of Go's refusal ladder in
+/// `serveShutdown` (`ipn/localapi/localapi.go`), in the order Go checks them.
+///
+/// Separate variants (rather than one pre-rendered string) because the ladder's ORDER is the
+/// contract and a test has to be able to name which rung answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownRefusal {
+    /// The caller may not write at all: not root, not the uid that owns the daemon. Go: `shutdown
+    /// access denied` (403).
+    AccessDenied,
+    /// The caller MAY write, but no system policy authorises stopping the daemon. Go: `shutdown
+    /// access denied by policy` (403), from `polc.GetBoolean(pkey.AllowTailscaledRestart, false)`.
+    DeniedByPolicy,
+}
+
+impl ShutdownRefusal {
+    /// The message the refused caller receives — **byte-for-byte what Go's `http.Error` writes** as
+    /// the 403 body, and nothing else.
+    ///
+    /// Go's bodies are the bare phrases, so these are the bare phrases. A remediation clause after a
+    /// colon would still leave Go's words as a prefix, but a consumer comparing the whole body
+    /// against upstream's would stop matching, and this fork has no reason to speak a dialect of
+    /// upstream's error text. The "and here is what to do about it" half is not lost: it goes to the
+    /// daemon's log next to the refusal ([`Self::hint`]), where the operator who can act on it is
+    /// looking anyway, rather than down a socket to a caller that was just told no.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::AccessDenied => "shutdown access denied",
+            Self::DeniedByPolicy => "shutdown access denied by policy",
+        }
+    }
+
+    /// What the operator would have to change for this refusal to stop happening — logged beside the
+    /// refusal, never sent on the wire (see [`Self::message`]).
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::AccessDenied => {
+                "stopping the daemon requires root or the same user that owns the daemon"
+            }
+            Self::DeniedByPolicy => {
+                "set AllowTailscaledRestart to true in the daemon's system policy file (see `tnet \
+                 syspolicy list`) to permit it"
+            }
+        }
+    }
+}
+
+/// Decide whether a [`Request::Shutdown`] may proceed — the port of `serveShutdown`'s refusal
+/// ladder, minus the rung this transport cannot have.
+///
+/// Go checks, in order: the HTTP method; then write access; then the policy. The method rung has no
+/// counterpart here (one JSON frame per request, no methods — see [`Request::Shutdown`]), so this
+/// starts at write access.
+///
+/// **The order of the two remaining rungs is load-bearing.** Write access is checked FIRST so that a
+/// caller which may not write is refused *without the policy ever being consulted*: it always gets
+/// [`ShutdownRefusal::AccessDenied`], never the by-policy message, so the difference between the two
+/// refusals cannot be used to read the administrator's policy state off a socket the caller was not
+/// trusted with. And an authorised caller gets the two refusals apart, which is the other half of
+/// the point: "you may not" and "nobody may" are different problems with different fixes.
+///
+/// Authorisation goes through [`auth::authorize`] rather than `access.can_write()` so there stays
+/// exactly one authority on which verbs mutate (its match over `Request` is exhaustive, so a new
+/// verb has to make the decision explicitly). Pure — no lock, no I/O — so every rung is unit-testable
+/// without a socket, a second uid, or a policy file.
+pub fn shutdown_verdict(access: Access, allowed_by_policy: bool) -> Result<(), ShutdownRefusal> {
+    if auth::authorize(&Request::Shutdown, access).is_err() {
+        return Err(ShutdownRefusal::AccessDenied);
+    }
+    if !allowed_by_policy {
+        return Err(ShutdownRefusal::DeniedByPolicy);
+    }
+    Ok(())
+}
+
+/// Whether the system policy authorises stopping the daemon — Go's
+/// `polc.GetBoolean(pkey.AllowTailscaledRestart, false)`, default **false**.
+///
+/// Split from [`shutdown_verdict`] so the decision stays pure and the one process-global read has a
+/// single named site.
+fn shutdown_allowed_by_policy() -> bool {
+    syspolicy::get_boolean(syspolicy::PKEY_ALLOW_TAILSCALED_RESTART, false)
+}
+
+/// The error [`serve`] returns when the LocalAPI `shutdown` verb — and only that verb — ended the
+/// accept loop. It exists to make the daemon exit **non-zero**, which is the whole point of the verb.
+///
+/// Upstream never returns "stopped on request" as a success. `serveShutdown` publishes
+/// `localapi.Shutdown`; the sole subscriber in `ipn/ipnserver/server.go` calls `ln.Close()`;
+/// `hs.Serve(ln)` then fails on the closed listener and `Run` returns that error — and because the
+/// context was NOT cancelled, `cmd/tailscaled/tailscaled.go` does not take its
+/// `errors.Is(err, context.Canceled)` escape and hands the error to `log.Fatal`. Upstream tailscaled
+/// therefore exits 1, its packaged unit's `Restart=on-failure` starts it again, and that is why the
+/// policy key authorising the verb is spelled `AllowTailscaledRestart` and not `AllowShutdown`.
+///
+/// Returning `Ok(())` here instead would invert that on this fork specifically, because the units
+/// `tnet install` writes restart on failure only — `Restart=on-failure` in
+/// `packaging/systemd/tailnetd{,-tun}.service`, `KeepAlive = {Crashed: true, SuccessfulExit: false}`
+/// in `packaging/launchd/cloud.tailscaled-rs.tailnetd.plist`. A clean exit is not a failure to either
+/// of them, so a verb named for a restart would have permanently stopped the daemon.
+///
+/// The SIGINT/SIGTERM path is unaffected and still returns `Ok(())`: that is upstream's cancelled
+/// context, the one case its `run()` deliberately maps to a nil error. So the exit status keeps
+/// saying what it always said — 0 means "someone asked this process to go away", non-zero means
+/// "bring me back" — and the two stops stay distinguishable to the service manager, which is the
+/// only consumer that has to tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoppedByLocalApi;
+
+impl std::fmt::Display for StoppedByLocalApi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "stopped by the LocalAPI `shutdown` verb; exiting non-zero so the service manager \
+             restarts the daemon (the policy key that permits this is AllowTailscaledRestart)"
+        )
+    }
+}
+
+impl std::error::Error for StoppedByLocalApi {}
+
 /// Run the LocalAPI server until `shutdown` resolves, then clean up the socket.
+///
+/// Returns `Ok(())` when the caller-supplied `shutdown` future ended it (SIGINT/SIGTERM) and
+/// [`StoppedByLocalApi`] when the LocalAPI `shutdown` verb did — the teardown is identical, only the
+/// exit status differs, and it differs on purpose. See [`StoppedByLocalApi`].
 pub async fn serve(
     socket_path: &Path,
     backend: Arc<Mutex<Backend>>,
@@ -96,10 +223,39 @@ pub async fn serve(
     // Track in-flight handlers so shutdown can drain them instead of dropping them mid-flight.
     let mut conns: JoinSet<()> = JoinSet::new();
 
+    // The LocalAPI `shutdown` verb's stop signal: a handler that has passed the refusal ladder
+    // notifies it AFTER acknowledging the request, and the accept loop below treats it exactly like
+    // the caller-supplied `shutdown` future (SIGINT/SIGTERM). That is the whole mechanism — no
+    // `process::exit`, no second teardown path: the listener is dropped, in-flight connections
+    // drain, the socket is unlinked and the daemon's own shutdown runs. The ONE difference from the
+    // signal path is the value `serve` finally returns, and hence the process's exit status: see
+    // `StoppedByLocalApi`.
+    //
+    // `Notify::notify_one` (not `notify_waiters`) is what makes this race-free: it stores a permit
+    // when nobody is parked yet, so a stop requested while the loop is inside `accept()` is still
+    // observed by the `notified()` future the select re-polls.
+    let stop_requested = Arc::new(Notify::new());
+    let stop_waiter = Arc::clone(&stop_requested);
+    let stop_signal = async move { stop_waiter.notified().await };
+
+    // Which arm ended the accept loop. Not a detail: it is the exit status, and the exit status is
+    // what the service manager reads to decide whether to start the daemon again — the difference
+    // between a `shutdown` verb that restarts the daemon (upstream's behaviour, and the name of the
+    // key that permits it) and one that stops it for good.
+    let mut stopped_by_localapi = false;
+
     tokio::pin!(shutdown);
+    tokio::pin!(stop_signal);
     loop {
         tokio::select! {
             _ = &mut shutdown => break,
+            // A LocalAPI caller asked the daemon to stop and was permitted to. It has already been
+            // acknowledged on its own connection, so there is nothing left to do but stop accepting.
+            () = &mut stop_signal => {
+                tracing::info!("LocalAPI shutdown requested; stopping");
+                stopped_by_localapi = true;
+                break;
+            }
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _addr)) => {
@@ -116,10 +272,11 @@ pub async fn serve(
                             continue;
                         };
                         let stream_limit = Arc::clone(&stream_limit);
+                        let stop_requested = Arc::clone(&stop_requested);
                         conns.spawn(async move {
                             let _permit = permit;
                             if let Err(e) =
-                                handle_conn(stream, access, peer_uid, backend, stream_limit).await
+                                handle_conn(stream, access, peer_uid, backend, stream_limit, stop_requested).await
                             {
                                 tracing::warn!(error = %e, "LocalAPI: connection error");
                             }
@@ -150,6 +307,11 @@ pub async fn serve(
 
     let _ = tokio::fs::remove_file(socket_path).await;
     tracing::info!("LocalAPI stopped");
+    // The teardown above is the same either way — only the answer to "was this a failure?" differs,
+    // and only the service manager is asking.
+    if stopped_by_localapi {
+        return Err(StoppedByLocalApi.into());
+    }
     Ok(())
 }
 
@@ -188,6 +350,7 @@ async fn handle_conn(
     peer_uid: Option<u32>,
     backend: Arc<Mutex<Backend>>,
     stream_limit: Arc<Semaphore>,
+    stop_requested: Arc<Notify>,
 ) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -236,7 +399,29 @@ async fn handle_conn(
                         initial_state,
                         initial_netmap,
                         prefs,
+                        policy,
+                        suggested_exit_node,
+                        initial_status,
                     }) => {
+                        // Judge the SUBSCRIPTION before subscribing it to anything: Go's
+                        // `serveWatchIPNBus` runs all of its refusals ahead of `WatchNotifications`,
+                        // so a refused watcher never takes a resource and never emits a frame. A
+                        // refusal is a request-level error like a denied `nc` — write the error line
+                        // and keep the request loop alive, because this connection was never
+                        // hijacked. Nothing on today's wire can trigger it (see
+                        // `watch_usage_refusal`); the call sits here so that the day a mask field
+                        // carrying one of Go's refusals lands, the refusal is already wired.
+                        if let Some(message) = watch_usage_refusal(&Request::Watch {
+                            initial_state,
+                            initial_netmap,
+                            prefs,
+                            policy,
+                            suggested_exit_node,
+                            initial_status,
+                        }) {
+                            write_response(&mut write_half, &Response::Error { message }).await?;
+                            continue;
+                        }
                         // A long-lived stream: take a permit from the SEPARATE stream budget so a
                         // flood of `Watch` connections can't starve the short-lived control pool. If
                         // the stream budget is exhausted, refuse cleanly (the client can retry) rather
@@ -254,7 +439,13 @@ async fn handle_conn(
                             .await?;
                             break;
                         };
-                        if !initial_state && !initial_netmap && !prefs {
+                        if !initial_state
+                            && !initial_netmap
+                            && !prefs
+                            && !policy
+                            && !suggested_exit_node
+                            && !initial_status
+                        {
                             // Bare watch → the legacy status-stream path, untouched.
                             stream_watch(&mut write_half, &backend).await?;
                         } else {
@@ -265,6 +456,9 @@ async fn handle_conn(
                                 initial_state,
                                 initial_netmap,
                                 prefs,
+                                policy,
+                                suggested_exit_node,
+                                initial_status,
                             )
                             .await?;
                         }
@@ -318,6 +512,90 @@ async fn handle_conn(
                         if stream_nc(&mut reader, &mut write_half, &backend, &host, port).await? {
                             break;
                         }
+                    }
+                    // `debug portmap` is terminal for this connection like `Watch`: it takes over
+                    // the socket and streams one log line per frame until the run ends. It is a
+                    // WRITE (it asks the LAN gateway to forward traffic inward), so it is authorized
+                    // here before anything is sent, exactly like `nc`.
+                    Ok(req @ Request::DebugPortmap { .. }) => {
+                        if auth::authorize(&req, access).is_err() {
+                            tracing::warn!(peer_uid = ?peer_uid, "denied LocalAPI debug portmap: caller lacks write permission");
+                            write_response(
+                                &mut write_half,
+                                &Response::Error {
+                                    message: "permission denied: debug portmap requires root or the same user that owns the daemon".into(),
+                                },
+                            )
+                            .await?;
+                            continue;
+                        }
+                        // A long-lived stream (up to the requested duration): take a permit from the
+                        // SEPARATE stream budget, after the auth check so a denied run never consumes
+                        // one. If exhausted, refuse cleanly and keep serving this peer.
+                        let Ok(_stream_permit) = Arc::clone(&stream_limit).try_acquire_owned()
+                        else {
+                            tracing::warn!("LocalAPI: stream cap reached; refusing debug portmap");
+                            write_response(
+                                &mut write_half,
+                                &Response::Error {
+                                    message: "too many concurrent watch/nc streams; try again"
+                                        .into(),
+                                },
+                            )
+                            .await?;
+                            continue;
+                        };
+                        // Audit the GRANT of a sensitive op (asking the router to open a hole).
+                        tracing::info!(peer_uid = ?peer_uid, "debug portmap started");
+                        stream_debug_portmap(&mut write_half, req).await?;
+                        break;
+                    }
+                    // `shutdown` is terminal for this connection AND for the daemon, so like `Watch`
+                    // and `nc` it is handled here rather than in `dispatch`: the ORDER of "answer the
+                    // caller, then stop" is the port (Go writes its 200 and FLUSHES before publishing
+                    // the `localapi.Shutdown` event), and `dispatch` cannot express it — it returns a
+                    // response that the caller of `dispatch` writes afterwards, which would stop the
+                    // daemon while its acknowledgement was still unwritten.
+                    //
+                    // Both refusals keep the request loop alive (`continue`): a caller that was told
+                    // "no" still has a usable connection, exactly as a refused `POST` leaves Go's
+                    // HTTP connection open.
+                    Ok(Request::Shutdown) => {
+                        if let Err(refusal) = shutdown_verdict(access, shutdown_allowed_by_policy())
+                        {
+                            // Audit every refused attempt to stop the daemon, naming which rung
+                            // answered — an unauthorized caller probing the socket and a permitted
+                            // caller hitting a policy that says no are different events. The
+                            // remediation rides here rather than on the wire: the caller gets Go's
+                            // bare phrase, the operator who can act on it gets the whole story.
+                            tracing::warn!(
+                                peer_uid = ?peer_uid,
+                                refusal = ?refusal,
+                                hint = refusal.hint(),
+                                "denied LocalAPI shutdown"
+                            );
+                            write_response(
+                                &mut write_half,
+                                &Response::Error {
+                                    message: refusal.message().into(),
+                                },
+                            )
+                            .await?;
+                            continue;
+                        }
+                        // Acknowledge FIRST, so the caller learns its request was accepted even
+                        // though the daemon is about to stop answering. `write_response` flushes.
+                        write_response(
+                            &mut write_half,
+                            &Response::Ok {
+                                message: "shutdown accepted; the daemon is stopping".into(),
+                            },
+                        )
+                        .await?;
+                        // Audit the GRANT: this is the one LocalAPI verb that ends the process.
+                        tracing::info!(peer_uid = ?peer_uid, "LocalAPI shutdown accepted");
+                        stop_requested.notify_one();
+                        break;
                     }
                     Ok(req) => {
                         let response = dispatch(req, access, peer_uid, &backend).await;
@@ -462,6 +740,44 @@ async fn stream_watch(
 /// `NotifyInitialNetMap`). So each new epoch re-subscribes WITH the mask and the engine re-delivers a
 /// fresh initial snapshot for the replacement device — no manual snapshot needed here.
 ///
+/// The DAEMON-built feeds do need a manual front-load. Two get one before the first epoch: prefs
+/// (Go `NotifyInitialPrefs`) and the effective system policy (Go `NotifySysPolicyChanges`, whose
+/// documented contract is that the first notify — sent immediately — carries the current snapshot).
+/// Neither is tied to a device epoch: prefs change on a down node, and policy is resolved from the
+/// process-global registry rather than the netmap, so both are also served on the device-less arm.
+///
+/// The third — the exit-node suggestion (Go `NotifyInitialSuggestedExitNode`) — is the exception: it
+/// cannot be computed without a live device, so its front-load runs INSIDE the epoch loop, once the
+/// device is in hand, and therefore runs again for a replacement device. That is the right place
+/// anyway: the previous epoch's suggestion was ranked against an engine that no longer exists.
+///
+/// A fourth daemon-built front-load, the `initial_status` snapshot (Go `NotifyInitialStatus`), is
+/// ordered against the engine's bus rather than ahead of it, and is never repeated, not even for a
+/// replacement device. While it is owed, the first epoch subscribes the bus widened to
+/// `INITIAL_STATE | INITIAL_NETMAP`, waits for that subscription's initial frame (the point at which
+/// the bus task has read the engine's cells), and only then takes the snapshot. It goes out on the
+/// same frame as the requested part of that engine front-load, as the session's first frame, so it
+/// carries the owed session id. The prefs, policy and exit-node-suggestion front-loads are held
+/// back until after it. With no device, or when the bus subscribe fails, there is no bus to order
+/// against and the snapshot goes out at once. What that order guarantees, and the one window it
+/// leaves, is documented on
+/// [`NotifyView::initial_status`](crate::localapi::NotifyView::initial_status).
+///
+/// ## A reader that falls behind is NOT told (engine gap, `docs/ENGINE_ASKS.md` #45)
+///
+/// Frames are written to the socket inline, so a slow client stalls `watcher.next()` and the engine's
+/// 128-deep per-watcher queue fills. Go disconnects such a watcher: `sendToLocked` drains its queue,
+/// sends one terminal `Notify` whose `ErrMessage` is `"IPN bus consumer fell behind; closing watch"`,
+/// and closes it, so the client knows to re-subscribe. The engine's bus instead drops the frame and
+/// keeps streaming, and records nothing, so this function cannot tell a gap happened. It does not
+/// guess (a write timeout or a queue-depth estimate would be a facsimile). Once the engine reports
+/// lag, the handling is: drop the watcher (discarding queued frames), write one
+/// [`NotifyView::error`](crate::localapi::NotifyView::error) frame, return — in that order.
+///
+/// The daemon-built prefs, policy and exit-node-suggestion feeds are not affected: they ride
+/// `tokio::sync::watch`, which coalesces to the latest value instead of dropping an entry, so a slow
+/// reader loses nothing.
+///
 /// ## Lock discipline (the load-bearing rule)
 ///
 /// The backend guard is held only for the brief `watch_lifecycle()` subscribe and the brief
@@ -470,19 +786,26 @@ async fn stream_watch(
 /// device `Arc` out under the lock, drop the lock, then subscribe + stream off-lock — exactly the
 /// "clone the work out, drop the lock" discipline [`stream_nc`] and the other slow engine calls use —
 /// so a notify watcher never head-of-line blocks a concurrent `up`/`down`/`status`.
+///
+/// One bool per `Request::Watch` mask field, destructured at the single call site, so the argument
+/// list grows with the mask rather than hiding it behind a struct that would mirror the request.
+#[allow(clippy::too_many_arguments)]
 async fn stream_notify(
     write_half: &mut tokio::net::unix::OwnedWriteHalf,
     backend: &Arc<Mutex<Backend>>,
     initial_state: bool,
     initial_netmap: bool,
     prefs: bool,
+    policy: bool,
+    suggested_exit_node: bool,
+    initial_status: bool,
 ) -> Result<()> {
     use tailscale::NotifyWatchOpt;
 
     // Translate the request's ENGINE mask bools into the engine's `NotifyWatchOpt` once (the same mask
     // is re-applied to every epoch's fresh subscription so a replacement device front-loads its
     // snapshot too). `empty()` carries no initial snapshot; each requested bit adds its front-load.
-    // (`prefs` is daemon-built, NOT an engine bit, so it is handled separately below.)
+    // (`prefs` and `policy` are daemon-built, NOT engine bits, so they are handled separately below.)
     let mut mask = NotifyWatchOpt::empty();
     if initial_state {
         mask = mask | NotifyWatchOpt::INITIAL_STATE;
@@ -491,19 +814,60 @@ async fn stream_notify(
         mask = mask | NotifyWatchOpt::INITIAL_NETMAP;
     }
 
-    // Subscribe to lifecycle (and, when the `prefs` bit is set, prefs-change ticks) BEFORE deriving the
-    // first device so a transition landing between the device clone and the subscribe is never lost
-    // (`subscribe()` starts synced) — the same ordering `stream_watch` relies on. The prefs watcher is
-    // independent of the device epoch (prefs change whether or not the node is up), so it lives across
-    // the outer loop and is selected in BOTH the device-present and device-absent arms.
-    let (mut life, mut prefs_rx) = {
+    // Subscribe to lifecycle (and, when their bits are set, prefs-change ticks and exit-node-suggestion
+    // pushes) BEFORE deriving the first device so a change landing between the device clone and the
+    // subscribe is never lost (`subscribe()` starts synced) — the same ordering `stream_watch` relies
+    // on. Both daemon-built watchers are independent of the device epoch (prefs change whether or not
+    // the node is up, and a suggestion published by another connection outlives this epoch), so they
+    // live across the outer loop and are selected in BOTH the device-present and device-absent arms.
+    let (mut life, mut prefs_rx, mut suggested_rx) = {
         let be = backend.lock().await;
-        (be.watch_lifecycle(), be.watch_prefs())
+        (
+            be.watch_lifecycle(),
+            be.watch_prefs(),
+            be.watch_suggested_exit_node(),
+        )
+    };
+    // The policy registry is process-global (like Go's `rsop` store list), so its tick channel is
+    // subscribed WITHOUT the backend lock — but still before the first device is derived, for the same
+    // reason: a reload landing between here and the first select must not be lost.
+    let mut policy_rx = Backend::watch_policy();
+
+    // One identity per connection, minted before the first frame and kept across device epochs: the
+    // session id goes out once, on whichever frame is written first.
+    let mut session = match NotifySession::new(initial_state) {
+        Ok(session) => session,
+        Err(e) => {
+            let _ = write_response(
+                write_half,
+                &Response::Error {
+                    message: e.to_string(),
+                },
+            )
+            .await;
+            return Ok(());
+        }
     };
 
-    // `prefs` front-load: emit the current prefs as the first frame (Go `NotifyInitialPrefs`). Done
+    // `initial_status` front-load (Go `NotifyInitialStatus`): owed until the first epoch sends it,
+    // then never again (Go carries it in the first `Notify` only). While it is owed, the prefs and
+    // policy front-loads below wait for it, so the snapshot stays the session's first frame.
+    let mut status_pending = initial_status;
+
+    // `prefs` front-load: emit the current prefs (Go `NotifyInitialPrefs`) as the first frame. Done
     // once up front (daemon-built, not tied to a device epoch). A write error = client gone.
-    if prefs && emit_prefs_frame(write_half, backend).await.is_err() {
+    if prefs
+        && !status_pending
+        && emit_prefs_frame(write_half, &mut session, backend)
+            .await
+            .is_err()
+    {
+        return Ok(());
+    }
+    // `policy` front-load: Go's `NotifySysPolicyChanges` explicitly makes the FIRST notify — sent
+    // immediately — carry the current effective snapshot, so this is part of the bit's contract, not
+    // an optimisation. Also daemon-built and epoch-independent.
+    if policy && !status_pending && emit_policy_frame(write_half, &mut session).await.is_err() {
         return Ok(());
     }
 
@@ -515,6 +879,20 @@ async fn stream_notify(
         let dev = { backend.lock().await.device_handle() };
 
         let Some(dev) = dev else {
+            // No bus to order an owed status snapshot against, so it goes out now. An `up` landing
+            // after it still wakes `life`, which was subscribed before the snapshot was taken.
+            if std::mem::take(&mut status_pending)
+                && emit_status_front_loads(write_half, &mut session, backend, None, prefs, policy)
+                    .await
+                    .is_err()
+            {
+                return Ok(()); // client hung up
+            }
+            // No engine frame is coming, so a still-unsent session id goes out on its own now. A
+            // no-op when the snapshot above already carried it.
+            if flush_session_id(write_half, &mut session).await.is_err() {
+                return Ok(()); // client hung up
+            }
             // No device this epoch: nothing to stream from the bus. Wait for the next lifecycle change
             // — but ALSO keep serving prefs ticks if the `prefs` bit is set (prefs can change while the
             // node is down, e.g. a `set` on a down node), so a prefs watcher isn't deaf between epochs.
@@ -529,7 +907,36 @@ async fn stream_notify(
                     if res.is_err() {
                         return Ok(()); // prefs sender dropped (daemon gone)
                     }
-                    if emit_prefs_frame(write_half, backend).await.is_err() {
+                    if emit_prefs_frame(write_half, &mut session, backend).await.is_err() {
+                        return Ok(()); // client hung up
+                    }
+                    continue; // still no device — loop back to the device-derive/wait
+                }
+                // Policy ticks are served on the device-less path too: policy is resolved from the
+                // registry, not the netmap, so a policy change on a down node is just as real as one
+                // on a running node. (A tick only ever means the effective policy MOVED — see
+                // `syspolicy::reload_and_publish` — so every frame emitted here carries new rows.)
+                res = policy_rx.changed(), if policy => {
+                    if res.is_err() {
+                        return Ok(()); // policy sender dropped (process gone)
+                    }
+                    if emit_policy_frame(write_half, &mut session).await.is_err() {
+                        return Ok(()); // client hung up
+                    }
+                    continue; // still no device — loop back to the device-derive/wait
+                }
+                // Suggestion pushes are served here too. Nothing can compute a suggestion while this
+                // watcher has no device, but the backend is shared: a concurrent `up` plus another
+                // connection's `exit-node suggest` can publish before this loop re-derives, and a
+                // watcher that was deaf between epochs would miss it.
+                res = suggested_rx.changed(), if suggested_exit_node => {
+                    if res.is_err() {
+                        return Ok(()); // suggestion sender dropped (daemon gone)
+                    }
+                    let id = suggested_rx.borrow_and_update().clone();
+                    if let Some(id) = id
+                        && emit_suggested_exit_node_frame(write_half, &mut session, &id).await.is_err()
+                    {
                         return Ok(()); // client hung up
                     }
                     continue; // still no device — loop back to the device-derive/wait
@@ -537,13 +944,89 @@ async fn stream_notify(
             }
         };
 
+        // `suggested_exit_node` front-load (Go `NotifyInitialSuggestedExitNode`): compute this
+        // device's suggestion and send it to this client. The computation also publishes it to EVERY
+        // watcher when it differs from the last one — that is where the ongoing half of this feed
+        // lives, so the front-load and the broadcast can never disagree. It computes only in
+        // `Running` and is time-bounded, because it runs before the bus watcher below is attached: a
+        // `NeedsLogin` engine would otherwise hold back the state frame and the login URL until the
+        // node was authorised (see `Backend::front_load_suggested_exit_node`).
+        //
+        // Read the value back off our own receiver rather than out of the response: `borrow_and_update`
+        // both takes the current published value and marks it seen, so our own compute's push does not
+        // come round again as a duplicate frame on the select below. An empty answer leaves the cell
+        // untouched (see `publish_suggested_exit_node`), which is exactly why the cell — not the
+        // response — is the right thing to front-load: a watcher joining after a withheld suggestion
+        // sees the same value every other watcher holds, instead of a gap only it has.
+        //
+        // While the status snapshot is owed it runs after the snapshot instead (below), so that the
+        // snapshot is the session's first frame.
+        if suggested_exit_node
+            && !status_pending
+            && emit_suggested_exit_node_front_load(
+                write_half,
+                &mut session,
+                backend,
+                &dev,
+                &mut suggested_rx,
+            )
+            .await
+            .is_err()
+        {
+            return Ok(()); // client hung up
+        }
+
         // Attach a fresh IPN-bus watcher OFF-LOCK. The mask front-loads this device's current
         // state/peer set as the first `Notify` (so a replacement device re-snapshots). On failure the
         // device is already gone/closing — fall through to wait on the next lifecycle change.
-        let mut watcher = match dev.watch_ipn_bus(mask).await {
+        //
+        // While the status snapshot is owed, the engine is also asked for its initial state and
+        // netmap. The engine always sends that frame, because the state is always set, and it sends
+        // it once its bus task has read the engine's cells: every change after that point is queued
+        // on this watcher. `watch_ipn_bus` returning means only that the task was spawned, so this
+        // frame is the one signal that a snapshot taken now cannot lose a later transition.
+        let bus_mask = if status_pending {
+            mask | NotifyWatchOpt::INITIAL_STATE | NotifyWatchOpt::INITIAL_NETMAP
+        } else {
+            mask
+        };
+        let mut watcher = match dev.watch_ipn_bus(bus_mask).await {
             Ok(w) => w,
             Err(e) => {
                 tracing::debug!(error = %e, "watch_ipn_bus failed; awaiting lifecycle change");
+                // No bus to order against: an owed snapshot does not wait for the next change.
+                if std::mem::take(&mut status_pending) {
+                    if emit_status_front_loads(
+                        write_half,
+                        &mut session,
+                        backend,
+                        None,
+                        prefs,
+                        policy,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return Ok(()); // client hung up
+                    }
+                    if suggested_exit_node
+                        && emit_suggested_exit_node_front_load(
+                            write_half,
+                            &mut session,
+                            backend,
+                            &dev,
+                            &mut suggested_rx,
+                        )
+                        .await
+                        .is_err()
+                    {
+                        return Ok(()); // client hung up
+                    }
+                }
+                // No engine frame is coming either. A no-op when the snapshot carried the id.
+                if flush_session_id(write_half, &mut session).await.is_err() {
+                    return Ok(()); // client hung up
+                }
                 if life.changed().await.is_err() {
                     return Ok(());
                 }
@@ -553,7 +1036,62 @@ async fn stream_notify(
         // Release the device Arc before parking on the selects below: holding it would keep the old
         // engine alive across a concurrent `down` (the documented `Arc::into_inner` clone-count
         // concern in `device_handle`). The watcher reads cloned `watch` receivers internally, so it
-        // does not need our `Arc` to keep streaming.
+        // does not need our `Arc` to keep streaming. A `Weak` stays behind so a netmap tick can ask
+        // THIS epoch's device for its self node (Go `Notify.SelfChange`) without keeping the engine
+        // alive between ticks. `had_self` records whether this epoch has already given us one: the
+        // engine's self-node cell is never cleared once set, so from then on the query cannot wait.
+        let epoch_dev = Arc::downgrade(&dev);
+        let mut had_self = false;
+
+        if std::mem::take(&mut status_pending) {
+            // Prompt by construction: the bus task pushes its initial frame into a fresh channel as
+            // soon as it runs, or ends (closing the channel) if the runtime is already shutting down.
+            let first = watcher.next().await;
+            let bus_closed = first.is_none();
+            // Forward only the parts of the engine's front-load this client asked for.
+            let engine_initial = match first {
+                Some(notify) => {
+                    let notify = retain_requested_initial(notify, initial_state, initial_netmap);
+                    let self_change = if notify.net_map.is_some() {
+                        ipn::fetch_self_report(&dev, had_self).await
+                    } else {
+                        None
+                    };
+                    had_self |= self_change.is_some();
+                    project_notify(notify, self_change)
+                }
+                None => None,
+            };
+            if emit_status_front_loads(
+                write_half,
+                &mut session,
+                backend,
+                engine_initial,
+                prefs,
+                policy,
+            )
+            .await
+            .is_err()
+            {
+                return Ok(()); // client hung up
+            }
+            if suggested_exit_node
+                && emit_suggested_exit_node_front_load(
+                    write_half,
+                    &mut session,
+                    backend,
+                    &dev,
+                    &mut suggested_rx,
+                )
+                .await
+                .is_err()
+            {
+                return Ok(()); // client hung up
+            }
+            if bus_closed {
+                continue; // re-derive at the top, exactly as the inner loop does on a closed bus
+            }
+        }
         drop(dev);
 
         // Inner loop: stream this epoch's notifications, but also break out on a lifecycle change so a
@@ -567,16 +1105,27 @@ async fn stream_notify(
                         // arm and wait.
                         None => break,
                         Some(notify) => {
-                            let Some(view) = project_notify(notify) else {
+                            // Go re-sends the self node with every netmap update (`SelfChange`) and
+                            // the engine's bus carries only peers, so a netmap tick fetches it here.
+                            // The upgraded `Arc` lives only for the bounded query; a `down` racing it
+                            // sees the benign extra clone `device_handle` documents. A netmap that
+                            // changes only this node sends no tick at all, so it is not fetched here
+                            // either (engine gap, `docs/ENGINE_ASKS.md` #46); no timer polls for it.
+                            let self_change = if notify.net_map.is_none() {
+                                None
+                            } else if let Some(dev) = epoch_dev.upgrade() {
+                                ipn::fetch_self_report(&dev, had_self).await
+                            } else {
+                                None
+                            };
+                            had_self |= self_change.is_some();
+                            let Some(view) = project_notify(notify, self_change) else {
                                 // An all-empty Notify never occurs (the engine's bus skips empties),
                                 // but if one ever arrived there is nothing to send — skip it rather
                                 // than emit a meaningless frame.
                                 continue;
                             };
-                            if write_response(write_half, &Response::Notify(view))
-                                .await
-                                .is_err()
-                            {
+                            if write_notify(write_half, &mut session, view).await.is_err() {
                                 return Ok(()); // client hung up
                             }
                         }
@@ -596,7 +1145,33 @@ async fn stream_notify(
                     if res.is_err() {
                         return Ok(()); // prefs sender dropped (daemon gone)
                     }
-                    if emit_prefs_frame(write_half, backend).await.is_err() {
+                    if emit_prefs_frame(write_half, &mut session, backend).await.is_err() {
+                        return Ok(()); // client hung up
+                    }
+                }
+                // Policy ticks (only armed when the `policy` bit is set): emit a fresh snapshot in
+                // place, without disturbing this device epoch's bus stream.
+                res = policy_rx.changed(), if policy => {
+                    if res.is_err() {
+                        return Ok(()); // policy sender dropped (process gone)
+                    }
+                    if emit_policy_frame(write_half, &mut session).await.is_err() {
+                        return Ok(()); // client hung up
+                    }
+                }
+                // Exit-node-suggestion pushes (only armed when the `suggested_exit_node` bit is set).
+                // The channel fires only when a computed suggestion DIFFERS from the last published
+                // one, so a stable answer never reaches here however often it is recomputed — and the
+                // computation that fired it may well have been another connection's `exit-node
+                // suggest`, which is the point (Go sends to `allClients`).
+                res = suggested_rx.changed(), if suggested_exit_node => {
+                    if res.is_err() {
+                        return Ok(()); // suggestion sender dropped (daemon gone)
+                    }
+                    let id = suggested_rx.borrow_and_update().clone();
+                    if let Some(id) = id
+                        && emit_suggested_exit_node_frame(write_half, &mut session, &id).await.is_err()
+                    {
                         return Ok(()); // client hung up
                     }
                 }
@@ -605,22 +1180,234 @@ async fn stream_notify(
     }
 }
 
+/// The version a notify frame states (Go fills `Notify.Version` with `version.Long()`). The same
+/// string the `version` verb answers with, so a watcher and `tnet version --daemon` agree.
+const NOTIFY_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Per-connection identity for a masked watch: the two fields Go's notify path puts on frames that
+/// no feed produces. `version` goes on every frame; the session id goes on the first frame only, and
+/// only when the watch asked for `initial_state` (Go `WatchNotificationsAs` gates `SessionID` on
+/// `NotifyInitialState`). Every frame of a masked watch goes through [`stamp`](Self::stamp), so no
+/// feed can forget either field.
+///
+/// The id is not yet load-bearing — see [`Request::Watch::initial_state`](crate::localapi::Request::Watch).
+struct NotifySession {
+    /// The session id still waiting for its first frame; `None` once sent, or if never asked for.
+    pending_id: Option<String>,
+}
+
+impl NotifySession {
+    /// Mint the session for one connection. Fails only if the OS entropy source does.
+    fn new(initial_state: bool) -> std::io::Result<Self> {
+        let pending_id = if initial_state {
+            Some(new_session_id()?)
+        } else {
+            None
+        };
+        Ok(Self { pending_id })
+    }
+
+    /// Whether the session id has yet to go out.
+    fn is_pending(&self) -> bool {
+        self.pending_id.is_some()
+    }
+
+    /// Fill the identity fields on a frame about to be written. A version already on the frame is
+    /// kept, as Go's `sendToLocked` only fills an empty `Version`.
+    fn stamp(&mut self, mut view: crate::localapi::NotifyView) -> crate::localapi::NotifyView {
+        if view.version.is_none() {
+            view.version = Some(NOTIFY_VERSION.to_string());
+        }
+        view.session_id = self.pending_id.take();
+        view
+    }
+}
+
+/// A fresh watch session id: 16 hex characters from the OS CSPRNG, the shape of Go's
+/// `rands.HexString(16)`. Random rather than a counter so an id is not reused across daemon restarts
+/// either; 64 random bits makes a repeat among live watches negligible.
+fn new_session_id() -> std::io::Result<String> {
+    let mut bytes = [0u8; 8];
+    getrandom::fill(&mut bytes)
+        .map_err(|e| std::io::Error::other(format!("generating a watch session id: {e}")))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Write one notify frame, stamped with the session's identity fields. Returns `Err` if the client
+/// hung up.
+async fn write_notify(
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    session: &mut NotifySession,
+    view: crate::localapi::NotifyView,
+) -> Result<()> {
+    write_response(write_half, &Response::Notify(session.stamp(view))).await
+}
+
+/// If the session id has not gone out yet, send it now on a frame carrying only the identity fields.
+/// Called before parking where no engine frame is coming (no device, or the bus subscribe failed), so
+/// a client that reads one frame for its id — as Go's foreground `serve` does — is not left waiting
+/// for an `up`. Returns `Err` if the client hung up.
+async fn flush_session_id(
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    session: &mut NotifySession,
+) -> Result<()> {
+    if !session.is_pending() {
+        return Ok(());
+    }
+    write_notify(write_half, session, crate::localapi::NotifyView::default()).await
+}
+
 /// Emit one `Response::Notify { prefs: Some(current prefs) }` frame (the daemon-built prefs feed).
 /// A brief await-free lock reads the projection; returns `Err` if the client hung up (so the caller
 /// returns `Ok(())` and ends the stream). Shared by the front-load + both prefs select arms.
 async fn emit_prefs_frame(
     write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    session: &mut NotifySession,
     backend: &Arc<Mutex<Backend>>,
 ) -> Result<()> {
     let view = { backend.lock().await.prefs_view() };
-    write_response(
+    write_notify(
         write_half,
-        &Response::Notify(crate::localapi::NotifyView {
+        session,
+        crate::localapi::NotifyView {
             prefs: Some(view),
             ..Default::default()
-        }),
+        },
     )
     .await
+}
+
+/// Emit one `Response::Notify { policy: Some(effective snapshot) }` frame (the daemon-built policy
+/// feed; Go's `sysPolicyChangedForSession`, which fetches a fresh snapshot and sends it to the one
+/// session whose watch asked for it).
+///
+/// Takes no backend: policy resolution reads the process-global registry, not backend/engine state,
+/// so this never touches the lock — and a `syspolicy reload` therefore cannot be head-of-line blocked
+/// by a slow `up`. Returns `Err` if the client hung up (so the caller returns `Ok(())` and ends the
+/// stream). Shared by the front-load + both policy select arms.
+async fn emit_policy_frame(
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    session: &mut NotifySession,
+) -> Result<()> {
+    write_notify(
+        write_half,
+        session,
+        crate::localapi::NotifyView {
+            policy: Some(Backend::policy_snapshot()),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// Emit one `Response::Notify { suggested_exit_node: Some(id) }` frame (the daemon-built exit-node
+/// suggestion feed; Go's `b.sendToLocked(ipn.Notify{SuggestedExitNode: &res.ID}, allClients)`).
+///
+/// Carries the bare stable node id, as Go does — the human-facing name belongs to the `exit-node
+/// suggest` reply. Takes no backend: the id has already been read off the suggestion channel by the
+/// caller, so this never touches the lock. Like every other feed it goes out through
+/// [`write_notify`], so it carries the version, and the session id when it is the watch's first frame
+/// (the per-epoch front-load can be). Returns `Err` if the client hung up (so the caller returns
+/// `Ok(())` and ends the stream). Shared by the per-epoch front-load + both suggestion select arms.
+async fn emit_suggested_exit_node_frame(
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    session: &mut NotifySession,
+    id: &str,
+) -> Result<()> {
+    write_notify(
+        write_half,
+        session,
+        crate::localapi::NotifyView {
+            suggested_exit_node: Some(id.to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// The per-epoch `suggested_exit_node` front-load: compute this device's suggestion, then send this
+/// client the value its own receiver now holds, if any. See the call site in [`stream_notify`] for why
+/// the value is read back off the receiver rather than out of the computation. Returns `Err` if the
+/// client hung up.
+async fn emit_suggested_exit_node_front_load(
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    session: &mut NotifySession,
+    backend: &Arc<Mutex<Backend>>,
+    dev: &tailscale::Device,
+    suggested_rx: &mut tokio::sync::watch::Receiver<Option<String>>,
+) -> Result<()> {
+    Backend::front_load_suggested_exit_node(backend, dev).await;
+    let id = suggested_rx.borrow_and_update().clone();
+    match id {
+        Some(id) => emit_suggested_exit_node_frame(write_half, session, &id).await,
+        None => Ok(()),
+    }
+}
+
+/// Send the session's opening frames for a watch that set `initial_status`: the status snapshot,
+/// then the prefs and policy front-loads the watch asked for.
+///
+/// The snapshot is taken HERE, after the caller has received `engine_initial` from the bus, never
+/// before it: that is what makes a transition landing after it streamed rather than lost. It goes out
+/// on the same frame as `engine_initial` (the requested part of the engine's own front-load, if any),
+/// so the session's first frame carries both, and the session id when one is owed. `status()` bounds
+/// its engine query, so the backend lock is held briefly, as for a one-shot `status`. Returns `Err`
+/// if the client hung up.
+async fn emit_status_front_loads(
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    session: &mut NotifySession,
+    backend: &Arc<Mutex<Backend>>,
+    engine_initial: Option<crate::localapi::NotifyView>,
+    prefs: bool,
+    policy: bool,
+) -> Result<()> {
+    let report = { backend.lock().await.status().await };
+    write_notify(
+        write_half,
+        session,
+        with_initial_status(engine_initial, report),
+    )
+    .await?;
+    if prefs {
+        emit_prefs_frame(write_half, session, backend).await?;
+    }
+    if policy {
+        emit_policy_frame(write_half, session).await?;
+    }
+    Ok(())
+}
+
+/// The session's first frame for an `initial_status` watch: the requested part of the engine's
+/// initial frame, if any, with the status snapshot on it.
+fn with_initial_status(
+    engine_initial: Option<crate::localapi::NotifyView>,
+    report: crate::localapi::StatusReport,
+) -> crate::localapi::NotifyView {
+    crate::localapi::NotifyView {
+        initial_status: Some(Box::new(report)),
+        ..engine_initial.unwrap_or_default()
+    }
+}
+
+/// Strip from the engine's initial frame the front-loads this client did not ask for.
+///
+/// While a status snapshot is owed, `stream_notify` widens the engine mask to
+/// `INITIAL_STATE | INITIAL_NETMAP` so it can tell when the bus has read the engine. A watcher that
+/// did not set those bits must still not be sent those snapshots. `browse_to_url` goes with `state`:
+/// in the initial frame the engine derives it from `NeedsLogin`, and only under `INITIAL_STATE`.
+fn retain_requested_initial(
+    mut notify: tailscale::Notify,
+    initial_state: bool,
+    initial_netmap: bool,
+) -> tailscale::Notify {
+    if !initial_state {
+        notify.state = None;
+        notify.browse_to_url = None;
+    }
+    if !initial_netmap {
+        notify.net_map = None;
+    }
+    notify
 }
 
 /// Project one engine [`Notify`](tailscale::Notify) into the LocalAPI [`NotifyView`] wire shape,
@@ -634,7 +1421,14 @@ async fn emit_prefs_frame(
 /// engine carries the interactive-login URL in its own `browse_to_url` field (derived from
 /// `NeedsLogin`), so the auth-URL component of the state mapping is intentionally dropped here — the
 /// URL is sourced from `browse_to_url`, never duplicated out of `state`.
-fn project_notify(notify: tailscale::Notify) -> Option<crate::localapi::NotifyView> {
+///
+/// `self_change` is the self node the caller fetched for this tick (Go `Notify.SelfChange`). It is
+/// attached only to a frame that carries `net_map` — Go builds `SelfChange` on the netmap-update path
+/// and nowhere else — so a state or URL frame never carries a self view, whatever it was handed.
+fn project_notify(
+    notify: tailscale::Notify,
+    self_change: Option<crate::localapi::SelfReport>,
+) -> Option<crate::localapi::NotifyView> {
     let (state, error) = match notify.state {
         Some(ds) => {
             let (state, error) = ipn::notify_state_from_device(ds);
@@ -649,16 +1443,26 @@ fn project_notify(notify: tailscale::Notify) -> Option<crate::localapi::NotifyVi
             .collect()
     });
     let browse_to_url = notify.browse_to_url.map(|u| u.to_string());
+    let self_change = net_map.as_ref().and(self_change);
 
     let view = crate::localapi::NotifyView {
+        // The identity fields are not engine fields either: `NotifySession::stamp` sets them on the
+        // way out, so every frame gets them from one place whichever feed produced it.
+        version: None,
+        session_id: None,
         state,
         error,
         browse_to_url,
         net_map,
-        // `prefs` is the daemon-built field, never sourced from an engine `Notify` — `project_notify`
-        // only maps engine fields, so prefs is always `None` here (the prefs feed is emitted separately
-        // by `emit_prefs_frame`).
+        self_change,
+        // `prefs`, `policy`, `suggested_exit_node` and `initial_status` are the daemon-built fields,
+        // never sourced from an engine `Notify` — `project_notify` only maps engine fields, so all
+        // four are always `None` here (those feeds are emitted separately by `emit_prefs_frame`/
+        // `emit_policy_frame`/`emit_suggested_exit_node_frame` and `stream_notify`'s front-load).
         prefs: None,
+        policy: None,
+        suggested_exit_node: None,
+        initial_status: None,
     };
     // The engine never emits an all-`None` Notify, but guard the projection anyway: a frame with no
     // populated field carries nothing for a consumer to apply.
@@ -760,6 +1564,118 @@ async fn stream_nc(
     // we join so the connection lives as long as either direction is still flowing.
     let (_c2p, _p2c) = tokio::join!(client_to_peer, peer_to_client);
     Ok(true)
+}
+
+/// Stream a `debug portmap` run over this connection (the daemon half of Go's `serveDebugPortmap`).
+///
+/// The port-mapping client narrates itself through a synchronous log sink, while the socket write is
+/// async, so the two are joined by an unbounded channel: the sink pushes a line, and
+/// [`pump_debug_portmap`] forwards it as one [`Response::PortmapLog`] frame and flushes. When the
+/// run ends it drops its sender, the channel closes, and the pump returns — which closes the
+/// connection, exactly the EOF the CLI stops reading on.
+///
+/// A `--type` the run refuses (Go's 400 `unknown portmap debug type`) is reported as a single
+/// [`Response::Error`] frame instead, before any log line, so the CLI can exit non-zero.
+async fn stream_debug_portmap(
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    req: Request,
+) -> Result<()> {
+    let Request::DebugPortmap {
+        duration_ms,
+        ty,
+        gateway_and_self,
+        log_http,
+    } = req
+    else {
+        // Unreachable: the caller matched this variant to get here.
+        return Ok(());
+    };
+    let opts = crate::portmap::DebugPortmapOpts {
+        duration: std::time::Duration::from_millis(duration_ms),
+        ty,
+        gateway_and_self,
+        log_http,
+    };
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let logf: crate::portmap::LogSink = Arc::new(move |line: &str| {
+        // A send failure means the reader is gone (client disconnected); the pump cancels the run
+        // on its way out, so dropping the line is the whole response.
+        let _ = tx.send(line.to_string());
+    });
+
+    // Run the diagnostic on its own task so log lines are forwarded to the socket WHILE it runs
+    // rather than after it finishes (the operator is watching a live probe).
+    let run = tokio::spawn(async move { crate::portmap::debug_portmap(logf, &opts).await });
+
+    pump_debug_portmap(write_half, &mut rx, run).await
+}
+
+/// Forward one `debug portmap` run's log lines to the client until the run ends, then report its
+/// verdict. The streaming half of [`stream_debug_portmap`], split out so the cancellation contract
+/// below can be exercised with a task that would otherwise outlive the connection.
+///
+/// **The run is cancelled when this returns**, however it returns. Dropping a `JoinHandle` only
+/// *detaches* the task — it keeps running to completion with nothing left to read it — so without
+/// the guard a client that hangs up mid-run (every `write_response` below then fails with EPIPE,
+/// and `?` returns) would leave the probe holding its UDP socket and re-trying mappings for the
+/// whole client-chosen `--duration`, which has no upper bound. Go has this for free: its handler
+/// derives the run's context from the HTTP request, so a disconnect cancels the run and the
+/// handler's defers close the portmapper (`feature/debugportmapper/debugportmapper.go`,
+/// `serveDebugPortmap`). The abort guard is that context, and
+/// [`crate::portmap::debug_portmap`]'s own close-on-drop guard is those defers.
+async fn pump_debug_portmap(
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    mut run: tokio::task::JoinHandle<Result<(), String>>,
+) -> Result<()> {
+    /// Cancels the run it names when it goes out of scope, including on the `?` early returns
+    /// below. Aborting an already-finished task is a no-op, so the normal path pays nothing.
+    struct CancelOnDrop(tokio::task::AbortHandle);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _cancel = CancelOnDrop(run.abort_handle());
+
+    // Stop on whichever comes first: the sink closing, or the run returning. Both are needed. The
+    // run's own deadline is the operator's bound, but a background mapping attempt it kicked off can
+    // briefly outlive it while still holding a clone of the sink — so waiting for the channel alone
+    // could hold the connection open past the requested duration.
+    let outcome = loop {
+        tokio::select! {
+            biased;
+            line = rx.recv() => match line {
+                Some(line) => write_response(write_half, &Response::PortmapLog { line }).await?,
+                None => break run.await,
+            },
+            finished = &mut run => {
+                // Flush whatever the run queued before it returned, then stop.
+                while let Ok(line) = rx.try_recv() {
+                    write_response(write_half, &Response::PortmapLog { line }).await?;
+                }
+                break finished;
+            }
+        }
+    };
+
+    // The run is done: report its verdict. A refused `--type` is the only error it returns, and it
+    // produced no log lines, so that frame is the whole reply.
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(message)) => write_response(write_half, &Response::Error { message }).await?,
+        Err(e) => {
+            write_response(
+                write_half,
+                &Response::Error {
+                    message: format!("debug portmap run failed: {e}"),
+                },
+            )
+            .await?
+        }
+    }
+    Ok(())
 }
 
 /// Serialize one [`Response`] as a single newline-terminated JSON line and flush it.
@@ -872,6 +1788,19 @@ async fn dispatch(
         // `dispatch`; this arm exists only for match exhaustiveness.
         Request::Nc { .. } => Response::Error {
             message: "internal error: nc must be handled by the connection splicer".into(),
+        },
+        // `debug portmap` is intercepted in `handle_conn` (it takes over the connection to stream its
+        // log) and never reaches `dispatch`; this arm exists only for match exhaustiveness.
+        Request::DebugPortmap { .. } => Response::Error {
+            message: "internal error: debug portmap must be handled by the log streamer".into(),
+        },
+        // `shutdown` is intercepted in `handle_conn` (it must answer the caller BEFORE stopping the
+        // accept loop, which `dispatch`'s answer-afterwards shape cannot express) and never reaches
+        // `dispatch`; this arm exists only for match exhaustiveness. It deliberately does NOT stop
+        // the daemon: a `shutdown` that somehow arrived here took no refusal ladder, and a verb that
+        // ends the process must never be reachable by a path that did not check the policy.
+        Request::Shutdown => Response::Error {
+            message: "internal error: shutdown must be handled by the connection loop".into(),
         },
         // `version` (Go `tailscale version --daemon` reads `Status.Version`). The daemon's version is
         // its own compile-time crate version — a constant, needing no backend lock or engine.
@@ -995,7 +1924,7 @@ async fn dispatch(
         Request::SuggestExitNode => {
             let dev = { backend.lock().await.device_handle() };
             match dev {
-                Some(dev) => Backend::suggest_exit_node(&dev).await,
+                Some(dev) => Backend::suggest_exit_node(backend, &dev).await,
                 None => Response::Error {
                     message: "node is not up".into(),
                 },
@@ -1024,30 +1953,60 @@ async fn dispatch(
                 },
             }
         }
+        // `debug statedir` (Go `tailscale debug statedir` → the LocalAPI `debug` route's `statedir`
+        // action, which returns `TailscaleVarRoot()`): answer with the dir THIS daemon is using. That is
+        // the only reason the CLI asks instead of resolving its own — a root daemon under a unit that
+        // sets the dir and an unprivileged CLI resolve different paths from the same cascade. A brief
+        // lock, no engine, so it answers with the node down too (Go's does). The write-gate is enforced
+        // above by `auth::authorize`.
+        Request::DebugStateDir => {
+            let be = backend.lock().await;
+            Response::StateDir {
+                dir: be.state_dir().display().to_string(),
+            }
+        }
         // `reload-config` (Go `tailscaled`'s `reload-config` → `LocalBackend.ReloadConfig`): re-read the
         // `--config` file and adopt the changed fields into the running node. Like `Set`, this can drive
         // an off-lock device rebuild (when the node is up), so it goes through the `ipn::drive_reload_config`
         // free function — which mirrors `drive_set`'s three-phase lock discipline — rather than holding
         // the backend lock across the multi-second `Device::new` handshake. The daemon re-reads + merges
         // + persists under a brief lock, then rebuilds off-lock if a device is up; a node-down reload
-        // just persists (applies on the next `up`). `reload_config` fails clearly when there is no
-        // `--config` in use or the file is now malformed (running node untouched). The reconciled
-        // `ReloadAction` comes back so the success message can say which of those happened.
+        // just persists (applies on the next `up`). `reload_config` fails only when the
+        // file is now malformed (running node untouched); NOT being in config mode is a refusal, not
+        // a failure.
+        //
+        // The reply is Go's bare `ok` bool and nothing else. `LocalBackend.ReloadConfig` returns
+        // `(ok bool, err error)` and the CLI — not the backend — owns the two operator-facing lines,
+        // so the daemon deliberately sends no sentence of its own here: any wording invented at this
+        // layer would diverge from `tailscale debug reload-config`'s output. The reconciled
+        // `ReloadAction` is logged rather than returned, which is where it is actually useful (an
+        // operator reading the daemon log after a reload that stopped their node).
         Request::ReloadConfig => match ipn::drive_reload_config(backend).await {
-            // The reconcile that actually ran decides the confirmation: a generic "reloaded" cannot
-            // tell the operator whether their edit is RUNNING (the engine was rebuilt), whether it
-            // STOPPED the node (a reloaded `Enabled:false`), or whether it is only on disk awaiting
-            // the next `up` (node down). `ReloadAction::outcome_message` owns those strings.
-            Ok(action) => {
+            Ok(Some(action)) => {
                 tracing::info!(?action, "reload-config reconciled");
-                Response::Ok {
-                    message: action.outcome_message().to_string(),
-                }
+                Response::ReloadConfig { reloaded: true }
+            }
+            // Go's `(false, nil)`: no config in use, so nothing was reloaded and nothing failed.
+            Ok(None) => {
+                tracing::info!("reload-config: config mode not in use");
+                Response::ReloadConfig { reloaded: false }
             }
             Err(e) => Response::Error {
                 message: format!("{e:#}"),
             },
         },
+        // `service list` (Go `tailscale service list`, read-only). Off-lock device call; needs the
+        // node up (the Service set is decoded from the self node's control-delivered capability map,
+        // which only exists once a netmap has arrived — Go's handler answers `503 no netmap` here).
+        Request::Services => {
+            let dev = { backend.lock().await.device_handle() };
+            match dev {
+                Some(dev) => Backend::services(&dev).await,
+                None => Response::Error {
+                    message: "node is not up".into(),
+                },
+            }
+        }
         // `syspolicy list`/`reload` (Go `tailscale syspolicy`, read-only). NO lock + NO device:
         // policy resolution reads OS/registered policy stores, independent of node lifecycle, so it
         // works whether or not the node is up (and never touches the engine). On Linux/Unix no store
@@ -1072,10 +2031,18 @@ async fn dispatch(
             advertise_exit_node,
             advertise_routes,
             ssh,
+            auto_update,
         } => {
             let result = {
                 let be = backend.lock().await;
-                be.check_prefs(exit_node, advertise_exit_node, advertise_routes, ssh)
+                be.check_prefs(
+                    exit_node,
+                    advertise_exit_node,
+                    advertise_routes,
+                    ssh,
+                    auto_update,
+                )
+                .await
             };
             match result {
                 Ok(()) => Response::Ok {
@@ -1106,9 +2073,21 @@ async fn dispatch(
         }
         // `bugreport` (Go `tailscale bugreport`). Reads only daemon state under a brief lock (no
         // engine round-trip); works whether or not the node is up.
-        Request::BugReport { note } => {
+        //
+        // `--diagnose` (Go `BugReportOpts.Diagnose` → `LocalBackend.Doctor`) adds the checks that DO
+        // touch the OS and the engine, so they are gathered FIRST — engine handle cloned under a
+        // brief lock, lock dropped, probe run off-lock — and only then is the lock retaken to build
+        // the marker. That keeps the marker's "brief lock, no engine round-trip" promise true with
+        // the flag on, exactly as the other off-lock diagnostics do it.
+        Request::BugReport { note, diagnose } => {
+            let probe = if diagnose {
+                let dev = { backend.lock().await.device_handle() };
+                Some(Backend::diagnose_probe(dev.as_deref()).await)
+            } else {
+                None
+            };
             let be = backend.lock().await;
-            be.bugreport(note.as_deref())
+            be.bugreport(note.as_deref(), probe.as_ref())
         }
         // `serve status` (Go GetServeConfig): read the persisted serve config under a brief lock.
         Request::GetServeConfig => {
@@ -1133,39 +2112,47 @@ async fn dispatch(
         // profile under the lock (the teardown is a bounded graceful shutdown, not the multi-second
         // `Device::new` handshake, so holding the lock is correct and keeps the swap atomic). Does NOT
         // auto-up the target — the operator runs `up` if the new profile should connect.
+        //
+        // An unknown target is refused with the device untouched (Go: `No profile named %q`); making
+        // one is the separate `create_profile` request below.
         Request::SwitchProfile { target } => {
             let mut be = backend.lock().await;
-            match be.switch_profile(&target).await {
-                // The reply distinguishes "already on it" from a real switch, and names the target's
-                // settled state — see `SwitchOutcome`. The daemon log carries the resolved id, which
-                // `target` need not be (it may have been a display name).
+            switch_outcome_response(be.switch_profile(&target).await)
+        }
+        // `switch --new <id>` (this fork's stand-in for the interactive `tailscale login` that
+        // creates a profile upstream). Its own command rather than a flag on `switch_profile` so a
+        // daemon that predates it cannot silently degrade the request into a plain switch — see
+        // `Request::CreateProfile`.
+        Request::CreateProfile { id } => {
+            let mut be = backend.lock().await;
+            switch_outcome_response(be.create_profile(&id).await)
+        }
+        // `login`'s first step (Go `LocalClient.SwitchToEmptyProfile`): move to a new, empty profile
+        // so the login and its `--nickname` do not land on the profile the node was already on.
+        Request::SwitchToEmptyProfile => {
+            let mut be = backend.lock().await;
+            switch_outcome_response(be.switch_to_empty_profile().await)
+        }
+        // `switch remove <id>` (Go `tailscale switch remove`). Refuses an unknown profile, and the
+        // reserved `default` one; the CURRENT profile is left alone and reported as a success, which
+        // is what Go's `removeProfile` does (`Already on account %q`, exit 0) — see `DeleteOutcome`.
+        Request::DeleteProfile { target } => {
+            let mut be = backend.lock().await;
+            match be.delete_profile(&target).await {
+                // Report the resolved id, not the caller's argument (which may have been a name).
                 Ok(outcome) => {
                     match &outcome {
-                        crate::ipn::SwitchOutcome::AlreadyCurrent { id } => {
-                            tracing::info!(profile = %id, "switch: already on this profile; nothing changed");
+                        crate::ipn::DeleteOutcome::Removed { id } => {
+                            tracing::info!(profile = %id, "switch remove: profile deleted");
                         }
-                        crate::ipn::SwitchOutcome::Switched { id, state } => {
-                            tracing::info!(profile = %id, state = state.as_str(), "switched profile (device torn down; run `up` to connect)");
+                        crate::ipn::DeleteOutcome::AlreadyCurrent { id } => {
+                            tracing::info!(profile = %id, "switch remove: target is the current profile; nothing removed");
                         }
                     }
                     Response::Ok {
                         message: outcome.report(),
                     }
                 }
-                Err(e) => Response::Error {
-                    message: format!("{e:#}"),
-                },
-            }
-        }
-        // `switch remove <id>` (Go `tailscale switch remove`). Refuses an unknown profile, and the
-        // current/default profile.
-        Request::DeleteProfile { target } => {
-            let mut be = backend.lock().await;
-            match be.delete_profile(&target).await {
-                // Report the resolved id, not the caller's argument (which may have been a name).
-                Ok(id) => Response::Ok {
-                    message: format!("removed profile {id:?}"),
-                },
                 Err(e) => Response::Error {
                     message: format!("{e:#}"),
                 },
@@ -1179,19 +2166,28 @@ async fn dispatch(
         // one lock is correct and simplest — no concurrent `up` should interleave a half-logout.
         //
         // `--reason` (Go's, which travels as the base64 `X-Tailscale-Reason` header) is the
-        // operator's justification. This daemon registers no policy store that could *require* one
-        // and the engine has no audit-log transport to control, so what the reason buys here is a
-        // record in the daemon's own log, written before the attempt — a logout that then FAILS is
-        // exactly the record an operator reading the log later wants the justification attached to.
+        // operator's justification, and it is now load-bearing: `Backend::logout` runs the always-on
+        // gate (`ipn::alwayson`) first, so on a node whose policy file sets `AlwaysOn.Enabled` this
+        // logout can be REFUSED — with Go's message — and the reason is what lifts the refusal when
+        // `AlwaysOn.OverrideWithReason` is also set. The log line below is written before the
+        // attempt, so a logout that is refused, or that fails later, still carries the justification
+        // an operator reading the log wants attached to it. (The reason is still not forwarded to
+        // control; that half needs an engine transport — ask #41.)
         Request::Logout { reason } => {
             let mut be = backend.lock().await;
             if let Some(reason) = reason.as_deref() {
                 tracing::info!(
-                    reason = %sanitize_logout_reason(reason),
+                    peer_uid = ?peer_uid,
+                    reason = %alwayson::sanitize_request_reason(reason),
                     "logout requested with an operator-supplied reason"
                 );
             }
-            match be.logout().await {
+            match be
+                .logout(alwayson::Actor::Operator {
+                    reason: reason.as_deref(),
+                })
+                .await
+            {
                 Ok(()) => {
                     tracing::info!("logout: node deregistered + key wiped");
                     Response::Ok {
@@ -1203,9 +2199,26 @@ async fn dispatch(
                 },
             }
         }
-        Request::Down => {
+        // `down` (Go `tailscale down`): clears want-running, keeping the node key so a later `up`
+        // resumes. `--reason` (Go attaches it to the prefs edit as `apitype.RequestReasonKey`) gets
+        // the same treatment as `logout --reason` and for the same reason: `Backend::down` runs the
+        // same always-on gate, so a policy-managed node can refuse this `down`, and the log line is
+        // written BEFORE the attempt so a refused or failed `down` is still explained.
+        Request::Down { reason } => {
             let mut be = backend.lock().await;
-            match be.down().await {
+            if let Some(reason) = reason.as_deref() {
+                tracing::info!(
+                    peer_uid = ?peer_uid,
+                    reason = %alwayson::sanitize_request_reason(reason),
+                    "down requested with an operator-supplied reason"
+                );
+            }
+            match be
+                .down(alwayson::Actor::Operator {
+                    reason: reason.as_deref(),
+                })
+                .await
+            {
                 Ok(()) => {
                     tracing::info!("node down");
                     Response::Ok {
@@ -1223,21 +2236,34 @@ async fn dispatch(
         // `down`. So we follow the same "clone the work out, drop the lock" discipline as `drive_up`:
         // lock only long enough to clone the engine handle (`device_handle()`), DROP the lock, then
         // run the engine call off-lock. `Some` reproduces each method's prior behavior; `None` is the
-        // "node is not up" branch that used to live inside the method. The backend methods build the
-        // typed reply verbatim (including their own bad-input error responses).
+        // "node is not up" branch that used to live inside the method — except for `ip`, see below.
+        // The backend methods build the typed reply verbatim (including their own bad-input error
+        // responses).
+        //
+        // `ip` is the one read here that is NOT an engine operation: it asks what addresses this
+        // node holds, and a node with no engine holds none. That is an answer, not a failure, so the
+        // device-absent arm reports an EMPTY pair rather than "node is not up". Upstream settles it
+        // the same way — Go's `runIP` reads `ips := st.TailscaleIPs` off the one `Status` it fetches,
+        // and `Status` answers in every backend state with an empty `TailscaleIPs` when there is no
+        // netmap, which is what lets `runIP` reach `no current Tailscale IPs; state: %v`. Splitting
+        // that field out of `status` into its own request must not turn "none" into an error: it did,
+        // and `tnet ip` on a Stopped/NeedsLogin node printed `error: node is not up` where Go prints
+        // the state line. `whois`/`ping`/`id-token` keep the refusal — each needs a live engine to
+        // perform an action, and there is no true answer to give without one.
         Request::Ip => {
             let dev = { backend.lock().await.device_handle() };
             match dev {
                 Some(dev) => Backend::ip_report(&dev).await,
-                None => Response::Error {
-                    message: "node is not up".into(),
+                None => Response::Ip {
+                    ipv4: None,
+                    ipv6: None,
                 },
             }
         }
-        Request::Whois { ip } => {
+        Request::Whois { ip, port, proto } => {
             let dev = { backend.lock().await.device_handle() };
             match dev {
-                Some(dev) => Backend::whois(&dev, &ip).await,
+                Some(dev) => Backend::whois(&dev, &ip, port, proto).await,
                 None => Response::Error {
                     message: "node is not up".into(),
                 },
@@ -1537,34 +2563,276 @@ async fn dispatch(
     }
 }
 
-/// Harden the operator-supplied `logout --reason` text for the daemon log. The reason is free text
-/// typed by whoever ran `tnet logout`, and it lands in a log a human (or a log shipper) reads later,
-/// so it is untrusted for formatting: every control character — newline, CR, tab, ANSI escape —
-/// becomes `_` so one reason can never forge a second log line or steer a terminal, and the value is
-/// capped at [`MAX_LOGGED_REASON`] characters so a megabyte of "justification" cannot flood the log.
-/// Truncation is marked with a trailing `…` so a reader can tell the record is not the whole text.
-/// Same treatment (and same rationale) as the `bugreport` note's `sanitize_marker_note`.
-fn sanitize_logout_reason(reason: &str) -> String {
-    let mut out: String = reason
-        .chars()
-        .take(MAX_LOGGED_REASON)
-        .map(|c| if c.is_control() { '_' } else { c })
-        .collect();
-    if reason.chars().nth(MAX_LOGGED_REASON).is_some() {
-        out.push('…');
+/// Render the reply for the two profile-activation requests — `switch_profile` and `create_profile`,
+/// which differ only in how the target id is arrived at and share `Backend::activate_profile`
+/// underneath.
+///
+/// The reply distinguishes "already on it" from a real switch, and names the target's settled state
+/// — see [`SwitchOutcome`](crate::ipn::SwitchOutcome). The daemon log carries the RESOLVED id, which
+/// the caller's argument need not be (a `switch` target may have been a display name).
+fn switch_outcome_response(result: anyhow::Result<crate::ipn::SwitchOutcome>) -> Response {
+    match result {
+        Ok(outcome) => {
+            match &outcome {
+                crate::ipn::SwitchOutcome::AlreadyCurrent { id } => {
+                    tracing::info!(profile = %id, "switch: already on this profile; nothing changed");
+                }
+                crate::ipn::SwitchOutcome::Switched { id, state } => {
+                    tracing::info!(profile = %id, state = state.as_str(), "switched profile (device torn down; run `up` to connect)");
+                }
+            }
+            Response::Ok {
+                message: outcome.report(),
+            }
+        }
+        Err(e) => Response::Error {
+            message: format!("{e:#}"),
+        },
     }
-    out
 }
-
-/// Character cap applied to a logged `logout --reason` (see [`sanitize_logout_reason`]). Generous
-/// for a real justification, far below anything that would bloat the daemon log.
-const MAX_LOGGED_REASON: usize = 256;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
     use tokio::net::UnixStream;
+
+    /// Go builds `Notify.SelfChange` on the netmap-update path, re-sending the self node every time.
+    /// `project_notify` must therefore put the fetched self on a netmap frame, still stream the peers
+    /// when no self could be fetched, and never let a self view leak onto a frame that is not a
+    /// netmap tick.
+    #[test]
+    fn project_notify_attaches_self_only_to_a_netmap_frame() {
+        let me = crate::localapi::SelfReport {
+            stable_id: "nSELF1CNTRL".to_string(),
+            name: "laptop.tail0123.ts.net".to_string(),
+            ipv4: "100.64.0.1".to_string(),
+            ipv6: "fd7a:115c:a1e0::1".to_string(),
+            key_expiry: None,
+        };
+
+        let mut netmap = tailscale::Notify::default();
+        netmap.net_map = Some(Vec::new());
+        let view = project_notify(netmap.clone(), Some(me.clone())).expect("a netmap tick");
+        assert_eq!(view.net_map, Some(Vec::new()));
+        assert_eq!(view.self_change, Some(me.clone()));
+        // The status snapshot is a once-per-session front-load, never an engine tick: a netmap
+        // frame carrying self must not also carry one.
+        assert!(
+            view.initial_status.is_none(),
+            "a netmap tick must not carry the initial_status snapshot: {view:?}"
+        );
+
+        // No self node to give (none yet, or the bounded fetch failed): the peers still stream.
+        let view = project_notify(netmap, None).expect("a netmap tick without self");
+        assert_eq!(view.net_map, Some(Vec::new()));
+        assert!(view.self_change.is_none());
+
+        // A frame that is not a netmap tick carries no self, even if one was offered.
+        let mut url_only = tailscale::Notify::default();
+        url_only.browse_to_url = Some("https://login.example.com/a/1".parse().unwrap());
+        let view = project_notify(url_only, Some(me)).expect("a URL frame");
+        assert!(view.net_map.is_none());
+        assert!(
+            view.self_change.is_none(),
+            "self must not ride a non-netmap frame: {view:?}"
+        );
+    }
+
+    /// While a status snapshot is owed, `stream_notify` widens the engine mask to
+    /// `INITIAL_STATE | INITIAL_NETMAP` so it can tell when the bus has read the engine. The widened
+    /// frame must still reach the client carrying only the front-loads the client asked for.
+    #[test]
+    fn widened_initial_frame_forwards_only_the_requested_front_loads() {
+        let url = url::Url::parse("https://login.example.com/a/nodekey").unwrap();
+        let widened = || {
+            let mut n = tailscale::Notify::default();
+            n.state = Some(tailscale::DeviceState::NeedsLogin(url.clone()));
+            n.net_map = Some(Vec::new());
+            n.browse_to_url = Some(url.clone());
+            n
+        };
+
+        // Status only: nothing of the engine's front-load is forwarded, so no engine view at all.
+        assert_eq!(
+            project_notify(retain_requested_initial(widened(), false, false), None),
+            None
+        );
+
+        // Netmap only: the peer set, and no state or login URL riding along with it.
+        let netmap_only = project_notify(retain_requested_initial(widened(), false, true), None)
+            .expect("a netmap front-load was requested");
+        assert_eq!(netmap_only.net_map, Some(Vec::new()));
+        assert_eq!(netmap_only.state, None);
+        assert_eq!(netmap_only.browse_to_url, None);
+
+        // State only: the state and the login URL derived from it, and no peer set.
+        let state_only = project_notify(retain_requested_initial(widened(), true, false), None)
+            .expect("a state front-load was requested");
+        assert_eq!(state_only.state.as_deref(), Some("NeedsLogin"));
+        assert_eq!(state_only.browse_to_url, Some(url.to_string()));
+        assert_eq!(state_only.net_map, None);
+
+        // Both: the frame is forwarded whole.
+        assert_eq!(
+            retain_requested_initial(widened(), true, true),
+            widened(),
+            "nothing is stripped from a frame whose every front-load was asked for"
+        );
+    }
+
+    /// The snapshot rides the session's first frame together with whatever part of the engine's
+    /// initial frame the client asked for, and a client that asked for none of it is sent the
+    /// snapshot alone.
+    #[test]
+    fn the_status_snapshot_shares_the_first_frame_with_the_requested_engine_front_load() {
+        let report = crate::localapi::StatusReport {
+            state: "Starting".to_string(),
+            ..Default::default()
+        };
+        let mut engine = tailscale::Notify::default();
+        engine.state = Some(tailscale::DeviceState::Connecting);
+        engine.net_map = Some(Vec::new());
+
+        // Neither `initial_state` nor `initial_netmap`: the widened engine frame contributes nothing.
+        let status_only = with_initial_status(
+            project_notify(retain_requested_initial(engine.clone(), false, false), None),
+            report.clone(),
+        );
+        assert_eq!(
+            status_only,
+            crate::localapi::NotifyView {
+                initial_status: Some(Box::new(report.clone())),
+                ..Default::default()
+            },
+            "a status-only watcher must get the snapshot and no engine front-load"
+        );
+
+        // `initial_state` too: one frame carries the state and the snapshot.
+        let with_state = with_initial_status(
+            project_notify(retain_requested_initial(engine, true, false), None),
+            report.clone(),
+        );
+        assert_eq!(with_state.state.as_deref(), Some("Starting"));
+        assert_eq!(with_state.net_map, None);
+        assert_eq!(with_state.initial_status.as_deref(), Some(&report));
+    }
+
+    /// Go mints `rands.HexString(16)` per watch: 16 hex characters, fresh each time. The id will key
+    /// server-side state, so two connections must never share one.
+    #[test]
+    fn a_watch_session_id_is_sixteen_hex_chars_and_fresh_per_call() {
+        let ids: Vec<String> = (0..64).map(|_| new_session_id().unwrap()).collect();
+        for id in &ids {
+            assert_eq!(id.len(), 16, "Go's rands.HexString(16) shape, got {id:?}");
+            assert!(
+                id.chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+                "lowercase hex, got {id:?}"
+            );
+        }
+        let distinct: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(distinct.len(), ids.len(), "an id was reused: {ids:?}");
+    }
+
+    /// `initial_state` asks for the id: it rides the FIRST frame only (Go's field doc tells clients to
+    /// store it because no later frame repeats it), while `version` rides every frame.
+    #[test]
+    fn the_session_id_rides_only_the_first_frame_and_the_version_rides_all() {
+        let mut session = NotifySession::new(true).unwrap();
+        assert!(session.is_pending());
+
+        let first = session.stamp(crate::localapi::NotifyView {
+            state: Some("Running".into()),
+            ..Default::default()
+        });
+        let id = first
+            .session_id
+            .clone()
+            .expect("the first frame of an initial_state watch carries the session id");
+        assert_eq!(id.len(), 16);
+        assert_eq!(first.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        assert_eq!(
+            first.state.as_deref(),
+            Some("Running"),
+            "stamping keeps the payload"
+        );
+        assert!(!session.is_pending());
+
+        let second = session.stamp(crate::localapi::NotifyView::default());
+        assert_eq!(second.session_id, None, "no later frame repeats the id");
+        assert_eq!(second.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+    }
+
+    /// Go gates `SessionID` on `NotifyInitialState`: a watch that did not ask for it gets no id on
+    /// any frame, but still gets the version on every one.
+    #[test]
+    fn a_watch_without_initial_state_gets_a_version_but_no_session_id() {
+        let mut session = NotifySession::new(false).unwrap();
+        assert!(!session.is_pending());
+        for _ in 0..2 {
+            let frame = session.stamp(crate::localapi::NotifyView::default());
+            assert_eq!(frame.session_id, None);
+            assert_eq!(frame.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        }
+    }
+
+    /// Go's `sendToLocked` fills `Notify.Version` only when it is empty, so a version already on the
+    /// frame survives the stamp.
+    #[test]
+    fn stamping_keeps_a_version_the_frame_already_has() {
+        let kept = NotifySession::new(false)
+            .unwrap()
+            .stamp(crate::localapi::NotifyView {
+                version: Some("other".to_string()),
+                ..Default::default()
+            });
+        assert_eq!(kept.version.as_deref(), Some("other"));
+    }
+
+    /// The suggestion feed is a masked-watch feed like prefs and policy, so its frames are stamped
+    /// too. Its per-epoch front-load can be the FIRST frame of a watch (an `initial_state` +
+    /// `suggested_exit_node` watch with no prefs/policy bit writes it before the engine's first
+    /// frame), and then it is the frame that must carry the session id.
+    #[tokio::test]
+    async fn a_suggestion_frame_is_stamped_like_every_other_notify_frame() {
+        let (client, server) = UnixStream::pair().expect("UnixStream::pair");
+        let (_server_read, mut write_half) = server.into_split();
+        let (client_read, _client_write) = client.into_split();
+        let mut reader = BufReader::new(client_read);
+
+        let mut session = NotifySession::new(true).unwrap();
+        emit_suggested_exit_node_frame(&mut write_half, &mut session, "nodeid-first")
+            .await
+            .expect("write the first suggestion frame");
+        emit_suggested_exit_node_frame(&mut write_half, &mut session, "nodeid-second")
+            .await
+            .expect("write the second suggestion frame");
+
+        let mut frames = Vec::new();
+        for _ in 0..2 {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read a frame");
+            match serde_json::from_str::<Response>(&line).expect("a Response line") {
+                Response::Notify(view) => frames.push(view),
+                other => panic!("expected a notify frame, got {other:?}"),
+            }
+        }
+
+        let first = &frames[0];
+        assert_eq!(first.suggested_exit_node.as_deref(), Some("nodeid-first"));
+        assert_eq!(first.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        let id = first
+            .session_id
+            .as_deref()
+            .expect("the watch's first frame carries the session id, whichever feed wrote it");
+        assert_eq!(id.len(), 16);
+
+        let second = &frames[1];
+        assert_eq!(second.suggested_exit_node.as_deref(), Some("nodeid-second"));
+        assert_eq!(second.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        assert_eq!(second.session_id, None, "no later frame repeats the id");
+    }
 
     /// Drive `read_capped_line` with `input`: write the bytes into one end of a `UnixStream` pair
     /// (off-task so a write larger than the socket buffer cannot deadlock against the reader), drop
@@ -1593,6 +2861,52 @@ mod tests {
             .expect("read_capped_line");
         writer.await.expect("writer task");
         (result, out)
+    }
+
+    /// A `debug portmap` run must not outlive the client that asked for it. When the connection
+    /// breaks mid-run every write fails and the pump returns early — at which point it has to
+    /// *cancel* the run, because dropping a `JoinHandle` only detaches the task and it would keep
+    /// probing (and holding its UDP socket) for the whole client-chosen `--duration`, which is
+    /// unbounded.
+    #[tokio::test]
+    async fn portmap_run_is_cancelled_when_the_client_hangs_up() {
+        let (client, server) = UnixStream::pair().expect("UnixStream::pair");
+        // The operator hit ^C: the reading end is gone before the first line goes out, so every
+        // write below fails with EPIPE.
+        drop(client);
+        let (_read_half, mut write_half) = server.into_split();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        // Stand in for a long run: `tnet debug portmap --duration 1h` is a legal request, and this
+        // task never finishes on its own inside the test's patience.
+        let run = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            Ok(())
+        });
+        let cancelled = run.abort_handle();
+        tx.send("gw=192.0.2.1; self=192.0.2.2".to_string())
+            .expect("queue the run's first log line");
+
+        let err = pump_debug_portmap(&mut write_half, &mut rx, run)
+            .await
+            .expect_err("writing to a hung-up client must fail");
+        // It failed on the write itself — the peer is gone, so the send never blocks — and not by
+        // sitting in `write_response`'s stalled-client timeout.
+        let err = format!("{err:#}");
+        assert!(
+            !err.contains("timed out"),
+            "a hung-up client fails the write immediately, not by timeout: {err}"
+        );
+
+        // The abort lands the next time the runtime polls the task, so allow a bounded moment for
+        // it — but only a moment: without the cancellation this never becomes true.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !cancelled.is_finished() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the run must be cancelled when the client hangs up, not left detached");
     }
 
     #[tokio::test]
@@ -1673,39 +2987,117 @@ mod tests {
         assert_eq!(mode, 0o700, "loose socket dir must be tightened to 0700");
     }
 
-    #[test]
-    fn logout_reason_is_sanitized_before_it_reaches_the_log() {
-        // The reason is operator free text that ends up in the daemon log, so a newline must not be
-        // able to forge a second log record and an escape must not be able to steer a terminal that
-        // later renders the log.
-        let forged = "returned to IT\nINFO forged: node re-registered";
-        let clean = sanitize_logout_reason(forged);
-        assert!(
-            !clean.contains('\n'),
-            "a newline must not survive into the log line: {clean:?}"
-        );
-        assert_eq!(clean, "returned to IT_INFO forged: node re-registered");
-        assert_eq!(
-            sanitize_logout_reason("laptop returned to IT"),
-            "laptop returned to IT",
-            "ordinary text must pass through untouched"
-        );
-        assert!(
-            !sanitize_logout_reason("\u{1b}[2Jwiped").contains('\u{1b}'),
-            "ANSI escapes must be neutralized"
-        );
+    // ---------------------------------------------------------------------------------------
+    // The `shutdown` refusal ladder (Go `serveShutdown`, `ipn/localapi/localapi.go`).
+    // ---------------------------------------------------------------------------------------
 
-        // Over-long input is capped and marked as truncated.
-        let long = "j".repeat(MAX_LOGGED_REASON + 50);
-        let capped = sanitize_logout_reason(&long);
-        assert_eq!(capped.chars().count(), MAX_LOGGED_REASON + 1);
-        assert!(
-            capped.ends_with('…'),
-            "truncation must be visible: {capped:?}"
+    /// The rung that must come first. A caller that may not write is refused with
+    /// [`ShutdownRefusal::AccessDenied`] **whatever the policy says** — the policy is not consulted,
+    /// so the two refusals cannot be used to read the administrator's policy state off a socket the
+    /// caller was never trusted with. Both policy values are driven here precisely because the bug
+    /// this guards is invisible with only one of them: swapping the two checks still refuses an
+    /// unauthorized caller, it just tells them which policy is in force on the way out.
+    #[test]
+    fn an_unauthorized_shutdown_is_refused_before_the_policy_is_read() {
+        for allowed_by_policy in [false, true] {
+            assert_eq!(
+                shutdown_verdict(Access::ReadOnly, allowed_by_policy),
+                Err(ShutdownRefusal::AccessDenied),
+                "a read-only caller must get the access refusal with policy={allowed_by_policy}"
+            );
+        }
+    }
+
+    /// The second rung: write access is necessary and NOT sufficient. A caller that may issue
+    /// `up`/`down` still cannot stop the daemon unless the administrator opted in — which is the
+    /// whole shape of the key, an auditable power handed out on purpose rather than one that comes
+    /// free with write access.
+    #[test]
+    fn a_writer_is_refused_until_the_policy_allows_it() {
+        assert_eq!(
+            shutdown_verdict(Access::ReadWrite, false),
+            Err(ShutdownRefusal::DeniedByPolicy),
+            "write access alone must NOT be enough to stop the daemon"
         );
-        // Exactly at the cap: no truncation marker.
-        let exact = sanitize_logout_reason(&"j".repeat(MAX_LOGGED_REASON));
-        assert_eq!(exact.chars().count(), MAX_LOGGED_REASON);
-        assert!(!exact.ends_with('…'));
+        assert_eq!(
+            shutdown_verdict(Access::ReadWrite, true),
+            Ok(()),
+            "write access AND the policy must together permit the shutdown"
+        );
+    }
+
+    /// Each refusal is Go's 403 body and NOTHING ELSE. `http.Error(w, "shutdown access denied",
+    /// …)` writes exactly those bytes, so a consumer that compares a whole body against upstream's
+    /// has to keep matching here. Pinned with `assert_eq!` rather than `starts_with`, because a
+    /// prefix assertion is precisely what let a remediation clause grow onto the end of Go's
+    /// sentence without any test noticing.
+    #[test]
+    fn the_two_refusals_are_gos_bodies_verbatim() {
+        assert_eq!(
+            ShutdownRefusal::AccessDenied.message(),
+            "shutdown access denied"
+        );
+        assert_eq!(
+            ShutdownRefusal::DeniedByPolicy.message(),
+            "shutdown access denied by policy"
+        );
+    }
+
+    /// The remediation an operator needs did not disappear when it came off the wire — it is on the
+    /// refusal, for the log line to carry. Held here so a future edit cannot quietly empty it and
+    /// leave the log saying only "denied".
+    #[test]
+    fn each_refusal_carries_an_off_the_wire_remediation() {
+        let access = ShutdownRefusal::AccessDenied.hint();
+        let policy = ShutdownRefusal::DeniedByPolicy.hint();
+        assert!(
+            access.contains("root"),
+            "the access hint must say who may stop the daemon, got: {access}"
+        );
+        assert!(
+            policy.contains("AllowTailscaledRestart"),
+            "the policy hint must name the key that lifts the refusal, got: {policy}"
+        );
+        for hint in [access, policy] {
+            assert!(
+                !hint.starts_with("shutdown access denied"),
+                "the hint is logged BESIDE the message, not appended to it, got: {hint}"
+            );
+        }
+    }
+
+    /// `shutdown` is a write for the authorization gate. Pinned through the gate itself (not
+    /// re-derived), because the first rung of the ladder is exactly `auth::authorize` and a
+    /// misclassification there would silently hand the power to stop the daemon to any local user
+    /// who can reach the socket.
+    #[test]
+    fn shutdown_is_classified_as_a_write_by_the_auth_gate() {
+        assert_eq!(
+            auth::authorize(&Request::Shutdown, Access::ReadOnly),
+            Err(crate::auth::Denied),
+            "`shutdown` must be a write verb"
+        );
+        assert_eq!(
+            auth::authorize(&Request::Shutdown, Access::ReadWrite),
+            Ok(())
+        );
+    }
+
+    /// Default deny, over the real process-global policy registry: a daemon started without a
+    /// `--syspolicy-file` (which is every daemon in this test binary — no unit test registers a
+    /// source) reads `AllowTailscaledRestart` as false, so `shutdown` is refused. This is the
+    /// pre-existing behaviour of the fork and it stays the default; the verb only ever does
+    /// something when an administrator asked for it.
+    #[test]
+    fn the_policy_denies_shutdown_by_default() {
+        assert!(
+            !shutdown_allowed_by_policy(),
+            "with no policy source registered, `AllowTailscaledRestart` must read false"
+        );
+        assert_eq!(
+            shutdown_verdict(Access::ReadWrite, shutdown_allowed_by_policy()),
+            Err(ShutdownRefusal::DeniedByPolicy),
+            "an unconfigured daemon must refuse `shutdown` even from its owner"
+        );
     }
 }

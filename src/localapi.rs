@@ -57,6 +57,80 @@ pub enum Request {
     ///
     /// Keeping both on one `cmd` (rather than minting a second verb) mirrors Go, where the single
     /// `WatchIPNBus` LocalAPI route takes the mask as a parameter; the mask *is* the path selector.
+    ///
+    /// ## What named booleans cannot do — refuse — and where a refusal goes
+    ///
+    /// Go's `serveWatchIPNBus` (`ipn/localapi/localapi.go`) takes the whole subscription as ONE
+    /// decimal integer (`mask.UnmarshalText([]byte(s))`) and refuses FIVE ways, every one of them
+    /// *before* it subscribes to anything. In the order the handler runs them:
+    ///
+    /// 1. `watch ipn bus access denied` (403) when the handler's `PermitRead` is false. This is its
+    ///    very first statement: a caller without read permission is refused before the mask is even
+    ///    parsed, and never learns whether its subscription was otherwise valid.
+    /// 2. `not a flusher` (500) when the `http.ResponseWriter` it was handed is not an
+    ///    `http.Flusher`, so the response cannot be streamed at all.
+    /// 3. `bad mask` (400) for a value that will not parse.
+    /// 4. `NotifyInProcessNoDisconnect is only valid for in-process IPN bus subscribers` (400).
+    /// 5. `ipn.ValidateNotifyWatchOpt`'s `NotifyRateLimit is incompatible with new-style IPN bus
+    ///    subscription bits %v` for `NotifyRateLimit` combined with any bit in
+    ///    `NotifyRateLimitIncompatibleBits` (`NotifyPeerChanges | NotifyNoNetMap |
+    ///    NotifyInitialStatus | NotifyPeerPatches`) — those bits describe stateful delta streams,
+    ///    and a rate limiter that delays or merges messages in one breaks the consumer's ability to
+    ///    keep a coherent local view.
+    ///
+    /// Only the last two judge the subscription's CONTENT, and only those two are what
+    /// [`watch_usage_refusal`] is the home for. The first two are deliberate non-ports, written
+    /// down here so that neither is filed as a gap later:
+    ///
+    /// - The `PermitRead` 403 has no analogue because this fork gates no read at all.
+    ///   `auth::requires_write` classifies every `Request::Watch` as a read and [`crate::auth`]
+    ///   argues there why reads are ungated — and the `watch` arm in [`crate::server`] goes
+    ///   further, dispatching the stream without calling `auth::authorize` at all, so on this path
+    ///   the absence of an access refusal is structural rather than a classification detail. That
+    ///   posture is a fork-wide decision argued where it belongs, not something this mask surface
+    ///   gets to make; revisiting it is an `auth`/`server` change that would land ahead of the
+    ///   content checks, exactly where Go puts it.
+    /// - `not a flusher` is an assertion about Go's own `http.ResponseWriter` plumbing (can this
+    ///   response be streamed at all?). A LocalAPI stream here is a Unix socket that is written and
+    ///   flushed directly, so there is no capability to test and nothing to refuse.
+    ///
+    /// The fields above are the better wire format in almost every respect — self-describing,
+    /// impossible to mis-type as an integer, and back-compatible by construction. What they cannot
+    /// do is refuse. An unparseable mask is a serde type error rather than a value the daemon looks
+    /// at; an unknown bit is simply a field serde ignores; and a forbidden COMBINATION has no shape
+    /// in which a caller can even express it, so there is nothing here to rule on.
+    ///
+    /// **The ruling: the booleans stay, and each of Go's two content refusals is ported as a
+    /// cross-field check on the parsed request** — [`watch_usage_refusal`], in the same shape this
+    /// fork already uses for Go's one cross-flag usage refusal (`--exit-node-allow-lan-access can
+    /// only be used with --exit-node`): the check moves from "is this bit set in an integer" to
+    /// "are these two fields both true", Go's message is kept verbatim, and the wire stays
+    /// readable. The alternative — carrying Go's integer mask as an extra field and validating it
+    /// exactly as Go does — was rejected: this daemon's LocalAPI is its own protocol over a Unix
+    /// socket and has never claimed byte compatibility with Go's HTTP LocalAPI, so an integer mask
+    /// would buy no interoperability while committing this fork to keeping two spellings of one
+    /// subscription in step forever.
+    ///
+    /// Nothing offered today can trip either refusal. One operand of the rate-limit refusal IS
+    /// offered: [`initial_status`](Request::Watch::initial_status) is `NotifyInitialStatus`, a member
+    /// of `NotifyRateLimitIncompatibleBits`. The other operand is not: there is no `rate_limit`
+    /// field, so the forbidden pair still has no spelling. The day a `rate_limit` field lands, the
+    /// check `rate_limit && initial_status` goes into [`watch_usage_refusal`] with Go's message.
+    /// Which of Go's bits each field stands for is a mapping rather than an opinion, so it is
+    /// written as [`watch_upstream_mask`] and checked by a test instead of asserted in prose. The
+    /// ruling is written down here so whoever adds the next field does not have to re-derive it.
+    ///
+    /// ### `NotifyInProcessNoDisconnect` is not offered here, on purpose
+    ///
+    /// Its absence is not a gap to file. The bit's own doc in Go's `ipn/backend.go` says what it
+    /// marks: a subscriber that must not be disconnected for falling behind, so instead the PRODUCER
+    /// blocks until that subscriber catches up — possibly while holding the backend mutex. That is
+    /// only ever tolerable for a subscriber inside the process, which is why Go refuses it at the
+    /// LocalAPI boundary. Every subscriber in this fork arrives through that boundary — the daemon
+    /// has no in-process IPN bus consumer — so the bit would have nobody to describe. Nor could the
+    /// stack below honour it: the engine's per-watcher queue is bounded (`ts_runtime`'s
+    /// `NOTIFY_BUFFER`, matching Go's `make(chan *ipn.Notify, 128)`) and its producer never blocks
+    /// on a full one, it drops. Offering the bit would be offering a promise nothing under it keeps.
     Watch {
         /// Front-load the current connection state (and, in `NeedsLogin`, the auth URL as
         /// [`NotifyView::browse_to_url`]) as the first [`Response::Notify`] frame. The faithful
@@ -64,6 +138,23 @@ pub enum Request {
         /// [`NotifyWatchOpt::INITIAL_STATE`](tailscale::NotifyWatchOpt::INITIAL_STATE). `#[serde(default)]`
         /// makes it `false` when omitted (so a bare watch still parses); `skip_serializing_if` drops it
         /// from the wire when `false`, preserving the exact `{"cmd":"watch"}` legacy encoding.
+        ///
+        /// ## The session id rides on this bit
+        ///
+        /// Setting it also mints a per-connection session id, sent once as
+        /// [`NotifyView::session_id`] on the FIRST frame of the watch and never repeated — the
+        /// analogue of Go's `WatchNotificationsAs`, which sets `Notify.SessionID` only when the
+        /// watcher asked for `NotifyInitialState`. A client that wants the id must store it from that
+        /// first frame. It is fresh for every connection and stable for the life of this one.
+        ///
+        /// On a device-less daemon the engine has no initial state to front-load, so when no
+        /// status/prefs/policy snapshot is going out first either, the daemon sends a frame
+        /// carrying only the identity fields, so the id still arrives immediately.
+        ///
+        /// **The id is not yet load-bearing.** Go keys a foreground `serve`'s config on it
+        /// (`ServeConfig.Foreground[sessionID]`) and deletes that config when the watch ends. This
+        /// daemon does not model `ServeConfig.Foreground` yet, so nothing server-side is tied to the
+        /// id today: a foreground `tnet serve` still restores its config from its own signal handler.
         #[serde(default, skip_serializing_if = "core::ops::Not::not")]
         initial_state: bool,
         /// Front-load the current peer set as the first [`Response::Notify`] frame's
@@ -82,6 +173,104 @@ pub enum Request {
         /// `skip_serializing_if` back-compat discipline (a bare watch stays `{"cmd":"watch"}`).
         #[serde(default, skip_serializing_if = "core::ops::Not::not")]
         prefs: bool,
+        /// Stream the effective system policy as [`NotifyView::policy`]: a front-loaded snapshot on
+        /// subscribe, then a fresh snapshot whenever the effective policy actually moves. The
+        /// analogue of Go's
+        /// `ipn.NotifySysPolicyChanges` (`1 << 17`), which makes the first `Notify` carry the current
+        /// effective `setting.Snapshot` in `Notify.Policy` and re-sends it — always in full, never as
+        /// a delta — on every subsequent policy change.
+        ///
+        /// Like [`prefs`](Request::Watch::prefs) and unlike `initial_state`/`initial_netmap` this is
+        /// **daemon-built**, not an engine `NotifyWatchOpt` bit: the policy registry lives in the
+        /// daemon, not the engine.
+        ///
+        /// ## What "on change" means in THIS build — read before relying on it
+        ///
+        /// Go registers real change sources (a Windows registry watcher; a handle a management agent
+        /// writes through) and pushes the moment one of them moves — and *only* then: its
+        /// `rsop.(*Policy).reloadNow` invokes the change callbacks under
+        /// `if old != nil && !old.EqualItems(new)`, so a re-resolve landing on the same items
+        /// notifies nobody. This build enforces the same guard.
+        ///
+        /// This build has exactly one source, the `--syspolicy-file` JSON document, which is read
+        /// once at startup and — exactly as in Go, whose `JSONPolicyStore` captures the file at
+        /// construction — never re-read. A `syspolicy reload` therefore re-resolves the very rows a
+        /// watcher already holds, and emits **no frame**. So the honest contract here is the initial
+        /// snapshot, and after it a frame only if the effective policy actually moves; with this
+        /// daemon's single captured source, the source being registered at startup is the one moment
+        /// that can happen. An administrator who edits the policy file behind the daemon's back is
+        /// not seen until the daemon restarts. Promising more than that would be promising a watch
+        /// this build cannot perform, and emitting an unchanged frame on every reload would be
+        /// promising it while delivering nothing: the field's meaning is *changed*, so a frame that
+        /// repeats the watcher's own rows asserts something untrue.
+        ///
+        /// Even so, this is the difference between a watcher that can see policy and one that
+        /// cannot. Policy outranks local prefs on every write here, so a `tnet set` that appears to
+        /// do nothing is explained by a policy row, and the front-loaded snapshot is how a watcher
+        /// gets that row without a second round trip.
+        #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+        policy: bool,
+        /// Stream the node's exit-node suggestion as [`NotifyView::suggested_exit_node`] — the stable
+        /// node id of the best exit node available to this node. The analogue of Go's
+        /// `ipn.NotifyInitialSuggestedExitNode` (`1 << 10`), which front-loads
+        /// `Notify.SuggestedExitNode` on subscribe, plus the ongoing push that
+        /// `LocalBackend.suggestExitNodeLocked` performs to `allClients` whenever the answer moves.
+        ///
+        /// Like [`prefs`](Request::Watch::prefs) and [`policy`](Request::Watch::policy) — and unlike
+        /// `initial_state`/`initial_netmap` — this is **daemon-built**, not an engine `NotifyWatchOpt`
+        /// bit: the engine's bus has no `SuggestedExitNode` field, so the daemon pushes from the one
+        /// place a computed suggestion is published (`Backend::publish_suggested_exit_node`).
+        ///
+        /// The push goes to EVERY watcher, not only the connection whose request triggered the
+        /// computation — Go sends it to `allClients` because the suggestion is a property of the
+        /// node, not of the asker. So one `tnet exit-node suggest` informs every subscriber at once.
+        ///
+        /// ## What "on change" means in THIS build — read before relying on it
+        ///
+        /// Go recomputes the suggestion from several places — a fresh net-report, a netmap update,
+        /// and the re-run `sysPolicyChanged` performs after `AllowedSuggestedExitNodes` moves — so a
+        /// Go watcher learns of a new pick without anyone asking. This fork computes the suggestion
+        /// **on demand only**: `exit-node suggest` and this bit's own front-load are the only
+        /// computations. So the honest contract here is
+        /// **front-loaded when the watch attaches to a device (and again on each later device epoch,
+        /// i.e. after a `down`+`up`), then re-sent whenever a suggestion is computed and differs from
+        /// the last one published**. That is narrower than Go's, deliberately: closing the gap means
+        /// a timer that re-probes the engine on a schedule, which is a different and larger decision
+        /// than putting the value the daemon already has on the bus.
+        ///
+        /// An empty answer is **silence**, never a frame. That holds for both empties this fork can
+        /// return: "no eligible candidate" and "withheld by the administrator's
+        /// `AllowedSuggestedExitNodes`". The `exit-node suggest` reply tells them apart with
+        /// `withheld_by_policy`, but neither carries a node id, and Go likewise sends nothing when
+        /// `suggestExitNodeLocked` returns an error. The remembered value is left alone in that
+        /// case, exactly as Go leaves
+        /// `lastSuggestedExitNode` untouched on its error path, so the next real suggestion is
+        /// compared against the last value a watcher was actually told. Two consequences worth
+        /// stating plainly: there is no frame that CLEARS a suggestion, so a consumer's running view
+        /// keeps the last id it was given; and the front-load carries that same remembered id, so a
+        /// watcher attaching after an empty computation sees what every other watcher holds rather
+        /// than a gap only it has.
+        ///
+        /// The front-load computes only while the node is `Running`, and gives the engine a bounded
+        /// time to answer (Go's error arm returns at once, and a `NeedsLogin` engine here would not
+        /// answer until the node was authorised). Otherwise it computes nothing, and the watcher is
+        /// front-loaded the remembered id, if any. That id is forgotten, silently, on `logout` and on
+        /// every profile change (Go's `resetForProfileChangeLocked`), so a pick from one tailnet is
+        /// never front-loaded to a watcher on another.
+        #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+        suggested_exit_node: bool,
+        /// Front-load a whole [`StatusReport`] as the session's first [`Response::Notify`] frame, in
+        /// [`NotifyView::initial_status`]. The analogue of Go's `ipn.NotifyInitialStatus` (`1 << 14`),
+        /// which upstream recommends over fetching the netmap: a watcher that wants a snapshot AND a
+        /// stream asks for both on one connection instead of racing a `status` request on a second.
+        ///
+        /// It is the same report [`Request::Status`] answers with, peers included (Go builds it with
+        /// `WantPeers: true`). Sent once per session, not once per device epoch — Go's
+        /// `InitialStatus` is carried by the first `Notify` only. Daemon-built like `prefs`/`policy`.
+        /// See [`NotifyView::initial_status`] for the ordering guarantee this build can and cannot
+        /// give. Same `#[serde(default)]` + `skip_serializing_if` back-compat discipline.
+        #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+        initial_status: bool,
     },
     /// Bring the node up (`WantRunning = true`), optionally (re)setting login/config fields.
     Up {
@@ -126,7 +315,9 @@ pub enum Request {
         #[serde(default)]
         advertise_routes: Option<Vec<String>>,
         /// ACL tags this node requests (Go `--advertise-tags`, each `tag:<name>`). `None` unchanged;
-        /// `Some(vec)` replaces (`Some([])` clears). `#[serde(default)]` keeps the wire back-compatible.
+        /// `Some(vec)` replaces (`Some([])` clears). A value with no colon at all is completed to
+        /// `tag:<value>` by the daemon (Go does this in its CLI), so a caller may send either form.
+        /// `#[serde(default)]` keeps the wire back-compatible.
         #[serde(default)]
         advertise_tags: Option<Vec<String>>,
         /// Accept (and route to) subnet routes advertised by peers (Go `tailscale up
@@ -252,7 +443,7 @@ pub enum Request {
         #[serde(default)]
         advertise_routes: Option<Vec<String>>,
         /// ACL tags this node requests (`None` unchanged; `Some(vec)` replaces, `Some([])` clears;
-        /// each `tag:<name>`).
+        /// each `tag:<name>`, or a colon-less value the daemon completes to `tag:<value>`).
         #[serde(default)]
         advertise_tags: Option<Vec<String>>,
         /// Run the Tailscale SSH server (`None` unchanged; `Some(b)` sets it). Toggling SSH via
@@ -369,10 +560,19 @@ pub enum Request {
     Netcheck,
     /// Ask the daemon to suggest the best available exit node (Go `tailscale exit-node suggest` →
     /// `LocalClient.SuggestExitNode`). Replies with [`Response::ExitNodeSuggestion`] carrying the
-    /// suggested node (or `None` when there is no eligible candidate — NOT an error, mirroring Go's
-    /// empty response). Read-only — it computes a suggestion from the netmap + latency, mutating
+    /// suggested node — or no node, either because there is no eligible candidate (Go's empty
+    /// response) or because the administrator's `AllowedSuggestedExitNodes` policy excludes the one
+    /// the engine picked, which the reply flags as `withheld_by_policy`. Neither is an error.
+    /// Read-only — it computes a suggestion from the netmap + latency, mutating
     /// nothing (gated like [`Status`](Request::Status)). Requires the node to be up.
     SuggestExitNode,
+    /// Report the Tailscale **Services** (VIPs) this node can reach (Go `tailscale service list` →
+    /// the LocalAPI `services` verb). Replies with [`Response::Services`]. Read-only — Go's
+    /// `serveServices` is a GET that only reads the netmap, so this is classified like
+    /// [`Status`](Request::Status). Requires the node to be up: the Service set is decoded from the
+    /// **self node's** capability map, which only exists once control has sent a netmap (Go's handler
+    /// answers `503 no netmap` in the same situation).
+    Services,
     /// Report the effective system policy / MDM configuration (Go `tailscale syspolicy list`).
     /// Replies with [`Response::Policy`]. Read-only — Go gates BOTH `list` and `reload` on
     /// `PermitRead` (the LocalAPI `policy/` handler checks only `PermitRead`), so this is classified
@@ -403,9 +603,10 @@ pub enum Request {
     /// [`Response::Ok`] on success or [`Response::Error`] naming the violation(s). A **write** (Go
     /// gates `serveCheckPrefs` on `PermitWrite`), but it MUTATES NOTHING — it only runs the same
     /// validation the bring-up path would. This fork mirrors the subset of Go's rule chain that maps
-    /// to its prefs: the exit-node-vs-advertise-exit-node conflict, SSH-server capability, and
-    /// advertise-route CIDR masking (Go's operator/auto-update/profile/config-lock rules reference
-    /// prefs this fork does not model). The fields are the same "leave unchanged unless named"
+    /// to its prefs: the exit-node-vs-advertise-exit-node conflict, SSH-server capability,
+    /// advertise-route CIDR masking, and the auto-update opt-in an installation that can never
+    /// replace its own binary must not make (Go's operator/profile/config-lock rules reference prefs
+    /// this fork does not model). The fields are the same "leave unchanged unless named"
     /// sentinels as [`Set`](Request::Set) — a check validates the prospective combined posture.
     CheckPrefs {
         /// Prospective exit-node selector (same double-option semantics as [`Set::exit_node`]).
@@ -424,6 +625,10 @@ pub enum Request {
         /// Prospective SSH-server enable intent.
         #[serde(default)]
         ssh: Option<bool>,
+        /// Prospective auto-update opt-in (Go's `AutoUpdate.Apply` `opt.Bool`): `Some(true)` opts
+        /// in, `Some(false)` declines, absent leaves the current preference.
+        #[serde(default)]
+        auto_update: Option<bool>,
     },
     /// Provision (or fetch) a TLS certificate + key for `domain` via the tailnet's ACME flow (Go
     /// `tailscale cert <domain>`). Replies with [`Response::Cert`] carrying the leaf+chain and the
@@ -461,13 +666,21 @@ pub enum Request {
         /// backward-compatible (an older client sends the bare variant, which deserializes to `None`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         note: Option<String>,
+        /// Run the extra diagnostic pass (Go `bugreport --diagnose` →
+        /// `ipn.BugReportOpts.Diagnose` → `LocalBackend.Doctor`). The daemon then fills
+        /// [`Response::BugReport::checks`]; the marker itself is unaffected. `false` (the default)
+        /// keeps the wire byte-identical to a request from a client that predates the flag.
+        #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+        diagnose: bool,
     },
     /// Read the node's serve configuration (Go `GetServeConfig`; `tnet serve status`). Replies with
     /// [`Response::ServeConfig`]. Read-only — gated like [`Status`](Request::Status).
     GetServeConfig,
     /// Replace the node's serve configuration (Go `SetServeConfig`; `tnet serve --tcp` / `reset`).
     /// The daemon persists it and re-arms its serve accept loops to match. A WRITE — gated like
-    /// `up`/`down`.
+    /// `up`/`down`. May be REFUSED with [`Response::Error`] and nothing persisted: a config that
+    /// turns Funnel on while the `shields_up` pref is set, or one that changes the serve type of a
+    /// port already being served (see `Backend::set_serve_config` for both rules).
     SetServeConfig {
         /// The new serve config (replaces the current one wholesale).
         config: ServeConfig,
@@ -479,14 +692,60 @@ pub enum Request {
     /// The `Ok` message distinguishes the three outcomes Go's CLI reports in words: already on this
     /// profile (nothing changed), switched to a profile that still needs a login, and switched to a
     /// registered profile that is merely down.
+    ///
+    /// A `target` that matches no known profile is **refused** (Go's `switchProfile`: `No profile
+    /// named %q`, exit 1) — nothing is torn down on the refusal path. Creating a profile is a
+    /// separate request, [`CreateProfile`](Request::CreateProfile); this one only ever *selects* one
+    /// that already exists.
     SwitchProfile {
         /// The target profile id (or name; the daemon resolves either).
         target: String,
     },
+    /// Create a new, empty profile and switch to it (`tnet switch --new <id>`). A WRITE, gated like
+    /// [`SwitchProfile`](Request::SwitchProfile) — it registers a profile, repoints the
+    /// current-profile pointer and tears the live device down on the way.
+    ///
+    /// A **fork extension with no upstream counterpart**: Go creates a profile through the
+    /// interactive `tailscale login`, which this fork does not have yet, and Go's `switch` refuses an
+    /// unknown target outright. The daemon refuses an `id` that is not a usable profile id, and one
+    /// that already names a profile by id **or** by nickname.
+    ///
+    /// # Why this is its own command and not a flag on `SwitchProfile`
+    ///
+    /// The LocalAPI socket permits a mixed pair — a newer `tnet` against a daemon that has not been
+    /// restarted since an upgrade. Serde ignores unknown *fields*, so had "create it" travelled as a
+    /// `create: true` field on `SwitchProfile`, a daemon that predates the flag would have dropped it
+    /// and run a plain switch: for an `id` that already names a profile that silently *activates* it
+    /// — tearing the live device down and repointing the node — where the operator asked for a
+    /// creation the newer daemon refuses. An unknown *command*, by contrast, cannot be silently
+    /// reinterpreted: the older daemon's `Request` deserializer fails and it answers `bad request`,
+    /// so the older-daemon outcome is a refusal with the node untouched. The version gate is the
+    /// deserializer itself, which needs no capability table to keep in step with releases.
+    CreateProfile {
+        /// The id for the new profile. Must be a usable single-path-component profile id (letters,
+        /// digits, `-` or `_`; 1-64 characters) that does not already name a profile.
+        id: String,
+    },
+    /// Switch to a new, empty profile — the first thing `tnet login` does, as Go's `tailscale login`
+    /// calls `LocalClient.SwitchToEmptyProfile` before it runs the login (`cmd/tailscale/cli/
+    /// login.go`). The profile the node was on is left alone, name and key included, so a following
+    /// `--nickname` names the profile being logged in rather than renaming the old one. A WRITE,
+    /// gated like [`SwitchProfile`](Request::SwitchProfile).
+    ///
+    /// The daemon picks the new id (Go's four-hex-digit `newUnusedID`) and lists the profile in
+    /// `switch --list` only once it has logged in, as Go saves it only then. A current profile that
+    /// has never finished logging in (a node key alone does not count) is not left behind, since Go
+    /// never saves one: the daemon stays on it and resets its prefs and name to a new profile's, as
+    /// Go's switch gives it `defaultPrefs`.
+    ///
+    /// Its own command for the reason [`CreateProfile`](Request::CreateProfile) is: a daemon that
+    /// predates it answers `bad request`, and `login` stops there with nothing renamed.
+    SwitchToEmptyProfile,
     /// Delete a profile (Go `tailscale switch remove`). The target may be an id or a display name,
     /// like [`SwitchProfile`](Request::SwitchProfile). Refuses a target that matches no known profile
-    /// (Go: `No profile named %q`), and refuses the current/default profile. A WRITE — gated like
-    /// `up`/`down`.
+    /// (Go: `No profile named %q`) and the reserved `default` profile. Naming the profile that is
+    /// currently active is a **success** that removes nothing, as in Go (`Already on account %q`,
+    /// exit 0); the `Ok` message says so. A WRITE — gated like `up`/`down`.
     DeleteProfile {
         /// The profile id to remove.
         target: String,
@@ -502,8 +761,23 @@ pub enum Request {
         /// Destination TCP port.
         port: u16,
     },
-    /// Bring the node down (`WantRunning = false`) without logging out.
-    Down,
+    /// Bring the node down (`WantRunning = false`) without logging out. A WRITE — gated like
+    /// `up`/`logout`.
+    Down {
+        /// The operator's justification for the disconnect (Go `tailscale down --reason`, which
+        /// travels as the base64 `X-Tailscale-Reason` LocalAPI header on the prefs edit). `None`
+        /// when the flag was omitted — which is also what an older client sending the bare
+        /// `{"cmd":"down"}` deserializes to.
+        ///
+        /// Same SCOPE as [`Logout::reason`](Request::Logout): the reason is what lifts the always-on
+        /// refusal (`ipn::alwayson`) on a node whose policy file sets `AlwaysOn.Enabled` **and**
+        /// `AlwaysOn.OverrideWithReason` — without it the daemon answers Go's "disconnect not
+        /// allowed: reason required" and the node stays up. What is still missing is delivery: the
+        /// audit record a permitted disconnect leaves goes to the daemon's own log, not to the
+        /// control plane, because the engine exposes no audit-log transport (ask #41).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     /// Log the node out (the analogue of Go's `tailscale logout`): deregister the node key with the
     /// control plane, tear the datapath down, and **discard the persisted node key** so the next
     /// `up` re-registers fresh (a new login) rather than resuming the old registration. This is
@@ -514,22 +788,54 @@ pub enum Request {
         /// as the base64 `X-Tailscale-Reason` LocalAPI header). `None` when the flag was omitted —
         /// which is also what an older client sending the bare `{"cmd":"logout"}` deserializes to.
         ///
-        /// HONEST SCOPE: in Go the reason is what lets a user disconnect a node whose MDM policy
-        /// requires a justification, and it is recorded in the node's audit log. This fork registers
-        /// no policy store on Unix (see [`SyspolicyList`](Request::SyspolicyList)) and the engine has
-        /// no audit-log transport to control, so the daemon *records the reason in its own log*
-        /// alongside the logout and nothing else consumes it. It is not forwarded to the control
-        /// plane.
+        /// SCOPE: in Go the reason is what lets a user disconnect a node whose MDM policy requires a
+        /// justification, and it is recorded in the node's audit log. This fork now enforces the
+        /// first half: a policy file (see [`SyspolicyList`](Request::SyspolicyList)) that sets
+        /// `AlwaysOn.Enabled` makes the daemon refuse this logout outright, and one that also sets
+        /// `AlwaysOn.OverrideWithReason` makes it refuse a logout with no reason. The second half is
+        /// still local — the audit record is written to the daemon's own log rather than shipped to
+        /// control, which needs an engine transport that does not exist (ask #41).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
     /// Report this node's own tailnet addresses (Go `tailscale ip`). Read-only — gated like
     /// [`Status`](Request::Status).
+    ///
+    /// Always answered with [`Response::Ip`], never refused for want of an engine: this asks a
+    /// question about the node, not for work from the engine, and a node with no engine holds no
+    /// addresses — an EMPTY pair, which is an answer. That mirrors where Go reads them from, the
+    /// `TailscaleIPs` field of a `Status` that answers in every backend state, and it is what lets
+    /// the CLI reach Go's `no current Tailscale IPs; state: %v` instead of reporting the request as
+    /// failed on a `Stopped`/`NeedsLogin` node.
     Ip,
     /// Resolve a tailnet IP to the peer that owns it (Go `tailscale whois`). Read-only.
+    ///
+    /// Go's argument is `ip[:port]` and its LocalAPI query is `?proto=&addr=`, so the flow triple is
+    /// carried here as three fields: the address in [`ip`](Request::Whois::ip), the optional flow
+    /// [`port`](Request::Whois::port), and the optional [`proto`](Request::Whois::proto). Both new
+    /// fields are `#[serde(default)]`, so a request written by an older CLI (address only) still
+    /// deserializes.
     Whois {
-        /// The tailnet IP to resolve.
+        /// The tailnet IP to resolve. Address only — the port travels in [`port`](Request::Whois::port),
+        /// the way Go's `serveWhoIs` splits `addr` into a `netip.AddrPort` before the lookup.
         ip: String,
+        /// The flow's port, from Go's `ip[:port]` argument form. `None` when the caller named a bare
+        /// IP (Go's `netip.AddrPortFrom(ip, 0)`).
+        ///
+        /// HONEST SCOPE: a whois is a *flow* lookup in Go only for flows tailscaled itself proxies —
+        /// `LocalBackend.WhoIs` consults the port (and [`proto`](Request::Whois::proto)) solely in its
+        /// `ProxyMapper` fallback, reached when the address matches no node in the netmap. When the
+        /// address IS a tailnet address — every address this fork can answer for — Go resolves it by
+        /// IP and never looks at the port. The engine's `Device::whois` likewise resolves by IP and
+        /// discards the port, so this field records what was asked without changing the answer. The
+        /// engine surface a proxied-flow lookup would need is engine ask #35.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        port: Option<u16>,
+        /// The flow's protocol (Go `whois --proto`, `?proto=` on the LocalAPI query). `None` is Go's
+        /// empty value: "both". See [`port`](Request::Whois::port) for why this fork records it but
+        /// cannot select on it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proto: Option<WhoisProto>,
     },
     /// Fetch an OIDC id-token for this node, scoped to `audience` (Go `tailscale id-token <aud>`).
     /// The daemon asks control to mint a signed JWT; replies with [`Response::IdToken`]. A WRITE: it
@@ -638,6 +944,56 @@ pub enum Request {
     /// have changed but the socket is still fine. A **write** (mutates live datapath state): gated like
     /// `down`/`logout`. Needs the node up. Replies with [`Response::Ok`]/[`Response::Error`].
     DebugReStun,
+    /// Report the state directory **the daemon** is using (Go `tailscale debug statedir` → the LocalAPI
+    /// `debug` route's `statedir` action, `ipn/localapi/debug.go` @ v1.100.0, which JSON-encodes
+    /// `LocalBackend.TailscaleVarRoot()`), rendered by `tnet debug statedir`.
+    ///
+    /// The round trip is the entire point of the verb. The daemon's state dir is whatever it resolved
+    /// at boot — `--statedir`, or the cascade run in *its* environment (as root, with the unit's
+    /// `EnvironmentFile`). A CLI that re-runs that cascade in its own environment answers a different
+    /// question, and on the configuration people actually hit (root daemon + unprivileged `tnet`) it
+    /// answers it wrongly. Only the daemon knows.
+    ///
+    /// A **read** of one path, but gated as a write: Go gates its whole `debug` route on `PermitWrite`
+    /// ("debug access denied"), not per-action, so the faithful classification matches
+    /// [`DebugRebind`](Self::DebugRebind). Needs no engine — it answers with the node down, like Go's.
+    /// Replies with [`Response::StateDir`].
+    DebugStateDir,
+    /// Run a port-mapping diagnostic and stream its log back, one [`Response::PortmapLog`] frame
+    /// per line (Go `tailscale debug portmap` → the `debug-portmap` LocalAPI route, served by
+    /// `feature/debugportmapper`), rendered by `tnet debug portmap`.
+    ///
+    /// The daemon probes the LAN gateway for NAT-PMP / PCP / UPnP-IGD support and, if any answers,
+    /// asks for a UDP mapping — reporting each step as it happens. This is the one verb on this fork
+    /// that STREAMS a reply per line rather than answering once, because the run takes up to
+    /// [`duration_ms`](Request::DebugPortmap::duration_ms) and its value is in watching it unfold;
+    /// Go streams the same text over a flushed `text/plain` body. The daemon closes the connection
+    /// when the run ends.
+    ///
+    /// A **write** for authorization: Go gates `serveDebugPortmap` on `PermitWrite` ("debug access
+    /// denied" otherwise), and the run sends packets to the LAN gateway asking it to open a hole, so
+    /// it is gated like `up`/`down` (root/same-uid). Node-up independent — the probe talks to the
+    /// local router, not through the tailnet, so it answers with the node down.
+    DebugPortmap {
+        /// How long the whole run may take, in milliseconds. The CLI parses Go's `--duration`
+        /// duration string (`5s`) and sends the resolved milliseconds, so the wire carries a plain
+        /// number rather than a Go-specific grammar the daemon would have to re-parse.
+        duration_ms: u64,
+        /// Which protocol to exercise: `""` (all — the default), `"pmp"`, `"pcp"` or `"upnp"`.
+        /// Anything else is refused with [`Response::Error`] carrying Go's `unknown portmap debug
+        /// type` (Go answers 400 with that same text).
+        #[serde(default)]
+        ty: String,
+        /// `"<gateway>/<self>"` — override gateway auto-detection with an explicit pair (Go's
+        /// `gateway_and_self` query parameter, which its CLI builds from `--gateway-addr` +
+        /// `--self-addr`). `None` auto-detects from the host routing table.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gateway_and_self: Option<String>,
+        /// Log raw HTTP for the UPnP leg (Go's `--log-http`). Carried for parity; this fork's UPnP
+        /// leg is discovery-only, so it currently adds no output.
+        #[serde(default)]
+        log_http: bool,
+    },
     /// Re-read the daemon's `--config` file and adopt the changed fields into the running node (Go
     /// `tailscaled`'s `reload-config` LocalAPI route → `LocalBackend.ReloadConfig` → `setConfigLocked`,
     /// v1.100.0). Rendered by `tnet reload-config`. The daemon re-loads the same declarative config it
@@ -646,11 +1002,233 @@ pub enum Request {
     /// updated prefs to actually adopt the change (a brief reconnect, like a rebuild-only `set`); if the
     /// node is down, the merged prefs apply on the next `up`. A **write** — gated like `up`/`down`: Go
     /// gates `serveReloadConfig` on `PermitWrite`, and it reconfigures the running node. Fails with a
-    /// clear error when the daemon was started WITHOUT `--config` (there is nothing to reload) or when
-    /// the config file is now malformed (rejected with the running node untouched — the fail-fast
-    /// contract). Replies with [`Response::Ok`]/[`Response::Error`]. NOTE: a reloaded config's `AuthKey`
-    /// is deliberately ignored (a reload is not a re-registration — see the daemon's `reload_config`).
+    /// clear error ONLY when the config file is now malformed (rejected with the running node
+    /// untouched — the fail-fast contract); that is the [`Response::Error`] arm. A daemon started
+    /// WITHOUT `--config` is NOT an error: there is nothing to reload, so it replies
+    /// [`Response::ReloadConfig`] `{ reloaded: false }` — Go's `(false, nil)` — and the CLI decides
+    /// what that means to an operator. So the reply is [`Response::ReloadConfig`] (Go's `ok` bool) on
+    /// both non-failing paths, and [`Response::Error`] only on a genuine failure. NOTE: a reloaded
+    /// config's `AuthKey` is deliberately ignored (a reload is not a re-registration — see the
+    /// daemon's `reload_config`).
     ReloadConfig,
+    /// Stop the daemon (Go's LocalAPI `shutdown` route → `serveShutdown`, `ipn/localapi/localapi.go`
+    /// @ `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`; the client half is
+    /// `LocalClient.ShutdownTailscaled`, `POST /localapi/v0/shutdown`). Rendered by `tnet shutdown`.
+    ///
+    /// The point of the verb is that stopping the daemon otherwise needs privileges *beyond* LocalAPI
+    /// write access — signalling the process, or asking the service manager — and neither of those
+    /// can be granted or withheld by a policy file. This one can: it is the power to stop the daemon,
+    /// handed out (or not) by the administrator who writes the policy, without handing out root.
+    ///
+    /// ## The refusal ladder, in this order
+    ///
+    /// Go refuses in four places and the ORDER is the contract, because a caller has to be able to
+    /// tell "you may not" from "nobody may":
+    ///
+    /// 1. **method** — Go answers `405 only POST allowed` on a non-`POST`. This transport has no
+    ///    methods (one JSON frame per request, no verb/route split), so there is no request this
+    ///    rung can reject and it is the one refusal with no counterpart here. Nothing is lost: the
+    ///    rung exists in Go to stop a `GET /localapi/v0/shutdown` from a browser/curl reflex, and a
+    ///    `{"cmd":"shutdown"}` frame cannot be sent by accident in that way.
+    /// 2. **write access** — a caller that may not write gets `shutdown access denied`
+    ///    ([`Response::Error`]), from the same [`crate::auth`] gate `up`/`down` use. This rung comes
+    ///    **before** the policy check on purpose: an unauthorised caller must not be able to read the
+    ///    policy state off the difference between the two messages.
+    /// 3. **policy** — a caller that MAY write is still refused, with `shutdown access denied by
+    ///    policy`, unless the system policy sets `AllowTailscaledRestart`
+    ///    ([`PKEY_ALLOW_TAILSCALED_RESTART`](crate::ipn::syspolicy::PKEY_ALLOW_TAILSCALED_RESTART))
+    ///    to true. The default is false, so the verb is opt-in: a daemon with no policy file refuses
+    ///    every `shutdown`, which is the pre-existing behaviour of this fork and stays the default.
+    /// 4. **the stop itself** — the daemon answers [`Response::Ok`] FIRST (so the caller learns it
+    ///    was accepted, exactly as Go writes and flushes its 200 before publishing the event), then
+    ///    asks its own accept loop to stop. What follows is the ordinary graceful shutdown: the
+    ///    listener is dropped, in-flight connections drain, the socket is unlinked and the backend is
+    ///    torn down — the same path a SIGTERM takes, so the state file and any live device close the
+    ///    way they always do. It is deliberately NOT a `process::exit`.
+    ///
+    /// The daemon then exits **non-zero**, and that is the last rung of the port rather than a
+    /// detail: Go's subscriber closes the listener, `hs.Serve` fails on it, the context was never
+    /// cancelled so `run()` does not take its `context.Canceled` escape, and `log.Fatal` ends
+    /// tailscaled with a failure status that its packaged unit's `Restart=on-failure` acts on. The
+    /// restart is the verb's whole purpose — it is why Go names the key `AllowTailscaledRestart` and
+    /// not `AllowShutdown` — and the units this fork ships restart on failure too, so the exit status
+    /// is what carries the intent across. See [`crate::server::StoppedByLocalApi`].
+    Shutdown,
+}
+
+/// Go's `ipn.NotifyRateLimitIncompatibleBits` (`ipn/backend.go` @
+/// `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`, v1.102.4): `NotifyPeerChanges | NotifyNoNetMap |
+/// NotifyInitialStatus | NotifyPeerPatches` — the bits `ipn.ValidateNotifyWatchOpt` refuses to see
+/// alongside `NotifyRateLimit`, because each names a stateful delta stream that a rate limiter
+/// would silently make incoherent.
+///
+/// ## Where the four numbers come from
+///
+/// Upstream's `NotifyWatchOpt` `const` block is written as explicit `1 << N` literals rather than
+/// with `iota`, in one dense ascending run from `NotifyWatchEngineUpdates` (`1 << 0`) to
+/// `NotifyPeerWireGuardState` (`1 << 18`). These four are the contiguous `1 << 12` … `1 << 15`
+/// stretch of it, in declaration order:
+///
+/// | bit | Go constant |
+/// |---|---|
+/// | `1 << 12` | `NotifyPeerChanges` |
+/// | `1 << 13` | `NotifyNoNetMap` |
+/// | `1 << 14` | `NotifyInitialStatus` |
+/// | `1 << 15` | `NotifyPeerPatches` |
+///
+/// Each was read out of that block at the ref above rather than inferred from the run being
+/// contiguous. Its immediate neighbours are `NotifyInitialClientVersion` (`1 << 11`) below and
+/// `NotifyInProcessNoDisconnect` (`1 << 16`) above — named here because they are what makes a
+/// transcription slip in the middle visible instead of silent. `1 << 14` is the only one of the
+/// four this repo already pinned anywhere before now.
+///
+/// ## Why it is a value and not a sentence
+///
+/// It is load-bearing: [`watch_upstream_mask`] overlaps it in exactly one bit, `initial_status`'s
+/// `NotifyInitialStatus`, and that overlap is why a `rate_limit` field could not be added without
+/// porting Go's refusal alongside it. Written out that way the claim can be checked by a test
+/// rather than believed, and the test stops passing the day a second mask field spells one of
+/// these bits.
+pub const NOTIFY_RATE_LIMIT_INCOMPATIBLE_BITS: u64 = (1 << 12) | (1 << 13) | (1 << 14) | (1 << 15);
+
+/// The upstream `ipn.NotifyWatchOpt` mask a [`Request::Watch`] spells — the integer a Go client
+/// would have put in `?mask=` for the same *masked* subscription — or `None` for any other verb.
+///
+/// Each mask field of [`Request::Watch`] is this fork's named-boolean spelling of exactly one bit
+/// from Go's `ipn/backend.go` (@ `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`), and its per-field
+/// rustdoc says which. This is that same mapping in a form a rule can read, so that a rule about
+/// Go's bits — [`watch_usage_refusal`] — evaluates the mapping instead of restating it in prose,
+/// where prose can drift away from the fields it describes. (It already did: the sentence this
+/// function replaces claimed `prefs` and `policy` had no upstream bit at all.)
+///
+/// `Some(0)`, a BARE watch, is the one answer that corresponds to no Go subscription. A Go client
+/// sending `?mask=0` still gets the notify bus; a bare watch here is answered on the legacy
+/// [`Response::Status`] stream instead, a different feed entirely — see the dual-path contract on
+/// [`Request::Watch`]. The mapping is about which bits a MASKED watch spells; `Some(0)` says only
+/// that no bit was asked for, and which feed that selects is the dispatch arm's business.
+///
+/// Note what "daemon-built" does and does not mean. `prefs`, `policy`, `suggested_exit_node` and
+/// `initial_status` are served from the daemon rather than from an engine `NotifyWatchOpt` bit,
+/// because what they carry lives in the daemon; that is a fact about how the frame is BUILT here.
+/// Upstream has a bit for all six, and it is those bits — not the plumbing — that decide whether
+/// one of Go's subscribe-time refusals applies.
+///
+/// The destructuring below names every field instead of using `..` ON PURPOSE: adding a seventh
+/// mask field stops compiling here until its author has said which of Go's bits it is, and so
+/// decided whether that field carries one of Go's refusals.
+pub fn watch_upstream_mask(req: &Request) -> Option<u64> {
+    let Request::Watch {
+        initial_state,
+        initial_netmap,
+        prefs,
+        policy,
+        suggested_exit_node,
+        initial_status,
+    } = req
+    else {
+        // Every other verb is a one-shot; only a subscription has a mask.
+        return None;
+    };
+    let mut mask = 0;
+    if *initial_state {
+        // ipn.NotifyInitialState, pinned engine-side as `NotifyWatchOpt::INITIAL_STATE`.
+        mask |= 1 << 1;
+    }
+    if *prefs {
+        // ipn.NotifyInitialPrefs.
+        mask |= 1 << 2;
+    }
+    if *initial_netmap {
+        // ipn.NotifyInitialNetMap, pinned engine-side as `NotifyWatchOpt::INITIAL_NETMAP`.
+        mask |= 1 << 3;
+    }
+    if *suggested_exit_node {
+        // ipn.NotifyInitialSuggestedExitNode.
+        mask |= 1 << 10;
+    }
+    if *initial_status {
+        // ipn.NotifyInitialStatus — a member of `NOTIFY_RATE_LIMIT_INCOMPATIBLE_BITS`, so this is
+        // the operand Go's rate-limit refusal would judge the day a `rate_limit` field lands.
+        mask |= 1 << 14;
+    }
+    if *policy {
+        // ipn.NotifySysPolicyChanges.
+        mask |= 1 << 17;
+    }
+    Some(mask)
+}
+
+/// The refusal a [`Request::Watch`] subscription owes *before* the daemon subscribes it to anything,
+/// or `None` when the subscription is usable. Ported from Go's `serveWatchIPNBus`
+/// (`ipn/localapi/localapi.go`) and `ipn.ValidateNotifyWatchOpt` (`ipn/backend.go`) @
+/// `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`.
+///
+/// Go judges the whole subscription up front — all five of its refusals, enumerated in the order
+/// it runs them on [`Request::Watch`], come before `WatchNotifications` is called, so a refused
+/// watcher never subscribes and never emits a frame — and this runs at the same point on the
+/// daemon's side: first thing in the `watch` dispatch arm, before the stream permit and before
+/// either stream.
+///
+/// This is the home for the two of those five that judge the subscription's CONTENT. Of the other
+/// three, Go's `bad mask` is answered one layer earlier here (by the server's parse arm) and Go's
+/// first two are deliberate non-ports — [`Request::Watch`] gives each its own reason. So *inside
+/// the watch dispatch arm* nothing refuses ahead of this call; the only thing that can refuse a
+/// watch earlier at all is the serde decode that produced the request, which is `bad mask` one
+/// layer up. A refusal is answered as an ordinary error line (Go's 400), not as a terminal stream
+/// frame; Go's second, in-process call site delivers the same failure as an `ErrMessage` frame
+/// precisely because an in-process caller has no status code to receive, and this fork has no
+/// in-process caller (also [`Request::Watch`]).
+///
+/// ## Why it accepts everything today
+///
+/// Neither of Go's two *content* refusals can fire on anything this fork's wire format can spell:
+///
+/// - `NotifyInProcessNoDisconnect is only valid for in-process IPN bus subscribers` — the bit is
+///   deliberately not a field at all, for the reasons recorded on [`Request::Watch`].
+/// - `NotifyRateLimit is incompatible with new-style IPN bus subscription bits %v` — Go's rule
+///   needs BOTH operands, and only one is reachable. ONE of the six fields this fork offers spells a
+///   bit in [`NOTIFY_RATE_LIMIT_INCOMPATIBLE_BITS`]: `initial_status` is `NotifyInitialStatus`.
+///   The other five stand for bits outside that set. But there is no `rate_limit` field, so
+///   `NotifyRateLimit` itself is unspellable, and a subscription carrying `initial_status` is still
+///   usable. The missing `rate_limit` field is the fact that actually makes the answer `None`.
+///
+///   None of the six is bitless upstream. Every one of them has a bit, as their own field docs
+///   say: `initial_state` is `NotifyInitialState` (`1 << 1`), `prefs` is `NotifyInitialPrefs`
+///   (`1 << 2`), `initial_netmap` is `NotifyInitialNetMap` (`1 << 3`), `suggested_exit_node` is
+///   `NotifyInitialSuggestedExitNode` (`1 << 10`), `initial_status` is `NotifyInitialStatus`
+///   (`1 << 14`) and `policy` is `NotifySysPolicyChanges` (`1 << 17`). What the daemon-built ones
+///   lack is an *engine* `NotifyWatchOpt` bit, which says nothing about which of Go's bits they
+///   stand for.
+///
+///   Nobody has to take that on trust. The mapping is [`watch_upstream_mask`], and
+///   `watch_usage_refusal_accepts_every_subscription_this_fork_can_spell` evaluates it against
+///   [`NOTIFY_RATE_LIMIT_INCOMPATIBLE_BITS`] for all sixty-four subscriptions a client can ask
+///   for. A seventh mask field cannot be added without editing [`watch_upstream_mask`]'s
+///   exhaustive destructuring, so its author is told where the question lives before that test
+///   ever runs.
+///
+/// (Go's `bad mask`, for a value that will not parse, is structurally impossible here: a mis-typed
+/// field is a serde decode error answered as `bad request` by the server's parse arm, which is the
+/// same outcome one layer earlier.)
+///
+/// So this is the *place* those refusals go rather than the refusals themselves — which is why it
+/// exists now, while the surface is still small enough that the ruling is cheap to record. Go's
+/// message goes in next to the check, verbatim; the return type is owned because one of the two
+/// messages interpolates the offending bits.
+pub fn watch_usage_refusal(req: &Request) -> Option<String> {
+    // Not a subscription — every other verb is a one-shot, and this judges subscriptions only.
+    // Deriving the mask rather than discarding the fields keeps this function reasoning in Go's
+    // own terms, and makes `watch_upstream_mask` the single place a seventh mask field must declare
+    // which of Go's bits it is.
+    watch_upstream_mask(req)?;
+
+    // `initial_status` spells `NotifyInitialStatus`, a member of `NotifyRateLimitIncompatibleBits`,
+    // but it is refusable only together with `NotifyRateLimit`, which has no field here. When one
+    // is added, the refusal is `rate_limit && initial_status`, answered with Go's message verbatim.
+    // `NotifyInProcessNoDisconnect` has no field at all, so every subscription a client can spell
+    // is usable. See the doc above for why that is a fact about the bits and not about the
+    // plumbing.
+    None
 }
 
 /// The daemon's reply to a [`Request`].
@@ -722,6 +1300,16 @@ pub enum Response {
         /// The daemon binary's version (its crate version, `CARGO_PKG_VERSION`).
         version: String,
     },
+    /// The daemon's state directory (reply to [`Request::DebugStateDir`]), printed by `tnet debug
+    /// statedir`. Mirrors Go's `statedir` debug action, which encodes `TailscaleVarRoot()` as a bare
+    /// JSON string — including the empty one.
+    StateDir {
+        /// The daemon's state directory, or `""` when it has none. Empty is the wire analogue of Go's
+        /// empty `TailscaleVarRoot()`, which the CLI renders as Go's `no statedir is set` error rather
+        /// than as a blank line. This fork's daemon always has one (it needs a place for `prefs.json`),
+        /// so the empty case is the ported error path, not a state it reaches on its own.
+        dir: String,
+    },
     /// The OIDC id-token minted by control (reply to [`Request::IdToken`]), printed by
     /// `tnet id-token`.
     IdToken {
@@ -757,14 +1345,44 @@ pub enum Response {
     /// `tnet netcheck`.
     Netcheck(NetcheckReport),
     /// The suggested exit node (reply to [`Request::SuggestExitNode`]), rendered by `tnet exit-node
-    /// suggest`. `suggestion` is `None` when the engine found no eligible candidate — an honest empty
-    /// result, not an error (mirroring Go's empty `SuggestExitNode` response). A **struct** variant
-    /// (not a newtype over `Option`): the `Response` enum is internally tagged (`tag = "kind"`), which
-    /// cannot merge its tag into a bare `Option`/`null` content, so the optional payload is carried as
-    /// a named field instead.
+    /// suggest`. `suggestion` is `None` in two very different situations, which
+    /// [`withheld_by_policy`](Response::ExitNodeSuggestion::withheld_by_policy) tells apart:
+    ///
+    /// - `withheld_by_policy: false` — the engine found no eligible candidate. This is Go's empty
+    ///   `SuggestExitNode` response: an honest empty result, not an error.
+    /// - `withheld_by_policy: true` — the engine DID pick a node and the administrator's
+    ///   `AllowedSuggestedExitNodes` allow-list excludes it. Go does not answer this way: it filters
+    ///   the candidates *before* ranking them, so it answers with the best node the allow-list
+    ///   permits, and only empties when no candidate passes at all. This build is handed one
+    ///   already-chosen node and cannot re-rank (engine ask #44), so it withholds — and says so,
+    ///   rather than dressing the refusal up as "the tailnet has no exit node".
+    ///
+    /// Still not an error in either case (the reply is a suggestion, and there is none). A
+    /// **struct** variant (not a newtype over `Option`): the `Response` enum is internally tagged
+    /// (`tag = "kind"`), which cannot merge its tag into a bare `Option`/`null` content, so the
+    /// optional payload is carried as a named field instead.
     ExitNodeSuggestion {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         suggestion: Option<ExitNodeSuggestionView>,
+        /// `true` when `suggestion` is empty **because** `AllowedSuggestedExitNodes` excludes the
+        /// node the engine picked, rather than because there was nothing to pick. Only ever `true`
+        /// alongside `suggestion: None`. `#[serde(default)]` + `skip_serializing_if` keep the wire
+        /// backward-compatible: a reply from a daemon that predates the flag omits the key and reads
+        /// back as `false`, which is the old meaning of a bare empty reply.
+        #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+        withheld_by_policy: bool,
+    },
+    /// The Tailscale Services (VIPs) this node can reach (reply to [`Request::Services`]), rendered
+    /// by `tnet service list`. Sorted by [`ServiceReport::name`], one entry per Service (Go returns a
+    /// `map[tailcfg.ServiceName]tailcfg.ServiceDetails`, which the CLI sorts by name before printing;
+    /// sorting daemon-side makes the wire itself deterministic). Empty when control has granted this
+    /// node no Services — an honest empty result, not an error. A **struct** variant (not a newtype
+    /// over the `Vec`): the `Response` enum is internally tagged (`tag = "kind"`), which cannot merge
+    /// its tag into a bare sequence, so the payload is carried as a named field — the same shape
+    /// `Files`/`FileTargets` use.
+    Services {
+        /// One entry per Service this node can reach.
+        services: Vec<ServiceReport>,
     },
     /// The effective system policy snapshot (reply to [`Request::SyspolicyList`] /
     /// [`Request::SyspolicyReload`]), rendered by `tnet syspolicy list` / `reload`.
@@ -791,10 +1409,45 @@ pub enum Response {
         /// The marker string (a local identifier + daemon version + node state). NOT a server-side
         /// log id — this fork uploads nothing.
         marker: String,
+        /// The `--diagnose` pass, one `name: detail` line per check, ready to print (see
+        /// [`crate::ipn::doctor`]). EMPTY unless the request set
+        /// [`diagnose`](Request::BugReport::diagnose) — Go's `Doctor` likewise runs only then.
+        /// Returned rather than logged because this fork uploads no logs: the lines are for the
+        /// operator to read and paste, not for support to fetch. `#[serde(default)]` + skip keeps
+        /// the wire backward-compatible with a client that predates the flag.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        checks: Vec<String>,
     },
     /// The node's serve configuration (reply to [`Request::GetServeConfig`]), rendered by
     /// `tnet serve status`.
     ServeConfig(ServeConfig),
+    /// The result of a [`Request::ReloadConfig`] — the faithful analogue of what Go's
+    /// `LocalBackend.ReloadConfig` hands back to its CLI: a bare `ok` bool.
+    ///
+    /// Go splits this verb across two layers, and so do we. The backend answers only "did I reload a
+    /// config?"; `cmd/tailscale/cli/debug.go`'s `reloadConfig` owns BOTH operator-facing lines
+    /// (`config reloaded` on ok, `config mode not in use` + exit 1 otherwise). Keeping the daemon
+    /// wordless here is what keeps `tnet reload-config`'s output byte-identical to `tailscale debug
+    /// reload-config`'s — a daemon-authored sentence on this path is a divergence by construction.
+    ///
+    /// Note what is NOT here: which reconcile ran (rebuild / bring-down / persisted-only). Go has no
+    /// such field, so it stays daemon-side, in the log line the server emits.
+    ReloadConfig {
+        /// Go's `ok`: `true` when the config file was re-read and adopted; `false` when the daemon is
+        /// not in config mode (started without `--config`, or with an `optional:` source that was not
+        /// found) and there was therefore nothing to reload. `false` is a REFUSAL, not a failure —
+        /// nothing was mutated, and no error occurred.
+        reloaded: bool,
+    },
+    /// One line of a `debug portmap` run's log (a streamed reply to [`Request::DebugPortmap`]).
+    /// The daemon emits these as the run narrates itself and then closes the connection; the CLI
+    /// prints each `line` after neutralizing control characters (parts of a line are built from
+    /// what a device on the local network answered), so the output is byte-identical to what
+    /// `tailscale debug portmap` writes to stdout for any line of plain printable text.
+    PortmapLog {
+        /// One log line, without its trailing newline.
+        line: String,
+    },
     /// A command succeeded.
     Ok {
         /// Human-readable detail.
@@ -837,6 +1490,50 @@ pub struct RevertedPref {
     /// `"true"`/`"false"`; for a list it is the comma-joined set; for an optional string it is the
     /// value itself.
     pub value: String,
+}
+
+/// The transport protocol of the flow a [`Request::Whois`] asks about — Go `tailscale whois
+/// --proto`, documented upstream as `protocol; one of "tcp" or "udp"; empty means both`.
+///
+/// Go passes the flag's string straight through to `?proto=` unvalidated (an unrecognized value
+/// simply matches nothing in its proxied-flow table). This fork parses it into a closed enum
+/// instead — see [`FromStr`](WhoisProto::from_str) — because the value can never select anything
+/// here (engine ask #35), and a silently-ignored `--proto=TCP` typo would be indistinguishable from
+/// a working one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WhoisProto {
+    /// Go `--proto=tcp`.
+    Tcp,
+    /// Go `--proto=udp`.
+    Udp,
+}
+
+impl std::fmt::Display for WhoisProto {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        })
+    }
+}
+
+impl std::str::FromStr for WhoisProto {
+    type Err = String;
+
+    /// Parse Go's two documented values. Case-sensitive and exact, like every other proto string Go
+    /// compares against (`ProxyMapper.WhoIsIPPort` keys its table on the literal `"tcp"`/`"udp"`),
+    /// so `TCP` is a refusal rather than a silent alias. The empty string is NOT accepted here: it is
+    /// Go's "both", which this fork models as `None` at the call site, not as a variant.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "tcp" => Ok(Self::Tcp),
+            "udp" => Ok(Self::Udp),
+            other => Err(format!(
+                "invalid --proto {other:?}: expected \"tcp\" or \"udp\" (empty means both)"
+            )),
+        }
+    }
 }
 
 /// The identity behind a tailnet IP, returned by [`Request::Whois`]. The Rust analogue of tsnet's
@@ -929,6 +1626,12 @@ pub struct PolicySetting {
     /// The resolved value rendered as a string (Go prints the `any` value with `%v`). `None` when the
     /// setting resolved to an error instead of a value (then [`error`](PolicySetting::error) is set).
     /// The "Value" column.
+    ///
+    /// One key's value is deliberately **not** here: the daemon renders a configured `AuthKey` as
+    /// the literal `<redacted>`, because it is a registration credential and this report is a
+    /// reporting surface (`tnet syspolicy list`, and every `Watch` policy frame). The row still says
+    /// the key is configured and which store supplied it; the key itself never leaves the daemon.
+    /// See `ipn::syspolicy`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
     /// The resolution error for this key, if any (Go prints it wrapped in `{...}` in the "Error"
@@ -936,6 +1639,227 @@ pub struct PolicySetting {
     /// the setting resolved cleanly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// One Tailscale **Service** (a VIP service) this node can reach, in a [`Response::Services`] reply.
+/// The Rust analogue of Go's `tailcfg.ServiceDetails`, which control delivers to each node as the
+/// value of a `services/<opaque>` entry in the **self node's** capability map (Go
+/// `tailcfg.NodeAttrPrefixServices`; decoded daemon-side by `ipn::diag::services_from_cap_map`,
+/// the port of Go's `netmap.NetworkMap.Services()`).
+///
+/// A Service is not a peer: it is a virtual service with its own addresses, and which Services a
+/// node can see is decided by the tailnet's ACLs. Rendered by `tnet service list`, and consulted by
+/// `tnet ip <service-VIP>` (Go `ip.go`'s Service fallback).
+///
+/// Container-level `#[serde(default)]` so a wire document missing any field deserializes to the
+/// [`ServiceReport::default`] value rather than hard-erroring. Not `Eq`: an action's
+/// [`attributes`](ServiceActionReport::attributes) carry arbitrary JSON.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServiceReport {
+    /// The Service's canonical name, `svc:<dns-label>` (Go `ServiceDetails.Name`). This is the map
+    /// key Go's `services` verb returns, taken from the value's own `Name` field — never parsed out
+    /// of the capability key, whose suffix is opaque and server-chosen.
+    pub name: String,
+    /// An optional human-readable label (Go `ServiceDetails.DisplayName`). Empty when control sent
+    /// none; clients fall back to [`name`](ServiceReport::name).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub display_name: String,
+    /// The Service's virtual IP addresses (Go `ServiceDetails.Addrs`), re-rendered from the parsed
+    /// address so a differently-spelled literal normalizes. IPv4 first when the tailnet has IPv4
+    /// enabled — Go's table prints `Addrs[0]`, which is the v6 address on a v6-only tailnet.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub addrs: Vec<String>,
+    /// The protocol/port combinations the Service accepts (Go `ServiceDetails.Ports`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<ServicePortRange>,
+    /// How a client may interact with this Service (Go `ServiceDetails.Actions`). Empty when control
+    /// sent none, in which case clients infer the interaction from the ports instead.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<ServiceActionReport>,
+}
+
+/// One action a client may invoke against a [`ServiceReport`] — the Rust analogue of Go's
+/// `tailcfg.ServiceAction`. Drives the TYPE column of `tnet service list`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServiceActionReport {
+    /// The action's type slug (Go `ServiceAction.Type`, e.g. `ssh`, `http`, `postgresql`). Carried as
+    /// an opaque string, not an enum: Go tells clients to *ignore* types they do not recognize, so a
+    /// type this build has never heard of must survive the wire rather than fail it.
+    pub action_type: String,
+    /// The target TCP port for this action (Go `ServiceAction.Port`).
+    pub port: u16,
+    /// An optional label for client menus (Go `ServiceAction.DisplayName`). Empty when absent.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub display_name: String,
+    /// Optional per-action metadata (Go `ServiceAction.Attributes`), keyed by attribute name with the
+    /// raw JSON value kept verbatim — this daemon neither interprets nor validates it, exactly as Go
+    /// carries `RawMessage`. Preserved so `tnet service list --json` emits what control sent.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub attributes: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// A protocol + inclusive port range on a [`ServiceReport`] — the Rust analogue of Go's
+/// `tailcfg.ProtoPortRange`.
+///
+/// On the wire between control and the node this is a **string**, not an object: Go's type
+/// implements `encoding.TextMarshaler`, so a Service's `Ports` arrive as `"tcp:443"`, `"udp:1-100"`,
+/// `"443"` or `"*"`. The daemon parses that text form once ([`FromStr`]) and hands the CLI the
+/// decoded triple, so the renderer can both re-emit Go's spelling ([`Display`]) and answer the
+/// question Go's TYPE column asks — "is this a single TCP port?" — without re-parsing strings.
+///
+/// `proto == 0` means "all protocols" (Go's `int(0)`); otherwise it is an IP protocol number
+/// (6 = TCP, 17 = UDP). A `first..=last` span of `0..=65535` means "all ports".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServicePortRange {
+    /// IP protocol number (Go `ProtoPortRange.Proto`). `0` = all protocols.
+    pub proto: u8,
+    /// Inclusive first port (Go `Ports.First`).
+    pub first: u16,
+    /// Inclusive last port (Go `Ports.Last`).
+    pub last: u16,
+}
+
+/// Go `ipproto.preferredNames` — the protocol-number → name table `ipproto.Proto.MarshalText` emits
+/// and `UnmarshalText` accepts (case-insensitively). Mirrored so a rendered [`ServicePortRange`]
+/// matches Go's bytes and a parse accepts every name Go accepts. Numbers absent from the table
+/// render as their decimal value, as Go's does.
+const PROTO_NAMES: &[(u8, &str)] = &[
+    (51, "ah"),
+    (33, "dccp"),
+    (8, "egp"),
+    (50, "esp"),
+    (47, "gre"),
+    (1, "icmp"),
+    (2, "igmp"),
+    (9, "igp"),
+    (4, "ipv4"),
+    (58, "ipv6-icmp"),
+    (132, "sctp"),
+    (6, "tcp"),
+    (17, "udp"),
+];
+
+/// The IP protocol number of TCP, the only protocol Go infers a Service action type for.
+const PROTO_TCP: u8 = 6;
+
+impl ServicePortRange {
+    /// The full `0..=65535` "all ports" span (Go `PortRangeAny`).
+    fn ports_is_any(&self) -> bool {
+        self.first == 0 && self.last == 65535
+    }
+
+    /// Whether this range names exactly one TCP port, and which — the shape Go's
+    /// `serviceActionTypes` infers a well-known action from (`Proto` unset or TCP, `First == Last`).
+    /// `None` for anything else, which Go skips.
+    pub fn single_tcp_port(&self) -> Option<u16> {
+        if self.proto != 0 && self.proto != PROTO_TCP {
+            return None;
+        }
+        if self.first != self.last {
+            return None;
+        }
+        Some(self.first)
+    }
+}
+
+impl std::fmt::Display for ServicePortRange {
+    /// Mirrors Go `ProtoPortRange.String()`: `"*"` for all-protocols + all-ports; otherwise
+    /// `[<proto>:]<ports>`, where the proto token is present only when `proto != 0` and the ports
+    /// token is a single port, `*` for the any-span, or `first-last`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.proto == 0 && self.ports_is_any() {
+            return f.write_str("*");
+        }
+        if self.proto != 0 {
+            match PROTO_NAMES.iter().find(|(n, _)| *n == self.proto) {
+                Some((_, name)) => write!(f, "{name}:")?,
+                None => write!(f, "{}:", self.proto)?,
+            }
+        }
+        if self.ports_is_any() {
+            f.write_str("*")
+        } else if self.first == self.last {
+            write!(f, "{}", self.first)
+        } else {
+            write!(f, "{}-{}", self.first, self.last)
+        }
+    }
+}
+
+impl std::str::FromStr for ServicePortRange {
+    type Err = String;
+
+    /// Parse Go's text form `[<proto>:]<ports>` — the inverse of the [`Display`] impl, ported from
+    /// `tailcfg.parseProtoPortRange` + `ParseHostPortRange`.
+    ///
+    /// Go lower-cases the whole token first, splits on the LAST colon, and treats a colon-less token
+    /// as `*:<ports>` (all protocols). `<proto>` is `*` (all), a `PROTO_NAMES` name, or a decimal
+    /// number; `<ports>` is `*` (the any span), a single port, or `low-high` with `low <= high`.
+    /// Fail-closed: anything else is an error, so a Service carrying a port range this build cannot
+    /// read is dropped whole rather than rendered as a guess — which is Go's behaviour too (its
+    /// `json.Unmarshal` of the enclosing `ServiceDetails` fails and the Service is skipped).
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.is_empty() {
+            return Err("empty string".to_string());
+        }
+        let lower = s.to_ascii_lowercase();
+        if lower == "*" {
+            return Ok(Self {
+                proto: 0,
+                first: 0,
+                last: 65535,
+            });
+        }
+        // Go: a token with no colon is rewritten to `*:<ports>`, then split on the LAST colon.
+        let (proto_str, ports) = match lower.rsplit_once(':') {
+            Some((p, ports)) => (p, ports),
+            None => ("*", lower.as_str()),
+        };
+        if proto_str.is_empty() {
+            return Err("empty protocol".to_string());
+        }
+        if proto_str.contains(',') {
+            return Err("host cannot contain a comma (\",\")".to_string());
+        }
+        let proto = if proto_str == "*" {
+            0
+        } else {
+            match PROTO_NAMES.iter().find(|(_, name)| *name == proto_str) {
+                Some((n, _)) => *n,
+                None => proto_str
+                    .parse::<u8>()
+                    .map_err(|_| format!("unknown protocol {proto_str:?}"))?,
+            }
+        };
+        let (first, last) = if ports == "*" {
+            (0, 65535)
+        } else {
+            match ports.split_once('-') {
+                None => {
+                    let p = ports
+                        .parse::<u16>()
+                        .map_err(|_| format!("invalid port {ports:?}"))?;
+                    (p, p)
+                }
+                Some((lo, hi)) => {
+                    let lo = lo
+                        .parse::<u16>()
+                        .map_err(|_| format!("invalid port range {ports:?}"))?;
+                    let hi = hi
+                        .parse::<u16>()
+                        .map_err(|_| format!("invalid port range {ports:?}"))?;
+                    if lo > hi {
+                        return Err(format!("invalid port range {ports:?}"));
+                    }
+                    (lo, hi)
+                }
+            }
+        };
+        Ok(Self { proto, first, last })
+    }
 }
 
 /// A single waiting Taildrop file, returned by [`Request::FileList`]. Mirrors the engine's
@@ -989,7 +1913,7 @@ pub struct FileTargetReport {
 /// [`StatusReport::default`], so a JSON document missing any field (e.g. an older client's status
 /// line) deserializes instead of hard-erroring. Fields keep their `skip_serializing_if` so the
 /// emitted wire still drops empty optionals.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct StatusReport {
     /// The IPN state name. One of the seven [`crate::ipn::State`] variants (the authoritative
@@ -1415,10 +2339,9 @@ pub struct LockLogEntry {
     /// Go prints tailnet-lock key ids in. Empty for an unsigned AUM (the genesis checkpoint).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub signer_key_ids: Vec<String>,
-    /// The AUM's canonical CBOR serialization (Go `NetworkLockUpdate.Raw`), hex-encoded. Carried so
-    /// an operator can decode the full AUM out-of-band; the daemon itself never decodes it (it has no
-    /// AUM decoder), which is why `tnet lock log`'s human output cannot print Go's per-kind key
-    /// detail. Emitted only by `tnet lock log --json`.
+    /// The AUM's canonical CBOR serialization (Go `NetworkLockUpdate.Raw`), hex-encoded. The daemon
+    /// never decodes it; `tnet lock log --json=1` does, in the CLI as Go does, to expand it into Go's
+    /// schema-1 fields. The human output does not decode it, so it prints no per-kind key detail.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub raw: String,
 }
@@ -1581,11 +2504,20 @@ pub struct ProfileEntry {
 /// The engine's [`Notify`](tailscale::Notify) (v0.39.0) has exactly three fields — `state`,
 /// `net_map`, `browse_to_url` — so this view fills exactly those (with `state`'s terminal-failure
 /// reason split out into [`error`](NotifyView::error), mirroring how [`StatusReport`] already
-/// separates `state` from `error`). It has **no `prefs` field**: a prefs-change broadcast is a later
-/// phase, not this one.
+/// separates `state` from `error`). Four further fields are **daemon-built**, sourced from state the
+/// engine does not hold at all: [`prefs`](NotifyView::prefs) (this fork's prefs are daemon-owned),
+/// [`policy`](NotifyView::policy) (the system-policy registry lives in the daemon) and
+/// [`suggested_exit_node`](NotifyView::suggested_exit_node) (the daemon computes the suggestion, and
+/// filters it through the administrator's allow-list, on top of the engine's ranking), plus the
+/// one-shot [`initial_status`](NotifyView::initial_status) snapshot. All four are Go `Notify` fields —
+/// `Notify.Prefs`, `Notify.Policy`, `Notify.SuggestedExitNode` and `Notify.InitialStatus` — so
+/// carrying them here is a port, not an invention; only the plumbing that feeds them differs. A fifth,
+/// [`self_change`](NotifyView::self_change) (Go `Notify.SelfChange`), is daemon-fetched rather than
+/// daemon-owned: the engine's bus carries the peer set but not this node, so the daemon asks the
+/// engine for its self node on every `net_map` frame and rides it on that same frame.
 ///
-/// The richer Go `Notify` fields (`Health`, `PeerChangedPatch`, `Engine`, `FilesWaiting`,
-/// `SuggestedExitNode`, …) are intentionally **absent**: the fork's engine does not surface them on
+/// The richer Go `Notify` fields (`Health`, `PeerChangedPatch`, `Engine`, `FilesWaiting`, …) are
+/// intentionally **absent**: the fork's engine does not surface them on
 /// its bus (there is no incremental peer-patch feed, no engine-status or health stream here), so
 /// faithfully reflecting "what the engine actually knows" means omitting them rather than fabricating
 /// empty values. In particular [`net_map`](NotifyView::net_map) is always the **full** peer set, never
@@ -1593,6 +2525,18 @@ pub struct ProfileEntry {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct NotifyView {
+    /// The version of the daemon that produced this frame (Go `Notify.Version`). Set on EVERY frame
+    /// the daemon writes, as Go's `sendToLocked` fills it on the way out, because the notify field
+    /// set is not a stable API and a consumer needs to know which backend it is reading. It is the
+    /// same string [`Response::Version`] answers with. `None` only on a frame built but not yet sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// The watch's session id (Go `Notify.SessionID`): set on the FIRST frame of a watch that asked
+    /// for [`initial_state`](Request::Watch::initial_state), and on no other frame. Opaque to the
+    /// client, fresh per connection, stable for its lifetime. Not yet tied to any daemon-side state —
+    /// see [`Request::Watch::initial_state`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     /// The new connection state, if it changed this frame: one of the seven `ipn.State` names
     /// (`NoState` / `NeedsLogin` / `NeedsMachineAuth` / `InUseOtherUser` / `Starting` / `Running` /
     /// `Stopped`) — the SAME string [`StatusReport::state`] uses, derived from the engine's
@@ -1622,6 +2566,29 @@ pub struct NotifyView {
     /// engine has no incremental peer-patch feed). `None` when this frame carried no netmap change.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub net_map: Option<Vec<PeerReport>>,
+    /// This node's own view (Go `Notify.SelfChange`), carried on every frame whose
+    /// [`net_map`](NotifyView::net_map) is set — including the `initial_netmap` front-load, as Go's
+    /// initial notify fills `SelfChange` under `NotifyInitialNetMap`.
+    ///
+    /// A frame carrying it means **"the netmap moved"**, not "self is definitely different": like Go,
+    /// the daemon re-sends the self node with every netmap update rather than diffing it, so a
+    /// consumer can treat each one as the current truth and never has to wonder whether a change was
+    /// suppressed. It exists so a consumer that only cares about this node — its addresses, its
+    /// MagicDNS name, when its key expires — can react to the stream without polling `status` on a
+    /// second connection.
+    ///
+    /// `None` when the frame carried no netmap change, and also when the engine had no self node to
+    /// give for that netmap (Go leaves `SelfChange` nil when `SelfNode` is invalid). A frame never
+    /// carries `self_change` without `net_map`.
+    ///
+    /// **Narrower than Go (engine gap, `docs/ENGINE_ASKS.md` #46):** the engine's bus ticks `net_map`
+    /// only when the *peer* snapshot is republished, so a netmap update that changes only this node —
+    /// an extended key expiry, a new MagicDNS name, reassigned addresses, with no peer, patch or
+    /// liveness delta in the same response — produces no frame, and so no `self_change`, until the
+    /// next peer-side change carries the current self along. Go sends `SelfChange` on every netmap
+    /// update. A consumer that must see a self-only change promptly still has to read `status`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub self_change: Option<SelfReport>,
     /// The node's current prefs, if the `prefs` mask bit was set (Go `Notify.Prefs`). A front-loaded
     /// snapshot on subscribe, then a fresh frame on every prefs change. Reuses the same [`PrefsView`]
     /// projection [`StatusReport::prefs`] / `GetPrefs` use, so the watch feed and a one-shot read
@@ -1629,6 +2596,119 @@ pub struct NotifyView {
     /// daemon-owned). `None` when this frame carried no prefs change (or the `prefs` bit was unset).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefs: Option<PrefsView>,
+    /// The effective system policy, if the `policy` mask bit was set (Go `Notify.Policy`, gated by
+    /// `ipn.NotifySysPolicyChanges`). A front-loaded snapshot on subscribe, then a fresh one on every
+    /// policy change — always the **full** snapshot, never a delta, exactly as Go documents
+    /// `Notify.Policy`.
+    ///
+    /// It is the very [`PolicyReport`] [`Response::Policy`] carries, produced by the same
+    /// `Backend::policy_snapshot` call `syspolicy list`/`reload` answer from — the flat list of
+    /// per-key origin/value/error rows this fork already reports, not a second rendering of the same
+    /// snapshot. One producer, so a rule the report adopts (redacting a credential-bearing key, for
+    /// instance) reaches this stream by construction; that matters here more than on the CLI,
+    /// because a notify stream is read by more processes than a CLI is.
+    ///
+    /// DAEMON-built (not an engine `Notify` field — the engine has no policy registry). See
+    /// [`Request::Watch::policy`] for what "on change" can and cannot mean in this build. `None` when
+    /// this frame carried no policy change (or the `policy` bit was unset).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PolicyReport>,
+    /// The stable node id of the node's exit-node suggestion, if the `suggested_exit_node` mask bit
+    /// was set and a suggestion arrived this frame (Go `Notify.SuggestedExitNode`, a bare
+    /// `tailcfg.StableNodeID`). It is the `--exit-node=<id>` selector that would engage the node — a
+    /// recommendation, never an engagement.
+    ///
+    /// The id alone, as Go carries it: the display name belongs to the one-shot `exit-node suggest`
+    /// reply ([`ExitNodeSuggestionView`]), which answers a question, where this announces a fact.
+    ///
+    /// DAEMON-built (the engine's bus has no `SuggestedExitNode` field). `None` when this frame
+    /// carried no suggestion (or the bit was unset). It never means "the suggestion was withdrawn":
+    /// an empty suggestion is silence rather than a frame, so a consumer's running view keeps the
+    /// last id it was told. See [`Request::Watch::suggested_exit_node`] for the full contract and how
+    /// it is narrower than Go's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggested_exit_node: Option<String>,
+    /// A whole status snapshot, if the `initial_status` mask bit was set (Go `Notify.InitialStatus`,
+    /// gated by `ipn.NotifyInitialStatus`). Present on the session's FIRST frame only, and never
+    /// again: later changes arrive as `state` / `net_map` / `prefs` frames, which a watcher applies
+    /// over this snapshot.
+    ///
+    /// It is the very [`StatusReport`] [`Response::Status`] carries, produced by the same
+    /// `Backend::status` call, so `watch` and `status` cannot drift. Peers are included, as Go's
+    /// `WantPeers: true` includes them; on a node that is not `Running` the list is empty because
+    /// there is no netmap, exactly as a one-shot `status` reports it.
+    ///
+    /// ## Ordering: subscribe to the bus, wait for its baseline, then snapshot
+    ///
+    /// Go assembles `InitialStatus` under `b.mu` in the same critical section that registers the
+    /// watcher, so no event can reach the watcher before its snapshot and none can fall between the
+    /// two. This daemon has no single lock spanning its backend and the engine bus. It gets the
+    /// same "nothing falls between" result by ordering instead:
+    ///
+    /// - The lifecycle, prefs, policy and exit-node-suggestion subscriptions are taken first, so an
+    ///   `up`/`down`, a prefs write, a policy change or a new suggestion landing after the snapshot
+    ///   is still delivered.
+    /// - With a device, the engine's IPN bus is subscribed next, widened to
+    ///   `INITIAL_STATE | INITIAL_NETMAP`. The daemon waits for that subscription's initial frame.
+    ///   The engine sends it once its bus task has read its state and peer cells, so every change
+    ///   after that point is queued for this watcher. `watch_ipn_bus` returning is not that
+    ///   point: it only means the task was spawned.
+    /// - Only then is the snapshot taken. It goes out on the session's first frame, together with
+    ///   the part of the engine's initial frame the client asked for (`state` for `initial_state`,
+    ///   `net_map` for `initial_netmap`, nothing otherwise). The prefs, policy and suggestion
+    ///   front-loads follow it.
+    ///
+    /// So a connection-state or peer-set change landing after the snapshot is streamed as its own
+    /// frame. One landing between the engine's baseline and the snapshot can show up twice: in the
+    /// snapshot, then again as a frame. That is harmless, because frames carry whole values, not
+    /// deltas. For the same reason, the `state`/`net_map` sharing the first frame can be older than
+    /// the snapshot; the frame that moves them on follows.
+    ///
+    /// The window this order still leaves: with no device, or when the bus subscribe fails, there
+    /// is no bus to order against, so the snapshot is the device-less state, sent at once. The
+    /// device that a later `up` installs gets a fresh bus subscription with the client's own mask,
+    /// as every masked watch does. A client that did not set `initial_state` / `initial_netmap`
+    /// is not sent that device's state or peers as of that subscription, only the changes after
+    /// it. Setting those bits closes that window too. Apart from that, "streamed" assumes the
+    /// client keeps up: the engine drops frames for a reader that falls behind and does not say
+    /// so. That gap is engine-side (`docs/ENGINE_ASKS.md` #45, see `stream_notify`).
+    ///
+    /// DAEMON-built (not an engine `Notify` field). `None` on every frame but the first, and on
+    /// every frame when the bit was unset.
+    ///
+    /// Boxed only to keep [`Response`] small (a whole report inline would make every frame carry
+    /// its size); serde encodes a `Box` exactly like its contents, so the wire is unaffected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_status: Option<Box<StatusReport>>,
+}
+
+/// This node as a `watch` subscriber sees it: the body of [`NotifyView::self_change`], the wire
+/// shape of Go's `Notify.SelfChange`.
+///
+/// Go sends a whole `tailcfg.Node`; this is deliberately a small, fixed subset instead — the self
+/// fields [`StatusReport`] already reports (`self_name`, `self_ipv4`, `self_ipv6`), plus the stable
+/// id that says *which* node this is and the key expiry a consumer needs to re-authenticate in time.
+/// It is its own type rather than a reused [`PeerReport`] because most of a peer's fields (`cur_addr`,
+/// `relay`, `is_exit_node`, `last_seen`) mean nothing for the node itself, and a field that is always
+/// empty on the wire reads as "unknown" rather than "not applicable". The field set is pinned by a
+/// test; growing it is a wire change and should be reviewed as one.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SelfReport {
+    /// The node's stable node ID (Go `Node.StableID`) — the identity a consumer can compare across
+    /// frames to notice the node was replaced (a logout/login or profile switch).
+    pub stable_id: String,
+    /// Display name: the MagicDNS FQDN if the tailnet is known, else the bare hostname. The same
+    /// value [`StatusReport::self_name`] reports.
+    pub name: String,
+    /// The node's tailnet IPv4 address. The same value [`StatusReport::self_ipv4`] reports.
+    pub ipv4: String,
+    /// The node's tailnet IPv6 address. The same value [`StatusReport::self_ipv6`] reports.
+    pub ipv6: String,
+    /// When the node key expires (Go `Node.KeyExpiry`), strict RFC3339 like every other timestamp on
+    /// this wire. `None` means the key never expires (Go's zero `KeyExpiry`), not "unknown".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_expiry: Option<String>,
 }
 
 /// A single peer entry in a [`StatusReport`].
@@ -1790,9 +2870,32 @@ mod tests {
     #[test]
     fn request_down_wire_format() {
         assert_eq!(
-            serde_json::to_string(&Request::Down).unwrap(),
-            r#"{"cmd":"down"}"#
+            serde_json::to_string(&Request::Down { reason: None }).unwrap(),
+            r#"{"cmd":"down"}"#,
+            "no reason must serialize to the historical bare form"
         );
+        // `tnet down --reason "<text>"` (Go `tailscale down --reason`): the justification travels to
+        // the daemon verbatim, exactly as `logout --reason` does, and the bare `{"cmd":"down"}` an
+        // older client sends must still parse.
+        let json = serde_json::to_string(&Request::Down {
+            reason: Some("scheduled maintenance".into()),
+        })
+        .unwrap();
+        assert!(
+            json.contains(r#""cmd":"down""#)
+                && json.contains(r#""reason":"scheduled maintenance""#),
+            "{json}"
+        );
+        match serde_json::from_str::<Request>(&json).unwrap() {
+            Request::Down { reason } => {
+                assert_eq!(reason.as_deref(), Some("scheduled maintenance"))
+            }
+            other => panic!("expected Down, got {other:?}"),
+        }
+        match serde_json::from_str::<Request>(r#"{"cmd":"down"}"#).unwrap() {
+            Request::Down { reason } => assert_eq!(reason, None),
+            other => panic!("expected Down, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1806,6 +2909,27 @@ mod tests {
         assert!(matches!(
             serde_json::from_str::<Request>(r#"{"cmd":"reload_config"}"#).unwrap(),
             Request::ReloadConfig
+        ));
+    }
+
+    #[test]
+    fn response_reload_config_carries_only_gos_ok_bool() {
+        // The reply to `reload_config` is Go's `(ok bool, ...)` and nothing more — the CLI derives
+        // both of its lines from this bool. Pin the discriminant and the field (separate processes
+        // agree only on this JSON), and pin the ABSENCE of a daemon-authored message: adding one back
+        // is how the CLI's output drifts away from `tailscale debug reload-config`'s.
+        assert_eq!(
+            serde_json::to_string(&Response::ReloadConfig { reloaded: true }).unwrap(),
+            r#"{"kind":"reload_config","reloaded":true}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Response::ReloadConfig { reloaded: false }).unwrap(),
+            r#"{"kind":"reload_config","reloaded":false}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<Response>(r#"{"kind":"reload_config","reloaded":false}"#)
+                .unwrap(),
+            Response::ReloadConfig { reloaded: false }
         ));
     }
 
@@ -1865,6 +2989,9 @@ mod tests {
                 initial_state: false,
                 initial_netmap: false,
                 prefs: false,
+                policy: false,
+                suggested_exit_node: false,
+                initial_status: false,
             })
             .unwrap(),
             r#"{"cmd":"watch"}"#
@@ -1875,6 +3002,9 @@ mod tests {
                 initial_state: false,
                 initial_netmap: false,
                 prefs: false,
+                policy: false,
+                suggested_exit_node: false,
+                initial_status: false,
             }
         ));
         // A masked watch round-trips its bits (the Notify-path selector): each `true` field appears on
@@ -1885,12 +3015,15 @@ mod tests {
                 initial_state: true,
                 initial_netmap: true,
                 prefs: true,
+                policy: true,
+                suggested_exit_node: true,
+                initial_status: true,
             })
             .unwrap(),
-            r#"{"cmd":"watch","initial_state":true,"initial_netmap":true,"prefs":true}"#
+            r#"{"cmd":"watch","initial_state":true,"initial_netmap":true,"prefs":true,"policy":true,"suggested_exit_node":true,"initial_status":true}"#
         );
         match serde_json::from_str::<Request>(
-            r#"{"cmd":"watch","initial_state":true,"initial_netmap":true,"prefs":true}"#,
+            r#"{"cmd":"watch","initial_state":true,"initial_netmap":true,"prefs":true,"policy":true,"suggested_exit_node":true,"initial_status":true}"#,
         )
         .unwrap()
         {
@@ -1898,9 +3031,98 @@ mod tests {
                 initial_state,
                 initial_netmap,
                 prefs,
+                policy,
+                suggested_exit_node,
+                initial_status,
             } => {
-                assert!(initial_state && initial_netmap && prefs);
+                assert!(
+                    initial_state
+                        && initial_netmap
+                        && prefs
+                        && policy
+                        && suggested_exit_node
+                        && initial_status
+                );
             }
+            other => panic!("expected masked Watch, got {other:?}"),
+        }
+        // A client that predates the `initial_status` bit sends the five-field masked line. It must
+        // still parse with the bit OFF: a watcher never gets a snapshot it did not ask for.
+        match serde_json::from_str::<Request>(
+            r#"{"cmd":"watch","initial_state":true,"initial_netmap":true,"prefs":true,"policy":true,"suggested_exit_node":true}"#,
+        )
+        .unwrap()
+        {
+            Request::Watch { initial_status, .. } => assert!(
+                !initial_status,
+                "a watch line written before the initial_status bit existed must not turn it on"
+            ),
+            other => panic!("expected masked Watch, got {other:?}"),
+        }
+        // An `initial_status`-only watch (Go's `NotifyInitialStatus` alone) is masked, and implies no
+        // other bit.
+        assert_eq!(
+            serde_json::to_string(&Request::Watch {
+                initial_state: false,
+                initial_netmap: false,
+                prefs: false,
+                policy: false,
+                suggested_exit_node: false,
+                initial_status: true,
+            })
+            .unwrap(),
+            r#"{"cmd":"watch","initial_status":true}"#
+        );
+        match serde_json::from_str::<Request>(r#"{"cmd":"watch","initial_status":true}"#).unwrap() {
+            Request::Watch {
+                initial_state,
+                initial_netmap,
+                prefs,
+                policy,
+                suggested_exit_node,
+                initial_status,
+            } => {
+                assert!(
+                    initial_status,
+                    "the initial_status bit must survive the round trip"
+                );
+                assert!(
+                    !initial_state && !initial_netmap && !prefs && !policy && !suggested_exit_node,
+                    "a status-only watch must not imply any other mask bit"
+                );
+            }
+            other => panic!("expected masked Watch, got {other:?}"),
+        }
+        // A client that predates the `policy` bit sends the three-field masked line. It must still
+        // parse, with `policy` defaulting OFF — a watcher never gets a feed it did not ask for. The
+        // same back-compat discipline every earlier mask bit got.
+        match serde_json::from_str::<Request>(
+            r#"{"cmd":"watch","initial_state":true,"initial_netmap":true,"prefs":true}"#,
+        )
+        .unwrap()
+        {
+            Request::Watch { policy, .. } => assert!(
+                !policy,
+                "a watch line written before the policy bit existed must not turn it on"
+            ),
+            other => panic!("expected masked Watch, got {other:?}"),
+        }
+        // Same discipline for the newest bit: a client written before `suggested_exit_node` existed
+        // sends the four-field masked line, which must parse with the suggestion feed OFF. Turning it
+        // on by default would make every older watcher start triggering engine computations it never
+        // asked for.
+        match serde_json::from_str::<Request>(
+            r#"{"cmd":"watch","initial_state":true,"initial_netmap":true,"prefs":true,"policy":true}"#,
+        )
+        .unwrap()
+        {
+            Request::Watch {
+                suggested_exit_node,
+                ..
+            } => assert!(
+                !suggested_exit_node,
+                "a watch line written before the suggested_exit_node bit existed must not turn it on"
+            ),
             other => panic!("expected masked Watch, got {other:?}"),
         }
         // A `prefs`-only watch (the Phase-2 daemon-built path) is also masked — only `prefs` on the wire.
@@ -1909,10 +3131,536 @@ mod tests {
                 initial_state: false,
                 initial_netmap: false,
                 prefs: true,
+                policy: false,
+                suggested_exit_node: false,
+                initial_status: false,
             })
             .unwrap(),
             r#"{"cmd":"watch","prefs":true}"#
         );
+        // A `policy`-only watch (Go's `NotifySysPolicyChanges` alone) is masked too: a management agent
+        // that only wants to know when the administrator changed something asks for nothing else.
+        assert_eq!(
+            serde_json::to_string(&Request::Watch {
+                initial_state: false,
+                initial_netmap: false,
+                prefs: false,
+                policy: true,
+                suggested_exit_node: false,
+                initial_status: false,
+            })
+            .unwrap(),
+            r#"{"cmd":"watch","policy":true}"#
+        );
+        match serde_json::from_str::<Request>(r#"{"cmd":"watch","policy":true}"#).unwrap() {
+            Request::Watch {
+                initial_state,
+                initial_netmap,
+                prefs,
+                policy,
+                suggested_exit_node,
+                initial_status,
+            } => {
+                assert!(policy, "the policy bit must survive the round trip");
+                assert!(
+                    !initial_state
+                        && !initial_netmap
+                        && !prefs
+                        && !suggested_exit_node
+                        && !initial_status,
+                    "a policy-only watch must not imply any other mask bit"
+                );
+            }
+            other => panic!("expected masked Watch, got {other:?}"),
+        }
+        // A `suggested_exit_node`-only watch (Go's `NotifyInitialSuggestedExitNode` alone): a client
+        // that only wants to be told which exit node to recommend asks for nothing else.
+        assert_eq!(
+            serde_json::to_string(&Request::Watch {
+                initial_state: false,
+                initial_netmap: false,
+                prefs: false,
+                policy: false,
+                suggested_exit_node: true,
+                initial_status: false,
+            })
+            .unwrap(),
+            r#"{"cmd":"watch","suggested_exit_node":true}"#
+        );
+        match serde_json::from_str::<Request>(r#"{"cmd":"watch","suggested_exit_node":true}"#)
+            .unwrap()
+        {
+            Request::Watch {
+                initial_state,
+                initial_netmap,
+                prefs,
+                policy,
+                suggested_exit_node,
+                initial_status,
+            } => {
+                assert!(
+                    suggested_exit_node,
+                    "the suggested_exit_node bit must survive the round trip"
+                );
+                assert!(
+                    !initial_state && !initial_netmap && !prefs && !policy && !initial_status,
+                    "a suggestion-only watch must not imply any other mask bit"
+                );
+            }
+            other => panic!("expected masked Watch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn notify_initial_status_frame_carries_the_status_report() {
+        // Go's `Notify.InitialStatus` is the `ipnstate.Status` a `status` call returns. Ours is the
+        // very `StatusReport` `Response::Status` carries, so a status frame decodes back to the
+        // identical report — peers included — and carries nothing else.
+        let report = StatusReport {
+            state: "Running".to_string(),
+            want_running: true,
+            self_ipv4: Some("100.64.0.1".to_string()),
+            self_name: Some("node-a.tail0123.ts.net".to_string()),
+            magic_dns_suffix: Some("tail0123.ts.net".to_string()),
+            peers: vec![PeerReport {
+                name: "node-b.tail0123.ts.net".to_string(),
+                ipv4: "100.64.0.2".to_string(),
+                stable_id: "nB".to_string(),
+                online: Some(true),
+                cur_addr: Some("192.0.2.7:41641".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let frame = NotifyView {
+            initial_status: Some(Box::new(report.clone())),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&Response::Notify(frame.clone())).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let object = value.as_object().unwrap();
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["initial_status", "kind"],
+            "a status frame is nil-means-unchanged for every other field"
+        );
+        assert_eq!(
+            object["initial_status"],
+            serde_json::to_value(&report).unwrap(),
+            "the snapshot must serialize exactly as the status report itself does"
+        );
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::Notify(back) => {
+                assert_eq!(back, frame);
+                assert_eq!(back.initial_status.unwrap().peers, report.peers);
+            }
+            other => panic!("expected a notify frame, got {other:?}"),
+        }
+        // A frame that predates the field (or any later frame) decodes with the snapshot absent.
+        match serde_json::from_str::<Response>(r#"{"kind":"notify","state":"Running"}"#).unwrap() {
+            Response::Notify(back) => assert!(back.initial_status.is_none()),
+            other => panic!("expected a notify frame, got {other:?}"),
+        }
+    }
+
+    /// One `Request::Watch` from the six mask booleans, in the order they are declared. Adding a
+    /// seventh mask field stops this helper compiling, which is the same compile-time gate
+    /// `watch_upstream_mask` puts on production code — so a new field cannot arrive with these
+    /// tests silently still passing about six of seven.
+    fn watch(
+        initial_state: bool,
+        initial_netmap: bool,
+        prefs: bool,
+        policy: bool,
+        suggested_exit_node: bool,
+        initial_status: bool,
+    ) -> Request {
+        Request::Watch {
+            initial_state,
+            initial_netmap,
+            prefs,
+            policy,
+            suggested_exit_node,
+            initial_status,
+        }
+    }
+
+    #[test]
+    fn watch_mask_fields_spell_the_go_bits_their_own_docs_name() {
+        // Each mask field is this fork's spelling of exactly one `ipn.NotifyWatchOpt` bit from Go's
+        // `ipn/backend.go` @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8. ALL SIX have one — including
+        // `prefs`, `policy`, `suggested_exit_node` and `initial_status`, which are merely BUILT by
+        // the daemon rather than by an engine `NotifyWatchOpt` bit. Pinned because every argument about which of Go's refusals can apply
+        // is only as good as this mapping, and "that field has no upstream bit" is the easy way to
+        // get it wrong. The expected values are Go's literals, not a recomputation of what the
+        // function does.
+        assert_eq!(
+            watch_upstream_mask(&watch(true, false, false, false, false, false)),
+            Some(1 << 1),
+            "initial_state is Go's NotifyInitialState"
+        );
+        assert_eq!(
+            watch_upstream_mask(&watch(false, true, false, false, false, false)),
+            Some(1 << 3),
+            "initial_netmap is Go's NotifyInitialNetMap"
+        );
+        assert_eq!(
+            watch_upstream_mask(&watch(false, false, true, false, false, false)),
+            Some(1 << 2),
+            "prefs is Go's NotifyInitialPrefs — a real bit, not a field upstream lacks"
+        );
+        assert_eq!(
+            watch_upstream_mask(&watch(false, false, false, true, false, false)),
+            Some(1 << 17),
+            "policy is Go's NotifySysPolicyChanges — a real bit, not a field upstream lacks"
+        );
+        assert_eq!(
+            watch_upstream_mask(&watch(false, false, false, false, true, false)),
+            Some(1 << 10),
+            "suggested_exit_node is Go's NotifyInitialSuggestedExitNode"
+        );
+        assert_eq!(
+            watch_upstream_mask(&watch(false, false, false, false, false, true)),
+            Some(1 << 14),
+            "initial_status is Go's NotifyInitialStatus"
+        );
+        // A full subscription is the OR of the six, exactly as Go's single integer would carry it.
+        assert_eq!(
+            watch_upstream_mask(&watch(true, true, true, true, true, true)),
+            Some((1 << 1) | (1 << 2) | (1 << 3) | (1 << 10) | (1 << 14) | (1 << 17)),
+        );
+        // A bare watch asks for no bit. Unlike the six above this is NOT a Go subscription: Go
+        // answers `?mask=0` on the notify bus, while a bare watch here is answered on the legacy
+        // status stream (`Request::Watch`'s dual-path contract). `Some(0)` says only "no bit was
+        // requested"; which feed that selects is the dispatch arm's decision, not this mapping's.
+        assert_eq!(
+            watch_upstream_mask(&watch(false, false, false, false, false, false)),
+            Some(0)
+        );
+        // A one-shot verb has no mask at all — a different answer from "a mask with no bits set".
+        assert_eq!(watch_upstream_mask(&Request::Status), None);
+    }
+
+    #[test]
+    fn watch_usage_refusal_accepts_every_subscription_this_fork_can_spell() {
+        // The ruling recorded on `Request::Watch`, in code: Go refuses two subscriptions on their
+        // CONTENT before it subscribes (`NotifyInProcessNoDisconnect` from a LocalAPI client, and
+        // `NotifyRateLimit` combined with any of `NotifyRateLimitIncompatibleBits`), and NEITHER is
+        // expressible in this fork's named-boolean spelling. `initial_status` is
+        // `NotifyInitialStatus`, a member of that incompatible set, but the refusal needs
+        // `NotifyRateLimit` too and there is no rate-limit field. So every one of the sixty-four
+        // subscriptions a client can ask for is usable, including the all-bits-on one that would
+        // be the richest combination to refuse if any rule applied to it.
+        //
+        // Positive control, so the overlap assertion below is checking a real member of the set:
+        // Go's `NotifyInitialStatus` (1 << 14) IS in the constant.
+        assert_ne!(
+            NOTIFY_RATE_LIMIT_INCOMPATIBLE_BITS & (1 << 14),
+            0,
+            "NotifyInitialStatus must be in Go's NotifyRateLimitIncompatibleBits"
+        );
+        for bits in 0u8..64 {
+            let req = watch(
+                bits & 1 != 0,
+                bits & 2 != 0,
+                bits & 4 != 0,
+                bits & 8 != 0,
+                bits & 16 != 0,
+                bits & 32 != 0,
+            );
+            // The two production items evaluated against each other. This is the fact the rustdoc
+            // claims, so it is the fact under test — not the conclusion it supports: the only
+            // incompatible bit a client can spell is `initial_status`'s own.
+            let expected_overlap = if bits & 32 != 0 { 1 << 14 } else { 0 };
+            assert_eq!(
+                watch_upstream_mask(&req).expect("a watch always spells a mask")
+                    & NOTIFY_RATE_LIMIT_INCOMPATIBLE_BITS,
+                expected_overlap,
+                "{req:?} must reach Go's NotifyRateLimitIncompatibleBits only through \
+                 initial_status (NotifyInitialStatus)"
+            );
+            assert_eq!(
+                watch_usage_refusal(&req),
+                None,
+                "no combination of today's mask fields is refusable, but {req:?} was refused"
+            );
+        }
+        // It judges subscriptions only: a one-shot verb is not its business (Go's check lives in the
+        // watch handler, not in the LocalAPI mux).
+        assert_eq!(watch_usage_refusal(&Request::Status), None);
+    }
+
+    #[test]
+    fn watch_is_classified_as_a_read_so_gos_permit_read_403_has_no_analogue() {
+        // What this pins: `Request::Watch` — bare or fully masked — is classified as a READ, so
+        // `auth::authorize` clears it for the least-privileged LocalAPI caller there is. That is
+        // the classification half of why the enumeration on `Request::Watch` lists Go's first
+        // refusal (`watch ipn bus access denied`, 403, `serveWatchIPNBus`'s very first statement)
+        // as a deliberate non-port rather than omitting it from a list it calls complete. If the
+        // fork-wide ungated-read posture is ever revisited, the classification moves here first.
+        //
+        // What this does NOT pin, and where that actually lives: on the live path the watch arm in
+        // `src/server.rs` is terminal and dispatches `Request::Watch` without calling
+        // `auth::authorize` at all, so a read-only caller reaches the handler because nothing on
+        // that arm authorizes, not because of the answer below. Restoring an access refusal means
+        // editing that arm; this test would keep passing.
+        for bits in 0u8..64 {
+            let req = watch(
+                bits & 1 != 0,
+                bits & 2 != 0,
+                bits & 4 != 0,
+                bits & 8 != 0,
+                bits & 16 != 0,
+                bits & 32 != 0,
+            );
+            assert_eq!(
+                crate::auth::authorize(&req, crate::auth::Access::ReadOnly),
+                Ok(()),
+                "a watch is a read at every mask, but {req:?} was denied to a read-only caller"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_cannot_spell_the_bits_go_refuses() {
+        // The evidence behind that ruling. Go's refusals operate on bits of one integer, so a client
+        // can always SEND a forbidden mask and be told no. Here the same words are field names, and
+        // a name this fork does not offer is not a value the daemon looks at — serde drops it. A
+        // line naming every bit Go has a refusal for therefore decodes to a watch carrying only the
+        // one of them this fork offers, `initial_status` (`NotifyInitialStatus`, a member of
+        // `NotifyRateLimitIncompatibleBits`). Its partner in Go's refusal, `rate_limit`, is dropped,
+        // so the pair Go refuses never reaches the daemon and the watch is accepted.
+        let line = r#"{"cmd":"watch","in_process_no_disconnect":true,"rate_limit":true,"peer_changes":true,"no_net_map":true,"initial_status":true,"peer_patches":true}"#;
+        let req = serde_json::from_str::<Request>(line).unwrap();
+        match &req {
+            Request::Watch {
+                initial_state,
+                initial_netmap,
+                prefs,
+                policy,
+                suggested_exit_node,
+                initial_status,
+            } => {
+                assert!(
+                    *initial_status,
+                    "initial_status is an offered field and must survive, got {req:?}"
+                );
+                assert!(
+                    !initial_state && !initial_netmap && !prefs && !policy && !suggested_exit_node,
+                    "the unoffered bits must not turn on any other field, got {req:?}"
+                );
+            }
+            other => panic!("expected Watch, got {other:?}"),
+        }
+        assert_eq!(
+            watch_usage_refusal(&req),
+            None,
+            "without a rate_limit field the pair Go refuses was never received, so there is nothing \
+             to refuse"
+        );
+        // When `rate_limit` (or any other of those names) becomes a real field, this assertion
+        // starts failing, which is the point: its author has to come here, read the ruling on
+        // `Request::Watch`, and port the refusal Go attaches to it.
+    }
+
+    #[test]
+    fn notify_policy_frame_carries_the_reports_own_rows() {
+        // Go's `Notify.Policy` is the very `setting.Snapshot` `GetEffectivePolicy` returns. Ours is the
+        // very `PolicyReport` `Response::Policy` carries, so the notify frame and a one-shot
+        // `syspolicy list` describe the policy with the identical rows — no second rendering to drift.
+        let report = PolicyReport {
+            scope: "Device".to_string(),
+            settings: vec![
+                PolicySetting {
+                    key: "AlwaysOn.Enabled".to_string(),
+                    origin: "JSONFile (Device)".to_string(),
+                    value: Some("true".to_string()),
+                    error: None,
+                },
+                PolicySetting {
+                    key: "Hostname".to_string(),
+                    origin: "JSONFile (Device)".to_string(),
+                    value: None,
+                    error: Some("unreadable".to_string()),
+                },
+            ],
+        };
+        let frame = NotifyView {
+            policy: Some(report.clone()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&Response::Notify(frame.clone())).unwrap();
+        // A policy-only frame carries ONLY the policy key: every other field is nil-means-unchanged.
+        assert_eq!(
+            json,
+            r#"{"kind":"notify","policy":{"scope":"Device","settings":[{"key":"AlwaysOn.Enabled","origin":"JSONFile (Device)","value":"true"},{"key":"Hostname","origin":"JSONFile (Device)","error":"unreadable"}]}}"#
+        );
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::Notify(back) => assert_eq!(back, frame),
+            other => panic!("expected a notify frame, got {other:?}"),
+        }
+
+        // Absent `policy` means "unchanged", NOT "no policy" — a state-only frame must not be read as
+        // the administrator having cleared the policy.
+        let state_only = NotifyView {
+            state: Some("Running".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&Response::Notify(state_only)).unwrap(),
+            r#"{"kind":"notify","state":"Running"}"#
+        );
+        // ...and an empty-but-present snapshot is distinguishable from it: that IS a policy, it just
+        // has no rows (the daemon registered no source), which is what the CLI prints as "No policy
+        // settings".
+        let empty = NotifyView {
+            policy: Some(PolicyReport {
+                scope: "Device".to_string(),
+                settings: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&Response::Notify(empty)).unwrap(),
+            r#"{"kind":"notify","policy":{"scope":"Device"}}"#
+        );
+    }
+
+    #[test]
+    fn notify_suggested_exit_node_frame_carries_the_bare_stable_id() {
+        // Go's `Notify.SuggestedExitNode` is a bare `*tailcfg.StableNodeID`, so ours is the bare id
+        // string — not the `{id, name}` pair the one-shot `exit-node suggest` reply carries. Pin that,
+        // and pin that a suggestion-only frame carries ONLY the suggestion key (nil-means-unchanged
+        // for everything else).
+        let frame = NotifyView {
+            suggested_exit_node: Some("nodeid-abc".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&Response::Notify(frame.clone())).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"notify","suggested_exit_node":"nodeid-abc"}"#
+        );
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::Notify(back) => assert_eq!(back, frame),
+            other => panic!("expected a notify frame, got {other:?}"),
+        }
+
+        // An ABSENT `suggested_exit_node` means "unchanged", never "the suggestion was withdrawn" —
+        // an empty suggestion is silence on this bus, so there is no frame that clears it. A
+        // state-only frame must therefore leave a consumer's remembered suggestion alone.
+        let state_only = NotifyView {
+            state: Some("Running".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&Response::Notify(state_only)).unwrap(),
+            r#"{"kind":"notify","state":"Running"}"#
+        );
+
+        // A frame written before this field existed must still decode, with the suggestion unset.
+        match serde_json::from_str::<Response>(r#"{"kind":"notify","state":"Running"}"#).unwrap() {
+            Response::Notify(back) => assert_eq!(back.suggested_exit_node, None),
+            other => panic!("expected a notify frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn notify_view_identity_fields_wire_format() {
+        // Go's `Notify` leads with `Version` then `SessionID`; the wire names here are snake_case like
+        // every other field on this stream, and both drop out when unset.
+        let first = NotifyView {
+            version: Some("0.62.2".to_string()),
+            session_id: Some("0123456789abcdef".to_string()),
+            state: Some("NeedsLogin".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&Response::Notify(first.clone())).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"notify","version":"0.62.2","session_id":"0123456789abcdef","state":"NeedsLogin"}"#
+        );
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::Notify(back) => assert_eq!(back, first),
+            other => panic!("expected a notify frame, got {other:?}"),
+        }
+        // An identity-only frame (the device-less first frame) is a valid notify on its own.
+        match serde_json::from_str::<Response>(
+            r#"{"kind":"notify","version":"0.62.2","session_id":"0123456789abcdef"}"#,
+        )
+        .unwrap()
+        {
+            Response::Notify(back) => {
+                assert_eq!(back.session_id.as_deref(), Some("0123456789abcdef"));
+                assert!(back.state.is_none() && back.prefs.is_none() && back.policy.is_none());
+            }
+            other => panic!("expected a notify frame, got {other:?}"),
+        }
+        // A frame from an older daemon has neither field and must still parse.
+        match serde_json::from_str::<Response>(r#"{"kind":"notify","state":"Running"}"#).unwrap() {
+            Response::Notify(back) => {
+                assert_eq!(back.version, None);
+                assert_eq!(back.session_id, None);
+            }
+            other => panic!("expected a notify frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn notify_self_change_rides_the_netmap_frame_with_a_pinned_field_set() {
+        let me = SelfReport {
+            stable_id: "nSELF1CNTRL".to_string(),
+            name: "laptop.tail0123.ts.net".to_string(),
+            ipv4: "100.64.0.1".to_string(),
+            ipv6: "fd7a:115c:a1e0::1".to_string(),
+            key_expiry: Some("2026-09-01T12:00:00+00:00".to_string()),
+        };
+        // The self view's field set is pinned: this exhaustive destructure stops compiling when a
+        // field is added, so growing the wire type is a deliberate edit here and not a drive-by.
+        let SelfReport {
+            stable_id: _,
+            name: _,
+            ipv4: _,
+            ipv6: _,
+            key_expiry: _,
+        } = &me;
+
+        let frame = NotifyView {
+            net_map: Some(Vec::new()),
+            self_change: Some(me.clone()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&Response::Notify(frame.clone())).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"notify","net_map":[],"self_change":{"stable_id":"nSELF1CNTRL","name":"laptop.tail0123.ts.net","ipv4":"100.64.0.1","ipv6":"fd7a:115c:a1e0::1","key_expiry":"2026-09-01T12:00:00+00:00"}}"#
+        );
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::Notify(back) => assert_eq!(back, frame),
+            other => panic!("expected a notify frame, got {other:?}"),
+        }
+
+        // A key that never expires omits `key_expiry` rather than sending an empty string, so it
+        // cannot be mistaken for an expiry the consumer failed to parse.
+        let never = SelfReport {
+            key_expiry: None,
+            ..me
+        };
+        assert_eq!(
+            serde_json::to_string(&never).unwrap(),
+            r#"{"stable_id":"nSELF1CNTRL","name":"laptop.tail0123.ts.net","ipv4":"100.64.0.1","ipv6":"fd7a:115c:a1e0::1"}"#
+        );
+
+        // A frame from a daemon that predates the field still parses, with no self.
+        match serde_json::from_str::<Response>(r#"{"kind":"notify","net_map":[]}"#).unwrap() {
+            Response::Notify(back) => {
+                assert_eq!(back.net_map, Some(Vec::new()));
+                assert!(back.self_change.is_none());
+            }
+            other => panic!("expected a notify frame, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1939,6 +3687,68 @@ mod tests {
     }
 
     #[test]
+    fn request_debug_portmap_wire_format_and_streamed_reply() {
+        // Pin the `debug_portmap` discriminant + field names so daemon + CLI agree. An absent
+        // gateway override stays off the wire (auto-detect), which is what a bare
+        // `tnet debug portmap` sends.
+        assert_eq!(
+            serde_json::to_string(&Request::DebugPortmap {
+                duration_ms: 5_000,
+                ty: String::new(),
+                gateway_and_self: None,
+                log_http: false,
+            })
+            .unwrap(),
+            r#"{"cmd":"debug_portmap","duration_ms":5000,"ty":"","log_http":false}"#
+        );
+        // With `--gateway-addr`/`--self-addr` the pair travels as one `<gateway>/<self>` string,
+        // the same shape Go's client puts in its `gateway_and_self` query parameter.
+        assert_eq!(
+            serde_json::to_string(&Request::DebugPortmap {
+                duration_ms: 1_500,
+                ty: "pmp".into(),
+                gateway_and_self: Some("192.0.2.1/192.0.2.2".into()),
+                log_http: true,
+            })
+            .unwrap(),
+            r#"{"cmd":"debug_portmap","duration_ms":1500,"ty":"pmp","gateway_and_self":"192.0.2.1/192.0.2.2","log_http":true}"#
+        );
+        // Every optional field defaults, so a minimal raw-client line still parses.
+        match serde_json::from_str::<Request>(r#"{"cmd":"debug_portmap","duration_ms":250}"#)
+            .unwrap()
+        {
+            Request::DebugPortmap {
+                duration_ms,
+                ty,
+                gateway_and_self,
+                log_http,
+            } => {
+                assert_eq!(duration_ms, 250);
+                assert_eq!(ty, "");
+                assert_eq!(gateway_and_self, None);
+                assert!(!log_http);
+            }
+            other => panic!("expected DebugPortmap, got {other:?}"),
+        }
+        // The reply is a stream of log lines; each frame must survive the process boundary intact,
+        // because the CLI prints `line` (control characters neutralized) as one line of output.
+        let json = serde_json::to_string(&Response::PortmapLog {
+            line: "Probe: {PCP:false PMP:true UPnP:true}".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"portmap_log","line":"Probe: {PCP:false PMP:true UPnP:true}"}"#
+        );
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::PortmapLog { line } => {
+                assert_eq!(line, "Probe: {PCP:false PMP:true UPnP:true}")
+            }
+            other => panic!("expected PortmapLog, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn version_request_response_round_trip() {
         // The `version` discriminant + the daemon's reply shape must be stable across the CLI/daemon
         // process boundary (they agree only on this JSON wire format).
@@ -1957,6 +3767,49 @@ mod tests {
         match serde_json::from_str::<Response>(&json).unwrap() {
             Response::Version { version } => assert_eq!(version, "0.9.0"),
             other => panic!("expected Version, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn profile_switch_and_create_are_distinct_commands_on_the_wire() {
+        // The daemon side of the `--new` guard. Creation is its own `cmd`, so a daemon that predates
+        // it fails to deserialize and answers `bad request` instead of quietly serving a switch —
+        // which, for an id that already names a profile, would tear the live device down and repoint
+        // the node. `switch_profile` keeps the shape it has always had, so an older CLI's bare switch
+        // is still understood unchanged.
+        assert_eq!(
+            serde_json::to_string(&Request::SwitchProfile {
+                target: "work".into()
+            })
+            .unwrap(),
+            r#"{"cmd":"switch_profile","target":"work"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::CreateProfile { id: "work".into() }).unwrap(),
+            r#"{"cmd":"create_profile","id":"work"}"#
+        );
+        match serde_json::from_str::<Request>(r#"{"cmd":"create_profile","id":"work"}"#).unwrap() {
+            Request::CreateProfile { id } => assert_eq!(id, "work"),
+            other => panic!("expected CreateProfile, got {other:?}"),
+        }
+        // `login`'s switch to an empty profile carries nothing: the daemon chooses the id.
+        assert_eq!(
+            serde_json::to_string(&Request::SwitchToEmptyProfile).unwrap(),
+            r#"{"cmd":"switch_to_empty_profile"}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<Request>(r#"{"cmd":"switch_to_empty_profile"}"#).unwrap(),
+            Request::SwitchToEmptyProfile
+        ));
+        // A `create` key on a switch is NOT a creation: `SwitchProfile` models no such field, so it
+        // deserializes as the plain switch it reads as, and the daemon refuses an unknown target.
+        match serde_json::from_str::<Request>(
+            r#"{"cmd":"switch_profile","target":"work","create":true}"#,
+        )
+        .unwrap()
+        {
+            Request::SwitchProfile { target } => assert_eq!(target, "work"),
+            other => panic!("expected SwitchProfile, got {other:?}"),
         }
     }
 
@@ -1992,31 +3845,98 @@ mod tests {
 
     #[test]
     fn bug_report_request_wire_is_back_compatible() {
-        // `BugReport` changed from a unit variant to `{ note: Option<String> }`. This LOCKS the wire
-        // back-compat both ways (the riskiest part of that change): a no-note request must serialize
-        // BYTE-IDENTICAL to the old bare unit variant (`skip_serializing_if` is what makes this hold —
-        // no `"note":null`), and the old bare JSON must still deserialize (→ note: None). Mirrors the
-        // per-variant wire-lock convention every sibling request already follows.
+        // `BugReport` changed from a unit variant to `{ note: Option<String> }`, and then grew
+        // `diagnose: bool`. This LOCKS the wire back-compat both ways (the riskiest part of those
+        // changes): a plain request must serialize BYTE-IDENTICAL to the old bare unit variant
+        // (`skip_serializing_if` on both fields is what makes this hold — no `"note":null`, no
+        // `"diagnose":false`), and the old bare JSON must still deserialize (→ note: None,
+        // diagnose: false). Mirrors the per-variant wire-lock convention every sibling request
+        // already follows.
         assert_eq!(
-            serde_json::to_string(&Request::BugReport { note: None }).unwrap(),
+            serde_json::to_string(&Request::BugReport {
+                note: None,
+                diagnose: false
+            })
+            .unwrap(),
             r#"{"cmd":"bug_report"}"#,
-            "no-note must be byte-identical to the old unit variant's wire form"
+            "a plain bugreport must be byte-identical to the old unit variant's wire form"
         );
-        // Old client's bare JSON → new struct variant with note: None (forward-compat).
+        // Old client's bare JSON → new struct variant with both fields defaulted (forward-compat).
         assert!(matches!(
             serde_json::from_str::<Request>(r#"{"cmd":"bug_report"}"#).unwrap(),
-            Request::BugReport { note: None }
+            Request::BugReport {
+                note: None,
+                diagnose: false
+            }
         ));
         // With a note, the field is present on the wire and round-trips.
         assert_eq!(
             serde_json::to_string(&Request::BugReport {
-                note: Some("dns broke".into())
+                note: Some("dns broke".into()),
+                diagnose: false
             })
             .unwrap(),
             r#"{"cmd":"bug_report","note":"dns broke"}"#
         );
         match serde_json::from_str::<Request>(r#"{"cmd":"bug_report","note":"x"}"#).unwrap() {
-            Request::BugReport { note } => assert_eq!(note.as_deref(), Some("x")),
+            Request::BugReport { note, diagnose } => {
+                assert_eq!(note.as_deref(), Some("x"));
+                assert!(!diagnose, "an absent diagnose key means the pass is off");
+            }
+            other => panic!("expected BugReport, got {other:?}"),
+        }
+        // `--diagnose` rides as its own key and round-trips.
+        assert_eq!(
+            serde_json::to_string(&Request::BugReport {
+                note: None,
+                diagnose: true
+            })
+            .unwrap(),
+            r#"{"cmd":"bug_report","diagnose":true}"#
+        );
+        match serde_json::from_str::<Request>(r#"{"cmd":"bug_report","diagnose":true}"#).unwrap() {
+            Request::BugReport { note, diagnose } => {
+                assert_eq!(note, None);
+                assert!(diagnose);
+            }
+            other => panic!("expected BugReport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bug_report_response_checks_are_wire_optional() {
+        // The reply grew `checks` alongside `--diagnose`. A marker-only reply (the no-`--diagnose`
+        // case, and every reply an older daemon sends) must stay byte-identical to the pre-change
+        // wire form, and old JSON must still deserialize — otherwise a mixed-version pair breaks on
+        // the one command an operator reaches for when things are already broken.
+        assert_eq!(
+            serde_json::to_string(&Response::BugReport {
+                marker: "BUG-1-0".into(),
+                checks: Vec::new()
+            })
+            .unwrap(),
+            r#"{"kind":"bug_report","marker":"BUG-1-0"}"#,
+            "no checks must not appear on the wire at all"
+        );
+        match serde_json::from_str::<Response>(r#"{"kind":"bug_report","marker":"BUG-1-0"}"#)
+            .unwrap()
+        {
+            Response::BugReport { marker, checks } => {
+                assert_eq!(marker, "BUG-1-0");
+                assert!(checks.is_empty(), "an absent checks key means no pass ran");
+            }
+            other => panic!("expected BugReport, got {other:?}"),
+        }
+        // With a pass, the lines ride along and round-trip in order.
+        let json = serde_json::to_string(&Response::BugReport {
+            marker: "BUG-1-0".into(),
+            checks: vec!["state: Running".into(), "profile: default".into()],
+        })
+        .unwrap();
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::BugReport { checks, .. } => {
+                assert_eq!(checks, ["state: Running", "profile: default"]);
+            }
             other => panic!("expected BugReport, got {other:?}"),
         }
     }
@@ -2044,6 +3964,179 @@ mod tests {
                 assert!(v.accept_routes);
             }
             other => panic!("expected Prefs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_port_range_parses_and_renders_gos_text_form() {
+        use crate::localapi::ServicePortRange;
+        // Go's `ProtoPortRange` is a TextMarshaler, so a Service's `Ports` arrive as strings.
+        // Every documented form round-trips through the ported codec.
+        let cases = [
+            (
+                "*",
+                ServicePortRange {
+                    proto: 0,
+                    first: 0,
+                    last: 65535,
+                },
+            ),
+            (
+                "443",
+                ServicePortRange {
+                    proto: 0,
+                    first: 443,
+                    last: 443,
+                },
+            ),
+            (
+                "tcp:443",
+                ServicePortRange {
+                    proto: 6,
+                    first: 443,
+                    last: 443,
+                },
+            ),
+            (
+                "udp:1-100",
+                ServicePortRange {
+                    proto: 17,
+                    first: 1,
+                    last: 100,
+                },
+            ),
+            (
+                "tcp:*",
+                ServicePortRange {
+                    proto: 6,
+                    first: 0,
+                    last: 65535,
+                },
+            ),
+            (
+                "80-90",
+                ServicePortRange {
+                    proto: 0,
+                    first: 80,
+                    last: 90,
+                },
+            ),
+            (
+                "ipv6-icmp:0",
+                ServicePortRange {
+                    proto: 58,
+                    first: 0,
+                    last: 0,
+                },
+            ),
+        ];
+        for (text, want) in cases {
+            let got: ServicePortRange = text.parse().unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(got, want, "parsing {text:?}");
+            assert_eq!(got.to_string(), text, "rendering {want:?}");
+        }
+        // Go lower-cases the token and resolves a numeric protocol through the same name table, so
+        // both spellings normalize to the canonical one on the way back out.
+        assert_eq!(
+            "TCP:443".parse::<ServicePortRange>().unwrap().to_string(),
+            "tcp:443"
+        );
+        assert_eq!(
+            "6:443".parse::<ServicePortRange>().unwrap().to_string(),
+            "tcp:443"
+        );
+        // A protocol with no `preferredNames` entry renders as its decimal number, as Go's does.
+        assert_eq!(
+            "99:443".parse::<ServicePortRange>().unwrap().to_string(),
+            "99:443"
+        );
+        // Fail-closed: malformed text is an error, never a guessed range.
+        for bad in [
+            "",
+            "tcp:",
+            "tcp:notaport",
+            ":443",
+            "tcp:900-100",
+            "nosuchproto:443",
+        ] {
+            assert!(
+                bad.parse::<ServicePortRange>().is_err(),
+                "{bad:?} must not parse into a port range"
+            );
+        }
+    }
+
+    #[test]
+    fn service_port_range_single_tcp_port_matches_gos_inference_filter() {
+        use crate::localapi::ServicePortRange;
+        // Go infers a well-known action only from a single TCP port: an unset proto counts as TCP,
+        // a real non-TCP proto does not, and a range is skipped however it is spelled.
+        let single_tcp: ServicePortRange = "tcp:443".parse().unwrap();
+        assert_eq!(single_tcp.single_tcp_port(), Some(443));
+        let unset_proto: ServicePortRange = "22".parse().unwrap();
+        assert_eq!(unset_proto.single_tcp_port(), Some(22));
+        let udp: ServicePortRange = "udp:53".parse().unwrap();
+        assert_eq!(udp.single_tcp_port(), None);
+        let range: ServicePortRange = "tcp:80-90".parse().unwrap();
+        assert_eq!(range.single_tcp_port(), None);
+        let any: ServicePortRange = "*".parse().unwrap();
+        assert_eq!(any.single_tcp_port(), None);
+    }
+
+    #[test]
+    fn services_request_response_round_trip() {
+        // The `services` discriminant + the Services(Vec<ServiceReport>) reply must survive the wire
+        // (the CLI and daemon are separate processes agreeing only on this JSON format).
+        assert_eq!(
+            serde_json::to_string(&Request::Services).unwrap(),
+            r#"{"cmd":"services"}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<Request>(r#"{"cmd":"services"}"#).unwrap(),
+            Request::Services
+        ));
+        let report = ServiceReport {
+            name: "svc:db".into(),
+            display_name: "Production database".into(),
+            addrs: vec!["100.64.0.10".into(), "fd7a:115c:a1e0::a".into()],
+            ports: vec![ServicePortRange {
+                proto: 6,
+                first: 5432,
+                last: 5432,
+            }],
+            actions: vec![ServiceActionReport {
+                action_type: "postgresql".into(),
+                port: 5432,
+                display_name: "Postgres".into(),
+                attributes: std::collections::BTreeMap::from([(
+                    "tailscale.com/cap/resource-name".to_string(),
+                    serde_json::json!("orders"),
+                )]),
+            }],
+        };
+        let resp = Response::Services {
+            services: vec![report.clone()],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::Services { services } => assert_eq!(services, vec![report]),
+            other => panic!("expected Services, got {other:?}"),
+        }
+        // An empty Service set is a valid answer (the tailnet grants this node none), and every
+        // empty field of a bare report is dropped from the wire.
+        let empty = serde_json::to_string(&Response::Services {
+            services: vec![ServiceReport::default()],
+        })
+        .unwrap();
+        assert!(
+            !empty.contains("display_name")
+                && !empty.contains("addrs")
+                && !empty.contains("actions"),
+            "empty ServiceReport fields must be omitted from the wire: {empty}"
+        );
+        match serde_json::from_str::<Response>(&empty).unwrap() {
+            Response::Services { services } => assert_eq!(services, vec![ServiceReport::default()]),
+            other => panic!("expected Services, got {other:?}"),
         }
     }
 
@@ -2094,6 +4187,21 @@ mod tests {
             Response::DnsStatus(r) => assert_eq!(r, DnsStatusReport::default()),
             other => panic!("expected DnsStatus, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn shutdown_request_wire_format() {
+        // `shutdown` is a bare verb: no method, no arguments, nothing for a client to get wrong
+        // except the discriminant. Pin it — the CLI and the daemon agree on this JSON alone, and a
+        // rename would turn `tnet shutdown` into `bad request` against an older daemon.
+        assert_eq!(
+            serde_json::to_string(&Request::Shutdown).unwrap(),
+            r#"{"cmd":"shutdown"}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<Request>(r#"{"cmd":"shutdown"}"#).unwrap(),
+            Request::Shutdown
+        ));
     }
 
     #[test]
@@ -2262,6 +4370,77 @@ mod tests {
         match serde_json::from_str::<Request>(r#"{"cmd":"logout"}"#).unwrap() {
             Request::Logout { reason } => assert_eq!(reason, None),
             other => panic!("expected Logout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn whois_request_carries_gos_flow_triple_and_stays_backward_compatible() {
+        // Go's `whois [--proto tcp|udp] ip[:port]` is a flow triple, so the request carries the port
+        // and the protocol alongside the address. Both are additive: the bare `{"cmd":"whois",
+        // "ip":...}` an older CLI sends must still parse, and a bare-IP request must still serialize
+        // to exactly that historical form (skip_serializing_if).
+        let json = serde_json::to_string(&Request::Whois {
+            ip: "100.64.0.9".into(),
+            port: Some(22),
+            proto: Some(WhoisProto::Tcp),
+        })
+        .unwrap();
+        assert_eq!(
+            json, r#"{"cmd":"whois","ip":"100.64.0.9","port":22,"proto":"tcp"}"#,
+            "the proto must ride the wire as Go's lowercase spelling"
+        );
+        match serde_json::from_str::<Request>(&json).unwrap() {
+            Request::Whois { ip, port, proto } => {
+                assert_eq!(ip, "100.64.0.9");
+                assert_eq!(port, Some(22));
+                assert_eq!(proto, Some(WhoisProto::Tcp));
+            }
+            other => panic!("expected Whois, got {other:?}"),
+        }
+        let bare = serde_json::to_string(&Request::Whois {
+            ip: "100.64.0.9".into(),
+            port: None,
+            proto: None,
+        })
+        .unwrap();
+        assert_eq!(
+            bare, r#"{"cmd":"whois","ip":"100.64.0.9"}"#,
+            "a bare-IP whois must serialize to the historical form"
+        );
+        match serde_json::from_str::<Request>(r#"{"cmd":"whois","ip":"100.64.0.9"}"#).unwrap() {
+            Request::Whois { ip, port, proto } => {
+                assert_eq!(ip, "100.64.0.9");
+                assert_eq!(port, None, "an older CLI's request means Go's port 0");
+                assert_eq!(proto, None, "and Go's empty proto: both");
+            }
+            other => panic!("expected Whois, got {other:?}"),
+        }
+        // A proto the daemon does not know must not deserialize into some default — the closed enum
+        // is what keeps a bogus value off the lookup path.
+        assert!(
+            serde_json::from_str::<Request>(r#"{"cmd":"whois","ip":"100.64.0.9","proto":"sctp"}"#)
+                .is_err(),
+            "an unknown proto must be a parse failure, not a silent fallback"
+        );
+    }
+
+    #[test]
+    fn whois_proto_parses_and_renders_gos_two_values() {
+        // Go documents the flag as `one of "tcp" or "udp"; empty means both`. The empty case is
+        // modelled as `None` at the call site, so `FromStr` accepts exactly the two named values,
+        // exactly as spelled.
+        assert_eq!("tcp".parse::<WhoisProto>(), Ok(WhoisProto::Tcp));
+        assert_eq!("udp".parse::<WhoisProto>(), Ok(WhoisProto::Udp));
+        assert_eq!(WhoisProto::Tcp.to_string(), "tcp");
+        assert_eq!(WhoisProto::Udp.to_string(), "udp");
+        for bad in ["TCP", "Udp", "sctp", "icmp", ""] {
+            let err = bad
+                .parse::<WhoisProto>()
+                .expect_err("only Go's two documented values parse");
+            assert!(
+                err.contains("expected \"tcp\" or \"udp\" (empty means both)"),
+                "the refusal should quote Go's own flag documentation: {err}"
+            );
         }
     }
 
@@ -2500,27 +4679,68 @@ mod tests {
             serde_json::from_str::<Request>(r#"{"cmd":"suggest_exit_node"}"#).unwrap(),
             Request::SuggestExitNode
         ));
-        // Some(suggestion) round-trips with both fields.
+        // Some(suggestion) round-trips with both fields, and carries no policy flag.
         let sugg = ExitNodeSuggestionView {
             id: "nABC123".to_string(),
             name: "exit-fra-1".to_string(),
         };
         let resp = Response::ExitNodeSuggestion {
             suggestion: Some(sugg.clone()),
+            withheld_by_policy: false,
         };
         let json = serde_json::to_string(&resp).unwrap();
+        assert!(
+            !json.contains("withheld_by_policy"),
+            "a false flag must not reach the wire (skip_serializing_if): {json}"
+        );
         match serde_json::from_str::<Response>(&json).unwrap() {
             Response::ExitNodeSuggestion {
                 suggestion: Some(s),
+                withheld_by_policy: false,
             } => assert_eq!(s, sugg),
             other => panic!("expected ExitNodeSuggestion(Some), got {other:?}"),
         }
         // None (no candidate) round-trips as a distinct, non-error empty result.
-        let none = Response::ExitNodeSuggestion { suggestion: None };
+        let none = Response::ExitNodeSuggestion {
+            suggestion: None,
+            withheld_by_policy: false,
+        };
         let none_json = serde_json::to_string(&none).unwrap();
         match serde_json::from_str::<Response>(&none_json).unwrap() {
-            Response::ExitNodeSuggestion { suggestion: None } => {}
+            Response::ExitNodeSuggestion {
+                suggestion: None,
+                withheld_by_policy: false,
+            } => {}
             other => panic!("expected ExitNodeSuggestion(None), got {other:?}"),
+        }
+        // The policy refusal is a THIRD outcome and must survive the wire as itself: an empty
+        // suggestion that says why it is empty. Collapsing it back into the plain empty reply is the
+        // bug this flag exists to prevent — "no exit node exists" and "you may not be steered onto
+        // the one that does" are different facts for the operator reading the answer.
+        let withheld = Response::ExitNodeSuggestion {
+            suggestion: None,
+            withheld_by_policy: true,
+        };
+        let withheld_json = serde_json::to_string(&withheld).unwrap();
+        assert!(
+            withheld_json.contains(r#""withheld_by_policy":true"#),
+            "the refusal reason must be on the wire: {withheld_json}"
+        );
+        match serde_json::from_str::<Response>(&withheld_json).unwrap() {
+            Response::ExitNodeSuggestion {
+                suggestion: None,
+                withheld_by_policy: true,
+            } => {}
+            other => panic!("expected a withheld ExitNodeSuggestion, got {other:?}"),
+        }
+        // Back-compat: a reply from a daemon that predates the flag omits the key, and must read
+        // back as the plain empty result rather than failing to parse.
+        match serde_json::from_str::<Response>(r#"{"kind":"exit_node_suggestion"}"#).unwrap() {
+            Response::ExitNodeSuggestion {
+                suggestion: None,
+                withheld_by_policy: false,
+            } => {}
+            other => panic!("expected a legacy empty ExitNodeSuggestion, got {other:?}"),
         }
     }
 

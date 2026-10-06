@@ -1,25 +1,60 @@
 //! Declarative daemon config file — the Rust analogue of Go's `ipn.ConfigVAlpha` + `ipn/conffile`.
 //!
-//! `tailnetd --config <file>` loads a JSON document describing the node's intended prefs up front,
+//! `tailnetd --config <source>` loads a JSON document describing the node's intended prefs up front,
 //! the path headless / k8s / automated installs rely on (declarative prefs without an interactive
 //! `tnet up`). This module owns: the [`ConfigVAlpha`] DTO (Go-faithful field names), [`load`] (read +
 //! version-gate + strict-parse, mirroring `conffile.Load`), and [`Config::apply_to_prefs`] (merge the
 //! honored subset into [`Prefs`]).
 //!
+//! ## The flag takes a SOURCE, not just a path
+//!
+//! Go's `--config` value is a config *source* ([`ConfigFlag`] parses it):
+//!
+//! * a file path — the common case;
+//! * [`VM_USER_DATA_PATH`] (`vm:user-data`), the VM's user-data from the cloud instance metadata
+//!   service (EC2) — recognized here, but see [`load`]: this build cannot read it;
+//! * either of those behind an [`OPTIONAL_PREFIX`] (`optional:`) marker, meaning an **absent** source
+//!   is not fatal — the node boots unconfigured and can be enrolled interactively instead of failing
+//!   to start, while a source that is present but **invalid** still fails.
+//!
+//! That last distinction is why the read phase of [`load`] reports [`NoConfig`] (Go's
+//! `conffile.ErrNoConfig`) rather than one opaque failure: `optional:` must be able to tell "no config
+//! present" from "config present and malformed".
+//!
 //! ## Honest omission
 //!
-//! Go's `ConfigVAlpha` carries fields this fork has no home for yet (operator user, SNAT/netfilter,
-//! app-connector, posture, web-client, auto-update, …). We still **parse** them — a valid Go config
-//! must not error here — but we only **honor** the subset that maps to a real [`Prefs`] field, and we
-//! **warn** (never silently drop) when an unmapped field is set to a non-default value, so a headless
-//! operator sees exactly what is and isn't applied. The mapped set today: `Enabled` → `want_running`,
-//! `ServerURL` → `control_url`, `Hostname`, `AcceptDNS`, `AcceptRoutes`, `ExitNode`, `AdvertiseRoutes`,
-//! `ShieldsUp`, `RunSSHServer` → `ssh_enabled`. `AuthKey` is returned separately (it is a registration
-//! credential, not a persisted pref).
+//! Go's `ConfigVAlpha` carries fields this fork has no home for (SNAT/netfilter, services, serve,
+//! relay-server, …). We still **parse** them — a valid Go config must not error here — but we only
+//! **honor** the subset that maps to a real [`Prefs`] field, and we **warn** (never silently drop)
+//! when an unmapped field is set to a non-default value, so a headless operator sees exactly what is
+//! and isn't applied. Both lists are re-derived field-by-field against `ipn/conf.go` @
+//! `53a0d659afa51835dd7a9283873cca44261454f8` (upstream v1.102.3), and [`ConfigVAlpha`] declares its
+//! fields in Go's own declaration order so the next re-derivation is a straight read-down.
+//!
+//! **Honored** (17 of Go's 27 settable keys): `Enabled` → `want_running`, `ServerURL` →
+//! `control_url`, `OperatorUser` → `operator_user`, `Hostname`, `acceptDNS` → `accept_dns`,
+//! `acceptRoutes` → `accept_routes`, `exitNode` → `exit_node`, `allowLANWhileUsingExitNode` →
+//! `exit_node_allow_lan_access`, `AdvertiseRoutes`, `AdvertiseExitNode` → `advertise_exit_node`,
+//! `AppConnector.Advertise` → `advertise_app_connector`, `PostureChecking` → `posture_checking`,
+//! `RunSSHServer` → `ssh_enabled`, `RunWebClient` → `run_web_client`, `ShieldsUp` → `shields_up`,
+//! `AutoUpdate.Check`/`.Apply` → `auto_update_check`/`auto_update_apply`. `AuthKey` is returned
+//! separately (it is a registration credential, not a persisted pref).
+//!
+//! **Parsed but not honored** (warned by `unmapped_fields`): `Locked`, `DisableSNAT`,
+//! `AdvertiseServices`, `NetfilterMode`, `NoStatefulFiltering`, `RemoteConfig`, `ServeConfigTemp`,
+//! `StaticEndpoints`, `RelayServerPort`, `RelayServerStaticEndpoints`.
+//!
+//! The drift runs both ways, so the two lists together must cover **every** Go field: a Go field in
+//! neither is a silent drop (what `AdvertiseExitNode`, `RemoteConfig`, `RelayServerPort` and
+//! `RelayServerStaticEndpoints` were), and a field left in the warning list after its pref shipped is
+//! a lie in the log (what `AllowLANWhileUsingExitNode`, `OperatorUser`, `PostureChecking` and
+//! `RunWebClient` were). `every_go_field_is_either_honored_or_warned` pins that.
 //!
 //! NOTE: Go's `ConfigVAlpha` has **no** tags field — ACL tags are carried by the auth key at
-//! registration, never by the config file (verified against `ipn/conf.go` @ v1.100.0). So there is no
-//! `AdvertiseTags` config mapping (tags are still settable via `tnet up --advertise-tags`).
+//! registration, never by the config file (re-verified at the pinned ref). So there is no
+//! `AdvertiseTags` config mapping (tags are still settable via `tnet up --advertise-tags`). Same for
+//! this fork's `node_nickname`, `ephemeral`, `tun_*` and `taildrop_dir` prefs: Go's config has no key
+//! for them, so there is nothing to map and nothing to warn about.
 
 use anyhow::{Context, Result, anyhow, bail};
 use secrecy::SecretString;
@@ -55,94 +90,352 @@ pub struct Config {
 #[derive(Clone, Default, Deserialize)]
 #[serde(default, rename_all = "PascalCase")]
 pub struct ConfigVAlpha {
+    // Fields below are in Go's own declaration order (`ipn/conf.go`), each tagged HONORED (mapped
+    // onto a real `Prefs` field by `apply_to_prefs`) or WARNED (parsed for forward-compat, reported
+    // by `unmapped_fields`). Keeping the order means re-deriving against a newer upstream is a
+    // straight read-down of two files side by side — which is how the four dropped fields
+    // (`AdvertiseExitNode`, `RemoteConfig`, `RelayServerPort`, `RelayServerStaticEndpoints`) were
+    // found in the first place.
     /// Schema version; `"alpha0"` today. Gated in [`load`] before this struct is decoded.
     pub version: String,
-    /// `wantRunning`: whether the node should connect. Go default (unset) is `true`.
-    pub enabled: Option<bool>,
-    /// Control server URL; `None` → the engine/`TS_CONTROL_URL` default.
+    /// WARNED. Go `Locked`: whether the config is locked from out-of-band `tnet set` mutations. NOT
+    /// enforced by this fork (`tnet set` remains free to mutate prefs), so it is surfaced by
+    /// `unmapped_fields` rather than silently dropped — an operator who set `"Locked": true`
+    /// (expecting `set` to be refused) must see that it is not honored. Parsing it explicitly (vs
+    /// relying on the unknown-key catch-all) keeps that honest-omission contract intact.
+    pub locked: Option<bool>,
+    /// HONORED → [`Prefs::control_url`]. Control server URL; `None` → the engine/`TS_CONTROL_URL`
+    /// default.
     #[serde(rename = "ServerURL")]
     pub server_url: Option<String>,
-    /// Auth key for registration when `NeedsLogin` (or `file:<path>` to read it from a file). Not a
-    /// persisted pref — [`Config::apply_to_prefs`] returns it as a [`SecretString`] and it is never
-    /// written into `prefs`. Kept as `String` here only because it must deserialize from the JSON
-    /// (`secrecy 0.10`'s `SecretString` needs an opt-in serde feature); the leak risk that a `String`
-    /// field would otherwise pose via `{:?}` is closed by **withholding `Debug`** on this struct
-    /// (see the type's derive list — the deliberate omission matches `tnet`'s `Cli`).
+    /// HONORED (returned, never persisted). Auth key for registration when `NeedsLogin` (or
+    /// `file:<path>` to read it from a file). Not a persisted pref — [`Config::apply_to_prefs`]
+    /// returns it as a [`SecretString`] and it is never written into `prefs`. Kept as `String` here
+    /// only because it must deserialize from the JSON (`secrecy 0.10`'s `SecretString` needs an
+    /// opt-in serde feature); the leak risk that a `String` field would otherwise pose via `{:?}` is
+    /// closed by **withholding `Debug`** on this struct (see the type's derive list — the deliberate
+    /// omission matches `tnet`'s `Cli`).
     pub auth_key: Option<String>,
-    /// Requested hostname; `None` → the OS hostname.
+    /// HONORED → [`Prefs::want_running`]. `wantRunning`: whether the node should connect. Go default
+    /// (unset) is `true` — see [`Config::apply_to_prefs`], where this is the one unconditionally
+    /// applied field.
+    pub enabled: Option<bool>,
+    /// HONORED → [`Prefs::operator_user`]. Go `OperatorUser` — the local user allowed to operate the
+    /// daemon without root. Recorded like `tnet set --operator`; as that pref's docs say, this fork's
+    /// LocalAPI write policy is still the root-or-owner-UID check, so setting it records intent.
+    pub operator_user: Option<String>,
+    /// HONORED → [`Prefs::hostname`]. Requested hostname; `None` → the OS hostname.
     pub hostname: Option<String>,
-    /// `--accept-dns` (Go `CorpDNS`). Go default `true`.
+    /// HONORED → [`Prefs::accept_dns`]. `--accept-dns` (Go `CorpDNS`). Go default `true`.
     #[serde(rename = "acceptDNS")]
     pub accept_dns: Option<bool>,
-    /// `--accept-routes`. Go default `true`.
+    /// HONORED → [`Prefs::accept_routes`]. `--accept-routes`.
     #[serde(rename = "acceptRoutes")]
     pub accept_routes: Option<bool>,
-    /// Exit node selector: IP, StableID, or MagicDNS base name.
+    /// HONORED → [`Prefs::exit_node`]. Exit node selector: IP, StableID, or MagicDNS base name.
     #[serde(rename = "exitNode")]
     pub exit_node: Option<String>,
-    /// Allow LAN access while using an exit node. **Not yet mapped** (no such pref in this fork).
+    /// HONORED → [`Prefs::exit_node_allow_lan_access`]. Allow LAN access while using an exit node
+    /// (Go `--exit-node-allow-lan-access`).
     #[serde(rename = "allowLANWhileUsingExitNode")]
     pub allow_lan_while_using_exit_node: Option<bool>,
-    /// Subnet routes (CIDRs) to advertise.
-    pub advertise_routes: Vec<String>,
-    /// Shields-up: block inbound connections from peers.
-    pub shields_up: Option<bool>,
-    /// Run the Tailscale SSH server (Go `RunSSHServer`). Requires the `ssh` build + root at runtime.
-    #[serde(rename = "RunSSHServer")]
-    pub run_ssh_server: Option<bool>,
-
-    // ---- Parsed-but-not-yet-honored (engine-gated / non-goal in this fork). Kept so a valid Go
-    // config parses; `apply_to_prefs` warns when any is set to a non-default. ----
-    /// Go `OperatorUser` — local user allowed to operate the daemon without root. No daemon authz tier yet.
-    pub operator_user: Option<String>,
-    /// Go `DisableSNAT`. Engine routing concern, not a daemon pref. Explicit rename: `rename_all =
-    /// "PascalCase"` would mangle this to `DisableSnat`, but Go's field is `DisableSNAT` (all-caps
-    /// acronym) — without the rename a real Go config's `DisableSNAT` would be silently ignored and the
-    /// honest-omission `warn_unmapped` would never fire for it.
+    /// HONORED → [`Prefs::advertise_routes`]. Subnet routes (CIDRs) to advertise. Each must be a
+    /// masked prefix — [`Config::apply_to_prefs`] refuses one with host bits set (`192.0.2.5/24`),
+    /// as Go's `ToPrefs` does — and the list is checked as a SET
+    /// ([`crate::routes::calc_advertise_routes`]): a 4via6 prefix must decode, and a default route
+    /// must appear in both families or in neither (a lone `0.0.0.0/0` is a half exit node). Those
+    /// last two are this fork's own rules on this path — Go keeps them in its CLI — so they are
+    /// refused in this module's words rather than in `ToPrefs`'.
+    ///
+    /// `Option`, not a bare `Vec`, because Go guards the whole block with `if c.AdvertiseRoutes !=
+    /// nil` and an explicit `"AdvertiseRoutes": []` is a non-nil empty slice: it sets the pref to
+    /// empty (`AdvertiseRoutesSet = true`) and WITHDRAWS every advertised route. Only an absent key
+    /// (or JSON `null`) leaves the persisted routes alone. A bare `Vec` cannot tell the two apart,
+    /// and would make "stop advertising these subnets" unsayable in a declarative config.
+    pub advertise_routes: Option<Vec<String>>,
+    /// HONORED → [`Prefs::advertise_exit_node`]. Go `AdvertiseExitNode` — advertise this node as an
+    /// exit node. It **composes** with [`advertise_routes`](ConfigVAlpha::advertise_routes) rather
+    /// than replacing it: Go stores the exit-node advertisement *inside* `AdvertiseRoutes` (as the two
+    /// v4/v6 default routes) and appends those two to whatever the config listed
+    /// (`ToPrefs`: `mp.AdvertiseRoutes = append(mp.AdvertiseRoutes, tsaddr.AllIPv4(), …)`). This fork
+    /// keeps the two as separate prefs that the engine composes, so the same "routes AND exit" outcome
+    /// falls out of setting both — see [`Config::apply_to_prefs`].
+    pub advertise_exit_node: Option<bool>,
+    /// WARNED. Go `DisableSNAT`. Engine routing concern, not a daemon pref. Explicit rename:
+    /// `rename_all = "PascalCase"` would mangle this to `DisableSnat`, but Go's field is `DisableSNAT`
+    /// (all-caps acronym) — without the rename a real Go config's `DisableSNAT` would be silently
+    /// ignored and the honest-omission warning would never fire for it.
     #[serde(rename = "DisableSNAT")]
     pub disable_snat: Option<bool>,
-    /// Go `NetfilterMode` ("on"/"off"/"nodivert"). Engine routing concern.
-    pub netfilter_mode: Option<String>,
-    /// Go `NoStatefulFiltering`. Engine routing concern.
-    pub no_stateful_filtering: Option<bool>,
-    /// Go `PostureChecking`. Not implemented in this fork.
-    pub posture_checking: Option<bool>,
-    /// Go `RunWebClient`. The web client is a documented non-goal of this fork.
-    pub run_web_client: Option<bool>,
-    /// Go `Locked`: whether the config is locked from out-of-band `tnet set` mutations. NOT enforced
-    /// by this fork (`tnet set` remains free to mutate prefs), so it is surfaced via `warn_unmapped`
-    /// rather than silently dropped — an operator who set `"Locked": true` (expecting `set` to be
-    /// refused) must see that it is not honored. Parsing it explicitly (vs relying on the unknown-key
-    /// catch-all) keeps that honest-omission contract intact.
-    pub locked: Option<bool>,
-    /// Go `AdvertiseServices` — Tailscale Services this node advertises. No service-advertisement pref
-    /// in this fork; parsed + warned so a real Go config that sets it is not silently dropped. Wire key
-    /// is the Go field name (`AdvertiseServices`, un-tagged `omitempty` → PascalCase here).
+    /// WARNED. Go `AdvertiseServices` — Tailscale Services this node advertises. No
+    /// service-advertisement pref in this fork; parsed + warned so a real Go config that sets it is
+    /// not silently dropped.
     pub advertise_services: Vec<String>,
-    /// Go `AppConnector` — app-connector config (a JSON object). Not implemented in this fork; parsed as
-    /// an opaque value + warned. Kept opaque (`serde_json::Value`) because we never inspect it.
-    pub app_connector: Option<serde_json::Value>,
-    /// Go `AutoUpdate` — self-update policy (a JSON object). This fork does not self-update; parsed +
-    /// warned.
-    pub auto_update: Option<serde_json::Value>,
-    /// Go `ServeConfigTemp` — an embedded serve config. Set via `tnet serve` in this fork, not the
-    /// declarative config; parsed as opaque + warned.
+    /// HONORED → [`Prefs::advertise_app_connector`]. Go `AppConnector` (`ipn.AppConnectorPrefs`) —
+    /// advertise this node as an app connector.
+    pub app_connector: Option<AppConnectorPrefs>,
+    /// WARNED. Go `NetfilterMode` ("on"/"off"/"nodivert"). Engine routing concern.
+    pub netfilter_mode: Option<String>,
+    /// WARNED. Go `NoStatefulFiltering`. Engine routing concern.
+    pub no_stateful_filtering: Option<bool>,
+    /// HONORED → [`Prefs::posture_checking`]. Go `PostureChecking` (`--report-posture`).
+    pub posture_checking: Option<bool>,
+    /// HONORED → [`Prefs::ssh_enabled`]. Run the Tailscale SSH server (Go `RunSSHServer`). Requires
+    /// the `ssh` build + root at runtime.
+    #[serde(rename = "RunSSHServer")]
+    pub run_ssh_server: Option<bool>,
+    /// HONORED → [`Prefs::run_web_client`]. Go `RunWebClient` (`--webclient`). A carried pref: no web
+    /// server is started (see the pref's docs), but the declared intent is recorded rather than lost.
+    pub run_web_client: Option<bool>,
+    /// HONORED → [`Prefs::shields_up`]. Shields-up: block inbound connections from peers.
+    pub shields_up: Option<bool>,
+    /// WARNED, and permanently so. Go `RemoteConfig` — delegate full remote control of this node's
+    /// prefs *and its LocalAPI* to the tailnet admin, bypassing the per-feature double opt-in. This
+    /// fork **declines the behaviour** rather than deferring it (THREAT_MODEL §4.1: authorization is
+    /// local, and control is a peer whose input is validated, never a principal that may rewrite
+    /// prefs) — `tnet set --remote-config` is refused by name for exactly that reason, see
+    /// `docs/ENGINE_ASKS.md` §34. Warned rather than silently dropped because an operator who
+    /// declared it would otherwise believe the tailnet admin owns this node's settings when nothing
+    /// does.
+    pub remote_config: Option<bool>,
+    /// HONORED → [`Prefs::auto_update_check`] + [`Prefs::auto_update_apply`]. Go `AutoUpdate`
+    /// (`ipn.AutoUpdatePrefs`) — self-update policy. Go applies the **whole struct** when the key is
+    /// present (`AutoUpdateSet{ApplySet: true, CheckSet: true}`), so a missing inner key means that
+    /// inner field's Go zero value, not the pref default — see [`AutoUpdatePrefs`].
+    ///
+    /// `Apply: true` is REFUSED (see [`Config::apply_to_prefs`]) on an installation that could never
+    /// replace its own binary, the same refusal `tnet set --auto-update` gets: the pref is advertised
+    /// to control as `Hostinfo.AllowsUpdate`, and a config file is no more entitled to make that
+    /// claim than an operator is. `Apply: false` and an absent `Apply` are accepted everywhere.
+    pub auto_update: Option<AutoUpdatePrefs>,
+    /// WARNED. Go `ServeConfigTemp` — an embedded serve config. Set via `tnet serve` in this fork, not
+    /// the declarative config; parsed as opaque (`serde_json::Value`) because we never inspect it.
     pub serve_config_temp: Option<serde_json::Value>,
-    /// Go `StaticEndpoints` — operator-pinned WireGuard endpoints. Engine-gated (no `Config` knob);
-    /// parsed + warned.
+    /// WARNED. Go `StaticEndpoints` — operator-pinned WireGuard endpoints. Engine-gated (no `Config`
+    /// knob). Kept as raw strings rather than parsed `SocketAddr`s: nothing here consumes them, and a
+    /// forward-compat parse is not worth a new way for a valid Go config to fail.
     pub static_endpoints: Vec<String>,
+    /// WARNED. Go `RelayServerPort` — the UDP port for the peer-relay server to bind (`0` picks a
+    /// random port, an absent value disables the relay server). Engine-gated: the pinned engine has no
+    /// relay listener to bind and cannot advertise the role (`docs/ENGINE_ASKS.md` §34), which is why
+    /// `tnet set --relay-server-port` honours only the disable form and refuses a port by name.
+    pub relay_server_port: Option<u16>,
+    /// WARNED. Go `RelayServerStaticEndpoints` — static `IP:port` endpoints to advertise as relay
+    /// candidates. Only meaningful alongside `RelayServerPort`, which is engine-gated too. Raw
+    /// strings, for the same reason as [`static_endpoints`](ConfigVAlpha::static_endpoints).
+    pub relay_server_static_endpoints: Vec<String>,
 }
 
-/// Load and parse a `--config` file (Go `conffile.Load`).
+/// Go `ipn.AppConnectorPrefs` (`ipn/prefs.go`) — the object Go's `AppConnector` config key decodes to.
 ///
-/// Reads `path`, parses it as **standard JSON** (this fork omits HuJSON — the comment-stripping
+/// Typed rather than opaque so `Advertise` can actually reach [`Prefs::advertise_app_connector`].
+/// `Debug` is safe to derive here (unlike on [`ConfigVAlpha`], which carries the auth key): this
+/// struct holds one bool and no secret, and the parent still has no `Debug` to print it through.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct AppConnectorPrefs {
+    /// Advertise this node as an app connector (Go `AppConnectorPrefs.Advertise`).
+    pub advertise: bool,
+}
+
+/// Go `ipn.AutoUpdatePrefs` (`ipn/prefs.go`) — the object Go's `AutoUpdate` config key decodes to.
+///
+/// The inner defaults are **Go's zero values, not this fork's pref defaults**, and that is
+/// deliberate: `ToPrefs` assigns the decoded struct wholesale and sets BOTH mask bits
+/// (`AutoUpdateSet{ApplySet: true, CheckSet: true}`), so in Go `"AutoUpdate": {"Apply": true}` also
+/// writes `Check: false` — the Go zero value for the key the JSON omitted — over whatever `Check` was.
+/// Defaulting `check` to `false` here reproduces that exactly; defaulting it to [`Prefs`]'s `true`
+/// would quietly make this fork's config mean something Go's does not.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct AutoUpdatePrefs {
+    /// Whether a background updater should check for updates (Go `AutoUpdatePrefs.Check`).
+    pub check: bool,
+    /// Whether updates are applied automatically (Go `AutoUpdatePrefs.Apply`, an `opt.Bool`:
+    /// absent/`null` → `None`, the never-stated state).
+    pub apply: Option<bool>,
+}
+
+/// The sentinel `--config` value meaning "read the config from the VM's user-data, via the cloud
+/// instance metadata service" instead of from a file on disk (Go `conffile.VMUserDataPath`).
+pub const VM_USER_DATA_PATH: &str = "vm:user-data";
+
+/// The prefix that marks a `--config` source as optional (Go `cmd/tailscaled`'s `optional:`): an
+/// absent source is not a startup failure. See [`ConfigFlag`].
+pub const OPTIONAL_PREFIX: &str = "optional:";
+
+/// "No config was provided" — the Rust analogue of Go's `conffile.ErrNoConfig`, and the error
+/// [`load`] reports for every **read-phase** failure: a missing or unreadable file, or a
+/// `vm:user-data` source this build cannot read.
+///
+/// It is deliberately distinguishable from the errors [`load`] returns once the bytes ARE in hand (a
+/// JSON syntax error, an absent/unsupported `version`), because that is the entire contract of the
+/// `optional:` prefix: **absent** → boot unconfigured; **present but malformed** → still fail. Callers
+/// classify with [`is_no_config`] (Go `errors.Is(err, conffile.ErrNoConfig)`) rather than by matching
+/// on message text.
+#[derive(Debug)]
+pub struct NoConfig {
+    /// The source as the operator named it (`/etc/tailnetd/config.json`, `vm:user-data`, …).
+    pub source: String,
+    /// Why nothing could be read from it (the underlying I/O error, or why the source is unreadable
+    /// by this build). Carried as a string because it is only ever reported, never re-inspected —
+    /// Go likewise flattens it in with `fmt.Errorf("%w: %v", ErrNoConfig, err)`.
+    pub reason: String,
+}
+
+impl std::fmt::Display for NoConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no config present at {}: {}", self.source, self.reason)
+    }
+}
+
+impl std::error::Error for NoConfig {}
+
+/// Does this error mean "the config source is absent" (as opposed to "present but invalid")? The Go
+/// `errors.Is(err, conffile.ErrNoConfig)` of this port.
+///
+/// Walks the whole [`anyhow`] chain, so a caller's own `.with_context(…)` wrapper — which every
+/// `--config` call site adds — cannot hide the classification.
+pub fn is_no_config(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| cause.is::<NoConfig>())
+}
+
+/// Where a `--config` document comes from.
+///
+/// Go passes the raw flag string to `conffile.Load`, where `vm:user-data` is a *sentinel* rather than
+/// a filename. Typing it here is the fix for this fork's original `PathBuf` flag, which had no way to
+/// express "not a path" and so tried to `open("vm:user-data")` and died at startup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfigSource {
+    /// A JSON config document at this path on disk.
+    File(std::path::PathBuf),
+    /// The VM's user-data, from the cloud instance metadata service (Go `VMUserDataPath`, EC2 today).
+    /// Recognized by this build but not readable by it — see [`load`].
+    VmUserData,
+}
+
+impl ConfigSource {
+    /// Classify a `--config` value whose `optional:` prefix (if any) has already been stripped — Go's
+    /// `switch path { case VMUserDataPath: readVMUserData() default: os.ReadFile(path) }`.
+    pub fn parse(value: &str) -> Self {
+        if value == VM_USER_DATA_PATH {
+            Self::VmUserData
+        } else {
+            Self::File(std::path::PathBuf::from(value))
+        }
+    }
+}
+
+impl std::fmt::Display for ConfigSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::File(path) => write!(f, "{}", path.display()),
+            Self::VmUserData => f.write_str(VM_USER_DATA_PATH),
+        }
+    }
+}
+
+/// A parsed `tailnetd --config` flag value: the [`ConfigSource`] plus whether the operator marked it
+/// `optional:` (Go strips that prefix in `cmd/tailscaled/tailscaled.go`, not in `conffile`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigFlag {
+    /// `optional:` was given: an **absent** source is not fatal — boot unconfigured and let the node
+    /// be enrolled interactively. A source that is present but invalid still fails.
+    pub optional: bool,
+    /// The source, with any `optional:` prefix stripped.
+    pub source: ConfigSource,
+}
+
+impl ConfigFlag {
+    /// Parse a raw `--config` value.
+    ///
+    /// `None` for an empty value: Go gates its whole config block on `args.confFile != ""`, so
+    /// `--config ""` means "no config given", not "read the file named ``". Note that
+    /// `--config optional:` (an empty source *behind* the marker) is NOT that case — it is an
+    /// optional source that is absent, which [`load`] duly reports as [`NoConfig`] and
+    /// [`ConfigFlag::load`] duly tolerates, exactly as Go's `os.ReadFile("")` does.
+    pub fn parse(value: &str) -> Option<Self> {
+        if value.is_empty() {
+            return None;
+        }
+        // Go: `if p, ok := strings.CutPrefix(path, "optional:"); ok { optional, path = true, p }` —
+        // ONE prefix is stripped, so `optional:optional:x` is an optional source literally named
+        // `optional:x`.
+        Some(match value.strip_prefix(OPTIONAL_PREFIX) {
+            Some(rest) => Self {
+                optional: true,
+                source: ConfigSource::parse(rest),
+            },
+            None => Self {
+                optional: false,
+                source: ConfigSource::parse(value),
+            },
+        })
+    }
+
+    /// [`load`] this flag's source, applying the `optional:` contract: `Ok(None)` means "no config
+    /// present, and that is allowed — carry on unconfigured" (Go's
+    /// `case optional && errors.Is(err, conffile.ErrNoConfig)`). Every other failure — including any
+    /// failure at all when `optional` is false, and a malformed-but-present config even when it is
+    /// true — is returned as an error, because a config the operator declared and that exists must
+    /// never be silently ignored.
+    pub fn load(&self) -> Result<Option<Config>> {
+        match load(&self.source) {
+            Ok(config) => Ok(Some(config)),
+            Err(e) if self.optional && is_no_config(&e) => {
+                tracing::info!(
+                    source = %self.source,
+                    reason = %e,
+                    "config: none present; continuing unconfigured (--config optional:)"
+                );
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Load and parse a `--config` source (Go `conffile.Load`).
+///
+/// Reads `source`, parses it as **standard JSON** (this fork omits HuJSON — the comment-stripping
 /// preprocessor Go gates behind a build feature; a config must be valid JSON here), gates the
 /// `version` (only `"alpha0"` is accepted — an empty or unrecognized version is a clear error, like
 /// Go), then decodes the full [`ConfigVAlpha`]. Fails loudly with context on any step (a misconfigured
 /// headless deploy must fail fast, not start half-configured).
-pub fn load(path: &std::path::Path) -> Result<Config> {
-    let raw =
-        std::fs::read(path).with_context(|| format!("reading config file {}", path.display()))?;
+///
+/// ## Two kinds of failure
+///
+/// A **read-phase** failure — the source is absent or unreadable — is reported as [`NoConfig`], which
+/// [`is_no_config`] recognizes anywhere in the error chain. Everything after the bytes are in hand
+/// (bad JSON, missing or unsupported `version`) is a plain error. Only the first kind is survivable,
+/// and only behind `optional:` — see [`ConfigFlag::load`].
+///
+/// ## `vm:user-data` is recognized but not readable here
+///
+/// Go reads [`VM_USER_DATA_PATH`] from the EC2 instance metadata service, behind its `HasAWS` build
+/// feature; a Go build *without* that feature returns `feature.ErrUnavailable`, which `conffile.Load`
+/// wraps in `ErrNoConfig` exactly like a missing file. This fork has no cloud-metadata client, so it
+/// takes that same branch. The point is the error path, and it is now the right one: the sentinel is
+/// recognized rather than mistaken for a filename, `--config optional:vm:user-data` (the cloud-init
+/// form) boots unconfigured instead of dying at startup, and a bare `--config vm:user-data` still
+/// fails loudly — naming what is missing — rather than silently ignoring a declared config source.
+pub fn load(source: &ConfigSource) -> Result<Config> {
+    let raw = match source {
+        ConfigSource::File(path) => std::fs::read(path).map_err(|e| {
+            anyhow!(NoConfig {
+                source: source.to_string(),
+                reason: e.to_string(),
+            })
+        })?,
+        ConfigSource::VmUserData => {
+            return Err(anyhow!(NoConfig {
+                source: VM_USER_DATA_PATH.to_string(),
+                reason: "reading a VM's user-data (cloud instance metadata) is not supported by \
+                         this build"
+                    .to_string(),
+            }));
+        }
+    };
 
     // Gate the version BEFORE decoding the whole body (Go decodes a {version} probe first), so an
     // unsupported version yields a precise message rather than a confusing field error.
@@ -151,26 +444,18 @@ pub fn load(path: &std::path::Path) -> Result<Config> {
         #[serde(default)]
         version: String,
     }
-    let probe: VersionProbe = serde_json::from_slice(&raw).with_context(|| {
-        format!(
-            "parsing config file {} (must be valid JSON)",
-            path.display()
-        )
-    })?;
+    let probe: VersionProbe = serde_json::from_slice(&raw)
+        .with_context(|| format!("parsing config file {source} (must be valid JSON)"))?;
     match probe.version.as_str() {
-        "" => bail!(
-            "config file {}: no \"version\" field defined (want \"alpha0\")",
-            path.display()
-        ),
+        "" => bail!("config file {source}: no \"version\" field defined (want \"alpha0\")"),
         "alpha0" => {}
         other => bail!(
-            "config file {}: unsupported \"version\" value {other:?}; want \"alpha0\" for now",
-            path.display()
+            "config file {source}: unsupported \"version\" value {other:?}; want \"alpha0\" for now"
         ),
     }
 
-    let parsed: ConfigVAlpha = serde_json::from_slice(&raw)
-        .with_context(|| format!("parsing config file {}", path.display()))?;
+    let parsed: ConfigVAlpha =
+        serde_json::from_slice(&raw).with_context(|| format!("parsing config file {source}"))?;
     Ok(Config {
         version: probe.version,
         parsed,
@@ -182,15 +467,39 @@ impl Config {
     /// the config supplied one) for the caller to use at bring-up — it is a credential, not a
     /// persisted pref, so it is never written into `prefs`.
     ///
-    /// A field left unset in the config (`None` / empty vec) does NOT touch the corresponding pref, so
-    /// the config layers on top of the daemon's defaults rather than resetting them. Each engine-gated
-    /// / non-goal field that is *set to a non-default value* is logged at `warn` so a headless operator
-    /// can see it was parsed but not applied (honest omission — never a silent drop).
+    /// A field left unset in the config (`None`) does NOT touch the corresponding pref, so the config
+    /// layers on top of the daemon's defaults rather than resetting them. "Unset" means ABSENT, not
+    /// empty: an explicit `"AdvertiseRoutes": []` is a value, and applying it withdraws every
+    /// advertised route (Go's `if c.AdvertiseRoutes != nil` guard — see the field's docs). Each
+    /// engine-gated / non-goal field that is *set to a non-default value* is logged at `warn` so a
+    /// headless operator can see it was parsed but not applied (honest omission — never a silent
+    /// drop).
     ///
     /// `AuthKey` resolution: a bare value is returned as-is; a `file:<path>` value is read from that
     /// file (trimmed) — Go's convention for keeping the secret out of the (often world-readable)
     /// config file itself.
     pub fn apply_to_prefs(&self, prefs: &mut Prefs) -> Result<Option<SecretString>> {
+        self.apply_to_prefs_gated(
+            prefs,
+            crate::ipn::selfupdate::auto_update_refusal().as_deref(),
+        )
+    }
+
+    /// [`apply_to_prefs`](Self::apply_to_prefs) with this installation's update provenance passed IN
+    /// rather than read from the running process — `Some(reason)` = this installation can never
+    /// replace its own binary, `None` = it can (Go `feature.CanAutoUpdate()`, decided here by
+    /// [`selfupdate::auto_update_refusal`](crate::ipn::selfupdate::auto_update_refusal)).
+    ///
+    /// Injected for the same reason [`crate::ipn`]'s `check_prefs_gated` injects its host gates: the
+    /// verdict is a property of the machine the code runs on — every Linux x86_64 CI runner answers
+    /// `None`, a macOS developer box answers `Some(..)` — so a test that let the production code read
+    /// it could only ever assert the branch its own host takes, and the refusal below would go
+    /// unexercised wherever CI happens to run.
+    fn apply_to_prefs_gated(
+        &self,
+        prefs: &mut Prefs,
+        host_refusal: Option<&str>,
+    ) -> Result<Option<SecretString>> {
         let c = &self.parsed;
 
         // VALIDATE every field-level value BEFORE mutating `prefs` (all-or-nothing). The daemon's
@@ -208,9 +517,75 @@ impl Config {
                 other => bail!("config: ServerURL {url:?} scheme {other:?} is not http or https"),
             }
         }
-        for s in &c.advertise_routes {
-            s.parse::<ipnet::IpNet>()
-                .with_context(|| format!("config: invalid advertise route {s:?}"))?;
+        // The advertised routes are checked as a SET, by the one function the `up`/`set`/`check-prefs`
+        // paths ask (`crate::routes::calc_advertise_routes`, Go `netutil.CalcAdvertiseRoutes`): every
+        // CIDR must parse at all (Go gets that for free — its `AdvertiseRoutes` is a
+        // `[]netip.Prefix`, so a malformed entry dies in the JSON decode) and be MASKED
+        // (`"192.0.2.5/24"` parses happily as an `IpNet` that keeps its host bits, so without this the
+        // typo boots and the node advertises the route exactly as written instead of the
+        // `192.0.2.0/24` the operator meant); every 4via6 prefix must actually decode; and a default
+        // route must be advertised in BOTH families or neither, because a lone `0.0.0.0/0` is a half
+        // exit node whose clients leak their IPv6 traffic out of their own link. That last rule is
+        // asked of the routes this config COMPOSES with `AdvertiseExitNode` — the two are one field in
+        // Go and two prefs here — and of the set that will actually be persisted, so a config that
+        // does not mention routes at all is judged on the prefs it leaves in place, while one that
+        // names an explicit `[]` is judged on the empty set it is about to write.
+        //
+        // Go's own config loader checks only the masking rule (`ipn/conf.go` `ToPrefs`); the set-level
+        // rules live in its CLI path (`netutil.CalcAdvertiseRoutes`, reached from `up`/`set`, the k8s
+        // operator and client/web — never from a config file). They are applied here as well because a
+        // declaratively-managed subnet router is exactly the deployment where nobody reads command
+        // output: a half-advertised default route would otherwise boot silently and leak with no
+        // operator on the other end. Same rules, same messages as `Backend::check_prefs`, so the
+        // declarative and interactive paths refuse the same configs. Every offender is collected (Go
+        // `errors.Join`) rather than only the first: a headless deploy should learn about all its bad
+        // routes in one boot, not one per restart.
+        //
+        // Which is why the refusal is reported in TWO blocks, by whose rule each reason is
+        // ([`crate::routes::RouteError::refused_by_go_config_path`]). Go's config-path refusals get
+        // Go's config-path wrapper, verbatim. The rules only this fork asks here get this module's own
+        // `config: ` wording, because telling an operator whose config Go loads that "parsing config to
+        // prefs" failed sends them to a Go message that has no such rule in it, and reads as a syntax
+        // error in a file that has none.
+        let prospective_routes = match &c.advertise_routes {
+            // Present, even as an explicit `[]`: this list REPLACES the persisted one, so it is the
+            // list to judge — an empty one withdraws every route, which is a legal outcome.
+            Some(routes) => routes.clone(),
+            // Absent: the config says nothing about routes, so the prefs already on disk are what
+            // will be advertised, and they are what the pairing rule is asked about.
+            None => prefs.advertise_routes.clone(),
+        };
+        let prospective_advertise_exit = c.advertise_exit_node.unwrap_or(prefs.advertise_exit_node);
+        // Each block is wrapped ONCE. Go's `ToPrefs` returns `errors.Join` of the bare route errors
+        // and its two callers (`initPrefsFromConfig`, `setConfigLocked`) put
+        // `error parsing config to prefs: %w` around the whole join, so that wrapper goes on the front
+        // of the joined block and the lines below it are Go's verbatim. This fork's extra set-level
+        // rules get one wrapper of their own for the same reason — repeating a prefix per line says
+        // the same thing once per bad route. A config that trips both kinds reports both blocks, so a
+        // headless boot still learns everything wrong with it at once.
+        if let Err(errs) =
+            crate::routes::calc_advertise_routes(&prospective_routes, prospective_advertise_exit)
+        {
+            let (go_rules, our_rules): (Vec<_>, Vec<_>) =
+                errs.iter().partition(|e| e.refused_by_go_config_path());
+            let join = |group: Vec<&crate::routes::RouteError>| {
+                group
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            let mut blocks: Vec<String> = Vec::new();
+            if !go_rules.is_empty() {
+                blocks.push(format!("error parsing config to prefs: {}", join(go_rules)));
+            }
+            if !our_rules.is_empty() {
+                blocks.push(format!(
+                    "config: refusing the advertised route set: {}",
+                    join(our_rules)
+                ));
+            }
+            bail!("{}", blocks.join("\n"));
         }
         if let Some(exit) = &c.exit_node {
             // The engine's `ExitNodeSelector::FromStr` is infallible (a non-IP string → a Name that
@@ -228,6 +603,43 @@ impl Config {
                     "config: exitNode {exit:?} uses the auto: form, which this build does not support"
                 );
             }
+        }
+        // An auto-update OPT-IN this installation could never honour is refused here too, so the
+        // declarative ingress cannot make a claim the interactive one refuses. `AutoUpdate.Apply` is
+        // not local state: the engine advertises it as `Hostinfo.AllowsUpdate` at registration and on
+        // every map request, so a `--config` daemon on a host whose binary can never be replaced
+        // would otherwise tell the tailnet admin that a remote update trigger will be honoured —
+        // precisely the dishonest advertisement `Backend::begin_set` and `Backend::check_prefs`
+        // refuse to make. Same rule and same predicate as those two
+        // (`ipn::selfupdate::check_auto_update_pref`, Go `checkAutoUpdatePrefsLocked`), so every
+        // ingress to this pref answers alike; the closing sentence differs because the way out does
+        // (`REMEDY_CONFIG` — there is no daemon up at boot to accept `tnet set --no-auto-update`).
+        //
+        // Upstream does NOT check here — `initPrefsFromConfig` and `setConfigLocked`
+        // (`ipn/ipnlocal/local.go`) apply the config's prefs with `ApplyEdits` + `SetPrefs` and never
+        // reach `checkPrefsLocked`; only `Start`'s `opts.UpdatePrefs` and `EditPrefs` do. This is the
+        // same deliberate divergence the advertised-route rules above already make, for the same
+        // reason: a declaratively-managed node is exactly the deployment where nobody reads command
+        // output, so a claim nothing can keep would be made silently and forever.
+        //
+        // Only what the CONFIG declares is judged, never a pref already on disk: refusing a persisted
+        // opt-in here would stop the daemon booting, and `tnet set --no-auto-update` — the way to
+        // clear it — needs a running daemon. The write paths judge the resulting posture
+        // (`Backend::prospective_auto_update`); this one judges its own input.
+        //
+        // Placement inside this block, not its order within it, is what matters: like every rule
+        // above it this one bails on the first offender (`apply_to_prefs` is fail-fast, where
+        // `check_prefs` accumulates), so a config that is bad in two ways names whichever fault is
+        // checked first. What it guarantees is the all-or-nothing contract — not one pref is mutated
+        // when any of them is refused.
+        if let Some(au) = c.auto_update
+            && let Some(e) = crate::ipn::selfupdate::check_auto_update_pref(
+                au.apply,
+                host_refusal,
+                crate::ipn::selfupdate::REMEDY_CONFIG,
+            )
+        {
+            bail!("config: AutoUpdate.Apply: {e}");
         }
 
         // `Enabled` is special: Go ALWAYS masks `WantRunning` in from a config (`mp.WantRunning =
@@ -254,14 +666,64 @@ impl Config {
         if let Some(exit) = &c.exit_node {
             prefs.exit_node = Some(exit.clone());
         }
-        if !c.advertise_routes.is_empty() {
-            prefs.advertise_routes = c.advertise_routes.clone();
+        // Go: `if c.AdvertiseRoutes != nil { mp.AdvertiseRoutes = c.AdvertiseRoutes;
+        // mp.AdvertiseRoutesSet = true }`. PRESENCE of the key is the switch, not non-emptiness —
+        // `"AdvertiseRoutes": []` is present, and withdraws everything this node advertised.
+        if let Some(routes) = &c.advertise_routes {
+            prefs.advertise_routes = routes.clone();
         }
         if let Some(v) = c.shields_up {
             prefs.shields_up = v;
         }
         if let Some(v) = c.run_ssh_server {
             prefs.ssh_enabled = v;
+        }
+        // `AdvertiseExitNode` — deliberately applied AFTER `advertise_routes`, because in Go the two
+        // are the SAME field and the order is what makes them compose: `ToPrefs` sets
+        // `mp.AdvertiseRoutes` from the config's list first, then, if `AdvertiseExitNode` is true,
+        // *appends* the v4/v6 default routes to it (falling back to just those two when the config
+        // listed no routes). Advertising as an exit node therefore never drops the subnet routes the
+        // same config asked for. This fork splits the intent into two prefs that the engine composes
+        // (`Config::advertise_exit_node` + `Config::advertise_routes`, see `ipn::config`), so writing
+        // the bool here after the routes yields exactly Go's outcome for all four combinations.
+        //
+        // One deliberate difference: Go acts only on `EqualBool(true)` — an explicit
+        // `"AdvertiseExitNode": false` leaves its derived routes alone, because in Go the *absence*
+        // of the default routes is what "not an exit node" means and an unset `AdvertiseRoutes` must
+        // not clobber the existing set. Here the bool is the ONLY carrier of the intent, so an
+        // explicitly declared `false` is applied as `false`. Ignoring it would be precisely the
+        // silent-drop this module forbids, and it matches `tnet up --advertise-exit-node=false`.
+        if let Some(v) = c.advertise_exit_node {
+            prefs.advertise_exit_node = v;
+        }
+        if let Some(op) = &c.operator_user {
+            // Go: `mp.OperatorUser = *c.OperatorUser` — an explicit empty string means "no operator",
+            // which this fork spells `None` (the same clearing `tnet set --operator=` performs).
+            prefs.operator_user = if op.is_empty() {
+                None
+            } else {
+                Some(op.clone())
+            };
+        }
+        if let Some(v) = c.allow_lan_while_using_exit_node {
+            prefs.exit_node_allow_lan_access = v;
+        }
+        if let Some(v) = c.posture_checking {
+            prefs.posture_checking = v;
+        }
+        if let Some(v) = c.run_web_client {
+            prefs.run_web_client = v;
+        }
+        if let Some(app) = c.app_connector {
+            prefs.advertise_app_connector = app.advertise;
+        }
+        // Go assigns the whole `AutoUpdatePrefs` struct and sets BOTH mask bits, so a present
+        // `AutoUpdate` object writes both prefs — including from an inner key the JSON omitted, whose
+        // value is then Go's zero (`Check: false`). See `AutoUpdatePrefs` for why that is reproduced
+        // rather than smoothed over.
+        if let Some(au) = c.auto_update {
+            prefs.auto_update_check = au.check;
+            prefs.auto_update_apply = au.apply;
         }
 
         warn_unmapped(c);
@@ -295,19 +757,32 @@ fn resolve_auth_key(value: &str) -> Result<SecretString> {
     }
 }
 
-/// Log a `warn` for each engine-gated / non-goal field that is set to a non-default value, so an
-/// operator sees the config carried something this build does not honor (honest omission). Pure-ish
-/// (only logs); no pref mutation.
-fn warn_unmapped(c: &ConfigVAlpha) {
-    let mut unmapped: Vec<&str> = Vec::new();
-    if c.allow_lan_while_using_exit_node.is_some() {
-        unmapped.push("AllowLANWhileUsingExitNode");
-    }
-    if c.operator_user.is_some() {
-        unmapped.push("OperatorUser");
+/// The Go config fields this build parses but does NOT honor, for each one that is set to a
+/// non-default value — the honest-omission list, in Go's declaration order.
+///
+/// Split out from [`warn_unmapped`] (which only logs it) so a test can assert the exact list the
+/// production code produces for a given config. That matters more than it looks: the list drifts in
+/// *both* directions — a Go field missing from it AND from [`ConfigVAlpha`] is a silent drop, while a
+/// field left in it after this fork grew the pref behind it is a warning that lies. Four entries were
+/// each kind before this list was re-derived against `ipn/conf.go` @
+/// `53a0d659afa51835dd7a9283873cca44261454f8`.
+///
+/// Only non-default values are reported: warning about a field the operator left at its default (or
+/// spelled out at its default) would be noise, and Go's `ToPrefs` likewise no-ops on an unset
+/// `opt.Bool`.
+fn unmapped_fields(c: &ConfigVAlpha) -> Vec<&'static str> {
+    let mut unmapped: Vec<&'static str> = Vec::new();
+    // `Locked: true` is an operator intent (refuse out-of-band `tnet set`) this fork does not enforce;
+    // warn so it is never silently ignored. `Locked: false`/absent is the default (no lock), so only
+    // a true value is worth surfacing.
+    if c.locked == Some(true) {
+        unmapped.push("Locked");
     }
     if c.disable_snat.is_some() {
         unmapped.push("DisableSNAT");
+    }
+    if !c.advertise_services.is_empty() {
+        unmapped.push("AdvertiseServices");
     }
     if c.netfilter_mode.is_some() {
         unmapped.push("NetfilterMode");
@@ -315,26 +790,8 @@ fn warn_unmapped(c: &ConfigVAlpha) {
     if c.no_stateful_filtering.is_some() {
         unmapped.push("NoStatefulFiltering");
     }
-    if c.posture_checking.is_some() {
-        unmapped.push("PostureChecking");
-    }
-    if c.run_web_client.is_some() {
-        unmapped.push("RunWebClient");
-    }
-    // `Locked: true` is an operator intent (refuse out-of-band `tnet set`) this fork does not enforce;
-    // warn so it is never silently ignored. `Locked: false`/absent is the default (no lock), so only
-    // a true value is worth surfacing.
-    if c.locked == Some(true) {
-        unmapped.push("Locked");
-    }
-    if !c.advertise_services.is_empty() {
-        unmapped.push("AdvertiseServices");
-    }
-    if c.app_connector.is_some() {
-        unmapped.push("AppConnector");
-    }
-    if c.auto_update.is_some() {
-        unmapped.push("AutoUpdate");
+    if c.remote_config.is_some() {
+        unmapped.push("RemoteConfig");
     }
     if c.serve_config_temp.is_some() {
         unmapped.push("ServeConfigTemp");
@@ -342,6 +799,21 @@ fn warn_unmapped(c: &ConfigVAlpha) {
     if !c.static_endpoints.is_empty() {
         unmapped.push("StaticEndpoints");
     }
+    // Go's `RelayServerPort` is a pointer whose *absence* disables the relay server, so any present
+    // value — `0` included, which asks Go to pick a random port — is a real request this build drops.
+    if c.relay_server_port.is_some() {
+        unmapped.push("RelayServerPort");
+    }
+    if !c.relay_server_static_endpoints.is_empty() {
+        unmapped.push("RelayServerStaticEndpoints");
+    }
+    unmapped
+}
+
+/// Log a `warn` naming every `unmapped_fields` entry, so an operator sees the config carried
+/// something this build does not honor (honest omission). Pure-ish (only logs); no pref mutation.
+fn warn_unmapped(c: &ConfigVAlpha) {
+    let unmapped = unmapped_fields(c);
     if !unmapped.is_empty() {
         tracing::warn!(
             fields = ?unmapped,
@@ -374,7 +846,7 @@ mod tests {
             CFG_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::write(&path, json).unwrap();
-        let loaded = load(&path);
+        let loaded = load(&ConfigSource::File(path.clone()));
         let _ = std::fs::remove_file(&path);
         match loaded {
             Ok(c) => c,
@@ -436,10 +908,11 @@ mod tests {
         // Malformed ServerURL.
         let e = err(r#"{"version":"alpha0","ServerURL":"not a url"}"#);
         assert!(e.to_lowercase().contains("serverurl"), "{e}");
-        // Bad advertise route CIDR.
+        // Bad advertise route CIDR — named in Go's words (`netutil.CalcAdvertiseRoutes`: "%q is not a
+        // valid IP address or CIDR prefix"), which is what the shared route-set check reports.
         let e = err(r#"{"version":"alpha0","AdvertiseRoutes":["10.0.0.0/8","garbage"]}"#);
         assert!(
-            e.contains("advertise route") && e.contains("garbage"),
+            e.contains("\"garbage\" is not a valid IP address or CIDR prefix"),
             "{e}"
         );
         // Empty exit node.
@@ -469,13 +942,299 @@ mod tests {
     }
 
     #[test]
+    fn apply_refuses_advertise_routes_with_host_bits_set() {
+        // Go's `ToPrefs` walks `c.AdvertiseRoutes` and refuses every prefix that is not its own
+        // masked form (`route != route.Masked()` → `route %s has non-address bits set; expected
+        // %s`), returning before it writes a pref. `"192.0.2.5/24"` parses as a perfectly good
+        // `IpNet` that keeps its host bits, so this refusal is the only thing between an operator's
+        // typo and a node that advertises the route exactly as mistyped.
+        let c = cfg(r#"{"version":"alpha0","AdvertiseRoutes":
+                ["192.0.2.5/24","198.51.100.0/24","2001:db8::1/64"]}"#);
+        let mut p = Prefs {
+            advertise_routes: vec!["203.0.113.0/24".to_string()],
+            ..Prefs::default()
+        };
+        let before = p.clone();
+        let e = match c.apply_to_prefs(&mut p) {
+            Ok(_) => panic!("an advertised route with host bits set must be refused"),
+            Err(e) => e.to_string(),
+        };
+        // Every offender is named — Go joins them all rather than stopping at the first — and each
+        // names the masked form the operator meant.
+        assert!(
+            e.contains("route 192.0.2.5/24 has non-address bits set; expected 192.0.2.0/24"),
+            "{e}"
+        );
+        assert!(
+            e.contains("route 2001:db8::1/64 has non-address bits set; expected 2001:db8::/64"),
+            "{e}"
+        );
+        // The already-masked route in the same list is not complained about.
+        assert!(!e.contains("198.51.100.0/24"), "{e}");
+        // All-or-nothing, like every other field-level refusal here: nothing was written.
+        assert_eq!(p.advertise_routes, before.advertise_routes);
+        assert_eq!(p.want_running, before.want_running);
+
+        // Not over-eager: a single-address route is its own masked form, so it is accepted (Go
+        // too), as is a genuinely masked subnet.
+        let ok = cfg(r#"{"version":"alpha0","AdvertiseRoutes":
+                ["192.0.2.5/32","2001:db8::1/128","198.51.100.0/24"]}"#);
+        let mut p2 = Prefs::default();
+        ok.apply_to_prefs(&mut p2).unwrap();
+        assert_eq!(
+            p2.advertise_routes,
+            vec!["192.0.2.5/32", "2001:db8::1/128", "198.51.100.0/24"]
+        );
+    }
+
+    #[test]
+    fn explicit_empty_advertise_routes_withdraws_them() {
+        // Go guards the whole block with `if c.AdvertiseRoutes != nil`, and JSON `[]` decodes to a
+        // NON-nil empty slice: it sets `AdvertiseRoutes` to empty with `AdvertiseRoutesSet = true`,
+        // withdrawing every route this node advertised. Reading the field as a bare `Vec` made an
+        // explicit `[]` indistinguishable from an absent key, so a declaratively managed subnet
+        // router could not be told to stop advertising by editing its config — the routes it had
+        // already published stayed published, and only the operator's intent changed.
+        let c = cfg(r#"{"version":"alpha0","AdvertiseRoutes":[]}"#);
+        let mut p = Prefs {
+            advertise_routes: vec!["192.0.2.0/24".to_string(), "198.51.100.0/24".to_string()],
+            ..Prefs::default()
+        };
+        c.apply_to_prefs(&mut p).unwrap();
+        assert!(
+            p.advertise_routes.is_empty(),
+            "an explicit [] withdraws every advertised route, got {:?}",
+            p.advertise_routes
+        );
+
+        // Withdrawing the subnet routes of a node that also advertises itself as an exit node is
+        // still legal — the exit-node intent lives in its own pref here, and the composed set is
+        // both default routes, so the pairing rule is satisfied.
+        let mut p_exit = Prefs {
+            advertise_routes: vec!["192.0.2.0/24".to_string()],
+            advertise_exit_node: true,
+            ..Prefs::default()
+        };
+        c.apply_to_prefs(&mut p_exit).unwrap();
+        assert!(p_exit.advertise_routes.is_empty());
+        assert!(p_exit.advertise_exit_node);
+
+        // Go's nil is spelled two ways in JSON — an absent key and an explicit `null` — and neither
+        // touches the pref. That is the layering contract the rest of this module keeps.
+        for json in [
+            r#"{"version":"alpha0","AdvertiseRoutes":null}"#,
+            r#"{"version":"alpha0"}"#,
+        ] {
+            let mut p2 = Prefs {
+                advertise_routes: vec!["192.0.2.0/24".to_string()],
+                ..Prefs::default()
+            };
+            cfg(json).apply_to_prefs(&mut p2).unwrap();
+            assert_eq!(
+                p2.advertise_routes,
+                vec!["192.0.2.0/24".to_string()],
+                "{json} must leave the persisted routes alone"
+            );
+        }
+    }
+
+    #[test]
+    fn route_refusals_are_wrapped_once_and_name_the_parsed_prefix() {
+        // Two message-shape rules in one refusal. (1) Go's `ToPrefs` returns `errors.Join` of the
+        // bare route errors and its callers (`initPrefsFromConfig`, `setConfigLocked`) wrap that
+        // join ONCE as `error parsing config to prefs: %w` — not once per line. (2) Go's `%s`
+        // formats the `netip.Prefix` it parsed, so a route typed long-hand and in upper case is
+        // named back canonically; the "expected" half is canonical either way, so echoing the raw
+        // string put the two halves of one sentence in two different notations.
+        let c = cfg(r#"{"version":"alpha0","AdvertiseRoutes":
+                ["2001:0DB8:0000::1/64","192.0.2.5/24"]}"#);
+        let mut p = Prefs::default();
+        let e = match c.apply_to_prefs(&mut p) {
+            Ok(_) => panic!("routes with host bits set must be refused"),
+            Err(e) => e.to_string(),
+        };
+        let lines: Vec<&str> = e.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                "error parsing config to prefs: route 2001:db8::1/64 has non-address bits set; \
+                 expected 2001:db8::/64",
+                "route 192.0.2.5/24 has non-address bits set; expected 192.0.2.0/24",
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_refuses_a_default_route_advertised_in_one_family_only() {
+        // The half-exit-node leak, from the path that most needs catching it: a declaratively managed
+        // subnet router boots with nobody reading command output. `0.0.0.0/0` alone takes its clients'
+        // v4 traffic while their v6 traffic leaves out their own link, and neither end can see it.
+        //
+        // This config LOADS in Go — `ToPrefs` checks only the masking rule, and the pairing rule sits
+        // in `netutil.CalcAdvertiseRoutes`, which no config path calls — so the refusal is this fork's
+        // and says so. Wearing Go's `error parsing config to prefs:` sentence would send an operator
+        // holding a config Go accepts to a Go function that has no such rule in it.
+        let c = cfg(r#"{"version":"alpha0","AdvertiseRoutes":["0.0.0.0/0","192.0.2.0/24"]}"#);
+        let mut p = Prefs::default();
+        let before = p.clone();
+        let e = match c.apply_to_prefs(&mut p) {
+            Ok(_) => panic!("a lone v4 default route must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert_eq!(
+            e,
+            "config: refusing the advertised route set: 0.0.0.0/0 advertised without its IPv6 \
+             counterpart, please also advertise ::/0"
+        );
+        // All-or-nothing: the good route in the same list was not written either.
+        assert_eq!(p.advertise_routes, before.advertise_routes);
+        assert_eq!(p.want_running, before.want_running);
+
+        // The mirror case names the other counterpart.
+        let c6 = cfg(r#"{"version":"alpha0","AdvertiseRoutes":["::/0"]}"#);
+        let mut p6 = Prefs::default();
+        let e6 = match c6.apply_to_prefs(&mut p6) {
+            Ok(_) => panic!("a lone v6 default route must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert_eq!(
+            e6,
+            "config: refusing the advertised route set: ::/0 advertised without its IPv4 \
+             counterpart, please also advertise 0.0.0.0/0"
+        );
+    }
+
+    #[test]
+    fn only_gos_own_config_rules_are_refused_in_gos_config_words() {
+        // Go splits the route rules across two functions and puts only ONE of them on the config
+        // path: `ipn/conf.go` `ToPrefs` checks `route != route.Masked()`, and its callers wrap the
+        // join as `error parsing config to prefs: %w`. The pairing rule and the 4via6 validation live
+        // in `netutil.CalcAdvertiseRoutes`, which at v1.102.4 is reached from `up`, `set`, the k8s
+        // operator and client/web — never from a config file. This fork asks all of them here anyway,
+        // so the one thing that has to be right is WHOSE words each refusal is reported in.
+        let refuse = |json: &str| {
+            let mut p = Prefs::default();
+            match cfg(json).apply_to_prefs(&mut p) {
+                Ok(_) => panic!("expected {json} to be refused"),
+                Err(e) => e.to_string(),
+            }
+        };
+
+        // Go's rule → Go's wrapper, verbatim.
+        let masked = refuse(r#"{"version":"alpha0","AdvertiseRoutes":["192.0.2.5/24"]}"#);
+        assert_eq!(
+            masked,
+            "error parsing config to prefs: route 192.0.2.5/24 has non-address bits set; expected \
+             192.0.2.0/24"
+        );
+
+        // Not Go's rules → not Go's wrapper. Both of these configs load in Go.
+        for json in [
+            r#"{"version":"alpha0","AdvertiseRoutes":["0.0.0.0/0"]}"#,
+            r#"{"version":"alpha0","AdvertiseRoutes":["fd7a:115c:a1e0:b1a::/64"]}"#,
+        ] {
+            let e = refuse(json);
+            assert!(
+                !e.contains("error parsing config to prefs"),
+                "{json} is refused in Go's config-path words for a rule Go's config path does not \
+                 have: {e}"
+            );
+            assert!(
+                e.starts_with("config: refusing the advertised route set: "),
+                "{e}"
+            );
+        }
+
+        // A config that trips both kinds still reports everything wrong with it in one boot: two
+        // blocks, each wrapped once, each under the wrapper that belongs to it.
+        let both = refuse(
+            r#"{"version":"alpha0","AdvertiseRoutes":["192.0.2.5/24","0.0.0.0/0","garbage"]}"#,
+        );
+        assert_eq!(
+            both.lines().collect::<Vec<_>>(),
+            vec![
+                "error parsing config to prefs: route 192.0.2.5/24 has non-address bits set; \
+                 expected 192.0.2.0/24",
+                "\"garbage\" is not a valid IP address or CIDR prefix",
+                "config: refusing the advertised route set: 0.0.0.0/0 advertised without its IPv6 \
+                 counterpart, please also advertise ::/0",
+            ],
+            "got:\n{both}"
+        );
+    }
+
+    #[test]
+    fn advertise_exit_node_satisfies_the_default_route_pairing() {
+        // The rule is about the SET the config composes, not about the literal list: `AdvertiseExitNode`
+        // IS the two default routes, so the same `0.0.0.0/0` that is refused above is fine beside it —
+        // both families are advertised, which is exactly what was asked for.
+        let c =
+            cfg(r#"{"version":"alpha0","AdvertiseRoutes":["0.0.0.0/0"],"AdvertiseExitNode":true}"#);
+        let mut p = Prefs::default();
+        c.apply_to_prefs(&mut p).unwrap();
+        assert_eq!(p.advertise_routes, vec!["0.0.0.0/0"]);
+        assert!(p.advertise_exit_node);
+
+        // And the reverse composition: a config that turns the exit-node advertisement OFF while the
+        // PERSISTED routes still carry a lone default is the same leak, so it is refused — the set is
+        // what is judged, and a config that names no routes is judged on the prefs it leaves in place.
+        let off = cfg(r#"{"version":"alpha0","AdvertiseExitNode":false}"#);
+        let mut p2 = Prefs {
+            advertise_routes: vec!["0.0.0.0/0".to_string()],
+            advertise_exit_node: true,
+            ..Prefs::default()
+        };
+        let e = match off.apply_to_prefs(&mut p2) {
+            Ok(_) => panic!("dropping the exit-node advertisement must not leave a lone default"),
+            Err(e) => e.to_string(),
+        };
+        assert!(e.contains("please also advertise ::/0"), "{e}");
+        assert!(
+            p2.advertise_exit_node,
+            "refused before any pref was written"
+        );
+    }
+
+    #[test]
+    fn apply_refuses_a_malformed_4via6_route() {
+        // A 4via6 prefix too short to carry the site id it is supposed to encode (Go
+        // `netutil.ValidateViaPrefix`, message verbatim). Without this it is advertised as an ordinary
+        // IPv6 route that decodes to no IPv4 CIDR at all. Go reaches that check from its CLI and not
+        // from a config file, so the reason is Go's but the refusal is this fork's, and the wrapper
+        // around it is this module's rather than `ToPrefs`'.
+        let c = cfg(r#"{"version":"alpha0","AdvertiseRoutes":["fd7a:115c:a1e0:b1a::/64"]}"#);
+        let mut p = Prefs::default();
+        let e = match c.apply_to_prefs(&mut p) {
+            Ok(_) => panic!("a 4via6 prefix shorter than /96 must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert_eq!(
+            e,
+            "config: refusing the advertised route set: fd7a:115c:a1e0:b1a::/64 4-in-6 prefix must \
+             be at least a /96"
+        );
+        assert!(p.advertise_routes.is_empty());
+
+        // A well-formed one — site 7, 192.0.2.0/24 — is accepted.
+        let ok = cfg(
+            r#"{"version":"alpha0","AdvertiseRoutes":["fd7a:115c:a1e0:b1a:0:7:c000:200/120"]}"#,
+        );
+        let mut p2 = Prefs::default();
+        ok.apply_to_prefs(&mut p2).unwrap();
+        assert_eq!(
+            p2.advertise_routes,
+            vec!["fd7a:115c:a1e0:b1a:0:7:c000:200/120"]
+        );
+    }
+
+    #[test]
     fn version_gate_rejects_missing_and_unknown() {
         // Missing version.
         let dir = std::env::temp_dir().join(format!("tailnetd-conf-bad-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("nover.json");
         // `Config` has no `Debug`, so `unwrap_err()` won't compile — assert via the Err arm directly.
-        let err_str = |path: &std::path::Path| match load(path) {
+        let err_str = |path: &std::path::Path| match load(&ConfigSource::File(path.to_path_buf())) {
             Ok(_) => panic!("expected an error"),
             Err(e) => e.to_string(),
         };
@@ -522,17 +1281,20 @@ mod tests {
 
     #[test]
     fn go_config_fields_without_a_pref_parse_and_are_not_applied() {
-        // Go's ConfigVAlpha (v1.100.0) carries fields this fork has no pref for — including
-        // AdvertiseServices, AppConnector, AutoUpdate, ServeConfigTemp, StaticEndpoints. A real Go
-        // config that sets them MUST parse (no error) and MUST NOT mutate prefs — they are surfaced via
-        // warn_unmapped (honest omission), never silently applied. Critically, Go has NO tags field in
-        // the config (tags ride the auth key), so there is no AdvertiseTags mapping to leave a pref set.
+        // Go's ConfigVAlpha carries fields this fork has no pref for — AdvertiseServices,
+        // ServeConfigTemp, StaticEndpoints, RemoteConfig, RelayServerPort,
+        // RelayServerStaticEndpoints, DisableSNAT, NetfilterMode, NoStatefulFiltering, Locked. A real
+        // Go config that sets them MUST parse (no error) and MUST NOT mutate prefs — they are
+        // surfaced by `unmapped_fields` (honest omission), never silently applied. Critically, Go has
+        // NO tags field in the config (tags ride the auth key), so there is no AdvertiseTags mapping
+        // to leave a pref set.
         let c = cfg(r#"{
                 "version":"alpha0",
                 "Hostname":"only-host",
                 "AdvertiseServices":["svc:web"],
-                "AppConnector":{"advertise":true},
-                "AutoUpdate":{"apply":true},
+                "RemoteConfig":true,
+                "RelayServerPort":41641,
+                "RelayServerStaticEndpoints":["192.0.2.10:41641"],
                 "StaticEndpoints":["1.2.3.4:41641"]
             }"#);
         let mut p = Prefs::default();
@@ -547,6 +1309,359 @@ mod tests {
         assert!(
             p.advertise_tags.is_empty(),
             "the config has no tags field at all (Go carries tags on the auth key) → pref untouched"
+        );
+        // …and each one is REPORTED, not dropped. `RelayServerPort` in particular: Go treats the
+        // pointer's presence as "run a relay server", so even a non-zero port here is a request this
+        // build silently ignored before it was in this list at all.
+        assert_eq!(
+            unmapped_fields(&c.parsed),
+            vec![
+                "AdvertiseServices",
+                "RemoteConfig",
+                "StaticEndpoints",
+                "RelayServerPort",
+                "RelayServerStaticEndpoints",
+            ]
+        );
+    }
+
+    /// `AdvertiseExitNode` is the field whose absence was actually damaging: it is not engine-gated —
+    /// this fork has `Prefs::advertise_exit_node` and `tnet up --advertise-exit-node` — so a Go config
+    /// declaring it booted a node that quietly was not an exit node and said nothing about it.
+    ///
+    /// Go `ipn/conf.go` `ToPrefs` also *composes* it with `AdvertiseRoutes` (appending the two default
+    /// routes rather than replacing the set), so the subnet routes the same config asked for must
+    /// survive. This fork splits the intent across two prefs the engine composes; the composition is
+    /// visible here as "both prefs set from one config".
+    #[test]
+    fn advertise_exit_node_applies_and_composes_with_advertise_routes() {
+        let c = cfg(r#"{
+                "version":"alpha0",
+                "AdvertiseRoutes":["192.0.2.0/24"],
+                "AdvertiseExitNode":true
+            }"#);
+        let mut p = Prefs::default();
+        c.apply_to_prefs(&mut p).unwrap();
+        assert!(
+            p.advertise_exit_node,
+            "a config declaring AdvertiseExitNode must actually advertise as an exit node"
+        );
+        assert_eq!(
+            p.advertise_routes,
+            vec!["192.0.2.0/24".to_string()],
+            "advertising as an exit node must COMPOSE with the config's subnet routes (Go appends \
+             the default routes), never replace them"
+        );
+
+        // Exit node alone, no routes: Go's `else` branch (AdvertiseRoutes was never set).
+        let c = cfg(r#"{"version":"alpha0","AdvertiseExitNode":true}"#);
+        let mut p = Prefs::default();
+        c.apply_to_prefs(&mut p).unwrap();
+        assert!(p.advertise_exit_node);
+        assert!(p.advertise_routes.is_empty());
+
+        // An explicitly declared `false` is applied as false — in this fork the bool is the only
+        // carrier of the intent, so ignoring it (as Go's EqualBool(true) guard does, where the
+        // intent lives inside AdvertiseRoutes instead) would be the silent drop this module forbids.
+        let c = cfg(r#"{"version":"alpha0","AdvertiseExitNode":false}"#);
+        let mut p = Prefs {
+            advertise_exit_node: true,
+            ..Prefs::default()
+        };
+        c.apply_to_prefs(&mut p).unwrap();
+        assert!(!p.advertise_exit_node);
+
+        // Omitting it entirely leaves the pref alone (the module's layering contract).
+        let c = cfg(r#"{"version":"alpha0","Hostname":"h"}"#);
+        let mut p = Prefs {
+            advertise_exit_node: true,
+            ..Prefs::default()
+        };
+        c.apply_to_prefs(&mut p).unwrap();
+        assert!(
+            p.advertise_exit_node,
+            "an unmentioned AdvertiseExitNode must not clobber the existing pref"
+        );
+        // …and it is not reported as unmapped either, in any of those cases.
+        assert!(!unmapped_fields(&c.parsed).contains(&"AdvertiseExitNode"));
+    }
+
+    /// The drift ran the other way too: the warning list kept naming fields whose prefs had since
+    /// shipped, and `apply_to_prefs` mapped none of them — so the declarative path was strictly weaker
+    /// than the flag path for prefs the daemon already had. Each of these has a `tnet up`/`set` flag.
+    #[test]
+    fn prefs_that_shipped_after_the_first_port_are_honored_not_warned() {
+        let c = cfg(r#"{
+                "version":"alpha0",
+                "OperatorUser":"alice",
+                "allowLANWhileUsingExitNode":true,
+                "PostureChecking":true,
+                "RunWebClient":true,
+                "AppConnector":{"Advertise":true},
+                "AutoUpdate":{"Check":true,"Apply":true}
+            }"#);
+        let mut p = Prefs::default();
+        // The gate is handed in as "this installation can replace its own binary", so the opt-in
+        // mapping is pinned on every host — the refusal it gets elsewhere is a property of the
+        // machine, and it has its own test below.
+        c.apply_to_prefs_gated(&mut p, None).unwrap();
+        assert_eq!(p.operator_user.as_deref(), Some("alice"), "--operator");
+        assert!(p.exit_node_allow_lan_access, "--exit-node-allow-lan-access");
+        assert!(p.posture_checking, "--report-posture");
+        assert!(p.run_web_client, "--webclient");
+        assert!(p.advertise_app_connector, "--advertise-connector");
+        assert!(p.auto_update_check, "--update-check");
+        assert_eq!(p.auto_update_apply, Some(true), "--auto-update");
+        // None of them may still be claimed as "parsed but not honored" — a warning that lies is as
+        // bad as a silent drop.
+        assert!(
+            unmapped_fields(&c.parsed).is_empty(),
+            "{:?}",
+            unmapped_fields(&c.parsed)
+        );
+
+        // The false/clearing forms apply too (Go assigns the value, it does not only turn things on).
+        let c = cfg(r#"{
+                "version":"alpha0",
+                "OperatorUser":"",
+                "allowLANWhileUsingExitNode":false,
+                "PostureChecking":false,
+                "RunWebClient":false,
+                "AppConnector":{"Advertise":false}
+            }"#);
+        let mut p = Prefs {
+            operator_user: Some("bob".to_string()),
+            exit_node_allow_lan_access: true,
+            posture_checking: true,
+            run_web_client: true,
+            advertise_app_connector: true,
+            ..Prefs::default()
+        };
+        c.apply_to_prefs(&mut p).unwrap();
+        assert_eq!(
+            p.operator_user, None,
+            "Go's empty OperatorUser means no operator (`tnet set --operator=`)"
+        );
+        assert!(!p.exit_node_allow_lan_access);
+        assert!(!p.posture_checking);
+        assert!(!p.run_web_client);
+        assert!(!p.advertise_app_connector);
+    }
+
+    /// Go's `ToPrefs` assigns the whole `AutoUpdatePrefs` struct and sets BOTH mask bits, so a
+    /// present `AutoUpdate` object writes `Check` from the object even when the JSON omitted that
+    /// inner key — with Go's zero value, `false`, not this fork's `true` pref default. Reproduced
+    /// rather than smoothed over: the alternative is a config file that means one thing under
+    /// `tailscaled` and another here.
+    #[test]
+    fn auto_update_object_writes_both_inner_fields_like_go() {
+        let c = cfg(r#"{"version":"alpha0","AutoUpdate":{"Apply":true}}"#);
+        let mut p = Prefs::default();
+        assert!(p.auto_update_check, "the pref's own default is true");
+        // Updatable installation handed in: this test is about which FIELDS a present `AutoUpdate`
+        // object writes, not about who may opt in.
+        c.apply_to_prefs_gated(&mut p, None).unwrap();
+        assert_eq!(p.auto_update_apply, Some(true));
+        assert!(
+            !p.auto_update_check,
+            "an AutoUpdate object omitting Check writes Go's zero value (false), because Go assigns \
+             the whole struct with CheckSet+ApplySet"
+        );
+
+        // Apply is an opt.Bool: an object that omits it leaves the pref at the never-stated state.
+        let c = cfg(r#"{"version":"alpha0","AutoUpdate":{"Check":true}}"#);
+        let mut p = Prefs {
+            auto_update_apply: Some(true),
+            ..Prefs::default()
+        };
+        c.apply_to_prefs(&mut p).unwrap();
+        assert!(p.auto_update_check);
+        assert_eq!(p.auto_update_apply, None);
+
+        // No AutoUpdate key at all → neither pref is touched.
+        let c = cfg(r#"{"version":"alpha0","Hostname":"h"}"#);
+        let mut p = Prefs {
+            auto_update_apply: Some(false),
+            auto_update_check: false,
+            ..Prefs::default()
+        };
+        c.apply_to_prefs(&mut p).unwrap();
+        assert_eq!(p.auto_update_apply, Some(false));
+        assert!(!p.auto_update_check);
+    }
+
+    /// The declarative ingress may not make a claim the interactive one refuses. `AutoUpdate.Apply`
+    /// is advertised to control as `Hostinfo.AllowsUpdate`, so on an installation whose binary can
+    /// never be replaced, a `--config` opt-in is the same dishonest advertisement `tnet set
+    /// --auto-update` is refused for — reaching the tailnet admin from a file instead of a command.
+    ///
+    /// Both outcomes are driven here, on any host, by handing the update provenance in: the refusal
+    /// arm is the whole point of the rule, and it fires on no CI runner this project owns.
+    #[test]
+    fn auto_update_opt_in_is_refused_when_the_installation_cannot_update() {
+        use crate::ipn::selfupdate;
+
+        let cannot = selfupdate::auto_update_refusal_for(None, None, "macos/aarch64")
+            .expect("a platform with no published artifact can never replace its binary");
+
+        // The opt-in alongside an unrelated pref, so the all-or-nothing contract is visible: a
+        // refused config must not have applied the fields it listed before the bad one.
+        let c = cfg(r#"{"version":"alpha0","Hostname":"node-a","AutoUpdate":{"Apply":true}}"#);
+        let mut p = Prefs::default();
+        let err = c
+            .apply_to_prefs_gated(&mut p, Some(&cannot))
+            .expect_err("a config opt-in on an un-updatable installation must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("Auto-updates are not supported"), "got {msg}");
+        assert!(
+            msg.contains("Hostinfo.AllowsUpdate"),
+            "the refusal must say what the pref claims to the tailnet: {msg}"
+        );
+        assert!(
+            msg.contains(r#""AutoUpdate": {"Apply": false}"#),
+            "a config-file refusal must name the config-file fix, not a flag no file can carry: \
+             {msg}"
+        );
+        assert!(
+            !msg.contains("--no-auto-update"),
+            "there is no daemon up at boot to accept that: {msg}"
+        );
+        assert_eq!(
+            p.auto_update_apply, None,
+            "a refused config must leave the pref never-stated"
+        );
+        assert_eq!(
+            p.hostname, None,
+            "apply_to_prefs is all-or-nothing: nothing may be applied when it bails"
+        );
+
+        // The SAME config on an installation that can replace its own binary is honest, so it
+        // applies in full. This is the half a host-reading test can assert on Linux CI, and it is
+        // the half that proves the refusal above is the rule firing rather than the mapping broken.
+        let mut p = Prefs::default();
+        c.apply_to_prefs_gated(&mut p, None)
+            .expect("an installation that can replace its own binary may opt in");
+        assert_eq!(p.auto_update_apply, Some(true));
+        assert_eq!(p.hostname.as_deref(), Some("node-a"));
+
+        // A DECLINE, and a config that says nothing about auto-update, are legal on every
+        // installation — neither claims anything to the tailnet (Go acts on `EqualBool(true)` alone).
+        let mut p = Prefs::default();
+        cfg(r#"{"version":"alpha0","AutoUpdate":{"Apply":false}}"#)
+            .apply_to_prefs_gated(&mut p, Some(&cannot))
+            .expect("declining auto-update is legal on every installation");
+        assert_eq!(p.auto_update_apply, Some(false));
+
+        // A pref already on DISK is never re-litigated here, whatever this host can do: the write
+        // paths judge the posture a write would leave behind, but a config is read at boot, and a
+        // daemon that refuses to start over a persisted pref cannot be told to stop claiming it —
+        // `tnet set --no-auto-update` needs a running daemon.
+        let mut p = Prefs {
+            auto_update_apply: Some(true),
+            ..Prefs::default()
+        };
+        cfg(r#"{"version":"alpha0","Hostname":"h"}"#)
+            .apply_to_prefs_gated(&mut p, Some(&cannot))
+            .expect("a config that says nothing about auto-update must not judge the stored pref");
+        assert_eq!(p.auto_update_apply, Some(true));
+        assert_eq!(p.hostname.as_deref(), Some("h"));
+
+        // And the public entry point is the same function with this host's own verdict — no second
+        // definition of updatability that could drift from the one `tnet update` asks.
+        let mut a = Prefs::default();
+        let mut b = Prefs::default();
+        let via_wrapper = c.apply_to_prefs(&mut a).is_ok();
+        let via_host_gate = c
+            .apply_to_prefs_gated(&mut b, selfupdate::auto_update_refusal().as_deref())
+            .is_ok();
+        assert_eq!(via_wrapper, via_host_gate);
+        assert_eq!(a.auto_update_apply, b.auto_update_apply);
+    }
+
+    /// The contract this module lives by, pinned as one test: EVERY field of Go's `ConfigVAlpha`
+    /// (`ipn/conf.go` @ 53a0d659afa51835dd7a9283873cca44261454f8) is either honored — it moves a
+    /// `Prefs` field — or reported by `unmapped_fields`. A field in neither is a silent drop, which is
+    /// what `AdvertiseExitNode`, `RemoteConfig`, `RelayServerPort` and `RelayServerStaticEndpoints`
+    /// were.
+    ///
+    /// Every key Go declares is set here to a non-default value, so a field that stops being parsed
+    /// (a rename, a dropped `#[serde(rename)]`) shows up as a pref that did not move or a warning
+    /// that did not fire.
+    #[test]
+    fn every_go_field_is_either_honored_or_warned() {
+        let c = cfg(r#"{
+                "version":"alpha0",
+                "Locked":true,
+                "ServerURL":"https://hs.example.com",
+                "AuthKey":"tskey-abc123",
+                "Enabled":true,
+                "OperatorUser":"alice",
+                "Hostname":"node-a",
+                "acceptDNS":false,
+                "acceptRoutes":true,
+                "exitNode":"100.64.0.9",
+                "allowLANWhileUsingExitNode":true,
+                "AdvertiseRoutes":["192.0.2.0/24"],
+                "AdvertiseExitNode":true,
+                "DisableSNAT":true,
+                "AdvertiseServices":["svc:web"],
+                "AppConnector":{"Advertise":true},
+                "NetfilterMode":"nodivert",
+                "NoStatefulFiltering":true,
+                "PostureChecking":true,
+                "RunSSHServer":true,
+                "RunWebClient":true,
+                "ShieldsUp":true,
+                "RemoteConfig":true,
+                "AutoUpdate":{"Check":true,"Apply":true},
+                "ServeConfigTemp":{"TCP":{}},
+                "StaticEndpoints":["192.0.2.10:41641"],
+                "RelayServerPort":0,
+                "RelayServerStaticEndpoints":["192.0.2.11:41641"]
+            }"#);
+        let mut p = Prefs::default();
+        // Updatable installation handed in, so every key below is judged on the same host: the
+        // `AutoUpdate.Apply` opt-in is the one value whose acceptance depends on the machine, and
+        // reading that from the runner would pin this contract on only half the world's CI.
+        let key = c.apply_to_prefs_gated(&mut p, None).unwrap();
+
+        // HONORED — 16 keys onto prefs, plus AuthKey returned as a credential.
+        assert_eq!(key_str(key).as_deref(), Some("tskey-abc123"));
+        assert!(p.want_running);
+        assert_eq!(p.control_url.as_deref(), Some("https://hs.example.com"));
+        assert_eq!(p.operator_user.as_deref(), Some("alice"));
+        assert_eq!(p.hostname.as_deref(), Some("node-a"));
+        assert!(!p.accept_dns);
+        assert!(p.accept_routes);
+        assert_eq!(p.exit_node.as_deref(), Some("100.64.0.9"));
+        assert!(p.exit_node_allow_lan_access);
+        assert_eq!(p.advertise_routes, vec!["192.0.2.0/24".to_string()]);
+        assert!(p.advertise_exit_node);
+        assert!(p.advertise_app_connector);
+        assert!(p.posture_checking);
+        assert!(p.ssh_enabled);
+        assert!(p.run_web_client);
+        assert!(p.shields_up);
+        assert!(p.auto_update_check);
+        assert_eq!(p.auto_update_apply, Some(true));
+
+        // WARNED — the remaining 10, in Go's declaration order. An exact match (not `contains`) is
+        // the point: it fails both when a Go field goes unreported AND when a field lingers here
+        // after its pref shipped.
+        assert_eq!(
+            unmapped_fields(&c.parsed),
+            vec![
+                "Locked",
+                "DisableSNAT",
+                "AdvertiseServices",
+                "NetfilterMode",
+                "NoStatefulFiltering",
+                "RemoteConfig",
+                "ServeConfigTemp",
+                "StaticEndpoints",
+                "RelayServerPort",
+                "RelayServerStaticEndpoints",
+            ]
         );
     }
 
@@ -607,5 +1722,198 @@ mod tests {
         let mut p = Prefs::default();
         c.apply_to_prefs(&mut p).unwrap();
         assert_eq!(p.hostname.as_deref(), Some("h"));
+    }
+
+    /// A `--config` value is a SOURCE, not just a path: `optional:` is stripped (once), and
+    /// `vm:user-data` is a sentinel rather than a filename. Go:
+    /// `strings.CutPrefix(path, "optional:")` in `cmd/tailscaled` + `case VMUserDataPath` in
+    /// `conffile.Load`.
+    #[test]
+    fn config_flag_parses_optional_prefix_and_vm_user_data_sentinel() {
+        let flag = |v: &str| ConfigFlag::parse(v);
+
+        // Plain path: not optional, a file source.
+        assert_eq!(
+            flag("/etc/tailnetd/config.json"),
+            Some(ConfigFlag {
+                optional: false,
+                source: ConfigSource::File(std::path::PathBuf::from("/etc/tailnetd/config.json")),
+            })
+        );
+        // The sentinel, bare and behind the marker.
+        assert_eq!(
+            flag("vm:user-data"),
+            Some(ConfigFlag {
+                optional: false,
+                source: ConfigSource::VmUserData,
+            })
+        );
+        assert_eq!(
+            flag("optional:vm:user-data"),
+            Some(ConfigFlag {
+                optional: true,
+                source: ConfigSource::VmUserData,
+            }),
+            "the cloud-init form: optional marker + user-data sentinel"
+        );
+        // Optional file path.
+        assert_eq!(
+            flag("optional:/etc/tailnetd/config.json"),
+            Some(ConfigFlag {
+                optional: true,
+                source: ConfigSource::File(std::path::PathBuf::from("/etc/tailnetd/config.json")),
+            })
+        );
+        // Exactly ONE prefix is stripped (Go's CutPrefix), so the rest is a literal source name.
+        assert_eq!(
+            flag("optional:optional:x"),
+            Some(ConfigFlag {
+                optional: true,
+                source: ConfigSource::File(std::path::PathBuf::from("optional:x")),
+            })
+        );
+        // Empty value = "no --config given" (Go gates on `args.confFile != ""`).
+        assert_eq!(flag(""), None);
+        // But `optional:` with an empty source IS a flag — an optional source that is simply absent.
+        assert_eq!(
+            flag("optional:"),
+            Some(ConfigFlag {
+                optional: true,
+                source: ConfigSource::File(std::path::PathBuf::new()),
+            })
+        );
+        // Display round-trips the source as the operator wrote it (used in every error message).
+        assert_eq!(ConfigSource::VmUserData.to_string(), "vm:user-data");
+        assert_eq!(
+            ConfigSource::File(std::path::PathBuf::from("/tmp/c.json")).to_string(),
+            "/tmp/c.json"
+        );
+    }
+
+    /// The load error must distinguish "no config present" from "config present and malformed" —
+    /// Go's `conffile.ErrNoConfig` vs. a plain parse error. This is what makes `optional:` possible.
+    #[test]
+    fn absent_source_is_no_config_but_malformed_one_is_not() {
+        let dir = std::env::temp_dir().join(format!("tailnetd-conf-noconf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Missing file → NoConfig.
+        let missing = dir.join("definitely-absent.json");
+        let err = match load(&ConfigSource::File(missing.clone())) {
+            Ok(_) => panic!("a missing config file must not load"),
+            Err(e) => e,
+        };
+        assert!(
+            is_no_config(&err),
+            "a missing file is 'no config present': {err}"
+        );
+        assert!(err.to_string().contains("no config present"), "{err}");
+
+        // The classification survives a caller's context wrapper (every call site adds one).
+        let wrapped = err.context("loading --config");
+        assert!(
+            is_no_config(&wrapped),
+            "context must not hide the classification: {wrapped}"
+        );
+
+        // Present but malformed JSON → NOT NoConfig (it must still fail, even with `optional:`).
+        let broken = dir.join("broken.json");
+        std::fs::write(&broken, "{ this is not json").unwrap();
+        let err = match load(&ConfigSource::File(broken.clone())) {
+            Ok(_) => panic!("malformed JSON must not load"),
+            Err(e) => e,
+        };
+        assert!(
+            !is_no_config(&err),
+            "a present-but-malformed config is NOT 'no config present': {err}"
+        );
+
+        // Present but an unsupported version → also NOT NoConfig.
+        let badver = dir.join("badver.json");
+        std::fs::write(&badver, r#"{"version":"beta9"}"#).unwrap();
+        let err = match load(&ConfigSource::File(badver.clone())) {
+            Ok(_) => panic!("an unsupported version must not load"),
+            Err(e) => e,
+        };
+        assert!(!is_no_config(&err), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `vm:user-data` is RECOGNIZED (not treated as a filename) and reports absence, the branch Go
+    /// takes on a build without cloud-metadata support (`feature.ErrUnavailable`, wrapped in
+    /// `ErrNoConfig`). So the sentinel no longer dies with a bogus "no such file" and, behind
+    /// `optional:`, does not fail startup at all.
+    #[test]
+    fn vm_user_data_source_reports_no_config_naming_the_missing_support() {
+        let err = match load(&ConfigSource::VmUserData) {
+            Ok(_) => panic!("this build cannot read the VM user-data"),
+            Err(e) => e,
+        };
+        assert!(is_no_config(&err), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("vm:user-data"), "{msg}");
+        assert!(
+            msg.contains("not supported by this build"),
+            "the error must name what is missing, not pretend it was a file: {msg}"
+        );
+    }
+
+    /// The `optional:` contract end-to-end, through the production `ConfigFlag::load`:
+    /// absent + optional → boot unconfigured; absent + required → fail; present + malformed → fail
+    /// EVEN when optional; present + valid → load.
+    #[test]
+    fn optional_prefix_tolerates_an_absent_source_but_never_a_broken_one() {
+        let dir = std::env::temp_dir().join(format!("tailnetd-conf-opt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("absent.json");
+        let missing_s = missing.display().to_string();
+
+        // `Config` has no `Debug`, so `Result<Option<Config>>` cannot be unwrapped — match by hand.
+        let loaded = |value: &str| {
+            let flag = ConfigFlag::parse(value).expect("a non-empty --config value parses");
+            match flag.load() {
+                Ok(Some(_)) => Ok(true),
+                Ok(None) => Ok(false),
+                Err(e) => Err(e.to_string()),
+            }
+        };
+
+        // Absent + optional → Ok(None): the node boots unconfigured.
+        assert_eq!(
+            loaded(&format!("optional:{missing_s}")),
+            Ok(false),
+            "an absent optional source must not fail startup"
+        );
+        // Same for the cloud-init form this bead is named after.
+        assert_eq!(loaded("optional:vm:user-data"), Ok(false));
+        // Absent + required → error (unchanged fail-fast contract).
+        match loaded(&missing_s) {
+            Err(e) => assert!(e.contains("no config present"), "{e}"),
+            Ok(_) => panic!("a required but absent config must fail"),
+        }
+        match loaded("vm:user-data") {
+            Err(e) => assert!(e.contains("not supported by this build"), "{e}"),
+            Ok(_) => panic!("a required vm:user-data source must fail on this build"),
+        }
+
+        // Present but malformed → fails EVEN with `optional:` (the whole point: optional means
+        // "may be absent", never "may be broken").
+        let broken = dir.join("broken.json");
+        std::fs::write(&broken, r#"{"version":"beta9"}"#).unwrap();
+        let broken_s = broken.display().to_string();
+        match loaded(&format!("optional:{broken_s}")) {
+            Err(e) => assert!(e.contains("unsupported") && e.contains("beta9"), "{e}"),
+            Ok(_) => panic!("an optional-but-present-and-invalid config must still fail"),
+        }
+
+        // Present and valid → loaded, optional or not.
+        let good = dir.join("good.json");
+        std::fs::write(&good, r#"{"version":"alpha0","Hostname":"node-a"}"#).unwrap();
+        let good_s = good.display().to_string();
+        assert_eq!(loaded(&good_s), Ok(true));
+        assert_eq!(loaded(&format!("optional:{good_s}")), Ok(true));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

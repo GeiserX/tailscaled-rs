@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tailscaled_rs::ipn::Backend;
-use tailscaled_rs::localapi::{Request, Response};
+use tailscaled_rs::localapi::{ExitNodeSuggestionView, Request, Response};
 use tailscaled_rs::server;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -238,6 +238,48 @@ async fn try_read_watch_status(
     }
 }
 
+/// `initial_status` (Go `NotifyInitialStatus`) edges that
+/// `an_initial_status_watch_front_loads_the_status_report_once` does not cover: a watch that did not
+/// set the bit never receives a snapshot, and when the session id rides the snapshot it is not
+/// repeated on the prefs frame that follows (Go puts `SessionID` on the same first Notify that carries
+/// `InitialStatus`).
+#[tokio::test]
+async fn initial_status_is_only_sent_when_asked_for_and_carries_the_id_once() {
+    let harness = Harness::start().await;
+
+    // Without the bit: the same front-loads, and no snapshot anywhere.
+    let (_write, mut reader) = open_masked_watch(
+        &harness,
+        b"{\"cmd\":\"watch\",\"prefs\":true,\"policy\":true}\n",
+    )
+    .await;
+    for what in ["the prefs front-load", "the policy front-load"] {
+        let view = read_notify(&mut reader, what).await;
+        assert!(
+            view.initial_status.is_none(),
+            "a watch that did not ask for the snapshot must not get one, got {view:?}"
+        );
+    }
+
+    // With `initial_state` as well, the session id rides the snapshot — the first frame written —
+    // and is not repeated on the prefs frame that follows.
+    let (_write, mut reader) = open_masked_watch(
+        &harness,
+        b"{\"cmd\":\"watch\",\"initial_state\":true,\"prefs\":true,\"initial_status\":true}\n",
+    )
+    .await;
+    let first = read_notify(&mut reader, "the status front-load").await;
+    assert!(
+        first.initial_status.is_some() && first.session_id.is_some(),
+        "the session id rides the first frame written, here the snapshot: {first:?}"
+    );
+    let next = read_notify(&mut reader, "the prefs front-load").await;
+    assert!(next.prefs.is_some(), "prefs follows the snapshot: {next:?}");
+    assert_eq!(next.session_id, None, "the id is not repeated");
+
+    harness.shutdown_and_verify().await;
+}
+
 /// 1. status round-trip: a fresh, never-configured node reports an unauthenticated, not-running
 ///    snapshot, and the server shuts down cleanly (socket removed).
 #[tokio::test]
@@ -312,37 +354,84 @@ async fn down_round_trip_then_status_is_no_state() {
     harness.shutdown_and_verify().await;
 }
 
-/// `reload-config` over the real socket, on a node that is DOWN: the daemon must answer with the
-/// outcome-specific success line, not a generic "reloaded".
+/// `reload-config` end to end over the real socket: the daemon answers with Go's bare `ok` bool, and
+/// the CLI turns that bool into the exact bytes `tailscale debug reload-config` writes.
 ///
-/// A `reload-config` reconciles one of three ways (`ipn::ReloadAction`), and only one of them makes
-/// the operator's edit live: `Rebuild` (engine rebuilt from the new prefs), `BringDown` (the reloaded
-/// `Enabled:false` stopped the node), or `PersistedOnly` (node down — the merged prefs sit on disk
-/// until the next `up`). The daemon returns the reconciled action from `ipn::drive_reload_config` and
-/// renders it with `ReloadAction::outcome_message`, so the confirmation answers "is my edit running?"
-/// instead of leaving the operator to guess.
+/// Go splits this verb in two. `LocalBackend.ReloadConfig` returns `(ok bool, err error)` — `(true,
+/// nil)` when a config was re-read, `(false, nil)` when the daemon holds no config at all — and
+/// `cmd/tailscale/cli/debug.go`'s `reloadConfig` turns that bool into the only two lines an operator
+/// ever sees: `config reloaded` on ok, or `config mode not in use` followed by `os.Exit(1)`. Both go
+/// to STDOUT via `printf`, so neither carries an `error:` prefix. Keeping the split means the daemon
+/// must NOT author a sentence of its own: a message on this path is wording Go does not have, so a
+/// script grepping Go's output against this daemon would find nothing.
 ///
-/// This drives the whole production path over the wire — dispatch → `drive_reload_config` →
-/// `Backend::reload_config` → the message — for the one arm reachable offline (`PersistedOnly`; the
-/// live `Rebuild`/`BringDown` arms need a real engine, i.e. the gated e2e). It also pins the error
-/// path that precedes it: a daemon started WITHOUT `--config` has nothing to reload and must say so
-/// rather than report a success.
+/// This drives the whole production path — the built `tnet` binary → the socket → dispatch →
+/// `ipn::drive_reload_config` → `Backend::reload_config` → the reply → the printed line and the
+/// process exit code — for both bool arms:
+///
+/// * `reloaded: false` — no `--config` in use. It must be this NON-error reply, not
+///   `Response::Error`: Go's `(false, nil)` is a refusal, and the CLI (not the daemon) decides it
+///   means "print a line and exit 1".
+/// * `reloaded: true` — a config file was re-read and adopted. Which reconcile ran (here
+///   `PersistedOnly`, the one arm reachable with no engine; `Rebuild`/`BringDown` need a real
+///   tailnet, i.e. the gated e2e) stays daemon-side in the log, exactly as it does upstream.
+///
+/// The stdout/exit-code halves are the ones that would catch a regression in the CLI arm: swapping
+/// the two lines, or dropping the `exit(1)`, changes nothing a wire-level assertion can see.
 #[tokio::test]
-async fn reload_config_reports_the_persisted_only_outcome_over_the_wire() {
+async fn reload_config_speaks_gos_exact_lines_and_exit_codes_over_the_wire() {
     let harness = Harness::start().await;
 
-    // (1) No `--config` in use → a clear error, never an Ok. (The harness's Backend::load records no
-    // config path, exactly like a `tailnetd` started without the flag.)
-    match harness.round_trip(r#"{"cmd":"reload_config"}"#).await {
-        Response::Error { message } => assert!(
-            message.contains("--config"),
-            "the no-config refusal must name the missing --config: {message}"
-        ),
-        other => panic!("expected Response::Error without a --config in use, got {other:?}"),
+    /// Run the built `tnet reload-config` against this daemon's socket and hand back its output.
+    async fn run_tnet_reload_config(socket: &std::path::Path) -> std::process::Output {
+        let socket = socket.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            std::process::Command::new(env!("CARGO_BIN_EXE_tnet"))
+                .arg("--socket")
+                .arg(&socket)
+                .arg("reload-config")
+                .output()
+                .expect("the `tnet` binary built for this test should run")
+        })
+        .await
+        .expect("tnet subprocess join")
     }
 
+    // (1) No `--config` in use → `ok: false`, and NOT an error. (The harness's Backend::load records
+    // no config path, exactly like a `tailnetd` started without the flag.)
+    match harness.round_trip(r#"{"cmd":"reload_config"}"#).await {
+        Response::ReloadConfig { reloaded } => assert!(
+            !reloaded,
+            "not being in config mode must report ok=false (Go's (false, nil))"
+        ),
+        other => panic!(
+            "not being in config mode is Go's (false, nil) refusal, so the daemon must still reply \
+             ReloadConfig{{reloaded: false}}, got {other:?}"
+        ),
+    }
+
+    // ...and the bytes an operator (or their script) actually sees for that bool: Go's refusal line
+    // on stdout, nothing on stderr, exit 1.
+    let out = run_tnet_reload_config(&harness.socket_path).await;
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "config mode not in use\n",
+        "Go prints exactly this on the not-in-config-mode arm, via printf on stdout"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "",
+        "the refusal is not an error — Go uses printf, not errf, so stderr stays empty"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "Go's reloadConfig calls os.Exit(1) after printing the refusal"
+    );
+
     // (2) Point the daemon at a config file (as `tailnetd`'s main() does for `--config`) and reload
-    // it. The node is down (this harness never joins a tailnet), so the reconcile is PersistedOnly.
+    // it. The node is down (this harness never joins a tailnet), so the reconcile is PersistedOnly —
+    // which the operator-facing reply deliberately does not mention.
     let cfg_path = harness.state_dir.join("daemon-config.json");
     tokio::fs::write(
         &cfg_path,
@@ -350,26 +439,34 @@ async fn reload_config_reports_the_persisted_only_outcome_over_the_wire() {
     )
     .await
     .expect("write daemon config");
-    harness.backend.lock().await.set_config_path(cfg_path);
+    harness
+        .backend
+        .lock()
+        .await
+        .set_config_source(tailscaled_rs::conffile::ConfigSource::File(cfg_path));
 
     match harness.round_trip(r#"{"cmd":"reload_config"}"#).await {
-        Response::Ok { message } => {
-            // The generic line is not enough: on a down node nothing was applied live, and the
-            // message must say the edit lands on the next `up`.
-            assert!(
-                message.contains("next up"),
-                "a node-down reload must tell the operator it applies on the next up: {message}"
-            );
-            assert_eq!(
-                message,
-                tailscaled_rs::ipn::ReloadAction::PersistedOnly.outcome_message(),
-                "dispatch must render the reconciled action's own message"
-            );
-        }
-        other => panic!("expected Response::Ok from reload_config, got {other:?}"),
+        Response::ReloadConfig { reloaded } => assert!(
+            reloaded,
+            "a config that was re-read and adopted must report ok=true"
+        ),
+        other => panic!("expected Response::ReloadConfig from reload_config, got {other:?}"),
     }
 
-    // The reloaded config really was adopted (so the message is not describing a no-op).
+    // ...and the success bytes: Go's one line on stdout, exit 0.
+    let out = run_tnet_reload_config(&harness.socket_path).await;
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "config reloaded\n",
+        "Go prints exactly this on ok — not a reworded 'configuration reloaded…' variant"
+    );
+    assert!(
+        out.status.success(),
+        "a successful reload exits 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The reloaded config really was adopted (so ok=true is not describing a no-op).
     let status = harness.round_trip(r#"{"cmd":"status"}"#).await;
     match status {
         Response::Status(report) => assert_eq!(
@@ -443,7 +540,7 @@ async fn auth_gate_denies_write_allows_read() {
     // --- Deny-side, through the exact predicate `dispatch` calls before taking the backend lock. ---
     // A ReadOnly caller: the write verb is denied, the read verb is allowed. These are the real
     // `Request` values the daemon dispatches on (not stand-ins).
-    let write_req = Request::Down;
+    let write_req = Request::Down { reason: None };
     let read_req = Request::Status;
     assert_eq!(
         authorize(&write_req, Access::ReadOnly),
@@ -591,7 +688,7 @@ async fn wire_format_discriminants_are_stable() {
         "status request wire format drifted"
     );
     assert_eq!(
-        serde_json::to_string(&Request::Down).expect("serialize Down"),
+        serde_json::to_string(&Request::Down { reason: None }).expect("serialize Down"),
         r#"{"cmd":"down"}"#,
         "down request wire format drifted"
     );
@@ -611,7 +708,7 @@ async fn wire_format_discriminants_are_stable() {
         serde_json::from_str(r#"{"cmd":"status"}"#).expect("parse status request");
     assert!(matches!(parsed, Request::Status));
     let parsed: Request = serde_json::from_str(r#"{"cmd":"down"}"#).expect("parse down request");
-    assert!(matches!(parsed, Request::Down));
+    assert!(matches!(parsed, Request::Down { .. }));
 
     // The Taildrop verbs added this session — pin their `cmd` tags so a rename can't silently break
     // the CLI↔daemon contract. `file_targets` (read) is a unit variant; `file_get_dir` carries
@@ -825,8 +922,9 @@ async fn lifecycle_subscriber_observes_generation_advance_on_up_path() {
 /// pinned alongside the state changes.
 ///
 /// The interesting cases are the refusals and the no-op, because those are the ones a caller cannot
-/// verify for itself: a `switch` to the profile you are already on must not claim it switched, and a
-/// `switch remove` of a profile that does not exist must not claim it removed one.
+/// verify for itself: a `switch` to a profile that does not exist must refuse rather than create one,
+/// a `switch` to the profile you are already on must not claim it switched, and a `switch remove` of
+/// a profile that does not exist must not claim it removed one.
 #[tokio::test]
 async fn profile_switch_list_and_remove_round_trip_over_the_wire() {
     let harness = Harness::start().await;
@@ -845,10 +943,48 @@ async fn profile_switch_list_and_remove_round_trip_over_the_wire() {
         other => panic!("expected Response::Profiles, got {other:?}"),
     }
 
-    // Switching to a brand-new id creates and activates it. The profile has never registered, so the
-    // reply says so (Go's post-switch `NeedsLogin` arm) rather than claiming a connection.
+    // A switch to a target that names no profile is REFUSED, and creates nothing — Go's
+    // `switchProfile` prints `No profile named %q` and exits 1. This is the shape a typo takes, and
+    // the daemon used to answer it by tearing the node down into a profile nobody asked for.
     match harness
         .round_trip(r#"{"cmd":"switch_profile","target":"work"}"#)
+        .await
+    {
+        Response::Error { message } => assert_eq!(message, r#"No profile named "work""#),
+        other => panic!("expected Response::Error switching to an unknown profile, got {other:?}"),
+    }
+    // ...and the refused target really was not created: still just the default profile, still current.
+    match harness.round_trip(r#"{"cmd":"profile_list"}"#).await {
+        Response::Profiles { profiles } => {
+            assert_eq!(
+                profiles.len(),
+                1,
+                "a refused switch must not create a profile: {profiles:?}"
+            );
+            assert!(profiles[0].id == "default" && profiles[0].current);
+        }
+        other => panic!("expected Response::Profiles, got {other:?}"),
+    }
+
+    // A stray `create` KEY on a switch is not a creation either. Nothing in a shipped release ever
+    // sent one, but a switch request is the place a mixed pair could grow an extra field, and the
+    // daemon must not read a field it does not model as consent to create: the refusal is unchanged.
+    match harness
+        .round_trip(r#"{"cmd":"switch_profile","target":"work","create":true}"#)
+        .await
+    {
+        Response::Error { message } => assert_eq!(
+            message, r#"No profile named "work""#,
+            "an unmodelled field must not turn a switch into a creation"
+        ),
+        other => panic!("expected Response::Error, got {other:?}"),
+    }
+
+    // Creating it is its own request (`tnet switch --new work`), which activates it. The profile
+    // has never registered, so the reply says so (Go's post-switch `NeedsLogin` arm) rather than
+    // claiming a connection.
+    match harness
+        .round_trip(r#"{"cmd":"create_profile","id":"work"}"#)
         .await
     {
         Response::Ok { message } => {
@@ -858,6 +994,19 @@ async fn profile_switch_list_and_remove_round_trip_over_the_wire() {
             );
         }
         other => panic!("expected Response::Ok from switch, got {other:?}"),
+    }
+    // Asking to create it a second time is refused — `create_profile` never adopts an existing
+    // profile. This is the pairing an older daemon would have got wrong had creation been a flag on
+    // `switch_profile`: dropping the flag, it would have ACTIVATED "work" instead of refusing.
+    match harness
+        .round_trip(r#"{"cmd":"create_profile","id":"work"}"#)
+        .await
+    {
+        Response::Error { message } => assert!(
+            message.contains("already exists"),
+            "unexpected refusal: {message:?}"
+        ),
+        other => panic!("expected Response::Error re-creating a profile, got {other:?}"),
     }
 
     // Both profiles are now listed, with the marker moved to "work".
@@ -888,16 +1037,26 @@ async fn profile_switch_list_and_remove_round_trip_over_the_wire() {
         other => panic!("expected Response::Ok from the no-op switch, got {other:?}"),
     }
 
-    // Removing the CURRENT profile is refused (this daemon requires an explicit switch away first).
+    // Removing the CURRENT profile removes nothing and SUCCEEDS, exactly as Go's `removeProfile`
+    // does (`Already on account %q`, `os.Exit(0)`) — a script that walks the profile list and
+    // removes each one must not die on the active one. The reply says nothing was removed.
     match harness
         .round_trip(r#"{"cmd":"delete_profile","target":"work"}"#)
         .await
     {
-        Response::Error { message } => assert!(
-            message.contains("current profile"),
-            "unexpected refusal: {message:?}"
+        Response::Ok { message } => assert_eq!(
+            message,
+            "already on profile \"work\"; not removed — switch away first to remove it"
         ),
-        other => panic!("expected Response::Error removing the current profile, got {other:?}"),
+        other => panic!("expected Response::Ok removing the current profile, got {other:?}"),
+    }
+    // ...and it really is still there, node key and all.
+    match harness.round_trip(r#"{"cmd":"profile_list"}"#).await {
+        Response::Profiles { profiles } => assert!(
+            profiles.iter().any(|p| p.id == "work"),
+            "the current profile must survive its own `switch remove`"
+        ),
+        other => panic!("expected Response::Profiles, got {other:?}"),
     }
 
     // Removing a profile that does not exist is refused too (Go: `No profile named %q`), rather than
@@ -906,10 +1065,7 @@ async fn profile_switch_list_and_remove_round_trip_over_the_wire() {
         .round_trip(r#"{"cmd":"delete_profile","target":"nonesuch"}"#)
         .await
     {
-        Response::Error { message } => assert!(
-            message.contains("no profile named"),
-            "unexpected refusal: {message:?}"
-        ),
+        Response::Error { message } => assert_eq!(message, r#"No profile named "nonesuch""#),
         other => panic!("expected Response::Error removing an unknown profile, got {other:?}"),
     }
 
@@ -948,6 +1104,660 @@ async fn profile_switch_list_and_remove_round_trip_over_the_wire() {
             .unwrap(),
         "removing a profile must remove its on-disk prefs/key directory"
     );
+
+    harness.shutdown_and_verify().await;
+}
+
+/// `debug statedir` must answer from the DAEMON, not from the CLI's own environment.
+///
+/// Go's `runPrintStateDir` (`cmd/tailscale/cli/debug.go` @ v1.100.0) round-trips
+/// `DebugResultJSON(ctx, "statedir")` and prints the daemon's answer, because the daemon's state dir
+/// is whatever *it* resolved at boot. The configuration that motivates the command is exactly the one
+/// where the two disagree: a `tailnetd` whose environment sets the state dir, and a `tnet` whose does
+/// not (or sets a different one). This drives both halves of that — the wire verb against a real
+/// daemon, and the built `tnet` binary run with `$TAILNETD_STATE_DIR` pointing somewhere else.
+#[tokio::test]
+async fn debug_statedir_answers_from_the_daemon_not_the_cli_environment() {
+    let harness = Harness::start().await;
+    let daemon_dir = harness.state_dir.display().to_string();
+
+    // The wire verb: the daemon reports the dir it was loaded with — with the node down (no engine),
+    // like Go's, which reads `TailscaleVarRoot()` and never touches the datapath.
+    match harness.round_trip(r#"{"cmd":"debug_state_dir"}"#).await {
+        Response::StateDir { dir } => assert_eq!(
+            dir, daemon_dir,
+            "the daemon must report the state dir it is actually using"
+        ),
+        other => panic!("expected Response::StateDir, got {other:?}"),
+    }
+
+    // A decoy for the CLI's environment: a path the daemon has never heard of. The CLI's cascade
+    // resolves it (`$TAILNETD_STATE_DIR` wins outright), so any answer computed CLI-side shows up
+    // here instead of the daemon's dir. Never created — nothing may depend on it existing.
+    let decoy = std::env::temp_dir().join(format!("tailnetd-decoy-{}", std::process::id()));
+    let decoy_str = decoy.display().to_string();
+
+    // The built `tnet`, pointed at this daemon's socket, with the decoy in its environment.
+    let socket = harness.socket_path.clone();
+    let decoy_env = decoy.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_tnet"))
+            .arg("--socket")
+            .arg(&socket)
+            .args(["debug", "statedir"])
+            .env("TAILNETD_STATE_DIR", &decoy_env)
+            .output()
+            .expect("the `tnet` binary built for this test should run")
+    })
+    .await
+    .expect("tnet subprocess join");
+    assert!(
+        out.status.success(),
+        "`tnet debug statedir` should exit 0 against a running daemon; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(
+        stdout,
+        format!("{daemon_dir}\n"),
+        "Go prints the daemon's path and nothing else, so a script can consume it"
+    );
+    assert!(
+        !stdout.contains(&decoy_str),
+        "the CLI's own $TAILNETD_STATE_DIR must not reach the answer: {stdout:?}"
+    );
+
+    // `--local` is the other question, and it still answers it: the CLI's own resolution plus the
+    // cascade rule that won — the fork's report, kept because it needs no daemon.
+    let decoy_env = decoy.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_tnet"))
+            .args(["debug", "statedir", "--local"])
+            .env("TAILNETD_STATE_DIR", &decoy_env)
+            .output()
+            .expect("the `tnet` binary built for this test should run")
+    })
+    .await
+    .expect("tnet --local subprocess join");
+    assert!(
+        out.status.success(),
+        "`debug statedir --local` should exit 0"
+    );
+    let local_stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        local_stdout.contains(&decoy_str) && local_stdout.contains("$TAILNETD_STATE_DIR"),
+        "--local must report the CLI's resolution and the rule that chose it: {local_stdout:?}"
+    );
+    assert!(
+        !tokio::fs::try_exists(&decoy).await.unwrap(),
+        "`debug statedir` must never create the dir it reports"
+    );
+
+    harness.shutdown_and_verify().await;
+}
+
+/// `debug portmap` STREAMS its log over the connection and then closes it — unlike every other
+/// one-shot verb, which answers with a single line. This drives the real server branch end to end:
+/// send the request, read frames until EOF, and check the run narrated itself the way Go's does.
+///
+/// The gateway is pinned to a documentation-range address (RFC 5737 TEST-NET-1) that nothing can
+/// answer on, and `"ty":"pmp"` keeps the run to NAT-PMP alone. That second half matters: the UPnP
+/// leg discovers over the SSDP *multicast* group on port 1900, which the gateway override does
+/// not constrain, so on a LAN with a real IGD it would find one and the run would narrate a fourth
+/// line. Restricted to NAT-PMP, the only packet that leaves is addressed to the unroutable gateway,
+/// so the run is deterministic wherever it executes: it reports the gateway it used, reports that
+/// nothing answered, and stops.
+#[tokio::test]
+async fn debug_portmap_streams_its_log_then_closes_the_connection() {
+    let harness = Harness::start().await;
+
+    let stream = UnixStream::connect(&harness.socket_path)
+        .await
+        .expect("CLI connect to LocalAPI socket for debug portmap");
+    let (read_half, mut write_half) = stream.into_split();
+    write_half
+        .write_all(
+            b"{\"cmd\":\"debug_portmap\",\"duration_ms\":500,\"ty\":\"pmp\",\"gateway_and_self\":\"192.0.2.1/192.0.2.2\"}\n",
+        )
+        .await
+        .expect("write debug portmap request");
+    write_half.flush().await.expect("flush request");
+
+    let mut reader = BufReader::new(read_half);
+    let mut lines = Vec::new();
+    loop {
+        let mut buf = String::new();
+        let n = tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut buf))
+            .await
+            .expect("the run is bounded by its own duration, so the stream must end")
+            .expect("read portmap stream line");
+        if n == 0 {
+            // The daemon closed the connection: the run is over. That EOF is what the CLI stops on.
+            break;
+        }
+        let trimmed = buf.trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Response>(trimmed).expect("portmap frame is Response JSON") {
+            Response::PortmapLog { line } => lines.push(line),
+            other => panic!("expected PortmapLog frames, got {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        lines,
+        vec![
+            "gw=192.0.2.1; self=192.0.2.2".to_string(),
+            "Probe: {PCP:false PMP:false UPnP:false}".to_string(),
+            "no portmapping services available".to_string(),
+        ],
+        "the streamed run must read exactly like `tailscale debug portmap` on a network with no \
+         port-mapping service"
+    );
+
+    harness.shutdown_and_verify().await;
+}
+
+/// A `--type` the port mapper does not know is refused with Go's message — the daemon's 400 —
+/// before anything is probed, and it arrives as a single `Response::Error` rather than a log frame,
+/// so the CLI can exit non-zero.
+#[tokio::test]
+async fn debug_portmap_refuses_an_unknown_type() {
+    let harness = Harness::start().await;
+
+    match harness
+        .round_trip(r#"{"cmd":"debug_portmap","duration_ms":500,"ty":"natpmp"}"#)
+        .await
+    {
+        Response::Error { message } => assert_eq!(message, "unknown portmap debug type"),
+        other => panic!("expected Response::Error for a bad --type, got {other:?}"),
+    }
+
+    harness.shutdown_and_verify().await;
+}
+
+/// The `policy` mask bit (Go `ipn.NotifySysPolicyChanges`, `1 << 17`) end to end over the real
+/// socket: a masked `Watch` asking only for policy must get the effective snapshot as its FIRST
+/// frame, and a fresh snapshot pushed to it whenever the policy actually CHANGES — and nothing
+/// otherwise. Go's `rsop.(*Policy).reloadNow` invokes the change callbacks under
+/// `if old != nil && !old.EqualItems(new)`, so a forced `Policy.Reload()` over a store that has not
+/// moved notifies no watcher. This test owns the *negative* half of that rule.
+///
+/// Why this matters here more than upstream: policy outranks local prefs on every write in this
+/// fork, so a `tnet set` that appears to do nothing is explained by a policy row. Before this bit the
+/// only way to see that row was to ask for it (`syspolicy list`), which cannot distinguish "policy
+/// unchanged" from "policy changed and I have not asked again".
+///
+/// Honest scope. This harness registers no `--syspolicy-file`, so the snapshot is the empty-but-valid
+/// device-scope report a daemon without a policy source resolves — which is the point being pinned:
+/// the frame is *present*, carrying a scope and an (empty) row list, rather than absent. The rows a
+/// real file produces are pinned where a source is actually registered (tests/syspolicy_file.rs),
+/// and they are the same rows by construction: both come from `Backend::policy_snapshot`.
+///
+/// The *positive* edge — a real change waking a parked socket watcher and producing a second frame —
+/// is `tests/syspolicy_watch.rs`, which is its own test binary because the only thing in this build
+/// that moves the effective policy is registering a source, and the registry is process-global: a
+/// registration here would change the empty snapshot the other tests in this binary resolve.
+///
+/// The `syspolicy reload` below is invoked on the backend API rather than over a second socket
+/// connection purely so the assertion is about the notify path and nothing else; it is the identical
+/// call `server::serve` dispatches the `syspolicy_reload` verb to.
+#[tokio::test]
+async fn a_policy_masked_watch_front_loads_the_snapshot_and_stays_quiet_on_an_unchanged_reload() {
+    let harness = Harness::start().await;
+
+    let stream = UnixStream::connect(&harness.socket_path)
+        .await
+        .expect("CLI connect to LocalAPI socket for a policy watch");
+    let (read_half, mut write_half) = stream.into_split();
+    // Only the `policy` bit: a management agent that just wants to know when the administrator
+    // changed something asks for nothing else. Any mask bit selects the Notify path.
+    write_half
+        .write_all(b"{\"cmd\":\"watch\",\"policy\":true}\n")
+        .await
+        .expect("write masked watch request");
+    write_half.flush().await.expect("flush watch request");
+    let mut reader = BufReader::new(read_half);
+
+    // Go documents `NotifySysPolicyChanges` as causing "the first Notify message, which is sent
+    // immediately, to contain the current effective snapshot" — so the front-load is part of the
+    // bit's contract, not an optimisation. A bounded read, so a regression FAILS instead of hanging.
+    let first = try_read_watch_status(&mut reader, Duration::from_secs(5))
+        .await
+        .expect("a policy-masked watch must send its snapshot immediately, before any change");
+    let Response::Notify(first) = first else {
+        panic!("a masked watch streams Notify frames, got {first:?}");
+    };
+    let snapshot = first
+        .policy
+        .as_ref()
+        .expect("the first frame of a policy-masked watch carries the policy");
+    assert_eq!(
+        snapshot.scope, "Device",
+        "the daemon resolves the device scope, as Go's `setting.DefaultScope()` does"
+    );
+    assert!(
+        snapshot.settings.is_empty(),
+        "this harness registers no policy source, so the snapshot is empty-but-present"
+    );
+    assert!(
+        first.state.is_none() && first.net_map.is_none() && first.prefs.is_none(),
+        "a policy-only watch must not be sent fields it did not ask for: {first:?}"
+    );
+
+    // Nothing has changed, so nothing more may arrive.
+    assert!(
+        try_read_watch_status(&mut reader, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "a parked policy watcher must stay quiet while the policy does not move"
+    );
+
+    // A forced re-read. It answers with the snapshot — and must leave the parked watcher exactly as
+    // quiet as it was, because it re-resolved the rows that watcher already holds. `Notify.Policy`
+    // means "the effective policy changed"; a frame here would assert a change that did not happen,
+    // and a management agent acting on policy frames would re-apply on every operator `reload`.
+    let Response::Policy(reloaded) = Backend::syspolicy_reload() else {
+        panic!("syspolicy_reload must reply with a policy report");
+    };
+    assert_eq!(
+        &reloaded, snapshot,
+        "the reload re-resolved the very rows the front-loaded frame carried — one producer, so the \
+         notify stream cannot drift from the one-shot read"
+    );
+
+    assert!(
+        try_read_watch_status(&mut reader, Duration::from_secs(1))
+            .await
+            .is_none(),
+        "a `syspolicy reload` that resolved the same rows must push no policy frame: Go invokes the \
+         change callbacks only under `!old.EqualItems(new)`"
+    );
+
+    harness.shutdown_and_verify().await;
+}
+
+/// The `suggested_exit_node` mask bit (Go `ipn.NotifyInitialSuggestedExitNode`, `1 << 10`) end to
+/// end over the real socket. The unit tests in `src/ipn/mod.rs` pin the cell and the ones in
+/// `src/server.rs` pin the frame writer; this is the wiring between them — a
+/// `Backend::publish_suggested_exit_node` call reaching a watcher parked in `server::serve`.
+///
+/// Pinned here, on a device-less daemon:
+///
+/// 1. **Nothing is front-loaded.** `prefs` and `policy` are daemon-owned and go out before the first
+///    epoch; a suggestion has to be ranked by a live engine, so a watcher on a down node is told
+///    nothing — not an empty frame — and waits. That silence is what gives the next frame meaning.
+/// 2. **A publish reaches the parked watcher** with the bare stable id (Go's
+///    `Notify.SuggestedExitNode` is the `StableNodeID`, not the display name) and no field the
+///    watch did not ask for.
+/// 3. **The same pick again is not a frame.** Go's `suggestExitNodeLocked` sends only under
+///    `prevSuggestion != res.ID`, so recomputing a stable answer costs nothing on the bus. A moved
+///    pick afterwards does produce a frame, which shows the silence came from that guard and not
+///    from a stream that had stopped delivering.
+///
+/// Out of reach here, and why:
+///
+/// - **The front-load itself.** Go's `NotifyInitialSuggestedExitNode` computes a suggestion when
+///   the watch opens. Here that is `Backend::front_load_suggested_exit_node`, which runs only
+///   against a `Running` engine device; this harness has no engine and no tailnet, so it cannot
+///   reach that code at all. The frame it writes is the one `emit_suggested_exit_node_frame`
+///   writes, which the emitter test in `src/server.rs` pins.
+/// - **An empty answer.** Today an empty suggestion publishes nothing and leaves the cell alone. In
+///   Go, "no eligible candidate" is an empty response with a nil error, so `suggestExitNodeLocked`
+///   compares `""` with the last pick and sends `SuggestedExitNode: &""`. When the daemon does the
+///   same, a fourth step belongs here: publish `ExitNodeSuggestion { suggestion: None }` after a
+///   pick and read a frame whose id is empty.
+///
+/// The publish goes through the backend API rather than an `exit-node suggest` on a second
+/// connection because the engine call that verb wraps needs a live device. It is the same
+/// `publish_suggested_exit_node` call `Backend::suggest_exit_node` makes with the engine's answer,
+/// so everything after the engine is the path a real suggestion takes.
+#[tokio::test]
+async fn a_suggestion_masked_watch_is_quiet_until_a_pick_moves() {
+    fn picked(id: &str, name: &str) -> Response {
+        Response::ExitNodeSuggestion {
+            suggestion: Some(ExitNodeSuggestionView {
+                id: id.to_string(),
+                name: name.to_string(),
+            }),
+            withheld_by_policy: false,
+        }
+    }
+
+    let harness = Harness::start().await;
+
+    // Only the `suggested_exit_node` bit: a client that wants to show "we recommend X" asks for
+    // nothing else.
+    let (_w, mut r) = open_masked_watch(
+        &harness,
+        b"{\"cmd\":\"watch\",\"suggested_exit_node\":true}\n",
+    )
+    .await;
+
+    // (1) No device, so no suggestion to front-load, and no `initial_state`, so no session id: the
+    // stream is silent. The wait also gives `serve` time to subscribe this watcher before the
+    // publish below.
+    assert!(
+        try_read_watch_status(&mut r, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "a suggestion-only watch on a device-less daemon must be sent nothing, not an empty frame"
+    );
+
+    // (2) The first pick of the run is a change, so every watcher hears it.
+    assert!(
+        harness
+            .backend
+            .lock()
+            .await
+            .publish_suggested_exit_node(&picked("nStableAms1CNTRL", "amsterdam")),
+        "the first pick of the run is a change and must publish"
+    );
+    let frame = read_notify(
+        &mut r,
+        "a published exit-node suggestion must reach a parked suggestion watcher",
+    )
+    .await;
+    assert_eq!(
+        frame.suggested_exit_node.as_deref(),
+        Some("nStableAms1CNTRL"),
+        "the frame carries the bare stable id, not the display name: {frame:?}"
+    );
+    assert!(
+        frame.state.is_none()
+            && frame.error.is_none()
+            && frame.browse_to_url.is_none()
+            && frame.net_map.is_none()
+            && frame.self_change.is_none()
+            && frame.prefs.is_none()
+            && frame.policy.is_none()
+            && frame.initial_status.is_none()
+            && frame.session_id.is_none(),
+        "a suggestion-only watch must not be sent fields it did not ask for: {frame:?}"
+    );
+
+    // (3) The same pick recomputed is not news. Without the guard every `exit-node suggest` and
+    // every other watcher's front-load would wake this one with a value it already holds.
+    assert!(
+        !harness
+            .backend
+            .lock()
+            .await
+            .publish_suggested_exit_node(&picked("nStableAms1CNTRL", "amsterdam")),
+        "an unchanged pick must not republish"
+    );
+    assert!(
+        try_read_watch_status(&mut r, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "an unchanged pick must not produce a second frame"
+    );
+
+    // The pick moves: the stream is still live, and the silence above was the guard.
+    assert!(
+        harness
+            .backend
+            .lock()
+            .await
+            .publish_suggested_exit_node(&picked("nStableFra2CNTRL", "frankfurt")),
+        "a different pick is a change and must publish"
+    );
+    let moved = read_notify(
+        &mut r,
+        "a moved exit-node suggestion must reach the same parked watcher",
+    )
+    .await;
+    assert_eq!(
+        moved.suggested_exit_node.as_deref(),
+        Some("nStableFra2CNTRL"),
+        "the frame carries the new pick: {moved:?}"
+    );
+
+    harness.shutdown_and_verify().await;
+}
+
+/// The `initial_status` mask bit (Go `ipn.NotifyInitialStatus`, `1 << 14`) end to end over the real
+/// socket. Before it, a watcher that wanted a snapshot and a stream opened a second connection for
+/// `status` and could not tell which of the two had seen a transition first.
+///
+/// Pinned here: the snapshot is the FIRST frame of the session, ahead of the other daemon-built
+/// front-loads; it is the same report the `status` verb answers with; it is sent once and never
+/// again; and a status-only watch is sent nothing else.
+///
+/// Honest scope. The harness backend never comes up, so the report is a down node's — no netmap,
+/// so no peers — which is also what `status` reports for it. Peers on a `Running` node cannot be
+/// exercised without an engine and a control server; they come from the same `Backend::status` call
+/// by construction.
+#[tokio::test]
+async fn an_initial_status_watch_front_loads_the_status_report_once() {
+    let harness = Harness::start().await;
+
+    let Response::Status(one_shot) = harness.round_trip(r#"{"cmd":"status"}"#).await else {
+        panic!("the status verb must answer with a status report");
+    };
+
+    // Status-only: nothing but the snapshot may arrive, and nothing after it while the node is idle.
+    let stream = UnixStream::connect(&harness.socket_path)
+        .await
+        .expect("CLI connect to LocalAPI socket for a status watch");
+    let (read_half, mut write_half) = stream.into_split();
+    write_half
+        .write_all(b"{\"cmd\":\"watch\",\"initial_status\":true}\n")
+        .await
+        .expect("write masked watch request");
+    write_half.flush().await.expect("flush watch request");
+    let mut reader = BufReader::new(read_half);
+
+    let first = try_read_watch_status(&mut reader, Duration::from_secs(5))
+        .await
+        .expect("an initial_status watch must send its snapshot immediately");
+    let Response::Notify(first) = first else {
+        panic!("a masked watch streams Notify frames, got {first:?}");
+    };
+    assert_eq!(
+        first.initial_status.as_deref(),
+        Some(&one_shot),
+        "the snapshot must be the very report the `status` verb answers with, so watch and status \
+         cannot drift"
+    );
+    assert!(
+        first.state.is_none()
+            && first.net_map.is_none()
+            && first.prefs.is_none()
+            && first.policy.is_none()
+            && first.suggested_exit_node.is_none()
+            && first.session_id.is_none(),
+        "a status-only watch must not be sent fields it did not ask for: {first:?}"
+    );
+    assert!(
+        try_read_watch_status(&mut reader, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "the snapshot is sent once; an idle status-only watcher must stay quiet"
+    );
+    drop(write_half);
+    drop(reader);
+
+    // With every daemon-built bit set, the snapshot still leads, and no later frame repeats it.
+    let stream = UnixStream::connect(&harness.socket_path)
+        .await
+        .expect("CLI connect to LocalAPI socket for a combined watch");
+    let (read_half, mut write_half) = stream.into_split();
+    write_half
+        .write_all(b"{\"cmd\":\"watch\",\"prefs\":true,\"policy\":true,\"initial_status\":true}\n")
+        .await
+        .expect("write masked watch request");
+    write_half.flush().await.expect("flush watch request");
+    let mut reader = BufReader::new(read_half);
+
+    let mut frames = Vec::new();
+    while let Some(resp) = try_read_watch_status(&mut reader, Duration::from_millis(500)).await {
+        let Response::Notify(view) = resp else {
+            panic!("a masked watch streams Notify frames, got {resp:?}");
+        };
+        frames.push(view);
+    }
+    // Not an exact frame count: the policy tick channel is process-global, so a policy change in a
+    // test running alongside this one may legitimately push an extra policy frame.
+    assert_eq!(
+        frames.first().and_then(|f| f.initial_status.as_deref()),
+        Some(&one_shot),
+        "the status snapshot must be the session's first frame: {frames:?}"
+    );
+    assert!(
+        frames[1..].iter().all(|f| f.initial_status.is_none()),
+        "no frame after the first may carry the snapshot again: {frames:?}"
+    );
+    assert!(
+        frames[1..].iter().any(|f| f.prefs.is_some())
+            && frames[1..].iter().any(|f| f.policy.is_some()),
+        "the prefs and policy front-loads follow the snapshot: {frames:?}"
+    );
+
+    // With `initial_state` too, the snapshot is still the first frame written, so the session id
+    // rides it rather than a frame of its own.
+    let stream = UnixStream::connect(&harness.socket_path)
+        .await
+        .expect("CLI connect to LocalAPI socket for a session watch");
+    let (read_half, mut write_half) = stream.into_split();
+    write_half
+        .write_all(b"{\"cmd\":\"watch\",\"initial_state\":true,\"initial_status\":true}\n")
+        .await
+        .expect("write masked watch request");
+    write_half.flush().await.expect("flush watch request");
+    let mut reader = BufReader::new(read_half);
+    let Some(Response::Notify(first)) =
+        try_read_watch_status(&mut reader, Duration::from_secs(5)).await
+    else {
+        panic!("an initial_state + initial_status watch must send a Notify frame immediately");
+    };
+    assert!(
+        first.initial_status.is_some() && first.session_id.is_some(),
+        "the session id must ride the status snapshot, the session's first frame: {first:?}"
+    );
+
+    harness.shutdown_and_verify().await;
+}
+
+/// Open a masked watch with `request` (one JSON line) and return the still-open write half plus the
+/// reader. The write half must be held for the watch to stay open.
+async fn open_masked_watch(
+    harness: &Harness,
+    request: &[u8],
+) -> (
+    tokio::net::unix::OwnedWriteHalf,
+    BufReader<tokio::net::unix::OwnedReadHalf>,
+) {
+    let stream = UnixStream::connect(&harness.socket_path)
+        .await
+        .expect("CLI connect to LocalAPI socket for a masked watch");
+    let (read_half, mut write_half) = stream.into_split();
+    write_half
+        .write_all(request)
+        .await
+        .expect("write masked watch request");
+    write_half.flush().await.expect("flush watch request");
+    (write_half, BufReader::new(read_half))
+}
+
+/// Read one `Notify` frame within a bounded wait, so a regression fails instead of hanging.
+async fn read_notify(
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    what: &str,
+) -> tailscaled_rs::localapi::NotifyView {
+    match try_read_watch_status(reader, Duration::from_secs(5)).await {
+        Some(Response::Notify(view)) => view,
+        Some(other) => panic!("a masked watch streams Notify frames, got {other:?}"),
+        None => panic!("no frame arrived: {what}"),
+    }
+}
+
+/// The identity fields end to end over the real socket (Go `WatchNotificationsAs` + `sendToLocked`):
+/// an `initial_state` watch gets a session id on its first frame and never again, every frame states
+/// the daemon's version, and a second connection gets a different id.
+///
+/// The device-less daemon is the case that matters: the engine has no initial state to send, and Go's
+/// foreground `serve` reads exactly one frame for its id, so the id must arrive without an `up`.
+#[tokio::test]
+async fn an_initial_state_watch_is_given_a_session_id_once_and_a_version_always() {
+    let harness = Harness::start().await;
+    let Response::Version { version } = harness.round_trip(r#"{"cmd":"version"}"#).await else {
+        panic!("the version verb replies with a version");
+    };
+
+    // (1) `initial_state` alone on a device-less daemon: the first frame carries only identity.
+    let (_w1, mut r1) =
+        open_masked_watch(&harness, b"{\"cmd\":\"watch\",\"initial_state\":true}\n").await;
+    let first = read_notify(
+        &mut r1,
+        "an initial_state watch must send its session id immediately",
+    )
+    .await;
+    let id1 = first
+        .session_id
+        .clone()
+        .expect("the first frame of an initial_state watch carries the session id");
+    assert_eq!(id1.len(), 16, "Go's rands.HexString(16) shape, got {id1:?}");
+    assert_eq!(
+        first.version.as_deref(),
+        Some(version.as_str()),
+        "the frame names the same version `tnet version --daemon` reports"
+    );
+
+    // (2) A second connection is a different session.
+    let (_w2, mut r2) =
+        open_masked_watch(&harness, b"{\"cmd\":\"watch\",\"initial_state\":true}\n").await;
+    let id2 = read_notify(
+        &mut r2,
+        "a second initial_state watch must get its own session id",
+    )
+    .await
+    .session_id
+    .expect("the second connection's first frame carries a session id");
+    assert_ne!(
+        id1, id2,
+        "a session id must not be reused across connections"
+    );
+
+    // (3) With a prefs front-load the id rides that first real frame, and the next frame — pushed by
+    // a `down`, which persists prefs — carries the version but no id. Prefs, not policy: the prefs
+    // tick belongs to this harness's backend, while a policy reload is process-global and would push
+    // frames into the other policy watch test running alongside this one.
+    let (_w3, mut r3) = open_masked_watch(
+        &harness,
+        b"{\"cmd\":\"watch\",\"initial_state\":true,\"prefs\":true}\n",
+    )
+    .await;
+    let snapshot = read_notify(&mut r3, "the prefs front-load").await;
+    assert!(
+        snapshot.prefs.is_some(),
+        "the first frame is the prefs snapshot: {snapshot:?}"
+    );
+    let id3 = snapshot
+        .session_id
+        .expect("the id rides the first frame written, whichever feed produced it");
+    assert!(id3 != id1 && id3 != id2);
+    let Response::Ok { .. } = harness.round_trip(r#"{"cmd":"down"}"#).await else {
+        panic!("down on an offline node replies Ok");
+    };
+    let pushed = read_notify(
+        &mut r3,
+        "a down persists prefs and pushes a fresh prefs frame",
+    )
+    .await;
+    assert!(
+        pushed.prefs.is_some(),
+        "the pushed frame is prefs: {pushed:?}"
+    );
+    assert_eq!(pushed.session_id, None, "no later frame repeats the id");
+    assert_eq!(pushed.version.as_deref(), Some(version.as_str()));
+
+    // (4) Without `initial_state` there is no id, as in Go — but the version is still there.
+    let (_w4, mut r4) = open_masked_watch(&harness, b"{\"cmd\":\"watch\",\"prefs\":true}\n").await;
+    let prefs_only = read_notify(&mut r4, "the prefs front-load").await;
+    assert_eq!(prefs_only.session_id, None);
+    assert_eq!(prefs_only.version.as_deref(), Some(version.as_str()));
 
     harness.shutdown_and_verify().await;
 }

@@ -17,23 +17,47 @@
 //! - [`server`] — the LocalAPI server, a Unix-domain-socket IPC surface the CLI talks to.
 //! - [`hardening`] — best-effort OS-level protection (no-coredump / no-ptrace / no-swap) for the
 //!   secrets the engine holds in memory, the in-RAM analogue of [`ensure_state_dir_secure`].
+//! - [`debugmode`] — `tailnetd debug`, the daemon-less network diagnostics subcommand (Go
+//!   `tailscaled debug`), which runs without a daemon or a socket — for the node that will not
+//!   come up at all.
 //! - [`hostreap`] — startup cleanup of host routes/DNS a *hard-killed* previous run left behind
 //!   (the engine's graceful teardown never ran), so a crash cannot outlive the daemon.
+//! - [`tunflag`] — `tailnetd --tun`, Go's tunnel-interface flag, resolved onto this fork's TUN
+//!   prefs so a `tailscaled` command line copied from a unit file or a container image starts.
+//! - [`envknob`] — the on-disk environment file (`/etc/tailnetd/tailnetd-env.txt` on macOS) an
+//!   operator sets the administrative envknobs below in, for a launchd-managed daemon whose plist is
+//!   rewritten by `tnet install` and so cannot hold them (Go `envknob.ApplyDiskConfig`).
+//! - [`featureknob`] — the host/operator gates on optional features: whether this machine may run
+//!   the Tailscale SSH server at all, including the `TS_DISABLE_SSH_SERVER` administrative
+//!   off-switch an image build or a configuration-managed host uses to hold it down.
+//! - [`portmap`] — the NAT-PMP / PCP / UPnP-IGD port-mapping client: ask the LAN router to open a
+//!   hole so peers can reach this node directly instead of through a relay.
+//! - [`routes`] — the advertised-route SET (Go `netutil.CalcAdvertiseRoutes`): the one place
+//!   `--advertise-routes` and `--advertise-exit-node` become the prefixes this node offers to
+//!   route, so the rules that are properties of the set — a default route needs its other-family
+//!   counterpart, a 4via6 prefix must decode — are asked once, for every path that writes prefs.
 //!
 //! Two binaries consume it: `tailnetd` (the daemon) and `tnet` (the thin CLI client).
 
 pub mod auth;
 pub mod conffile;
+pub mod debugmode;
 pub mod debugserver;
+pub mod envknob;
+pub mod featureknob;
+pub mod goduration;
 pub mod hardening;
 pub mod hostreap;
 pub mod httpproxy;
 pub mod ipforward;
 pub mod ipn;
 pub mod localapi;
+pub mod portmap;
 pub mod prefs;
+pub mod routes;
 pub mod server;
 pub mod socks5;
+pub mod tunflag;
 
 use std::path::PathBuf;
 

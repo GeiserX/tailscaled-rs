@@ -1,6 +1,6 @@
 [package]
 name = "tailscaled-rs"
-version = "0.52.2"
+version = "0.67.1"
 edition = "2024"
 rust-version = "1.95"
 license = "BSD-3-Clause"
@@ -97,9 +97,25 @@ ts_control = { package = "geiserx_ts_control", git = "https://github.com/GeiserX
 # `ts_control` dep above. Keep this rev in lockstep with `tailscale`'s.
 ts_capabilityversion = { package = "geiserx_ts_capabilityversion", git = "https://github.com/GeiserX/tailscale-rs", rev = "9d847a6e252c0b268f823145ccfa4fc04006798d" }
 
+# The engine's Tailnet Lock crate, for its AUM CBOR decoder (`ts_tka::Aum::from_cbor`) and hash.
+# `tnet lock log --json=1` decodes each update the way Go's `PrintTailnetLockLogJSONV1` does, and
+# a second, hand-written decoder of a consensus-relevant format would be the wrong thing to own.
+# Already an engine transitive dep; the facade does not re-export it. Keep this rev in lockstep
+# with `tailscale`'s.
+ts_tka = { package = "geiserx_ts_tka", git = "https://github.com/GeiserX/tailscale-rs", rev = "9d847a6e252c0b268f823145ccfa4fc04006798d" }
+
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# `tnet configure kubeconfig`: parse the user's existing kubeconfig and re-emit it after merging the
+# new cluster/context/user in (Go `updateKubeconfig`). Go reaches for `sigs.k8s.io/yaml`, which is a
+# YAML front-end over `encoding/json`: it converts the document to the JSON data model, mutates a
+# `map[string]any`, and marshals back through JSON — so the port is `serde_json::Value` as the
+# document model with this crate doing only the YAML parse + emit, which reproduces Go's output
+# byte-for-byte (top-level keys alphabetical, because `serde_json::Map` is a `BTreeMap` exactly as
+# Go's `encoding/json` sorts map keys). `serde_norway` is the maintained fork of the archived
+# `serde_yaml`, same libyaml-derived emitter, no C dependency.
+serde_norway = "0.9"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 # chrono is already in the tree (the engine re-exports `DateTime<Utc>` on Node/StatusNode), but the
@@ -116,7 +132,12 @@ secrecy = "0.10"
 # pure-local, offline Argon2i KDF Go `tka.DisablementKDF` uses (`argon2.Key`, i.e. Argon2i, NOT the
 # crate-default Argon2id). `default-features = false` keeps it alloc-only. Byte-for-byte verified
 # against Go v1.100.0 goldens in the command's test.
-argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
+# `tnet lock init`: mint the tailnet-lock disablement secrets from the OS CSPRNG, the way Go's
+# `runTailnetLockInit` reads 32 bytes from `crypto/rand`. Only the raw OS entropy source is wanted
+# (no generator, no distributions), and `getrandom` is what the tree's crypto crates already use for
+# it — so this is a dependency EDGE, not a new crate. The `rand` crate below stays optional/ssh-only.
+getrandom = "0.3"
 # Peer-process euid for the same-user LocalAPI write policy. libc is already in the tree
 # (transitively via the engine); used only for geteuid() on unix.
 libc = "0.2"
@@ -161,6 +182,15 @@ tar = "0.4"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 rustls-pemfile = "2"
+# Unicode general categories, for the one place a ported Go regexp needs them: `serve
+# --accept-app-caps` validates each capability against `^([\pL\pN-]+\.)+[\pL\pN-]+\/[\pL\pN-/]+$`,
+# and `\pL` is the Letter general CATEGORY. `char::is_alphabetic` is the Alphabetic derived
+# PROPERTY, a superset that also admits ~6k combining marks (Other_Alphabetic), so it accepts
+# capability names Go refuses. This crate is already in the graph — idna (via url, via ureq) pulls
+# it through idna_adapter — so naming it here adds a dependency EDGE, not a crate; the alternative,
+# a direct `regex` dependency for one pattern, would add five (regex, regex-automata with its
+# Unicode tables, regex-syntax, aho-corasick, memchr).
+icu_properties = "2"
 # RNG for generating the Tailscale SSH server's host key (`russh::keys::PrivateKey::random`). Must
 # be `rand 0.10` — russh 0.61's `ssh-key` bounds `random` on `rand_core 0.10`'s `CryptoRng`, which
 # `rand 0.9`'s `ThreadRng` does NOT implement (verified: build fails with a CryptoRng trait-bound

@@ -156,9 +156,10 @@ pub(super) async fn build_config(
     }
     // TUN-mode data path. Default is the engine's userspace netstack (unprivileged); TUN hands
     // packets to a real kernel interface, which needs (a) a daemon built with the `tun` cargo
-    // feature [`tailscale/tun`] and (b) root / CAP_NET_ADMIN. We preflight both and FAIL LOUDLY
-    // — never silently downgrade to netstack, because the operator asked for OS-wide
-    // connectivity and a silent fallback would be a confusing, hard-to-notice half-working state.
+    // feature [`tailscale/tun`] and (b) the privilege to create the device. We preflight (a) and the
+    // part of (b) Go pre-judges, and FAIL LOUDLY — never silently downgrade to netstack, because the
+    // operator asked for OS-wide connectivity and a silent fallback would be a confusing,
+    // hard-to-notice half-working state.
     if prefs.tun_enabled {
         #[cfg(not(feature = "tun"))]
         {
@@ -169,17 +170,12 @@ pub(super) async fn build_config(
         }
         #[cfg(feature = "tun")]
         {
-            // Privilege preflight: the engine's TUN transport errors `RootUserRequired` without
-            // root; surface that here with actionable context before the handshake starts.
-            #[cfg(unix)]
-            // SAFETY: geteuid() is infallible (no args, no preconditions).
-            if unsafe { libc::geteuid() } != 0 {
-                return Err(anyhow!(
-                    "TUN mode requires root / CAP_NET_ADMIN to create the kernel TUN interface, \
-                     but the daemon is not running as root. Run tailnetd as root (the packaged \
-                     systemd/launchd units do) or use the default userspace-networking mode"
-                ));
-            }
+            // Privilege preflight, macOS only — the same judgment `--tun` resolution makes. Off
+            // macOS the uid proves nothing (a non-root daemon with `CAP_NET_ADMIN` can create the
+            // device), so the engine's device open decides, as Go's `tryEngine` does; a truly
+            // unprivileged open still fails loudly there with the engine's `RootUserRequired`.
+            crate::tunflag::kernel_tun_privilege(super::captive::goos(), crate::tunflag::euid())
+                .map_err(|e| anyhow!("TUN mode requested (tun_enabled) but {e}"))?;
             // Select the kernel-TUN transport. The engine (v0.6.7+) re-exports `TransportMode`
             // and `TunConfig` from the facade, so the daemon can construct the value directly.
             //
@@ -205,13 +201,24 @@ pub(super) async fn build_config(
     }
     // Tailscale SSH server preflight. Unlike TUN, SSH is NOT an engine `Config` knob — the server
     // is a daemon-spawned task (see `spawn_ssh_task`), so `ssh_enabled` sets NO field on
-    // `config`. It only gates the spawn, plus these two fail-loud preflights mirroring TUN's, so
+    // `config`. It only gates the spawn, plus these three fail-loud preflights mirroring TUN's, so
     // an impossible `--ssh` fails the bring-up here rather than silently doing nothing:
-    // (a) built without the `ssh` cargo feature → there is no server to spawn; and
-    // (b) running as non-root → the engine's `listen_ssh` must drop privileges to the
+    // (a) the host or its operator has ruled the server out — Go's `featureknob.CanRunTailscaleSSH`,
+    //     chiefly `TS_DISABLE_SSH_SERVER`, the administrative off-switch an image build or a
+    //     configuration-managed host uses to hold the SSH server down regardless of the prefs;
+    // (b) built without the `ssh` cargo feature → there is no server to spawn; and
+    // (c) running as non-root → the engine's `listen_ssh` must drop privileges to the
     //     policy-mapped local user, which requires root, so the session would fail closed.
-    // Both fail loudly here (never a silent no-SSH node when SSH was explicitly requested).
+    // All three fail loudly here (never a silent no-SSH node when SSH was explicitly requested).
+    //
+    // (a) is checked FIRST, matching Go, where `checkSSHPrefsLocked` calls `CanRunTailscaleSSH()`
+    // before anything else: on a host that is administratively barred from running SSH at all, that
+    // is the sentence the operator needs, not an invitation to rebuild with another cargo feature.
+    // The `up`/`set` paths run the same gate BEFORE persisting, so this is the merged-pref backstop —
+    // it catches an `ssh_enabled` that was persisted before the knob was set on the host, including
+    // one that arrived through the config file (`RunSSHServer`) or the daemon's auto-start.
     if prefs.ssh_enabled {
+        crate::featureknob::can_run_tailscale_ssh()?;
         #[cfg(not(feature = "ssh"))]
         {
             return Err(anyhow!(
@@ -525,6 +532,44 @@ mod tests {
             Some(41641),
             "--port 41641 must pin the engine's WireGuard listen port"
         );
+    }
+
+    /// A TUN pref must reach the engine as the kernel-TUN transport whatever the uid, everywhere but
+    /// macOS. The bug this guards: `build_config` used to refuse any non-zero euid, so a Linux daemon
+    /// running with `CAP_NET_ADMIN` but no root — which `--tun` resolution already accepts — failed at
+    /// bring-up for a device it could create. On macOS a non-root process is still refused, as Go
+    /// refuses it.
+    #[cfg(feature = "tun")]
+    #[tokio::test]
+    async fn tun_pref_is_not_refused_on_uid_off_macos() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let key_path = std::env::temp_dir().join(format!(
+            "tailnetd-tuncfgtest-{}-{}.key",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let prefs = Prefs {
+            tun_enabled: true,
+            ..Default::default()
+        };
+        let result = build_config(&prefs, &key_path, None).await;
+        let _ = std::fs::remove_file(&key_path);
+        if super::super::captive::goos() == "darwin" && crate::tunflag::euid() != 0 {
+            let Err(err) = result else {
+                panic!("macOS refuses a kernel TUN device to a non-root process");
+            };
+            assert!(
+                err.to_string().contains("requires root"),
+                "should say root is required; got:\n{err}"
+            );
+        } else {
+            let cfg = result.expect("the uid must not refuse a TUN pref off macOS");
+            assert!(
+                matches!(cfg.transport_mode, tailscale::TransportMode::Tun(_)),
+                "a TUN pref must select the kernel-TUN transport"
+            );
+        }
     }
 
     #[tokio::test]

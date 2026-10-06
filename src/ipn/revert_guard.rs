@@ -210,6 +210,35 @@ pub(super) fn check_accidental_reverts(
     reverts
 }
 
+/// Drop every revert whose pref the system policy **pins** (`pinned` comes from
+/// [`syspolicy::pinned_prefs`], whose names are the `key` strings above).
+///
+/// The guard's question is "would this `up` silently lose a setting the operator cares about?". For
+/// a policy-pinned pref the answer is no, and cannot be: the same `up` re-applies the policy over
+/// its own overrides just before persisting (see [`Backend::begin_up`]), so the value the guard is
+/// about to name is the value the node ends with either way. Reporting it would refuse an `up` that
+/// changes nothing, and — worse — tell the operator to re-mention a setting they are not allowed to
+/// change, with `--reset` offered as the way out even though `--reset` cannot escape policy either.
+///
+/// Kept a separate pass rather than another condition inside each arm: the pinning rule is one
+/// sentence about the whole guard, not eleven near-identical clauses, and the guard itself stays a
+/// pure function of `(prefs, opts, has_logged_in)` that a test can drive with no policy at all.
+///
+/// [`syspolicy::pinned_prefs`]: super::syspolicy::pinned_prefs
+/// [`Backend::begin_up`]: super::Backend::begin_up
+pub(super) fn drop_policy_pinned(
+    reverts: Vec<RevertedPref>,
+    pinned: &[&'static str],
+) -> Vec<RevertedPref> {
+    if pinned.is_empty() {
+        return reverts;
+    }
+    reverts
+        .into_iter()
+        .filter(|r| !pinned.contains(&r.key.as_str()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -479,20 +508,151 @@ mod tests {
 
     #[test]
     fn advertise_tags_validation() {
-        use super::super::validate_advertise_tags;
-        // Valid: tag:<name> — letter-led, [A-Za-z0-9-] only.
-        assert!(validate_advertise_tags(&["tag:server".into(), "tag:ci".into()]).is_ok());
-        assert!(validate_advertise_tags(&["tag:web-1".into()]).is_ok());
-        assert!(validate_advertise_tags(&[]).is_ok());
-        // Invalid: bare name, empty tag name, wrong prefix.
-        assert!(validate_advertise_tags(&["server".into()]).is_err());
-        assert!(validate_advertise_tags(&["tag:".into()]).is_err());
-        assert!(validate_advertise_tags(&["notatag:x".into()]).is_err());
+        use super::super::complete_and_validate_advertise_tags as check;
+        // Valid: tag:<name> — letter-led, [A-Za-z0-9-] only. Passed through byte-for-byte.
+        assert_eq!(
+            check(&["tag:server".into(), "tag:ci".into()]).unwrap(),
+            vec!["tag:server".to_string(), "tag:ci".to_string()]
+        );
+        assert_eq!(
+            check(&["tag:web-1".into()]).unwrap(),
+            vec!["tag:web-1".to_string()]
+        );
+        assert!(check(&[]).unwrap().is_empty());
+        // Invalid: empty tag name, wrong prefix on a value that DOES have a colon.
+        assert!(check(&["tag:".into()]).is_err());
+        assert!(check(&["notatag:x".into()]).is_err());
         // Invalid per Go CheckTag: leading digit, underscore, space, punctuation.
-        assert!(validate_advertise_tags(&["tag:9server".into()]).is_err());
-        assert!(validate_advertise_tags(&["tag:my_tag".into()]).is_err());
-        assert!(validate_advertise_tags(&["tag:has space".into()]).is_err());
-        assert!(validate_advertise_tags(&["tag:exit!".into()]).is_err());
+        assert!(check(&["tag:9server".into()]).is_err());
+        assert!(check(&["tag:my_tag".into()]).is_err());
+        assert!(check(&["tag:has space".into()]).is_err());
+        assert!(check(&["tag:exit!".into()]).is_err());
+    }
+
+    #[test]
+    fn advertise_tags_completion_matches_go() {
+        use super::super::complete_and_validate_advertise_tags as check;
+        // Go `prefsFromUpArgs`: a value with NO colon at all gets the `tag:` prefix added for it,
+        // so the documented shorthand `--advertise-tags server,ci` means `tag:server,tag:ci`.
+        assert_eq!(
+            check(&["server".into(), "ci".into()]).unwrap(),
+            vec!["tag:server".to_string(), "tag:ci".to_string()],
+            "a colon-less value must be completed to tag:<value>"
+        );
+        // Completion is per-value: an already-prefixed tag alongside a shorthand is untouched, and
+        // the completion is NOT applied twice.
+        assert_eq!(
+            check(&["tag:server".into(), "web-1".into()]).unwrap(),
+            vec!["tag:server".to_string(), "tag:web-1".to_string()]
+        );
+        // The colon rule is the whole rule: a value that already contains a colon is passed to the
+        // CheckTag port UNTOUCHED, so a malformed `foo:bar` is refused by name rather than quietly
+        // becoming a `tag:foo:bar` nobody asked for.
+        let err = format!(
+            "{:#}",
+            check(&["foo:bar".into()]).expect_err("a non-`tag:` colon value must be refused")
+        );
+        assert!(
+            err.contains("\"foo:bar\""),
+            "the refusal must name the value as typed, not a completed one, got {err:?}"
+        );
+        assert!(
+            !err.contains("tag:foo:bar"),
+            "a colon-bearing value must never be completed, got {err:?}"
+        );
+        // Completion happens BEFORE validation, so a shorthand that is not a legal tag name is
+        // refused by the CheckTag port — and Go quotes the COMPLETED value in `tag: %q`, so the
+        // operator sees the tag as the daemon would have seen it.
+        for (typed, completed) in [("9server", "tag:9server"), ("my_tag", "tag:my_tag")] {
+            let err = format!(
+                "{:#}",
+                check(&[typed.into()]).expect_err("an illegal tag name must be refused")
+            );
+            assert!(
+                err.contains(&format!("{completed:?}")),
+                "the refusal must quote the completed value {completed:?}, got {err:?}"
+            );
+        }
+        // An empty value has no colon either: completed to `tag:`, then refused for an empty name.
+        let err = format!(
+            "{:#}",
+            check(&["".into()]).expect_err("an empty tag must be refused")
+        );
+        assert!(
+            err.contains("empty"),
+            "an empty value completes to `tag:` and is refused for an empty name, got {err:?}"
+        );
+    }
+
+    /// Go refuses a bad tag as `fmt.Errorf("tag: %q: %s", tag, err)` over `tailcfg.CheckTag`'s own
+    /// reason string — `cmd/tailscale/cli/up.go` (`prefsFromUpArgs`) and `tailcfg/tailcfg.go`
+    /// (`CheckTag`) @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8 — so `tailscale up --advertise-tags
+    /// foo:bar` prints `tag: "foo:bar": tags must start with 'tag:'`. Pin the WHOLE refusal, not
+    /// just that it is one: the frame, the quoted COMPLETED value, and each of CheckTag's four
+    /// reasons, in CheckTag's order. An operator who knows the Go message, or a script that greps
+    /// for it, gets the same bytes out of this daemon.
+    #[test]
+    fn advertise_tags_refusals_match_go_checktag() {
+        use super::super::complete_and_validate_advertise_tags as check;
+        for (typed, want) in [
+            // CheckTag clause 1 — no `tag:` prefix. Only a COLON-BEARING value can reach it: a
+            // colon-less one is completed to `tag:<value>` before CheckTag ever sees it.
+            ("foo:bar", r#"tag: "foo:bar": tags must start with 'tag:'"#),
+            (
+                "TAG:server",
+                r#"tag: "TAG:server": tags must start with 'tag:'"#,
+            ),
+            // clause 2 — empty name. Note the quoted value is the completed one, so the bare `""`
+            // an operator typed is reported as the `tag:` the daemon made of it.
+            ("tag:", r#"tag: "tag:": tag names must not be empty"#),
+            ("", r#"tag: "tag:": tag names must not be empty"#),
+            // clause 3 — name does not start with an ASCII letter.
+            (
+                "tag:9server",
+                r#"tag: "tag:9server": tag names must start with a letter, after 'tag:'"#,
+            ),
+            (
+                "9server",
+                r#"tag: "tag:9server": tag names must start with a letter, after 'tag:'"#,
+            ),
+            (
+                "tag:-web",
+                r#"tag: "tag:-web": tag names must start with a letter, after 'tag:'"#,
+            ),
+            // clause 4 — a later byte outside [0-9A-Za-z-].
+            (
+                "tag:my_tag",
+                r#"tag: "tag:my_tag": tag names can only contain numbers, letters, or dashes"#,
+            ),
+            (
+                "tag:has space",
+                r#"tag: "tag:has space": tag names can only contain numbers, letters, or dashes"#,
+            ),
+            (
+                "tag:exit!",
+                r#"tag: "tag:exit!": tag names can only contain numbers, letters, or dashes"#,
+            ),
+        ] {
+            let err = format!(
+                "{:#}",
+                check(&[typed.into()]).expect_err("a tag CheckTag rejects must be refused here")
+            );
+            assert_eq!(
+                err, want,
+                "refusing {typed:?} must read exactly as Go's `tag: %q: %s` over CheckTag"
+            );
+        }
+        // The offender is reported one at a time and it is the FIRST one, as Go's loop returns on
+        // the first CheckTag failure — the good tag before it is not what the operator hears about.
+        let err = format!(
+            "{:#}",
+            check(&["tag:ok".into(), "tag:bad!".into(), "tag:worse!".into()])
+                .expect_err("a list containing a bad tag must be refused")
+        );
+        assert_eq!(
+            err,
+            r#"tag: "tag:bad!": tag names can only contain numbers, letters, or dashes"#
+        );
     }
 
     /// A node that already advertises routes; the canonical "non-default prefs present" fixture.
@@ -598,5 +758,48 @@ mod tests {
         let reverts = check_accidental_reverts(&prefs, &opts, true);
         let keys: Vec<&str> = reverts.iter().map(|r| r.key.as_str()).collect();
         assert_eq!(keys, vec!["advertise_routes"], "{keys:?}");
+    }
+
+    #[test]
+    fn a_policy_pinned_pref_is_not_reported_as_an_accidental_revert() {
+        // A node whose hostname AND exit node are both non-default, under an `up` that mentions
+        // neither: without policy both are reverts, with `hostname` pinned only the exit node is.
+        let prefs = Prefs {
+            hostname: Some("kiosk-3".into()),
+            exit_node: Some("100.64.0.9".into()),
+            has_logged_in: true,
+            ..Prefs::default()
+        };
+        let opts = UpOptions {
+            ssh: Some(true),
+            ..UpOptions::default()
+        };
+        let reverts = check_accidental_reverts(&prefs, &opts, true);
+        let keys: Vec<&str> = reverts.iter().map(|r| r.key.as_str()).collect();
+        assert!(keys.contains(&"hostname"), "{keys:?}");
+        assert!(keys.contains(&"exit_node"), "{keys:?}");
+
+        let kept = drop_policy_pinned(reverts, &["hostname"]);
+        let keys: Vec<&str> = kept.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["exit_node"],
+            "a pinned pref cannot be reverted, so it must not be warned about; an unpinned one still must"
+        );
+    }
+
+    #[test]
+    fn with_nothing_pinned_every_revert_survives() {
+        let prefs = Prefs {
+            hostname: Some("kiosk-3".into()),
+            has_logged_in: true,
+            ..Prefs::default()
+        };
+        let opts = UpOptions {
+            ssh: Some(true),
+            ..UpOptions::default()
+        };
+        let reverts = check_accidental_reverts(&prefs, &opts, true);
+        assert_eq!(drop_policy_pinned(reverts.clone(), &[]), reverts);
     }
 }

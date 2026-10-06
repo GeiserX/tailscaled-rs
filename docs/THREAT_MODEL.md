@@ -70,7 +70,7 @@ flowchart TB
 | ① | **LocalAPI socket** | Local IPC (Unix domain socket, newline-delimited JSON) | **Reads:** anyone who can reach the socket. **Writes:** only root or the daemon's own UID. Enforced by `SO_PEERCRED` (`src/auth.rs`) behind a `0700` directory (`src/lib.rs`, `src/server.rs`). |
 | ② | **Control-plane connection** | Noise control protocol (engine) | The control plane is **operator-trusted but not blindly trusted**: the engine talks Noise to it, but Tailnet Lock is **inert** (§5), so a compromised control plane *can* inject peer keys. The control URL is operator-chosen (scheme-validated at `src/ipn/config.rs:110`, change-gated at `src/ipn/control_url.rs:64`). |
 | ③ | **Data plane** | WireGuard over direct UDP or DERP relay (engine) | Peers are authenticated by WireGuard keys distributed via the netmap. Trust here is only as strong as the (unaudited) handshake and the (un-enforced) Tailnet Lock. |
-| ④ | **On-disk state dir** | Filesystem | Trusted to the owning UID only — enforced by `0700` (`src/lib.rs:60`). **Not** trusted against root or anyone who can read the raw disk; keys are stored **without at-rest encryption**. |
+| ④ | **On-disk state dir** | Filesystem | Trusted to the owning UID only — enforced by `0700` (`src/lib.rs:60`). **Not** trusted against root or anyone who can read the raw disk; keys are stored **without at-rest encryption** — a recorded decision, see §5.8. |
 
 The hard trust line is **boundary ①**: it is the only one this daemon fully owns and enforces in
 its own code. Boundaries ② and ③ are the engine's; boundary ④ is a filesystem-permission gate, not
@@ -414,6 +414,33 @@ on the daemon side (an allowlist rooted at the configured Taildrop directory), n
 refusal — a symlink refusal would cost the ordinary case and buy nothing the UID gate does not
 already hold.
 
+### 5.8 State at rest is UNENCRYPTED — a recorded decision, adversaries (b) and raw-disk access
+
+The node key, the WireGuard key material the engine persists, and `prefs.json` are written as
+**plain files** under a `0700` state dir (§2, boundary ④). Filesystem permissions and the §4.7
+process hardening are the whole of the protection: nothing on disk is sealed to a key. Anyone who
+can read the raw disk — root, an offline attacker with the drive, a backup, a snapshotted VM image,
+a container layer pushed to a registry — reads the node's identity and can impersonate it on the
+tailnet until the key is revoked.
+
+Go `tailscaled` has two flags for exactly this, and **this fork implements neither**:
+
+| Go flag | What Go does | Here |
+|---|---|---|
+| `--encrypt-state` | Seals the state file to the device's TPM (Linux and Windows only) by prefixing the state path with `tpm:`; when unset it turns itself on where the platform supports it, or where the syspolicy key `EncryptState` asks for it. | **Out of scope for now.** No state-store provider layer, no TPM/keystore integration. |
+| `--hardware-attestation` | Binds the node identity to a hardware-backed key (TPM 2.0 on Linux/Windows, Secure Enclave on macOS/iOS, Keystore on Android) and marks the node hardware-attested to its backend; defaults from the syspolicy key `HardwareAttestation`. | **Out of scope for now.** No hardware key store anywhere in the daemon or the engine, so there is no attestation key to bind to. |
+
+Both flags are nevertheless **declared** by `tailnetd` and **refused at startup** when switched on
+(`explicit_tpm_flag_refusal`, `src/bin/tailnetd.rs`), and a `--syspolicy-file` that sets either key
+is reported at startup rather than silently ignored (`tpm_policy_notices`). That is the security
+point of declaring them at all: accepting either as a no-op would let an operator carry a Go unit
+file across and believe the state is sealed, or the identity machine-bound, when neither is true.
+A loud refusal keeps this section's claim and the daemon's behaviour in agreement.
+
+Until there is a platform key store to seal to, the mitigations available to an operator are
+outside this daemon: full-disk or filesystem encryption on the host, and treating the state dir as
+key material when backing up or imaging.
+
 ---
 
 ## 6. The Rust memory-safety thesis — honest version
@@ -466,6 +493,7 @@ the language; and the privileged-attacker and cold-boot leaks remain unaddressed
 | Rogue peer-key injection | (d) | **No** — Tailnet Lock inert | Compromised control plane can add trusted peers | Engine; §5.4, `SECURITY.md` |
 | Operator repoints control plane | (b)/operator | **N/A** — by design | A write-authed caller can move the root of trust (authz-gated) | §5.6; `src/ipn/config.rs:118` |
 | Root daemon writes to a caller-named path (`file get`, `debug capture`) | (a)/operator | **Partial** — parent directory resolved + validated, leaf must be absent-or-regular, `O_NOFOLLOW`/`O_EXCL` opens | A write-authed caller still picks the directory, and a symlinked ancestor is followed (its own namespace) — Go's residual too; bounded by the peercred write gate | §4.9, §5.7; `src/ipn/diag.rs` `taildrop_dest_resolved`/`taildrop_dir_resolved` |
+| Keys on disk readable from the raw disk / a backup / an image | (b) | **No** — `0700` dir only, no at-rest encryption | Go's `--encrypt-state` (TPM) and `--hardware-attestation` are declared and refused, not implemented; host-level disk encryption is the operator's to supply | §5.8; `src/bin/tailnetd.rs` `explicit_tpm_flag_refusal` |
 | Auth-key in argv / shell history | (a)/(b) | **Partial** — `--authkey-file` / `$TS_AUTH_KEY` offered | `--authkey` flag still exposes the key in argv if used | `src/bin/tnet.rs:37-42` |
 | Terminal escape / column-row injection via off-box text | (d)/peer | **Yes** — all control/peer-supplied text sanitized at every print site (columnar cells strip `\t`/`\n`/`\r` too) | Display hardening only; the underlying control-plane trust gap is unchanged (§5.4); does not cover output piped through a *different* tool that re-interprets `U+FFFD` | §4.8; `src/bin/tnet.rs` `sanitize_for_terminal`/`sanitize_multiline` |
 

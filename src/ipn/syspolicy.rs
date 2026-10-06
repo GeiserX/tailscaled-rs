@@ -4,36 +4,509 @@
 //! single `setting.Snapshot` (a map of policy-key → {value, origin, error}). The `tailscale
 //! syspolicy list` / `reload` commands print that snapshot. On **Windows** Go registers the
 //! registry-backed `Platform` store (HKLM for the device scope, HKCU for the user scope). On
-//! **Linux/Unix** — and in this daemon — **no policy store is registered**, so the effective policy
-//! is always an empty-but-valid snapshot: `syspolicy list` prints "No policy settings", and `reload`
-//! returns the same empty snapshot (never an error).
+//! **Linux/Unix** the registry store does not exist — but since v1.102.3 every platform can also
+//! register a **JSON policy file** named by `tailscaled --syspolicy-file`, which is what gives an
+//! admin on a non-Windows host something to write policy into at all.
 //!
-//! This matches Go's *runtime* behavior on Linux exactly. Go ships an in-tree `EnvPolicyStore`
-//! (env-var sourced, `TS_DEBUGSYSPOLICY_*` prefixed) but **never registers it by default** — so a
-//! faithful port likewise reads no environment or file source. Registering one would make this
-//! daemon report policy where upstream Go reports none, i.e. a behavioral *deviation*, so we do not.
+//! This module owns both halves of that: [`load_json_policy_file`] (Go
+//! `syspolicy.LoadJSONPolicyFile`, called once at daemon startup from `tailnetd`) and the merge that
+//! [`effective_policy`] / [`reload_effective_policy`] report over. Go's other in-tree store, the
+//! env-var-sourced `EnvPolicyStore`, is **never registered by default**, so — as before — we read no
+//! environment source either.
 //!
-//! The model below is the real (if currently source-less) merge point: [`registered_store_settings`]
-//! is the single authority for "which stores contribute settings," so a future managed-platform
-//! source (macOS configuration profiles, an explicit opt-in store, …) would populate the snapshot
-//! here without reshaping the LocalAPI wire or the CLI renderer.
+//! ## Precedence
+//!
+//! Go's `rsop` merges same-scope sources in registration order, so a **later-registered source wins
+//! per key**, with earlier sources still supplying the keys it does not set. That is why the JSON
+//! file beats the Windows registry there: `cmd/tailscaled` registers it after the platform store.
+//! This daemon consults **exactly one** source — the JSON file — because it has no registry store
+//! and registers no env store, so on every platform it supports the merge is the file itself. The
+//! ordering rule is still implemented ([`merge`], last writer wins) rather than assumed away, so
+//! adding a second source later is a registration call and not a redesign.
+//!
+//! ## Applying the snapshot to prefs
+//!
+//! Resolving is half the job; [`apply_to_prefs`] is the other half — the port of Go's
+//! `ipnlocal.applySysPolicy` (+ `applyExitNodeSysPolicyLocked`), which overwrites the node's
+//! [`Prefs`] with what the administrator configured. Go runs it from `reconcilePrefs`, which sits on
+//! every prefs write and on every profile load; this daemon calls it from the same places it has:
+//! profile load (daemon start and `tnet switch`), `up`, `set` and the `--config` merge, always
+//! **after** the caller's own overrides, so **policy outranks whatever the operator just typed**.
+//! That is the entire point of policy: a `tnet set --hostname laptop` against a policy file pinning
+//! `"Hostname"` persists the pinned name, not the typed one.
+//!
+//! ### Precedence inversion: `AuthKey` ranks LAST, not first
+//!
+//! One key does not follow that rule, and the next reader should not file it as a bug.
+//! [`auth_key`] — the registration credential, the only policy setting whose consumer is not a pref
+//! — is consulted **only after** an explicit `tnet up --auth-key` / `TS_AUTH_KEY` and the
+//! `--config` file's `AuthKey` have both come up empty. That is Go's order (`Start` reads
+//! `pkey.AuthKey` last, behind `opts.AuthKey` and `b.conf`), and it is the right one for a
+//! credential: an operator who typed a key meant *that* key, and silently registering with a
+//! different one would be a worse surprise than ignoring the policy. Everything else here stays as
+//! above — the administrator wins.
+//!
+//! ### Reporting a credential
+//!
+//! `AuthKey` is a secret, and the snapshot is a reporting surface: `tnet syspolicy list` prints
+//! every configured key with its value and origin, and the `policy` notify bit pushes the same rows
+//! to every watcher. So the value is **kept out of the snapshot entirely**: the key's row carries
+//! the literal `<redacted>` in the Value column ([`REDACTED`]), while the usable copy is held beside
+//! the rows in [`PolicySource::auth_key`] and read only on the registration path. An administrator
+//! can still confirm the key arrived and which source supplied it; nothing that leaves the daemon
+//! carries the credential. This is the one place the Value column is not Go's `%v` of the decoded
+//! value — Go prints the key.
+//!
+//! What it applies, and the rulings this fork had to make that Go did not:
+//!
+//! - `LoginURL` → `control_url`, `Hostname` → `hostname`. `Hostname` is a **tri-state**: absent
+//!   leaves the pref alone, a non-empty value pins it, and a present-but-empty value CLEARS it (back
+//!   to the OS hostname). Go needs a `"HostnameDefaultValue"` sentinel to express that, because its
+//!   pref is a bare string; here the pref is already an `Option<String>` and the store already knows
+//!   whether a key is configured, so the tri-state falls out with no sentinel.
+//! - `AlwaysOn.Enabled` forces `want_running` back to true. That is only half of always-on mode: the
+//!   other half is the **disconnect gate** ([`alwayson`](super::alwayson)), which reads
+//!   [`PKEY_ALWAYS_ON`] and [`PKEY_ALWAYS_ON_OVERRIDE_WITH_REASON`] by name and refuses a
+//!   `down`/`logout` outright unless the override key is set and the operator gave a reason. Go
+//!   splits it the same way (`applySysPolicy` re-asserts the intent, `ipnauth.CheckDisconnectPolicy`
+//!   refuses the disconnect), so both keys are enforced here and neither is reported as unenforced.
+//!   The window between the two is Go's `overrideAlwaysOn` flag, which suppresses the re-assert for
+//!   as long as a permitted disconnect stands, and its `ReconnectAfter` timer, which ends that
+//!   window on the administrator's schedule. Both are ported: the flag is
+//!   [`Backend::override_always_on`](super::Backend::override_always_on) (passed into
+//!   [`apply_to_prefs`] by the caller, because it is backend state rather than policy) and the timer
+//!   is armed from [`reconnect_after`] and fired by
+//!   [`reconnect_loop`](super::reconnect_loop) — see the note on [`apply_settings_to_prefs`].
+//! - Seven of Go's eight `preferencePolicies` map onto one bool pref each. The eighth,
+//!   `UnattendedMode` (Go `ForceDaemon`), asks a GUI client to keep the daemon connected while no
+//!   user is logged in; a system daemon with no user session is unattended by construction, which is
+//!   why there is no pref for it — so it is reported as unenforced.
+//! - `ExitNodeID` is **not applied**. Go pins a `tailcfg.StableNodeID`, and parks the pref on a
+//!   deliberately invalid id while an `auto:` expression is unresolved so that traffic blackholes
+//!   instead of leaking past the policy. This fork's exit node is one selector resolved by tailnet IP
+//!   or MagicDNS name (`resolve_exit_node_arg`), with no stable-node-id form and no auto-selection —
+//!   so storing the id would match no peer, and a selector that matches no peer egresses DIRECTLY.
+//!   That is the leak the blackhole exists to prevent, so the honest answer is to refuse the key
+//!   loudly instead of appearing to honour it. Go's mutual exclusion is kept: a configured
+//!   `ExitNodeID` suppresses `ExitNodeIP` here too, so the refusal is one message rather than a
+//!   silent downgrade to the key the admin de-prioritised. `ExitNodeIP` alone is applied.
+//! - Applying the exit node is, like `AlwaysOn.Enabled`, only half of the key's effect. The other
+//!   half is the **edit gate** ([`exitnodepolicy`](super::exitnodepolicy)): an `up`/`set` that names
+//!   an exit node while the policy pins one is refused outright (*exit node cannot be changed:
+//!   managed by policy*) unless [`PKEY_ALLOW_EXIT_NODE_OVERRIDE`] is set, and even then it may only
+//!   move the egress to another node, never turn it off. Without the gate the re-apply below is the
+//!   only thing standing between the administrator's node and the operator's, which makes
+//!   `tnet set --exit-node=<peer>` report success and silently store the administrator's value.
+//!   **What counts as "managed" here is the fork's one deviation**: Go asks
+//!   `HasAnyOf(pkey.ExitNodeID, pkey.ExitNodeIP)`, so a file naming only `ExitNodeID` locks the pref
+//!   upstream — but this build *refuses* that key (see the bullet above), so locking on it would
+//!   refuse the operator's exit node in the name of a value that pins nothing, leaving the node with
+//!   no exit node and no way to choose one. The lock is therefore on what is actually applied: a
+//!   non-empty, parseable `ExitNodeIP` that no configured `ExitNodeID` suppresses — exactly the
+//!   condition under which [`pinned_prefs`] already reports `exit_node` as pinned.
+//!   Go's `overrideExitNodePolicy` — the flag that remembers a permitted override so the re-apply
+//!   below does not immediately undo it — is ported as
+//!   [`Backend::override_exit_node_policy`](super::Backend::override_exit_node_policy) and passed
+//!   back in through [`PolicyOverrides`], the same way `overrideAlwaysOn` is.
+//!
+//! Refusals are returned, not swallowed: [`PolicyApplication::refused`] names every configured key
+//! this build cannot enforce, and the daemon logs it at WARN every time the policy is reconciled. A
+//! report that renders an administrator's intent while changing nothing is worse than no policy
+//! support at all, so an unenforceable key has to say so.
+//!
+//! Three more keys act without ever touching prefs, because their effect is a refusal rather than a
+//! rewritten pref: `tailnetd` reads [`PKEY_ENCRYPT_STATE`] and [`PKEY_HARDWARE_ATTESTATION`] by name
+//! for two startup refusals, and the LocalAPI server reads [`PKEY_ALLOW_TAILSCALED_RESTART`] by name
+//! to decide whether a caller that may already write is *also* permitted to stop the daemon
+//! ([`crate::server::shutdown_verdict`]). None of the three is reported as unenforced, because all
+//! three are read.
+//!
+//! And one key acts on the *registration* rather than on a pref: `AuthKey` is the credential an
+//! administrator enrols a fleet with — the only way onto the tailnet that does not mean touching
+//! each host — and it is resolved by [`auth_key`] on the bring-up path (Go's `Start`). Its two
+//! peculiarities have their own sections below: it ranks LAST among this daemon's auth-key sources,
+//! and its value is redacted out of the snapshot.
+//!
+//! It also takes a companion key to do its job unattended, and an administrator writing the file
+//! needs to know which. The daemon's boot-time auto-start only runs for a node that **wants to
+//! run**, and a host nobody has touched has no `prefs.json` to say so — so the file that carries
+//! `AuthKey` should carry `AlwaysOn.Enabled` too: the always-on key re-asserts the intent as this
+//! same reconcile runs at profile load, and the auth key is then what the resulting bring-up
+//! registers with. `AuthKey` alone still enrols a node the operator brings up by hand (`tnet up`
+//! with no key of its own); it is the pair that needs nobody at the keyboard.
+//!
+//! A further key acts on an *answer* rather than on a pref: `AllowedSuggestedExitNodes` is the
+//! administrator's allow-list for exit-node suggestions, resolved as a set by
+//! [`allowed_suggested_exit_nodes`] and applied by [`diag::suggest_exit_node`](super::diag), which
+//! withholds a suggestion the list excludes rather than recommending a node the administrator ruled
+//! out. Go filters *candidates* before the latency ranking and so answers with the best permitted
+//! node; this daemon is handed the engine's already-chosen one, so it can refuse but not re-rank.
+//! The missing half — an allow-list that excludes only the engine's top pick, where Go would answer
+//! with the runner-up — is engine ask #44 in `docs/ENGINE_ASKS.md`; until it lands, the refusal is
+//! reported as a refusal (`withheld_by_policy` on the reply, its own `tnet` notice) rather than as
+//! Go's "no candidate" empty, which it only matches when the permitted set is empty.
+//!
+//! Two consequences worth stating. The applied values are **persisted** into `prefs.json` by
+//! whichever write follows (a profile load applies in memory only and writes nothing, so merely
+//! having a policy file never creates prefs for a never-configured node), which means removing a
+//! policy file later leaves its last values behind as ordinary prefs — Go behaves the same way. And
+//! `tnet syspolicy reload` deliberately does **not** re-apply: Go's JSON store captures the file at
+//! construction and never re-reads it, so a reload cannot produce a different snapshot than the one
+//! already applied, and re-applying would turn a read-only LocalAPI verb into a prefs write for no
+//! observable gain (see the invariant on [`registered_store_settings`]).
 //!
 //! Scope: Go's CLI always resolves `setting.DefaultScope()`, which is the **device scope** on every
-//! non-Windows platform. We record that as the report's scope and do not parameterize it (the CLI
-//! never varies it); profile/user scoping can be added if a real caller ever needs it.
+//! non-Windows platform, and `LoadJSONPolicyFile` registers at `setting.DeviceScope`. We record that
+//! as the report's scope and do not parameterize it (the CLI never varies it); profile/user scoping
+//! can be added if a real caller ever needs it.
+//!
+//! Upstream: `cmd/tailscaled/syspolicy.go`, `util/syspolicy/load.go`,
+//! `util/syspolicy/source/json_policy_store.go`, `util/syspolicy/source/policy_reader.go` and
+//! `util/syspolicy/policy_keys.go` @ `53a0d659afa51835dd7a9283873cca44261454f8`; the apply half is
+//! `ipn/ipnlocal/local.go` (`applySysPolicy`, `applyExitNodeSysPolicyLocked`,
+//! `preferencePolicies`) @ `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`. The reload/change-callback
+//! half — when a re-resolve is allowed to notify watchers — is
+//! `util/syspolicy/rsop/resultant_policy.go` (`Reload`, `reloadNow`) @ the same ref.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+use std::sync::{Mutex, RwLock};
+
+use serde_json::{Map, Value};
+
+use crate::goduration::{format_go_duration, parse_go_duration};
 use crate::localapi::{PolicyReport, PolicySetting};
+use crate::prefs::Prefs;
+
+/// Go `pkey.EncryptState` — the policy key that asks a daemon to encrypt its state file at rest.
+/// Named because `tailnetd` reads it by name (Go's `handleTPMFlags` does the same via
+/// `policyclient.Get().GetBoolean(pkey.EncryptState, false)`), so the spelling has exactly one
+/// definition shared with [`DEFINITIONS`].
+pub const PKEY_ENCRYPT_STATE: &str = "EncryptState";
+
+/// Go `pkey.HardwareAttestation` — the policy key that asks a daemon to bind the node identity to a
+/// hardware-backed key. Read by name for the same reason as [`PKEY_ENCRYPT_STATE`].
+pub const PKEY_HARDWARE_ATTESTATION: &str = "HardwareAttestation";
+
+/// Go `pkey.AllowTailscaledRestart` — the policy key that authorises a LocalAPI caller to stop the
+/// daemon (`shutdown`). Read by name by the server's `shutdown` arm
+/// ([`crate::server::shutdown_verdict`]), exactly as Go's `serveShutdown` reads it via
+/// `polc.GetBoolean(pkey.AllowTailscaledRestart, false)` — so, like [`PKEY_ENCRYPT_STATE`], the
+/// spelling has exactly one definition, shared with [`DEFINITIONS`].
+///
+/// Default **false**: the verb is opt-in, which is the shape the key exists for — an administrator
+/// hands a management agent one specific, auditable power over the daemon without handing it root.
+pub const PKEY_ALLOW_TAILSCALED_RESTART: &str = "AllowTailscaledRestart";
+
+/// Go `pkey.AlwaysOn` — the policy key that forbids disconnecting the node. Read by name by the
+/// disconnect gate ([`alwayson`](super::alwayson)), so — like [`PKEY_ENCRYPT_STATE`] — the spelling
+/// has exactly one definition, shared with [`DEFINITIONS`].
+pub const PKEY_ALWAYS_ON: &str = "AlwaysOn.Enabled";
+
+/// Go `pkey.AlwaysOnOverrideWithReason` — the policy key that lets an operator disconnect an
+/// always-on node by saying why. Read by name for the same reason as [`PKEY_ALWAYS_ON`].
+pub const PKEY_ALWAYS_ON_OVERRIDE_WITH_REASON: &str = "AlwaysOn.OverrideWithReason";
+
+/// Go `pkey.ReconnectAfter` — how long a permitted disconnect may last before the daemon connects
+/// the node again on its own. Read by name by [`reconnect_after`], which is what
+/// [`Backend::down`](super::Backend::down)/[`logout`](super::Backend::logout) arm their reconnect
+/// timer from, so the spelling has exactly one definition, shared with [`DEFINITIONS`].
+pub const PKEY_RECONNECT_AFTER: &str = "ReconnectAfter";
+
+/// Go `pkey.AuthKey` — the policy key carrying the pre-authorized registration credential an
+/// administrator enrols a fleet with. Read by name by [`auth_key`], which is the only consumer, so
+/// — like [`PKEY_ALLOWED_SUGGESTED_EXIT_NODES`] — it stays private to this module; what leaves is
+/// the key itself, as a [`secrecy::SecretString`], never the spelling and never a report row.
+/// Shared with [`DEFINITIONS`] so there is exactly one definition of it.
+const PKEY_AUTH_KEY: &str = "AuthKey";
+
+/// Go `pkey.ExitNodeID` — the policy key that pins the exit node by stable node id. Named because
+/// three call sites read it by name: the apply path below, the gate that refuses an operator's
+/// exit-node edit ([`exitnodepolicy`](super::exitnodepolicy)) and the snapshot that revokes a
+/// standing override ([`exit_node_keys`]). Shared with [`DEFINITIONS`], like [`PKEY_ALWAYS_ON`].
+pub const PKEY_EXIT_NODE_ID: &str = "ExitNodeID";
+
+/// Go `pkey.ExitNodeIP` — the policy key that pins the exit node by IP address, and the only one of
+/// the pair this build can honour (see the module docs). Read by name for the same three reasons as
+/// [`PKEY_EXIT_NODE_ID`].
+pub const PKEY_EXIT_NODE_IP: &str = "ExitNodeIP";
+
+/// Go `pkey.AllowExitNodeOverride` — the policy key that lets a user pick a *different* exit node
+/// than the pinned one. Read by name by [`exitnodepolicy`](super::exitnodepolicy), which is the only
+/// thing it can affect: it moves no pref of its own, it decides whether the refusal above happens.
+///
+/// Default **false**, like Go's, so an administrator who pins an exit node and says nothing else
+/// gets the pin they asked for and not a suggestion.
+pub const PKEY_ALLOW_EXIT_NODE_OVERRIDE: &str = "ExitNode.AllowOverride";
+
+/// Go `pkey.AllowedSuggestedExitNodes` — the policy key naming the exit nodes a managed node may be
+/// steered onto. Read by name by [`allowed_suggested_exit_nodes`], which is the only consumer, so —
+/// unlike the keys above — it stays private to this module; what leaves is the decoded set, not
+/// the spelling. Shared with [`DEFINITIONS`] so there is exactly one definition of it.
+const PKEY_ALLOWED_SUGGESTED_EXIT_NODES: &str = "AllowedSuggestedExitNodes";
 
 /// The scope name the CLI resolves, matching Go `setting.DefaultScope().String()` on non-Windows
 /// hosts (`"Device"`). Centralized so the report and any future scope plumbing agree on the spelling.
 const DEVICE_SCOPE: &str = "Device";
 
+/// The source name `tailnetd` registers the `--syspolicy-file` store under, matching the literal
+/// `cmd/tailscaled` passes to `syspolicy.LoadJSONPolicyFile`. It is user-visible: the Origin column
+/// of `tnet syspolicy list` shows `JSONFile (Device)` for every setting the file supplies.
+pub const JSON_FILE_SOURCE_NAME: &str = "JSONFile";
+
+/// What the Value column shows for a policy setting whose value is a **credential** — today only
+/// `AuthKey`. It is the whole of what leaves the daemon for that key: the row still says the key is
+/// configured and which source configured it, so an administrator can confirm the policy arrived,
+/// but the key itself never reaches the LocalAPI, `tnet syspolicy list`, a `Watch` policy frame or a
+/// log line. See the Reporting a credential section of the module docs.
+const REDACTED: &str = "<redacted>";
+
+/// A policy value that must not be reported, logged or `Debug`-printed — the `AuthKey`.
+///
+/// A newtype rather than a bare `String` so the enclosing [`PolicySource`] can keep its derived
+/// `Debug` (used by tests and by any future diagnostic) without that `Debug` being the leak this
+/// whole change exists to prevent. It renders as [`REDACTED`], exactly like the report row.
+#[derive(Clone, PartialEq, Eq)]
+struct Secret(String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(REDACTED)
+    }
+}
+
+/// A registered policy store's contribution to the effective policy: the settings it resolved,
+/// already rendered into the wire shape the report carries.
+///
+/// The source's *name* is not a field: it is already baked into every setting's `origin` string
+/// (`JSONFile (Device)`), which is where both the CLI's Origin column and any future diagnostic read
+/// it from, so carrying a second copy here would be a value nothing may consult.
+///
+/// Go keeps a live `source.Reader` per store and re-reads it lazily. A [`JSONPolicyStore`-equivalent]
+/// has nothing to re-read — Go's own JSON store "is a read-only snapshot; the underlying map is
+/// captured at construction time and never re-read" — so we capture the resolved settings once, at
+/// registration, and hold those. This also keeps the read path side-effect-free (see the invariant
+/// on [`registered_store_settings`]): answering `syspolicy list` touches no file and no syscall.
+///
+/// [`JSONPolicyStore`-equivalent]: load_json_policy_file
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PolicySource {
+    /// The settings this source resolved, one per configured policy key.
+    settings: Vec<PolicySetting>,
+    /// The **decoded** value of every `StringList` key this source configured, keyed by policy key.
+    ///
+    /// Carried beside the rendered rows because a consumer of a list policy cannot recover the list
+    /// from the row: [`PolicySetting::value`] holds Go's `%v` rendering (`[a b c]`), in which an
+    /// element containing a space is indistinguishable from two elements. For an allow-list that
+    /// difference decides whether a node id the administrator never wrote is admitted, so the
+    /// decoded form is kept rather than re-parsed — see [`configured_string_list`].
+    string_lists: BTreeMap<&'static str, Vec<String>>,
+    /// The **raw** `AuthKey` this source configured, if any — held here rather than in `settings`
+    /// because the row for that key carries [`REDACTED`] instead of its value (see the module docs).
+    /// Read only by [`configured_auth_key`], on the registration path.
+    ///
+    /// Raw, not trimmed: trimming is the *consumer's* rule (Go `strings.TrimSpace` at the point of
+    /// use), and this is the store, which holds what the administrator wrote.
+    auth_key: Option<Secret>,
+}
+
+/// Every registered device-scope policy source, in registration order (Go's `rsop` store list).
+///
+/// Process-global because Go's is: `LoadJSONPolicyFile` is called once from `main` before anything
+/// reads a policy setting, and the LocalAPI handlers ([`Backend::syspolicy_list`]) are static — they
+/// take neither the backend lock nor a receiver, exactly like Go's `rsop.PolicyFor(scope)`.
+///
+/// [`Backend::syspolicy_list`]: crate::ipn::Backend::syspolicy_list
+static REGISTERED: RwLock<Vec<PolicySource>> = RwLock::new(Vec::new());
+
+/// Wakes policy watchers (a masked `Watch` with the `policy` bit) whenever the effective policy may
+/// have moved — Go's `policyclient.RegisterChangeCallback`, which `ipnlocal` hooks per watch session
+/// so `sysPolicyChangedForSession` can push a fresh snapshot into that session's `Notify.Policy`.
+///
+/// A tick channel (`()` payload), not the snapshot itself: a receiver re-reads
+/// [`effective_policy`] on each tick, the same "tick, then re-read the source" pattern the prefs
+/// feed ([`Backend::watch_prefs`]) uses. Re-reading is what makes the notify field carry *exactly*
+/// the rows `syspolicy list` returns — there is one renderer of the snapshot, not two, so any rule
+/// the report later adopts (redaction of a credential-bearing key, say) reaches the notify stream
+/// without a second edit.
+///
+/// Process-global for the same reason [`REGISTERED`] is: the policy registry has no backend
+/// receiver to hang off, and the LocalAPI policy handlers are static.
+///
+/// **What actually ticks it, honestly.** Go registers real change sources (a Windows registry
+/// watcher, a `ReadWriteHandle` a management agent pokes) and its callback fires whenever one of
+/// them moves — but *only* when it moves. `rsop.(*Policy).reloadNow` swaps the fresh merge in and
+/// then invokes the callbacks under `if old != nil && !old.EqualItems(new)`, so a re-resolve that
+/// lands on the same items notifies nobody. That guard is ported as [`reload_and_publish`], which
+/// is the only caller of [`notify_policy_changed`].
+///
+/// This build re-resolves at exactly two points — [`load_json_policy_file`] (a source appears) and
+/// [`reload_effective_policy`] (the operator asked for a forced re-read) — and each ticks only if
+/// the merge it produced differs from the one watchers already hold. The one source this daemon
+/// registers is a JSON file captured at startup and never re-read, so in practice **registration is
+/// the only tick that can fire**: a `syspolicy reload` re-resolves the same rows by construction and
+/// is silent. That is a coarser signal than Go's — a hand edit of `syspolicy.json` is not seen until
+/// the daemon restarts — and the mask bit's documentation says so rather than promising a watch this
+/// build cannot perform. A file watcher would narrow the gap and is deliberately not smuggled in
+/// here.
+///
+/// [`Backend::watch_prefs`]: crate::ipn::Backend::watch_prefs
+static POLICY_CHANGED: std::sync::LazyLock<tokio::sync::watch::Sender<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::watch::channel(()).0);
+
+/// Subscribe to policy-change ticks (a masked `Watch` with the `policy` bit). The receiver re-reads
+/// [`effective_policy`] on each tick. `subscribe()` starts synced (no spurious initial tick), so a
+/// watcher emits its first policy frame from its own initial snapshot, not from this channel —
+/// matching Go, where `NotifySysPolicyChanges` front-loads the snapshot from the initial-state
+/// assembly and the registered callback only carries *subsequent* changes.
+pub fn watch_policy() -> tokio::sync::watch::Receiver<()> {
+    POLICY_CHANGED.subscribe()
+}
+
+/// The effective policy every watcher has already been told about — Go's `Policy.effective`, the
+/// pointer `rsop.(*Policy).reloadNow` swaps before it decides whether to invoke the change
+/// callbacks.
+///
+/// Held beside [`REGISTERED`] rather than replacing it: [`effective_policy`] stays a live merge of
+/// the registered sources, and this is only the "what did watchers last see" half. The invariant
+/// that keeps the two from drifting is that **every mutation of [`REGISTERED`] is followed by a
+/// [`reload_and_publish`]** — today that is the single `push` in [`load_json_policy_file`].
+static LAST_PUBLISHED: Mutex<Vec<PolicySetting>> = Mutex::new(Vec::new());
+
+/// Tell every policy watcher to re-read the snapshot. A failed send (zero receivers) is the common
+/// case — nobody is watching policy — and is not an error.
+///
+/// Called from exactly one place, [`reload_and_publish`], so the "only on an actual change" rule
+/// cannot be bypassed by a future send site.
+fn notify_policy_changed() {
+    let _ = POLICY_CHANGED.send(());
+}
+
+/// Re-resolve the effective policy and tick the policy watchers **only if it moved** — the tail of
+/// Go `rsop.(*Policy).reloadNow`:
+///
+/// ```go
+/// old := p.effective.Swap(new)
+/// if old != nil && !old.EqualItems(new) {
+///     p.changeCallbacks.Invoke(Change[*setting.Snapshot]{New: new, Old: old})
+/// }
+/// ```
+///
+/// Returns the fresh merge, so the caller reports exactly what it published.
+///
+/// `last` (Go's `p.effective`) and `resolve` (Go's `readAndMerge`) are parameters rather than reads
+/// of the process globals, so the rule is testable without touching the registry — the same split
+/// [`allowed_suggestions_in`] and [`auth_key_in`] use. `resolve` runs while `last` is held so two
+/// concurrent reloads cannot publish their snapshots out of order and leave `last` disagreeing with
+/// what watchers were told; Go gets that for free by funnelling every reload through one goroutine.
+/// The lock order is only ever `last` → [`REGISTERED`] (the read `resolve` takes), never the
+/// inverse, so the one writer of `REGISTERED` — which drops its write guard before calling here —
+/// cannot deadlock against it.
+///
+/// **What is compared.** `Vec<PolicySetting>` is the *reported* row set, in which a configured
+/// `AuthKey` renders as `<redacted>` rather than its value; Go's `EqualItems` compares raw snapshot
+/// items. The two can only disagree if a second source registered under the same origin string and
+/// differed from the first *only* in an `AuthKey` value. Exactly one source is ever registered here
+/// (from `main`, once), so that is unreachable; comparing the rows a watcher would actually receive
+/// is the stronger statement while that holds, because it is precisely "would this frame tell the
+/// watcher anything new?". A build that registers a second source should compare the raw
+/// [`PolicySource`] settings instead.
+///
+/// Go's extra `old != nil` guard suppresses the callbacks for the very first resolution of a scope,
+/// which it can do because `p.effective` starts unset. There is no unset state here: this daemon
+/// resolves the device scope from the first instruction (an empty registry merges to an empty
+/// snapshot, which [`effective_policy`] will happily report), so `last` starts as that empty
+/// snapshot and a registration that configures keys is a real empty→non-empty change. That matches
+/// what Go does whenever a `Policy` for the scope already exists when `RegisterStore` runs, and it
+/// is the only reading under which the registration tick is not a lie.
+fn reload_and_publish(
+    last: &Mutex<Vec<PolicySetting>>,
+    resolve: impl FnOnce() -> Vec<PolicySetting>,
+) -> Vec<PolicySetting> {
+    let mut last = last.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let new = resolve();
+    if *last != new {
+        last.clone_from(&new);
+        notify_policy_changed();
+    }
+    new
+}
+
+/// What [`load_json_policy_file`] did, so the caller can log it honestly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadOutcome {
+    /// The file does not exist. Nothing was registered and this is **not** an error: Go returns nil
+    /// for `fs.ErrNotExist`, so the stock default path being absent is the silent, normal case.
+    NoFile,
+    /// The file parsed and validated, and its settings are now registered as a device-scope source.
+    Registered {
+        /// How many policy settings the file supplied (the row count `syspolicy list` will show).
+        settings: usize,
+    },
+}
+
+/// Load the JSON policy file at `path` and register its settings as a device-scope policy source
+/// under `source_name` — Go `syspolicy.LoadJSONPolicyFile` (`util/syspolicy/load.go`), the body of
+/// `tailscaled --syspolicy-file`.
+///
+/// Faithful to Go's three outcomes:
+/// - **absent file** → [`LoadOutcome::NoFile`], no source registered, no error. The default path
+///   ships empty on most hosts, so this is the common case and must stay quiet.
+/// - **readable, well-formed, valid** → the settings are read once and registered.
+/// - **anything else** → an error describing the whole problem. Malformed JSON, a non-object
+///   document, an unknown policy key, or a value that cannot be decoded as its key's registered type
+///   all surface *here*, at startup, rather than at first use — and **nothing is registered**, so a
+///   half-valid file never applies half its settings. The caller (`tailnetd`) logs the error and
+///   keeps running: a bad policy file must not stop the daemon from coming up.
+///
+/// The error strings are Go's shapes, including its doubled prefix on a parse failure
+/// (`syspolicy: loading <path>: syspolicy: parsing JSON: …`) — Go wraps the store constructor's
+/// already-prefixed error, and reproducing that is the point of a port. The one unavoidable
+/// divergence is the text of an OS-level read failure, which comes from Rust's `io::Error`
+/// (`Permission denied (os error 13)`) rather than Go's (`open …: permission denied`).
+pub fn load_json_policy_file(source_name: &str, path: &Path) -> Result<LoadOutcome, String> {
+    let data = match std::fs::read(path) {
+        Ok(data) => data,
+        // Go: `if errors.Is(err, fs.ErrNotExist) { return nil }` — an absent file disables the
+        // source without complaint, which is what makes a default path safe to ship.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(LoadOutcome::NoFile),
+        Err(e) => return Err(format!("syspolicy: loading {}: {e}", path.display())),
+    };
+    let store = parse_json_store(&data)
+        .map_err(|e| format!("syspolicy: loading {}: {e}", path.display()))?;
+    if let Err(problems) = validate(&store) {
+        return Err(format!(
+            "syspolicy: invalid {}:\n{problems}",
+            path.display()
+        ));
+    }
+
+    // Validation passed, so every key is known and every value decodes; read the snapshot once and
+    // register it. (Go's `rsop.RegisterStore` can fail; ours cannot — there is no reader to
+    // construct and no store to lock — so there is no third error shape to port here.)
+    let source = read_source(&store, source_name);
+    let count = source.settings.len();
+    REGISTERED
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(source);
+    // A source appeared: re-resolve, and tick if that moved the effective policy for anyone holding
+    // an older snapshot (it does whenever the file configured at least one key). The `REGISTERED`
+    // write guard above is dropped by the end of that statement, so the read `reload_and_publish`
+    // takes is not nested inside it. Nothing is watching at daemon start (this runs from `main`
+    // before the LocalAPI is served), so this is for the sake of the invariant rather than any
+    // current caller — every mutation of `REGISTERED` is published, so a watcher can never silently
+    // miss one.
+    reload_and_publish(&LAST_PUBLISHED, registered_store_settings);
+    Ok(LoadOutcome::Registered { settings: count })
+}
+
 /// Resolve the effective system policy (the `tnet syspolicy list` path; Go
 /// `LocalClient.GetEffectivePolicy(DefaultScope())` → `rsop.PolicyFor(scope).Get()`).
 ///
-/// Returns the merge of all registered policy stores for the device scope. This daemon (like Go on
-/// Linux/Unix) registers **zero** stores, so the result is always an empty-but-valid snapshot:
-/// `settings` is empty and the CLI prints "No policy settings". Never errors.
+/// Returns the merge of all registered policy stores for the device scope: empty (and the CLI prints
+/// "No policy settings") on a daemon started with no `--syspolicy-file`, or with one naming a file
+/// that does not exist or failed to load. Never errors.
 pub(super) fn effective_policy() -> PolicyReport {
     PolicyReport {
         scope: DEVICE_SCOPE.to_string(),
@@ -45,26 +518,30 @@ pub(super) fn effective_policy() -> PolicyReport {
 /// `LocalClient.ReloadEffectivePolicy(DefaultScope())` → `rsop.PolicyFor(scope).Reload()`).
 ///
 /// Go's `reload` forces a full re-read + re-merge of every registered source even when nothing
-/// changed. With zero registered stores the forced re-read re-merges nothing, so `reload` yields the
-/// same empty snapshot as [`effective_policy`] — observationally identical here, but kept a distinct
-/// verb (faithful to Go, and the place a real re-read would happen the moment a source is
-/// registered). Never errors.
+/// changed. For the JSON file source that is observationally identical to [`effective_policy`], and
+/// deliberately so: Go's `JSONPolicyStore` captures the file's contents at construction and never
+/// re-reads them, so `tailscale syspolicy reload` does **not** pick up an edit made to
+/// `syspolicy.json` after the daemon started — only a restart does. Kept a distinct verb (faithful
+/// to Go, and the place a genuinely re-readable source would be re-read). Never errors.
+///
+/// It pushes the re-read snapshot to every policy watcher (see [`POLICY_CHANGED`]) **only if that
+/// snapshot differs from the one they already hold**, which is Go's contract: `reloadNow` invokes
+/// the change callbacks under `if old != nil && !old.EqualItems(new)`, so `Policy.Reload()` over an
+/// unchanged store notifies nobody. For this build's single source — a JSON file captured at
+/// registration — the re-read *always* resolves the same rows, so a `tnet syspolicy reload` is
+/// silent on the notify bus by construction. That is the honest answer: `Notify.Policy` says the
+/// effective policy CHANGED, and a frame carrying the rows a watcher already has asserts the
+/// opposite of what receiving it would imply.
 pub(super) fn reload_effective_policy() -> PolicyReport {
-    // No registered stores → the forced re-read has nothing to re-read; the merge is empty. The two
-    // verbs diverge only once a source exists (this is where the source would be re-read).
+    // The forced re-read re-merges the registered sources; none of them can have changed underneath
+    // us, because each captured its settings at registration (see `PolicySource`).
     PolicyReport {
         scope: DEVICE_SCOPE.to_string(),
-        settings: registered_store_settings(),
+        settings: reload_and_publish(&LAST_PUBLISHED, registered_store_settings),
     }
 }
 
 /// The merged settings from every registered policy store, for the device scope.
-///
-/// EMPTY on this platform: no policy store is registered. (Go registers a store only in
-/// `syspolicy_windows.go`; its in-tree `EnvPolicyStore` is never registered by default, so we read
-/// no env/file source either.) This is the single seam a future managed-platform source would
-/// extend — it returns the contributed settings, which the snapshot then carries through the
-/// LocalAPI to the CLI unchanged.
 ///
 /// INVARIANT for any future store wired in here: reading/reloading it MUST be side-effect-free. The
 /// `syspolicy list`/`reload` LocalAPI is classified read-only (`auth::requires_write` → false,
@@ -72,36 +549,3030 @@ pub(super) fn reload_effective_policy() -> PolicyReport {
 /// performs an observable action (writes a cache as the daemon's uid, fetches over the network,
 /// spawns a helper), that classification becomes too weak — a non-owner read-only caller could drive
 /// the side effect. In that case, reclassify `Request::SyspolicyReload` (at least) as a write in
-/// `auth.rs` before wiring the store.
+/// `auth.rs` before wiring the store. The JSON file source satisfies the invariant by construction:
+/// the file is read exactly once, at startup, on the daemon's own initiative.
 fn registered_store_settings() -> Vec<PolicySetting> {
-    Vec::new()
+    merge(
+        &REGISTERED
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    )
+}
+
+/// Merge registered sources into one device-scope setting list, **last registration wins per key**
+/// (Go's `rsop` layering — see the Precedence section in the module docs), with the result sorted by
+/// key so the report is stable regardless of registration or definition order.
+fn merge(sources: &[PolicySource]) -> Vec<PolicySetting> {
+    let mut by_key: BTreeMap<&str, &PolicySetting> = BTreeMap::new();
+    for source in sources {
+        for setting in &source.settings {
+            by_key.insert(setting.key.as_str(), setting);
+        }
+    }
+    by_key.into_values().cloned().collect()
+}
+
+// ---------------------------------------------------------------------------------------------
+// The JSON policy store (Go `util/syspolicy/source/json_policy_store.go`).
+// ---------------------------------------------------------------------------------------------
+
+/// The type a policy key's value must decode as — Go's `setting.Type` restricted to the variants
+/// this fork's definition table actually uses.
+///
+/// Go additionally has `IntegerValue` (read via `Store.ReadUInt64`). No key in
+/// `implicitDefinitions` is declared with it at the pinned ref, so a variant here would be
+/// permanently unconstructible; it is omitted rather than carried as dead code, and adding it is a
+/// one-line change the day upstream declares an integer policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueType {
+    /// JSON `true`/`false` (Go `setting.BooleanValue`).
+    Boolean,
+    /// A JSON string (Go `setting.StringValue`).
+    String,
+    /// A JSON array of strings (Go `setting.StringListValue`).
+    StringList,
+    /// A JSON string, one of `always` / `never` / `user-decides` (Go
+    /// `setting.PreferenceOptionValue`).
+    PreferenceOption,
+    /// A JSON string, one of `show` / `hide` (Go `setting.VisibilityValue`).
+    Visibility,
+    /// A JSON string in Go's `time.ParseDuration` grammar, e.g. `24h` (Go
+    /// `setting.DurationValue`).
+    Duration,
+}
+
+impl ValueType {
+    /// The JSON type name Go's `%T` prints for a value of this setting type, used in the
+    /// `want <type>` half of a type-mismatch message. Every one of these is read out of the document
+    /// as a JSON string except a boolean and a list.
+    fn wanted_json_type(self) -> &'static str {
+        match self {
+            ValueType::Boolean => "bool",
+            ValueType::StringList => "array",
+            _ => "string",
+        }
+    }
+}
+
+/// One registered policy setting definition — Go's `setting.Definition`, reduced to the two fields
+/// that matter here.
+///
+/// Go's third field, the setting's scope (`DeviceSetting` / `UserSetting`), is deliberately not
+/// modelled: `source.Reader` skips a definition only when `origin.Scope().IsConfigurableSetting` is
+/// false, and that test is `setting.Scope() >= scope.Kind()`, which is true for **every** definition
+/// at the device scope. Since this daemon only ever resolves the device scope, carrying the field
+/// would add a value that nothing may branch on.
+#[derive(Debug, Clone, Copy)]
+struct Definition {
+    /// The policy key as it is spelled in the file and in the report's Name column (Go `pkey.Key` —
+    /// note these are frequently *not* the Go constant's name: `ControlURL` is `"LoginURL"`).
+    key: &'static str,
+    /// The type its value must decode as.
+    ty: ValueType,
+}
+
+/// Shorthand for one row of [`DEFINITIONS`].
+const fn def(key: &'static str, ty: ValueType) -> Definition {
+    Definition { key, ty }
+}
+
+/// Every policy key this daemon recognises — a direct port of Go's `implicitDefinitions`
+/// (`util/syspolicy/policy_keys.go`), with the key strings from `util/syspolicy/pkey/pkey.go`.
+///
+/// This table is what makes an unknown key an error instead of a silent typo: Go's `Validate`
+/// rejects any key not in it, so `{"Hostnmae": "x"}` refuses the whole file at startup rather than
+/// leaving the admin to wonder why the policy has no effect. The order is Go's (device settings
+/// first, then user settings); the report is sorted by key at merge time, so it does not matter to
+/// output.
+const DEFINITIONS: &[Definition] = &[
+    // Device policy settings (configurable only on a per-device basis in Go).
+    def(PKEY_ALLOWED_SUGGESTED_EXIT_NODES, ValueType::StringList),
+    def(PKEY_ALLOW_EXIT_NODE_OVERRIDE, ValueType::Boolean),
+    def(PKEY_ALLOW_TAILSCALED_RESTART, ValueType::Boolean),
+    def(PKEY_ALWAYS_ON, ValueType::Boolean),
+    def(PKEY_ALWAYS_ON_OVERRIDE_WITH_REASON, ValueType::Boolean),
+    def("InstallUpdates", ValueType::PreferenceOption),
+    def(PKEY_AUTH_KEY, ValueType::String),
+    def("CheckUpdates", ValueType::PreferenceOption),
+    def("LoginURL", ValueType::String),
+    def("DeviceSerialNumber", ValueType::String),
+    def("EnableDNSRegistration", ValueType::PreferenceOption),
+    def("AllowIncomingConnections", ValueType::PreferenceOption),
+    def("AdvertiseExitNode", ValueType::PreferenceOption),
+    def("UnattendedMode", ValueType::PreferenceOption),
+    def("UseTailscaleDNSSettings", ValueType::PreferenceOption),
+    def("UseTailscaleSubnets", ValueType::PreferenceOption),
+    def("ExitNodeAllowLANAccess", ValueType::PreferenceOption),
+    def(PKEY_EXIT_NODE_ID, ValueType::String),
+    def(PKEY_EXIT_NODE_IP, ValueType::String),
+    def("FlushDNSOnSessionUnlock", ValueType::Boolean),
+    def(PKEY_ENCRYPT_STATE, ValueType::Boolean),
+    def("Hostname", ValueType::String),
+    def("LogSCMInteractions", ValueType::Boolean),
+    def("LogTarget", ValueType::String),
+    def("MachineCertificateSubject", ValueType::String),
+    def("PostureChecking", ValueType::PreferenceOption),
+    def(PKEY_RECONNECT_AFTER, ValueType::Duration),
+    def("Tailnet", ValueType::String),
+    def(PKEY_HARDWARE_ATTESTATION, ValueType::Boolean),
+    // User policy settings (configurable on a user- or device-basis; all of them are configurable
+    // at the device scope, which is the only scope this daemon resolves).
+    def("AdminConsole", ValueType::Visibility),
+    def("ApplyUpdates", ValueType::Visibility),
+    def("ExitNodesPicker", ValueType::Visibility),
+    def("KeyExpirationNotice", ValueType::Duration),
+    def("ManagedByCaption", ValueType::String),
+    def("ManagedByOrganizationName", ValueType::String),
+    def("ManagedByURL", ValueType::String),
+    def("NetworkDevices", ValueType::Visibility),
+    def("PreferencesMenu", ValueType::Visibility),
+    def("ResetToDefaults", ValueType::Visibility),
+    def("RunExitNode", ValueType::Visibility),
+    def("SuggestedExitNode", ValueType::Visibility),
+    def("TestMenu", ValueType::Visibility),
+    def("UpdateMenu", ValueType::Visibility),
+    def("OnboardingFlow", ValueType::Visibility),
+];
+
+/// The definition registered for `key`, or `None` if the key is not a known policy setting — Go's
+/// `setting.DefinitionOf` lookup inside `Validate`.
+fn definition_of(key: &str) -> Option<&'static Definition> {
+    DEFINITIONS.iter().find(|d| d.key == key)
+}
+
+/// Read a boolean policy setting from the effective device-scope policy — Go
+/// `syspolicy.GetBoolean(key, defaultValue)`, which `cmd/tailscaled` calls as
+/// `policyclient.Get().GetBoolean(pkey.EncryptState, false)`.
+///
+/// `default` is returned whenever Go would return its own default: the key is not configured by any
+/// registered source (Go's not-configured branch), the key is not a registered *boolean* definition
+/// (Go's `ErrTypeMismatch`), or the setting resolved to an error instead of a value. Go's signature
+/// is `(bool, error)` and every `cmd/tailscaled` caller discards the error and keeps the default, so
+/// the error is folded into the default here rather than handed to a caller that would drop it.
+///
+/// Side-effect-free, like every other read of the registered stores — see the invariant on
+/// [`registered_store_settings`].
+pub fn get_boolean(key: &str, default: bool) -> bool {
+    boolean_setting(&registered_store_settings(), key, default)
+}
+
+/// The decision behind [`get_boolean`], over an already-merged setting list so it is testable
+/// without touching the process-global registry.
+///
+/// The definition-table check is not redundant with the lookup: it is Go's `ErrTypeMismatch` guard,
+/// and it is what stops a caller asking for `GetBoolean("Hostname", …)` from getting a value parsed
+/// out of a string setting's rendered form.
+fn boolean_setting(settings: &[PolicySetting], key: &str, default: bool) -> bool {
+    // A row carrying an error has no value; Go reports the error and the caller keeps the default,
+    // which is what folding `None` into `default` does here.
+    configured_boolean(settings, key).unwrap_or(default)
+}
+
+/// The value of boolean policy `key`, or `None` when it is **not configured** by any registered
+/// source (Go's `ErrNotConfigured`), is not a registered *boolean* definition (Go's
+/// `ErrTypeMismatch`), or resolved to an error instead of a value.
+///
+/// Distinguishing "not configured" from a configured `false` is what [`apply_settings_to_prefs`]
+/// needs and [`boolean_setting`] does not — Go's `GetBoolean` collapses the two into its caller's
+/// default, which is the right answer for `EncryptState` and the wrong one for `AlwaysOn.Enabled`.
+fn configured_boolean(settings: &[PolicySetting], key: &str) -> Option<bool> {
+    if !matches!(definition_of(key), Some(d) if d.ty == ValueType::Boolean) {
+        return None;
+    }
+    settings
+        .iter()
+        .find(|s| s.key == key)?
+        .value
+        .as_deref()?
+        .parse::<bool>()
+        .ok()
+}
+
+/// The value of string policy `key`, or `None` when it is not configured, is not a registered
+/// *string* definition, or resolved to an error — Go `syspolicy.GetString`'s configured branch.
+///
+/// A configured **empty** string is `Some("")`, not `None`: the two mean opposite things for
+/// `Hostname` (see the tri-state note in the module docs), so the distinction cannot be collapsed.
+fn configured_string<'a>(settings: &'a [PolicySetting], key: &str) -> Option<&'a str> {
+    if !matches!(definition_of(key), Some(d) if d.ty == ValueType::String) {
+        return None;
+    }
+    settings.iter().find(|s| s.key == key)?.value.as_deref()
+}
+
+/// The value of preference-option policy `key`, or `None` when it is not configured, is not a
+/// registered *`PreferenceOption`* definition, or resolved to an error — Go
+/// `syspolicy.GetPreferenceOption`'s configured branch.
+fn configured_preference(settings: &[PolicySetting], key: &str) -> Option<PreferenceOption> {
+    if !matches!(definition_of(key), Some(d) if d.ty == ValueType::PreferenceOption) {
+        return None;
+    }
+    Some(PreferenceOption::parse(
+        settings.iter().find(|s| s.key == key)?.value.as_deref()?,
+    ))
+}
+
+/// The value of duration policy `key` in **nanoseconds** (Go's `time.Duration` representation), or
+/// `None` when it is not configured, is not a registered *duration* definition, or resolved to an
+/// error — Go `syspolicy.GetDuration`'s configured branch.
+///
+/// The row's value is already the canonical `Duration.String()` rendering (`"60m"` in the file is
+/// stored as `1h0m0s` — see [`read_value`]), which is itself in `time.ParseDuration`'s grammar, so
+/// parsing it back is exact. It cannot fail for a row that loaded, because [`validate`] parsed the
+/// same text at load time; a failure would mean the renderer and the parser disagree, and folding it
+/// into `None` keeps that a silent default rather than a panic.
+fn configured_duration(settings: &[PolicySetting], key: &str) -> Option<i64> {
+    if !matches!(definition_of(key), Some(d) if d.ty == ValueType::Duration) {
+        return None;
+    }
+    let value = settings.iter().find(|s| s.key == key)?.value.as_deref()?;
+    parse_go_duration(value).ok()
+}
+
+/// How long a permitted disconnect may last before the node reconnects itself, or `None` when the
+/// administrator configured no bound — Go's `b.polc.GetDuration(pkey.ReconnectAfter, 0)` together
+/// with the `reconnectAfter > 0` guard `onEditPrefsLocked` applies to it
+/// (`ipn/ipnlocal/local.go`).
+///
+/// The guard is folded in here rather than left to the caller because the answer a caller wants is
+/// "is there a bound, and what is it" — and `0` (the Go default) and a negative duration are the
+/// same answer: no. That also makes the return a [`std::time::Duration`], which cannot represent the
+/// negative value the policy file is free to contain.
+///
+/// Side-effect-free, like every other read of the registered stores — see the invariant on
+/// [`registered_store_settings`].
+pub(super) fn reconnect_after() -> Option<std::time::Duration> {
+    reconnect_after_in(&registered_store_settings())
+}
+
+/// The decision behind [`reconnect_after`], over an already-merged setting list so it is testable
+/// without the process-global registry (the same split [`get_boolean`] uses).
+fn reconnect_after_in(settings: &[PolicySetting]) -> Option<std::time::Duration> {
+    let ns = configured_duration(settings, PKEY_RECONNECT_AFTER)?;
+    // Go: `if reconnectAfter > 0`. A zero or negative `ReconnectAfter` is not a bound.
+    let ns = u64::try_from(ns).ok().filter(|ns| *ns > 0)?;
+    Some(std::time::Duration::from_nanos(ns))
+}
+
+/// The two always-on policy keys as they are currently configured — the snapshot Go compares in
+/// `sysPolicyChanged` (`policy.HasChangedAnyOf(pkey.AlwaysOn, pkey.AlwaysOnOverrideWithReason)`)
+/// to decide whether an outstanding always-on override is still the one the administrator granted.
+///
+/// Tri-state per key (`None` = not configured), because "unset" and "set to false" are different
+/// policies: going from unset to `false` is a change an administrator made, and Go's change
+/// notification carries it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct AlwaysOnKeys {
+    /// [`PKEY_ALWAYS_ON`] as configured, or `None` when no source sets it.
+    pub enabled: Option<bool>,
+    /// [`PKEY_ALWAYS_ON_OVERRIDE_WITH_REASON`] as configured, or `None` when no source sets it.
+    pub override_with_reason: Option<bool>,
+}
+
+/// Read the current [`AlwaysOnKeys`] from the registered stores — the input to
+/// [`Backend::sys_policy_changed`](super::Backend::sys_policy_changed).
+///
+/// Side-effect-free, like every other read of the registered stores — see the invariant on
+/// [`registered_store_settings`].
+pub(super) fn always_on_keys() -> AlwaysOnKeys {
+    always_on_keys_in(&registered_store_settings())
+}
+
+/// The decision behind [`always_on_keys`], over an already-merged setting list so it is testable
+/// without the process-global registry.
+fn always_on_keys_in(settings: &[PolicySetting]) -> AlwaysOnKeys {
+    AlwaysOnKeys {
+        enabled: configured_boolean(settings, PKEY_ALWAYS_ON),
+        override_with_reason: configured_boolean(settings, PKEY_ALWAYS_ON_OVERRIDE_WITH_REASON),
+    }
+}
+
+/// Parse the policy file's bytes into its top-level object — Go
+/// `source.NewJSONPolicyStoreFromBytes`.
+///
+/// **Standard JSON only.** Go accepts HuJSON (comments, trailing commas) when that feature is linked
+/// into the build; this fork omits HuJSON for the declarative `--config` file too (see
+/// `conffile::load`), and staying consistent beats supporting one dialect in one file type. A
+/// comment in the policy file is therefore a load error, not a silently ignored line.
+///
+/// A JSON `null` document decodes to an empty store rather than an error, matching Go: `null`
+/// unmarshals into a nil map, which reads as "no keys configured".
+fn parse_json_store(data: &[u8]) -> Result<Map<String, Value>, String> {
+    let parsed: Value =
+        serde_json::from_slice(data).map_err(|e| format!("syspolicy: parsing JSON: {e}"))?;
+    match parsed {
+        Value::Object(map) => Ok(map),
+        Value::Null => Ok(Map::new()),
+        other => Err(format!(
+            "syspolicy: parsing JSON: cannot unmarshal {} into a policy object",
+            go_type_name(&other)
+        )),
+    }
+}
+
+/// The name Go's `%T` prints for a value decoded out of a JSON document by `encoding/json` with
+/// `UseNumber` — used verbatim in the type-mismatch messages, so a mistyped policy value reads the
+/// same here as it does from `tailscaled`.
+fn go_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "<nil>",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "json.Number",
+        Value::String(_) => "string",
+        Value::Array(_) => "[]interface {}",
+        Value::Object(_) => "map[string]interface {}",
+    }
+}
+
+/// Go's `%q` on a string: double-quoted with escapes. Rust's `{:?}` agrees with Go for the
+/// characters a policy key or value realistically contains.
+///
+/// `pub(super)` because the always-on audit record renders Go's `%q` over a profile name and a
+/// username too ([`alwayson`](super::alwayson)), and two spellings of "Go's %q" would be one
+/// spelling too many.
+pub(super) fn quoted(s: &str) -> String {
+    format!("{s:?}")
+}
+
+/// Check that every key in the parsed document is a known policy setting and that its value decodes
+/// as that setting's type — Go `JSONPolicyStore.Validate`.
+///
+/// Every problem is reported, not just the first: Go joins them with `errors.Join` (one per line) so
+/// an admin fixes the whole file in one pass instead of one startup per mistake. Keys are visited in
+/// sorted order — Go sorts explicitly, and `serde_json::Map` is a `BTreeMap`, so iteration already
+/// is — which makes the message deterministic.
+///
+/// Stricter than a plain read for the two enum-like types, exactly as Go is: `PreferenceOption` and
+/// `Visibility` coerce an unrecognised string to a default when *read*, which would silently turn a
+/// misspelled `"alwyas"` into `user-decides`, so validation checks the raw string instead.
+fn validate(store: &Map<String, Value>) -> Result<(), String> {
+    let mut problems: Vec<String> = Vec::new();
+    for (key, value) in store {
+        let Some(def) = definition_of(key) else {
+            problems.push(format!("unknown policy setting {}", quoted(key)));
+            continue;
+        };
+        let outcome = match def.ty {
+            ValueType::PreferenceOption => validate_enum(
+                value,
+                key,
+                &["always", "never", "user-decides"],
+                "PreferenceOption",
+                r#"("always", "never", or "user-decides")"#,
+            ),
+            ValueType::Visibility => validate_enum(
+                value,
+                key,
+                &["show", "hide"],
+                "Visibility",
+                r#"("show" or "hide")"#,
+            ),
+            _ => read_value(value, key, def.ty).map(|_| ()),
+        };
+        if let Err(problem) = outcome {
+            problems.push(format!("{}: {problem}", quoted(key)));
+        }
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("\n"))
+    }
+}
+
+/// The strict half of [`validate`] for Go's two enum-like setting types: the value must be a string
+/// **and** one of the listed spellings, because their `UnmarshalText` never fails and would
+/// otherwise turn a typo into a default at read time.
+fn validate_enum(
+    value: &Value,
+    key: &str,
+    allowed: &[&str],
+    type_name: &str,
+    allowed_text: &str,
+) -> Result<(), String> {
+    let s = as_string(value, key)?;
+    if allowed.contains(&s.as_str()) {
+        return Ok(());
+    }
+    Err(format!(
+        "type mismatch: {} is not a valid {type_name} {allowed_text}",
+        quoted(&s)
+    ))
+}
+
+/// Read `value` as the type `ty` requires and render it the way Go's `%v` would print the decoded
+/// value — the Value column of `syspolicy list`.
+///
+/// Go splits this across `Store.Read*` (which decodes) and `printPolicySettings` (which prints with
+/// `%v`); the two are joined here because the report's wire type carries the value as a string.
+/// The renderings are Go's: a `[]string` prints as `[a b c]`, a `time.Duration` as
+/// `Duration.String()` (`24h` in the file becomes `24h0m0s`), and the enum-like types as their
+/// `String()` spelling.
+fn read_value(value: &Value, key: &str, ty: ValueType) -> Result<String, String> {
+    match ty {
+        ValueType::Boolean => match value.as_bool() {
+            Some(b) => Ok(b.to_string()),
+            None => Err(type_mismatch(key, value, ty)),
+        },
+        ValueType::String => as_string(value, key),
+        ValueType::StringList => {
+            let Some(items) = value.as_array() else {
+                return Err(type_mismatch(key, value, ty));
+            };
+            let mut out: Vec<&str> = Vec::with_capacity(items.len());
+            for (i, item) in items.iter().enumerate() {
+                match item.as_str() {
+                    Some(s) => out.push(s),
+                    // Go names the offending index: `"K"[1] is bool, want string`.
+                    None => {
+                        return Err(format!(
+                            "type mismatch: {}[{i}] is {}, want string",
+                            quoted(key),
+                            go_type_name(item)
+                        ));
+                    }
+                }
+            }
+            // Go's `%v` of a `[]string`: elements space-separated inside square brackets.
+            Ok(format!("[{}]", out.join(" ")))
+        }
+        // Go's `UnmarshalText` for these two never fails; an unrecognised spelling becomes the
+        // default. Validation has already refused any such spelling, so the coercion is unreachable
+        // through the load path — it is kept because it is what Go does at read time.
+        ValueType::PreferenceOption => Ok(match as_string(value, key)?.as_str() {
+            "always" => "always",
+            "never" => "never",
+            _ => "user-decides",
+        }
+        .to_string()),
+        ValueType::Visibility => Ok(match as_string(value, key)?.as_str() {
+            "hide" => "hide",
+            _ => "show",
+        }
+        .to_string()),
+        ValueType::Duration => {
+            let s = as_string(value, key)?;
+            // Go hands the raw string to `time.ParseDuration` and reports its error verbatim, so a
+            // bad duration reads `time: unknown unit "d" in duration "7d"`.
+            Ok(format_go_duration(parse_go_duration(&s)?))
+        }
+    }
+}
+
+/// Read `value` as a JSON string or produce Go's `want string` mismatch — the shared front half of
+/// every string-shaped setting type.
+fn as_string(value: &Value, key: &str) -> Result<String, String> {
+    match value.as_str() {
+        Some(s) => Ok(s.to_string()),
+        None => Err(type_mismatch(key, value, ValueType::String)),
+    }
+}
+
+/// Go's type-mismatch text: `type mismatch: "Hostname" is bool, want string`, where `type mismatch`
+/// is `setting.ErrTypeMismatch`'s message, the key is `%q`-quoted and the actual type is `%T`.
+fn type_mismatch(key: &str, value: &Value, ty: ValueType) -> String {
+    format!(
+        "type mismatch: {} is {}, want {}",
+        quoted(key),
+        go_type_name(value),
+        ty.wanted_json_type()
+    )
+}
+
+/// Resolve the whole definition table against a validated store — Go `source.Reader.reload`.
+///
+/// One entry per *configured* key: a definition the document does not mention is skipped (Go's
+/// `ErrNotConfigured` branch), which is what keeps `syspolicy list` showing the admin's file rather
+/// than 44 rows of defaults. A per-key read error would be carried in the row's Error column rather
+/// than dropping the row — Go's behaviour — though the load path cannot produce one, because
+/// [`validate`] already refused every value this could fail on.
+fn read_settings(store: &Map<String, Value>, source_name: &str) -> Vec<PolicySetting> {
+    // Go `setting.Origin.String()`: `<name> (<scope>)`, e.g. `JSONFile (Device)`.
+    let origin = format!("{source_name} ({DEVICE_SCOPE})");
+    let mut out = Vec::new();
+    for def in DEFINITIONS {
+        let Some(value) = store.get(def.key) else {
+            continue;
+        };
+        let (value, error) = match read_value(value, def.key, def.ty) {
+            // The one key whose value is a credential. It is still read (so a mistyped value
+            // produces the same Error row as any other key) and then thrown away: the row reports
+            // that the administrator configured an auth key and where it came from, never the key.
+            // The usable copy lives in `PolicySource::auth_key`, which no report can reach.
+            Ok(_) if def.key == PKEY_AUTH_KEY => (Some(REDACTED.to_string()), None),
+            Ok(rendered) => (Some(rendered), None),
+            Err(text) => (None, Some(text)),
+        };
+        out.push(PolicySetting {
+            key: def.key.to_string(),
+            origin: origin.clone(),
+            value,
+            error,
+        });
+    }
+    out
+}
+
+/// Resolve a validated store into the source this daemon registers: the rendered rows
+/// [`effective_policy`] reports, plus the decoded lists a policy *consumer* reads (see
+/// [`PolicySource::string_lists`]).
+fn read_source(store: &Map<String, Value>, source_name: &str) -> PolicySource {
+    PolicySource {
+        settings: read_settings(store, source_name),
+        string_lists: read_string_lists(store),
+        auth_key: read_auth_key(store),
+    }
+}
+
+/// Decode the configured `AuthKey` — the typed half of [`read_source`] for the one key whose
+/// rendered row is [`REDACTED`], so the value has to be carried out of band or lost.
+///
+/// A non-string value is **skipped** (no key configured) for the same reason
+/// [`read_string_lists`] skips an undecodable list: the row already reports the type mismatch, and
+/// inventing a credential out of a malformed value is the one thing this must never do.
+/// [`validate`] refuses such a document outright before this runs.
+fn read_auth_key(store: &Map<String, Value>) -> Option<Secret> {
+    Some(Secret(store.get(PKEY_AUTH_KEY)?.as_str()?.to_string()))
+}
+
+/// Decode every configured `StringList` key — the typed half of [`read_source`].
+///
+/// A key the document does not mention is absent from the map (Go's `ErrNotConfigured`), and a key
+/// whose value is not an array of strings is **skipped** rather than recorded as an empty list: Go's
+/// `GetStringArray` hands its caller an error, and `fillAllowedSuggestions` turns that into a nil
+/// set — i.e. *no restriction*, not *nothing is allowed*. Recording an empty list here would invert
+/// that, so an undecodable value must read as unset. [`validate`] refuses such a document outright
+/// before this runs, so the skip is unreachable through the load path; it is kept because it is the
+/// behaviour Go falls back to.
+fn read_string_lists(store: &Map<String, Value>) -> BTreeMap<&'static str, Vec<String>> {
+    let mut out = BTreeMap::new();
+    for def in DEFINITIONS.iter().filter(|d| d.ty == ValueType::StringList) {
+        let Some(Value::Array(items)) = store.get(def.key) else {
+            continue;
+        };
+        let decoded: Option<Vec<String>> = items
+            .iter()
+            .map(|item| item.as_str().map(str::to_string))
+            .collect();
+        if let Some(values) = decoded {
+            out.insert(def.key, values);
+        }
+    }
+    out
+}
+
+/// The exit nodes the administrator permits this node to be **steered onto** — Go
+/// `LocalBackend.getAllowedSuggestions()`, over the set `fillAllowedSuggestions` builds from
+/// `AllowedSuggestedExitNodes` (`ipn/ipnlocal/local.go`).
+///
+/// `None` is **no restriction**; `Some(set)` is *only* these stable node ids, and that includes
+/// `Some(empty)` — a configured empty array, which permits nothing. The distinction is load bearing
+/// and it is Go's: `fillAllowedSuggestions` returns a nil set when the key is unset (and when
+/// reading it fails), and the candidate filter is written `if allowList != nil &&
+/// !allowList.Contains(peer.StableID())`, so nil means allow-all while an empty set means deny-all.
+/// Collapsing the two would make every node with no policy file one that can never be suggested an
+/// exit node.
+///
+/// Read by [`diag::suggest_exit_node`](super::diag), which refuses to hand back a suggestion outside
+/// the set. Side-effect-free, like every other read of the registered stores — see the invariant on
+/// [`registered_store_settings`].
+pub(super) fn allowed_suggested_exit_nodes() -> Option<BTreeSet<String>> {
+    allowed_suggestions_in(
+        &REGISTERED
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    )
+}
+
+/// The decision behind [`allowed_suggested_exit_nodes`], over a source list so it is testable
+/// without touching the process-global registry.
+///
+/// Go stores the set on the backend and rebuilds it from `sysPolicyChanged`; there is nothing to
+/// cache here because this daemon's only policy source captures its contents at registration and can
+/// never change underneath us (see [`PolicySource`]), so the set is derived on each read.
+fn allowed_suggestions_in(sources: &[PolicySource]) -> Option<BTreeSet<String>> {
+    Some(
+        configured_string_list(sources, PKEY_ALLOWED_SUGGESTED_EXIT_NODES)?
+            .iter()
+            .cloned()
+            .collect(),
+    )
+}
+
+/// The decoded value of string-list policy `key`, or `None` when no registered source configures it
+/// — Go `syspolicy.GetStringArray`'s configured branch, with the same last-registration-wins
+/// layering [`merge`] gives the report (hence the reverse scan: the newest source that configured
+/// the key answers).
+fn configured_string_list<'a>(sources: &'a [PolicySource], key: &str) -> Option<&'a [String]> {
+    sources
+        .iter()
+        .rev()
+        .find_map(|source| source.string_lists.get(key))
+        .map(Vec::as_slice)
+}
+
+/// The node facts Go's `Start` tests before it will register with the administrator's `AuthKey`,
+/// gathered by the caller because they are backend state rather than policy (the same split
+/// [`apply_to_prefs`]'s `override_always_on` parameter uses).
+///
+/// Built by [`Backend::auth_key_gate`](super::Backend::auth_key_gate), which is where each field's
+/// fork-side derivation is justified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AuthKeyGate {
+    /// Go `b.state == ipn.Running`: the node is already up, so nothing is waiting to register.
+    pub running: bool,
+    /// Go `b.state == ipn.NeedsLogin`: **the control plane says this node must log in again**.
+    /// Go's escape hatch from the guard below — an enrolled node whose session has lapsed may still
+    /// take the administrator's key.
+    pub needs_login: bool,
+    /// Go `len(b.pm.Profiles()) > 0`: this node has completed a registration before, i.e. it is
+    /// already enrolled and a policy file appearing next to it must not silently re-register it.
+    pub enrolled: bool,
+    /// Go `b.conf != nil`: a `--config` file is in use, and that file is the declarative source of
+    /// truth for this node's credential — policy does not reach past it.
+    pub config_in_use: bool,
+}
+
+/// What [`auth_key`] decided, so the caller can act and log it honestly.
+#[derive(Debug)]
+pub(super) enum AuthKeyDecision {
+    /// No administrator key to offer: the policy does not configure one (or configures only
+    /// whitespace). Go's silent, overwhelmingly common case — the caller says nothing.
+    NotConfigured,
+    /// Register with this key — Go's `opts.AuthKey = strings.TrimSpace(sysak)`.
+    Use(secrecy::SecretString),
+    /// A key IS configured and this node will not use it, with the reason in words an administrator
+    /// can act on. Logged by the caller, because an MDM key that quietly does nothing is the exact
+    /// failure this port exists to remove.
+    Skipped(&'static str),
+}
+
+/// The administrator's registration credential, for a bring-up that has no other key — Go's third
+/// and last `AuthKey` source in `Start` (`ipn/ipnlocal/local.go`):
+///
+/// ```text
+/// if opts.AuthKey == "" && b.state != ipn.Running && b.conf == nil {
+///     sysak, _ := b.polc.GetString(pkey.AuthKey, "")
+///     if sysak != "" {
+///         if len(b.pm.Profiles()) == 0 || b.state == ipn.NeedsLogin {
+///             b.logf("Start: setting opts.AuthKey from syspolicy")
+///             opts.AuthKey = strings.TrimSpace(sysak)
+///         } else {
+///             b.logf("Start: not setting opts.AuthKey from syspolicy; login profiles exist, state=%v", b.state)
+///         }
+///     }
+/// }
+/// ```
+///
+/// The caller supplies the guards' inputs ([`AuthKeyGate`]) and has already established the first
+/// one — a key it was handed explicitly wins, so this is only consulted when there is none. **That
+/// makes policy the LOWEST-priority auth-key source, which is the opposite of how policy ranks for
+/// prefs** (see the Precedence inversion section of the module docs); it is Go's order and it is
+/// kept.
+///
+/// Side-effect-free, like every other read of the registered stores — see the invariant on
+/// [`registered_store_settings`].
+pub(super) fn auth_key(gate: AuthKeyGate) -> AuthKeyDecision {
+    auth_key_in(
+        &REGISTERED
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        gate,
+    )
+}
+
+/// The decision behind [`auth_key`], over a source list so it is testable without the
+/// process-global registry (the same split [`allowed_suggestions_in`] uses).
+///
+/// One deliberate divergence from Go, in the whitespace case: Go tests `sysak != ""` *before*
+/// trimming, so a value of `"\n"` passes its guard, logs "setting opts.AuthKey from syspolicy" and
+/// then assigns an EMPTY key — a node that reports it took the policy key and registers without
+/// one. Here the trim comes first and a blank value reads as not configured, matching what this
+/// daemon already does with an empty `--config` `AuthKey` and an empty `TS_AUTH_KEY`. The trim
+/// itself is Go's and is the point: an MDM payload that round-trips through a plist or a registry
+/// string arrives with a trailing newline more often than not.
+fn auth_key_in(sources: &[PolicySource], gate: AuthKeyGate) -> AuthKeyDecision {
+    let Some(configured) = configured_auth_key(sources) else {
+        return AuthKeyDecision::NotConfigured;
+    };
+    let key = configured.0.trim();
+    if key.is_empty() {
+        return AuthKeyDecision::NotConfigured;
+    }
+    // Go's `b.state != ipn.Running`.
+    if gate.running {
+        return AuthKeyDecision::Skipped(
+            "the node is already running, so it has nothing to register",
+        );
+    }
+    // Go's `b.conf == nil`. Go is silent here; this build says so, because a `--config` file and a
+    // policy file that both carry a key is precisely the arrangement an administrator would expect
+    // to work and cannot otherwise tell has not.
+    if gate.config_in_use {
+        return AuthKeyDecision::Skipped(
+            "a --config file is in use and is the declarative source for this node's credential; \
+             put the key in the config file (or its AuthKey file:<path>) instead",
+        );
+    }
+    // Go's `len(b.pm.Profiles()) == 0 || b.state == ipn.NeedsLogin`, inverted into the refusal so
+    // the reason is what gets logged. Dropping a policy file on an already-enrolled host must never
+    // silently re-register it — the escape hatch is the control plane itself asking for a login.
+    if gate.enrolled && !gate.needs_login {
+        return AuthKeyDecision::Skipped(
+            "the node is already logged in and the control plane is not asking it to log in again, \
+             so an auth key would re-register a node that is already enrolled",
+        );
+    }
+    AuthKeyDecision::Use(secrecy::SecretString::from(key.to_string()))
+}
+
+/// The raw `AuthKey` the newest registered source configures, or `None` when none does — the
+/// [`configured_string_list`] treatment for the one key whose value never reaches the report (hence
+/// the same reverse scan: last registration wins).
+fn configured_auth_key(sources: &[PolicySource]) -> Option<&Secret> {
+    sources
+        .iter()
+        .rev()
+        .find_map(|source| source.auth_key.as_ref())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Applying the effective policy to prefs (Go `ipnlocal.applySysPolicy`).
+// ---------------------------------------------------------------------------------------------
+
+/// Go `setting.PreferenceOption`: an administrator's three-state answer about one boolean
+/// preference — force it on, force it off, or leave it to whoever owns the node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreferenceOption {
+    /// `always` — the preference is on and the operator cannot turn it off.
+    Always,
+    /// `never` — the preference is off and the operator cannot turn it on.
+    Never,
+    /// `user-decides` — the policy expresses no opinion; the current value stands.
+    UserDecides,
+}
+
+impl PreferenceOption {
+    /// Go `PreferenceOption.ShouldEnable(def)`: `always`/`never` answer outright, `user-decides`
+    /// keeps whatever the node already has.
+    fn should_enable(self, current: bool) -> bool {
+        match self {
+            PreferenceOption::Always => true,
+            PreferenceOption::Never => false,
+            PreferenceOption::UserDecides => current,
+        }
+    }
+
+    /// Decode the rendered Value column back into the option — the inverse of the
+    /// `ValueType::PreferenceOption` arm of [`read_value`].
+    ///
+    /// Total, like Go's `UnmarshalText`, which never fails and falls back to `user-decides`. That
+    /// fallback is unreachable through the load path ([`validate`] refuses any other spelling
+    /// outright, precisely so a misspelled `"alwyas"` cannot silently become "leave it alone").
+    fn parse(rendered: &str) -> Self {
+        match rendered {
+            "always" => PreferenceOption::Always,
+            "never" => PreferenceOption::Never,
+            _ => PreferenceOption::UserDecides,
+        }
+    }
+}
+
+/// One of Go's `preferencePolicies` rows: a `PreferenceOption` policy key wired to the single bool
+/// pref it governs.
+///
+/// `set` writes the pref **and returns the pref's new value rendered for the log**, rather than the
+/// caller re-deriving it: for `AllowIncomingConnections` the policy's bool and the pref's bool are
+/// opposites (Go's comment: "Allow Incoming (used by the UI) is the negation of ShieldsUp (used by
+/// the backend)"), so a log line built from the policy value would report the wrong pref state on
+/// the one row where it matters most.
+struct PreferencePolicy {
+    /// The policy key, as spelled in the file and in [`DEFINITIONS`].
+    key: &'static str,
+    /// The pref it governs, spelled as [`crate::ipn::revert_guard`] spells it — these names are
+    /// matched against that guard's keys (see [`pinned_prefs_in`]), so the two must agree.
+    pref: &'static str,
+    /// The pref's current value, in the policy's polarity.
+    get: fn(&Prefs) -> bool,
+    /// Write the policy's answer; returns the resulting PREF value, rendered.
+    set: fn(&mut Prefs, bool) -> String,
+}
+
+/// Go's `preferencePolicies` (`ipn/ipnlocal/local.go`), less the one row this daemon has no pref
+/// for.
+///
+/// The absentee is `UnattendedMode` (Go's `ForceDaemon`), which asks a GUI client to keep the
+/// daemon connected while no user is signed in. A system daemon has no user session to be tied to —
+/// it is unattended by construction — which is why [`crate::prefs::Prefs`] has no field for it and
+/// why [`apply_settings_to_prefs`] reports the key as unenforced instead of quietly dropping it.
+const PREFERENCE_POLICIES: &[PreferencePolicy] = &[
+    PreferencePolicy {
+        // Go's own note: this key is the UI's polarity, `ShieldsUp` is the backend's, so the row has
+        // to invert in both directions.
+        key: "AllowIncomingConnections",
+        pref: "shields_up",
+        get: |p| !p.shields_up,
+        set: |p, v| {
+            p.shields_up = !v;
+            p.shields_up.to_string()
+        },
+    },
+    PreferencePolicy {
+        key: "ExitNodeAllowLANAccess",
+        pref: "exit_node_allow_lan_access",
+        get: |p| p.exit_node_allow_lan_access,
+        set: |p, v| {
+            p.exit_node_allow_lan_access = v;
+            v.to_string()
+        },
+    },
+    PreferencePolicy {
+        // Go `EnableTailscaleDNS` → `Prefs.CorpDNS`.
+        key: "UseTailscaleDNSSettings",
+        pref: "accept_dns",
+        get: |p| p.accept_dns,
+        set: |p, v| {
+            p.accept_dns = v;
+            v.to_string()
+        },
+    },
+    PreferencePolicy {
+        // Go `EnableTailscaleSubnets` → `Prefs.RouteAll`.
+        key: "UseTailscaleSubnets",
+        pref: "accept_routes",
+        get: |p| p.accept_routes,
+        set: |p, v| {
+            p.accept_routes = v;
+            v.to_string()
+        },
+    },
+    PreferencePolicy {
+        key: "CheckUpdates",
+        pref: "auto_update_check",
+        get: |p| p.auto_update_check,
+        set: |p, v| {
+            p.auto_update_check = v;
+            v.to_string()
+        },
+    },
+    PreferencePolicy {
+        // Go `ApplyUpdates` → `Prefs.AutoUpdate.Apply`, an `opt.Bool`. Go reads it as
+        // `v, _ := Apply.Get()`, i.e. UNSET reads as false — so `never` and `user-decides` leave an
+        // unset pref unset (no change), and only `always` ever writes one. Mirrored exactly by the
+        // `unwrap_or(false)` here.
+        //
+        // This deliberately bypasses the fork's own `selfupdate::check_auto_update_pref` refusal,
+        // which guards the OPERATOR's `tnet set --auto-update` on a host that cannot replace its own
+        // binary. That refusal protects a person from promising something they cannot keep; it is not
+        // a rule the administrator's policy is subject to, and Go applies this key unconditionally.
+        // The pref only advertises `Hostinfo.AllowsUpdate`, so the worst case is a node telling the
+        // tailnet it accepts update triggers that an operator will then have to apply by hand.
+        key: "InstallUpdates",
+        pref: "auto_update_apply",
+        get: |p| p.auto_update_apply.unwrap_or(false),
+        set: |p, v| {
+            p.auto_update_apply = Some(v);
+            v.to_string()
+        },
+    },
+    PreferencePolicy {
+        key: "AdvertiseExitNode",
+        pref: "advertise_exit_node",
+        get: |p| p.advertise_exit_node,
+        set: |p, v| {
+            p.advertise_exit_node = v;
+            v.to_string()
+        },
+    },
+];
+
+/// One pref a policy setting actually changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyChange {
+    /// The policy key that caused it.
+    pub key: &'static str,
+    /// The pref it landed on.
+    pub pref: &'static str,
+    /// The pref's new value, rendered. An [`Option`] pref that was CLEARED renders as the empty
+    /// string, which is what "no value" looks like in the file that asked for it.
+    pub value: String,
+}
+
+/// One configured policy key this build cannot enforce, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyRefusal {
+    /// The policy key the administrator configured.
+    pub key: &'static str,
+    /// Why nothing happened, in words an administrator can act on.
+    pub reason: String,
+}
+
+/// What [`apply_to_prefs`] did — the honest answer to "did my policy file take effect?".
+///
+/// Both halves matter. `changed` is the enforcement; `refused` is the part that keeps this from
+/// being the reporting-only surface it replaced, where an administrator could watch their intent
+/// echoed back and find the node unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PolicyApplication {
+    /// Every pref a policy setting moved, in the order the policy was evaluated.
+    pub changed: Vec<PolicyChange>,
+    /// Every configured key this build cannot enforce.
+    pub refused: Vec<PolicyRefusal>,
+}
+
+impl PolicyApplication {
+    /// Whether the policy neither changed nor refused anything — the usual case, and the one the
+    /// caller stays quiet about.
+    pub fn is_quiet(&self) -> bool {
+        self.changed.is_empty() && self.refused.is_empty()
+    }
+}
+
+/// The exemptions the backend is currently standing on — the two flags Go keeps on `LocalBackend`
+/// and consults from `applySysPolicy`, passed in by the caller because they are backend state and
+/// not policy.
+///
+/// One struct rather than two `bool` parameters, because they travel together and a pair of
+/// positional booleans at a call site is a bug waiting to be typed in the wrong order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct PolicyOverrides {
+    /// Go `b.overrideAlwaysOn`: a disconnect the gate already permitted is standing, so the
+    /// `AlwaysOn.Enabled` re-assert must leave it alone. See
+    /// [`Backend::override_always_on`](super::Backend::override_always_on) for its lifecycle.
+    pub always_on: bool,
+    /// Go `b.overrideExitNodePolicy`: the operator picked a different exit node under an
+    /// `ExitNode.AllowOverride` policy, so the exit-node re-apply must leave that choice alone. See
+    /// [`Backend::override_exit_node_policy`](super::Backend::override_exit_node_policy).
+    pub exit_node: bool,
+}
+
+/// Apply the effective device-scope policy to `prefs` — Go `ipnlocal.applySysPolicy`, called from
+/// the daemon wherever Go's `reconcilePrefs` runs (profile load, `up`, `set`, `--config`).
+///
+/// `overrides` carries the backend's standing exemptions; see [`PolicyOverrides`].
+///
+/// Side-effect-free apart from `prefs`: it reads the registered stores exactly as
+/// [`effective_policy`] does (see the invariant on [`registered_store_settings`]) and touches no
+/// file. Persisting the result is the caller's job.
+pub(super) fn apply_to_prefs(prefs: &mut Prefs, overrides: PolicyOverrides) -> PolicyApplication {
+    apply_settings_to_prefs(&registered_store_settings(), prefs, overrides)
+}
+
+/// The decision behind [`apply_to_prefs`], over an already-merged setting list so the whole of Go's
+/// `applySysPolicy` is testable without the process-global registry.
+///
+/// Go's order, which this keeps: `LoginURL`, `Hostname`, the exit node, `AlwaysOn`, then the
+/// `preferencePolicies` table. No row reads a pref another row writes, so the order is documentary
+/// rather than load-bearing.
+///
+/// **`down` and `logout` are deliberately not reconcile points.** `AlwaysOn.Enabled` re-asserts
+/// `want_running` wherever this runs, which means a node under an always-on policy comes back up at
+/// the next daemon start, `up`, `set` or config reload. Re-asserting inside `down` itself would make
+/// a permitted disconnect a lie: the gate ([`alwayson`](super::alwayson)) is where the policy decides
+/// whether the operator may stop the node, and a `down` that is allowed and then immediately undone
+/// is worse than one that is refused, because nothing tells the operator which happened. Go bridges
+/// the gap between the two with `overrideAlwaysOn` — and so does this fork now: while the override
+/// stands, the re-assert below is skipped, so the disconnect survives every reconcile point until
+/// the node's own `ReconnectAfter` timer fires (or the operator connects, switches profile, or the
+/// administrator changes an always-on key).
+fn apply_settings_to_prefs(
+    settings: &[PolicySetting],
+    prefs: &mut Prefs,
+    overrides: PolicyOverrides,
+) -> PolicyApplication {
+    let mut out = PolicyApplication::default();
+
+    // `LoginURL` → the control server. Go compares against the current value and writes on
+    // difference; an EMPTY configured value means "no override" in Go's bare-string pref, which is
+    // this fork's `None` (fall back to the engine/`TS_CONTROL_URL` default).
+    if let Some(url) = configured_string(settings, "LoginURL") {
+        let want = (!url.is_empty()).then(|| url.to_string());
+        if prefs.control_url != want {
+            prefs.control_url = want;
+            out.changed.push(PolicyChange {
+                key: "LoginURL",
+                pref: "control_url",
+                value: prefs.control_url.clone().unwrap_or_default(),
+            });
+        }
+    }
+
+    // `Hostname` → the requested hostname, tri-state (see the module docs): configured-and-empty
+    // CLEARS the pref rather than leaving it alone, which is the distinction Go's
+    // `HostnameDefaultValue` sentinel exists to draw.
+    if let Some(hostname) = configured_string(settings, "Hostname") {
+        let want = (!hostname.is_empty()).then(|| hostname.to_string());
+        if prefs.hostname != want {
+            prefs.hostname = want;
+            out.changed.push(PolicyChange {
+                key: "Hostname",
+                pref: "hostname",
+                value: prefs.hostname.clone().unwrap_or_default(),
+            });
+        }
+    }
+
+    apply_exit_node_policy(settings, prefs, &mut out, overrides.exit_node);
+
+    // `AlwaysOn.Enabled` → force the node back to "should be connected". One-way: the policy can
+    // only turn want-running ON (Go's `alwaysOn && !prefs.WantRunning`), never off.
+    //
+    // `AlwaysOn.OverrideWithReason` has no pref to move and is therefore absent here, but it is NOT
+    // unenforced: the disconnect gate reads it by name to decide whether `down`/`logout` may proceed
+    // at all (see the module docs), which is the whole of its effect in Go too.
+    //
+    // `override_always_on` is Go's `alwaysOn && !b.overrideAlwaysOn && !prefs.WantRunning`: a
+    // disconnect this same policy already permitted is not something to fight.
+    if configured_boolean(settings, PKEY_ALWAYS_ON) == Some(true)
+        && !overrides.always_on
+        && !prefs.want_running
+    {
+        prefs.want_running = true;
+        out.changed.push(PolicyChange {
+            key: PKEY_ALWAYS_ON,
+            pref: "want_running",
+            value: "true".to_string(),
+        });
+    }
+
+    // The `preferencePolicies` table: one `PreferenceOption` key per bool pref. `user-decides`
+    // resolves to the pref's current value, so it never counts as a change — matching Go, which only
+    // writes when `curVal != newVal`.
+    for policy in PREFERENCE_POLICIES {
+        let Some(option) = configured_preference(settings, policy.key) else {
+            continue;
+        };
+        let current = (policy.get)(prefs);
+        let wanted = option.should_enable(current);
+        if wanted != current {
+            let value = (policy.set)(prefs, wanted);
+            out.changed.push(PolicyChange {
+                key: policy.key,
+                pref: policy.pref,
+                value,
+            });
+        }
+    }
+    if configured_preference(settings, "UnattendedMode").is_some() {
+        out.refused.push(PolicyRefusal {
+            key: "UnattendedMode",
+            reason: "this is a system daemon with no user session to be tied to, so it is already \
+                     unattended; there is no preference for the policy to move"
+                .to_string(),
+        });
+    }
+
+    out
+}
+
+/// The exit-node half — Go `applyExitNodeSysPolicyLocked` — with this fork's ruling on `ExitNodeID`.
+///
+/// Go's mutual exclusion is preserved: a configured, non-empty `ExitNodeID` wins outright and
+/// `ExitNodeIP` is never consulted. Since the id cannot be honoured here (see the module docs), that
+/// means a file naming both pins neither, and says so once — rather than silently falling through to
+/// the key the administrator ranked second.
+///
+/// `override_exit_node_policy` is Go's `b.overrideExitNodePolicy`: while a permitted override
+/// stands, the pinned value is **not** re-applied, because re-applying it here is exactly how an
+/// override that the administrator opted into would be undone a moment after it was granted. The
+/// refusals are still reported while it stands — an unenforceable key is unenforceable either way,
+/// and an override can only ever stand against a key this build does apply.
+fn apply_exit_node_policy(
+    settings: &[PolicySetting],
+    prefs: &mut Prefs,
+    out: &mut PolicyApplication,
+    override_exit_node_policy: bool,
+) {
+    if let Some(id) = configured_string(settings, PKEY_EXIT_NODE_ID).filter(|id| !id.is_empty()) {
+        // Go turns an `auto:`-prefixed id into an `ExitNodeExpression` and parks `ExitNodeID` on a
+        // deliberately invalid id until the pick resolves, so traffic blackholes rather than leaking
+        // outside the policy. Both halves need machinery this build does not have — it refuses
+        // `--exit-node auto:…` by name for the same reason — so the two cases are named separately
+        // and neither is applied.
+        let reason = if id.starts_with("auto:") {
+            format!(
+                "{id:?}: automatic exit-node selection (`auto:`…) is not supported by this build, \
+                 which has no expression to resolve and no blackhole state to park on while it is \
+                 unresolved; pin a concrete node with ExitNodeIP"
+            )
+        } else {
+            format!(
+                "{id:?}: this build selects an exit node by tailnet IP or MagicDNS name, not by \
+                 stable node id, and a selector that matches no peer egresses DIRECTLY rather than \
+                 blackholing — which is the leak this key exists to prevent; pin the node with \
+                 ExitNodeIP"
+            )
+        };
+        out.refused.push(PolicyRefusal {
+            key: PKEY_EXIT_NODE_ID,
+            reason,
+        });
+        return;
+    }
+
+    let Some(raw) = configured_string(settings, PKEY_EXIT_NODE_IP).filter(|ip| !ip.is_empty())
+    else {
+        return;
+    };
+    // Go ignores a value `netip.ParseAddr` rejects (its `err == nil` guard). Ignoring it is right —
+    // an unparseable address must not become a peer NAME to match against — but doing it silently is
+    // not, so the refusal is reported.
+    let Ok(addr) = raw.parse::<std::net::IpAddr>() else {
+        out.refused.push(PolicyRefusal {
+            key: PKEY_EXIT_NODE_IP,
+            reason: format!("{raw:?} is not an IP address"),
+        });
+        return;
+    };
+    // The operator's own pick stands (see the parameter's doc): the policy pinned a node, the
+    // administrator allowed an override, and one was taken.
+    if override_exit_node_policy {
+        return;
+    }
+    // Stored in the address's canonical form, which is what `resolve_exit_node_arg` and the engine's
+    // selector both parse back.
+    let want = addr.to_string();
+    if prefs.exit_node.as_deref() != Some(want.as_str()) {
+        prefs.exit_node = Some(want.clone());
+        out.changed.push(PolicyChange {
+            key: PKEY_EXIT_NODE_IP,
+            pref: "exit_node",
+            value: want,
+        });
+    }
+}
+
+/// The exit node the effective policy actually **pins**, in the canonical form
+/// [`apply_exit_node_policy`] stores — `None` when the policy pins nothing this build can apply.
+///
+/// This is the fork's reading of Go's `HasAnyOf(pkey.ExitNodeID, pkey.ExitNodeIP)`, and the one
+/// place it is decided: a configured `ExitNodeID` suppresses the pair (Go's mutual exclusion) and is
+/// itself refused here, and an `ExitNodeIP` that is empty or unparseable applies nothing either. See
+/// the module docs for why "managed" is the applied value rather than Go's "any of the two keys is
+/// configured".
+fn policy_exit_node_in(settings: &[PolicySetting]) -> Option<String> {
+    if configured_string(settings, PKEY_EXIT_NODE_ID).is_some_and(|id| !id.is_empty()) {
+        return None;
+    }
+    let raw = configured_string(settings, PKEY_EXIT_NODE_IP).filter(|ip| !ip.is_empty())?;
+    Some(raw.parse::<std::net::IpAddr>().ok()?.to_string())
+}
+
+/// The exit-node policy as the edit gate needs it: what is pinned, and whether the administrator
+/// allowed the user to pick something else.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct ExitNodePolicy {
+    /// The pinned selector ([`policy_exit_node_in`]), or `None` when nothing is pinned — in which
+    /// case the gate has nothing to refuse and the other field does not matter.
+    pub pinned: Option<String>,
+    /// [`PKEY_ALLOW_EXIT_NODE_OVERRIDE`], defaulting to false exactly as Go's
+    /// `GetBoolean(pkey.AllowExitNodeOverride, false)` does.
+    pub allow_override: bool,
+}
+
+/// Read the current [`ExitNodePolicy`] from the registered stores — the input to the edit gate
+/// ([`exitnodepolicy::check_exit_node_edit`](super::exitnodepolicy::check_exit_node_edit)).
+///
+/// Side-effect-free, like every other read of the registered stores — see the invariant on
+/// [`registered_store_settings`].
+pub(super) fn exit_node_policy() -> ExitNodePolicy {
+    exit_node_policy_in(&registered_store_settings())
+}
+
+/// The decision behind [`exit_node_policy`], over an already-merged setting list so it is testable
+/// without the process-global registry (the same split [`get_boolean`] uses).
+fn exit_node_policy_in(settings: &[PolicySetting]) -> ExitNodePolicy {
+    ExitNodePolicy {
+        pinned: policy_exit_node_in(settings),
+        allow_override: boolean_setting(settings, PKEY_ALLOW_EXIT_NODE_OVERRIDE, false),
+    }
+}
+
+/// The three exit-node policy keys as they are currently configured — the snapshot Go compares in
+/// `sysPolicyChanged` (`policy.HasChangedAnyOf(pkey.ExitNodeID, pkey.ExitNodeIP,
+/// pkey.AllowExitNodeOverride)`) to decide whether a standing exit-node override is still one the
+/// administrator would grant.
+///
+/// The raw configured values, not the resolved [`ExitNodePolicy`]: an administrator who swaps a
+/// pinned `ExitNodeIP` for an equally unusable `ExitNodeID` has changed the policy, and Go revokes
+/// the override on the *key* moving rather than on its effect moving. Tri-state per key (`None` =
+/// not configured) for the same reason [`AlwaysOnKeys`] is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct ExitNodeKeys {
+    /// [`PKEY_EXIT_NODE_ID`] as configured, or `None` when no source sets it.
+    pub id: Option<String>,
+    /// [`PKEY_EXIT_NODE_IP`] as configured, or `None` when no source sets it.
+    pub ip: Option<String>,
+    /// [`PKEY_ALLOW_EXIT_NODE_OVERRIDE`] as configured, or `None` when no source sets it.
+    pub allow_override: Option<bool>,
+}
+
+/// Read the current [`ExitNodeKeys`] from the registered stores — the input to
+/// [`Backend::exit_node_policy_changed`](super::Backend::exit_node_policy_changed).
+///
+/// Side-effect-free, like every other read of the registered stores — see the invariant on
+/// [`registered_store_settings`].
+pub(super) fn exit_node_keys() -> ExitNodeKeys {
+    exit_node_keys_in(&registered_store_settings())
+}
+
+/// The decision behind [`exit_node_keys`], over an already-merged setting list so it is testable
+/// without the process-global registry.
+fn exit_node_keys_in(settings: &[PolicySetting]) -> ExitNodeKeys {
+    ExitNodeKeys {
+        id: configured_string(settings, PKEY_EXIT_NODE_ID).map(str::to_string),
+        ip: configured_string(settings, PKEY_EXIT_NODE_IP).map(str::to_string),
+        allow_override: configured_boolean(settings, PKEY_ALLOW_EXIT_NODE_OVERRIDE),
+    }
+}
+
+/// The prefs the effective policy **pins** — the ones an operator cannot move, whether or not they
+/// currently differ from what the policy says.
+///
+/// Read by [`Backend::up_revert_guard`], which must not refuse an `up` for "silently reverting" a
+/// pref that the very same `up` re-applies from policy a moment later. See
+/// [`revert_guard::drop_policy_pinned`].
+///
+/// [`Backend::up_revert_guard`]: crate::ipn::Backend::up_revert_guard
+/// [`revert_guard::drop_policy_pinned`]: super::revert_guard::drop_policy_pinned
+pub(super) fn pinned_prefs() -> Vec<&'static str> {
+    pinned_prefs_in(&registered_store_settings())
+}
+
+/// The decision behind [`pinned_prefs`], over an already-merged setting list.
+///
+/// Every name here is a name [`apply_settings_to_prefs`] can write (asserted by a test, so the two
+/// cannot drift), spelled the way [`crate::ipn::revert_guard`] spells its keys. `want_running` is
+/// absent on purpose: `AlwaysOn` does pin it, but it is lifecycle rather than an up-managed setting,
+/// so the guard has no arm for it to suppress.
+fn pinned_prefs_in(settings: &[PolicySetting]) -> Vec<&'static str> {
+    let mut pinned = Vec::new();
+    if configured_string(settings, "LoginURL").is_some() {
+        pinned.push("control_url");
+    }
+    if configured_string(settings, "Hostname").is_some() {
+        pinned.push("hostname");
+    }
+    // Only a value that is actually applied pins the pref: a refused `ExitNodeID` changes nothing,
+    // so the operator's own exit node is still theirs to lose and still worth guarding. Same
+    // decision the edit gate locks on, read from the same place so the guard and the refusal can
+    // never disagree about whether the exit node is policy-managed.
+    if policy_exit_node_in(settings).is_some() {
+        pinned.push("exit_node");
+    }
+    for policy in PREFERENCE_POLICIES {
+        // `user-decides` is the policy declining to have an opinion, so it pins nothing.
+        if matches!(configured_preference(settings, policy.key),
+            Some(option) if option != PreferenceOption::UserDecides)
+        {
+            pinned.push(policy.pref);
+        }
+    }
+    pinned
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Serializes the tests that call [`reload_effective_policy`], because it ticks the
+    /// process-global policy-change channel and cargo runs these as parallel threads in one process:
+    /// one test's reload is visible on another test's receiver, so "no tick arrived" is only a
+    /// meaningful assertion while this is held.
+    static POLICY_TICK_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Parse + validate + resolve a document the way [`load_json_policy_file`] does, without
+    /// touching the process-global registry — so these tests stay independent of each other and of
+    /// whatever a daemon would have registered.
+    fn resolve(json: &str) -> Result<Vec<PolicySetting>, String> {
+        let store = parse_json_store(json.as_bytes())?;
+        validate(&store)?;
+        Ok(read_settings(&store, JSON_FILE_SOURCE_NAME))
+    }
+
+    /// The same, but resolving the whole source (rendered rows + decoded lists) the way
+    /// [`load_json_policy_file`] does — so the list-policy tests below drive the real decode path
+    /// and not a hand-built map.
+    fn resolve_source(json: &str) -> Result<PolicySource, String> {
+        let store = parse_json_store(json.as_bytes())?;
+        validate(&store)?;
+        Ok(read_source(&store, JSON_FILE_SOURCE_NAME))
+    }
+
     #[test]
-    fn list_is_empty_device_scoped_on_this_platform() {
-        // Faithful to Go on Linux: zero registered stores → empty snapshot, device scope, no error.
+    fn list_is_empty_device_scoped_with_no_registered_source() {
+        // A daemon that registered no policy file resolves an empty-but-valid snapshot: device
+        // scope, no settings, no error. `syspolicy list` prints "No policy settings".
         let r = effective_policy();
         assert_eq!(r.scope, "Device");
         assert!(
             r.settings.is_empty(),
-            "no policy store is registered on this platform; the effective policy must be empty"
+            "no policy source is registered in this test process; the effective policy must be empty"
         );
     }
 
     #[test]
     fn reload_matches_list_with_no_sources() {
+        let _serialized = POLICY_TICK_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         // With zero sources the forced re-read yields the same empty snapshot as `list`.
         assert_eq!(reload_effective_policy(), effective_policy());
     }
 
     #[test]
+    fn a_reload_that_resolves_the_same_rows_pushes_no_policy_frame() {
+        let _serialized = POLICY_TICK_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        // Go's `reloadNow` invokes the change callbacks only under `!old.EqualItems(new)`, so
+        // `Policy.Reload()` over a store that has not moved notifies nobody. A forced reload here
+        // re-merges sources that captured their settings at registration, so it can only ever
+        // resolve the rows a watcher already holds — and must therefore stay silent.
+        //
+        // Not `mut`: nothing here ever consumes a tick, because no tick may be produced.
+        let rx = watch_policy();
+        assert!(
+            !rx.has_changed().unwrap(),
+            "`subscribe()` starts synced: a fresh watcher must not see a spurious initial tick, \
+             because it front-loads its own snapshot instead"
+        );
+
+        let pushed = reload_effective_policy();
+        assert_eq!(
+            effective_policy(),
+            pushed,
+            "the re-read snapshot and the `list` snapshot are the same rows"
+        );
+        assert!(
+            !rx.has_changed().unwrap(),
+            "a reload that resolved the same rows must not emit a policy frame: `Notify.Policy` \
+             says the effective policy CHANGED, and a frame carrying rows the watcher already has \
+             says the opposite of what receiving it would imply"
+        );
+
+        // Not a one-shot suppression either: the second reload is silent for the same reason.
+        let _ = reload_effective_policy();
+        assert!(!rx.has_changed().unwrap());
+    }
+
+    #[test]
+    fn only_a_resolve_that_moves_the_snapshot_pushes_a_policy_frame() {
+        let _serialized = POLICY_TICK_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        // The other half of Go's rule: when the merge DOES move, every watcher is told, exactly
+        // once. Driven through the real publish path over a `last` cell of this test's own, so it
+        // needs no source in the process-global registry (the same split `allowed_suggestions_in`
+        // is tested through). The tick channel is the global one — that is the thing under test —
+        // which is why this holds `POLICY_TICK_TESTS`.
+        let mut rx = watch_policy();
+        assert!(!rx.has_changed().unwrap());
+        let last = Mutex::new(Vec::new());
+
+        let one = resolve(r#"{"Hostname": "documented-node"}"#).expect("a valid file resolves");
+        assert_eq!(reload_and_publish(&last, || one.clone()), one);
+        assert!(
+            rx.has_changed().unwrap(),
+            "empty → one configured key is a real change and must reach the notify bus"
+        );
+        rx.borrow_and_update();
+
+        // Re-resolving the same rows is not a change.
+        assert_eq!(reload_and_publish(&last, || one.clone()), one);
+        assert!(
+            !rx.has_changed().unwrap(),
+            "Go compares items, not identity: an equal re-merge invokes no callback"
+        );
+
+        // A value that moved is one, even though the key set did not — `EqualItems` compares rows.
+        let renamed = resolve(r#"{"Hostname": "renamed-node"}"#).expect("a valid file resolves");
+        assert_eq!(reload_and_publish(&last, || renamed.clone()), renamed);
+        assert!(
+            rx.has_changed().unwrap(),
+            "the same key with a different value is a policy change"
+        );
+        rx.borrow_and_update();
+
+        // ...and so is a key going away.
+        assert!(reload_and_publish(&last, Vec::new).is_empty());
+        assert!(
+            rx.has_changed().unwrap(),
+            "a source's last setting disappearing is a policy change"
+        );
+        rx.borrow_and_update();
+    }
+
+    #[test]
     fn reload_is_device_scoped_and_empty() {
+        let _serialized = POLICY_TICK_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let r = reload_effective_policy();
         assert_eq!(r.scope, "Device");
         assert!(r.settings.is_empty());
+    }
+
+    #[test]
+    fn a_configured_file_resolves_to_device_scoped_rows_with_the_file_as_origin() {
+        let settings = resolve(
+            r#"{"Hostname": "documented-node", "AlwaysOn.Enabled": true,
+                "CheckUpdates": "always", "AdminConsole": "hide",
+                "ReconnectAfter": "60m",
+                "AllowedSuggestedExitNodes": ["nodeA", "nodeB"]}"#,
+        )
+        .expect("a well-formed policy file should load");
+
+        let rendered: Vec<(String, Option<String>)> = settings
+            .iter()
+            .map(|s| (s.key.clone(), s.value.clone()))
+            .collect();
+        // Every row carries the file as its origin and no error.
+        for s in &settings {
+            assert_eq!(s.origin, "JSONFile (Device)", "row {:?}", s.key);
+            assert_eq!(s.error, None, "row {:?} should resolve cleanly", s.key);
+        }
+        // The values are Go's `%v` renderings, not the raw JSON: a duration is canonicalised by
+        // `Duration.String()` and a list is Go's `[a b c]`.
+        assert!(rendered.contains(&("Hostname".to_string(), Some("documented-node".to_string()))));
+        assert!(rendered.contains(&("AlwaysOn.Enabled".to_string(), Some("true".to_string()))));
+        assert!(rendered.contains(&("CheckUpdates".to_string(), Some("always".to_string()))));
+        assert!(rendered.contains(&("AdminConsole".to_string(), Some("hide".to_string()))));
+        assert!(rendered.contains(&("ReconnectAfter".to_string(), Some("1h0m0s".to_string()))));
+        assert!(rendered.contains(&(
+            "AllowedSuggestedExitNodes".to_string(),
+            Some("[nodeA nodeB]".to_string())
+        )));
+        assert_eq!(settings.len(), 6, "only configured keys become rows");
+    }
+
+    #[test]
+    fn only_configured_keys_appear() {
+        // The definition table has dozens of keys; a one-key file must produce exactly one row, not
+        // a row per known policy (Go skips `ErrNotConfigured`).
+        let settings = resolve(r#"{"Tailnet": "example.com"}"#).expect("one key should load");
+        assert_eq!(settings.len(), 1);
+        assert_eq!(settings[0].key, "Tailnet");
+        assert_eq!(settings[0].value.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn an_empty_object_is_valid_and_configures_nothing() {
+        assert_eq!(resolve("{}"), Ok(Vec::new()));
+        // Go decodes a `null` document into a nil map, which is "no keys configured", not an error.
+        assert_eq!(resolve("null"), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn an_unknown_key_refuses_the_whole_file() {
+        let err = resolve(r#"{"Hostnmae": "typo"}"#).expect_err("an unknown key must refuse");
+        assert_eq!(err, r#"unknown policy setting "Hostnmae""#);
+    }
+
+    #[test]
+    fn every_problem_is_reported_at_once() {
+        // Go joins the validation errors so one startup surfaces the whole broken file. Keys are
+        // visited in sorted order, so the message is deterministic.
+        let err = resolve(r#"{"Hostname": 7, "Nope": 1, "CheckUpdates": "sometimes"}"#)
+            .expect_err("three problems must refuse");
+        assert_eq!(
+            err,
+            concat!(
+                "\"CheckUpdates\": type mismatch: \"sometimes\" is not a valid PreferenceOption ",
+                "(\"always\", \"never\", or \"user-decides\")\n",
+                "\"Hostname\": type mismatch: \"Hostname\" is json.Number, want string\n",
+                "unknown policy setting \"Nope\""
+            )
+        );
+    }
+
+    #[test]
+    fn each_setting_type_refuses_the_wrong_json_type() {
+        for (json, want) in [
+            (
+                r#"{"AlwaysOn.Enabled": "yes"}"#,
+                "\"AlwaysOn.Enabled\": type mismatch: \"AlwaysOn.Enabled\" is string, want bool",
+            ),
+            (
+                r#"{"Hostname": ["a"]}"#,
+                "\"Hostname\": type mismatch: \"Hostname\" is []interface {}, want string",
+            ),
+            (
+                r#"{"AllowedSuggestedExitNodes": "nodeA"}"#,
+                "\"AllowedSuggestedExitNodes\": type mismatch: \"AllowedSuggestedExitNodes\" is \
+                 string, want array",
+            ),
+            (
+                r#"{"AllowedSuggestedExitNodes": ["nodeA", 2]}"#,
+                "\"AllowedSuggestedExitNodes\": type mismatch: \"AllowedSuggestedExitNodes\"[1] is \
+                 json.Number, want string",
+            ),
+            (
+                r#"{"AdminConsole": "maybe"}"#,
+                "\"AdminConsole\": type mismatch: \"maybe\" is not a valid Visibility (\"show\" or \
+                 \"hide\")",
+            ),
+            (
+                r#"{"ReconnectAfter": "7d"}"#,
+                "\"ReconnectAfter\": time: unknown unit \"d\" in duration \"7d\"",
+            ),
+            (
+                r#"{"ReconnectAfter": null}"#,
+                "\"ReconnectAfter\": type mismatch: \"ReconnectAfter\" is <nil>, want string",
+            ),
+        ] {
+            assert_eq!(
+                resolve(json).expect_err("the case should refuse"),
+                want,
+                "for {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_json_refuses_with_gos_prefix() {
+        let err = parse_json_store(b"{\"Hostname\": }").expect_err("malformed JSON must refuse");
+        assert!(
+            err.starts_with("syspolicy: parsing JSON: "),
+            "unexpected message: {err}"
+        );
+        // A comment is malformed too: this fork parses standard JSON only (no HuJSON), matching how
+        // it reads the `--config` file.
+        assert!(
+            parse_json_store(b"{\n// a comment\n}").is_err(),
+            "HuJSON comments are not accepted"
+        );
+    }
+
+    #[test]
+    fn a_non_object_document_refuses() {
+        assert_eq!(
+            parse_json_store(b"[1, 2]").expect_err("a JSON array is not a policy document"),
+            "syspolicy: parsing JSON: cannot unmarshal []interface {} into a policy object"
+        );
+    }
+
+    #[test]
+    fn an_absent_file_registers_nothing_and_is_not_an_error() {
+        // Go returns nil for `fs.ErrNotExist`: the stock default path is absent on most hosts, so
+        // this is the normal case and must not log or refuse.
+        let missing = std::env::temp_dir().join(format!(
+            "tailnetd-syspolicy-absent-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&missing);
+        assert_eq!(
+            load_json_policy_file(JSON_FILE_SOURCE_NAME, &missing),
+            Ok(LoadOutcome::NoFile)
+        );
+        // Nothing was registered, so the effective policy is still empty.
+        assert!(effective_policy().settings.is_empty());
+    }
+
+    #[test]
+    fn a_bad_file_names_the_path_and_registers_nothing() {
+        let path = std::env::temp_dir().join(format!(
+            "tailnetd-syspolicy-bad-{}-{}.json",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, br#"{"Nope": 1}"#).expect("the temp file should be writable");
+        let err = load_json_policy_file(JSON_FILE_SOURCE_NAME, &path)
+            .expect_err("an invalid file must refuse");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            err,
+            format!(
+                "syspolicy: invalid {}:\nunknown policy setting \"Nope\"",
+                path.display()
+            )
+        );
+        // Refused wholesale: a file with one bad key contributes none of its keys.
+        assert!(effective_policy().settings.is_empty());
+    }
+
+    #[test]
+    fn a_malformed_file_carries_gos_doubled_prefix() {
+        let path = std::env::temp_dir().join(format!(
+            "tailnetd-syspolicy-malformed-{}-{}.json",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, b"not json").expect("the temp file should be writable");
+        let err = load_json_policy_file(JSON_FILE_SOURCE_NAME, &path)
+            .expect_err("a malformed file must refuse");
+        let _ = std::fs::remove_file(&path);
+        // Go wraps the store constructor's already-prefixed error, so both prefixes appear.
+        assert!(
+            err.starts_with(&format!(
+                "syspolicy: loading {}: syspolicy: parsing JSON: ",
+                path.display()
+            )),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn a_later_source_wins_per_key_and_earlier_ones_fill_the_rest() {
+        // Go's `rsop` layers same-scope sources in registration order. This daemon registers one
+        // source today, but the rule is the ported one — and it is what would make a JSON file beat
+        // a registry store on Windows.
+        let earlier = PolicySource {
+            settings: vec![
+                PolicySetting {
+                    key: "Hostname".to_string(),
+                    origin: "Platform (Device)".to_string(),
+                    value: Some("from-registry".to_string()),
+                    error: None,
+                },
+                PolicySetting {
+                    key: "Tailnet".to_string(),
+                    origin: "Platform (Device)".to_string(),
+                    value: Some("example.com".to_string()),
+                    error: None,
+                },
+            ],
+            // This case is about the rendered rows the report merges; the decoded-list layering has
+            // its own test (`the_last_registered_source_wins_the_allow_list`).
+            string_lists: BTreeMap::new(),
+            auth_key: None,
+        };
+        let later = PolicySource {
+            settings: vec![PolicySetting {
+                key: "Hostname".to_string(),
+                origin: "JSONFile (Device)".to_string(),
+                value: Some("from-file".to_string()),
+                error: None,
+            }],
+            string_lists: BTreeMap::new(),
+            auth_key: None,
+        };
+
+        let merged = merge(&[earlier, later]);
+        // Sorted by key, the later source's Hostname wins, and the key it does not set survives.
+        assert_eq!(
+            merged
+                .iter()
+                .map(|s| (s.key.as_str(), s.value.as_deref(), s.origin.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Hostname", Some("from-file"), "JSONFile (Device)"),
+                ("Tailnet", Some("example.com"), "Platform (Device)"),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_definition_table_has_no_duplicate_keys() {
+        // Two Go constants map to confusingly similar key strings (`ApplyUpdates` is the key of
+        // `AutoUpdateVisibility`, while the `ApplyUpdates` constant's key is `InstallUpdates`), so a
+        // transcription slip here would shadow a real policy key. `definition_of` takes the first
+        // match, which would silently be the wrong type.
+        let mut seen = std::collections::BTreeSet::new();
+        for d in DEFINITIONS {
+            assert!(seen.insert(d.key), "duplicate policy key {:?}", d.key);
+        }
+        assert_eq!(seen.len(), DEFINITIONS.len());
+    }
+
+    // --- `get_boolean` (Go `syspolicy.GetBoolean`) ---------------------------------------------
+    //
+    // The two TPM policy keys `tailnetd` reads at startup are booleans, so this is the read path
+    // behind `handleTPMFlags`'s `policyclient.Get().GetBoolean(pkey.EncryptState, false)`.
+
+    #[test]
+    fn a_configured_boolean_policy_key_reads_as_its_value() {
+        let settings = resolve(r#"{"EncryptState": true, "HardwareAttestation": false}"#)
+            .expect("both keys are registered booleans");
+        // The default is deliberately the opposite of each configured value, so a `get_boolean`
+        // that ignored the file would fail rather than coincidentally agree with it.
+        assert!(boolean_setting(&settings, PKEY_ENCRYPT_STATE, false));
+        assert!(!boolean_setting(&settings, PKEY_HARDWARE_ATTESTATION, true));
+    }
+
+    #[test]
+    fn an_unconfigured_boolean_policy_key_reads_as_the_default() {
+        // Go's not-configured branch: the file sets one key, so the other must fall back.
+        let settings = resolve(r#"{"EncryptState": true}"#).expect("a registered boolean");
+        assert!(!boolean_setting(
+            &settings,
+            PKEY_HARDWARE_ATTESTATION,
+            false
+        ));
+        assert!(boolean_setting(&settings, PKEY_HARDWARE_ATTESTATION, true));
+    }
+
+    #[test]
+    fn a_non_boolean_or_unknown_key_reads_as_the_default() {
+        // Go's `ErrTypeMismatch`: `Hostname` is a string setting, so asking for it as a boolean
+        // yields the default rather than something parsed out of its rendered value. An unknown key
+        // has no definition at all and behaves the same way.
+        let settings = resolve(r#"{"Hostname": "true"}"#).expect("a registered string setting");
+        assert!(!boolean_setting(&settings, "Hostname", false));
+        assert!(boolean_setting(&settings, "Hostname", true));
+        assert!(!boolean_setting(&settings, "Hostnmae", false));
+    }
+
+    #[test]
+    fn get_boolean_returns_the_default_with_no_registered_source() {
+        // The public entry point over the process-global registry, which no unit test registers
+        // into (see `resolve`): a daemon started without `--syspolicy-file` must see the caller's
+        // default for both TPM keys, which is what keeps `handleTPMFlags` quiet by default.
+        assert!(!get_boolean(PKEY_ENCRYPT_STATE, false));
+        assert!(!get_boolean(PKEY_HARDWARE_ATTESTATION, false));
+        assert!(get_boolean(PKEY_ENCRYPT_STATE, true));
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // Applying the snapshot to prefs (Go `applySysPolicy`).
+    // -------------------------------------------------------------------------------------------
+
+    /// Resolve a policy document and apply it to `prefs`, exactly as the daemon's reconcile does —
+    /// via the production [`apply_settings_to_prefs`], not a re-derivation — while staying off the
+    /// process-global registry (see [`resolve`]).
+    fn apply(json: &str, prefs: &mut Prefs) -> PolicyApplication {
+        apply_with_overrides(json, prefs, PolicyOverrides::default())
+    }
+
+    /// The same, with Go's `overrideAlwaysOn` standing — the state a permitted disconnect leaves the
+    /// backend in until its reconnect window closes.
+    fn apply_with_override(
+        json: &str,
+        prefs: &mut Prefs,
+        override_always_on: bool,
+    ) -> PolicyApplication {
+        apply_with_overrides(
+            json,
+            prefs,
+            PolicyOverrides {
+                always_on: override_always_on,
+                exit_node: false,
+            },
+        )
+    }
+
+    /// The same again, with whichever of the backend's exemptions the test is about — the general
+    /// form both helpers above are a spelling of.
+    fn apply_with_overrides(
+        json: &str,
+        prefs: &mut Prefs,
+        overrides: PolicyOverrides,
+    ) -> PolicyApplication {
+        let settings = resolve(json).expect("the policy document should load");
+        apply_settings_to_prefs(&settings, prefs, overrides)
+    }
+
+    /// The keys the apply path spells as literals must all be registered definitions of the type it
+    /// reads them as. A typo would otherwise be invisible: `configured_*` returns `None` for an
+    /// unknown key, so the setting would simply never apply and nothing would say why.
+    #[test]
+    fn every_key_the_apply_path_names_is_a_registered_definition_of_the_right_type() {
+        for key in [
+            "LoginURL",
+            "Hostname",
+            PKEY_EXIT_NODE_ID,
+            PKEY_EXIT_NODE_IP,
+            // Named by `read_auth_key`, which decodes it with `Value::as_str`. Defined as anything
+            // but `String` and the administrator's enrolment credential stops working: either
+            // `validate` refuses the whole file for the value they wrote, or the decode yields
+            // `None` and the key is configured, reported and inert — which is the exact failure
+            // `auth_key` exists to remove.
+            PKEY_AUTH_KEY,
+        ] {
+            let def = definition_of(key).unwrap_or_else(|| panic!("{key} must be defined"));
+            assert_eq!(def.ty, ValueType::String, "{key}");
+        }
+        // `PKEY_ALWAYS_ON` is named by the apply path; `PKEY_ALWAYS_ON_OVERRIDE_WITH_REASON` is
+        // named by the disconnect gate and `PKEY_ALLOW_TAILSCALED_RESTART` by the LocalAPI
+        // `shutdown` arm, both of which read through the same store and so need the same definition
+        // to exist with the same type. `get_boolean` folds a type mismatch into the caller's
+        // default, so a key defined as anything but `Boolean` would silently deny the verb forever.
+        for key in [
+            PKEY_ALWAYS_ON,
+            PKEY_ALWAYS_ON_OVERRIDE_WITH_REASON,
+            PKEY_ALLOW_TAILSCALED_RESTART,
+            // Named by the exit-node edit gate, which reads it through the same store: defined as
+            // anything but `Boolean` it would resolve to the `false` default forever, and an
+            // administrator who opted into user overrides would never get one.
+            PKEY_ALLOW_EXIT_NODE_OVERRIDE,
+        ] {
+            let def = definition_of(key).unwrap_or_else(|| panic!("{key} must be defined"));
+            assert_eq!(def.ty, ValueType::Boolean, "{key}");
+        }
+        // `ReconnectAfter` is named by `reconnect_after`, which reads it through the same store and
+        // so needs the same definition to exist with the same type: read as anything but a duration
+        // it would resolve to `None` and every permitted disconnect would silently be unbounded.
+        let def = definition_of(PKEY_RECONNECT_AFTER).expect("ReconnectAfter must be defined");
+        assert_eq!(def.ty, ValueType::Duration);
+        for key in PREFERENCE_POLICIES
+            .iter()
+            .map(|p| p.key)
+            .chain(["UnattendedMode"])
+        {
+            let def = definition_of(key).unwrap_or_else(|| panic!("{key} must be defined"));
+            assert_eq!(def.ty, ValueType::PreferenceOption, "{key}");
+        }
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // Every registered key has a reader (Go `implicitDefinitions` <-> this build's consumers).
+    // -------------------------------------------------------------------------------------------
+
+    /// A key whose effect is produced somewhere other than [`apply_settings_to_prefs`], named
+    /// together with the production code that gives it that effect.
+    ///
+    /// `sees` **calls** that code over a resolved policy document and answers whether it observed
+    /// the administrator's value, rather than restating what it would say. The test runs it twice —
+    /// once over a document carrying the key, once over the same document with the key gone — and
+    /// requires the two answers to differ. One-sided is not enough: a reader that ignores the
+    /// administrator's value and always answers the same is exactly the failure this test exists to
+    /// catch, and it would pass a positive assertion.
+    ///
+    /// `ExitNode.AllowOverride` is the row this exists for. It is registered, it moves no pref, and
+    /// the only thing that makes it mean anything is the edit gate reading it — so that row calls
+    /// the gate itself, and it needs `also_configured` to do it, because the gate only looks at the
+    /// override key once the policy has already pinned a node.
+    ///
+    /// Where the consumer reads the **process-global** registry and so cannot be called from a unit
+    /// test, `consumer` names the read rather than the refusal behind it, and the row proves that
+    /// read: `tailnetd`'s two TPM refusals live in a binary, and the always-on disconnect gate
+    /// resolves its keys inside `alwayson::check_disconnect_policy`. Both refusals are pure
+    /// decisions over already-resolved values and are tested next to themselves, in `ipn::alwayson`.
+    /// No row claims a call it does not make.
+    struct NamedReader {
+        /// The policy key, spelled as [`DEFINITIONS`] spells it.
+        key: &'static str,
+        /// What reads it — printed by the assertion, so a failure names the wiring that went away.
+        consumer: &'static str,
+        /// Other keys that must be configured before this one means anything, as the body of a JSON
+        /// object (no braces, no trailing comma). Empty for a key whose consumer reads it on its
+        /// own. These stay configured in the key-absent document, so the differential isolates the
+        /// key under test rather than the whole policy.
+        also_configured: &'static str,
+        /// Does that consumer see the value the document configures?
+        sees: fn(&PolicySource) -> bool,
+    }
+
+    /// Every key whose consumer is not the apply path. The apply path's own keys are deliberately
+    /// absent: [`apply_path_acts_on`] proves those by running it.
+    const NAMED_READERS: &[NamedReader] = &[
+        NamedReader {
+            key: PKEY_ALLOW_EXIT_NODE_OVERRIDE,
+            consumer: "the exit-node edit gate, exitnodepolicy::check_exit_node_edit",
+            // The gate's answer is "managed by policy" whatever this key says until a node is
+            // pinned, so the one-key document would make the row untestable — Go reads
+            // `AllowExitNodeOverride` only after `HasAnyOf(ExitNodeID, ExitNodeIP)` has said yes.
+            also_configured: r#""ExitNodeIP": "100.64.0.9""#,
+            sees: |s| {
+                let policy = exit_node_policy_in(&s.settings);
+                // An operator naming a *different* node: refused outright without the key, and the
+                // granted exemption with it.
+                matches!(
+                    crate::ipn::exitnodepolicy::check_exit_node_edit(
+                        Some(Some("100.64.0.3")),
+                        &policy
+                    ),
+                    Ok(crate::ipn::exitnodepolicy::ExitNodeEdit::Override)
+                )
+            },
+        },
+        NamedReader {
+            key: PKEY_ALWAYS_ON_OVERRIDE_WITH_REASON,
+            consumer: "the always-on disconnect gate's read, always_on_keys",
+            also_configured: "",
+            sees: |s| always_on_keys_in(&s.settings).override_with_reason == Some(true),
+        },
+        NamedReader {
+            key: PKEY_RECONNECT_AFTER,
+            consumer: "the reconnect timer's arming read, reconnect_after",
+            also_configured: "",
+            sees: |s| reconnect_after_in(&s.settings).is_some(),
+        },
+        NamedReader {
+            key: PKEY_ENCRYPT_STATE,
+            consumer: "tailnetd's state-at-rest refusal, through the get_boolean read",
+            also_configured: "",
+            sees: |s| boolean_setting(&s.settings, PKEY_ENCRYPT_STATE, false),
+        },
+        NamedReader {
+            key: PKEY_HARDWARE_ATTESTATION,
+            consumer: "tailnetd's hardware-attestation refusal, through the get_boolean read",
+            also_configured: "",
+            sees: |s| boolean_setting(&s.settings, PKEY_HARDWARE_ATTESTATION, false),
+        },
+        NamedReader {
+            key: PKEY_ALLOW_TAILSCALED_RESTART,
+            consumer: "the LocalAPI shutdown verdict, crate::server::shutdown_verdict",
+            also_configured: "",
+            // Chained exactly as the server chains them: the policy read feeds the verdict, and a
+            // caller who may already write is refused until the administrator says otherwise.
+            sees: |s| {
+                crate::server::shutdown_verdict(
+                    crate::auth::Access::ReadWrite,
+                    boolean_setting(&s.settings, PKEY_ALLOW_TAILSCALED_RESTART, false),
+                )
+                .is_ok()
+            },
+        },
+        NamedReader {
+            key: PKEY_AUTH_KEY,
+            consumer: "the registration path, auth_key",
+            also_configured: "",
+            sees: |s| {
+                let gate = AuthKeyGate {
+                    running: false,
+                    needs_login: false,
+                    enrolled: false,
+                    config_in_use: false,
+                };
+                matches!(
+                    auth_key_in(std::slice::from_ref(s), gate),
+                    AuthKeyDecision::Use(_)
+                )
+            },
+        },
+        NamedReader {
+            key: PKEY_ALLOWED_SUGGESTED_EXIT_NODES,
+            consumer: "the exit-node suggestion filter, allowed_suggested_exit_nodes",
+            also_configured: "",
+            sees: |s| allowed_suggestions_in(std::slice::from_ref(s)).is_some(),
+        },
+    ];
+
+    /// The keys this daemon defines and knowingly does not act on, each with its reason.
+    ///
+    /// Defining them is not idle: [`validate`] refuses a file naming a key that is not defined,
+    /// so a fleet-wide payload that also carries the GUI clients' keys would otherwise be rejected
+    /// whole on this host, and `syspolicy list` reports them, which is how an administrator sees
+    /// they arrived. Acting on them is what this daemon has no surface for. One line each, so the
+    /// list stays a set of decisions rather than a dumping ground.
+    const REGISTERED_BUT_NOT_READ: &[(&str, &str)] = &[
+        (
+            "AdminConsole",
+            "shows or hides a GUI menu item; this daemon has no UI",
+        ),
+        (
+            "ApplyUpdates",
+            "shows or hides a GUI menu item; the update PREFERENCE is InstallUpdates, which is \
+             applied",
+        ),
+        (
+            "DeviceSerialNumber",
+            "overrides the serial a posture-reporting client sends; this daemon sends no posture \
+             identity",
+        ),
+        (
+            "EnableDNSRegistration",
+            "registers the tailnet interface with a Windows resolver; this daemon manages no host \
+             resolver registrations",
+        ),
+        (
+            "ExitNodesPicker",
+            "shows or hides a GUI menu item; this daemon has no UI",
+        ),
+        (
+            "FlushDNSOnSessionUnlock",
+            "a Windows session-unlock hook; a system daemon has no user session to unlock",
+        ),
+        (
+            "KeyExpirationNotice",
+            "how long before key expiry a GUI warns; this daemon has no UI to warn in",
+        ),
+        (
+            "LogSCMInteractions",
+            "traces Windows Service Control Manager calls; not how this daemon is supervised",
+        ),
+        (
+            "LogTarget",
+            "an alternate log-upload endpoint; this daemon uploads no logs",
+        ),
+        (
+            "MachineCertificateSubject",
+            "selects a machine certificate to sign control requests with; this daemon signs none",
+        ),
+        (
+            "ManagedByCaption",
+            "GUI text naming the administrator; this daemon has no UI",
+        ),
+        (
+            "ManagedByOrganizationName",
+            "GUI text naming the organization; this daemon has no UI",
+        ),
+        ("ManagedByURL", "a GUI support link; this daemon has no UI"),
+        (
+            "NetworkDevices",
+            "shows or hides a GUI menu item; this daemon has no UI",
+        ),
+        (
+            "OnboardingFlow",
+            "shows or hides a GUI first-run flow; this daemon has no UI",
+        ),
+        (
+            // A recorded GAP, not parity: upstream carries this in `preferencePolicies` and moves
+            // the pref with it.
+            "PostureChecking",
+            "upstream applies this to the posture-checking pref; this build answers no posture \
+             pull at all (c2n, engine ask #43), so applying it would advertise an intent nothing \
+             here serves — the pref is left to the operator until the channel exists",
+        ),
+        (
+            "PreferencesMenu",
+            "shows or hides a GUI menu item; this daemon has no UI",
+        ),
+        (
+            "ResetToDefaults",
+            "shows or hides a GUI menu item; this daemon has no UI",
+        ),
+        (
+            "RunExitNode",
+            "shows or hides a GUI menu item; the exit-node PREFERENCE is AdvertiseExitNode, which \
+             is applied",
+        ),
+        (
+            "SuggestedExitNode",
+            "shows or hides a GUI menu item; this daemon has no UI",
+        ),
+        (
+            "Tailnet",
+            "preselects the tailnet a GUI sign-in offers; this daemon signs in with an auth key \
+             and a control URL, with nothing to preselect",
+        ),
+        (
+            "TestMenu",
+            "shows or hides a GUI menu item; this daemon has no UI",
+        ),
+        (
+            "UpdateMenu",
+            "shows or hides a GUI menu item; this daemon has no UI",
+        ),
+    ];
+
+    /// A configured value of the right type for `ty`, as the JSON a policy file would carry, that a
+    /// consumer can tell apart from "not configured".
+    ///
+    /// More than one where the type has no single such value: a `PreferenceOption` resolves against
+    /// the pref's CURRENT value, so whichever of `always`/`never` already matches the default prefs
+    /// changes nothing and would look like a key nothing reads.
+    fn sample_values(ty: ValueType) -> &'static [&'static str] {
+        match ty {
+            ValueType::Boolean => &["true"],
+            // Parses as an address for ExitNodeIP and is an ordinary opaque string everywhere else.
+            ValueType::String => &["\"100.64.0.9\""],
+            ValueType::StringList => &["[\"100.64.0.9\"]"],
+            ValueType::PreferenceOption => &["\"always\"", "\"never\""],
+            ValueType::Visibility => &["\"hide\"", "\"show\""],
+            ValueType::Duration => &["\"30m\""],
+        }
+    }
+
+    /// Does the apply path give `key` an effect — a pref it writes, or a refusal it reports?
+    ///
+    /// Runs the production [`apply_settings_to_prefs`] over a one-key document, exactly as the
+    /// daemon's reconcile does, and asks what came back.
+    fn apply_path_acts_on(key: &str, json_value: &str) -> bool {
+        let mut prefs = Prefs::default();
+        let applied = apply(&one_key_document(key, json_value), &mut prefs);
+        !applied.is_quiet()
+    }
+
+    /// A policy document configuring exactly `key`.
+    fn one_key_document(key: &str, json_value: &str) -> String {
+        format!("{{{}: {json_value}}}", quoted(key))
+    }
+
+    /// The document a [`NamedReader`] is read over: its `also_configured` context plus the key
+    /// under test, or — when `configured` is false — the same context with the key left out.
+    fn reader_document(reader: &NamedReader, json_value: &str, configured: bool) -> String {
+        let key = match configured {
+            true => format!("{}: {json_value}", quoted(reader.key)),
+            false => String::new(),
+        };
+        let body = match (reader.also_configured, key.as_str()) {
+            ("", key) => key.to_string(),
+            (context, "") => context.to_string(),
+            (context, key) => format!("{context}, {key}"),
+        };
+        format!("{{{body}}}")
+    }
+
+    /// The defect class the `ExitNode.AllowOverride` report named: a key can be added to
+    /// [`DEFINITIONS`] — which is all it takes for a file naming it to load and for `syspolicy
+    /// list` to report it — and then be read by nothing at all, so an administrator's setting is
+    /// rendered back to them while changing nothing.
+    ///
+    /// Every registered key must therefore land in one of three places, and the first two are
+    /// proved by calling the code that does the reading:
+    ///
+    /// 1. the apply path acts on it — a pref it writes or a refusal it reports
+    ///    ([`apply_path_acts_on`]),
+    /// 2. a consumer outside the apply path reads it ([`NAMED_READERS`], whose `sees` calls it and
+    ///    must answer differently with the key configured and without it),
+    /// 3. it is listed in [`REGISTERED_BUT_NOT_READ`] with the reason, so "this daemon does not act
+    ///    on it" is a recorded decision rather than an oversight.
+    #[test]
+    fn every_registered_policy_key_is_read_or_recorded_as_unread() {
+        for def in DEFINITIONS {
+            let applied = sample_values(def.ty)
+                .iter()
+                .any(|value| apply_path_acts_on(def.key, value));
+            let reader = NAMED_READERS.iter().find(|r| r.key == def.key);
+            let unread = REGISTERED_BUT_NOT_READ.iter().find(|(k, _)| *k == def.key);
+
+            if let Some(reader) = reader {
+                // Every key with a named reader is of a type with one telling value; a
+                // `PreferenceOption` (the two-sample case) is applied to a pref, not read here.
+                let value = sample_values(def.ty)[0];
+                let configured = resolve_source(&reader_document(reader, value, true))
+                    .expect("a document of the registered type must load");
+                assert!(
+                    (reader.sees)(&configured),
+                    "{} is recorded as read by {}, but that consumer does not see it — the wiring \
+                     went away and the key is now registered, reported and inert",
+                    def.key,
+                    reader.consumer
+                );
+                let absent = resolve_source(&reader_document(reader, value, false))
+                    .expect("the same document without the key must load");
+                assert!(
+                    !(reader.sees)(&absent),
+                    "{} is recorded as read by {}, but that consumer answers the same with the key \
+                     absent — it is not reading the administrator's value",
+                    def.key,
+                    reader.consumer
+                );
+            }
+
+            assert!(
+                applied || reader.is_some() || unread.is_some(),
+                "{} is a registered policy setting that the apply path does not act on, that no \
+                 named consumer reads, and that REGISTERED_BUT_NOT_READ does not account for: an \
+                 administrator who ships it gets a row in `syspolicy list` and no effect. Wire it \
+                 up, refuse it in PolicyApplication::refused, or record why it does nothing.",
+                def.key
+            );
+
+            if let Some((key, reason)) = unread {
+                assert!(
+                    !applied && reader.is_none(),
+                    "{key} is recorded as unread ({reason}) but something does read it; drop the \
+                     row"
+                );
+            }
+        }
+    }
+
+    /// The reverse direction: neither list may name a key that is not a registered definition. A
+    /// stale row would otherwise sit there accounting for a key nobody can configure, and — for a
+    /// [`NamedReader`] — never run its `sees` against anything.
+    #[test]
+    fn the_key_accounting_names_no_setting_that_is_not_defined() {
+        for key in NAMED_READERS
+            .iter()
+            .map(|r| r.key)
+            .chain(REGISTERED_BUT_NOT_READ.iter().map(|(k, _)| *k))
+        {
+            assert!(
+                definition_of(key).is_some(),
+                "{key} is accounted for but is not a registered policy setting"
+            );
+        }
+    }
+    #[test]
+    fn an_empty_policy_leaves_every_pref_alone() {
+        let mut prefs = Prefs {
+            hostname: Some("operator-chose-this".into()),
+            ..Prefs::default()
+        };
+        let applied = apply("{}", &mut prefs);
+        assert!(applied.is_quiet(), "{applied:?}");
+        assert_eq!(prefs.hostname.as_deref(), Some("operator-chose-this"));
+    }
+
+    #[test]
+    fn login_url_and_hostname_override_what_the_operator_set() {
+        // The whole point of policy: the pref the operator chose loses to the pref the admin pinned.
+        let mut prefs = Prefs {
+            control_url: Some("https://operator.example.com".into()),
+            hostname: Some("laptop".into()),
+            ..Prefs::default()
+        };
+        let applied = apply(
+            r#"{"LoginURL": "https://headscale.example.com", "Hostname": "kiosk-3"}"#,
+            &mut prefs,
+        );
+        assert_eq!(
+            prefs.control_url.as_deref(),
+            Some("https://headscale.example.com")
+        );
+        assert_eq!(prefs.hostname.as_deref(), Some("kiosk-3"));
+        assert_eq!(
+            applied
+                .changed
+                .iter()
+                .map(|c| (c.key, c.pref, c.value.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("LoginURL", "control_url", "https://headscale.example.com"),
+                ("Hostname", "hostname", "kiosk-3"),
+            ]
+        );
+        assert!(applied.refused.is_empty(), "{applied:?}");
+    }
+
+    #[test]
+    fn a_configured_empty_hostname_clears_it_but_an_absent_key_does_not() {
+        // Go needs a `HostnameDefaultValue` sentinel to tell these two apart; here the store already
+        // knows whether the key is configured. Both halves of the tri-state, on the same prefs.
+        let mut prefs = Prefs {
+            hostname: Some("laptop".into()),
+            ..Prefs::default()
+        };
+        let untouched = apply(r#"{"CheckUpdates": "user-decides"}"#, &mut prefs);
+        assert!(untouched.is_quiet(), "{untouched:?}");
+        assert_eq!(
+            prefs.hostname.as_deref(),
+            Some("laptop"),
+            "a policy that does not mention Hostname must leave it alone"
+        );
+
+        let cleared = apply(r#"{"Hostname": ""}"#, &mut prefs);
+        assert_eq!(
+            prefs.hostname, None,
+            "a configured-but-empty Hostname CLEARS the pref (back to the OS hostname)"
+        );
+        assert_eq!(cleared.changed.len(), 1);
+        assert_eq!(cleared.changed[0].pref, "hostname");
+        assert_eq!(cleared.changed[0].value, "");
+    }
+
+    #[test]
+    fn an_empty_login_url_falls_back_to_the_engine_default() {
+        let mut prefs = Prefs {
+            control_url: Some("https://operator.example.com".into()),
+            ..Prefs::default()
+        };
+        apply(r#"{"LoginURL": ""}"#, &mut prefs);
+        assert_eq!(prefs.control_url, None);
+    }
+
+    #[test]
+    fn always_on_forces_want_running_back_up_and_never_turns_it_off() {
+        let mut prefs = Prefs::default();
+        assert!(!prefs.want_running);
+        let applied = apply(r#"{"AlwaysOn.Enabled": true}"#, &mut prefs);
+        assert!(prefs.want_running);
+        assert_eq!(applied.changed.len(), 1);
+        assert_eq!(applied.changed[0].pref, "want_running");
+
+        // One-way, like Go's `alwaysOn && !prefs.WantRunning`: a false value is not a `down`.
+        let mut running = Prefs {
+            want_running: true,
+            ..Prefs::default()
+        };
+        let off = apply(r#"{"AlwaysOn.Enabled": false}"#, &mut running);
+        assert!(running.want_running, "AlwaysOn: false must not stop a node");
+        assert!(off.is_quiet(), "{off:?}");
+    }
+
+    #[test]
+    fn a_standing_override_suppresses_the_always_on_re_assert_and_nothing_else() {
+        // Go's `alwaysOn && !b.overrideAlwaysOn && !prefs.WantRunning`. This is the whole point of
+        // the flag: between a disconnect the gate PERMITTED and the moment its window closes, the
+        // re-assert must not fight it — otherwise the next unrelated `tnet set` puts the node back
+        // up at an arbitrary moment.
+        let mut prefs = Prefs::default();
+        let applied = apply_with_override(r#"{"AlwaysOn.Enabled": true}"#, &mut prefs, true);
+        assert!(
+            !prefs.want_running,
+            "a permitted disconnect must survive a reconcile while the override stands"
+        );
+        assert!(applied.is_quiet(), "{applied:?}");
+
+        // The override is scoped to the always-on re-assert; every other key still applies, so a
+        // disconnected node is still a managed one.
+        let mut prefs = Prefs::default();
+        let applied = apply_with_override(
+            r#"{"AlwaysOn.Enabled": true, "Hostname": "documented-node"}"#,
+            &mut prefs,
+            true,
+        );
+        assert_eq!(prefs.hostname.as_deref(), Some("documented-node"));
+        assert!(!prefs.want_running);
+        assert_eq!(applied.changed.len(), 1);
+        assert_eq!(applied.changed[0].pref, "hostname");
+
+        // And once the window closes (the flag is cleared), the very same policy re-asserts.
+        let reasserted = apply_with_override(r#"{"AlwaysOn.Enabled": true}"#, &mut prefs, false);
+        assert!(prefs.want_running);
+        assert_eq!(reasserted.changed.len(), 1);
+        assert_eq!(reasserted.changed[0].pref, "want_running");
+    }
+
+    // --- `ReconnectAfter` (Go `syspolicy.GetDuration` + `onEditPrefsLocked`'s `> 0` guard) -------
+
+    #[test]
+    fn a_configured_reconnect_after_reads_back_as_the_duration_the_admin_wrote() {
+        // The row stores Go's `Duration.String()` rendering (`30m` → `30m0s`), so this also pins
+        // that the render/parse round-trip is exact — a bound that came back short or long would
+        // silently change the administrator's contract.
+        let settings = resolve(r#"{"ReconnectAfter": "30m"}"#).expect("a registered duration key");
+        assert_eq!(
+            reconnect_after_in(&settings),
+            Some(std::time::Duration::from_secs(30 * 60))
+        );
+        let settings =
+            resolve(r#"{"ReconnectAfter": "1h30m"}"#).expect("a registered duration key");
+        assert_eq!(
+            reconnect_after_in(&settings),
+            Some(std::time::Duration::from_secs(90 * 60))
+        );
+        // Sub-second precision survives too (nanoseconds are Go's unit).
+        let settings =
+            resolve(r#"{"ReconnectAfter": "1.5ms"}"#).expect("a registered duration key");
+        assert_eq!(
+            reconnect_after_in(&settings),
+            Some(std::time::Duration::from_nanos(1_500_000))
+        );
+    }
+
+    #[test]
+    fn a_zero_absent_or_negative_reconnect_after_is_no_bound_at_all() {
+        // Go's default is `0` and its arming test is `reconnectAfter > 0`, so all three of these
+        // mean "the disconnect is not time-bounded" — and must NOT arm a timer that fires instantly.
+        assert_eq!(reconnect_after_in(&[]), None, "not configured");
+        for json in [
+            r#"{"ReconnectAfter": "0s"}"#,
+            r#"{"ReconnectAfter": "0"}"#,
+            r#"{"ReconnectAfter": "-30m"}"#,
+        ] {
+            let settings = resolve(json).expect("all three are valid Go durations");
+            assert_eq!(reconnect_after_in(&settings), None, "{json}");
+        }
+        // A file that configures only the other duration key must not be read as a bound: Go's
+        // `GetDuration` is keyed, and `KeyExpirationNotice` is a different setting entirely.
+        let settings = resolve(r#"{"KeyExpirationNotice": "30m"}"#).expect("a duration key");
+        assert_eq!(reconnect_after_in(&settings), None);
+    }
+
+    #[test]
+    fn reconnect_after_returns_no_bound_with_no_registered_source() {
+        // The public entry point over the process-global registry, which no unit test registers
+        // into (see `resolve`): a daemon started without `--syspolicy-file` must find no bound, so
+        // an ordinary `tnet down` on an unmanaged node arms nothing.
+        assert_eq!(reconnect_after(), None);
+    }
+
+    #[test]
+    fn the_always_on_snapshot_distinguishes_unset_from_false() {
+        // Go's `sysPolicyChanged` fires on `HasChangedAnyOf(AlwaysOn, AlwaysOnOverrideWithReason)`,
+        // and an administrator moving a key from unset to `false` IS a change — so the snapshot the
+        // daemon compares has to be tri-state per key, not a pair of bools.
+        assert_eq!(always_on_keys_in(&[]), AlwaysOnKeys::default());
+        let unset = always_on_keys_in(&resolve(r#"{"Hostname": "x"}"#).expect("a string key"));
+        let off = always_on_keys_in(
+            &resolve(r#"{"AlwaysOn.Enabled": false}"#).expect("a registered boolean"),
+        );
+        assert_ne!(unset, off, "unset and false must not compare equal");
+        assert_eq!(off.enabled, Some(false));
+        assert_eq!(off.override_with_reason, None);
+
+        let both = always_on_keys_in(
+            &resolve(r#"{"AlwaysOn.Enabled": true, "AlwaysOn.OverrideWithReason": true}"#)
+                .expect("two registered booleans"),
+        );
+        assert_eq!(
+            both,
+            AlwaysOnKeys {
+                enabled: Some(true),
+                override_with_reason: Some(true),
+            }
+        );
+    }
+
+    #[test]
+    fn the_preference_options_force_their_prefs_on_and_off() {
+        // `always` on every row, against prefs where each governed pref is at the opposite value.
+        let mut prefs = Prefs {
+            shields_up: true,
+            exit_node_allow_lan_access: false,
+            accept_dns: false,
+            accept_routes: false,
+            auto_update_check: false,
+            auto_update_apply: None,
+            advertise_exit_node: false,
+            ..Prefs::default()
+        };
+        let applied = apply(
+            r#"{"AllowIncomingConnections": "always", "ExitNodeAllowLANAccess": "always",
+                "UseTailscaleDNSSettings": "always", "UseTailscaleSubnets": "always",
+                "CheckUpdates": "always", "InstallUpdates": "always",
+                "AdvertiseExitNode": "always"}"#,
+            &mut prefs,
+        );
+        assert!(
+            !prefs.shields_up,
+            "AllowIncomingConnections is the NEGATION of shields-up"
+        );
+        assert!(prefs.exit_node_allow_lan_access);
+        assert!(prefs.accept_dns);
+        assert!(prefs.accept_routes);
+        assert!(prefs.auto_update_check);
+        assert_eq!(prefs.auto_update_apply, Some(true));
+        assert!(prefs.advertise_exit_node);
+        assert_eq!(
+            applied.changed.len(),
+            PREFERENCE_POLICIES.len(),
+            "every row should have moved: {applied:?}"
+        );
+
+        // And `never` on the same rows, from the values `always` just produced.
+        let applied = apply(
+            r#"{"AllowIncomingConnections": "never", "ExitNodeAllowLANAccess": "never",
+                "UseTailscaleDNSSettings": "never", "UseTailscaleSubnets": "never",
+                "CheckUpdates": "never", "InstallUpdates": "never",
+                "AdvertiseExitNode": "never"}"#,
+            &mut prefs,
+        );
+        assert!(prefs.shields_up, "never = incoming blocked = shields up");
+        assert!(!prefs.exit_node_allow_lan_access);
+        assert!(!prefs.accept_dns);
+        assert!(!prefs.accept_routes);
+        assert!(!prefs.auto_update_check);
+        assert_eq!(prefs.auto_update_apply, Some(false));
+        assert!(!prefs.advertise_exit_node);
+        assert_eq!(applied.changed.len(), PREFERENCE_POLICIES.len());
+    }
+
+    #[test]
+    fn user_decides_leaves_the_pref_exactly_as_it_was() {
+        // Go writes only when `curVal != newVal`, and `user-decides` resolves to `curVal` — so it is
+        // not a change, on either polarity of the shields-up row.
+        for shields_up in [false, true] {
+            let mut prefs = Prefs {
+                shields_up,
+                accept_routes: true,
+                ..Prefs::default()
+            };
+            let applied = apply(
+                r#"{"AllowIncomingConnections": "user-decides", "UseTailscaleSubnets": "user-decides"}"#,
+                &mut prefs,
+            );
+            assert_eq!(prefs.shields_up, shields_up);
+            assert!(prefs.accept_routes);
+            assert!(applied.is_quiet(), "{applied:?}");
+        }
+    }
+
+    #[test]
+    fn install_updates_leaves_an_unstated_opt_in_unstated_unless_it_is_always() {
+        // Go reads `AutoUpdate.Apply` as `v, _ := Get()`, so UNSET reads false: `never` agrees with
+        // it and writes nothing, keeping Go's tri-state `unset` distinct from an explicit `false`.
+        let mut prefs = Prefs::default();
+        assert_eq!(prefs.auto_update_apply, None);
+        let applied = apply(r#"{"InstallUpdates": "never"}"#, &mut prefs);
+        assert_eq!(
+            prefs.auto_update_apply, None,
+            "`never` must not turn an unstated opt-in into an explicit false"
+        );
+        assert!(applied.is_quiet(), "{applied:?}");
+
+        apply(r#"{"InstallUpdates": "always"}"#, &mut prefs);
+        assert_eq!(prefs.auto_update_apply, Some(true));
+    }
+
+    #[test]
+    fn exit_node_ip_pins_the_selector_over_the_operators_choice() {
+        let mut prefs = Prefs {
+            exit_node: Some("someone-elses-node".into()),
+            ..Prefs::default()
+        };
+        let applied = apply(r#"{"ExitNodeIP": "100.64.0.9"}"#, &mut prefs);
+        assert_eq!(prefs.exit_node.as_deref(), Some("100.64.0.9"));
+        assert_eq!(applied.changed.len(), 1);
+        assert_eq!(applied.changed[0].key, "ExitNodeIP");
+        assert_eq!(applied.changed[0].pref, "exit_node");
+        assert!(applied.refused.is_empty(), "{applied:?}");
+    }
+
+    #[test]
+    fn an_unparseable_exit_node_ip_is_refused_rather_than_stored_as_a_peer_name() {
+        // Go's `err == nil` guard drops the value; storing it would turn a typo'd address into a
+        // NAME selector that matches no peer, which egresses directly.
+        let mut prefs = Prefs::default();
+        let applied = apply(r#"{"ExitNodeIP": "192.0.2.999"}"#, &mut prefs);
+        assert_eq!(prefs.exit_node, None);
+        assert!(applied.changed.is_empty());
+        assert_eq!(applied.refused.len(), 1);
+        assert_eq!(applied.refused[0].key, "ExitNodeIP");
+        assert!(
+            applied.refused[0].reason.contains("not an IP address"),
+            "{:?}",
+            applied.refused[0]
+        );
+    }
+
+    #[test]
+    fn a_stable_exit_node_id_is_refused_and_suppresses_exit_node_ip() {
+        // Go's mutual exclusion (ID wins, IP is never consulted) is kept even though the ID cannot
+        // be honoured — so a file naming both pins NEITHER, and says so once.
+        let mut prefs = Prefs::default();
+        let applied = apply(
+            r#"{"ExitNodeID": "nABC123CNTRL", "ExitNodeIP": "100.64.0.9"}"#,
+            &mut prefs,
+        );
+        assert_eq!(
+            prefs.exit_node, None,
+            "a refused ExitNodeID must not fall through to the key the admin ranked second"
+        );
+        assert!(applied.changed.is_empty(), "{applied:?}");
+        assert_eq!(applied.refused.len(), 1);
+        assert_eq!(applied.refused[0].key, "ExitNodeID");
+        assert!(
+            applied.refused[0].reason.contains("stable node id"),
+            "{:?}",
+            applied.refused[0]
+        );
+    }
+
+    #[test]
+    fn an_auto_exit_node_expression_is_refused_by_name() {
+        // The `auto:` form needs both an expression resolver and a blackhole state to park on; this
+        // build has neither, and refuses `--exit-node auto:…` on the operator path for the same
+        // reason. The refusal must name the feature, not the node.
+        let mut prefs = Prefs::default();
+        let applied = apply(r#"{"ExitNodeID": "auto:any"}"#, &mut prefs);
+        assert_eq!(prefs.exit_node, None);
+        assert_eq!(applied.refused.len(), 1);
+        assert_eq!(applied.refused[0].key, "ExitNodeID");
+        assert!(
+            applied.refused[0].reason.contains("auto:"),
+            "{:?}",
+            applied.refused[0]
+        );
+    }
+
+    #[test]
+    fn a_standing_exit_node_override_suppresses_the_re_apply() {
+        // The window Go's `overrideExitNodePolicy` buys: the administrator allowed the operator to
+        // pick a different node, so the re-apply that runs after every prefs write must leave that
+        // pick alone. Without this the permitted override would be undone by the very command that
+        // made it — the bug this pair exists to close, one reconcile point later.
+        let doc = r#"{"ExitNodeIP": "100.64.0.9", "ExitNode.AllowOverride": true}"#;
+        let mut prefs = Prefs {
+            exit_node: Some("100.64.0.3".into()),
+            ..Prefs::default()
+        };
+        let applied = apply_with_overrides(
+            doc,
+            &mut prefs,
+            PolicyOverrides {
+                always_on: false,
+                exit_node: true,
+            },
+        );
+        assert_eq!(
+            prefs.exit_node.as_deref(),
+            Some("100.64.0.3"),
+            "a permitted override must survive the reconcile that follows it"
+        );
+        assert!(applied.changed.is_empty(), "{applied:?}");
+        assert!(applied.refused.is_empty(), "{applied:?}");
+
+        // And with no override standing — the same document, the administrator's node.
+        let applied = apply(doc, &mut prefs);
+        assert_eq!(prefs.exit_node.as_deref(), Some("100.64.0.9"));
+        assert_eq!(applied.changed.len(), 1, "{applied:?}");
+    }
+
+    #[test]
+    fn the_gate_locks_on_the_exit_node_the_policy_actually_applies() {
+        // The fork's ruling on Go's `HasAnyOf(ExitNodeID, ExitNodeIP)` (see the module docs): the
+        // lock is what `apply_exit_node_policy` writes, so a key this build refuses cannot be used
+        // to refuse the operator's exit node while pinning nothing in its place.
+        let pinned =
+            exit_node_policy_in(&resolve(r#"{"ExitNodeIP": "100.64.0.9"}"#).expect("load"));
+        assert_eq!(pinned.pinned.as_deref(), Some("100.64.0.9"));
+        assert!(
+            !pinned.allow_override,
+            "ExitNode.AllowOverride defaults to false, exactly as Go's GetBoolean(..., false) does"
+        );
+
+        for doc in [
+            // Refused: a stable node id pins nothing here, and it suppresses ExitNodeIP.
+            r#"{"ExitNodeID": "nABC123CNTRL"}"#,
+            r#"{"ExitNodeID": "nABC123CNTRL", "ExitNodeIP": "100.64.0.9"}"#,
+            r#"{"ExitNodeID": "auto:any"}"#,
+            // Ignored: an address the apply path drops, and an empty value.
+            r#"{"ExitNodeIP": "192.0.2.999"}"#,
+            r#"{"ExitNodeIP": ""}"#,
+            // No exit-node key at all, with the override key set to prove it pins nothing by itself.
+            r#"{"ExitNode.AllowOverride": true}"#,
+            "{}",
+        ] {
+            let policy = exit_node_policy_in(&resolve(doc).expect("load"));
+            assert_eq!(
+                policy.pinned, None,
+                "{doc} pins nothing this build applies, so it must lock nothing either"
+            );
+            // Cross-check against the apply path itself, so the two cannot drift: what is locked is
+            // exactly what is written.
+            let mut prefs = Prefs::default();
+            apply(doc, &mut prefs);
+            assert_eq!(prefs.exit_node, None, "{doc}");
+        }
+
+        let allowed = exit_node_policy_in(
+            &resolve(r#"{"ExitNodeIP": "100.64.0.9", "ExitNode.AllowOverride": true}"#)
+                .expect("load"),
+        );
+        assert!(allowed.allow_override);
+    }
+
+    #[test]
+    fn the_exit_node_snapshot_carries_the_raw_keys_tri_state() {
+        // Go revokes a standing override when a KEY moves, not when its effect moves — an admin who
+        // swaps a pinned IP for an (unusable) stable id has still changed the policy. So the
+        // snapshot holds the configured values, and "unset" differs from "set to empty"/"false".
+        assert_eq!(
+            exit_node_keys_in(&resolve("{}").expect("load")),
+            ExitNodeKeys::default()
+        );
+        let keys = exit_node_keys_in(
+            &resolve(
+                r#"{"ExitNodeID": "nABC123CNTRL", "ExitNodeIP": "",
+                    "ExitNode.AllowOverride": false}"#,
+            )
+            .expect("load"),
+        );
+        assert_eq!(
+            keys,
+            ExitNodeKeys {
+                id: Some("nABC123CNTRL".to_string()),
+                ip: Some(String::new()),
+                allow_override: Some(false),
+            }
+        );
+        assert_ne!(
+            keys,
+            ExitNodeKeys {
+                allow_override: None,
+                ..keys.clone()
+            },
+            "an administrator writing `false` where nothing was configured is a change"
+        );
+    }
+
+    #[test]
+    fn the_key_with_no_pref_to_move_is_reported_unenforced() {
+        // `UnattendedMode` has no counterpart in this daemon; reporting it is what keeps the policy
+        // file from looking enforced when it is not.
+        let mut prefs = Prefs::default();
+        let applied = apply(r#"{"UnattendedMode": "always"}"#, &mut prefs);
+        assert!(applied.changed.is_empty(), "{applied:?}");
+        let refused: Vec<&str> = applied.refused.iter().map(|r| r.key).collect();
+        assert!(refused.contains(&"UnattendedMode"), "{refused:?}");
+    }
+
+    #[test]
+    fn the_always_on_override_key_is_not_reported_unenforced() {
+        // It moves no pref, so the apply path is silent about it — but it IS enforced, by the
+        // disconnect gate that reads it by name. Reporting it as unenforced would tell an
+        // administrator their `--reason` exemption does nothing, which is the opposite of true.
+        let mut prefs = Prefs::default();
+        let applied = apply(
+            r#"{"AlwaysOn.Enabled": true, "AlwaysOn.OverrideWithReason": true}"#,
+            &mut prefs,
+        );
+        assert!(
+            prefs.want_running,
+            "AlwaysOn.Enabled still re-asserts intent"
+        );
+        let refused: Vec<&str> = applied.refused.iter().map(|r| r.key).collect();
+        assert!(refused.is_empty(), "{refused:?}");
+        // The gate's own decision is pinned by the unit tests in `alwayson` (over resolved booleans)
+        // and end-to-end by `tests/alwayson_disconnect.rs` (over a registered policy file); this
+        // test owns only the half that lives here — that the apply path stays quiet about the key
+        // instead of contradicting them.
+    }
+
+    #[test]
+    fn re_applying_the_same_policy_reports_no_further_change() {
+        // The reconcile runs on every prefs write, so a policy that is already in force must be
+        // silent — otherwise every `tnet set` would log a change that did not happen.
+        let doc = r#"{"Hostname": "kiosk-3", "LoginURL": "https://headscale.example.com",
+                      "ExitNodeIP": "100.64.0.9", "AlwaysOn.Enabled": true,
+                      "AllowIncomingConnections": "never", "CheckUpdates": "always"}"#;
+        let mut prefs = Prefs::default();
+        let first = apply(doc, &mut prefs);
+        assert!(!first.changed.is_empty());
+        let second = apply(doc, &mut prefs);
+        assert!(
+            second.is_quiet(),
+            "the second application must be a no-op: {second:?}"
+        );
+    }
+
+    #[test]
+    fn pinned_prefs_names_exactly_what_the_apply_path_can_write() {
+        // Drift tripwire: `pinned_prefs_in` suppresses accidental-revert warnings, so a name it
+        // misses re-arms a warning policy makes wrong, and a name it invents silences a real one.
+        let doc = r#"{"LoginURL": "https://headscale.example.com", "Hostname": "kiosk-3",
+                      "ExitNodeIP": "100.64.0.9", "AllowIncomingConnections": "never",
+                      "ExitNodeAllowLANAccess": "always", "UseTailscaleDNSSettings": "never",
+                      "UseTailscaleSubnets": "always", "CheckUpdates": "never",
+                      "InstallUpdates": "always", "AdvertiseExitNode": "always"}"#;
+        let settings = resolve(doc).expect("load");
+        let pinned = pinned_prefs_in(&settings);
+        // Applied against defaults, every one of those keys moves its pref.
+        let mut prefs = Prefs::default();
+        let applied = apply_settings_to_prefs(&settings, &mut prefs, PolicyOverrides::default());
+        let mut changed: Vec<&str> = applied.changed.iter().map(|c| c.pref).collect();
+        changed.sort_unstable();
+        let mut pinned_sorted = pinned.clone();
+        pinned_sorted.sort_unstable();
+        assert_eq!(changed, pinned_sorted, "pinned {pinned:?}");
+    }
+
+    #[test]
+    fn pinned_prefs_ignores_user_decides_and_a_refused_exit_node_id() {
+        // `user-decides` is the policy declining to have an opinion, and a refused ExitNodeID
+        // applies nothing — in both cases the operator's own value is still theirs to lose, so the
+        // revert guard must keep warning about it.
+        let settings = resolve(
+            r#"{"AllowIncomingConnections": "user-decides", "ExitNodeID": "nABC123CNTRL",
+                "ExitNodeIP": "100.64.0.9"}"#,
+        )
+        .expect("load");
+        assert!(pinned_prefs_in(&settings).is_empty());
+    }
+
+    #[test]
+    fn pinned_prefs_is_empty_with_no_registered_source() {
+        // The entry point over the process-global registry, which no unit test registers into.
+        assert!(pinned_prefs().is_empty());
+    }
+
+    #[test]
+    fn an_unset_allow_list_is_no_restriction_not_an_empty_one() {
+        // Go's `fillAllowedSuggestions` returns a nil set for an unconfigured key, and its filter is
+        // `allowList != nil && !allowList.Contains(...)` — so nil is allow-all. Collapsing unset into
+        // an empty set would stop every node with no policy file from ever being suggested an exit
+        // node, which is the inversion this test exists to catch.
+        let source = resolve_source("{}").expect("an empty document should load");
+        assert_eq!(allowed_suggestions_in(&[source]), None);
+        // A policy file that configures *other* keys is still no restriction on suggestions.
+        let source = resolve_source(r#"{"Hostname": "documented-node"}"#)
+            .expect("an unrelated key should load");
+        assert_eq!(allowed_suggestions_in(&[source]), None);
+        // And with no source registered at all — an unmanaged node — the public reader agrees.
+        assert_eq!(allowed_suggested_exit_nodes(), None);
+    }
+
+    #[test]
+    fn a_configured_allow_list_is_exactly_the_ids_the_administrator_wrote() {
+        let source = resolve_source(r#"{"AllowedSuggestedExitNodes": ["nodeA", "nodeB"]}"#)
+            .expect("a well-formed list should load");
+        assert_eq!(
+            allowed_suggestions_in(&[source]),
+            Some(BTreeSet::from(["nodeA".to_string(), "nodeB".to_string()]))
+        );
+    }
+
+    #[test]
+    fn a_configured_empty_allow_list_permits_nothing() {
+        // The other half of the nil-versus-empty rule: `[]` is configured, so it IS a restriction —
+        // one that no node satisfies. `Some(empty)`, never `None`.
+        let source = resolve_source(r#"{"AllowedSuggestedExitNodes": []}"#)
+            .expect("an empty list is a valid value");
+        assert_eq!(allowed_suggestions_in(&[source]), Some(BTreeSet::new()));
+    }
+
+    #[test]
+    fn an_allow_list_entry_is_never_split_on_whitespace() {
+        // The rendered row for this value is Go's `%v`: `[node A]` — from which "one id containing a
+        // space" and "two ids" are indistinguishable. The decoded list is read instead, so the set
+        // holds the one id the administrator actually wrote and `nodeA`/`A` are NOT admitted.
+        let source = resolve_source(r#"{"AllowedSuggestedExitNodes": ["node A"]}"#)
+            .expect("a list with a space in an element should load");
+        assert_eq!(
+            allowed_suggestions_in(&[source]),
+            Some(BTreeSet::from(["node A".to_string()]))
+        );
+    }
+
+    #[test]
+    fn the_last_registered_source_wins_the_allow_list() {
+        // Same layering the report gets (`merge`, last writer wins per key): a later source's list
+        // replaces an earlier one wholesale rather than being unioned with it, and a later source
+        // that does not configure the key leaves the earlier list standing.
+        let first = resolve_source(r#"{"AllowedSuggestedExitNodes": ["nodeA"]}"#).unwrap();
+        let second = resolve_source(r#"{"AllowedSuggestedExitNodes": ["nodeB"]}"#).unwrap();
+        let silent = resolve_source(r#"{"Hostname": "documented-node"}"#).unwrap();
+        assert_eq!(
+            allowed_suggestions_in(&[first.clone(), second]),
+            Some(BTreeSet::from(["nodeB".to_string()]))
+        );
+        assert_eq!(
+            allowed_suggestions_in(&[first, silent]),
+            Some(BTreeSet::from(["nodeA".to_string()]))
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The administrator's `AuthKey` (Go `Start`'s third auth-key source).
+    // -----------------------------------------------------------------------------------------
+
+    /// The gate a never-enrolled node with no `--config` presents: the fleet-enrolment case, and the
+    /// baseline each guard test below flips exactly one field of.
+    fn unenrolled() -> AuthKeyGate {
+        AuthKeyGate {
+            running: false,
+            needs_login: false,
+            enrolled: false,
+            config_in_use: false,
+        }
+    }
+
+    /// The key [`auth_key_in`] decided to register with, or `None` for any other decision — so a
+    /// test can assert on the credential itself rather than on the discriminant alone.
+    fn decided(decision: AuthKeyDecision) -> Option<String> {
+        use secrecy::ExposeSecret;
+        match decision {
+            AuthKeyDecision::Use(key) => Some(key.expose_secret().to_string()),
+            _ => None,
+        }
+    }
+
+    /// The reason [`auth_key_in`] refused, or `None` if it did not refuse.
+    fn skipped(decision: AuthKeyDecision) -> Option<&'static str> {
+        match decision {
+            AuthKeyDecision::Skipped(reason) => Some(reason),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn an_auth_key_row_says_the_key_is_configured_without_carrying_it() {
+        // The ruling in the module docs, end to end: the administrator sees the key arrived and
+        // which source supplied it, the credential itself reaches no reporting surface, and the
+        // registration path still gets a usable key.
+        let source = resolve_source(r#"{"AuthKey": "tskey-auth-kPoLiCy", "Hostname": "kiosk-3"}"#)
+            .expect("a policy file carrying an auth key should load");
+
+        let row = source
+            .settings
+            .iter()
+            .find(|s| s.key == "AuthKey")
+            .expect("a configured AuthKey is still a row");
+        assert_eq!(
+            row.value.as_deref(),
+            Some("<redacted>"),
+            "the Value column says the key is redacted, it does not print the key"
+        );
+        assert_eq!(
+            row.origin, "JSONFile (Device)",
+            "the origin is still reported"
+        );
+        assert_eq!(row.error, None, "a redacted value is not an error");
+
+        // Nothing that leaves the daemon carries the credential: not the rows the report/notify
+        // stream is built from, not `configured_string` (the report-side reader), and not even the
+        // source's derived `Debug`.
+        assert!(
+            !format!("{:?}", source.settings).contains("tskey-auth-kPoLiCy"),
+            "the resolved rows must not carry the credential: {:?}",
+            source.settings
+        );
+        assert_eq!(
+            configured_string(&source.settings, PKEY_AUTH_KEY),
+            Some("<redacted>"),
+            "the report-side string reader sees the placeholder, never the key"
+        );
+        assert!(
+            !format!("{source:?}").contains("tskey-auth-kPoLiCy"),
+            "PolicySource's Debug must redact the key it holds for the registration path"
+        );
+
+        // ...and the registration path still gets the real key.
+        assert_eq!(
+            decided(auth_key_in(&[source], unenrolled())),
+            Some("tskey-auth-kPoLiCy".to_string())
+        );
+    }
+
+    #[test]
+    fn the_policy_key_enrols_a_node_that_has_never_registered() {
+        // The whole point of the key: an administrator drops one policy file that pins the hostname
+        // AND carries the credential, and the node gets onto the tailnet with nobody touching it.
+        let source =
+            resolve_source(r#"{"Hostname": "kiosk-3", "AuthKey": "tskey-auth-fleet"}"#).unwrap();
+        assert_eq!(
+            decided(auth_key_in(&[source], unenrolled())),
+            Some("tskey-auth-fleet".to_string())
+        );
+    }
+
+    #[test]
+    fn a_key_that_round_tripped_through_a_plist_is_trimmed_before_use() {
+        // Go's `strings.TrimSpace`: an MDM payload arrives with a trailing newline more often than
+        // not, and an untrimmed key fails registration for a reason nobody can see.
+        let source = resolve_source("{\"AuthKey\": \"  tskey-auth-padded\\n\"}").unwrap();
+        assert_eq!(
+            decided(auth_key_in(&[source], unenrolled())),
+            Some("tskey-auth-padded".to_string())
+        );
+    }
+
+    #[test]
+    fn a_blank_or_absent_key_is_no_key_at_all() {
+        // No `AuthKey` in the file — the overwhelmingly common case — and a value that is only
+        // whitespace both read as "not configured", so nothing is logged and nothing registers with
+        // an empty credential. (Go tests `sysak != ""` BEFORE trimming, so a whitespace-only value
+        // there logs that it took the policy key and then assigns an empty one; this daemon treats a
+        // blank key as absent, exactly as it already does for `--config` and `TS_AUTH_KEY`.)
+        let absent = resolve_source(r#"{"Hostname": "kiosk-3"}"#).unwrap();
+        assert!(matches!(
+            auth_key_in(&[absent], unenrolled()),
+            AuthKeyDecision::NotConfigured
+        ));
+        let blank = resolve_source("{\"AuthKey\": \" \\n \"}").unwrap();
+        assert!(matches!(
+            auth_key_in(&[blank], unenrolled()),
+            AuthKeyDecision::NotConfigured
+        ));
+        // With no registered source at all there is likewise nothing to take.
+        assert!(matches!(
+            auth_key_in(&[], unenrolled()),
+            AuthKeyDecision::NotConfigured
+        ));
+    }
+
+    #[test]
+    fn a_running_node_is_not_re_registered_from_policy() {
+        // Go's `b.state != ipn.Running` guard: the node is already up, so there is nothing waiting
+        // to register and an auth key would only churn it.
+        let source = resolve_source(r#"{"AuthKey": "tskey-auth-fleet"}"#).unwrap();
+        let gate = AuthKeyGate {
+            running: true,
+            ..unenrolled()
+        };
+        assert!(
+            skipped(auth_key_in(&[source], gate))
+                .is_some_and(|reason| reason.contains("already running")),
+            "a Running node must refuse the policy key, with a reason an admin can read"
+        );
+    }
+
+    #[test]
+    fn a_config_file_outranks_the_policy_key() {
+        // Go's `b.conf == nil` guard: with a `--config` file in use, that file is the declarative
+        // source for this node's credential and policy does not reach past it.
+        let source = resolve_source(r#"{"AuthKey": "tskey-auth-fleet"}"#).unwrap();
+        let gate = AuthKeyGate {
+            config_in_use: true,
+            ..unenrolled()
+        };
+        assert!(
+            skipped(auth_key_in(&[source], gate)).is_some_and(|reason| reason.contains("--config")),
+            "a config-driven node must refuse the policy key and say where to put it instead"
+        );
+    }
+
+    #[test]
+    fn an_already_enrolled_node_is_never_silently_re_registered() {
+        // Go's `len(b.pm.Profiles()) == 0 || b.state == ipn.NeedsLogin`. Dropping a policy file next
+        // to an enrolled node must not re-register it — but a node the control plane IS asking to
+        // log in again may still take the administrator's key, which is Go's escape hatch.
+        let source = resolve_source(r#"{"AuthKey": "tskey-auth-fleet"}"#).unwrap();
+        let enrolled = AuthKeyGate {
+            enrolled: true,
+            ..unenrolled()
+        };
+        assert!(
+            skipped(auth_key_in(std::slice::from_ref(&source), enrolled))
+                .is_some_and(|reason| reason.contains("already logged in")),
+            "an enrolled node must refuse the policy key"
+        );
+
+        let lapsed = AuthKeyGate {
+            enrolled: true,
+            needs_login: true,
+            ..unenrolled()
+        };
+        assert_eq!(
+            decided(auth_key_in(&[source], lapsed)),
+            Some("tskey-auth-fleet".to_string()),
+            "a node control is asking to log in again may take the administrator's key"
+        );
+    }
+
+    #[test]
+    fn the_last_registered_source_wins_the_auth_key() {
+        // The same layering the report and the allow-list get (`merge`, last writer wins per key),
+        // applied to the value that never appears in the merged rows.
+        let first = resolve_source(r#"{"AuthKey": "tskey-auth-first"}"#).unwrap();
+        let second = resolve_source(r#"{"AuthKey": "tskey-auth-second"}"#).unwrap();
+        let silent = resolve_source(r#"{"Hostname": "kiosk-3"}"#).unwrap();
+        assert_eq!(
+            decided(auth_key_in(&[first.clone(), second], unenrolled())),
+            Some("tskey-auth-second".to_string())
+        );
+        assert_eq!(
+            decided(auth_key_in(&[first, silent], unenrolled())),
+            Some("tskey-auth-first".to_string()),
+            "a later source that configures no key leaves the earlier one standing"
+        );
     }
 }

@@ -126,23 +126,53 @@ of it off.)
   release/update feed for this fork's artifacts (the GitHub releases the CI already publishes are a
   candidate source) + an in-daemon updater. *Not-yet-built* (needs an update-feed decision, then
   wire it — no longer "there is no server, so never").
-- **`syspolicy`** — the MDM / device-management policy store (Windows registry / Apple managed-prefs /
-  Group Policy). To match: read the platform policy store and apply it over prefs. *Blocked* on the
-  per-OS policy-store readers (and most useful once Windows lands).
+- **`syspolicy`** — the MDM / device-management policy store. The `--syspolicy-file` JSON source is
+  *shipped*: it is resolved, reported (`tnet syspolicy list`/`reload`) and **applied over prefs** at
+  profile load and on every prefs write, so policy outranks `tnet set`, `tnet up` and `--config`
+  alike. **One key inverts that ordering and it is not a bug:** `AuthKey` — the registration
+  credential, the only policy setting whose consumer is not a pref — is consulted **last**, after an
+  explicit `tnet up --auth-key` / `TS_AUTH_KEY` and after the `--config` file's own `AuthKey`. That
+  is Go's order in `Start`, and it is the right one for a credential: an operator who typed a key
+  meant *that* key. It registers a node that has never enrolled (or one the control plane is asking
+  to log in again) and is refused for one that is already enrolled, so dropping a policy file next to
+  a live node never silently re-registers it; a file carrying `AlwaysOn.Enabled` as well is what
+  enrols a never-touched host with nobody logging into it. Its value is the one thing the reports do
+  not print — `tnet syspolicy list` shows the row, the origin and `<redacted>` in the Value column,
+  so an administrator can confirm the key arrived without the credential leaving the daemon. The
+  PLATFORM stores (Windows registry / Apple managed-prefs / Group Policy) are still *blocked* on the
+  per-OS policy-store readers (and most useful once Windows lands); they register as additional
+  sources under the same merge, so adding one is a registration call, not a redesign.
 - **`systray`** — Go's desktop system-tray GUI. To match: a tray app driving the LocalAPI. A real
   target when a desktop UX is wanted; *not-yet-built* (a separate UI surface, not daemon-internal).
 - **`configure` (synology / sysext / jetkvm / kubeconfig)** — host-specific setup glue. Each is a
-  concrete file/host-config generator we can match per platform. **`configure kubeconfig`** (pure
-  file generation) is *shipped*, with one deliberate deviation: it emits a standalone kubeconfig
-  instead of merging into an existing `~/.kube/config`, because merging means parsing arbitrary user
-  YAML — a parser dependency this daemon has no other use for. The remaining sub-targets are
-  *not-yet-built* — file beads per sub-target.
+  concrete file/host-config generator we can match per platform. **`configure kubeconfig`** is
+  *shipped* and now at parity: it merges the cluster/context/user triple into the kubeconfig kubectl
+  already reads (`$KUBECONFIG`, else `~/.kube/config`), replacing a same-named entry and leaving
+  every other cluster intact, and it resolves a Tailscale Service DNS record when the argument names
+  no peer. `--output PATH` (a fork addition, not a Go flag) still writes a standalone document
+  instead. The remaining sub-targets are *not-yet-built* — file beads per sub-target.
 - **Exotic OS targets** — Plan9 / AIX / Solaris / illumos. *Blocked* on engine support for those
   targets (the engine builds Linux + macOS today; Windows is the next port). Match them as the engine
   grows targets.
-- **TPM / Secure-Enclave `--encrypt-state`** — at-rest state encryption backed by a hardware key
-  store. A real target (Go has it); *not-yet-built* — needs a platform keystore integration. Today the
-  state dir is `0700` + the process-hardening posture; that is the interim, not the end state.
+- **TPM / Secure-Enclave `--encrypt-state` and `--hardware-attestation`** — at-rest state encryption
+  and hardware-bound node identity, both backed by a platform key store (TPM 2.0 on Linux/Windows,
+  Secure Enclave on macOS/iOS, Keystore on Android). Real targets (Go has both, each defaulting from
+  a syspolicy key — `EncryptState`, `HardwareAttestation`); ***blocked***, on two named substrates
+  this fork does not have yet: a platform keystore integration to hold the key, and a pluggable
+  state-store layer for the provider prefix to seal through. Deferred until those land — not a
+  decision to skip them. Today the state dir is `0700` + the process-hardening posture; that is the
+  interim, not the end state, and `docs/THREAT_MODEL.md` §5.8 records it as a trust boundary rather
+  than a guarantee.
+
+  The **deferral is visible in the daemon**, not only here: `tailnetd` declares both flags and
+  refuses at startup when either is switched on, naming the missing integration and what protects
+  the state today (the way `--bird-socket` does), and reports — rather than silently drops — a
+  `--syspolicy-file` that sets either policy key. A refusal that names its own unblock is what a
+  deferral looks like where the operator meets it; accepting either flag as a no-op would let a Go
+  unit file carry across and leave an operator believing the state is sealed or the identity
+  machine-bound when neither is true. Go's two *usage* refusals (a portable `kube:`/`arn:` state
+  store for `--hardware-attestation`, a provider-prefixed `--state` for `--encrypt-state`) are
+  unreachable until the state-store providers exist, and land with them.
 
 > The one **gate** (not a feature, can't be "matched away"): the **unaudited-crypto production bar**
 > (bead tsd-q8o) — this fork must not be *claimed production-ready* until an external crypto audit of

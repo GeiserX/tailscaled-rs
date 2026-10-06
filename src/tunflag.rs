@@ -1,0 +1,562 @@
+//! `tailnetd --tun` — Go `tailscaled`'s tunnel-interface flag, resolved onto this fork's TUN prefs.
+//!
+//! Go registers the flag as
+//!
+//! ```text
+//! flag.StringVar(&args.tunname, "tun", defaultTunName(),
+//!     `tunnel interface name; use "userspace-networking" (beta) to not use TUN`)
+//! ```
+//!
+//! and it is the single most-copied entry on a `tailscaled` command line: packaged systemd units,
+//! container entrypoints and cloud images all pass `--tun=userspace-networking` or
+//! `--tun=tailscale0`. This fork models the data path as a **pref** instead (`tnet up --tun` /
+//! `--tun-name` / `--tun-mtu`, persisted in [`Prefs::tun_enabled`](crate::prefs::Prefs::tun_enabled)),
+//! so the flag has no engine field of its own to set. It is still accepted, and this module is the
+//! translation: a Go-shaped `--tun` value in, this daemon's transport choice out.
+//!
+//! ## The grammar, and why it is a list
+//!
+//! Go's value is "a `/dev/net/tun` tunnel name (`tailscale0`), the string `userspace-networking`,
+//! `tap:TAPNAME[:BRIDGENAME]`, or comma-separated list thereof" (`args.tunname`'s own comment), and
+//! `createEngine` walks the list in order, taking the first candidate it can actually bring up:
+//!
+//! ```text
+//! func createEngine(logf logger.Logf, sys *tsd.System) (onlyNetstack bool, err error) {
+//!     if args.tunname == "" {
+//!         return false, errors.New("no --tun value specified")
+//!     }
+//!     var errs []error
+//!     for _, name := range strings.Split(args.tunname, ",") {
+//!         onlyNetstack, err = tryEngine(logf, sys, name)
+//!         if err == nil {
+//!             return onlyNetstack, nil
+//!         }
+//!         errs = append(errs, err)
+//!     }
+//!     return false, errors.Join(errs...)
+//! }
+//! ```
+//!
+//! That loop is the whole reason `defaultTunName()` can return `"tailscale0,userspace-networking"`
+//! on Synology: *try the kernel device, fall back to the netstack*. [`resolve`] reproduces it —
+//! including the fallback, so a copied Go command line that asks for a device this build cannot
+//! provide lands on `userspace-networking` when the operator said it may, instead of refusing.
+//!
+//! The difference is *when* the candidates are judged. Go finds out by constructing the engine;
+//! this daemon decides here, from the facts it can know without opening anything — whether the build
+//! carries the `tun` cargo feature, and whether the engine has a TAP transport at all (it does not).
+//! Those two Go could only learn by trying, so deciding them at startup gives the same answer sooner.
+//!
+//! Privilege is deliberately NOT one of them, because it is not static: a process can hold
+//! `CAP_NET_ADMIN` without being uid 0, which is how container images and hardened systemd units run
+//! a kernel-TUN daemon. Go pre-judges it on exactly one platform,
+//!
+//! ```text
+//! if runtime.GOOS == "darwin" && os.Getuid() != 0 &&
+//!     !strings.Contains(args.tunname, "userspace-networking") && !args.cleanUp {
+//!     log.SetFlags(0)
+//!     log.Fatalf("tailscaled requires root; use sudo tailscaled (or use --tun=userspace-networking)")
+//! }
+//! ```
+//!
+//! and everywhere else lets the device open decide inside `tryEngine`, falling back to the next
+//! candidate when it fails. This module mirrors that split: a uid test on darwin only, and off darwin
+//! a device name resolves and the open reports for itself.
+//!
+//! Upstream: `cmd/tailscaled/tailscaled.go` @ `53a0d659afa51835dd7a9283873cca44261454f8`.
+
+/// Go's magic tunnel name for "do not use TUN" — the netstack data path this fork defaults to.
+///
+/// Spelled out rather than inlined because it appears in three roles: a candidate to match, the
+/// remedy every refusal below points at, and the value packaged units pass.
+pub const USERSPACE_NETWORKING: &str = "userspace-networking";
+
+/// The data path a `--tun` value resolved to — the daemon's two transports, which is what Go's
+/// `tryEngine` reduces its `name` to as well (`onlyNetstack = name == "userspace-networking"`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TunTransport {
+    /// The engine's in-process userspace netstack (Go `--tun=userspace-networking`). Unprivileged,
+    /// and this fork's default when no `--tun` is given and no TUN pref is set.
+    Netstack,
+    /// A kernel TUN interface. `name` is the interface to ask for; `None` means "let the platform
+    /// default choose", which is what Go's bare `utun` means on macOS ("a magic value that
+    /// uses/creates any free number", per `defaultTunName`) and what a `None`
+    /// [`Prefs::tun_name`](crate::prefs::Prefs::tun_name) already means to
+    /// [`build_config`](crate::ipn::Backend::build_config).
+    Tun { name: Option<String> },
+}
+
+/// Resolve a `--tun` value against *this* build and process — the [`resolve_with`] entry point the
+/// daemon uses, with the two facts it cannot pass in itself already filled in: whether this binary
+/// was built with the `tun` cargo feature, and this process's effective uid.
+///
+/// `goos` is the caller's `runtime.GOOS` spelling (`tailnetd`'s `goos()`), so the darwin-only
+/// `utun` carve-out is decided by the same string a ported Go message would print.
+pub fn resolve(value: &str, goos: &str) -> Result<TunTransport, String> {
+    resolve_with(value, cfg!(feature = "tun"), goos, euid())
+}
+
+/// Go's macOS root refusal, word for word apart from the product name: `tailscaled.go` prints
+/// `tailscaled requires root; use sudo tailscaled (or use --tun=userspace-networking)` through
+/// `log.SetFlags(0)` + `log.Fatalf`, so it is one bare line on stderr with nothing around it.
+pub const DARWIN_ROOT_REFUSAL: &str =
+    "tailnetd requires root; use sudo tailnetd (or use --tun=userspace-networking)";
+
+/// Go's one early privilege check, over the WHOLE `--tun` value, the way `tailscaled.go` makes it:
+///
+/// ```text
+/// if runtime.GOOS == "darwin" && os.Getuid() != 0 &&
+///     !strings.Contains(args.tunname, "userspace-networking") && !args.cleanUp {
+/// ```
+///
+/// Returns [`DARWIN_ROOT_REFUSAL`] when it fires. `--cleanup` is the caller's to honour: `tailnetd`
+/// never resolves `--tun` under it. The uid tested is the effective one (see [`euid`]).
+pub fn darwin_root_refusal(value: &str, goos: &str, euid: u32) -> Option<&'static str> {
+    (goos == "darwin" && euid != 0 && !value.contains(USERSPACE_NETWORKING))
+        .then_some(DARWIN_ROOT_REFUSAL)
+}
+
+/// Whether this process may ask the engine for a kernel TUN device, judged without opening one.
+///
+/// Only macOS is pre-judged, because only there does Go pre-judge. Everywhere else Go's `tryEngine`
+/// opens the device and the open decides, so a daemon holding `CAP_NET_ADMIN` under a non-zero uid —
+/// the ordinary container and hardened-systemd-unit setup — brings its TUN up. A uid test off darwin
+/// would refuse that host a device it can create, and name a capability it never looked at. The
+/// engine's own open maps a real `PermissionDenied` to its `RootUserRequired` error, so an
+/// unprivileged host still fails loudly, just at the point Go fails.
+///
+/// Both the `--tun` resolver and the bring-up preflight in `build_config` call this, so the flag and
+/// the pref (`tnet up --tun`) cannot disagree about who may create the device.
+pub fn kernel_tun_privilege(goos: &str, euid: u32) -> Result<(), String> {
+    if goos == "darwin" && euid != 0 {
+        return Err(format!(
+            "creating a kernel TUN interface on macOS requires root; use sudo tailnetd (or use \
+             --tun={USERSPACE_NETWORKING})"
+        ));
+    }
+    Ok(())
+}
+
+/// This process's effective uid on unix; `0` elsewhere (Windows has no euid, and its TUN adapter is
+/// gated by service privileges this daemon does not model — so the root condition is simply not a
+/// reason to reject a candidate there).
+///
+/// Go tests the real uid (`os.Getuid`). The effective uid is kept here on purpose: it is the
+/// credential the kernel checks when the utun device is created. The two differ only for a
+/// set-uid binary, where the effective uid is the one that predicts whether the open succeeds.
+pub fn euid() -> u32 {
+    #[cfg(unix)]
+    // SAFETY: `geteuid()` takes no arguments, has no preconditions and cannot fail.
+    unsafe {
+        libc::geteuid()
+    }
+    #[cfg(not(unix))]
+    0
+}
+
+/// The pure resolver behind [`resolve`]: Go's `createEngine` loop over a comma-separated `--tun`
+/// value, with each candidate judged by what this build can provide.
+///
+/// * `value` — the raw flag value, exactly as Go's `args.tunname`.
+/// * `tun_feature` — whether the `tun` cargo feature is compiled in (there is no kernel-TUN
+///   transport in the binary otherwise; [`crate::ipn`]'s `build_config` refuses the same way).
+/// * `goos` — `runtime.GOOS` spelling, for the darwin `utun` carve-out and the darwin-only root
+///   refusal.
+/// * `euid` — the process's effective uid. Consulted on darwin only, where Go refuses a kernel
+///   device to a non-root process before it ever tries to open one.
+///
+/// Returns the chosen transport, or the operator-facing refusal. Two Go error paths port with it:
+///
+/// * **an empty value is an error**, not "the default" — Go's `createEngine` opens with
+///   `if args.tunname == "" { return errors.New("no --tun value specified") }`, and that sentence is
+///   reused verbatim here;
+/// * **when no candidate works, every candidate's reason is reported**, the way Go returns
+///   `errors.Join(errs...)` of each failed `tryEngine`. An operator who wrote a list gets told why
+///   each entry was passed over, not just that the list failed.
+pub fn resolve_with(
+    value: &str,
+    tun_feature: bool,
+    goos: &str,
+    euid: u32,
+) -> Result<TunTransport, String> {
+    // Go `createEngine`. An explicitly empty `--tun=` is NOT "use the default": Go's flag default is
+    // already gone by then (the operator overrode it with the empty string), so it is an error.
+    // Go's macOS root check sits in `main`, ahead of `createEngine`, so it wins over every refusal
+    // below — an empty value included, since `""` does not contain `userspace-networking` either.
+    if let Some(line) = darwin_root_refusal(value, goos, euid) {
+        return Err(line.to_string());
+    }
+    if value.is_empty() {
+        return Err("no --tun value specified".to_string());
+    }
+    let mut reasons = Vec::new();
+    for name in value.split(',') {
+        match candidate(name, tun_feature, goos, euid) {
+            Ok(transport) => return Ok(transport),
+            // Go logs each failed candidate and keeps going; collect them for the joined refusal.
+            Err(why) => reasons.push((name, why)),
+        }
+    }
+    // One candidate reads as one sentence; a list reports every entry's reason, the way Go returns
+    // `errors.Join(errs...)` — an operator who wrote a fallback list gets told why each entry was
+    // passed over, not just that the line failed.
+    let detail = match reasons.as_slice() {
+        [(name, why)] => format!("--tun {name:?}: {why}"),
+        many => format!(
+            "no usable interface in --tun {value:?}:\n{}",
+            many.iter()
+                .map(|(name, why)| format!("  {name:?}: {why}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+    };
+    Err(format!(
+        "{detail}\n\
+         Use --tun={USERSPACE_NETWORKING} for the userspace netstack (this daemon's default data \
+         path), or add {USERSPACE_NETWORKING} to the list to fall back to it."
+    ))
+}
+
+/// Judge one candidate from the comma-separated list — the analogue of one `tryEngine` call.
+///
+/// The order of the tests is the order in which the answers are knowable and useful: a candidate
+/// this binary could never provide (no TAP transport, no `tun` feature) is rejected for *that*
+/// reason on every host, so the refusal an operator reads does not change with the uid they happened
+/// to run as. The darwin root refusal is checked last, and only for a candidate that is otherwise
+/// buildable.
+fn candidate(name: &str, tun_feature: bool, goos: &str, euid: u32) -> Result<TunTransport, String> {
+    // Go: `onlyNetstack = name == "userspace-networking"`. Always available — the netstack is the
+    // engine's default data path and is compiled into every build of this daemon.
+    if name == USERSPACE_NETWORKING {
+        return Ok(TunTransport::Netstack);
+    }
+    if name.is_empty() {
+        return Err("empty interface name".to_string());
+    }
+    // Go's `tap:TAPNAME[:BRIDGENAME]` is a layer-2 device, supported on Linux only and behind its
+    // own build feature. The `tailscale-rs` engine has no TAP transport at all, so this can never
+    // resolve here — but it stays a *named* reason, and (like Go) a later candidate can still win.
+    if name.starts_with("tap:") {
+        return Err(format!(
+            "TAP (layer-2) mode is not supported: the tailscale-rs engine has no TAP transport \
+             (Go itself supports {name:?} on Linux only)"
+        ));
+    }
+    if !tun_feature {
+        return Err(
+            "this daemon was built without the `tun` cargo feature, so it has no kernel-TUN \
+             transport; rebuild with `cargo build --features tun`"
+                .to_string(),
+        );
+    }
+    // Only reached on darwin as non-root when the value offers `userspace-networking` somewhere —
+    // otherwise [`darwin_root_refusal`] has already refused the whole line in Go's words. Here the
+    // device entry stands in for Go's `tryEngine` open failing on a non-root macOS host: it is passed
+    // over and the loop moves on to the netstack entry. Off darwin this never refuses; see
+    // [`kernel_tun_privilege`].
+    kernel_tun_privilege(goos, euid)?;
+    // macOS: bare `utun` is Go's "any free unit number" (`defaultTunName`'s darwin case), and it is
+    // NOT a literal interface name — `tun-rs` parses the trailing digits as the unit and rejects an
+    // empty one. `None` is this daemon's spelling of the same intent: `build_config` fills it in
+    // with the lowest free `utunN` (see `ipn::state::default_tun_name`).
+    let name = if goos == "darwin" && name == "utun" {
+        None
+    } else {
+        Some(name.to_string())
+    };
+    Ok(TunTransport::Tun { name })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The value every packaged unit file and container entrypoint passes. It must resolve to the
+    /// netstack on any build, feature or uid — it is the one candidate that never depends on them.
+    #[test]
+    fn userspace_networking_resolves_to_the_netstack_everywhere() {
+        for (feature, goos, euid) in [
+            (false, "linux", 1000),
+            (true, "linux", 0),
+            (false, "darwin", 0),
+            (true, "darwin", 501),
+        ] {
+            assert_eq!(
+                resolve_with(USERSPACE_NETWORKING, feature, goos, euid),
+                Ok(TunTransport::Netstack),
+                "userspace-networking must resolve on ({feature}, {goos}, {euid})"
+            );
+        }
+    }
+
+    /// A device name on a `tun`-feature build running as root is the kernel-TUN path, carrying the
+    /// name Go would hand to `tstun.New`.
+    #[test]
+    fn a_device_name_resolves_to_tun_with_that_name() {
+        assert_eq!(
+            resolve_with("tailscale0", true, "linux", 0),
+            Ok(TunTransport::Tun {
+                name: Some("tailscale0".to_string())
+            })
+        );
+    }
+
+    /// Go's darwin default `utun` means "any free unit", not an interface literally called `utun`.
+    /// It must reach the daemon as "no name" so the macOS default picks a free `utunN`; the same
+    /// spelling on another platform is an ordinary name.
+    #[test]
+    fn bare_utun_is_any_free_unit_on_darwin_only() {
+        assert_eq!(
+            resolve_with("utun", true, "darwin", 0),
+            Ok(TunTransport::Tun { name: None }),
+            "bare `utun` on darwin is Go's any-free-unit magic value"
+        );
+        assert_eq!(
+            resolve_with("utun3", true, "darwin", 0),
+            Ok(TunTransport::Tun {
+                name: Some("utun3".to_string())
+            }),
+            "an explicit unit number is a real name, not the magic value"
+        );
+        assert_eq!(
+            resolve_with("utun", true, "linux", 0),
+            Ok(TunTransport::Tun {
+                name: Some("utun".to_string())
+            }),
+            "off darwin, `utun` is just a name"
+        );
+    }
+
+    /// Go's candidate loop is a *fallback* list, which is exactly why `defaultTunName()` returns
+    /// `tailscale0,userspace-networking` on Synology. A build with no kernel-TUN transport must take
+    /// the second entry rather than refuse.
+    #[test]
+    fn a_list_falls_back_to_the_first_candidate_this_build_can_provide() {
+        assert_eq!(
+            resolve_with("tailscale0,userspace-networking", false, "linux", 0),
+            Ok(TunTransport::Netstack),
+            "no `tun` feature: the device is skipped and the netstack wins"
+        );
+        assert_eq!(
+            resolve_with("tailscale0,userspace-networking", true, "linux", 0),
+            Ok(TunTransport::Tun {
+                name: Some("tailscale0".to_string())
+            }),
+            "with the feature and root, the FIRST candidate wins — the list is ordered"
+        );
+        assert_eq!(
+            resolve_with("tap:tap0,tailscale0", true, "linux", 0),
+            Ok(TunTransport::Tun {
+                name: Some("tailscale0".to_string())
+            }),
+            "an unsupported TAP entry is skipped, not fatal, when a later entry works"
+        );
+    }
+
+    /// Go: `if args.tunname == "" { return errors.New("no --tun value specified") }`. An explicitly
+    /// empty flag is an error, not a fall-back to the default.
+    #[test]
+    fn an_empty_value_is_gos_no_tun_value_specified() {
+        assert_eq!(
+            resolve_with("", true, "linux", 0),
+            Err("no --tun value specified".to_string())
+        );
+    }
+
+    /// TAP is refused by name — the engine has no layer-2 transport — and the message says so
+    /// rather than blaming the platform, because unlike Go's the gap here is not Linux-specific.
+    #[test]
+    fn tap_is_refused_with_a_named_reason() {
+        let err = resolve_with("tap:tap0:br0", true, "linux", 0).expect_err("TAP cannot resolve");
+        assert!(
+            err.contains("TAP (layer-2) mode is not supported"),
+            "should name TAP as the missing support; got:\n{err}"
+        );
+        assert!(
+            err.contains("tap:tap0:br0"),
+            "should echo the rejected candidate; got:\n{err}"
+        );
+        assert!(
+            err.contains(USERSPACE_NETWORKING),
+            "should point at the value that always works; got:\n{err}"
+        );
+    }
+
+    /// Without the `tun` cargo feature there is no kernel-TUN transport in the binary at all, so a
+    /// device name is refused for THAT reason on every host — the uid must not change the answer,
+    /// or the same command line would be explained two different ways on two machines.
+    #[test]
+    fn a_device_name_without_the_tun_feature_names_the_feature_not_the_uid() {
+        for euid in [0, 1000] {
+            let err = resolve_with("tailscale0", false, "linux", euid)
+                .expect_err("no `tun` feature: a device name cannot resolve");
+            assert!(
+                err.contains("`tun` cargo feature"),
+                "should name the missing feature (euid {euid}); got:\n{err}"
+            );
+            assert!(
+                !err.contains("root"),
+                "must not blame privileges for a transport that is not in the binary (euid \
+                 {euid}); got:\n{err}"
+            );
+        }
+    }
+
+    /// Go's one early privilege refusal is macOS-only, and it is one exact line:
+    /// `tailscaled requires root; use sudo tailscaled (or use --tun=userspace-networking)`. A
+    /// non-root darwin host is refused with that line and nothing else — no `--tun "<name>":`
+    /// wrapper, no appended remedy paragraph — so a script matching Go's stderr matches this one.
+    #[test]
+    fn a_device_name_as_non_root_on_darwin_is_gos_single_line() {
+        let want = "tailnetd requires root; use sudo tailnetd (or use --tun=userspace-networking)";
+        // Go's check runs in `main`, before `createEngine`, so it also wins over the empty-value
+        // and TAP refusals: neither `""` nor `tap:tap0` contains `userspace-networking`.
+        for value in [
+            "tailscale0",
+            "utun",
+            "utun3",
+            "tailscale0,utun",
+            "",
+            "tap:tap0",
+        ] {
+            assert_eq!(
+                resolve_with(value, true, "darwin", 501),
+                Err(want.to_string()),
+                "--tun={value} as non-root on macOS"
+            );
+        }
+        // Go checks privilege before the engine is ever built, so the refusal does not change with
+        // what the build could provide.
+        assert_eq!(
+            resolve_with("tailscale0", false, "darwin", 501),
+            Err(want.to_string())
+        );
+    }
+
+    /// The whole-value gate itself, Go's condition term by term: darwin, a non-root uid, and a
+    /// value that does not mention `userspace-networking` anywhere (Go's `strings.Contains`).
+    #[test]
+    fn darwin_root_refusal_is_gos_whole_value_condition() {
+        assert_eq!(
+            darwin_root_refusal("utun", "darwin", 501),
+            Some(DARWIN_ROOT_REFUSAL)
+        );
+        assert_eq!(darwin_root_refusal("utun", "darwin", 0), None, "root");
+        assert_eq!(
+            darwin_root_refusal("utun", "linux", 1000),
+            None,
+            "off darwin"
+        );
+        assert_eq!(
+            darwin_root_refusal("utun,userspace-networking", "darwin", 501),
+            None,
+            "the value offers the netstack"
+        );
+    }
+
+    /// The privilege judgment shared by `--tun` and the bring-up preflight in `build_config`. Off
+    /// macOS it must never refuse on uid: a Linux daemon with `AmbientCapabilities=CAP_NET_ADMIN`
+    /// runs under a non-zero uid and can create the device, and Go lets the open decide there.
+    #[test]
+    fn kernel_tun_privilege_only_pre_judges_macos() {
+        for goos in ["linux", "freebsd", "openbsd", "windows"] {
+            assert_eq!(
+                kernel_tun_privilege(goos, 1000),
+                Ok(()),
+                "{goos} as non-root"
+            );
+            assert_eq!(kernel_tun_privilege(goos, 0), Ok(()), "{goos} as root");
+        }
+        assert_eq!(kernel_tun_privilege("darwin", 0), Ok(()));
+        let err = kernel_tun_privilege("darwin", 501).expect_err("macOS as non-root");
+        assert!(
+            err.contains("requires root") && !err.contains("CAP_NET_ADMIN"),
+            "should say root, and not name a capability nothing tested; got:\n{err}"
+        );
+    }
+
+    /// Off darwin, Go does not pre-judge privilege at all: `createEngine` calls `tryEngine`, which
+    /// opens the device and fails only if the open fails. That is what lets an unprivileged daemon
+    /// holding `CAP_NET_ADMIN` — the ordinary container and hardened-systemd-unit setup — bring up a
+    /// kernel TUN. A uid test here would refuse those hosts a device they can actually create, so a
+    /// device name must resolve on every non-darwin platform whatever the uid is.
+    #[test]
+    fn a_device_name_off_darwin_is_not_pre_judged_by_uid() {
+        for goos in ["linux", "freebsd", "openbsd", "windows"] {
+            assert_eq!(
+                resolve_with("tailscale0", true, goos, 1000),
+                Ok(TunTransport::Tun {
+                    name: Some("tailscale0".to_string())
+                }),
+                "{goos} must leave the verdict to the device open, as Go's tryEngine does"
+            );
+        }
+    }
+
+    /// The same fact through the list form a unit file actually carries: on Linux as a non-root uid,
+    /// `tailscale0,userspace-networking` must take the FIRST entry, because the kernel device is
+    /// still reachable there with `CAP_NET_ADMIN`. Silently landing on the netstack would give the
+    /// operator a half-working node with no OS-wide connectivity and no refusal to read.
+    #[test]
+    fn a_non_root_linux_list_still_prefers_the_kernel_device() {
+        assert_eq!(
+            resolve_with("tailscale0,userspace-networking", true, "linux", 1000),
+            Ok(TunTransport::Tun {
+                name: Some("tailscale0".to_string())
+            })
+        );
+    }
+
+    /// Go's darwin check is skipped when the flag value mentions `userspace-networking`
+    /// (`!strings.Contains(args.tunname, "userspace-networking")`), leaving the candidate loop to
+    /// fall back after the device open fails. Judging the candidates one at a time lands in the same
+    /// place: the utun entry is passed over on a non-root macOS host and the netstack entry wins.
+    #[test]
+    fn a_darwin_list_offering_the_netstack_falls_back_instead_of_refusing() {
+        assert_eq!(
+            resolve_with("utun,userspace-networking", true, "darwin", 501),
+            Ok(TunTransport::Netstack)
+        );
+        assert_eq!(
+            resolve_with("utun,userspace-networking", true, "darwin", 0),
+            Ok(TunTransport::Tun { name: None }),
+            "as root the first entry still wins — the list is ordered"
+        );
+    }
+
+    /// When nothing in the list can be provided, every entry's reason is reported — Go's
+    /// `errors.Join(errs...)` over the failed candidates.
+    #[test]
+    fn an_unusable_list_reports_every_candidates_reason() {
+        let err = resolve_with("tap:tap0,tailscale0", false, "linux", 0)
+            .expect_err("neither candidate is available on a no-`tun` build");
+        assert!(
+            err.contains("tap:tap0") && err.contains("TAP (layer-2)"),
+            "should carry the TAP candidate's reason; got:\n{err}"
+        );
+        assert!(
+            err.contains("tailscale0") && err.contains("`tun` cargo feature"),
+            "should carry the device candidate's reason; got:\n{err}"
+        );
+        assert!(
+            err.contains(USERSPACE_NETWORKING),
+            "should tell the operator what to write instead; got:\n{err}"
+        );
+    }
+
+    /// An empty entry inside a list is skipped with a reason (Go hands `""` to `tstun.New`, which
+    /// fails, and the loop moves on) — a trailing comma must not take the whole daemon down.
+    #[test]
+    fn an_empty_entry_inside_a_list_is_skipped() {
+        assert_eq!(
+            resolve_with(",userspace-networking", true, "linux", 0),
+            Ok(TunTransport::Netstack)
+        );
+        let err = resolve_with("tailscale0,", false, "linux", 0)
+            .expect_err("no candidate is available here");
+        assert!(
+            err.contains("empty interface name"),
+            "the empty entry should have its own reason; got:\n{err}"
+        );
+    }
+}

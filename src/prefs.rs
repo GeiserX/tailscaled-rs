@@ -93,6 +93,13 @@ pub struct Prefs {
     /// IPs) is a separate subsystem neither this daemon nor the engine implements, so an advertising
     /// node serves no connector traffic. That is identical in effect to Go advertising the bool
     /// before control has assigned any domains. Default `false`.
+    ///
+    /// The readback follows from that: because nothing observes a domain, nothing is ever appended
+    /// to [`advertise_routes`](Prefs::advertise_routes), and there is no `appctype.RouteInfo` store
+    /// for a `appc-route-info` LocalAPI verb to expose. `tnet appc-routes` reports the two things
+    /// prefs alone can answer — Go's `not a connector`, and `-n`'s advertised-route count — and
+    /// refuses the three learned-route shapes with that reason. Filed as ask #39 in
+    /// `docs/ENGINE_ASKS.md`.
     pub advertise_app_connector: bool,
     /// Opt in to admin-console-triggered auto-updates (Go `tailscale set --auto-update` /
     /// `ipn.Prefs.AutoUpdate.Apply`). Tri-state, mirroring Go's `opt.Bool`: `None` = never stated
@@ -104,7 +111,30 @@ pub struct Prefs {
     /// the node accepts remote update triggers. It advertises the bool ONLY: this daemon runs no
     /// background updater — `tnet update` is a manual, operator-invoked command — so nothing here
     /// acts on a trigger. Setting it is therefore an explicit operator statement of intent, not a
-    /// capability claim the daemon fulfils on its own.
+    /// capability claim the daemon fulfils on its own: *if* a trigger arrives, an operator will run
+    /// the update on this node.
+    ///
+    /// Which is exactly why the opt-in is **refused where that promise is impossible to keep**.
+    /// `Some(true)` is accepted only on an installation that can replace its own binary — the same
+    /// two conditions `tnet update --yes` refuses on (a package manager owns the binary; this host
+    /// has no published release artifact), which together are this fork's
+    /// [`feature::CanAutoUpdate`](crate::ipn::selfupdate::can_auto_update). Go's
+    /// `checkAutoUpdatePrefsLocked` refuses the same opt-in with "Auto-updates are not supported on
+    /// this platform."; the rule lives in
+    /// [`selfupdate::check_auto_update_pref`](crate::ipn::selfupdate::check_auto_update_pref) and
+    /// fires on both the `set` write path and `check-prefs`. `Some(false)` and `None` are legal
+    /// everywhere — neither claims anything to the tailnet.
+    ///
+    /// The deliberate narrowing versus Go: a literal port would refuse the opt-in on EVERY host,
+    /// since this daemon has no background updater to honour a trigger with. That would delete a
+    /// pref the fork carries on purpose, so the line is drawn at what can be checked rather than
+    /// argued — whether an update could physically be applied here at all.
+    ///
+    /// The trigger itself is a control-to-node (c2n) call — Go's `GET`/`POST /update`
+    /// (`feature/clientupdate/clientupdate.go`), which reads this pref as its `Enabled` field. The
+    /// engine owns the c2n session and offers no way to register a handler, so there is nothing to
+    /// receive it — which is why the promise above is an operator's to keep, not the daemon's.
+    /// Filed as ask #43 in `docs/ENGINE_ASKS.md`.
     pub auto_update_apply: Option<bool>,
     /// Whether a background updater should *check* for available updates (Go `tailscale set
     /// --update-check` / `ipn.Prefs.AutoUpdate.Check`). **Default `true`**, matching Go's
@@ -149,6 +179,10 @@ pub struct Prefs {
     /// responder, so control never pulls and the on-the-wire behavior is byte-for-byte the
     /// posture-disabled case. There is deliberately no `Hostinfo` field to advertise it. Persisted
     /// and threaded through so the pref state is faithful and a future c2n responder has its input.
+    ///
+    /// The pull is Go's `GET /posture/identity` (`feature/posture/posture.go`). The engine owns the
+    /// c2n session and offers no way to register a handler, so the responder cannot live here until
+    /// it does. Filed as ask #43 in `docs/ENGINE_ASKS.md`.
     pub posture_checking: bool,
     /// Run a local web client for managing this node (Go `tailscale set --webclient` /
     /// `ipn.Prefs.RunWebClient`). Default `false`. Maps to the engine `Config.run_web_client`.

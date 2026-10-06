@@ -663,37 +663,48 @@ not forgotten; the drain itself is already faithful without it. — daemon lane
 > shows — which Go drives from the same `Prefs.ProfileName` — is **done**: `set --nickname` now also
 > renames the current profile, so `nickname` is carried by the ENGINE but not inert locally.
 
-**Why:** Go's `tailscale up`/`set` (v1.100.0 `up.go:99-148`, `set.go:76-122`) expose ~15 pref flags;
-this fork's `up`/`set` faithfully cover the ten that map to existing engine `Config` fields
-(`hostname`, `accept-routes`, `accept-dns`, `shields-up`, `exit-node`, `advertise-exit-node`,
-`advertise-routes`, `advertise-tags`, `ssh`, `tun`). The remainder are **not daemon-fixable today**
-because the pinned engine `Config` (rev `6035651`, `src/config.rs`) has **no field** to carry them, and
-the honest-omission rule forbids shipping a flag that parses but silently does nothing (the historical
-`accept_dns` inert-flag trap). Confirmed by reading the authoritative `Config` struct: its fields end
-at `audience`, with nothing for any of the flags below.
+**Why — the rationale AS FILED, against pin `6035651`. Superseded for eight of the flags; kept as
+the record of what was asked for and why.** Go's `tailscale up`/`set` (v1.100.0 `up.go:99-148`,
+`set.go:76-122`) expose ~15 pref flags; this fork's `up`/`set` faithfully covered only the ten that
+mapped to existing engine `Config` fields (`hostname`, `accept-routes`, `accept-dns`, `shields-up`,
+`exit-node`, `advertise-exit-node`, `advertise-routes`, `advertise-tags`, `ssh`, `tun`). The remainder
+were **not daemon-fixable at that pin** because the engine `Config` (rev `6035651`, `src/config.rs`)
+had **no field** to carry them, and the honest-omission rule forbids shipping a flag that parses but
+silently does nothing (the historical `accept_dns` inert-flag trap). That was confirmed by reading the
+authoritative `Config` struct: its fields ended at `audience`, with nothing for any of the flags below.
+
+**Why it still stands, at pin `9d847a6` — for the Linux router knobs only.** The engine has since
+added a field for eight of the flags and the daemon wired them (banner above), so "no field to carry
+them" now describes `--snat-subnet-routes`, `--stateful-filtering`, `--netfilter-mode` and
+`--unattended` alone: for those four the reasoning above is unchanged and they stay unshipped rather
+than parse-and-do-nothing. The list below is marked per entry — ✅ SHIPPED at `9d847a6` (the daemon
+carries the pref today), ⬜ STILL OPEN (no engine field; this is the live ask).
 
 **Ask — add the engine `Config` fields (Go pref name → suggested field), so the daemon can wire each
 faithfully (a wire `Up`/`Set` field + pref mapping + the revert-guard/`--reset` lockstep + a
 `get_settings` row):**
 
-- `--operator <user>` → `operator_user: Option<String>` (also the substrate for the operator-GID
-  LocalAPI authz matrix the daemon's THREAT_MODEL notes as a later phase).
-- `--exit-node-allow-lan-access <bool>` → `exit_node_allow_lan_access: bool` (Go
+- ✅ SHIPPED — `--operator <user>` → `operator_user: Option<String>` (also the substrate for the
+  operator-GID LocalAPI authz matrix the daemon's THREAT_MODEL notes as a later phase).
+- ✅ SHIPPED — `--exit-node-allow-lan-access <bool>` → `exit_node_allow_lan_access: bool` (Go
   `Prefs.ExitNodeAllowLANAccess`; only meaningful with an exit node selected).
-- `--nickname <name>` → `nickname: Option<String>` (Go `Prefs.ProfileName`-adjacent / node nickname).
-- `--report-posture <bool>` → `posture_checking: bool` (Go `Prefs.PostureChecking`).
-- `--auto-update <bool>` / `--update-check <bool>` → `auto_update: { apply: Option<bool>, check:
-  Option<bool> }` (Go `Prefs.AutoUpdate`). *(Caveat: the daemon also lists self-update as a NON-GOAL —
-  see DESIGN §"Non-goals". If the engine carries the pref purely as state to report to control, the
-  daemon can wire the flag as a pref without implementing an updater; flagging the tension.)*
-- `--advertise-connector <bool>` → an app-connector pref/field (Go `Prefs.AppConnector`). Distinct from
-  the existing `advertise_services` (that is service-advertise, not the app-connector role).
-- `--webclient <bool>` → `run_web_client: bool` (Go `Prefs.RunWebClient`). *(Also a daemon NON-GOAL as
-  a UI; same caveat as auto-update — pref-state only, no embedded server.)*
-- Linux subnet-router knobs: `--snat-subnet-routes`, `--stateful-filtering`, `--netfilter-mode`,
-  `--unattended` → the engine's router/netfilter layer (Go `Prefs.NoSNAT` / `NoStatefulFiltering` /
-  `NetfilterMode` / `Unattended`). These ride on the Linux OS-router (daemon bead tsd-m8s) and are
-  lower priority.
+- ✅ SHIPPED — `--nickname <name>` → `nickname: Option<String>` (Go `Prefs.ProfileName`-adjacent /
+  node nickname).
+- ✅ SHIPPED — `--report-posture <bool>` → `posture_checking: bool` (Go `Prefs.PostureChecking`).
+- ✅ SHIPPED — `--auto-update <bool>` / `--update-check <bool>` → `auto_update: { apply:
+  Option<bool>, check: Option<bool> }` (Go `Prefs.AutoUpdate`). *(Caveat: the daemon also lists
+  self-update as a NON-GOAL — see DESIGN §"Non-goals". If the engine carries the pref purely as
+  state to report to control, the daemon can wire the flag as a pref without implementing an
+  updater; flagging the tension.)*
+- ✅ SHIPPED — `--advertise-connector <bool>` → an app-connector pref/field (Go
+  `Prefs.AppConnector`). Distinct from the existing `advertise_services` (that is service-advertise,
+  not the app-connector role).
+- ✅ SHIPPED — `--webclient <bool>` → `run_web_client: bool` (Go `Prefs.RunWebClient`). *(Also a
+  daemon NON-GOAL as a UI; same caveat as auto-update — pref-state only, no embedded server.)*
+- ⬜ STILL OPEN — Linux subnet-router knobs: `--snat-subnet-routes`, `--stateful-filtering`,
+  `--netfilter-mode`, `--unattended` → the engine's router/netfilter layer (Go `Prefs.NoSNAT` /
+  `NoStatefulFiltering` / `NetfilterMode` / `Unattended`). These ride on the Linux OS-router (daemon
+  bead tsd-m8s) and are lower priority.
 
 **Workload-identity flags** (`--client-id`/`--client-secret`/`--id-token`/`--audience`) are a SEPARATE
 case: the engine `Config` **already has** `client_id`/`client_secret`/`id_token`/`audience`, but they
@@ -1075,3 +1086,1004 @@ synthetic regions — `available_endpoints(regions, preferred_region_id)` — so
 one-argument change at the single call site in `ipn::captive_portal_loop`. Until then detection runs on
 the two Tailscale endpoints Go always appends (`controlplane`/`login`), which need no map but are
 status-code-only. Tracked in daemon bead tsd-iqq.5. — daemon lane
+
+---
+
+## 34. A peer-relay server (listen port + static endpoints) and a config-sync kill switch — for the last four Go `set` pref flags
+
+**Why:** Go's `tailscale set` (`cmd/tailscale/cli/set.go` @ `53a0d659afa51835dd7a9283873cca44261454f8`)
+registers four pref flags this fork models no pref for. Three of them are engine-gated; the fourth is
+listed here only so nobody files it as an ask by mistake.
+
+- **`--relay-server-port <PORT>`** (Go `Prefs.RelayServerPort *uint16`) — the UDP port a **peer relay
+  server** binds on all interfaces; `0` means "pick a random unused port", and the flag's empty value
+  means "disable relay-server functionality". A peer relay is a node that forwards disco + WireGuard
+  frames between two peers that cannot reach each other directly, without the round trip to a DERP
+  region.
+- **`--relay-server-static-endpoints <IP:PORT,…>`** (Go `Prefs.RelayServerStaticEndpoints
+  []netip.AddrPort`) — static endpoints to advertise as candidates for relay connections, for a relay
+  behind a firewall pinhole whose reflexive address discovery will not find the right candidate. Go
+  documents them as "only relevant when RelayServerPort is non-nil".
+- **`--sync`** (Go `Prefs.Sync opt.Bool`, unset = true) — whether the node actively syncs its
+  configuration from the control plane. `--sync=false` is Go's kill switch, and its stated purpose is
+  testing: "to verify that netmap caching and offline operation work correctly".
+
+Verified against pin `9d847a6e`/v0.43.0. The engine can **read** a peer's relay role —
+`ts_control::node` carries `peer_relay` (Go `Hostinfo.PeerRelay`) and `NodeInfo::is_peer_relay()` —
+but there is nothing on the **serving** side: `ts_control::Config` has no relay listen port and no
+static-endpoint list (its fields run from `server_url` to `allow_http_key_fetch`), `ts_control::hostinfo`
+never sets `peer_relay` for this node, so our own `Hostinfo` cannot advertise the role, and
+`ts_magicsock` has no relay listener to bind. There is likewise no way to suspend the map poll while
+the node stays up, so `--sync=false` has nothing to switch off.
+
+**Ask:**
+
+1. `Config.relay_server_port: Option<u16>` — `None` disables (today's behaviour), `Some(0)` binds a
+   random unused port, `Some(p)` binds `p` on all interfaces. This is the same construction-time shape
+   as the already-shipped `wireguard_listen_port` (ask #22), and it matches Go, where the port is a
+   pref read at engine reconfigure.
+2. `Config.relay_server_static_endpoints: Vec<SocketAddr>` — advertised as relay candidates; ignored
+   when `relay_server_port` is `None`, mirroring Go.
+3. Set `Hostinfo.PeerRelay` for THIS node when a relay port is configured, so control and peers learn
+   the role — the read side (`NodeInfo::is_peer_relay`) already exists, and without the advertise side
+   a bound listener is unreachable.
+4. The magicsock UDP relay path itself: accept relayed disco/WireGuard frames on the bound port and
+   forward between the two peers. This is the substantial half; (1)–(3) are plumbing around it.
+5. Separately and much smaller: a way to stop syncing configuration from control without bringing the
+   node down — `Config.sync: bool` or a `Device::set_sync(bool)` — so `--sync=false` can exercise
+   netmap caching and offline operation the way Go's does.
+
+(1)–(4) are one feature and can land together; (5) is independent and is the cheap one.
+
+**NOT asked for: `--remote-config`** (Go `Prefs.RemoteConfig`, new since v1.100.0). It delegates full
+remote control of the node's prefs **and its LocalAPI** to the tailnet admin via the control plane,
+bypassing Tailscale's per-feature double opt-in — "a single client-side 'I trust the tailnet admin'
+switch", in Go's own words. This daemon's authorization model is local (THREAT_MODEL §4.1: every
+LocalAPI write is gated on the caller's peer UID — root or the daemon's owner — and the control plane
+is a peer whose input is validated, never a principal that may rewrite prefs or invoke local
+endpoints). Adopting `RemoteConfig` would add a second,
+remote write path into both, so this fork **declines the behaviour** rather than deferring it. Please do
+not build it on this daemon's account; if the engine ever wants it for another consumer, it should be a
+feature the embedder opts into explicitly, never a default.
+
+**Daemon impact once landed:** `tnet set --relay-server-port` / `--relay-server-static-endpoints`
+already parse (with Go's own `ParseUint`/`ParseAddrPort` validation, dedup and `AddrPort.Compare`
+ordering) and are refused by name in `check_unmodelled_set_flags`; wiring them is a wire `Set` field +
+pref + `get_settings` row, and the refusal is deleted. `--sync`/`--no-sync` is the same shape.
+`--remote-config` keeps its refusal permanently. Tracked in daemon bead tsd-re94825b. — daemon lane
+
+## 35. Proxied-flow `whois` — a `(proto, ip:port) → node` lookup (for `tnet whois --proto`)
+
+**Why:** Go's `whois` is a *flow* lookup, not an address lookup. `cmd/tailscale/cli/whois.go` @
+`53a0d659afa51835dd7a9283873cca44261454f8` takes `ip[:port]` and a `--proto` selector (`protocol; one
+of "tcp" or "udp"; empty means both`) and calls `LocalClient.WhoIsProto`, which reaches
+`LocalBackend.WhoIs(proto, ipp)`. That method resolves by IP first (`cn.NodeByAddr`) and consults the
+protocol **only** in its fallback: when the address matches no node in the netmap and the port is
+non-zero, it asks `b.sys.ProxyMapper().WhoIsIPPort(proto, ipp)` — for `""` it tries `"tcp"` then
+`"udp"` — to map a locally-proxied flow (a `127.0.0.1:port` socket tailscaled itself proxied) back to
+the tailnet IP behind it, then resolves that. So the same `ip:port` really can belong to different
+sessions per protocol, but only for flows the daemon proxies.
+
+Verified against pin `9d847a6e`/v0.43.0. The engine has no such table and no port dimension at all:
+`Device::whois(SocketAddr)` (`src/lib.rs`) forwards to `ts_runtime`, whose `peer_tracker::whois_opt`
+calls `status::whois_addr(addr)` — the whole body of which is `addr.ip()` — and then
+`peer_by_tailnet_ip_opt`. There is no proxy-map type anywhere in the workspace, so nothing records
+which local socket belongs to which peer, and a protocol has nothing to select within.
+
+**Ask:**
+
+1. A proxied-flow registry in the engine, the analogue of Go's `proxymap.Mapper`: the netstack /
+   userspace-proxy paths record `(proto, local ip:port) → peer tailnet IP` when they proxy a
+   connection, and drop the entry when it closes.
+2. `Device::whois_proto(proto: Option<Proto>, addr: SocketAddr) -> Result<Option<WhoIs>, Error>` (or
+   a `proto` parameter on the existing `whois`): resolve by IP as today, and on a miss with a
+   non-zero port, consult (1) — trying `tcp` then `udp` when `proto` is `None`, which is Go's
+   empty-means-both order — and resolve the mapped tailnet IP.
+
+(1) is the substantial half; (2) is the surface over it. Both are additive: today's `whois(addr)` is
+(2) with `proto: None` and a port of 0.
+
+**Daemon impact once landed:** `tnet whois [--proto tcp|udp] ip[:port]` already parses Go's arguments
+in full, and the LocalAPI `Request::Whois` already carries `port` and `proto` through to
+`diag::whois`, which hands the port to the engine and can only record the protocol. Wiring it is one
+call-site change in `diag::whois` plus deleting the "recorded, cannot select" notes on the flag help
+and the wire docs. Until then a proxied flow that Go attributes to a peer is reported here as owned by
+no node, with or without the flag. Tracked in daemon bead tsd-re4d7624. — daemon lane
+
+## 36. Tailnet-lock init with a trusted-key set, several disablements, and this node's own lock key (for `tnet lock init`)
+
+**Why:** Go's `lock init` initializes the authority the operator describes, not a fixed one.
+`cmd/tailscale/cli/tailnet-lock.go` @ `53a0d659afa51835dd7a9283873cca44261454f8` takes
+`[--gen-disablement-for-support] --gen-disablements N <trusted-key>...`, where the positionals are the
+tailnet lock **public keys** (`tlpub:<hex>`, optionally `<key>?<votes>`) initially trusted to sign
+nodes — plus any pre-computed `disablement:<hex>` values — mints `N` disablement secrets itself,
+optionally mints one more that is transmitted to the coordination server for support, and calls
+`LocalClient.TailnetLockInit(ctx, keys, disablementValues, supportDisablement)`. Before any of that it
+refuses when `st.Enabled`, and refuses when the current node's own lock key is not among the trusted
+keys (`st.PublicKey`, from `NetworkLockStatus`) — "the tailnet lock key of the current node must be
+one of the trusted keys during initialization".
+
+Verified against pin `9d847a6e`/v0.43.0. The engine's init is a fixed single-node genesis:
+`Device::tka_init(disablement_secret: Vec<u8>)` (`src/lib.rs`) → `ts_runtime`'s `tka_init_run`
+(`control_runner.rs`), whose body builds `AumKey { kind: Ed25519, votes: 1, public:
+keys.network_lock_keys.public }` as the **sole** trusted key and `vec![disablement_value(&secret)]` as
+the **single** disablement value, then submits init/begin → init/finish. Three consequences:
+
+1. **No key set.** There is no parameter for one, so a tailnet cannot be locked with a second signing
+   node trusted from the start — the case Go's help is written around ("run `tailscale lock` on that
+   node, and copy the node's tailnet lock key").
+2. **No way to read this node's lock key.** `TkaStatus` (`ts_control/src/tka.rs`) carries only `head`
+   and `disabled` — no analogue of Go's `NetworkLockStatus.PublicKey` — and nothing else on `Device`
+   exposes `network_lock_keys.public`. So Go's self-key refusal cannot be *evaluated* here, and the
+   operator cannot obtain the key that Go's grammar requires them to pass.
+3. **The support disablement is unconditional.** `tka_init_run` sets
+   `TkaInitFinishRequest.support_disablement = disablement_secret` — the one secret it was given — so
+   the operator's disablement secret always reaches the coordination server. Upstream sends a
+   *separate*, purpose-minted secret there, and only when `--gen-disablement-for-support` is passed.
+
+**Ask** (extends #17 `tka_init` and #25's key-set half):
+
+1. `Device::tka_init(keys: Vec<AumKey>, disablement_values: Vec<Vec<u8>>, support_disablement:
+   Option<Vec<u8>>)` — the genesis built from the caller's trusted-key set and disablement values,
+   with the support secret sent only when it is `Some`. Today's call is that with the node's own key,
+   one derived value, and the secret repeated as the support disablement.
+2. This node's tailnet lock public key on the read path — a field on `TkaStatus` (Go's
+   `NetworkLockStatus.PublicKey`) or a `Device::tka_public_key()` — so the CLI can print it for the
+   operator to copy and can check Go's "current node must be among the trusted keys" refusal.
+
+**Daemon impact once landed:** `tnet lock init` already parses Go's whole positional grammar
+(`parse_lock_args`, a port of upstream's `parseTLArgs`, including `<key>?<votes>` and both
+`disablement:` prefixes) and already runs Go's `--confirm` two-step, its already-enabled refusal and
+its secret minting. Wiring is: pass the parsed keys and values to the new `tka_init`, delete the
+"this daemon cannot …" refusals in `plan_lock_init`, replace the placeholder trusted-key line with
+Go's `- tlpub:%x (%s key)` list, restore Go's self-key check against (2), and drop the
+support-disablement note the command prints today. Until then the fork initializes only the subset the
+engine has — this node as the sole trusted key, one disablement secret — and says so where the
+operator hits it. Tracked in daemon bead tsd-reb2dfc1. — daemon lane
+
+## 37. Per-peer `Location` (and `Active`) on `StatusNode` — for `exit-node list`'s country/city columns and `--filter`
+
+**Why:** Go's `exit-node list` is a *location* browser. `cmd/tailscale/cli/exitnode.go` @
+`53a0d659afa51835dd7a9283873cca44261454f8` runs the exit-node peers through
+`filterFormatAndSortExitNodes`, which buckets them by `Location.CountryCode` then `Location.CityCode`,
+keeps only the highest-`Location.Priority` node per city (plus whichever is the active exit node),
+synthesises an `Any` city row holding the country's best node when a country has more than one city,
+sorts countries and cities by name, and honours `--filter` ("filter exit nodes by country") with a
+case-insensitive match against `Location.Country`. It then prints five columns — IP, HOSTNAME,
+COUNTRY, CITY, STATUS.
+
+Verified against pin `9d847a6e`/v0.43.0. The **wire** type is already there and already parsed:
+`ts_control_serde::Location` (`ts_control_serde/src/location.rs`) carries `country`, `country_code`,
+`city`, `city_code`, `latitude`, `longitude` and `priority`, and `HostInfo.location:
+Option<Location<'a>>` (`ts_control_serde/src/host_info.rs`) decodes it off the netmap. It is dropped
+one layer up: `impl From<..> for Node` (`ts_control/src/node.rs`) projects `host_info.services`,
+`host_info.net_info.preferred_derp` and `host_info.peer_relay` into the domain `Node` but not
+`host_info.location`, so `ts_control::Node` has no location field, `StatusNode`
+(`ts_runtime/src/status.rs`) has none either, and neither does the daemon's `PeerReport`. Nothing
+between the decoder and the CLI can group, sort or filter by country.
+
+`StatusNode` is also missing Go's `PeerStatus.Active` (traffic seen in the last couple of minutes),
+which `peerStatus` consults before `Online` when it picks the STATUS wording.
+
+**Ask:**
+
+1. Retain the decoded location on the domain node — `Node::location: Option<Location>` (an owned
+   analogue of `ts_control_serde::Location`), projected in `From<..> for Node` next to the other
+   `host_info` fields it already keeps, `None` when the peer declared none (never fabricated).
+2. Surface it on the status view — `StatusNode::location: Option<Location>`, the analogue of Go's
+   `ipnstate.PeerStatus.Location`. `priority` is the field the per-city reduction needs, so it has to
+   ride along with the names and codes.
+3. `StatusNode::active: bool` — Go's `PeerStatus.Active`, true when traffic has been seen for the peer
+   recently. Independent of (1) and (2) and useful to `tnet status` as well.
+
+All three are additive: today's behaviour is (1)/(2) always `None` and (3) always `false`.
+
+**Daemon impact once landed:** `tnet exit-node list` already prints Go's five columns, sorts by DNS
+name, ports Go's `peerStatus` and both of its error paths (`no exit nodes found`, `no exit nodes found
+for %q`), and accepts `--filter`. What it cannot do is *group*: with no `Location`, every peer takes
+Go's own no-location path — one unnamed country, one unnamed city, no priority reduction, no `Any`
+row, `-` printed for country and city — and any non-empty `--filter` can only reach the "found for %q"
+error. Wiring is: carry `location` through `peer_report_from_status_node` into `PeerReport`, then port
+`filterFormatAndSortExitNodes` itself (the country/city buckets, the priority reduction, the `Any`
+row, the two name sorts) and match `--filter` against the real country. (3) removes the last deviation
+in the STATUS column, where an idle-but-online selected exit node currently reads `selected` and Go
+says `selected but offline`. Tracked in daemon bead tsd-red57f03. — daemon lane
+
+## 38. Selectable ping types and a ping size — `Device::ping_typed` (for Go `ping --tsmp` / `--peerapi` / `--size`)
+
+**Why:** Go's `tailscale ping` (`cmd/tailscale/cli/ping.go` @
+`53a0d659afa51835dd7a9283873cca44261454f8`) does not have one probe, it has four, and the operator
+picks between them. `pingType()` maps `--tsmp`/`--icmp`/`--peerapi` onto a `tailcfg.PingType`
+(defaulting to `PingDisco`) and hands it, together with `--size`, to `LocalClient.PingWithOpts`. The
+four measure genuinely different things:
+
+- **disco** (`PingDisco`, the default) — a magicsock-level probe between the two endpoints. Answers
+  "is there a direct path, and how fast is it".
+- **ICMP** (`PingICMP`) — an ICMP echo injected into the tunnel, answered by the peer's *host OS
+  stack*. Answers "is the peer's OS reachable through WireGuard".
+- **TSMP** (`PingTSMP`) — through WireGuard, answered by the peer's *tailscaled*, neither host OS
+  stack involved. Answers "is the peer's daemon alive and does the packet filter admit me". Go
+  returns after the first pong for TSMP and ICMP alike.
+- **peerAPI** (`PingPeerAPI`) — not a ping: an HTTP hit on the peer's peerAPI server, printed as
+  `hit peerapi of %s (%s) at %s in %s` (node IP, node name, peerAPI URL, latency).
+
+`--size` ("size of the ping message (disco pings only). 0 for minimum size.") pads the disco probe,
+which is how an operator finds a path MTU problem.
+
+Verified against pin `9d847a6e`/v0.43.0. The engine has **two** of the four, but no way to choose
+between them and no size knob:
+
+- `Device::ping(dst, timeout) -> Result<Duration, PingError>` — "an ICMPv4 echo … from this device's
+  own tailnet IPv4 over the overlay netstack — never a host socket", answered by the peer's own OS
+  stack. That is Go's `PingICMP`, and it is what the daemon sends for every `tnet ping` today.
+- `Device::ping_disco(dst, timeout) -> Result<Option<(SocketAddr, Duration)>, Error>` — a fresh
+  disco probe returning the endpoint that answered and the RTT. That is Go's `PingDisco`.
+- **TSMP: nothing.** `ts_dataplane` admits IP protocol 99 past the ACL on the way in (Go's `case
+  ipproto.TSMP: return Accept`), and `ts_capabilityversion` records the version at which TSMP ping
+  became a thing, but no crate constructs a TSMP message and none answers one. A TSMP probe sent
+  today would never be replied to.
+- **peerAPI: a client, but not a probe.** `Device::push_file` reaches a peer's peerAPI over
+  `NodeInfo::peerapi_addr`, so the transport exists; there is no call that hits the peer's peerAPI
+  and reports its URL plus a latency.
+- **Size: no parameter.** Both ping calls take a destination and a timeout and choose the packet
+  themselves.
+
+**Ask:**
+
+1. A single typed entry point, so the caller selects the probe instead of the engine choosing for
+   it — e.g.
+
+   ```rust
+   pub enum PingKind { Disco, Icmp, Tsmp, PeerApi }
+
+   pub struct PingOpts { pub kind: PingKind, pub size: Option<usize>, pub timeout: Duration }
+
+   pub struct PingOutcome {
+       pub latency: Duration,
+       /// The direct endpoint that answered, when the probe went direct.
+       pub endpoint: Option<SocketAddr>,
+       /// `PingKind::PeerApi` only: the peer's peerAPI base URL that was hit.
+       pub peerapi_url: Option<String>,
+       /// The peer's node name, for Go's `pong from <name> (<ip>)` line.
+       pub node_name: Option<String>,
+   }
+
+   pub async fn ping_typed(&self, dst: IpAddr, opts: PingOpts) -> Result<PingOutcome, PingError>;
+   ```
+
+   `Disco` and `Icmp` are re-exports of the two calls that already exist, so those two arms are
+   plumbing.
+2. **TSMP, both halves.** Construct and send a TSMP ping over the tunnel, and answer an inbound one
+   from this node's own daemon rather than only admitting it past the ACL. This is the substantial
+   piece; it is also the one that makes `tailscale ping --tsmp` against a Rust node work *from a Go
+   node*, which is a two-way interop gap today, not just a missing CLI flag.
+3. **A peerAPI probe** — a `GET` on the peer's peerAPI base returning `(url, latency)`, reusing the
+   client `push_file` already has.
+4. **`size` on the disco probe**, padding the disco payload; ignored for the other kinds, exactly as
+   Go documents it ("disco pings only").
+5. Nice to have with (1): the peer's node name in the outcome, so `pong from <name> (<ip>)` can carry
+   the name Go prints instead of the IP standing in for it.
+
+(2) and (3) are independent of each other; (1) and (4) are small once either lands, and (1) alone —
+with `Tsmp`/`PeerApi` returning `Unsupported` — is already useful, because it lets the daemon report
+"not implemented" from the engine instead of refusing at the CLI.
+
+**Related, and worth fixing before any of this: the default probe is the wrong one.** Go's default is
+`PingDisco`; the daemon's `Request::Ping` calls `Device::ping` (ICMP) and then reads the direct-path
+endpoint from `Device::direct_path`, a cached snapshot of the last periodic disco probe. So `tnet
+ping` today reports an ICMP RTT next to a disco endpoint that can be up to one probe interval stale,
+and `--until-direct` can overshoot Go by a ping or two before it notices the upgrade. That needs no
+engine change — `Device::ping_disco` already returns both halves from one fresh probe — and is
+tracked as a daemon-side follow-up, noted here so the two are not confused.
+
+**Daemon impact once landed:** `tnet ping --tsmp`/`--peerapi`/`--size` already parse and are refused
+by name in `ping_probe_refusal` (`src/bin/tnet.rs`); wiring them is a ping-kind + size field on the
+`Ping` wire request, the `ipn::diag::ping` call, and Go's `hit peerapi of …` line for the peerAPI
+arm — then the refusal is deleted. `--icmp` is already honoured (it names the probe the daemon
+sends) and needs nothing. — daemon lane
+
+## 39. App-connector route learning + a `RouteInfo` readback (for `tnet appc-routes`)
+
+**Why:** the daemon already ships the *advertise* half of the app connector. `tnet up/set
+--advertise-connector` sets `Config.advertise_app_connector`, the engine folds it into
+`Hostinfo.AppConnector` at registration and on every map request, and control sees the node
+offering the role. Nothing behind that advertisement exists, in the daemon or the engine.
+
+Go's connector (`appc.AppConnector`, driven from `ipnlocal`) is three pieces the engine would own,
+because all three sit on the data plane:
+
+- **The configured domain set.** Control pushes it in the netmap capability map — the
+  `tailscale.com/app-connectors` cap (`appctype.AppConnectorAttr`: `domains`, wildcards, and
+  predetermined `routes`). The engine parses the netmap; the daemon never sees the capmap.
+- **DNS observation.** For each configured domain (`example.com`, or `*.example.com` matched
+  against the wildcard list) the connector watches the answers flowing through its own resolver and
+  records the addresses it sees. That is a tap on the MagicDNS forwarder — engine-side.
+- **Route advertisement.** Each newly observed address becomes a /32 or /128 the node advertises,
+  appended to the advertised-route set and re-sent to control.
+
+Verified against pin `9d847a6e`/v0.43.0: `Config.advertise_app_connector` is a plain bool the
+register/map-poll paths read, and nothing else in the engine references app connectors. There is no
+domain observation, no learned-route accumulation, and no store — so there is nothing for a readback
+verb to return.
+
+**Ask:** the learning path above, plus one read-only accessor over what it accumulated —
+`Device::app_connector_route_info(&self) -> Option<RouteInfo>` where `RouteInfo` mirrors Go's
+`appctype.RouteInfo` (`types/appctype/appconnector.go`): `control: Vec<IpNet>` (routes from the
+policy's `routes` field), `domains: BTreeMap<String, Vec<IpAddr>>` (addresses learned per domain),
+`wildcards: Vec<String>` (the configured `*.` domains with the `*.` stripped — the watch list, not
+what the watching found: Go's `updateDomains` fills it from the control-pushed `domains` list alone,
+and `NewAppConnector` seeds a restarting connector's wildcard set straight back from it). `None`
+when the node is not advertising the role, so the caller can tell "not a connector" from "a
+connector that has learned nothing", which are different answers. The routes themselves should keep
+flowing through the existing advertised-route path rather than a second one.
+
+Split it if that is easier to land: the accessor is useless without the learning, but the *learning*
+alone is already the feature — a node that actually connects. The readback is how an operator
+confirms it.
+
+**Daemon impact once landed:** an `AppcRouteInfo` LocalAPI verb (read-only, the shape of
+`GetPrefs`) → `Device::app_connector_route_info`, consumed by `tnet appc-routes`. The CLI is already
+ported and its flag surface is settled: `appc_routes_shape` in `src/bin/tnet.rs` resolves Go's
+`-n` > `--map` > `--all` > summary precedence, and `appc_routes_output` answers the two prefs-only
+shapes today (Go's `not a connector`, and `-n`'s advertised-route count) while the other three
+return `appc_routes_refusal` — replace that arm with the three renderers ported from Go's
+`getAllOutput` / `getSummarizeLearnedOutput` and the command is complete. Until then
+`--advertise-connector` documents the limit at every place it appears (`tnet up`/`set --help`,
+`Prefs::advertise_app_connector`, README). Tracked in daemon bead tsd-ree961df. — engine lane
+
+---
+
+## 40. Peer route-reachability probing — `Device::route_check{,_probe}()` + a probe hint on `suggest_exit_node()` (for `tailscale routecheck` and `exit-node suggest --force-probe`)
+
+**Why:** Upstream v1.102.3 added `tailscale routecheck`
+(`cmd/tailscale/cli/routecheck.go` @ `53a0d659afa51835dd7a9283873cca44261454f8`), which prints — for
+each prefix advertised by **more than one** router — which of those routers this node can actually
+reach right now. Human output is a `PREFIX`/`IP`/`HOSTNAME` tabwriter table under a `Reachable
+routers at <time>` header, sorted by prefix then hostname, with prefixes served by one router or
+fewer dropped; `--format=json|json-line` selects the machine shapes. It reads the **cached** report
+over `LocalClient.RouteCheck` (`POST /localapi/v0/routecheck`) and forces a fresh one with `--probe`
+(`RouteCheckProbe`, `POST /localapi/v0/routecheck?probe=true`); when no report exists yet the handler
+answers `204` and the CLI says `routecheck: report unavailable`.
+
+The same subsystem now backs `exit-node suggest --force-probe` ("perform a routecheck probe before
+suggesting"), which calls `LocalClient.SuggestExitNodeWithProbe`
+(`POST /localapi/v0/suggest-exit-node?probe=true`) so the ranking runs against a *fresh* reachability
+report rather than the cached one. Go registers that flag only when the routecheck build feature is
+compiled in, and `SuggestExitNodeWithProbe` returns `feature.ErrUnavailable` when it is not — so
+even Go refuses rather than silently downgrading to the unprobed suggestion.
+
+The report itself comes from `net/routecheck`: a `Client` that groups the netmap's **online** peers
+by the route prefixes they advertise (`GroupRoutersByPrefix`), probes the candidate routers through a
+`Pinger` interface (`Ping(ip, pingType, size, cb)`), and caches a
+`Report { Done time.Time, Reachable NodeSet }`, where `NodeSet` is `map[tailcfg.NodeID]Node` and
+`Node { ID, Name, Addr, Routes }`. `Report.IsReachable(id)` is the per-node verdict and
+`Report.RoutablePrefixes()` the prefix→routers view the CLI renders. Probing is control-gated —
+`routecheck.IsEnabled` checks the `NodeAttrClientSideReachability` and
+`NodeAttrClientSideReachabilityRouteCheck` node attributes — and refreshed in the background off
+netmap availability and network-monitor rebind (`NotifyNetMapAvailable`, `NeedsRefresh`,
+`WatchForNetMonRebind`, `Start`/`Close`).
+
+Verified against pin `9d847a6e`/v0.43.0: the engine has **no routecheck subsystem** — no reachability
+report type, no per-peer reachability verdict, no cache, no background refresh — and
+`Device::suggest_exit_node()` takes no argument, so there is no way to ask for a probe-fresh
+suggestion.
+
+**Why not a CLI-side facsimile.** The half the daemon *can* already compute is precisely the half
+that carries none of the meaning: `StatusNode.allowed_routes` is exposed, so grouping peers by
+advertised prefix and finding the multi-path ones is a few lines here. What it cannot say is which of
+those routers is **reachable** — and "reachable" is the entire report. `Device::ping` (netstack ICMP
+echo) and `Device::ping_disco` (on-demand disco RTT) exist per peer, but a CLI loop over them would
+be a different measurement, taken at a different moment, with no `Done` timestamp, no shared cache
+for `--probe` to refresh against, and no control gate — a table that looks like Go's and does not
+mean what Go's means. Refused under the honest-omission rule; hence this ask.
+
+**Ask (three pieces, the third small):**
+
+1. A reachability report on `Device`, the analog of `routecheck.Report`:
+
+```rust
+pub struct RouteReachabilityReport {
+    /// When the report was completed (Go `Report.Done`).
+    pub done: std::time::SystemTime,
+    /// The routers found reachable (Go `Report.Reachable`, a `NodeSet`).
+    pub reachable: Vec<ReachableRouter>,
+}
+
+pub struct ReachableRouter {
+    /// Go keys on `tailcfg.NodeID`; this fork's `StableNodeId` is the equivalent handle.
+    pub stable_id: StableNodeId,
+    pub name: String,
+    pub addr: std::net::IpAddr,
+    pub routes: Vec<ipnet::IpNet>,
+}
+
+/// The cached report, or `Ok(None)` if none has been computed yet.
+pub async fn route_check(&self) -> Result<Option<RouteReachabilityReport>, Error>;
+```
+
+   `Ok(None)` mirrors Go's `204` / `ErrRouteCheckReportUnavailable` — an honest empty result, not an
+   error, exactly as `suggest_exit_node`'s `Ok(None)` already is.
+
+2. `pub async fn route_check_probe(&self) -> Result<Option<RouteReachabilityReport>, Error>` — force a
+   refresh and return the new report (Go `RouteCheckProbe` / `Client.Refresh`).
+
+3. A probe hint on the existing suggestion: `Device::suggest_exit_node_with_probe()`, or an argument
+   on `suggest_exit_node`, that refreshes the reachability report before ranking — so
+   `exit-node suggest --force-probe` means what it says.
+
+The prefix grouping, the online/candidate filter, the disco pinger and the two node-attribute gates
+all live with the netmap and the data plane, which is why this belongs in the engine: the daemon has
+neither. Whether the background refresh loop (`Start`/`NeedsRefresh`/rebind watching) ships with it is
+the engine's call — a probe-on-demand `route_check_probe` plus a `route_check` that returns `None`
+until the first probe is enough to make both commands faithful.
+
+**Daemon impact once landed:** a new `tnet routecheck` — a read-only LocalAPI verb over
+`Device::route_check`, `--probe` over `route_check_probe`, the multi-path filter and the
+`PREFIX`/`IP`/`HOSTNAME` render, plus Go's `routecheck: report unavailable` for the empty report — and
+`tnet exit-node suggest --force-probe` stops being a refusal and becomes the probe-fresh call. That
+flag already parses today and is refused at runtime with a message naming this gap
+(`check_exit_node_suggest_flags` in `src/bin/tnet.rs`), so the same command line keeps working the day
+this lands. Consumed via a pin bump. Tracked in daemon bead tsd-reb30066. — daemon lane
+
+## 41. A client audit-log submission to control — so `logout --reason` / `down --reason` reach the tailnet
+
+**Why:** Upstream's `--reason` exists to satisfy a tailnet policy that requires a justification, and
+that policy is enforced on the **control plane**, not on the node. `runLogout`
+(`cmd/tailscale/cli/logout.go` @ `53a0d659afa51835dd7a9283873cca44261454f8`) does
+`ctx = apitype.RequestReasonKey.WithValue(ctx, logoutArgs.reason)` before `localClient.Logout(ctx)`;
+`apitype.RequestReasonKey` is the context key for the `X-Tailscale-Reason` LocalAPI header
+(`client/tailscale/apitype`), which tailscaled reads back onto the acting identity
+(`ipnauth.WithRequestReason`). The reason is then consumed by
+`actor.CheckProfileAccess(profile, ipnauth.Disconnect, auditLogFn)` — the check that can *refuse* the
+disconnect outright when a policy demands a justification — and the accompanying
+`AuditLogFunc(action tailcfg.ClientAuditAction, details string)` hands it to `ipn/auditlog`, which
+persists a `{Action, Details, TimeStamp}` transaction and retries it to control through
+`Transport.SendAuditLog(ctx, tailcfg.AuditLogRequest)`. `tailscale down --reason` takes the same
+route via the prefs edit.
+
+Verified against pin `9d847a6e`/v0.43.0: the engine has **no audit-log path to control** — no
+`AuditLogRequest` analogue, no client-audit endpoint on the control client, and no reason parameter
+anywhere near a state change: `Device::logout()` (`src/lib.rs`) takes no arguments and is implemented
+as a backdated `/machine/register` (`ts_control/src/tokio/logout.rs`), which carries a node key and an
+expiry and nothing else. The only `audit` strings in the tree are the netmap's
+`DataPlaneAuditLogID` fields, which are about data-plane logging, not client actions.
+
+**Why not a daemon-side facsimile.** Go's `--reason` answers to two policies, and only one of them
+is local. The **device** policy — `AlwaysOn.Enabled` / `AlwaysOn.OverrideWithReason`, read from the
+MDM/syspolicy source — is enforced by this daemon today (`src/ipn/alwayson.rs`): a reasonless
+disconnect is refused with Go's own message, and a permitted one writes Go's `DISCONNECT_NODE` audit
+record. What is still missing is the **tailnet** half: putting that record where control reads it.
+Nothing on this side of the LocalAPI can reach control except through the engine, so a record that
+stops at the daemon's log satisfies the administrator's device policy and nothing on the tailnet.
+Written down here rather than papered over.
+
+**Ask (option 2 covers both commands; option 1 covers `logout` only):**
+
+1. A reason on the one state change that reaches the engine — `logout`:
+
+```rust
+/// Log out, attaching the operator's justification for control's audit trail
+/// (Go `apitype.RequestReasonKey` → `tailcfg.AuditLogRequest`). `None` = today's behaviour.
+pub async fn logout_with_reason(&self, reason: Option<&str>) -> Result<(), ts_control::LogoutError>;
+```
+
+   **This shape alone leaves `down --reason` local-only.** `down` never calls the engine:
+   `Backend::down` (`src/ipn/mod.rs`) tears the datapath down and persists `want_running = false`,
+   and that is the whole operation — there is no engine call for a reason to ride on. Go has the
+   same asymmetry and settles it a layer up: both commands land on
+   `actor.CheckProfileAccess(profile, ipnauth.Disconnect, auditLogFn)`, and the entry reaches control
+   through `auditlog`'s transport rather than through the logout registration itself. So option 1 is
+   the whole ask only if it ships with a way to submit a `Disconnect` entry that carries no state
+   change of its own — which is option 2.
+
+2. The general form, which covers `down` as well as `logout` and any later action Go audits:
+
+```rust
+pub enum ClientAuditAction { Disconnect, /* Go's `tailcfg.ClientAuditAction` set */ }
+
+/// Submit one client audit entry to control (Go `auditlog.Transport::SendAuditLog`).
+pub async fn send_audit_log(&self, action: ClientAuditAction, details: &str) -> Result<(), Error>;
+```
+
+Go's own logger persists and retries these because an audit entry must not be lost when control is
+briefly unreachable; whether that durability ships with the first cut is the engine's call — a
+best-effort submit is already the difference between a reason that leaves the node and one that does
+not.
+
+**Daemon impact once landed:** `tnet logout --reason` and `tnet down --reason` keep their existing
+command lines and stop being local-only — the daemon passes the reason it already receives to the
+engine instead of only logging it, and the "recorded locally, not forwarded to control" scope note on
+both flags (`src/bin/tnet.rs`, `src/server.rs`) goes away. `down` gets there only through option 2's
+`send_audit_log` (`logout` can ride either shape), so option 1 on its own retires half the note.
+Consumed via a pin bump. — daemon lane
+
+## 42. The self node's owning user — a login name on `Status` (for Go's `--nickname=` restore and the profile `Account` column)
+
+**Why:** Go names a login profile in TWO arms. `profileManager.setProfilePrefs`
+(`ipn/ipnlocal/profiles.go:450` @ `53a0d659afa51835dd7a9283873cca44261454f8`):
+
+```go
+if prefsIn.ProfileName() != "" {
+	lp.Name = prefsIn.ProfileName()
+} else {
+	lp.Name = up.LoginName
+}
+```
+
+`up` is the profile's persisted `tailcfg.UserProfile` — the account that logged the node in. So
+clearing the nickname (`tailscale set --nickname=`) never leaves a profile nameless: the name falls
+back to the account. The same value is what Go's `switch --list --json` reports as `Account`
+(`cmd/tailscale/cli/switch.go`: `Account: prof.UserProfile.LoginName`).
+
+The daemon ports the first arm — `Backend::rename_current_profile` (`src/ipn/mod.rs`) writes
+`profiles.json` so `tnet switch --list`/`tnet switch <name>` see the nickname — and **cannot port the
+second**, because it has no account identity to restore. `tnet set --nickname=` therefore blanks the
+name and both readers fall back to the profile **id** where Go shows the account. `ProfileEntry`
+(`src/localapi.rs`) has no `account` field for the same reason, so `tnet switch --list` cannot print
+Go's Account column either. Same missing value, two symptoms.
+
+Verified at pin `9d847a6`/v0.43.0: **no engine surface answers "who owns this node".**
+
+- `Device::status()` (`ts_runtime/src/lib.rs`) returns `Status { self_node: Option<StatusNode>, .. }`,
+  and `StatusNode` (`ts_runtime/src/status.rs`) carries no user/login field at all — the module doc
+  states the gap outright ("Capability / user / online surfacing (do not fabricate)").
+- `Device::whois()` *does* resolve an owning login, but only for **peers**: `whois_opt`
+  (`ts_runtime/src/peer_tracker/mod.rs`) starts at `peer_by_tailnet_ip_opt`, an index over `peer_db`,
+  and the tracker's own comment records that "the self node never enters `peer_db` — it is routed to
+  the control runner's `self_node` cell". A whois of one's own tailnet address answers `None`.
+- The daemon has no other route: it holds a `Device`, not the control runner or the peer tracker.
+
+Both halves of the join already exist **inside** the engine, and are already wired to each other for
+peers: the control runner holds the self `Node` (with its `user_id`) — `Device::status` asks it for
+`SelfNode` on every call — and the peer tracker accumulates the netmap's `UserProfiles` table keyed by
+`UserId` (`for profile in &msg.user_profiles { self.user_profiles.insert(..) }`), which
+`resolve_user` + `UserProfile::best_label` turn into `WhoIs.user`. Only the *self*-side join is
+missing.
+
+**Ask (either shape; (a) is the smaller change):**
+
+1. Put the resolved user on the self node in the snapshot that already exists:
+
+```rust
+pub struct StatusNode {
+    // …
+    /// The login (else display) name of the user that owns this node, when the netmap's
+    /// `UserProfiles` table has a profile for its `user_id`. `None` when control sent none.
+    pub user: Option<String>,
+}
+```
+
+   filled for `Status::self_node` by the same `UserId` → `UserProfile::best_label` join `WhoIs`
+   already performs. Filling it for peers too would be welcome but is not what this ask needs — the
+   self node is.
+
+2. Or a dedicated accessor, if `StatusNode` should stay a pure node view:
+
+```rust
+/// The account this node is logged in as, from the netmap's `UserProfiles` table
+/// (Go `persist.Persist.UserProfile`). `None` before the first netmap, or when control
+/// sent no profile for the self node's user (e.g. a tagged node with no human owner).
+pub async fn self_user_profile(&self) -> Result<Option<ts_control::UserProfile>, Error>;
+```
+
+   The owned `ts_control::UserProfile` (`id` + `login_name` + `display_name`) is already public, so
+   this can hand the profile back whole and let the caller pick a label.
+
+**Daemon impact once landed:** the daemon records the login name alongside the profile in
+`profiles.json` when the node registers; `rename_current_profile` gains Go's else arm, so a cleared
+nickname restores the account name instead of falling back to the id; `ProfileEntry` gains the
+`Account` column Go prints. No command line changes. The deviation notes on `rename_current_profile`
+and the `clearing_the_nickname_blanks_the_name_and_cannot_restore_a_login_name` test
+(`src/ipn/mod.rs`) are what retire when it does. Consumed via a pin bump. — daemon lane
+
+## 43. A c2n request hook — so control can ask this node for something (Go `ipn/ipnlocal/c2n.go`)
+
+**Why:** control-to-node ("c2n") is the mechanism by which an admin console *acts on* a node rather
+than merely reading about it, and a node built on this stack can answer exactly the two paths the
+engine hardcodes. Upstream registers around twenty handlers on it: `/echo`, `POST /logtail/flush`, `POST /sockstats`, the `/debug/*` family and
+`POST /netfilter-kind` in `ipn/ipnlocal/c2n.go` itself, plus `GET`+`POST /update`
+(`feature/clientupdate/clientupdate.go`), `GET /posture/identity` (`feature/posture/posture.go`),
+`GET /appconnector/routes` (`feature/appconnectors/appconnectors.go`), `POST /wol`
+(`feature/wakeonlan/wakeonlan.go`), `GET /vip-services` (`ipn/ipnlocal/serve.go`),
+`GET /tls-cert-status` (`ipn/ipnlocal/cert.go`), `/ssh/usernames` (`ssh/tailssh/tailssh.go`),
+`/debug/tka/log` (`feature/tailnetlock/tailnetlock.go`) and `GET /conn25/state`
+(`feature/conn25/conn25.go`).
+
+The absence is already documented here three times, one symptom at a time, without the cause being
+named: `Prefs::posture_checking` (`src/prefs.rs`) records that posture is a c2n *pull* nothing
+answers, so the pref's on-the-wire behaviour is byte-for-byte the disabled case;
+`Prefs::auto_update_apply` records that the node advertises `Hostinfo.AllowsUpdate` while nothing
+here acts on a trigger; and ask #39's app-connector readback is the LocalAPI half of a readback
+control performs over `GET /appconnector/routes`. Three reductions, one missing mechanism.
+
+How the request arrives, at upstream `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8` (v1.102.4):
+
+1. Control puts a `PingRequest` with `Types: ["c2n"]` into a `MapResponse`. Its `Payload` is a whole
+   serialized HTTP/1 request; `URL` is where the answer goes, over noise (`URLIsNoise`).
+2. The node parses that payload as an HTTP request, serves it locally, records the entire HTTP
+   *response*, and POSTs it as the body of a request to `PingRequest.URL`
+   (`feature/c2n/c2n.go` `answerC2NPing`, reached from `control/controlclient/direct.go`).
+3. Dispatch (`LocalBackend.handleC2N`) tries method+path, then path alone, then registered prefixes.
+   A path it knows under a method it does not gets `405 bad method`; anything else gets
+   `400 unknown c2n path`.
+
+Verified at pin `9d847a6e`/v0.43.0: **the engine already does all three steps, and its dispatch table
+is a hardcoded `match` with no way in.** `handle_ping` (`ts_control/src/tokio/ping.rs`) parses the
+c2n payload, answers `/echo` and `GET /vip-services` out of `Config`, returns
+`HTTP/1.1 400 Bad Request` + `unknown c2n path` for everything else, and POSTs the response back;
+`PingType::C2N` and `MapResponse::ping_request` are already modelled in `ts_control_serde`. So this
+is not an ask to build c2n. It is one hole in a dispatcher that already runs.
+
+The daemon cannot fill it from outside, which is why this is an engine ask and not a bead: the
+request arrives inside the control noise session, `handle_ping` is awaited inline in the control
+runner's map-poll frame loop (`ts_control/src/tokio/client.rs`), and the daemon holds a
+`tailscale::Device` — not the runner, not the session. A handler the engine will not dispatch to
+cannot be served, whichever side writes it. Equally, the engine cannot simply implement the handlers
+itself: the answers for the paths this fork wants are *daemon* state (prefs, serve config, posture),
+which is why the minimum useful primitive is a registration hook and not more engine-side handlers.
+
+**Ask (either shape; (a) is the one this daemon would rather consume):**
+
+1. A request stream and a responder, mirroring the `watch_ipn_bus` surface the daemon already runs a
+   task against:
+
+```rust
+pub async fn watch_c2n(&self) -> Result<C2nRequests, Error>;
+
+impl C2nRequests {
+    /// The next c2n request control sent that the engine did not answer itself. `None` once the
+    /// runtime is shutting down — the same end-of-stream signal `IpnBusWatcher::next` gives.
+    pub async fn next(&mut self) -> Option<(C2nRequest, C2nResponder)>;
+}
+
+pub struct C2nRequest {
+    pub method: String,                     // "GET", "POST": Go keys its table on method AND path
+    pub path: String,                       // URL path, no query string
+    pub query: String,                      // raw query; Go's handlers read it with r.FormValue
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+    /// How long the engine will wait for `respond` before answering for itself. Go's
+    /// `C2n-Handler-Timeout` request header, default one minute (`feature/c2n/c2n.go`).
+    pub timeout: Duration,
+}
+
+pub struct C2nResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl C2nResponder {
+    /// Answer this request; the engine serializes the HTTP response and POSTs it to control.
+    pub fn respond(self, res: C2nResponse);
+    /// Not ours — fall back to the engine's own refusal, so Go's two verdicts stay in one place.
+    pub fn decline(self);
+    /// Ours, but not under this method — the engine answers Go's `405 bad method`.
+    pub fn decline_method(self);
+}
+```
+
+2. Or a registered callback, if a stream is the wrong grain:
+   `Device::set_c2n_handler(Arc<dyn Fn(C2nRequest) -> BoxFuture<'static, Option<C2nResponse>> + Send + Sync>)`,
+   with `None` meaning the same as `decline`. It is the smaller surface, but it invokes daemon code
+   from inside the control runner, so a handler that wants to read `Device` state can re-enter the
+   engine; the stream shape has no such edge.
+
+Four things the shape must get right either way:
+
+- **Not on `Config`.** `ts_control::Config` derives `Clone + Serialize + Deserialize` and the daemon
+  persists prefs through it; a handler field breaks all three. The registration belongs on `Device`,
+  next to the live-set surface (ask #9).
+- **Carry the method.** The engine matches on `c2n_request.uri().path()` alone today. Go keys on
+  method+path, and the two handlers this fork wants first are `GET /update` and `POST /update` — one
+  path, two different answers, one of them a mutation. A path-only hook cannot express them.
+- **Never stall the map poll.** `handle_ping` is awaited in the frame loop that feeds the netmap, so
+  a wedged handler is a wedged control session. Bound it the way Go does — `C2n-Handler-Timeout`,
+  one minute by default, cancelled on expiry — and have the engine answer `500` itself on overrun.
+- **Keep the refusals engine-side, and make them Go's two.** Every unmatched path is
+  `400 unknown c2n path` today; Go distinguishes a known path under an unknown method (`405 bad
+  method`) from an unknown path (`400`). Once the table is dynamic the engine can no longer derive
+  that split on its own, which is what `decline` and `decline_method` above are for. Porting the
+  405 arm at the same time is the error path this ask brings with it.
+
+### The handlers this fork would answer first
+
+Two, and both turn a pref this daemon already carries into something with a wire effect:
+
+- **`GET /posture/identity`** → `tailcfg.C2NPostureIdentityResponse` (`SerialNumbers`,
+  `IfaceHardwareAddrs`, `PostureDisabled`). `Prefs::posture_checking` is persisted, threaded into
+  `Config.posture_checking` and reported by `tnet get`, and means nothing on the wire because
+  nothing answers the pull. The pref is not the handler's only input: Go's
+  `handleC2NPostureIdentityGet` first reads the `PostureChecking` policy
+  (`GetPreferenceOption(pkey.PostureChecking, …)`) and collects only when
+  `choice.ShouldEnable(prefs.PostureChecking())`, so an administrator's `always` turns collection
+  on over a `false` pref and `never` turns it off over a `true` one. Go does not fold that policy
+  into prefs (it is not in `preferencePolicies`, `ipn/ipnlocal/local.go`) and neither does this
+  daemon, so the handler must read it itself. `PostureChecking` is already a registered
+  `PreferenceOption` in `src/ipn/syspolicy.rs`, and `PreferenceOption::should_enable` is Go's
+  `ShouldEnable`; what the handler still needs is a public read of a preference-option policy, as
+  `get_boolean` is for booleans. With the hook, the disabled case — policy `never`, or the pref
+  `false` under `user-decides`, no policy, or a failed policy read — becomes a real
+  `{"PostureDisabled": true}`, Go's own answer, sent because the operator or the administrator opted
+  out rather than because the fork is silent. A failed read is not a refusal: Go logs it and falls
+  back to the `ShowChoiceByPolicy` default the call passes, which leaves the pref to decide. The
+  enabled case additionally needs serial-number and MAC collection (Go's `posture.GetSerialNumbers` / `GetHardwareAddrs`, behind Go's `hwaddrs=true` query
+  gate); that is local OS work on the daemon side and a separate piece, so the honest first shape
+  reports what it can collect and omits what it cannot.
+- **`GET /update` and `POST /update`** → `tailcfg.C2NUpdateResponse` (`Err`, `Enabled`, `Supported`,
+  `Started`). `Prefs::auto_update_apply` already crosses the wire as `Hostinfo.AllowsUpdate`: an
+  advertisement that the console may act on this node, which nothing then honours. `Enabled` is that
+  pref (Go: `envknob.AllowsRemoteUpdate() || upPref.Apply.EqualBool(true)`). `Supported` is
+  `feature.CanAutoUpdate()` upstream and is honestly `false` here — `tnet update` is a manual,
+  operator-invoked command and there is no updater to trigger. `POST /update` then refuses in
+  `handleC2NUpdatePost`'s order, which checks `Enabled` before `Supported`: with the pref unset or
+  `false` it answers `Err: "not enabled"`, and only with the pref `true` does it answer
+  `Err: "not supported"`. Both strings are Go's own for exactly those states, not fork inventions,
+  and the order matters because the default node is the unset one. A node that advertises
+  `AllowsUpdate` and then declines the trigger in
+  upstream's words is strictly better than one that advertises it and never answers at all. Running
+  an actual update from the trigger is its own piece of work.
+
+`/echo` and `GET /vip-services` need nothing from this ask: the engine answers both already, and
+should keep them — they are engine state, and `/echo` in particular is how control probes which of
+several high-availability subnet routers is alive.
+
+### The handlers it declines until they have their own security answer
+
+The `/debug/*` family — `/debug/prefs`, `/debug/metrics`, `/debug/netmap`, `/debug/health`,
+`/debug/goroutines`, `/debug/component-logging`, `/debug/logheap`, `/debug/pprof/heap`,
+`/debug/pprof/allocs`, and `/debug/tka/log` (the Tailnet Lock update log, registered from
+`feature/tailnetlock/tailnetlock.go` behind the same `buildfeatures.HasDebug` gate) — together with
+`POST /sockstats`, is a **remote read of daemon internals by
+the control plane**. This fork should not start answering it on the same day it gains the ability
+to, and the hook does not require it to.
+
+Upstream's exposure is a judgement made under upstream's assumptions: the family is behind a build
+feature (`buildfeatures.HasDebug`), the prefs it serves are stripped of key material
+(`LocalBackend.Prefs()` → `sanitizedPrefsLocked` → `stripKeysFromPrefs`), and only two pprof
+profiles are registered, "for security" in the source's own words. This fork's assumptions are
+written down and are weaker: `docs/THREAT_MODEL.md` §3 lists a malicious or compromised control
+plane as adversary **(d)**, and §5.4 records that it is **not** mitigated, because Tailnet Lock is
+inert here. Handing (d) a goroutine dump, a heap profile, the full netmap, or `Prefs` — which
+carries `operator_user`, `taildrop_dir` and `control_url`, an OS account name and local filesystem
+paths — is a new capability for the one adversary this fork cannot refuse, in exchange for no
+feature it has. Each of those paths is therefore its own decision, with its own threat-model
+paragraph, taken after the hook exists rather than bundled into it.
+
+The rest are declined for plainer reasons: `POST /logtail/flush` (no logtail client here),
+`POST /netfilter-kind` (no netfilter layer at all — ask #21, bead `tsd-m8s`),
+`GET /appconnector/routes` (the c2n half of ask #39, and blocked on the route learning that ask
+asks for), `POST /wol`, `/ssh/usernames`, `GET /tls-cert-status`, and `GET /conn25/state` (the
+work-in-progress connectors datapath, which this fork does not have and which upstream itself
+answers `501` outside `envknob.UseWIPCode()`).
+
+**Daemon impact once landed:** one `watch_c2n` task in the daemon's IPN layer with a method+path
+dispatch of its own, and the two handlers above, reading prefs the daemon already holds. The
+reduction notes on `Prefs::posture_checking` and `Prefs::auto_update_apply` (`src/prefs.rs`) are
+what retire when it does; until then they point here. Consumed via a pin bump. — engine lane
+
+## 44. An allow-list argument on `suggest_exit_node()` (or candidate enumeration) — so `AllowedSuggestedExitNodes` can pick the best *permitted* node
+
+**Why:** `AllowedSuggestedExitNodes` is the MDM policy key that tells a managed fleet which exit
+nodes it may be steered onto. Upstream threads it all the way into the picker
+(`ipn/ipnlocal/local.go` @ `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`): `fillAllowedSuggestions`
+reads the key as a string array and turns it into a `set.Set[tailcfg.StableNodeID]`,
+`refreshAllowedSuggestions` rebuilds it at backend start and from `sysPolicyChanged`,
+`getAllowedSuggestions` hands the set to `suggestExitNode`, and both ranking strategies apply it to
+the **candidates, before ranking**:
+
+```go
+if allowList != nil && !allowList.Contains(peer.StableID()) {
+    continue
+}
+```
+
+Because the filter runs first, Go's answer is *the best node the administrator permits*. The
+nil-versus-empty distinction is load bearing: an unset key is a nil set and means no restriction, a
+configured empty array means nothing is allowed.
+
+The daemon now enforces the half it can (`permitted_suggestion` in `src/ipn/diag.rs`, fed by
+`syspolicy::allowed_suggested_exit_nodes`): it withholds a suggestion whose stable id the allow-list
+excludes. That coincides with Go's empty response only when the permitted set leaves no candidate at
+all; in every other case Go answers with the best permitted node and this build answers with nothing,
+so the refusal is reported as *itself* — `Response::ExitNodeSuggestion { withheld_by_policy: true }`,
+and its own `tnet` notice — rather than being passed off as Go's empty result. What the daemon cannot
+do is **re-rank**. Verified against pin `9d847a6e`/v0.43.0: `Device::suggest_exit_node()` takes no
+arguments and returns one already-chosen `ExitNodeSuggestion { id, name }`, and the engine's own
+`ts_runtime/src/exit_node_suggest.rs` says so in as many words — "The allow-list gate is likewise
+absent (allow-all) since the fork has no such policy yet", alongside `ExitNodeCandidate::is_eligible`
+noting that Go's predicate also requires "an allow-list membership check". The candidate list
+(`ExitNodeCandidate`, built inside `Runtime::suggest_exit_node` from the peer tracker) and the
+DERP-region latencies it ranks on (the control runner's last `NetcheckReport`) are both engine-side
+and neither crosses `Device`.
+
+So the gap is precise and narrow: **an allow-list that excludes only the engine's top pick yields no
+suggestion on this side, where Go yields the runner-up.** A fleet that allow-lists three exit nodes
+gets a suggestion only while the lowest-latency candidate overall happens to be one of the three.
+
+**Why not a daemon-side facsimile.** Re-implementing the ranking here would mean re-deriving the
+candidate predicate (online, `suggest-exit-node` capability, advertises an exit route) from
+`StatusNode`, re-deriving home DERP regions, and ranking on region latencies the daemon can only get
+from `Device::netcheck` — a second, separately-timed measurement, with no access to the runtime's
+sticky `prev_suggestion`, so repeated calls would flap where Go's are stable. That is a different
+algorithm wearing `suggest_exit_node`'s name. Refused under the honest-omission rule; hence this ask.
+
+**Ask (either piece is sufficient; the first is smaller and preferred):**
+
+1. Let the caller pass the allow-list, so the existing (already correct, already sticky) algorithm
+   filters candidates before ranking — Go's shape exactly:
+
+```rust
+/// The stable ids a caller's policy permits, or `None` for no restriction (Go's nil
+/// `set.Set[tailcfg.StableNodeID]`; an EMPTY set means nothing is permitted — the two are not the
+/// same, and the engine must keep them apart).
+pub async fn suggest_exit_node_allowing(
+    &self,
+    allow_list: Option<&std::collections::BTreeSet<StableNodeId>>,
+) -> Result<Option<ExitNodeSuggestion>, Error>;
+```
+
+   Inside, this is one line in `ExitNodeCandidate::is_eligible`'s caller — the filter Go applies —
+   plus threading the argument through `Runtime::suggest_exit_node`. `suggest_exit_node()` stays as
+   `suggest_exit_node_allowing(None)`, so nothing downstream breaks.
+
+2. Or expose the candidates the daemon would rank itself — `Device::exit_node_candidates() ->
+   Result<Vec<ExitNodeCandidate>, Error>` (the struct is already `pub`) together with the region
+   latencies already available from `Device::netcheck`. This is strictly more surface for strictly
+   more duplicated logic, and it leaves stickiness inside the engine where the daemon cannot consult
+   it, which is why (1) is preferred.
+
+One behavioural note for whichever lands: the runtime remembers the returned id in
+`prev_suggestion` **including** when the result is empty (it mirrors Go clearing
+`lastSuggestedExitNode`). With the filter inside the engine, a node excluded by policy never becomes
+sticky in the first place — today's daemon-side refusal leaves it remembered, which is harmless (the
+refusal is stable rather than flapping) but is one more reason the gate belongs where Go has it.
+
+**Daemon impact once landed:** `diag::suggest_exit_node` passes
+`syspolicy::allowed_suggested_exit_nodes()` straight into the engine call and
+`permitted_suggestion`'s filter arm becomes redundant (the nil-versus-empty reading and its tests
+move with the argument). `tnet exit-node suggest` then answers with the best *allowed* exit node
+instead of withholding when the best overall is not allowed, and the `withheld_by_policy` reply flag
+plus its CLI notice become dead — the outcome they describe can no longer occur, so both are removed
+with the same commit that consumes the argument (the wire field is `skip_serializing_if`-false, so
+dropping it is invisible to a client that never saw it set). Consumed via a pin bump. — engine lane
+
+## 45. A lag signal on `IpnBusWatcher` — so a watcher that falls behind is told and disconnected, not silently starved
+
+**Why:** Go used to drop notifications for a slow watcher and no longer does. In
+`ipn/ipnlocal/local.go` @ `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`, `sendToLocked` does a
+non-blocking send into the session's 128-deep channel, and a full channel is a disconnect:
+
+```go
+select {
+case sess.ch <- nForSess:
+default:
+    if sess.mask&ipn.NotifyInProcessNoDisconnect != 0 {
+        select {
+        case sess.ch <- nForSess:
+        case <-sess.ctx.Done():
+        }
+        continue
+    }
+    b.closeLaggingWatchSessionLocked(sess)
+}
+```
+
+`closeLaggingWatchSessionLocked` removes the session from `b.notifyWatchers`, **drains** everything
+still queued ("the session already fell behind, so the queued delta stream is not trustworthy"),
+sends one terminal `Notify` whose `ErrMessage` is `watchIPNBusFellBehindMessage` (`"IPN bus consumer
+fell behind; closing watch"`), and closes the channel. The client is told once, is disconnected, and
+knows to re-subscribe and re-snapshot. The blocking arm is only for `NotifyInProcessNoDisconnect`,
+which is in-process only and which the LocalAPI handler refuses; the daemon has no in-process
+watchers, so it needs only the disconnect.
+
+Verified against pin `9d847a6e`: the engine keeps the old Go behaviour. `deliver` in
+`ts_runtime/src/ipn_bus.rs` treats a full queue as success and keeps streaming:
+
+```rust
+match tx.try_send(n) {
+    Ok(()) => false,
+    Err(mpsc::error::TrySendError::Full(_)) => false,
+    Err(mpsc::error::TrySendError::Closed(_)) => true,
+}
+```
+
+and `IpnBusWatcher::next() -> Option<Notify>` has no way to say a frame was dropped. The engine test
+`full_buffer_drops_and_never_blocks_producer` locks in the drop, so it changes with the fix. Its
+"never blocks the producer" half still holds under Go's disconnect. The daemon's
+`stream_notify` writes each frame to the socket inline, so a slow reader (`tnet` piped into a stalled
+pager, an agent doing synchronous work per frame) is exactly what fills that queue. The watcher then
+loses frames one at a time, the connection stays open, and neither side knows its view diverged.
+
+The drop costs more than one frame. `run_bus` calls `borrow_and_update()` on the source `watch` cell
+before `deliver`, so the dropped value counts as *seen*. The frames still in the queue are **older**
+values of that cell. A consumer that catches up ends on a stale state or peer set, and stays there
+until that cell next changes. On a quiet node that can be indefinitely. Once ask #28 lands and
+`net_map` carries deltas instead of full sets, a dropped delta would corrupt the watcher's view for
+good. So this ask should land before, or with, #28.
+
+**Why not a daemon-side facsimile.** The daemon cannot see a drop, because the engine records none.
+A write timeout or a queue-depth estimate would guess at lag. It would disconnect readers that never
+lost a frame and miss ones that did. Refused under the honest-omission rule; hence this ask.
+
+**Not affected:** the daemon-built prefs and policy feeds on the same stream ride
+`tokio::sync::watch`, which coalesces to the latest full snapshot instead of dropping an entry. For a
+full-snapshot feed that loses nothing. Only the engine's `mpsc` bus has the hazard.
+
+**Ask (either piece is sufficient; the first is preferred):**
+
+1. A `Lagged` outcome on the watcher, in the shape of
+   `tokio::sync::broadcast::error::RecvError::Lagged`, that carries Go's ordering inside the engine:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WatchError {
+    /// The bus ended (runtime shutdown, source senders dropped) — today's `next() == None`.
+    Closed,
+    /// This watcher's queue was full, so a notification was dropped. Queued frames were
+    /// discarded, and the watcher is finished: every later `recv` returns `Closed`.
+    Lagged,
+}
+
+impl IpnBusWatcher {
+    pub async fn recv(&mut self) -> Result<Notify, WatchError>;
+}
+```
+
+   Inside, `deliver`'s `Full` arm sets a flag shared with the watcher and returns `true` (stop the
+   task, as `Closed` already does). `recv` checks the flag first: if it is set, it drains `rx` with
+   `try_recv`, returns `Err(Lagged)` once, and returns `Closed` after that. Draining in `recv`, not
+   at the consumer, keeps a stale queued frame from ever reaching a caller after the gap. That is the
+   point of Go's drain-then-error-then-close order. `next()` can stay as `recv().await.ok()`.
+
+2. Or a counter, `IpnBusWatcher::dropped() -> u64`, that `deliver`'s `Full` arm increments. The
+   daemon would check it after each `next()` and, when it is non-zero, do the drain/terminal/close
+   itself. This is less surface in the engine, but it leaves every embedder to re-implement the
+   ordering. The engine would also keep streaming after a gap it knows about, so (1) is preferred.
+
+**Daemon impact once landed:** in `stream_notify` (`src/server.rs`), `Err(Lagged)` drops the
+watcher, writes one `Response::Notify(NotifyView { error: Some("IPN bus consumer fell behind;
+closing watch"), .. })` frame, and returns. That is Go's terminal frame, and `NotifyView::error`
+already exists. The ordering and the message get a test that drives the bus past 128 frames.
+`NotifyView::error` today means "terminal registration failure, alongside a `NeedsLogin` state".
+The lag frame carries `error` with no `state`, which is how Go overloads `Notify.ErrMessage` too, so
+the field's doc comment has to say so. Consumed via a pin bump. — engine lane
+
+## 46. A `net_map` tick on a self-node change — so `Notify.SelfChange` reaches a watcher when only this node moved
+
+**Why:** Go's `SelfChange` (`ipn/ipnlocal/local.go` @ `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`)
+is built from `NetMap.SelfNode` on every netmap update, so a watcher learns about its own node even
+when no peer changed: a key-expiry extension, a MagicDNS rename, reassigned addresses. The daemon
+fills `NotifyView::self_change` on each `net_map` frame, but at pin `9d847a6e` a self-only update
+produces no `net_map` frame:
+
+- `run_bus` (`ts_runtime/src/ipn_bus.rs`) emits `net_map` only from `peer_rx.changed()`, a `watch`
+  of `Vec<StatusNode>`.
+- `PeerTracker`'s netmap `handle` (`ts_runtime/src/peer_tracker/mod.rs`) returns early when the
+  response has no `peer_update`, no `peer_patches` and no liveness delta, before
+  `peer_watch.send_replace`. The self node never enters `peer_db`.
+- The self node goes to the control runner's `self_node` cell instead
+  (`ts_runtime/src/control_runner.rs`, `self.self_node.send_replace(Some(node.clone()))`), which the
+  bus does not watch.
+
+**Why not a daemon-side facsimile.** The daemon could poll `Device::self_node()` on a timer and
+emit a frame when it differs. That is a guess at when the netmap moved, not the event: it lags by the
+poll period, costs an engine round-trip per watcher per tick, and diffs where Go re-sends. Refused
+under the honest-omission rule; the gap is documented on `NotifyView::self_change` instead.
+
+**Ask (either is sufficient; the first is preferred):**
+
+1. Have `run_bus` also watch the control runner's `self_node` cell and emit a `net_map` tick (the
+   current peer snapshot) when it changes. A consumer then sees one frame per self-only update, as
+   Go's `SelfChange` does. An engine test drives a self-node `send_replace` with an unchanged peer
+   set and asserts one `net_map` notify arrives.
+2. Or add `self_node: Option<StatusNode>` to the engine's `Notify`, set on the same trigger. The
+   daemon would then read it off the frame instead of fetching it, and the extra
+   `STATUS_QUERY_TIMEOUT`-bounded round-trip in `stream_notify` goes away.
+
+**Daemon impact once landed:** with (1), nothing changes in `stream_notify` (`src/server.rs`): the
+existing netmap arm already fetches and attaches the self node. A test beside the existing
+`stream_notify` tests pins that a self-only change delivers a frame with `self_change` set, and the
+"Narrower than Go" paragraph on `NotifyView::self_change` is deleted. With (2), `project_notify`
+takes the self node from the engine `Notify`. Consumed via a pin bump. — engine lane

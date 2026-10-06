@@ -57,22 +57,35 @@ pub(super) fn is_valid_profile_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-/// Resolve a user-supplied `tnet switch <target>` to a canonical profile **id**, matching by id OR by
-/// display name (Go's `tailscale switch` accepts either). Precedence, mirroring Go (id wins over name
-/// so an exact-id target is never shadowed by a coincidental name):
-/// 1. `target` is a valid id that names a known profile (the reserved [`DEFAULT_PROFILE_ID`], or a key
-///    present in `profiles.json`) → that id.
-/// 2. exactly ONE profile's [`ProfileMeta::name`] equals `target` → that profile's id.
-/// 3. otherwise `None` — the caller reports an error. A name matching MULTIPLE ids is ambiguous and
-///    also yields `None` (the caller must be told to use the id), never an arbitrary pick.
+/// Resolve a user-supplied `tnet switch <target>` / `tnet switch remove <target>` to a canonical
+/// profile **id** — the analogue of Go's `matchProfile` (`cmd/tailscale/cli/switch.go`), which
+/// `switch` and `switch remove` share there exactly as `switch_profile`/`delete_profile` share this.
+///
+/// Go runs FOUR ordered passes over every profile — `ID`, `NetworkProfile.DomainName` (the tailnet),
+/// `Name` (the nickname, printed in `--list`'s Account column), then `NetworkProfile.DisplayName` —
+/// and each pass returns its FIRST hit, so a value two profiles happen to share resolves rather than
+/// erroring. Two of the four are portable here; the two `NetworkProfile` passes are not, because the
+/// engine surfaces no per-profile tailnet — it carries no netmap `Domain` at all — which is the same
+/// gap that leaves Go's `Tailnet`/`Account` `--list` columns with nothing to print
+/// (`docs/PARITY_GAP_ANALYSIS.md` §4.5). So the passes here are Go's first and third:
+/// 1. `target` is a valid id that names a known profile (the reserved [`DEFAULT_PROFILE_ID`], or a
+///    key present in `profiles.json`) → that id. First, so an exact-id target is never shadowed by a
+///    coincidental name — Go's ordering.
+/// 2. `target` equals some profile's [`ProfileMeta::name`] → that profile's id. That name is Go's
+///    `LoginProfile.Name`, what `tnet set --nickname` writes. Like Go's pass this takes the FIRST
+///    match rather than refusing a name two profiles share: `profiles.json` is a sorted map, so
+///    "first" is the lowest id — deterministic, where Go's is its profile-list order.
+/// 3. otherwise `None`.
 ///
 /// Every id this returns is guaranteed to satisfy [`is_valid_profile_id`] — including the ones read
 /// out of `profiles.json` by the name arm — so a caller may join it as a single path component.
 ///
 /// Pure over the parsed `profiles.json` (no I/O) so it is unit-testable; the caller loads the file.
-/// Note a *syntactically* valid id that is NOT yet a known profile is intentionally left to the
-/// caller (switching to a brand-new id is how a new profile is created), so this returns `None` for
-/// it and the caller falls back to its own id-validation path — see the `switch_profile` call site.
+/// `None` means "no such profile", and every caller treats it as Go does — `switch` and
+/// `switch remove` both refuse with `No profile named %q`. A *syntactically* valid id that is not a
+/// known profile is NOT a match: creating a profile is the separate, explicit
+/// [`Backend::create_profile`](super::Backend::create_profile) (`tnet switch --new`), which uses a
+/// `Some` here as its "already exists" refusal rather than as a target.
 pub(super) fn resolve_target_to_id(target: &str, meta: &ProfilesFile) -> Option<String> {
     // 1. Exact id match against a KNOWN profile (default is always known).
     if is_valid_profile_id(target)
@@ -80,8 +93,8 @@ pub(super) fn resolve_target_to_id(target: &str, meta: &ProfilesFile) -> Option<
     {
         return Some(target.to_string());
     }
-    // 2. Unique display-name match. Collect all ids whose name equals `target`; resolve only if
-    //    exactly one (an ambiguous name must not silently pick one).
+    // 2. Display-name match, first hit wins (Go's pass returns `p.ID` on the first `p.Name == arg`
+    //    and has no ambiguity case).
     //
     //    The `is_valid_profile_id` filter on the *key* is load-bearing, not decoration: unlike the
     //    id arm above (which validates `target` itself), this arm returns an id read straight out of
@@ -89,16 +102,41 @@ pub(super) fn resolve_target_to_id(target: &str, meta: &ProfilesFile) -> Option<
     //    ([`profile_paths`]). A hand-edited or corrupted map with a key like `"../../etc"` would
     //    otherwise let a name lookup escape the state dir. Ids the daemon writes always pass, so
     //    this only ever rejects a map this daemon did not produce.
-    let mut by_name = meta
-        .profiles
+    meta.profiles
         .iter()
-        .filter(|(id, m)| m.name == target && is_valid_profile_id(id))
-        .map(|(id, _)| id.clone());
-    let first = by_name.next()?;
-    if by_name.next().is_some() {
-        return None; // ambiguous: >1 profile shares this name → caller errors, user must use the id.
+        .find(|(id, m)| m.name == target && is_valid_profile_id(id))
+        .map(|(id, _)| id.clone())
+}
+
+/// The refusal for a target [`resolve_target_to_id`] matches to no profile. Go's `switchProfile` and
+/// `removeProfile` (`cmd/tailscale/cli/switch.go`) both write `errf("No profile named %q\n",
+/// args[0])`, capitalised, and `tnet` prints this line with no `error: ` in front so stderr reads the
+/// same. `%q` goes through the crate's one spelling of it, [`quoted`](super::syspolicy::quoted).
+pub(super) fn no_profile_named(target: &str) -> String {
+    format!("No profile named {}", super::syspolicy::quoted(target))
+}
+
+/// Pick an id for a new, empty profile — Go's `profileManager.newUnusedID`
+/// (`ipn/ipnlocal/profiles.go`), which formats two random bytes as four lowercase hex digits and
+/// draws again while the id is already known.
+///
+/// "Known" is wider here than in Go: an id that equals another profile's nickname is skipped too,
+/// because [`resolve_target_to_id`] matches ids first and a new id would shadow that profile for
+/// every later `switch`. Go loops without bound; this gives up after a fixed number of draws and
+/// returns `None`, so a hand-edited map cannot hang the daemon. `draw` supplies the random bytes, so
+/// the loop is testable without an entropy source.
+pub(super) fn unused_profile_id<E>(
+    meta: &ProfilesFile,
+    mut draw: impl FnMut() -> Result<[u8; 2], E>,
+) -> Result<Option<String>, E> {
+    for _ in 0..256 {
+        let [hi, lo] = draw()?;
+        let id = format!("{hi:02x}{lo:02x}");
+        if resolve_target_to_id(&id, meta).is_none() {
+            return Ok(Some(id));
+        }
     }
-    Some(first)
+    Ok(None)
 }
 
 /// The `(prefs.json, node.key.json)` paths for profile `id` under `state_dir`. The default profile
@@ -227,6 +265,35 @@ mod tests {
     }
 
     #[test]
+    fn unused_profile_id_is_four_hex_digits_and_skips_taken_ones() {
+        let mut meta = ProfilesFile::default();
+        meta.profiles
+            .insert("beef".to_string(), ProfileMeta::default());
+        meta.profiles.insert(
+            "cafe".to_string(),
+            ProfileMeta {
+                name: "0a0b".to_string(),
+            },
+        );
+        // `beef` is an id and `0a0b` is a nickname, so both draws are skipped.
+        let mut draws = [[0xbe, 0xef], [0x0a, 0x0b], [0x01, 0x2c]].into_iter();
+        let id = unused_profile_id(&meta, || Ok::<_, ()>(draws.next().expect("drew too often")));
+        assert_eq!(id, Ok(Some("012c".to_string())));
+        assert!(is_valid_profile_id("012c"));
+
+        // A source that only ever repeats a taken id gives up instead of looping forever.
+        assert_eq!(
+            unused_profile_id(&meta, || Ok::<_, ()>([0xbe, 0xef])),
+            Ok(None)
+        );
+        // A failed draw is returned, not retried.
+        assert_eq!(
+            unused_profile_id(&meta, || Err("no entropy")),
+            Err("no entropy")
+        );
+    }
+
+    #[test]
     fn default_profile_uses_legacy_top_level_paths() {
         let sd = Path::new("/var/lib/tailnetd");
         let (prefs, key) = profile_paths(sd, DEFAULT_PROFILE_ID);
@@ -281,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_target_matches_id_name_and_handles_ambiguity() {
+    fn resolve_target_matches_id_then_name_and_takes_the_first_hit_like_go() {
         let mut meta = ProfilesFile::default();
         meta.profiles.insert(
             "work".into(),
@@ -313,13 +380,20 @@ mod tests {
         // Neither a known id/name nor (here) relevant → None.
         assert_eq!(resolve_target_to_id("nope", &meta), None);
 
-        // Ambiguous name (two ids share it) → None: never silently pick one.
+        // A name two profiles SHARE resolves to the first match rather than being refused: Go's
+        // `matchProfile` pass is `for _, p := range all { if p.Name == arg { return p.ID, true } }`,
+        // which returns the first hit and has no ambiguity case at all. "First" here is the lowest
+        // id, because `profiles.json` is a sorted map — deterministic, where Go's is list order.
         let mut amb = ProfilesFile::default();
         amb.profiles
-            .insert("a".into(), ProfileMeta { name: "dup".into() });
-        amb.profiles
             .insert("b".into(), ProfileMeta { name: "dup".into() });
-        assert_eq!(resolve_target_to_id("dup", &amb), None);
+        amb.profiles
+            .insert("a".into(), ProfileMeta { name: "dup".into() });
+        assert_eq!(
+            resolve_target_to_id("dup", &amb).as_deref(),
+            Some("a"),
+            "a shared display name must resolve (Go takes the first hit), not be refused"
+        );
 
         // id precedence over name: a target that is BOTH a known id AND some other profile's name
         // resolves to the id. (Set up "home" id whose name coincides with a target that is also an id.)
@@ -338,6 +412,16 @@ mod tests {
         );
         // "home" is a known id → resolves to id "home", NOT to "work" (whose name is "home").
         assert_eq!(resolve_target_to_id("home", &prec).as_deref(), Some("home"));
+    }
+
+    #[test]
+    fn the_unmatched_target_refusal_is_gos_text() {
+        // Go: `errf("No profile named %q\n", args[0])`. Capital N, no prefix, the target quoted.
+        assert_eq!(no_profile_named("wrok"), r#"No profile named "wrok""#);
+        assert_eq!(
+            no_profile_named(r#"a "b" c"#),
+            r#"No profile named "a \"b\" c""#
+        );
     }
 
     #[test]
@@ -362,8 +446,8 @@ mod tests {
         // Same key, looked up directly: the id arm already refused it.
         assert_eq!(resolve_target_to_id("../../etc", &meta), None);
 
-        // A traversal key alongside a legitimate one sharing the same name resolves to the safe id
-        // rather than being treated as ambiguous — the bad key is filtered out before the count.
+        // A traversal key alongside a legitimate one sharing the same name resolves to the safe id:
+        // the bad key is filtered out of the pass entirely, so it can never be the "first hit".
         let mut mixed = ProfilesFile::default();
         mixed
             .profiles

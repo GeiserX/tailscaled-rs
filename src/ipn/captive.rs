@@ -43,6 +43,12 @@
 //!   path rather than fabricating a per-interface bind the HTTP client cannot do.
 //! - **No `captiveportal_detected` client metric.** Go bumps a `clientmetric` counter; this daemon
 //!   has no client-metric registry of its own (`tnet metrics` proxies the engine's).
+//! - **Three connectivity signals instead of a health tracker.** Go probes while *any* registered
+//!   warnable with `ImpactsConnectivity` — other than the captive-portal warnable itself — is
+//!   unhealthy. This fork has no health tracker, so [`ConnectivityWarnable`] enumerates that set
+//!   directly: the members it can observe are `network-status`, `no-derp-home` and
+//!   `ip-forwarding-off`, and the two it cannot are named with their reasons on that type. The
+//!   *state* the trigger runs in is Go's unchanged: `Running`, and only `Running`.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -77,19 +83,211 @@ pub(super) const WARNABLE_TEXT: &str =
 /// `captivePortalDetectionInterval`). A short blip on the way up must not fire a probe.
 pub(super) const DETECTION_INTERVAL: Duration = Duration::from_secs(2);
 
+/// How long "this node cannot reach any relay server" must persist before it counts as a
+/// connectivity problem at all — Go `health.noDERPHomeWarnable`'s `TimeToVisible`
+/// (`health/warnings.go`: *"Tailscale could not connect to any relay server"*, `ImpactsConnectivity:
+/// true`, `TimeToVisible: 10 * time.Second`).
+///
+/// That warnable is one of the three this fork observes (see `ConnectivityWarnable`): with no health
+/// tracker, "the engine measured no
+/// reachable DERP region" is the observable that Go turns into `no-derp-home`, and Go only feeds it
+/// to captive-portal detection once it has been unhealthy for this long. Honouring the same delay
+/// keeps a node whose *first* DERP measurement simply has not landed yet — an empty report on a
+/// freshly-`Running` node is indistinguishable from a dead one — from probing on every bring-up.
+/// Go's [`DETECTION_INTERVAL`] is then spent on top, exactly as it is upstream, where the health
+/// change arrives at the loop only after the warnable becomes visible.
+pub(super) const NO_DERP_HOME_TIME_TO_VISIBLE: Duration = Duration::from_secs(10);
+
+/// How long "the host has no interface that could reach the Internet" must persist before it counts
+/// as a connectivity problem — Go `health.NetworkStatusWarnable`'s `TimeToVisible`
+/// (`health/warnings.go`: *"Tailscale cannot connect because the network is down"*,
+/// `ImpactsConnectivity: true`, `TimeToVisible: 5 * time.Second`).
+pub(super) const NETWORK_STATUS_TIME_TO_VISIBLE: Duration = Duration::from_secs(5);
+
+/// One of Go's `ImpactsConnectivity` warnables, as an observable this daemon actually has.
+///
+/// Upstream's captive-portal extension does not watch a single fact. It walks the whole health
+/// tracker and probes while **any** registered warnable with `ImpactsConnectivity` — other than
+/// `captivePortalWarnable` itself — is unhealthy (`feature/captiveportal/captiveportal.go`,
+/// `Extension.onHealthChange`: `if w.ImpactsConnectivity && w.WarnableCode !=
+/// captivePortalWarnable.Code`). This fork has no health tracker, so the set is enumerated here
+/// instead: one variant per such warnable whose input the daemon can observe at this pin. Go's
+/// "except the captive-portal warnable" exclusion is structural — `captive-portal-detected` is this
+/// loop's *output*, so it is not a member and can never re-trigger the loop that raised it.
+///
+/// Go registers five `ImpactsConnectivity` warnables (`health/warnings.go`). Two are **not** here,
+/// for a stated reason rather than by omission: `no-derp-connection` ("Relay server unavailable")
+/// and `no-udp4-bind` ("NAT traversal setup failure") are magicsock/DERP-client facts. The engine at
+/// this pin publishes no health signal for either — [`Device::netcheck`](tailscale::Device::netcheck)
+/// reports measured region latencies, not whether the home relay's connection is actually
+/// established, and nothing reports the UDP bind — so they are engine-side, and are not faked from
+/// something else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum ConnectivityWarnable {
+    /// Go `health.NetworkStatusWarnable` ("network-status"): the host has no interface that could
+    /// carry Internet traffic. Upstream's input is `health.Tracker.SetAnyInterfaceUp`, fed from the
+    /// link monitor; here it is [`linkmon::any_interface_up`](super::linkmon::any_interface_up).
+    NetworkStatus,
+    /// Go `health.noDERPHomeWarnable` ("no-derp-home"): this node could not connect to any relay
+    /// server. The engine's net report naming no reachable DERP region is the same fact, and it is
+    /// the warnable a portal trips most directly, since the portal answers the relay connections
+    /// itself.
+    NoDerpHome,
+    /// Go `health.ipForwardingWarnable` ("ip-forwarding-off"): a kernel-TUN node advertises routes
+    /// but the host will not forward them. Upstream's input is the check
+    /// `applyPrefsToHostinfoLocked` installs; here it is
+    /// [`ipforward::ip_forwarding_broken`](crate::ipforward::ip_forwarding_broken).
+    ///
+    /// Unlike the other two this is a **steady** condition — a misconfigured subnet router stays
+    /// unhealthy until someone changes a sysctl — so it is [`steady`](Self::is_steady): it probes
+    /// once when it becomes the reported warnable, and is not rechecked while it merely persists.
+    IpForwardingOff,
+}
+
+impl ConnectivityWarnable {
+    /// The warnable's Go `Code` — the stable identifier `health/warnings.go` registers it under.
+    /// Logged when the loop starts an episode, so the daemon log names *which* connectivity fact
+    /// triggered a probe rather than only that something did.
+    pub(super) const fn code(self) -> &'static str {
+        match self {
+            Self::NetworkStatus => "network-status",
+            Self::NoDerpHome => "no-derp-home",
+            Self::IpForwardingOff => "ip-forwarding-off",
+        }
+    }
+
+    /// The warnable's Go `TimeToVisible`: how long its condition must persist before the health
+    /// tracker shows it at all — and therefore before upstream's captive loop ever hears about it.
+    pub(super) const fn time_to_visible(self) -> Duration {
+        match self {
+            Self::NetworkStatus => NETWORK_STATUS_TIME_TO_VISIBLE,
+            Self::NoDerpHome => NO_DERP_HOME_TIME_TO_VISIBLE,
+            // `ipForwardingWarnable` sets no `TimeToVisible`: visible as soon as it is unhealthy.
+            Self::IpForwardingOff => Duration::ZERO,
+        }
+    }
+
+    /// Whether this warnable is a steady condition that earns one probe per onset rather than a
+    /// probe every [`RECHECK_INTERVAL`].
+    ///
+    /// Upstream probes on a health *change* (`Extension.onHealthChange`), and the tracker publishes a
+    /// change only when a warnable's state actually moves. A warnable that stays unhealthy therefore
+    /// costs Go one probe when it turns unhealthy, not one per minute. This fork polls, so without
+    /// this distinction a subnet router with forwarding off would probe tailscale.com every 30s
+    /// forever on a network that is fine.
+    pub(super) const fn is_steady(self) -> bool {
+        matches!(self, Self::IpForwardingOff)
+    }
+
+    /// How long connectivity must have been impacted by *this* warnable before the first probe of an
+    /// episode: its [`time_to_visible`](Self::time_to_visible), then Go's
+    /// [`DETECTION_INTERVAL`] on top. Upstream spends both — the health change only reaches the loop
+    /// once the warnable becomes visible, and the loop then sits on its own timer — so a warnable
+    /// that becomes visible sooner also probes sooner, which is why this is per-warnable and not one
+    /// constant.
+    pub(super) const fn settle_time(self) -> Duration {
+        // `Duration + Duration` is not a const fn; add the parts instead.
+        Duration::from_nanos(
+            self.time_to_visible().as_nanos() as u64 + DETECTION_INTERVAL.as_nanos() as u64,
+        )
+    }
+}
+
 /// How long to wait before re-probing while connectivity *stays* impacted.
 ///
 /// FORK BEHAVIOUR, not a Go constant. Go re-triggers detection from its health tracker: every health
 /// state change while connectivity is impacted pushes onto `needsCaptiveDetection`, which re-arms the
 /// 2s timer. This fork has no health-event bus (see `crate::localapi`'s note on the reduced `Notify`),
 /// so the loop polls instead — and a bare 2s poll would mean an unreachable-control node probes
-/// tailscale.com every two seconds forever. The first pass keeps Go's 2s latency; subsequent passes
-/// back off to this, which still notices a portal that appears while the node is already stuck.
+/// tailscale.com every two seconds forever. The first pass of an episode keeps Go's settle time
+/// ([`ConnectivityWarnable::settle_time`]); subsequent passes back off to this,
+/// which still notices a portal that appears while the node is already stuck.
 pub(super) const RECHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The captive-portal loop's tick — how often it re-reads whether connectivity is impacted. Fine
 /// enough to honour [`DETECTION_INTERVAL`] without a timer per state edge.
 pub(super) const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// When the next detection pass of an unhealthy episode is due — the schedule half of
+/// [`captive_portal_loop`](super::captive_portal_loop), split out so it is a pure decision a test
+/// can drive at any instant instead of a shape only a live loop can reach.
+///
+/// The wait is bound to **the warnable being waited out**, not to the episode. Go's warnables become
+/// visible on their own clocks (`network-status` after 5s, `no-derp-home` after 10s;
+/// health/warnings.go), so time that passed while one of them was unhealthy is not a wait the other
+/// has served. A node whose relay went quiet at t=0 and whose host network then died at t=6 must
+/// still owe `network-status` its own [`settle_time`](ConnectivityWarnable::settle_time) from t=6 —
+/// where an episode-scoped clock would have it probing at t=7, one second after the condition it is
+/// probing about began. Upstream cannot make that mistake: each warnable is timed from its own
+/// onset, and a warnable that recovers before it becomes visible never reaches the loop at all. So
+/// the wait here restarts whenever the warnable changes.
+///
+/// The recheck backoff is episode-scoped on purpose, and is not restarted the same way: once a pass
+/// has run, what governs the next one is [`RECHECK_INTERVAL`] since that pass. Go is in the same
+/// position — after its first probe it is on a timer, not on a fresh visibility wait — and a
+/// warnable that changes under an already-probing episode is not new evidence worth a new probe.
+#[derive(Debug, Default)]
+pub(super) struct EpisodeTimer {
+    /// The warnable currently being waited out and when it became the reported one. `None` between
+    /// episodes.
+    impacted: Option<(ConnectivityWarnable, tokio::time::Instant)>,
+    /// When this episode last probed. `None` until its first pass — which is exactly what makes that
+    /// pass owe the settle time rather than the recheck backoff.
+    last_run: Option<tokio::time::Instant>,
+}
+
+impl EpisodeTimer {
+    /// Connectivity is healthy: the episode is over. A later one waits out its settle time from
+    /// scratch rather than probing instantly on the strength of this one's clock.
+    pub(super) fn recovered(&mut self) {
+        self.impacted = None;
+        self.last_run = None;
+    }
+
+    /// Whether a detection pass is due at `now`, given the warnable that is unhealthy. Records the
+    /// pass when it answers `true`, so a caller must probe exactly when it does.
+    pub(super) fn probe_due(
+        &mut self,
+        warnable: ConnectivityWarnable,
+        now: tokio::time::Instant,
+    ) -> bool {
+        let since = match self.impacted {
+            Some((waiting_on, since)) if waiting_on == warnable => since,
+            // A new episode, or a different warnable took over inside one. Either way the wait
+            // starts now, because it is THIS warnable's onset that the settle time is measured from.
+            previous => {
+                tracing::debug!(
+                    code = warnable.code(),
+                    settle_secs = warnable.settle_time().as_secs(),
+                    "captive: connectivity impacted; waiting out the settle time before probing"
+                );
+                // A steady warnable on either side of the change makes this a new episode. Its one
+                // probe says nothing about a transient warnable that appears hours later, and a
+                // transient clearing back to the steady one is a health change Go would probe on.
+                if warnable.is_steady() || previous.is_some_and(|(w, _)| w.is_steady()) {
+                    self.last_run = None;
+                }
+                self.impacted = Some((warnable, now));
+                now
+            }
+        };
+        let due = match self.last_run {
+            // First pass of this episode: the settle time Go spends before its first probe — the
+            // triggering warnable's `TimeToVisible` (the health tracker's), then the captive loop's
+            // own `captivePortalDetectionInterval` on top.
+            None => now.duration_since(since) >= warnable.settle_time(),
+            // A steady warnable that has had its probe: nothing has changed, so no health change
+            // would reach Go's loop either.
+            Some(_) if warnable.is_steady() => false,
+            // Still impacted after a pass: re-probe on the backoff, measured from the probe.
+            Some(ran) => now.duration_since(ran) >= RECHECK_INTERVAL,
+        };
+        if due {
+            self.last_run = Some(now);
+        }
+        due
+    }
+}
 
 /// Where an [`Endpoint`] came from (Go `captivedetection.EndpointProvider`). The declaration order
 /// **is** the preference order: [`available_endpoints`] sorts on it, so a DERP node in the node's own
@@ -1175,6 +1373,144 @@ mod tests {
             ),
         );
         assert!(!seen.into_inner().unwrap().wants_body);
+    }
+
+    // --- the episode timer: which warnable's clock the first probe of an episode owes -----------
+
+    /// Drive [`EpisodeTimer`] at a fabricated instant: `probe_due` takes the clock as an argument,
+    /// so the whole schedule is exercised without sleeping or a paused runtime.
+    fn at(base: tokio::time::Instant, secs: u64) -> tokio::time::Instant {
+        base + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn the_settle_wait_belongs_to_the_warnable_that_started_it() {
+        use ConnectivityWarnable::{NetworkStatus, NoDerpHome};
+        let t = tokio::time::Instant::now();
+        let mut timer = EpisodeTimer::default();
+
+        // The relay goes quiet at t+0. `no-derp-home` owes 12s (10s TimeToVisible + 2s).
+        assert!(!timer.probe_due(NoDerpHome, at(t, 0)));
+        assert!(!timer.probe_due(NoDerpHome, at(t, 6)));
+
+        // At t+6 the host network dies too, and `network-status` — visible in 5s, so owed 7s — is
+        // the warnable now reported. Its condition is six seconds younger than the episode.
+        assert!(!timer.probe_due(NetworkStatus, at(t, 6)));
+        assert!(
+            !timer.probe_due(NetworkStatus, at(t, 7)),
+            "seven seconds into the EPISODE is one second into network-status: the elapsed time \
+             belongs to the warnable that spent it, and probing here would probe a condition that \
+             has not yet lasted long enough for Go's tracker to show it at all"
+        );
+        assert!(!timer.probe_due(NetworkStatus, at(t, 12)));
+        assert!(
+            timer.probe_due(NetworkStatus, at(t, 13)),
+            "seven seconds after ITS onset, network-status has served its own wait"
+        );
+    }
+
+    #[test]
+    fn an_unchanging_warnable_probes_once_its_settle_time_is_served() {
+        use ConnectivityWarnable::NoDerpHome;
+        let t = tokio::time::Instant::now();
+        let mut timer = EpisodeTimer::default();
+
+        assert!(!timer.probe_due(NoDerpHome, at(t, 0)));
+        assert!(
+            !timer.probe_due(NoDerpHome, at(t, 11)),
+            "11s: `no-derp-home` is visible at 10s and the loop then spends its own 2s"
+        );
+        assert!(timer.probe_due(NoDerpHome, at(t, 12)));
+
+        // Past the first pass the episode is on the recheck backoff, measured from that pass.
+        assert!(!timer.probe_due(NoDerpHome, at(t, 41)));
+        assert!(timer.probe_due(NoDerpHome, at(t, 42)));
+    }
+
+    #[test]
+    fn a_warnable_change_after_a_pass_does_not_re_probe_early() {
+        use ConnectivityWarnable::{NetworkStatus, NoDerpHome};
+        let t = tokio::time::Instant::now();
+        let mut timer = EpisodeTimer::default();
+
+        assert!(!timer.probe_due(NetworkStatus, at(t, 0)));
+        assert!(timer.probe_due(NetworkStatus, at(t, 7)), "its settle time");
+
+        // The network comes back but the relay is still unreachable: a different warnable, inside an
+        // episode that has already probed. What governs the next pass is the backoff since that
+        // probe — a fresh settle wait here would let a flapping pair probe far more often than Go's
+        // loop, which is on a timer once it has started.
+        assert!(!timer.probe_due(NoDerpHome, at(t, 8)));
+        assert!(!timer.probe_due(NoDerpHome, at(t, 36)));
+        assert!(timer.probe_due(NoDerpHome, at(t, 37)), "30s after the pass");
+    }
+
+    #[test]
+    fn recovery_ends_the_episode_and_the_next_one_waits_again() {
+        use ConnectivityWarnable::NetworkStatus;
+        let t = tokio::time::Instant::now();
+        let mut timer = EpisodeTimer::default();
+
+        assert!(!timer.probe_due(NetworkStatus, at(t, 0)));
+        timer.recovered();
+        assert!(
+            !timer.probe_due(NetworkStatus, at(t, 6)),
+            "a healthy poll ended the episode, so the next one starts its own wait: six seconds of \
+             the old episode do not carry over"
+        );
+        assert!(timer.probe_due(NetworkStatus, at(t, 13)));
+    }
+
+    #[test]
+    fn ip_forwarding_off_probes_once_per_onset_not_every_recheck() {
+        use ConnectivityWarnable::IpForwardingOff;
+        assert_eq!(IpForwardingOff.code(), "ip-forwarding-off");
+        assert_eq!(
+            IpForwardingOff.settle_time(),
+            Duration::from_secs(2),
+            "no TimeToVisible in health/warnings.go, then Go's 2s detection interval"
+        );
+        let t = tokio::time::Instant::now();
+        let mut timer = EpisodeTimer::default();
+
+        assert!(!timer.probe_due(IpForwardingOff, at(t, 0)));
+        assert!(
+            timer.probe_due(IpForwardingOff, at(t, 2)),
+            "the warnable turning unhealthy is the health change Go probes on"
+        );
+        assert!(
+            !timer.probe_due(IpForwardingOff, at(t, 32)),
+            "a subnet router whose forwarding stays off publishes no further change, so it must \
+             not probe on the recheck backoff"
+        );
+        assert!(!timer.probe_due(IpForwardingOff, at(t, 3600)));
+    }
+
+    #[test]
+    fn a_steady_warnable_neither_lends_nor_borrows_a_probe() {
+        use ConnectivityWarnable::{IpForwardingOff, NetworkStatus};
+        let t = tokio::time::Instant::now();
+        let mut timer = EpisodeTimer::default();
+
+        assert!(!timer.probe_due(IpForwardingOff, at(t, 0)));
+        assert!(timer.probe_due(IpForwardingOff, at(t, 2)));
+
+        // An hour later the host network dies. The forwarding probe is an hour old, but it is not a
+        // pass over THIS condition: network-status owes its own 7s, then the 30s backoff.
+        assert!(
+            !timer.probe_due(NetworkStatus, at(t, 3600)),
+            "an old steady-warnable probe must not make a fresh outage probe instantly"
+        );
+        assert!(!timer.probe_due(NetworkStatus, at(t, 3606)));
+        assert!(timer.probe_due(NetworkStatus, at(t, 3607)));
+        assert!(!timer.probe_due(NetworkStatus, at(t, 3636)));
+        assert!(timer.probe_due(NetworkStatus, at(t, 3637)));
+
+        // The network returns while forwarding is still off: that recovery is a health change Go
+        // probes on, once.
+        assert!(!timer.probe_due(IpForwardingOff, at(t, 3700)));
+        assert!(timer.probe_due(IpForwardingOff, at(t, 3702)));
+        assert!(!timer.probe_due(IpForwardingOff, at(t, 3732)));
     }
 
     #[test]

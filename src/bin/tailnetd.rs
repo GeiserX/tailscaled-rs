@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use tailscaled_rs::conffile;
 use tailscaled_rs::ipn::{self, Backend};
 use tailscaled_rs::prefs::Prefs;
 use tokio::sync::Mutex;
@@ -42,11 +43,12 @@ const LONG_VERSION: &str = concat!(
 /// resolution (`tailscaled_rs::state_dir` / `socket_path`) is unchanged, so existing env-driven
 /// deployments behave exactly as before.
 ///
-/// One Go daemon flag Go also exposes is deliberately NOT a daemon-startup flag here: `--tun` (and
-/// its name/MTU) is a **pref**, set via `tnet up` (`--tun`/`--tun-name`/`--tun-mtu`), not a launch
-/// flag. `--port` (the WireGuard/disco UDP listen port) IS a startup flag (see below) — the engine
-/// gained a configurable listen port in v0.40.0. `--config` (declarative `ipn.ConfigVAlpha`) is a
-/// tracked follow-up that hangs off this flag surface.
+/// The data path is the one knob that is BOTH: `--tun` is a launch flag here as it is in Go, and it
+/// is also a pref (`tnet up --tun`/`--tun-name`/`--tun-mtu`), because the pref is what reaches the
+/// engine. The flag resolves onto that pref at startup — see the `--tun` field below and
+/// [`tailscaled_rs::tunflag`] — so a Go-shaped command line and a `tnet up` end at the same place
+/// instead of at two competing answers. `--port` (the WireGuard/disco UDP listen port) is a plain
+/// startup flag (see below) — the engine gained a configurable listen port in v0.40.0.
 #[derive(Parser, Debug)]
 #[command(
     name = "tailnetd",
@@ -63,14 +65,80 @@ struct Args {
     /// since `tnet` has no `--statedir` of its own.
     #[arg(long, value_name = "DIR")]
     statedir: Option<PathBuf>,
+    /// Encrypt the daemon's state file on disk (Go `tailscaled --encrypt-state`). **Accepted by the
+    /// parser, then refused at startup when it is on** — see `can_encrypt_state`. Go seals the
+    /// state file to the device's TPM (Linux and Windows only) by prefixing the state path with
+    /// `tpm:`, and when the flag is *unset* enables that by itself wherever the platform supports it
+    /// or the syspolicy key `EncryptState` asks for it.
+    ///
+    /// This fork has no state-store provider layer and no TPM/keystore integration: prefs and the
+    /// node key are written as plain JSON under a `0700` state dir, which `docs/THREAT_MODEL.md`
+    /// records as a trust boundary. At-rest encryption is therefore **out of scope for now**, and
+    /// the flag says so rather than being an unknown argument or a silent no-op that would claim
+    /// protection this build does not provide.
+    ///
+    /// Tri-state, like Go's `boolFlag` (`cmd/tailscaled/flag.go`), which tracks whether it was ever
+    /// set: absent, `--encrypt-state` (= on), or `--encrypt-state=false` (explicitly off, and inert
+    /// — Go validates only the "on" case). Go's `flag` package accepts a value for a bool flag only
+    /// in the `=` form, hence `require_equals`; the value spellings are Go's `strconv.ParseBool`
+    /// set, see `parse_go_bool`.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        value_parser = parse_go_bool
+    )]
+    encrypt_state: Option<bool>,
     /// Path of the LocalAPI control socket. Overrides `TAILNETD_SOCKET`. When omitted, resolves to
     /// `TAILNETD_SOCKET` else `<statedir>/tailnetd.sock`. Go `tailscaled --socket`.
     #[arg(long, value_name = "PATH")]
     socket: Option<PathBuf>,
+    /// Path of the BIRD control socket, for a subnet router that hands its advertised routes to a
+    /// BIRD BGP daemon (Go `tailscaled --bird-socket`). **Accepted by the parser, then refused at
+    /// startup** — see `bird_socket_refusal`. Go passes the path to its engine
+    /// (`wgengine.Config.BIRDSocket`, constructed via `wgengine.HookNewBird`), which enables BIRD's
+    /// `tailscale` protocol while this node is a *primary* subnet router and disables it otherwise.
+    /// That toggle lives inside the engine's reconfigure cycle, which this daemon does not own, and
+    /// the `tailscale-rs` engine exposes no BIRD hook — so there is nothing here to hand the socket
+    /// to. Declaring the flag anyway is the whole point: a Go-shaped command line gets a startup
+    /// error that NAMES the missing integration instead of clap's generic "unexpected argument",
+    /// and — unlike silently ignoring it — a subnet router is never left believing its BGP
+    /// announcements are being driven when nothing is connected to BIRD. Declaring it
+    /// unconditionally is also the closer of Go's two shapes: `buildfeatures.HasBird` is `true`
+    /// unless the binary was built with `ts_omit_bird`, so Go's *default* build registers the flag
+    /// and refuses it (`--bird-socket is not supported on %s`) when no hook is linked in. The shape
+    /// that never declares it is the `ts_omit_bird` opt-out, and it produces exactly the "flag
+    /// provided but not defined" that this refusal exists to replace.
+    #[arg(long, value_name = "PATH")]
+    bird_socket: Option<String>,
     /// Log verbosity: `0` (default, info), `1` (debug), `2+` (trace). Overrides the `TAILNETD_LOG`
     /// env filter when given. Go `tailscaled --verbose`.
     #[arg(long, short = 'v', value_name = "LEVEL")]
     verbose: Option<u8>,
+    /// Tunnel interface name; use `userspace-networking` to not use TUN (Go `tailscaled --tun`).
+    /// This is the single most-copied flag on a `tailscaled` command line — packaged systemd units,
+    /// container entrypoints and cloud images all pass `--tun=userspace-networking` or
+    /// `--tun=tailscale0` — so it is accepted in Go's full grammar: a device name (`tailscale0`),
+    /// `userspace-networking`, `tap:TAPNAME[:BRIDGENAME]`, or a comma-separated fallback list of
+    /// those tried left to right (Go's `createEngine` loop; `tailscale0,userspace-networking` is
+    /// Go's own Synology default). [`tailscaled_rs::tunflag`] resolves the value and owns every
+    /// refusal — a name this build cannot provide is a startup error that says which and why.
+    ///
+    /// **The resolved data path lands in the TUN prefs** (`tun_enabled`/`tun_name` — the same prefs
+    /// `tnet up --tun`/`--tun-name` write), because in this fork the pref is what reaches the
+    /// engine. Go instead threads `args.tunname` straight into `wgengine.Config`; it has no pref to
+    /// collide with. Mapping the flag onto the pref keeps a single answer to "what data path is this
+    /// node on" — see `Backend::apply_tun_flag`, which also explains why it persists.
+    ///
+    /// **Deliberate deviation: omitting the flag does not mean `tailscale0`.** Go's flag carries a
+    /// per-platform device default, so a bare `tailscaled` runs in TUN mode; an absent `--tun` here
+    /// leaves the persisted pref alone, and that pref defaults to the userspace netstack. A daemon
+    /// that started capturing OS-wide traffic because a flag was left OFF would be a far worse
+    /// surprise than a copied command line having to name the mode it wants.
+    #[arg(long, value_name = "NAME")]
+    tun: Option<String>,
     /// Fixed UDP port for WireGuard + disco (Go `tailscaled --port`). When omitted, falls back to the
     /// `PORT` env var (Go's `EnvironmentFile` convention; the explicit flag wins), and if neither is
     /// set the OS picks an ephemeral port (Go's port `0`, the default) — fine for the common
@@ -80,14 +148,50 @@ struct Args {
     /// failing bring-up (a collision never takes the node down). `0` means "pick any" (= omitting it).
     #[arg(long, value_name = "PORT")]
     port: Option<u16>,
-    /// Declarative config file (Go `tailscaled --config`, the `ipn.ConfigVAlpha` JSON). Loaded at
+    /// Declarative config SOURCE (Go `tailscaled --config`, the `ipn.ConfigVAlpha` JSON). Loaded at
     /// startup and merged over the persisted prefs — the headless/automated path for setting prefs
     /// without an interactive `tnet up`. An `AuthKey` (or `file:<path>`) in the config registers the
-    /// node. Fails fast on a malformed/unsupported-version file. (SIGHUP re-read is a follow-up: it
-    /// shares the same blocker as the existing prefs reload — adopting changed config fields into a
-    /// *running* engine needs an `ipn` `reload_prefs` primitive this crate does not yet own.)
-    #[arg(long, value_name = "PATH")]
-    config: Option<PathBuf>,
+    /// node. Fails fast on a malformed/unsupported-version config.
+    ///
+    /// The value is a *source*, not merely a path (Go's flag doc: "path to config file, or
+    /// 'vm:user-data' to use the VM's user-data (EC2); prefix with 'optional:' to boot unconfigured
+    /// when the source is absent instead of failing"):
+    ///
+    /// * `<path>` — a JSON config file on disk;
+    /// * `vm:user-data` — the VM's user-data from the cloud instance metadata service. Recognized,
+    ///   but this build has no cloud-metadata client, so it reports the source as absent (the same
+    ///   branch a Go build without its `HasAWS` feature takes) — see `tailscaled_rs::conffile::load`;
+    /// * `optional:<source>` — an ABSENT source is not fatal: the node boots unconfigured and can be
+    ///   enrolled interactively instead of refusing to start. A source that is present but INVALID
+    ///   still fails. This is what makes the `--config optional:vm:user-data` line in a cloud-init
+    ///   template safe to paste onto a host that is not the cloud it was written for.
+    ///
+    /// (SIGHUP re-read is a follow-up: it shares the same blocker as the existing prefs reload —
+    /// adopting changed config fields into a *running* engine needs an `ipn` `reload_prefs` primitive
+    /// this crate does not yet own. The `reload-config` LocalAPI verb re-reads this same source.)
+    #[arg(long, value_name = "SOURCE")]
+    config: Option<String>,
+    /// Bind this node's identity to a hardware-backed key (Go `tailscaled --hardware-attestation`).
+    /// **Accepted by the parser, then refused at startup when it is on** — see
+    /// `can_use_hardware_attestation`. Go uses TPM 2.0 on Linux and Windows, the Secure Enclave on
+    /// macOS and iOS and Keystore on Android, then marks the node hardware-attested to its backend;
+    /// when the flag is unset it defaults from the syspolicy key `HardwareAttestation`.
+    ///
+    /// There is no hardware key store anywhere in this fork — the node key is generated and held by
+    /// the `tailscale-rs` engine and persisted as an ordinary file — so there is no attestation key
+    /// to bind an identity to. **Out of scope for now**, and refused rather than ignored: a silently
+    /// accepted flag would leave an operator believing the identity is sealed to this machine.
+    ///
+    /// Tri-state like `--encrypt-state` above; `--hardware-attestation=false` is accepted and inert.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        value_parser = parse_go_bool
+    )]
+    hardware_attestation: Option<bool>,
     /// Run a SOCKS5 proxy on `[host:]port` that dials **over the tailnet** (Go `tailscaled
     /// --socks5-server`). A bare port (`1055`) binds `127.0.0.1:<port>`; pass an explicit address to
     /// bind elsewhere (the proxy is UNAUTHENTICATED — the bind address is the security boundary, so it
@@ -121,6 +225,25 @@ struct Args {
     /// which has anything to gate here.
     #[arg(long)]
     no_logs_no_support: bool,
+    /// JSON file registered as a **device-scope system-policy source** (Go `tailscaled
+    /// --syspolicy-file`, new in v1.102.3). This is the only way an admin on a non-Windows host can
+    /// supply MDM-style policy at all — without it `tnet syspolicy list` reports an empty policy set
+    /// on every platform, because Go's only other store is the Windows registry. The file is a JSON
+    /// object mapping policy keys to values (`{"Hostname": "kiosk-3", "CheckUpdates": "always"}`);
+    /// unknown keys and values of the wrong type are refused at startup rather than at first use.
+    /// Defaults to `/etc/tailscale/syspolicy.json` (`%ProgramData%\Tailscale\syspolicy.json` on
+    /// Windows) — an absent file is simply no policy, not an error — and **an empty value disables
+    /// the source**. A file that fails to load is logged and the daemon carries on: a broken policy
+    /// file must not keep the node off the tailnet. The settings are both reported (`tnet syspolicy
+    /// list`/`reload`) and APPLIED to prefs, at profile load and on every prefs write (`up`, `set`,
+    /// `--config`), so policy outranks anything an operator sets locally. A key this build cannot
+    /// enforce is logged at WARN each time rather than silently reported as if it took effect.
+    /// One key inverts that precedence, deliberately: `AuthKey` — the credential that enrols the
+    /// node — is used only when no auth key was given on the command line, in `TS_AUTH_KEY` or in a
+    /// `--config` file, and never on a node that is already enrolled. Its value is redacted out of
+    /// `tnet syspolicy list`. See `ipn::syspolicy` for both rulings.
+    #[arg(long, value_name = "PATH", default_value_t = default_syspolicy_file())]
+    syspolicy_file: String,
     /// Run a debug HTTP server on `[host:]port` exposing `GET /debug/metrics` (Go `tailscaled
     /// --debug`). Serves the daemon's Prometheus metrics (the same text `tnet metrics` returns) over
     /// plain HTTP so a scraper can pull them without the unix LocalAPI socket. A bare port binds
@@ -130,6 +253,26 @@ struct Args {
     /// unless given.
     #[arg(long, value_name = "[HOST:]PORT")]
     debug: Option<String>,
+    /// The daemon's subcommands. `None` is the ordinary case: run the daemon.
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// `tailnetd`'s subcommands — the analogue of Go `tailscaled`'s `subCommands` map, which `main`
+/// dispatches on `os.Args[1]` **before** parsing the daemon's own flag set, so a subcommand runs
+/// standalone and never starts a daemon.
+///
+/// Go's map holds four entries; only `debug` is ported here. `install-system-daemon` /
+/// `uninstall-system-daemon` are already reachable in this fork as `tnet install`/`uninstall`
+/// (`ipn::install`), and `be-child` is Go's Windows subprocess plumbing, which has nothing to be
+/// the child of here.
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Daemon-less network diagnostics: dump the host network state, follow link changes, or fetch a
+    /// URL — none of which need a running daemon or its socket (Go `tailscaled debug`).
+    ///
+    /// This is NOT the `--debug` flag above, which is the listen address of the metrics HTTP server.
+    Debug(tailscaled_rs::debugmode::DebugArgs),
 }
 
 /// Restore the default `SIGPIPE` disposition (terminate) before any output. The Rust runtime sets
@@ -146,15 +289,132 @@ fn reset_sigpipe() {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// The process entry point — and deliberately **not** the async one: the tokio runtime is built by
+/// [`run`] below, so everything here runs before any second thread exists.
+///
+/// That is the whole reason this function is split out. Applying the operator env file
+/// ([`tailscaled_rs::envknob::apply_disk_config`]) mutates *this* process's environment, and
+/// `std::env::set_var` is unsound once another thread might be calling `getenv` — which, under a
+/// multi-thread runtime, is true from the moment the runtime is constructed. Go's ordering is the
+/// same and for a related reason: `envknob.ApplyDiskConfig()` is the first statement of
+/// `tailscaled`'s `main`, ahead of flag registration, so every later environment read — including
+/// the ones inside flag defaults — sees the file.
+fn main() -> Result<()> {
     // Restore default SIGPIPE before any output (a broken `--version`/`--help` pipe should terminate
     // cleanly, not panic the print). Must run before clap, which prints help/version.
     reset_sigpipe();
+
+    // The operator env file (Go `envknob.ApplyDiskConfig`): on macOS, `/etc/tailnetd/tailnetd-env.txt`
+    // is where an operator sets the administrative envknobs this daemon reads — `TS_DISABLE_SSH_SERVER`,
+    // `TS_DISABLE_PORTMAPPER`, `TAILNETD_LOG`, `PORT`, … — because the launchd plist's own
+    // `EnvironmentVariables` dict is embedded in this binary and rewritten by `tnet install`, so an
+    // addition to it does not survive. On Linux there is no such file, exactly as in Go: the packaged
+    // unit's `EnvironmentFile=-/etc/default/tailnetd` is the seam there.
+    //
+    // A malformed file is NOT fatal, exactly as in Go: `envknob.ApplyDiskConfig()` is called for its
+    // effect there and its error discarded, to be printed later from `run` while the daemon comes up
+    // regardless. The lines above a bad one still apply and the rest of startup continues; whatever
+    // did not apply rides out in `Applied::problems` and is reported below, once flags are parsed.
+    // A daemon that refuses to start over a typo in an optional file strands the operator who would
+    // fix it on the far side of the tailnet. Absent file, or a platform with none: nothing happens.
+    let applied_env = tailscaled_rs::envknob::apply_disk_config();
+
+    run(applied_env)
+}
+
+#[tokio::main]
+async fn run(applied_env: tailscaled_rs::envknob::Applied) -> Result<()> {
     // Parse flags FIRST: clap handles `--help`/`--version` (print + exit 0) and rejects unknown
     // flags before we touch the experiment gate or any state, matching how Go `tailscaled` parses its
     // flag set up front. The parsed values then override the env-derived defaults below.
     let args = Args::parse();
+
+    // `tailnetd debug …` (Go `tailscaled debug`): a SUBCOMMAND, dispatched first — before the
+    // `--bird-socket` refusal, before `--cleanup`, and before the experiment gate. All three of
+    // those orderings are deliberate and all three are Go's: Go dispatches its `subCommands` map on
+    // `os.Args[1]` at the top of `main`, ahead of its own flag parsing and every startup
+    // precondition, because the subcommand never starts a daemon. Here the experiment gate is the
+    // one that matters most — the gate exists because the ENGINE is unaudited, and `debug` never
+    // constructs one: it enumerates interfaces and speaks plain HTTP. Making an operator opt into
+    // experimental software before they may look at their own network state would defeat the point
+    // of the tool, which is diagnosing a node that will not come up.
+    //
+    // Bare message + exit 1 on failure mirrors Go's `log.SetFlags(0)` + `log.Fatal(err)`.
+    if let Some(Command::Debug(debug_args)) = &args.command {
+        if let Err(e) = tailscaled_rs::debugmode::run(debug_args) {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    // `--bird-socket <path>` (Go `tailscaled --bird-socket`): parsed so a Go-shaped command line
+    // reaches a refusal that names the missing integration, then refused HERE — before the
+    // `--cleanup` handling below, which is where Go puts the same check (top of `main`, above its
+    // own cleanup exit), so `--cleanup --bird-socket <path>` refuses instead of quietly cleaning up.
+    // Bare message + exit 1 mirrors Go's `log.SetFlags(0)` + `log.Fatalf`. See `bird_socket_refusal`
+    // for the reasoning and for the empty-path carve-out.
+    if let Some(message) = bird_socket_refusal(args.bird_socket.as_deref()) {
+        eprintln!("{message}");
+        std::process::exit(1);
+    }
+
+    // `--encrypt-state` / `--hardware-attestation` (Go `tailscaled --encrypt-state` /
+    // `--hardware-attestation`): the explicit-flag half of Go's `handleTPMFlags`. Refused HERE, next
+    // to the `--bird-socket` refusal and for the same reasons — an operator who asked for a feature
+    // this build does not have should be told about the FLAG rather than about `--cleanup`'s result
+    // or an unrelated environment variable, and Go likewise validates these flags before it reaches
+    // its own cleanup path. Bare message + exit 1 mirrors Go's `log.SetFlags(0)` + `log.Fatal(err)`.
+    // The policy-driven half runs further down, once the syspolicy file is loaded.
+    if let Some(message) =
+        explicit_tpm_flag_refusal(args.encrypt_state, args.hardware_attestation, goos())
+    {
+        eprintln!("{message}");
+        std::process::exit(1);
+    }
+
+    // `--tun <name>` (Go `tailscaled --tun`): resolve the requested data path from the command line.
+    // Refused HERE — with the neighbouring flag refusals, before the experiment gate — for the same
+    // reason they are: an operator who named an interface this build cannot provide should be told
+    // about the FLAG, not about an unrelated environment variable. Bare message + exit 1 mirrors Go's
+    // `log.SetFlags(0)` + `log.Fatal(err)`.
+    //
+    // Skipped entirely under `--cleanup`: Go validates `--tun` inside `createEngine`, which a cleanup
+    // run never reaches, and the one check Go does make earlier (its macOS root refusal) carves
+    // cleanup out by hand — so reclaiming a stale socket keeps working with whatever `--tun` the unit
+    // file happens to carry. The resolved transport is applied to prefs further down, once the
+    // backend has loaded them.
+    //
+    // Go's macOS root refusal goes out first and on its own: `log.SetFlags(0)` + `log.Fatalf` print
+    // that one line with no `error:` prefix, so a script matching Go's stderr matches this one.
+    let tun_value = args.tun.as_deref().filter(|_| !args.cleanup);
+    if let Some(line) = tun_value.and_then(|value| {
+        tailscaled_rs::tunflag::darwin_root_refusal(value, goos(), tailscaled_rs::tunflag::euid())
+    }) {
+        eprintln!("{line}");
+        std::process::exit(1);
+    }
+    let tun_transport = match tun_value {
+        Some(value) => match tailscaled_rs::tunflag::resolve(value, goos()) {
+            Ok(transport) => Some(transport),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+
+    // Anything in the operator env file that did NOT apply, said once per problem. HERE, and not at
+    // the `apply_disk_config` call in `main`, for two reasons that are both Go's: `log.Printf("Error
+    // reading environment config: %v", err)` lives in Go's `run`, after its flag parse (so a
+    // `--help`/`--version`/`debug` run is silent about it) and before its `--cleanup` branch (so a
+    // cleanup run still says it) — and a message emitted from `main` would land before clap had a
+    // chance to print help. stderr rather than `tracing`, because the log filter is not built until
+    // after the experiment gate below and this must not be held back behind either.
+    for problem in &applied_env.problems {
+        eprintln!("error reading environment config: {problem}");
+    }
 
     // `--cleanup` (Go `tailscaled --cleanup`): reclaim OS-level network state from a previous run,
     // then exit — WITHOUT running the engine, so it deliberately runs BEFORE the experiment gate
@@ -204,6 +464,17 @@ async fn main() -> Result<()> {
         })
         .init();
 
+    // Say that the env file was read, now that there is somewhere to say it. Names only — a value in
+    // that file can be a secret (`TS_AUTH_KEY`), and this is the same discipline the prefs logging
+    // uses. Silent when there was no file, which is the normal case on nearly every host.
+    if let Some(path) = &applied_env.path {
+        tracing::info!(
+            path = %path.display(),
+            keys = %applied_env.keys.join(","),
+            "applied operator environment file"
+        );
+    }
+
     // `--no-logs-no-support` (Go `tailscaled --no-logs-no-support`): Go flips an envknob that swaps
     // the logtail uploader for a no-op transport and prints a warning. This fork never uploads logs
     // or telemetry anywhere, so the flag is an honest no-op — emit the one-line notice (now that
@@ -212,6 +483,26 @@ async fn main() -> Result<()> {
         tracing::info!(
             "--no-logs-no-support: tailnetd never uploads logs or telemetry; this flag is a no-op"
         );
+    }
+
+    // `--syspolicy-file <path>` (Go `tailscaled --syspolicy-file`): register the JSON policy file as
+    // a device-scope system-policy source. Done HERE — right after logging is initialized, so a load
+    // failure has somewhere to be reported, and before anything that could consult a policy setting
+    // (Go calls its `loadSyspolicy` hook at the same point, after flag parsing and before the engine
+    // exists). Never fatal: see `load_syspolicy_file`.
+    load_syspolicy_file(&args.syspolicy_file);
+
+    // The system-policy half of Go's `handleTPMFlags`, run at Go's own position: immediately after
+    // the syspolicy file is registered, because these two arms are the only place the daemon reads a
+    // policy key at startup. Neither feature can be turned on here, so all this produces is the
+    // reporting Go does on the way past — see `tpm_policy_notices`.
+    for notice in tpm_policy_notices(
+        args.encrypt_state,
+        args.hardware_attestation,
+        |key| ipn::syspolicy::get_boolean(key, false),
+        goos(),
+    ) {
+        tracing::warn!("{notice}");
     }
 
     // Best-effort OS-level hardening (no-coredump / no-ptrace / no-swap) for the secrets the engine
@@ -302,27 +593,68 @@ async fn main() -> Result<()> {
         tracing::info!(port, "pinning WireGuard/disco listen port (--port/PORT)");
     }
 
-    // `--config <file>`: load the declarative config and merge it over the just-loaded prefs (Go
+    // `--config <source>`: load the declarative config and merge it over the just-loaded prefs (Go
     // `tailscaled --config`). The merge is layered + persisted by `apply_config`, so the config
     // refines the stored prefs and the merged intent survives a later restart. A malformed or
-    // unsupported-version file fails the daemon HARD (a misconfigured headless deploy must not start
+    // unsupported-version config fails the daemon HARD (a misconfigured headless deploy must not start
     // half-configured) — propagate the error rather than logging + continuing. The config's auth key
     // (if any) is threaded into auto-start as a registration credential (never persisted into prefs).
-    let config_authkey = match &args.config {
-        Some(path) => {
-            let config = tailscaled_rs::conffile::load(path)
-                .with_context(|| format!("loading --config {}", path.display()))?;
-            tracing::info!(path = %path.display(), version = %config.version, "applying --config");
-            let authkey = backend.apply_config(&config).await?;
-            // Record the config path on the backend so the `reload-config` LocalAPI verb (Go
-            // `tailscaled`'s `reload-config`) can re-read this exact file and re-adopt its fields into
-            // the running node. Done only on the `--config` path — a config-less daemon has nothing to
-            // reload (and `reload_config` errors clearly in that case).
-            backend.set_config_path(path.clone());
-            authkey
+    //
+    // The flag's value is a config SOURCE (`ConfigFlag::parse`): a path, the `vm:user-data` sentinel,
+    // or either behind `optional:`. `ConfigFlag::load` applies Go's optional contract — `Ok(None)`
+    // means "the source is absent and that was declared acceptable", so the node boots unconfigured
+    // and can be enrolled interactively, while a present-but-invalid config still fails even then.
+    // An absent optional source deliberately leaves the backend's config source UNSET: there is
+    // nothing to re-read, so `reload-config` says so plainly — `config mode not in use`, exit 1 (Go
+    // leaves `sys.InitialConfig` nil the same way).
+    let config_authkey = match args.config.as_deref().and_then(conffile::ConfigFlag::parse) {
+        Some(flag) => {
+            match flag
+                .load()
+                .with_context(|| format!("loading --config {}", flag.source))?
+            {
+                Some(config) => {
+                    tracing::info!(source = %flag.source, version = %config.version, "applying --config");
+                    let authkey = backend.apply_config(&config).await?;
+                    // Record the config source on the backend so the `reload-config` LocalAPI verb (Go
+                    // `tailscaled`'s `reload-config`) can re-read this exact source and re-adopt its
+                    // fields into the running node. Done only when a config actually loaded — a
+                    // config-less daemon has nothing to reload, and `reload_config` then returns
+                    // `Ok(None)` (Go's `(false, nil)`), which `tnet reload-config` reports as
+                    // `config mode not in use` + exit 1. Not an error: nothing failed.
+                    backend.set_config_source(flag.source.clone());
+                    authkey
+                }
+                // `optional:` + absent: `ConfigFlag::load` already logged which source was missing.
+                None => None,
+            }
         }
         None => None,
     };
+
+    // `--tun <name>`: map the resolved data path onto the TUN prefs — the only route to the engine
+    // here, where Go has a `wgengine.Config` field. Applied AFTER `--config` so an explicit flag on
+    // the command line outranks a config document, the way `--verbose` outranks `TAILNETD_LOG`.
+    // `apply_tun_flag` persists ONLY when the value changes something, so the overwhelmingly common
+    // `--tun=userspace-networking` in a unit file writes nothing at all; `persisted` in the log line
+    // below says which happened, so the flag is never silent about having rewritten an intent.
+    if let Some(transport) = &tun_transport {
+        let persisted = backend
+            .apply_tun_flag(transport)
+            .await
+            .context("applying --tun")?;
+        match transport {
+            tailscaled_rs::tunflag::TunTransport::Netstack => tracing::info!(
+                persisted,
+                "--tun: userspace networking; no kernel TUN interface (the engine's netstack)"
+            ),
+            tailscaled_rs::tunflag::TunTransport::Tun { name } => tracing::info!(
+                persisted,
+                name = name.as_deref().unwrap_or("<platform default>"),
+                "--tun: kernel TUN data path"
+            ),
+        }
+    }
 
     // Describe the daemon's effective posture once at boot so an operator tailing the log knows which
     // control plane it talks to, which data path it uses, and the exact build — without having to run
@@ -365,15 +697,27 @@ async fn main() -> Result<()> {
 
     // Captive-portal detection (Go `ipn/ipnlocal/captiveportal.go`): a daemon-lifetime task that
     // notices when this node is stuck behind an airport/hotel Wi-Fi login page and raises the
-    // `captive-portal-detected` health warning `tnet status` prints. Deliberately NOT tied to a
-    // device (unlike the link monitor): the case worth reporting is precisely the one where the
-    // engine never came up. It probes only while the node wants to be up and is not — a connected or
-    // deliberately-down node makes zero requests — so it costs nothing on a healthy headless node.
+    // `captive-portal-detected` health warning `tnet status` prints. Its own gate makes it inert
+    // outside `Running`, which is how it expresses the loop lifetime Go gets from starting the loop
+    // on entry to `ipn.Running` and cancelling it on the way out: it probes only while the node is
+    // up, wants to be up, and can reach no relay server. A healthy node, a node still coming up and
+    // a deliberately-down node all make zero requests, so it costs nothing on a headless node.
     //
     // Detached rather than a `select!` arm: it must never be able to end `serve`, and it owns no
     // resource needing orderly teardown beyond its `Arc`. Its handle is aborted after `serve` returns
     // so the loop cannot outlive the backend it reports on.
     let captive_portal_task = tokio::spawn(ipn::captive_portal_loop(Arc::clone(&backend)));
+
+    // The always-on reconnect timer (Go `ipn/ipnlocal/local.go`, `startReconnectTimerLocked`): a
+    // daemon-lifetime task that closes the window a permitted always-on disconnect opened, after the
+    // `ReconnectAfter` the administrator configured, and that revokes an outstanding exemption when
+    // an always-on policy key changes. Parked and free until a disconnect arms it, so a node nobody
+    // disconnects — and every node with no policy file — pays one idle task and nothing else.
+    //
+    // Detached for the same reasons as the captive-portal loop: it must never be able to end
+    // `serve`, and it owns no resource needing orderly teardown beyond its `Arc`. Aborted after
+    // `serve` returns so an armed timer cannot fire into a backend that is being shut down.
+    let reconnect_task = tokio::spawn(ipn::reconnect_loop(Arc::clone(&backend)));
 
     // Serve the LocalAPI socket until SIGINT/SIGTERM, with SIGHUP handled *concurrently* as a reload
     // (never a shutdown). `serve`'s shutdown future is still SIGINT/SIGTERM only — the SIGHUP loop is
@@ -418,13 +762,31 @@ async fn main() -> Result<()> {
             }
         }
     };
-    // The daemon is exiting: stop reporting on a backend that is about to be torn down. Aborting
-    // before `shutdown` also guarantees the loop is not holding the backend lock we need next.
+    // The daemon is exiting: stop reporting on a backend that is about to be torn down, and stop any
+    // armed reconnect from bringing it back up mid-shutdown. Aborting before `shutdown` also
+    // guarantees neither loop is holding the backend lock we need next. An outstanding reconnect is
+    // in-memory and dies here with the process: on the next start, an `AlwaysOn.Enabled` node is
+    // reconciled back up at profile load (earlier than the deadline, never later), and a node whose
+    // administrator set only `ReconnectAfter` stays down until someone brings it up.
     captive_portal_task.abort();
+    reconnect_task.abort();
 
-    serve_result?;
-
+    // Tear the backend down BEFORE the error (if any) propagates, and unconditionally. Go's
+    // equivalent is a `defer`: `ipnserver.Server.Run` opens with `defer lb.Shutdown()`, so the
+    // backend is down by the time the error it returns reaches `main`'s `log.Fatal`. Ending on an
+    // error used to skip this, which was invisible while the only error here was a failed bind — but
+    // `serve` now ends with `server::StoppedByLocalApi` on the LocalAPI `shutdown` verb, and that is
+    // the *normal* stop: skipping teardown on it would leave the engine, the state file and any live
+    // device to the process death, which is exactly what the verb exists to avoid.
     backend.lock().await.shutdown().await;
+
+    // Then the exit status. `serve` returns `StoppedByLocalApi` when the LocalAPI `shutdown` verb
+    // stopped the daemon, and `?` turns that into a non-zero exit — upstream's behaviour (its
+    // `hs.Serve` error reaches `log.Fatal` because the context was never cancelled) and the reason
+    // the key permitting the verb is named `AllowTailscaledRestart`: the shipped units restart on
+    // failure, so the non-zero exit IS the restart. SIGINT/SIGTERM still returns `Ok(())` and still
+    // exits 0, matching the one case Go maps to nil (`errors.Is(err, context.Canceled)`).
+    serve_result?;
     Ok(())
 }
 
@@ -836,6 +1198,14 @@ async fn reconcile_on_reload(backend: &Arc<Mutex<Backend>>, prefs_path: &std::pa
 ///   rotation).
 /// - no persisted key AND no `TS_AUTH_KEY` → nothing to resume from and no key to auth with; still
 ///   attempt `up(None, ..)` so the engine yields the authoritative needs-login state, not a guess.
+///
+/// A fourth source sits BEHIND all of these and is resolved inside [`ipn::Backend::up`] rather than
+/// here: the administrator's `AuthKey` system policy (Go `Start`'s `pkey.AuthKey`). It is consulted
+/// on the two arms that hand `up` no key — the resume and the nothing-to-go-on arms — and its own
+/// gate then refuses it for any node that has already enrolled, so a managed host still resumes from
+/// its persisted key on every reboot and only ever *registers* from policy while it is unenrolled.
+/// That is the fleet-enrolment case the key exists for, and it is why the "cannot resume or
+/// authenticate" warning below is not the end of the story on an MDM-managed host.
 async fn auto_start(backend: &mut Backend, config_authkey: Option<secrecy::SecretString>) {
     if !backend.wants_running() {
         return;
@@ -951,6 +1321,385 @@ fn log_resume_decision(resuming: bool, have_authkey: bool, ephemeral: bool) {
     }
 }
 
+/// The `--bird-socket` refusal decision and its message, pure so it can be unit-tested.
+///
+/// Ported from Go `cmd/tailscaled/tailscaled.go` @ `53a0d659afa51835dd7a9283873cca44261454f8`,
+/// which registers the flag and then fatals early when no BIRD hook is linked in:
+///
+/// ```text
+/// if buildfeatures.HasBird && args.birdSocketPath != "" && !wgengine.HookNewBird.IsSet() {
+///     log.SetFlags(0)
+///     log.Fatalf("--bird-socket is not supported on %s", runtime.GOOS)
+/// }
+/// ```
+///
+/// **Why this refusal is unconditional, where Go's is guarded twice.** Go's two guards are not the
+/// same kind of thing, and only one of them has an analogue here:
+///
+/// * `buildfeatures.HasBird` is a build tag: it is `true` unless the binary was built with
+///   `ts_omit_bird` (`feature/buildfeatures/feature_bird_enabled.go`). So Go's *default* build does
+///   declare `--bird-socket` and does reach this fatal; the shape that never declares it is the
+///   opt-out build, whose command line then dies with "flag provided but not defined" — the failure
+///   this whole refusal exists to replace. There is no build-feature system here and no BIRD code
+///   to omit, so declaring the flag always is the faithful half of that pair. It is also what this
+///   file already does for Go's other feature-gated flags (`--encrypt-state` and
+///   `--hardware-attestation` are `buildfeatures.HasTPM`-gated upstream — see
+///   [`explicit_tpm_flag_refusal`]).
+/// * `!wgengine.HookNewBird.IsSet()` is the runtime hook. Upstream it is set by `feature/bird`'s
+///   `init`, empty-imported from `feature/condregister/maybe_bird.go` under
+///   `!ts_omit_bird && (linux || darwin || freebsd || openbsd)` — so in a default build the fatal is
+///   reached exactly on an OS outside that set, which is why Go's `%s` names `runtime.GOOS`. This
+///   fork has no hook on any platform, so the condition is permanently true and there is nothing to
+///   test at runtime.
+///
+/// **The message keeps Go's sentence but not Go's `%s`.** [`can_use_bird`] holds the sentence on
+/// its own, the way [`can_encrypt_state`] and [`can_use_hardware_attestation`] hold theirs, and this
+/// function does the presenting — the same split [`explicit_tpm_flag_refusal`] makes. The `%s`
+/// becomes "this platform or in this build of tailnetd" rather than a concrete GOOS, because naming
+/// one would invite the false repair of moving to another OS. (Refusals with no Go string behind
+/// them, like `debugmode`'s `--derp` and `--portmap`, use this fork's own "is not supported by
+/// tailnetd" instead; this one has an upstream string to carry.)
+///
+/// **What an operator's `grep` actually matches, stated plainly**, because "keeps Go's wording" has
+/// been read here as more than it is. Go's whole output is one bare line — `log.SetFlags(0)` drops
+/// the date/time prefix `log` would otherwise write, and `log.Fatalf` writes the sentence and exits
+/// 1:
+///
+/// ```text
+/// --bird-socket is not supported on linux
+/// ```
+///
+/// This fork's output differs from that in three deliberate ways:
+///
+/// 1. the `%s` slot carries fork text rather than a GOOS, as above;
+/// 2. it is prefixed `error: ` and closed with a full stop, which is how **every** fatal refusal on
+///    this binary's stderr reads (the experiment gate, both TPM refusals) — one flag opting out of
+///    that would make `tailnetd`'s startup errors inconsistent to gain a prefix match that the `%s`
+///    substitution has already cost;
+/// 3. explanatory paragraphs follow on later lines, since a reader of this message cannot go and
+///    read `feature/bird` to find out what was refused.
+///
+/// So a substring match on `--bird-socket is not supported on ` matches and is what the tests pin;
+/// a match anchored to the start of the line, or one expecting Go's full line including its GOOS,
+/// does not and cannot. What line 1 must *not* do is break Go's sentence up — nothing is
+/// interpolated into the middle of it, and the rejected path is echoed further down rather than
+/// inside it, so the sentence survives whole for the match that does work.
+///
+/// One Go edge case ports with it: the empty path is **not** a refusal. Go's guard is
+/// `birdSocketPath != ""`, so `--bird-socket=""` means "no BIRD socket" exactly like omitting the
+/// flag — hence `Some("")` maps to `None` here, and the daemon starts normally.
+///
+/// Returns `None` when there is nothing to refuse, else the operator-facing message.
+fn bird_socket_refusal(path: Option<&str>) -> Option<String> {
+    // Go: `args.birdSocketPath != ""` — an unset *or* explicitly empty path is "no BIRD socket".
+    let path = path.filter(|p| !p.is_empty())?;
+    // Go: `!wgengine.HookNewBird.IsSet()`. Never satisfied here, but routed through the same shape
+    // as the neighbouring refusals so Go's sentence has one home.
+    let reason = can_use_bird().err()?;
+    Some(format!(
+        "error: {reason}.\n\
+         Go accepts this flag for a subnet router that hands its advertised routes to a BIRD BGP \
+         daemon: it passes the socket path to its engine (`wgengine.Config.BIRDSocket`, built via \
+         `wgengine.HookNewBird`), which enables BIRD's `tailscale` protocol while this node is a \
+         primary subnet router and disables it otherwise.\n\
+         That toggle belongs to the engine's reconfigure cycle, which this daemon does not own, and \
+         the tailscale-rs engine exposes no BIRD hook — so there is nothing here to hand the socket \
+         to. tailnetd therefore refuses at startup, the way Go refuses when its own BIRD hook is \
+         not registered, instead of accepting the flag as a no-op: a silently ignored \
+         --bird-socket would leave a \
+         subnet router believing its BGP announcements track its primary-route status when nothing \
+         was ever connected to BIRD.\n\
+         Drop the flag (it was given {path:?}) to start tailnetd. Routes are still advertised to \
+         the tailnet with `tnet up --advertise-routes=<prefix,...>`; driving BIRD from that state \
+         needs a BIRD hook in the engine, and is out of scope here until it has one."
+    ))
+}
+
+/// Whether a BIRD control socket could be wired up here — this fork's standing answer to Go's
+/// `wgengine.HookNewBird.IsSet()` (`cmd/tailscaled/tailscaled.go`,
+/// `feature/condregister/maybe_bird.go` @ `53a0d659afa51835dd7a9283873cca44261454f8`).
+///
+/// Always `Err`, and the `Err` carries Go's `log.Fatalf` sentence with its `%s` slot filled — see
+/// [`bird_socket_refusal`] for why that slot names the build rather than `runtime.GOOS`, and for
+/// what is and is not added around this sentence before an operator sees it. Upstream the hook is
+/// registered by `feature/bird` on `linux || darwin || freebsd || openbsd`; there is no BIRD code
+/// in this fork and no hook in the `tailscale-rs` engine to register one against, so the answer
+/// does not vary by platform and takes no arguments.
+///
+/// Separate from the message so Go's string is one testable value, the way
+/// [`can_encrypt_state`] and [`can_use_hardware_attestation`] are.
+fn can_use_bird() -> Result<(), String> {
+    Err("--bird-socket is not supported on this platform or in this build of tailnetd".to_string())
+}
+
+/// This host's OS in Go's `runtime.GOOS` spelling, so a message ported from Go names the platform
+/// the way Go's `%s` of `runtime.GOOS` would. Rust spells macOS `"macos"`; every other target this
+/// daemon builds for already agrees with Go.
+fn goos() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    }
+}
+
+/// Go `strconv.ParseBool` — the parser behind `cmd/tailscaled`'s `boolFlag.Set`
+/// (`cmd/tailscaled/flag.go` @ `53a0d659afa51835dd7a9283873cca44261454f8`).
+///
+/// Accepts exactly Go's twelve spellings and nothing else, so `--encrypt-state=yes` is refused here
+/// the way `tailscaled` refuses it instead of being accepted — or, worse, read as false — by a
+/// looser parser. The message is Go's own `strconv` error, which is what `boolFlag.Set` returns and
+/// Go's `flag` package prints back to the operator.
+fn parse_go_bool(s: &str) -> Result<bool, String> {
+    match s {
+        "1" | "t" | "T" | "TRUE" | "true" | "True" => Ok(true),
+        "0" | "f" | "F" | "FALSE" | "false" | "False" => Ok(false),
+        _ => Err(format!("strconv.ParseBool: parsing {s:?}: invalid syntax")),
+    }
+}
+
+/// Whether hardware attestation could be enabled here — Go `canUseHardwareAttestation`
+/// (`cmd/tailscaled/tailscaled.go` @ `53a0d659afa51835dd7a9283873cca44261454f8`).
+///
+/// Go's first test is `key.NewEmptyHardwareAttestationKey() == key.ErrUnsupported`: does this
+/// platform *and this build* have a hardware-attestation key type at all. This fork is permanently
+/// on that branch — neither the daemon nor the `tailscale-rs` engine has a hardware key store — so
+/// the answer is always no, and the error is Go's sentence with this binary's name in it.
+///
+/// Go's second test has nothing to port to: it refuses the flag against a **portable** state store
+/// (`kube:`, `arn:`) because a TPM-bound key cannot be migrated to another machine. `tailnetd` has
+/// no `--state` flag and no state-store providers, so every state path it can have is the local file
+/// store Go's `isPortableStore` reports as non-portable, and the refusal is unreachable. It lands
+/// the day a provider-prefixed `--state` does.
+///
+/// `Err` carries the short Go-shaped sentence; the callers decide whether it becomes a fatal
+/// refusal (an explicit flag) or a log line (a policy that asked for it).
+fn can_use_hardware_attestation() -> Result<(), String> {
+    Err(
+        "--hardware-attestation is not supported on this platform or in this build of tailnetd"
+            .to_string(),
+    )
+}
+
+/// Whether state-at-rest encryption could be enabled here — Go `canEncryptState`
+/// (`cmd/tailscaled/tailscaled.go` @ `53a0d659afa51835dd7a9283873cca44261454f8`).
+///
+/// Go's three tests, in order:
+///
+/// 1. `runtime.GOOS` is neither `windows` nor `linux` → `--encrypt-state is not supported on %s`.
+///    Ported verbatim: it is exactly as true of this fork as it is of Go, so an operator on macOS
+///    gets Go's own sentence.
+/// 2. `!feature.TPMAvailable()` → Go blames the device. Here the cause is the *build* — there is no
+///    TPM code to be available — so the sentence keeps Go's shape and names the honest reason.
+/// 3. `--state` carries a known provider prefix → `--encrypt-state can only be used with --state set
+///    to a local file path`. Unreachable for the same reason as the portable-store refusal in
+///    [`can_use_hardware_attestation`]: there is no `--state` flag and no provider prefixes.
+///
+/// `goos` is Go's `runtime.GOOS` spelling (pass [`goos()`]), taken as a parameter so the
+/// platform-specific arm is testable on any host.
+fn can_encrypt_state(goos: &str) -> Result<(), String> {
+    // Go: TPM encryption is only configurable on Windows and Linux; other platforms either use
+    // system APIs and are not configurable (Android/Apple) or support no encryption at all.
+    if goos != "windows" && goos != "linux" {
+        return Err(format!("--encrypt-state is not supported on {goos}"));
+    }
+    Err("--encrypt-state is not supported on this device or in this build of tailnetd".to_string())
+}
+
+/// The **explicit-flag** half of Go's `handleTPMFlags` — its two `case args.X.v:` arms, which fire
+/// when a flag was set *and* set to true, validate it, and `log.SetFlags(0)` + `log.Fatal(err)` when
+/// it cannot be honoured. Pure so it can be unit-tested; returns `None` when there is nothing to
+/// refuse, else the operator-facing message the caller prints before `exit(1)`.
+///
+/// The tri-state matters and is Go's: `--hardware-attestation=false` matches **neither** arm of Go's
+/// switch (the first needs `.v`, the second needs `!.set`), so an explicit "off" is inert and is not
+/// even validated. Only `None` — the flag omitted — reaches the policy half,
+/// [`tpm_policy_notices`].
+///
+/// Hardware attestation is checked before state encryption, which is Go's order: with both flags
+/// explicitly on, the attestation refusal is the one the operator sees.
+///
+/// Go runs both halves from one `handleTPMFlags()` call. This fork splits them because their
+/// preconditions differ: this half needs nothing but the command line, so it runs early — before
+/// `--cleanup` and before the experiment gate, exactly where the `--bird-socket` refusal runs and
+/// for the same reason (an operator who asked for a feature that does not exist should be told
+/// that, not told about an unrelated environment variable, and `--cleanup` must not quietly swallow
+/// the refusal — Go refuses ahead of its own cleanup too). The policy half needs the syspolicy file
+/// loaded and the logger up, so it runs where those exist.
+fn explicit_tpm_flag_refusal(
+    encrypt_state: Option<bool>,
+    hardware_attestation: Option<bool>,
+    goos: &str,
+) -> Option<String> {
+    // Go: `case args.hardwareAttestation.v:` — set AND true.
+    if hardware_attestation == Some(true)
+        && let Err(e) = can_use_hardware_attestation()
+    {
+        return Some(format!(
+            "error: {e}.\n\
+                 Go uses this flag to bind the node identity to a hardware-backed key — TPM 2.0 on \
+                 Linux and Windows, the Secure Enclave on macOS and iOS, Keystore on Android — and \
+                 then marks the node hardware-attested to its backend.\n\
+                 This fork has no hardware key store: the node key is generated and held by the \
+                 tailscale-rs engine and persisted as an ordinary file under the 0700 state dir \
+                 (docs/THREAT_MODEL.md records that as a trust boundary). With no attestation key \
+                 there is nothing to bind an identity to and nothing to report as attested, so \
+                 tailnetd refuses instead of accepting the flag as a no-op: a silently ignored \
+                 --hardware-attestation would leave an operator believing this node's identity is \
+                 sealed to this machine, when the key is a file that copies to any other machine.\n\
+                 Drop the flag to start tailnetd. Hardware-bound node identity is out of scope \
+                 until there is a platform key store to bind to — see docs/DESIGN.md."
+        ));
+    }
+    // Go: `case args.encryptState.v:` — "explicitly enabled, validate".
+    if encrypt_state == Some(true)
+        && let Err(e) = can_encrypt_state(goos)
+    {
+        return Some(format!(
+            "error: {e}.\n\
+                 Go encrypts the state file at rest by sealing it to the device's TPM (Linux and \
+                 Windows only), prefixing the state path with `tpm:` so the state store seals and \
+                 unseals through the TPM, and enables that by itself when the flag is unset and the \
+                 platform supports it.\n\
+                 tailnetd has no state-store provider layer and no TPM or keystore integration: \
+                 prefs and the node key are written as plain JSON under a 0700 state dir, protected \
+                 by filesystem permissions and best-effort process hardening (mlockall + coredump \
+                 suppression), not by a key. docs/THREAT_MODEL.md records that as a trust boundary, \
+                 and refusing here is what keeps it honest — accepting --encrypt-state as a no-op \
+                 would claim at-rest protection this build does not provide.\n\
+                 Drop the flag to start tailnetd. State-at-rest encryption is out of scope until \
+                 there is a platform key store to seal to — see docs/DESIGN.md."
+        ));
+    }
+    None
+}
+
+/// The **system-policy** half of Go's `handleTPMFlags` — its two `case !args.X.set:` arms, which
+/// fire when the flag was omitted, read the matching policy key, and default the flag from it *if*
+/// the device can honour it.
+///
+/// In this fork neither [`can_use_hardware_attestation`] nor [`can_encrypt_state`] can succeed, so
+/// Go's "default it on" branches are unreachable: both features stay off no matter what the policy
+/// says, and nothing downstream consumes a resolved value. What is left is the reporting Go does on
+/// the way past, which is the whole point of running this at all — an admin who wrote
+/// `{"HardwareAttestation": true}` into `--syspolicy-file` must not be left thinking it took effect.
+///
+/// Returns the lines to log, in Go's order (hardware attestation first). Two of them:
+///
+/// * `[unexpected] policy requires hardware attestation, but device does not support it: …` — Go's,
+///   verbatim, including its `[unexpected]` prefix.
+/// * A **fork addition** for `EncryptState`. Go stays silent there: its `case !args.encryptState.set`
+///   arm just leaves encryption off when `canEncryptState` fails, because on a Go build the operator
+///   can usually fix the device. Here the gap is permanent, so silence would leave `EncryptState`
+///   sitting in a policy file looking effective forever. The wording is deliberately not Go's, so
+///   nobody mistakes an addition for a port.
+///
+/// `policy_boolean` reads a boolean policy key (pass a closure over
+/// [`ipn::syspolicy::get_boolean`]); it is a parameter both so the branch stays testable without a
+/// registered policy source and so the read stays *lazy*, as Go's is — a flag that was set never
+/// consults the policy at all.
+fn tpm_policy_notices(
+    encrypt_state: Option<bool>,
+    hardware_attestation: Option<bool>,
+    policy_boolean: impl Fn(&str) -> bool,
+    goos: &str,
+) -> Vec<String> {
+    let mut notices = Vec::new();
+    // Go: `case !args.hardwareAttestation.set:`, whose `canUseHardwareAttestation` error branch then
+    // sets `args.hardwareAttestation.v = false` — off, which is the only value this fork can reach,
+    // and which nothing here consumes. The `&&` chain keeps the policy read lazy, as Go's is.
+    if hardware_attestation.is_none()
+        && let Err(e) = can_use_hardware_attestation()
+        && policy_boolean(ipn::syspolicy::PKEY_HARDWARE_ATTESTATION)
+    {
+        notices.push(format!(
+            "[unexpected] policy requires hardware attestation, but device does not support it: {e}"
+        ));
+    }
+    // Go: `case !args.encryptState.set:` — where Go stays silent (see the doc comment above).
+    if encrypt_state.is_none()
+        && let Err(e) = can_encrypt_state(goos)
+        && policy_boolean(ipn::syspolicy::PKEY_ENCRYPT_STATE)
+    {
+        notices.push(format!(
+            "policy sets {}, but state-at-rest encryption is not available here, so the state file \
+             stays unencrypted: {e}",
+            ipn::syspolicy::PKEY_ENCRYPT_STATE
+        ));
+    }
+    notices
+}
+
+/// The stock `--syspolicy-file` path for **this host** — Go `defaultSyspolicyFile`
+/// (`cmd/tailscaled/syspolicy.go`). Thin wrapper over [`default_syspolicy_file_for`] so the decision
+/// itself stays testable on any platform.
+fn default_syspolicy_file() -> String {
+    default_syspolicy_file_for(cfg!(windows), std::env::var("ProgramData").ok().as_deref())
+}
+
+/// Where `--syspolicy-file` points when the operator does not say — Go's `defaultSyspolicyFile`,
+/// with the host facts passed in rather than read from the environment.
+///
+/// On Windows the file sits with the rest of Tailscale's machine state under
+/// `%ProgramData%\Tailscale`; if `ProgramData` is somehow unset Go returns the **empty string**,
+/// which disables the source rather than guessing a path — so that case ports too. Everywhere else
+/// (Linux, the BSDs, illumos/Solaris, and a GUI-less macOS daemon) it is `/etc/tailscale`, the
+/// conventional home for admin-provided configuration.
+///
+/// Note that the default naming a file that does not exist is the *normal* case: an absent policy
+/// file is simply no policy (see `syspolicy::load_json_policy_file`), which is what makes it safe to
+/// point at a path the operator has never created. Pure → unit-testable.
+fn default_syspolicy_file_for(windows: bool, program_data: Option<&str>) -> String {
+    if windows {
+        return match program_data.filter(|pd| !pd.is_empty()) {
+            Some(pd) => Path::new(pd)
+                .join("Tailscale")
+                .join("syspolicy.json")
+                .to_string_lossy()
+                .into_owned(),
+            // Go returns "" here, and an empty value disables the source.
+            None => String::new(),
+        };
+    }
+    "/etc/tailscale/syspolicy.json".to_string()
+}
+
+/// Register `--syspolicy-file` as a device-scope policy source — the body of Go's `loadSyspolicy`
+/// hook in `cmd/tailscaled/syspolicy.go`, which runs once after flag parsing and before anything
+/// reads a policy setting.
+///
+/// Three behaviours port together, and each of them is the point:
+/// - **empty path disables it.** Go's hook returns immediately on `syspolicyFile == ""`, so
+///   `--syspolicy-file=""` is how an operator turns the file source off entirely (including on a
+///   Windows host with no `ProgramData`, whose default is already empty).
+/// - **an absent file is silent.** Not an error, no source registered — the shipped default path
+///   exists on almost no host.
+/// - **a load failure is logged and the daemon continues.** Go's hook is
+///   `if err := ...; err != nil { log.Printf("%v", err) }` — deliberately not `log.Fatal`. A policy
+///   file with a typo in it must not be able to keep a node off the tailnet, so the error is
+///   reported and startup proceeds with the source unregistered (all of it, never half of it).
+fn load_syspolicy_file(path: &str) {
+    if path.is_empty() {
+        tracing::debug!("--syspolicy-file is empty; the file policy source is disabled");
+        return;
+    }
+    match ipn::syspolicy::load_json_policy_file(
+        ipn::syspolicy::JSON_FILE_SOURCE_NAME,
+        Path::new(path),
+    ) {
+        Ok(ipn::syspolicy::LoadOutcome::NoFile) => {
+            tracing::debug!(
+                path,
+                "no system-policy file; the file policy source is inactive"
+            );
+        }
+        Ok(ipn::syspolicy::LoadOutcome::Registered { settings }) => {
+            tracing::info!(path, settings, "registered the system-policy file");
+        }
+        // Go: `log.Printf("%v", err)` — report it, keep going.
+        Err(e) => tracing::error!("{e}"),
+    }
+}
+
 /// The experimental-gate decision, pure so it can be unit-tested: the gate passes only when the
 /// env var holds exactly the required opt-in value. `None` (unset) and any other value fail.
 fn experiment_gate_ok(value: Option<&str>) -> bool {
@@ -972,6 +1721,48 @@ fn verbose_to_level(level: u8) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn syspolicy_file_defaults_to_the_unix_admin_config_path() {
+        // Go's non-Windows branch is a literal, and it is the path an admin is told to create.
+        assert_eq!(
+            default_syspolicy_file_for(false, None),
+            "/etc/tailscale/syspolicy.json"
+        );
+        // `ProgramData` is a Windows notion; it must not leak into the Unix default.
+        assert_eq!(
+            default_syspolicy_file_for(false, Some("C:\\ProgramData")),
+            "/etc/tailscale/syspolicy.json"
+        );
+    }
+
+    #[test]
+    fn syspolicy_file_defaults_under_program_data_on_windows() {
+        let resolved = default_syspolicy_file_for(true, Some("C:\\ProgramData"));
+        // Asserted by parts rather than as one literal: the separator `Path::join` produces depends
+        // on the host running the test, and only the placement is Go's contract.
+        assert!(
+            resolved.starts_with("C:\\ProgramData"),
+            "the file belongs under %ProgramData%: {resolved}"
+        );
+        assert!(
+            resolved.contains("Tailscale"),
+            "the file sits in the Tailscale machine-state directory: {resolved}"
+        );
+        assert!(
+            resolved.ends_with("syspolicy.json"),
+            "the file is named syspolicy.json: {resolved}"
+        );
+    }
+
+    #[test]
+    fn syspolicy_file_default_is_empty_when_windows_has_no_program_data() {
+        // Go returns "" rather than guessing a path, and an empty value disables the source — so a
+        // Windows host with no ProgramData starts with no file policy instead of reading a wrong
+        // file. An empty variable is the same case as an unset one.
+        assert_eq!(default_syspolicy_file_for(true, None), "");
+        assert_eq!(default_syspolicy_file_for(true, Some("")), "");
+    }
 
     #[test]
     fn experiment_gate_rejects_unset() {
@@ -1138,6 +1929,430 @@ mod tests {
                 .as_deref(),
             Some("9090")
         );
+    }
+
+    // --- `--bird-socket` (Go `tailscaled --bird-socket`) ---------------------------------------
+    //
+    // Go registers the flag on any build without `ts_omit_bird` and then fatals when no BIRD hook
+    // is linked in. This fork is permanently in that case, so the things worth pinning are: the
+    // flag PARSES (a Go-shaped command line must reach the refusal, not clap's "unexpected
+    // argument"), an omitted or empty path is NOT a refusal (Go's guard is `birdSocketPath != ""`),
+    // a real path IS refused with a message that says why, and the refusal carries Go's own
+    // sentence whole while deliberately declining Go's `%s`.
+
+    #[test]
+    fn bird_socket_flag_parses_rather_than_being_an_unknown_argument() {
+        use clap::Parser;
+        // Absent → None (nothing to refuse).
+        assert!(Args::parse_from(["tailnetd"]).bird_socket.is_none());
+        // Present → the path, in both `--flag value` and `--flag=value` spellings.
+        assert_eq!(
+            Args::parse_from(["tailnetd", "--bird-socket", "/run/bird.ctl"])
+                .bird_socket
+                .as_deref(),
+            Some("/run/bird.ctl")
+        );
+        assert_eq!(
+            Args::parse_from(["tailnetd", "--bird-socket=/run/bird.ctl"])
+                .bird_socket
+                .as_deref(),
+            Some("/run/bird.ctl")
+        );
+        // The empty path parses too (Go's flag is a plain string) — `bird_socket_refusal` is what
+        // decides that it means "no BIRD socket".
+        assert_eq!(
+            Args::parse_from(["tailnetd", "--bird-socket="])
+                .bird_socket
+                .as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn bird_socket_absent_or_empty_is_not_a_refusal() {
+        // Omitted: nothing to refuse.
+        assert_eq!(bird_socket_refusal(None), None);
+        // Explicitly empty: Go tests `args.birdSocketPath != ""`, so `--bird-socket=""` is "no BIRD
+        // socket" and the daemon starts normally. Ported deliberately — do not "tidy" this into a
+        // refusal.
+        assert_eq!(bird_socket_refusal(Some("")), None);
+    }
+
+    #[test]
+    fn bird_socket_path_is_refused_and_the_message_says_why() {
+        let message =
+            bird_socket_refusal(Some("/run/bird.ctl")).expect("a non-empty path must be refused");
+        // Opens with Go's literal sentence, up to and including its `on`, so an operator or a
+        // runbook that greps for `tailscaled`'s wording still matches. Go's is
+        // `--bird-socket is not supported on %s`; anything that drops the `on` (an earlier
+        // "not supported by tailnetd") has stopped carrying the upstream string.
+        assert!(
+            message.starts_with("error: --bird-socket is not supported on "),
+            "keeps Go's refusal sentence, `on` and all; got {message:?}"
+        );
+        // Echoes the rejected path — on a later line, see
+        // `bird_socket_refusal_keeps_gos_sentence_whole_on_the_first_line`.
+        assert!(
+            message.contains("/run/bird.ctl"),
+            "names the path it was given; got {message:?}"
+        );
+        // Names the actual reason (no BIRD hook in the engine) rather than just "unsupported".
+        assert!(
+            message.contains("BIRD") && message.contains("engine exposes no BIRD hook"),
+            "says WHY it is unsupported; got {message:?}"
+        );
+        // Tells the operator what to do instead.
+        assert!(
+            message.contains("--advertise-routes"),
+            "points at the route-advertising path that does work; got {message:?}"
+        );
+    }
+
+    /// Go's whole output here is one bare line: `log.SetFlags(0)` drops the date/time prefix and
+    /// `log.Fatalf` writes `--bird-socket is not supported on linux`. This fork wraps that sentence
+    /// — `error: ` in front and a full stop behind, which is how every fatal refusal on this
+    /// binary's stderr reads — and follows it with explanation. What it must never do is break the
+    /// sentence itself up: an earlier revision spliced `(given "/run/bird.ctl")` into the middle of
+    /// line 1, between Go's words and their full stop, which left the ported string reading as a
+    /// prefix rather than as Go's sentence. Pinned here so the wrapping stays exactly what the doc
+    /// comment on [`bird_socket_refusal`] discloses, and the path an operator was given stays off
+    /// Go's line.
+    #[test]
+    fn bird_socket_refusal_keeps_gos_sentence_whole_on_the_first_line() {
+        let message =
+            bird_socket_refusal(Some("/run/bird.ctl")).expect("a non-empty path must be refused");
+        let first_line = message
+            .lines()
+            .next()
+            .expect("the message has a first line");
+
+        // Go's sentence, `%s` slot aside, with nothing but the file-wide `error: ` and a full stop
+        // around it — and, crucially, nothing inside it.
+        let go_sentence = can_use_bird().expect_err("this fork never has a BIRD hook");
+        assert_eq!(
+            first_line,
+            format!("error: {go_sentence}."),
+            "line 1 is Go's sentence and the disclosed wrapping, nothing else; got {first_line:?}"
+        );
+
+        // The path is still reported to the operator, just not from inside Go's sentence.
+        assert!(
+            !first_line.contains("/run/bird.ctl"),
+            "the rejected path must not be spliced into Go's sentence; got {first_line:?}"
+        );
+        assert!(
+            message.lines().skip(1).any(|l| l.contains("/run/bird.ctl")),
+            "the rejected path must still be named further down; got {message:?}"
+        );
+
+        // The substring match the doc comment promises an operator or a runbook — this is the one
+        // that works, and it works because the sentence is unbroken.
+        assert!(
+            message.contains("--bird-socket is not supported on "),
+            "Go's wording must be greppable as one run of text; got {message:?}"
+        );
+    }
+
+    /// Go fills its `%s` with `runtime.GOOS` because upstream the hook is registered per-OS
+    /// (`feature/condregister/maybe_bird.go`: `linux || darwin || freebsd || openbsd`), so the
+    /// fatal really is reached only on some platforms. Here there is no hook on any platform, so
+    /// the refusal is unconditional and naming one GOOS would invite the false repair of moving to
+    /// another OS. Pinned so a later "port Go's `%s` literally" has to argue with this: the message
+    /// is identical whatever host it is produced on, and it names no concrete platform.
+    #[test]
+    fn bird_socket_refusal_is_unconditional_and_names_no_platform() {
+        let message =
+            bird_socket_refusal(Some("/run/bird.ctl")).expect("a non-empty path must be refused");
+        // The first line is the ported sentence; it must not have a GOOS substituted into it.
+        let first_line = message
+            .lines()
+            .next()
+            .expect("the message has a first line");
+        for goos in ["linux", "darwin", "windows", "freebsd", "openbsd", "macos"] {
+            assert!(
+                !first_line.contains(goos),
+                "the refusal must not name a platform ({goos:?} found); got {first_line:?}"
+            );
+        }
+        // It says instead that no build of tailnetd has this, which is the honest scope.
+        assert!(
+            first_line.contains("this platform or in this build of tailnetd"),
+            "names the honest scope in place of Go's %s; got {first_line:?}"
+        );
+        // And the decision does not consult the host: the same input gives the same message, with
+        // no argument through which a platform could enter.
+        assert_eq!(
+            bird_socket_refusal(Some("/run/bird.ctl")),
+            Some(message),
+            "the refusal is a pure function of the path"
+        );
+    }
+
+    // --- `--encrypt-state` / `--hardware-attestation` (Go `tailscaled`'s TPM flags) -------------
+    //
+    // Go registers both only on a `buildfeatures.HasTPM` build and validates them in
+    // `handleTPMFlags`. This fork declares them unconditionally and refuses the "on" case, so a
+    // Go-shaped command line reaches a named refusal instead of clap's "unexpected argument". The
+    // cases below pin the tri-state (absent / on / explicitly off), the refusal messages, and the
+    // policy-driven reporting.
+
+    #[test]
+    fn parse_go_bool_accepts_exactly_gos_spellings() {
+        for on in ["1", "t", "T", "TRUE", "true", "True"] {
+            assert_eq!(parse_go_bool(on), Ok(true), "{on:?} is a Go true");
+        }
+        for off in ["0", "f", "F", "FALSE", "false", "False"] {
+            assert_eq!(parse_go_bool(off), Ok(false), "{off:?} is a Go false");
+        }
+        // Go's `strconv.ParseBool` takes none of these, so neither do we: a mistyped value must be
+        // a parse error, never a silent "false" that would look like the flag was honoured.
+        for bad in ["yes", "no", "on", "off", "TrUe", "2", ""] {
+            let err = parse_go_bool(bad).expect_err("{bad:?} is not a Go boolean");
+            assert!(
+                err.contains("strconv.ParseBool") && err.contains("invalid syntax"),
+                "keeps Go's error text; got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tpm_flags_parse_as_a_tristate_rather_than_being_unknown_arguments() {
+        // Omitted: neither flag was set, which is what sends them to the policy half.
+        let none = Args::parse_from(["tailnetd"]);
+        assert_eq!(none.encrypt_state, None);
+        assert_eq!(none.hardware_attestation, None);
+        // Bare: Go's `boolFlag` reports `IsBoolFlag`, so the flag alone means true.
+        let bare = Args::parse_from(["tailnetd", "--encrypt-state", "--hardware-attestation"]);
+        assert_eq!(bare.encrypt_state, Some(true));
+        assert_eq!(bare.hardware_attestation, Some(true));
+        // `=value`: the only form Go's flag package accepts for a bool, in Go's spellings.
+        let explicit = Args::parse_from([
+            "tailnetd",
+            "--encrypt-state=false",
+            "--hardware-attestation=T",
+        ]);
+        assert_eq!(explicit.encrypt_state, Some(false));
+        assert_eq!(explicit.hardware_attestation, Some(true));
+        // A non-boolean value is refused by the parser, not coerced.
+        assert!(Args::try_parse_from(["tailnetd", "--encrypt-state=yes"]).is_err());
+    }
+
+    #[test]
+    fn neither_tpm_feature_is_available_in_this_build() {
+        // Hardware attestation: Go's build/platform arm, which this fork is permanently on.
+        let e = can_use_hardware_attestation().expect_err("no hardware key store exists here");
+        assert!(
+            e.contains("--hardware-attestation is not supported on this platform or in this build"),
+            "keeps Go's sentence; got {e:?}"
+        );
+        // State encryption on a platform Go does not support either: Go's `%s`-of-GOOS arm, ported
+        // verbatim, so the operator sees the same sentence `tailscaled` would print.
+        assert_eq!(
+            can_encrypt_state("darwin"),
+            Err("--encrypt-state is not supported on darwin".to_string())
+        );
+        assert_eq!(
+            can_encrypt_state("freebsd"),
+            Err("--encrypt-state is not supported on freebsd".to_string())
+        );
+        // On the two platforms Go CAN encrypt on, the refusal names the build rather than the OS,
+        // because that is the honest reason here — there is no TPM code to be unavailable.
+        for os in ["linux", "windows"] {
+            let e = can_encrypt_state(os).expect_err("no TPM support is linked into this build");
+            assert!(
+                e.contains("--encrypt-state is not supported on this device or in this build"),
+                "names the build, not the OS, on {os}; got {e:?}"
+            );
+            assert!(
+                !e.contains(os),
+                "must not blame the platform Go supports; got {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_omitted_or_explicitly_off_tpm_flag_is_not_a_refusal() {
+        // Go's switch fires only on `args.X.v`, so both of these fall through untouched — an
+        // operator can leave `--encrypt-state=false` in a unit file and the daemon still starts.
+        assert_eq!(explicit_tpm_flag_refusal(None, None, "linux"), None);
+        assert_eq!(
+            explicit_tpm_flag_refusal(Some(false), Some(false), "linux"),
+            None
+        );
+        assert_eq!(
+            explicit_tpm_flag_refusal(Some(false), Some(false), "darwin"),
+            None
+        );
+    }
+
+    #[test]
+    fn an_explicit_encrypt_state_is_refused_and_the_message_says_why() {
+        let message = explicit_tpm_flag_refusal(Some(true), None, "linux")
+            .expect("--encrypt-state must be refused");
+        // Names the flag, so the operator can tell which argument stopped the daemon.
+        assert!(
+            message.contains("--encrypt-state is not supported"),
+            "keeps Go's refusal wording; got {message:?}"
+        );
+        // Says what Go does with the flag, so the refusal is legible to someone porting a Go unit
+        // file rather than reading as an arbitrary rejection.
+        assert!(
+            message.contains("TPM"),
+            "says what Go's flag does; got {message:?}"
+        );
+        // Names the actual reason: no state-store provider / keystore here, and what DOES protect
+        // the state dir instead.
+        assert!(
+            message.contains("no state-store provider layer") && message.contains("0700 state dir"),
+            "says WHY it is unsupported and what protects the state today; got {message:?}"
+        );
+        // Records the parity decision where the operator hits it, and points at the write-up.
+        assert!(
+            message.contains("out of scope") && message.contains("docs/DESIGN.md"),
+            "states the decision and where it is recorded; got {message:?}"
+        );
+        // Tells the operator what to do.
+        assert!(
+            message.contains("Drop the flag"),
+            "says how to start the daemon; got {message:?}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_hardware_attestation_is_refused_and_the_message_says_why() {
+        let message = explicit_tpm_flag_refusal(None, Some(true), "linux")
+            .expect("--hardware-attestation must be refused");
+        assert!(
+            message.contains("--hardware-attestation is not supported"),
+            "keeps Go's refusal wording; got {message:?}"
+        );
+        assert!(
+            message.contains("no hardware key store"),
+            "says WHY it is unsupported; got {message:?}"
+        );
+        // The concrete consequence of ignoring it, which is why this is a refusal and not a no-op.
+        assert!(
+            message.contains("copies to any other machine"),
+            "says what a silent no-op would let an operator believe; got {message:?}"
+        );
+        assert!(
+            message.contains("out of scope") && message.contains("Drop the flag"),
+            "states the decision and how to proceed; got {message:?}"
+        );
+    }
+
+    #[test]
+    fn hardware_attestation_is_refused_before_encrypt_state() {
+        // Go validates the attestation flag in the first switch, so with both flags on that is the
+        // error `log.Fatal` prints. Only one message ever reaches the operator, so which one it is
+        // matters.
+        let message = explicit_tpm_flag_refusal(Some(true), Some(true), "linux")
+            .expect("both flags on must still refuse");
+        assert!(
+            message.contains("--hardware-attestation is not supported"),
+            "Go's order puts hardware attestation first; got {message:?}"
+        );
+        assert!(
+            !message.contains("--encrypt-state"),
+            "only the first refusal is reported; got {message:?}"
+        );
+    }
+
+    #[test]
+    fn a_policy_that_asks_for_the_tpm_features_is_reported_not_silently_dropped() {
+        let notices = tpm_policy_notices(None, None, |_| true, "linux");
+        assert_eq!(notices.len(), 2, "one per key; got {notices:?}");
+        // Go's line, verbatim including its `[unexpected]` prefix.
+        assert!(
+            notices[0].starts_with(
+                "[unexpected] policy requires hardware attestation, but device does not support it:"
+            ),
+            "keeps Go's wording and order; got {:?}",
+            notices[0]
+        );
+        // The fork addition: Go stays silent here, which would leave `EncryptState` looking
+        // effective forever on a build that can never honour it.
+        assert!(
+            notices[1].contains("policy sets EncryptState")
+                && notices[1].contains("stays unencrypted"),
+            "says the policy did not take effect; got {:?}",
+            notices[1]
+        );
+    }
+
+    #[test]
+    fn a_policy_that_asks_for_neither_feature_says_nothing() {
+        // The default path on every host: no policy file, or one that sets other keys. Startup must
+        // stay quiet, exactly as Go's does when `GetBoolean` returns its default.
+        assert!(tpm_policy_notices(None, None, |_| false, "linux").is_empty());
+        assert!(tpm_policy_notices(None, None, |_| false, "darwin").is_empty());
+    }
+
+    #[test]
+    fn a_flag_that_was_set_never_consults_the_policy() {
+        // Go reads the policy only in its `case !args.X.set:` arm, so a daemon started with
+        // `--encrypt-state=false` must not be told about an `EncryptState` policy it already
+        // overrode. The closure panics to prove the read is not merely ignored but never made.
+        let notices = tpm_policy_notices(
+            Some(false),
+            Some(false),
+            |key| panic!("the policy must not be read for a flag that was set (asked for {key:?})"),
+            "linux",
+        );
+        assert!(notices.is_empty());
+        // Only the omitted flag's key is read when just one flag was set.
+        let notices = tpm_policy_notices(
+            Some(false),
+            None,
+            |key| {
+                assert_eq!(
+                    key,
+                    tailscaled_rs::ipn::syspolicy::PKEY_HARDWARE_ATTESTATION
+                );
+                true
+            },
+            "linux",
+        );
+        assert_eq!(notices.len(), 1);
+    }
+
+    // --- the `debug` subcommand (Go `tailscaled debug`) ----------------------------------------
+    //
+    // The decision and the refusals are `tailscaled_rs::debugmode`'s, and are tested there. What
+    // belongs here is the daemon's own wiring: that `debug` is a subcommand at all, that its flag
+    // set is separate from the daemon's, that a stray positional REACHES the refusal instead of
+    // dying as clap's "unexpected argument", and that the unrelated `--debug` flag still works.
+
+    #[test]
+    fn debug_subcommand_parses_alongside_the_daemons_own_flags() {
+        use clap::Parser;
+        // No subcommand is the ordinary case: run the daemon.
+        assert!(Args::parse_from(["tailnetd"]).command.is_none());
+
+        let Some(Command::Debug(debug)) =
+            Args::parse_from(["tailnetd", "debug", "--ifconfig"]).command
+        else {
+            panic!("`tailnetd debug --ifconfig` should parse as the debug subcommand");
+        };
+        assert!(debug.ifconfig && !debug.monitor && debug.rest.is_empty());
+
+        // A stray positional is carried through rather than rejected by clap, so
+        // `debugmode::select` can refuse it with Go's own message.
+        let Some(Command::Debug(debug)) =
+            Args::parse_from(["tailnetd", "debug", "monitor"]).command
+        else {
+            panic!("a stray argument should still parse into the debug subcommand");
+        };
+        assert_eq!(debug.rest, vec!["monitor".to_string()]);
+
+        // A daemon-startup flag is NOT in the debug flag set (Go's is a separate `flag.FlagSet`).
+        assert!(Args::try_parse_from(["tailnetd", "debug", "--statedir", "/var/lib/x"]).is_err());
+
+        // …and the daemon's own `--debug <addr>` (the metrics server's listen address) is an
+        // unrelated flag that still parses on its own, with no subcommand.
+        let a = Args::parse_from(["tailnetd", "--debug", "9090"]);
+        assert_eq!(a.debug.as_deref(), Some("9090"));
+        assert!(a.command.is_none());
     }
 
     #[test]
