@@ -25,6 +25,21 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.67.2](https://github.com/GeiserX/tailscaled-rs/compare/v0.67.1...v0.67.2) (2026-10-06)
+
+
+### Bug Fixes
+
+* **deps:** follow the engine to russh 0.63.2 to close four advisories ([#611](https://github.com/GeiserX/tailscaled-rs/issues/611)) ([54866a4](https://github.com/GeiserX/tailscaled-rs/commit/54866a45f6a23e9f388765d301a667ccb038a904))
+
+## [0.67.1](https://github.com/GeiserX/tailscaled-rs/compare/v0.67.0...v0.67.1) (2026-10-06)
+
+
+### Bug Fixes
+
+* **exit-node:** don't report a policy refusal as an empty tailnet ([#603](https://github.com/GeiserX/tailscaled-rs/issues/603)) ([e1cd13e](https://github.com/GeiserX/tailscaled-rs/commit/e1cd13ef0e0a17e0eee3048d5a26abb07d3e20c6))
+* **watch:** stop holding an unregistered node's first frame for 500 ms ([#606](https://github.com/GeiserX/tailscaled-rs/issues/606)) ([4f0ed20](https://github.com/GeiserX/tailscaled-rs/commit/4f0ed20c5ddb95edc3dc172c703ff6e54ff5ca4b))
+
 ## [0.67.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.66.1...v0.67.0) (2026-09-30)
 
 
