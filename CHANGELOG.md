@@ -25,6 +25,14 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.67.3](https://github.com/GeiserX/tailscaled-rs/compare/v0.67.2...v0.67.3) (2026-10-07)
+
+
+### Bug Fixes
+
+* **exit-node:** tell the operator where a withheld node's id is logged ([f03d958](https://github.com/GeiserX/tailscaled-rs/commit/f03d95828713f472392e942e809cc66ad860ad4d))
+* **exit-node:** tell the operator where a withheld node's id is logged ([#624](https://github.com/GeiserX/tailscaled-rs/issues/624)) ([f03d958](https://github.com/GeiserX/tailscaled-rs/commit/f03d95828713f472392e942e809cc66ad860ad4d))
+
 ## [0.67.2](https://github.com/GeiserX/tailscaled-rs/compare/v0.67.1...v0.67.2) (2026-10-06)
 
 
