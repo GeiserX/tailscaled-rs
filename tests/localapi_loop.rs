@@ -1423,6 +1423,7 @@ async fn a_suggestion_masked_watch_is_quiet_until_a_pick_moves() {
                 id: id.to_string(),
                 name: name.to_string(),
             }),
+            // A reply that carries a node is never a policy refusal.
             withheld_by_policy: false,
         }
     }

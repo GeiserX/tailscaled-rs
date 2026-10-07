@@ -9020,7 +9020,9 @@ fn check_exit_node_suggest_flags(force_probe: bool) -> Result<()> {
 /// build cannot re-rank the candidates to answer with the best *permitted* one — it is handed a
 /// single already-chosen node (engine ask #44). Printing "no eligible exit-node peer right now"
 /// there would be a plain falsehood, and it would hide the two things that DO work: list that node
-/// in the policy, or choose a permitted exit node by hand.
+/// in the policy, or choose a permitted exit node by hand. The reply deliberately carries no id for
+/// the withheld node (keeping that node away from the caller is what the policy is for), so the
+/// notice says where the id is instead: the daemon logs it as `suggested_id` when it withholds.
 ///
 /// Pure (a `bool` in, a `&'static str` out) so both notices are pinned by unit tests rather than by
 /// reading the terminal.
@@ -9028,8 +9030,8 @@ fn exit_node_suggest_empty_notice(withheld_by_policy: bool) -> &'static str {
     if withheld_by_policy {
         "No exit node suggestion available: the AllowedSuggestedExitNodes policy does not list the \
          node this build picked.\nThis build cannot re-rank to the best permitted node, so it \
-         suggests none. List that node in the policy, or choose a permitted one with `tnet \
-         exit-node list` and `tnet set --exit-node=<id>`."
+         suggests none. List that node in the policy (the daemon log names it as suggested_id), \
+         or choose a permitted one with `tnet exit-node list` and `tnet set --exit-node=<id>`."
     } else {
         "No exit node suggestion available (no eligible exit-node peer right now)."
     }
@@ -19612,6 +19614,10 @@ mod tests {
         assert!(
             withheld.contains("tnet set --exit-node=<id>"),
             "it must point at the way out: {withheld}"
+        );
+        assert!(
+            withheld.contains("daemon log") && withheld.contains("suggested_id"),
+            "the reply carries no id, so it must say where the withheld node is named: {withheld}"
         );
         assert!(
             !withheld.contains("no eligible exit-node peer"),
