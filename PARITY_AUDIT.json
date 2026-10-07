@@ -1,5 +1,18 @@
 {
   "schema": "parity-audit/v1",
+  "summary": {
+    "auditedPrs": 5,
+    "faithful": 3,
+    "gaps": 2,
+    "findings": 2,
+    "upstream": {
+      "ref": "v1.102.4",
+      "commit": "bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "note": "The revision every upstream citation below was read at, and the ref docs/PARITY_GAP_ANALYSIS.md pins.",
+      "clone": "github.com/tailscale/tailscale cloned shallow at tag v1.102.4; HEAD verified as bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8."
+    },
+    "note": "This edition replaces the #484-#547 edition (#584). It audits five merged pull requests that claim a port, audit a port or describe Go behaviour: #535, #568, #569, #570 and #580. Each squash commit was re-read against github.com/tailscale/tailscale at v1.102.4. Where a divergence is disclosed in the merged commit or rustdoc, the finding says so. No finding is fixed here; each is left as tracked work."
+  },
   "auditedPrs": [
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/535",
@@ -19,12 +32,20 @@
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/580",
       "verdict": "gaps",
-      "notes": "Squash 8048737. Ports ipn.NotifyInitialStatus ordering from ipn/ipnlocal/local.go WatchNotificationsAs and ipn/backend.go at bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8. Most of it holds. Widening the engine mask to INITIAL_STATE|INITIAL_NETMAP changes only the engine's initial frame, because the pinned run_bus streams state, peer and browser changes regardless of mask. retain_requested_initial strips what the client did not ask for, and the snapshot is taken after the engine has read its cells, so no transition is lost. The only refusal Go attaches to the bit is the NotifyRateLimit pairing in ValidateNotifyWatchOpt, and the fork has no rate_limit field to pair it with. The device-less window and the prefs/policy front-loads on separate frames are disclosed. One divergence is filed: the merged first frame is not internally consistent the way Go's is."
+      "notes": "Squash 8048737. Ports ipn.NotifyInitialStatus ordering from ipn/ipnlocal/local.go WatchNotificationsAs and ipn/backend.go at bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8. Most of it holds. Widening the engine mask to INITIAL_STATE|INITIAL_NETMAP changes only the engine's initial frame, because the pinned run_bus streams state, peer and browser changes regardless of mask. retain_requested_initial strips what the client did not ask for, and the snapshot is taken after the engine has read its cells, so no transition is lost. The only refusal Go attaches to the bit is the NotifyRateLimit pairing in ValidateNotifyWatchOpt, and the fork has no rate_limit field to pair it with. The device-less window and the prefs/policy front-loads on separate frames are disclosed. One divergence is filed: the merged first frame is not internally consistent the way Go's is.",
+      "upstream": "ipn/ipnlocal/local.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "divergences": [
+        "internally consistent"
+      ]
     },
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/569",
       "verdict": "gaps",
-      "notes": "Squash ba180be. Two beads cover this PR (the review round and the conflict landing), so it has one row. The squash diff makes stamp keep an existing version, as Go's sendToLocked fills Version only when it is empty. It also adds a test for that and a back-compat parse test, and both call production code. Checked at bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8. The id shape (16 hex characters, fresh per watch), the NotifyInitialState gate on SessionID and the version on every masked frame all match WatchNotificationsAs/sendToLocked. The version string is CARGO_PKG_VERSION, not Go's version.Long(), which is right for a separate daemon. Refusing the watch when getrandom fails has no Go counterpart, because rands.HexString cannot fail, and the fork discloses it. One divergence is filed: the frame that carries SessionID does not always carry State. The commit body's 'not fixed' note says the id waits for the first frame on a down node; that is stale, since flush_session_id on main sends it bare."
+      "notes": "Squash ba180be. Two beads cover this PR (the review round and the conflict landing), so it has one row. The squash diff makes stamp keep an existing version, as Go's sendToLocked fills Version only when it is empty. It also adds a test for that and a back-compat parse test, and both call production code. Checked at bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8. The id shape (16 hex characters, fresh per watch), the NotifyInitialState gate on SessionID and the version on every masked frame all match WatchNotificationsAs/sendToLocked. The version string is CARGO_PKG_VERSION, not Go's version.Long(), which is right for a separate daemon. Refusing the watch when getrandom fails has no Go counterpart, because rands.HexString cannot fail, and the fork discloses it. One divergence is filed: the frame that carries SessionID does not always carry State. The commit body's 'not fixed' note says the id waits for the first frame on a down node; that is stale, since flush_session_id on main sends it bare.",
+      "upstream": "ipn/ipnlocal/local.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "divergences": [
+        "carries SessionID"
+      ]
     }
   ],
   "gate": {
