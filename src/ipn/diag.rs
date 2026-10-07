@@ -458,11 +458,52 @@ pub(super) async fn netcheck(dev: &tailscale::Device) -> Response {
 /// administrator excluded — and, when that withholds the answer, the reply says so
 /// ([`suggestion_response`]) instead of looking like an empty tailnet.
 pub(super) async fn suggest_exit_node(dev: &tailscale::Device) -> Response {
+    compute_suggestion(dev, true).await
+}
+
+/// The same computation as [`suggest_exit_node`], for the daemon's own recomputes: the ones Go runs
+/// on every netmap and on an `AllowedSuggestedExitNodes` change, with nobody asking. The only
+/// difference is the log level of a withheld pick. A netmap can arrive every few seconds, and a
+/// warning on each would bury the one an operator's own `exit-node suggest` produces.
+pub(super) async fn recompute_exit_node_suggestion(dev: &tailscale::Device) -> Response {
+    compute_suggestion(dev, false).await
+}
+
+/// The body of [`suggest_exit_node`] and [`recompute_exit_node_suggestion`]. `warn_withheld` picks
+/// the level the allow-list's withholding is logged at.
+async fn compute_suggestion(dev: &tailscale::Device, warn_withheld: bool) -> Response {
     match dev.suggest_exit_node().await {
-        Ok(suggestion) => suggestion_response(
-            suggestion,
-            super::syspolicy::allowed_suggested_exit_nodes().as_ref(),
-        ),
+        Ok(suggestion) => {
+            let engine_pick = suggestion.as_ref().map(|s| s.id.0.clone());
+            let allow_list = super::syspolicy::allowed_suggested_exit_nodes();
+            let response = suggestion_response(suggestion, allow_list.as_ref());
+            if let (
+                Some(id),
+                Response::ExitNodeSuggestion {
+                    withheld_by_policy: true,
+                    ..
+                },
+            ) = (engine_pick, &response)
+            {
+                let allowed = allow_list.as_ref().map_or(0, |set| set.len());
+                if warn_withheld {
+                    tracing::warn!(
+                        suggested_id = %id,
+                        allowed,
+                        "exit-node suggest: withholding the suggestion — AllowedSuggestedExitNodes \
+                         does not list it; this build cannot re-rank to the best allowed node (see \
+                         ENGINE_ASKS #44)"
+                    );
+                } else {
+                    tracing::debug!(
+                        suggested_id = %id,
+                        allowed,
+                        "exit-node suggestion recomputed: withheld by AllowedSuggestedExitNodes"
+                    );
+                }
+            }
+            response
+        }
         Err(e) => Response::Error {
             message: format!("exit-node suggest failed: {e:?}"),
         },
@@ -543,9 +584,9 @@ fn suggestion_response(
 /// so latency is not what is missing, and an implementer should not go looking for it. Ranking from
 /// the peer list anyway would mean guessing the eligibility predicate, which risks suggesting a node
 /// Go never would: a different algorithm wearing Go's name, so it is deliberately not written.
-/// The withholding is also logged, for the operator reading the daemon log rather than the CLI. (The
-/// engine's suggestion is *sticky*, so a withheld node stays withheld across calls rather than
-/// flapping.)
+/// The withholding is also logged (by [`compute_suggestion`]), for the operator reading the daemon
+/// log rather than the CLI. (The engine's suggestion is *sticky*, so a withheld node stays withheld
+/// across calls rather than flapping.)
 fn permitted_suggestion(
     suggestion: Option<tailscale::ExitNodeSuggestion>,
     allow_list: Option<&std::collections::BTreeSet<String>>,
@@ -555,15 +596,8 @@ fn permitted_suggestion(
     };
     let id = suggestion.id.0;
     match allow_list {
-        Some(allowed) if !allowed.contains(&id) => {
-            tracing::warn!(
-                suggested_id = %id,
-                allowed = allowed.len(),
-                "exit-node suggest: withholding the suggestion — AllowedSuggestedExitNodes does not \
-                 list it; this build cannot re-rank to the best allowed node (see ENGINE_ASKS #44)"
-            );
-            PermittedSuggestion::WithheldByPolicy
-        }
+        // Logged by the caller, `compute_suggestion`, at a level that depends on who asked.
+        Some(allowed) if !allowed.contains(&id) => PermittedSuggestion::WithheldByPolicy,
         _ => PermittedSuggestion::Suggest(crate::localapi::ExitNodeSuggestionView {
             id,
             name: suggestion.name,

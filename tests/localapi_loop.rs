@@ -1395,6 +1395,10 @@ async fn a_policy_masked_watch_front_loads_the_snapshot_and_stays_quiet_on_an_un
 ///    `prevSuggestion != res.ID`, so recomputing a stable answer costs nothing on the bus. A moved
 ///    pick afterwards does produce a frame, which shows the silence came from that guard and not
 ///    from a stream that had stopped delivering.
+/// 4. **A pick going away is a frame with an empty id.** In Go, "no eligible candidate" is an empty
+///    response with a nil error, so `suggestExitNodeLocked` compares `""` with the last pick and
+///    sends `SuggestedExitNode: &""`. The empty id is present, not absent, so a client can tell
+///    "withdrawn" from "unchanged".
 ///
 /// Out of reach here, and why:
 ///
@@ -1403,11 +1407,9 @@ async fn a_policy_masked_watch_front_loads_the_snapshot_and_stays_quiet_on_an_un
 ///   against a `Running` engine device; this harness has no engine and no tailnet, so it cannot
 ///   reach that code at all. The frame it writes is the one `emit_suggested_exit_node_frame`
 ///   writes, which the emitter test in `src/server.rs` pins.
-/// - **An empty answer.** Today an empty suggestion publishes nothing and leaves the cell alone. In
-///   Go, "no eligible candidate" is an empty response with a nil error, so `suggestExitNodeLocked`
-///   compares `""` with the last pick and sends `SuggestedExitNode: &""`. When the daemon does the
-///   same, a fourth step belongs here: publish `ExitNodeSuggestion { suggestion: None }` after a
-///   pick and read a frame whose id is empty.
+/// - **The recompute triggers.** The daemon recomputes on every engine netmap and on an
+///   `AllowedSuggestedExitNodes` change, from a task bound to the device. With no device there is
+///   no such task; the trigger logic has its own unit tests in `src/ipn/mod.rs`.
 ///
 /// The publish goes through the backend API rather than an `exit-node suggest` on a second
 /// connection because the engine call that verb wraps needs a live device. It is the same
@@ -1513,6 +1515,29 @@ async fn a_suggestion_masked_watch_is_quiet_until_a_pick_moves() {
         moved.suggested_exit_node.as_deref(),
         Some("nStableFra2CNTRL"),
         "the frame carries the new pick: {moved:?}"
+    );
+
+    // (4) No eligible candidate any more: Go sends `SuggestedExitNode: &""`, and so does this.
+    assert!(
+        harness
+            .backend
+            .lock()
+            .await
+            .publish_suggested_exit_node(&Response::ExitNodeSuggestion {
+                suggestion: None,
+                withheld_by_policy: false,
+            }),
+        "a pick going away is a change and must publish"
+    );
+    let cleared = read_notify(
+        &mut r,
+        "a withdrawn exit-node suggestion must reach the same parked watcher",
+    )
+    .await;
+    assert_eq!(
+        cleared.suggested_exit_node.as_deref(),
+        Some(""),
+        "the withdrawn suggestion is Go's empty StableNodeID, present on the wire: {cleared:?}"
     );
 
     harness.shutdown_and_verify().await;
