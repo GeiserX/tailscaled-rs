@@ -1,6 +1,6 @@
 [package]
 name = "tailscaled-rs"
-version = "0.67.0"
+version = "0.67.1"
 edition = "2024"
 rust-version = "1.95"
 license = "BSD-3-Clause"
@@ -64,24 +64,23 @@ path = "src/bin/tnet.rs"
 # so `use tailscale::...` is unchanged. Pinned to a specific rev for reproducible builds; Cargo.lock
 # is committed so CI and every clone build the exact same engine.
 #
-# crates.io: the engine is published. Every `geiserx_*` crate in this daemon's resolved graph —
-# the facade plus the 39 `geiserx_ts_*` crates it pulls in, including the ones only an optional
-# feature reaches — is on crates.io at the version locked here, so nothing upstream blocks a
-# registry dependency any more. Re-check that for whatever the pin resolves to with
-# `scripts/check-engine-on-crates-io.sh`.
+# crates.io: the engine is published, but not yet at this pin. Of the 40 `geiserx_*` crates in this
+# daemon's resolved graph (the facade plus the 39 `geiserx_ts_*` crates it pulls in, including the
+# ones only an optional feature reaches), 38 are on crates.io at the 0.57.4 locked here; the
+# facade `geiserx_tailscale` and `geiserx_ts_runtime` are not. Re-check that for whatever the pin
+# resolves to with `scripts/check-engine-on-crates-io.sh`.
 #
-# The pin nonetheless stays a `rev`, because the switch is NOT a same-version source swap. crates.io
-# `geiserx_tailscale` 0.43.0 was cut a month BEFORE this commit and does not carry the russh
-# security bump this rev exists for; the release cut from *this* tree is 0.43.1. Moving to
-# `version = "0.43.1"` is therefore a deliberate engine-version change, gated on the bump
-# discipline in `docs/ENGINE.md` — and it is what publishing the daemon needs, since
-# `cargo publish` rejects a git dependency.
+# The pin is this rev (engine 0.57.4) because it is the first tree that moves russh to 0.63.2,
+# closing GHSA-47hw-gvq5-r2gm, GHSA-35g8-35p8-c8fw, GHSA-w3jg-pjxf-73p4 and GHSA-p8qx-h547-fjw9
+# (engine commit fc862384). Moving to a `version = "..."` registry dependency is a deliberate
+# engine-version change, gated on the bump discipline in `docs/ENGINE.md` — and it is what
+# publishing the daemon needs, since `cargo publish` rejects a git dependency.
 #
 # Local engine iteration (optional): a *gitignored* `.cargo/config.toml` with
 #   paths = ["/path/to/your/tailscale-rs/checkout"]
 # transparently overrides this git dep when the local checkout's version matches the pin —
 # so you can edit the engine and rebuild the daemon with no manifest change. See README.
-tailscale = { package = "geiserx_tailscale", git = "https://github.com/GeiserX/tailscale-rs", rev = "9d847a6e252c0b268f823145ccfa4fc04006798d" }
+tailscale = { package = "geiserx_tailscale", git = "https://github.com/GeiserX/tailscale-rs", rev = "eabd2cf2b810d18881c9cf305000d6f42aacbd19" }
 # The engine's control crate, pinned to the SAME rev as `tailscale` above (Cargo unifies it to the
 # identical crate instance, so its types ARE the ones the `tailscale` facade's signatures use). We
 # need it directly only to NAME `ts_control::FunnelOptions` for `Device::listen_funnel`: the engine
@@ -89,20 +88,20 @@ tailscale = { package = "geiserx_tailscale", git = "https://github.com/GeiserX/t
 # NOT `FunnelOptions`/`FunnelError`, so the funnel listener is otherwise uncallable from outside the
 # engine crate. Keep this rev in lockstep with `tailscale`'s. (TODO: drop this dep once the engine
 # re-exports the Funnel types at its root — coordinated upstream.)
-ts_control = { package = "geiserx_ts_control", git = "https://github.com/GeiserX/tailscale-rs", rev = "9d847a6e252c0b268f823145ccfa4fc04006798d" }
+ts_control = { package = "geiserx_ts_control", git = "https://github.com/GeiserX/tailscale-rs", rev = "eabd2cf2b810d18881c9cf305000d6f42aacbd19" }
 
 # The engine's capability-version constant (`CapabilityVersion::CURRENT`), needed to report `cap` in
 # `tnet version --json` (Go's `version.Meta.cap`). Already an engine transitive dep + a published
 # crate; the facade does not re-export it, so name it directly — same workaround pattern as the
 # `ts_control` dep above. Keep this rev in lockstep with `tailscale`'s.
-ts_capabilityversion = { package = "geiserx_ts_capabilityversion", git = "https://github.com/GeiserX/tailscale-rs", rev = "9d847a6e252c0b268f823145ccfa4fc04006798d" }
+ts_capabilityversion = { package = "geiserx_ts_capabilityversion", git = "https://github.com/GeiserX/tailscale-rs", rev = "eabd2cf2b810d18881c9cf305000d6f42aacbd19" }
 
 # The engine's Tailnet Lock crate, for its AUM CBOR decoder (`ts_tka::Aum::from_cbor`) and hash.
 # `tnet lock log --json=1` decodes each update the way Go's `PrintTailnetLockLogJSONV1` does, and
 # a second, hand-written decoder of a consensus-relevant format would be the wrong thing to own.
 # Already an engine transitive dep; the facade does not re-export it. Keep this rev in lockstep
 # with `tailscale`'s.
-ts_tka = { package = "geiserx_ts_tka", git = "https://github.com/GeiserX/tailscale-rs", rev = "9d847a6e252c0b268f823145ccfa4fc04006798d" }
+ts_tka = { package = "geiserx_ts_tka", git = "https://github.com/GeiserX/tailscale-rs", rev = "eabd2cf2b810d18881c9cf305000d6f42aacbd19" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "signal"] }
 serde = { version = "1", features = ["derive"] }
