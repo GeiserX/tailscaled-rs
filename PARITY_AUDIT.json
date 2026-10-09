@@ -1,17 +1,17 @@
 {
   "schema": "parity-audit/v1",
   "summary": {
-    "auditedPrs": 8,
-    "faithful": 0,
-    "gaps": 8,
-    "findings": 27,
+    "auditedPrs": 12,
+    "faithful": 2,
+    "gaps": 10,
+    "findings": 29,
     "upstream": {
       "ref": "v1.102.4",
       "commit": "bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
       "note": "The revision every upstream citation below was read at, and the ref docs/PARITY_GAP_ANALYSIS.md pins.",
       "clone": "github.com/tailscale/tailscale cloned shallow at tag v1.102.4; HEAD verified as bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8."
     },
-    "note": "An independent re-reading of the eight merged pull requests #484, #497, #530, #531, #535, #538, #544 and #547, each squash commit read diff by diff against github.com/tailscale/tailscale at v1.102.4, replacing the previous edition of the same eight. Every finding was checked on both the Go and the Rust side; findings that could not be confirmed on both sides were left out. Where the merged commit or rustdoc discloses a divergence, the finding says so. Engine-side causes are named as such. Nothing is fixed here; each finding is left as tracked work."
+    "note": "Twelve merged pull requests, each squash commit read against github.com/tailscale/tailscale at v1.102.4. #484, #497, #530, #531, #535, #538, #544 and #547 are an independent re-reading that replaced the previous edition of the same eight; every finding there was checked on both the Go and the Rust side, and findings that could not be confirmed on both sides were left out. #568, #570, #580 and #569 were audited separately at the same pin: the two engine-ask wording changes, and the watch stream's initial status, version and session id. Where the merged commit or rustdoc discloses a divergence, the finding says so. Engine-side causes are named as such. Nothing is fixed here; each finding is left as tracked work."
   },
   "gate": {
     "ran": true,
@@ -108,6 +108,34 @@
       "divergences": [
         "Start: prefix",
         "already fixed"
+      ]
+    },
+    {
+      "url": "https://github.com/GeiserX/tailscaled-rs/pull/568",
+      "verdict": "faithful",
+      "notes": "Squash 7f9e18a. Docs-only change to ENGINE_ASKS ask #43, plus a test that pins the new wording. Checked at bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8. feature/posture/posture.go handleC2NPostureIdentityGet logs a failed GetPreferenceOption(PostureChecking, ShowChoiceByPolicy) and falls through to choice.ShouldEnable(prefs.PostureChecking()). util/syspolicy/syspolicy.go returns the default on error, and ptype.ShouldEnable gives the user's choice for a default value, so 'a failed read leaves the pref to decide' is correct. The body's other claims also hold. feature/clientupdate/clientupdate.go handleC2NUpdatePost answers \"not enabled\" before \"not supported\", with Enabled = envknob.AllowsRemoteUpdate() || AutoUpdate.Apply. There are exactly 23 non-test RegisterC2N( call sites, including /debug/tka/log and GET /conn25/state."
+    },
+    {
+      "url": "https://github.com/GeiserX/tailscaled-rs/pull/570",
+      "verdict": "faithful",
+      "notes": "Squash c28a442. Two tracker entries cover this PR (the review round and the conflict landing), so it has one row. Docs-only: it extends ENGINE_ASKS ask #45. Checked at bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8 against ipn/ipnlocal/local.go. sendToLocked does a non-blocking send into a 128-deep channel and, on a full channel, blocks only for NotifyInProcessNoDisconnect; otherwise it calls closeLaggingWatchSessionLocked. That function deletes the session, drains the queue, sends one Notify with Version and ErrMessage \"IPN bus consumer fell behind; closing watch\", and closes the channel. The ask quotes this accurately. Its engine-side claim also checks out against the pinned engine (9d847a6, ts_runtime/src/ipn_bus.rs): run_bus marks values seen with borrow_and_update before deliver, and deliver treats TrySendError::Full as success. ipn/localapi/localapi.go serveWatchIPNBus refuses NotifyInProcessNoDisconnect, as the ask says."
+    },
+    {
+      "url": "https://github.com/GeiserX/tailscaled-rs/pull/580",
+      "verdict": "gaps",
+      "notes": "Squash 8048737. Ports ipn.NotifyInitialStatus ordering from ipn/ipnlocal/local.go WatchNotificationsAs and ipn/backend.go at bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8. Most of it holds. Widening the engine mask to INITIAL_STATE|INITIAL_NETMAP changes only the engine's initial frame, because the pinned run_bus streams state, peer and browser changes regardless of mask. retain_requested_initial strips what the client did not ask for, and the snapshot is taken after the engine has read its cells, so no transition is lost. The only refusal Go attaches to the bit is the NotifyRateLimit pairing in ValidateNotifyWatchOpt, and the fork has no rate_limit field to pair it with. The device-less window and the prefs/policy front-loads on separate frames are disclosed. One divergence is filed: the merged first frame is not internally consistent the way Go's is.",
+      "upstream": "ipn/ipnlocal/local.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "divergences": [
+        "internally consistent"
+      ]
+    },
+    {
+      "url": "https://github.com/GeiserX/tailscaled-rs/pull/569",
+      "verdict": "gaps",
+      "notes": "Squash ba180be. Two tracker entries cover this PR (the review round and the conflict landing), so it has one row. The squash diff makes stamp keep an existing version, as Go's sendToLocked fills Version only when it is empty. It also adds a test for that and a back-compat parse test, and both call production code. Checked at bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8. The id shape (16 hex characters, fresh per watch), the NotifyInitialState gate on SessionID and the version on every masked frame all match WatchNotificationsAs/sendToLocked. The version string is CARGO_PKG_VERSION, not Go's version.Long(), which is right for a separate daemon. Refusing the watch when getrandom fails has no Go counterpart, because rands.HexString cannot fail, and the fork discloses it. One divergence is filed: the frame that carries SessionID does not always carry State. The commit body's 'not fixed' note says the id waits for the first frame on a down node; that is stale, since flush_session_id on main sends it bare.",
+      "upstream": "ipn/ipnlocal/local.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "divergences": [
+        "carries SessionID"
       ]
     }
   ],
@@ -299,6 +327,20 @@
       "title": "The #482 tag-wording finding was already fixed on main when the audit merged",
       "detail": "The committed #482 finding says the tag refusals are reworded away from tailcfg.CheckTag's four sentences and prefsFromUpArgs's `tag: %q: %s` frame. That described #482's own code, but a38687b (#538), an ancestor of ddd2fb8, had already switched complete_and_validate_advertise_tags to Go's frame and CheckTag's sentences verbatim. A reader following the row chases a divergence that no longer existed at the commit that recorded it.",
       "upstream": "tailcfg/tailcfg.go, cmd/tailscale/cli/up.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "severity": "minor"
+    },
+    {
+      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/580",
+      "title": "The initial_status first frame can pair a stale state/net_map with a newer status snapshot, and repeat a transition",
+      "detail": "Go builds ini.State, ini.NetMap and ini.InitialStatus (via updateStatusLocked) inside the same b.mu critical section that registers the watcher. So the first Notify's State agrees with InitialStatus.BackendState, its NetMap agrees with the snapshot's peers, and no transition both appears in the snapshot and is streamed again. The merged stream_notify waits for the engine's widened initial frame, then calls Backend::status() later, then merges the two with with_initial_status into one frame. A transition that lands between the two reads makes that first frame carry an engine `state`/`net_map` older than `initial_status` (for example state Starting beside initial_status.state Running). The same transition is then also streamed as its own frame. The rustdoc on NotifyView::initial_status says so and calls it harmless. It is still a client-visible difference from the upstream contract, which promises an internally consistent first Notify.",
+      "upstream": "ipn/ipnlocal/local.go (WatchNotificationsAs) @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "severity": "minor"
+    },
+    {
+      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/569",
+      "title": "The frame that carries SessionID for an initial_state watch need not carry State",
+      "detail": "In WatchNotificationsAs, NotifyInitialState sets ini.SessionID and ini.State (plus BrowseToURL under NeedsLogin) on the same initial Notify, always. The backend always has a state, so a watcher reading the first frame gets both the id and the state it belongs to. The merged NotifySession puts the id on whichever frame is written first. With no device, or when watch_ipn_bus fails, flush_session_id writes a frame carrying only version and session_id, and no state is sent until a device appears. So `watch {initial_state:true}` on a down node never reports Stopped/NeedsLogin up front, which Go's initial notify does. When a prefs, policy or suggestion front-load goes first, the id also rides that frame rather than the state frame. Go's foreground serve (cmd/tailscale/cli/serve_v2.go) only needs the id, so serve-style readers work. A reader that expects the id and the state in one frame does not.",
+      "upstream": "ipn/ipnlocal/local.go (WatchNotificationsAs) @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
       "severity": "minor"
     }
   ]
