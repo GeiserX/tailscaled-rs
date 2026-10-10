@@ -1,304 +1,117 @@
 {
   "schema": "parity-audit/v1",
   "summary": {
-    "auditedPrs": 8,
-    "faithful": 0,
-    "gaps": 8,
-    "findings": 27,
+    "auditedPrs": 5,
+    "faithful": 1,
+    "gaps": 4,
+    "findings": 7,
     "upstream": {
       "ref": "v1.102.4",
       "commit": "bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
       "note": "The revision every upstream citation below was read at, and the ref docs/PARITY_GAP_ANALYSIS.md pins.",
       "clone": "github.com/tailscale/tailscale cloned shallow at tag v1.102.4; HEAD verified as bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8."
     },
-    "note": "An independent re-reading of the eight merged pull requests #484, #497, #530, #531, #535, #538, #544 and #547, each squash commit read diff by diff against github.com/tailscale/tailscale at v1.102.4, replacing the previous edition of the same eight. Every finding was checked on both the Go and the Rust side; findings that could not be confirmed on both sides were left out. Where the merged commit or rustdoc discloses a divergence, the finding says so. Engine-side causes are named as such. Nothing is fixed here; each finding is left as tracked work."
-  },
-  "gate": {
-    "ran": true,
-    "pass": true,
-    "detail": "All four steps green on main at 877814d, run with CARGO_BUILD_JOBS=4, RUST_TEST_THREADS=4, TS_RS_EXPERIMENT=this_is_unstable_software on the stable 1.95.0 toolchain: `cargo fmt --all --check` and `cargo clippy --all-targets -- -D warnings` clean; `cargo test --all-targets` 42 test targets, 1267 passed, 0 failed, 5 ignored; `cargo build --release --bins` finished in 6m 32s. Two machine facts, neither about the tree: the default toolchain here is a nightly with no clippy component, so the gate ran on 1.95.0 (what CI's stable runner uses); and the first test run, under the long per-session TMPDIR, failed only tailnetd's cleanup_refuses_live_socket with `path must be shorter than SUN_LEN` (darwin's 104-byte sun_path). Rerun with a short TMPDIR, test and release build passed."
+    "note": "A re-reading of five merged pull requests: #605, #611, #624, #625 and #631. Each squash commit on main was read diff by diff against github.com/tailscale/tailscale at v1.102.4, replacing the previous edition, which covered eight other pull requests. Where engine behaviour mattered, the engine was read at the rev Cargo.toml pins (eabd2cf2). Each finding was confirmed on both the Go and the Rust side. Where the merged commit or its rustdoc already discloses a divergence, the finding says so, and engine-side causes are named as such. Nothing is fixed here; each finding is left as tracked work."
   },
   "auditedPrs": [
     {
-      "url": "https://github.com/GeiserX/tailscaled-rs/pull/484",
+      "url": "https://github.com/GeiserX/tailscaled-rs/pull/605",
       "verdict": "gaps",
-      "notes": "Squash 84f399d. The sentence move is accurate: at the pinned commit tailscaled registers --bird-socket under buildfeatures.HasBird and, after log.SetFlags(0), calls log.Fatalf(\"--bird-socket is not supported on %s\", runtime.GOOS) only when wgengine.HookNewBird is unset; the diff cites an older ref (53a0d659) but the code it describes is unchanged at the pin. The empty-path carve-out, exit 1, stderr and the check running before --cleanup all match. Two divergences remain, both disclosed in the diff: the flag is refused on every platform, and line 1 keeps an error: prefix, a full stop and build text in Go's GOOS slot. Tests call bird_socket_refusal and the built binary.",
-      "upstream": "cmd/tailscaled/tailscaled.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "notes": "Squash 8c97d86. Ports NotifyInitialStatus. The snapshot is sent once, it is the session's first frame and carries the owed session id, and the NotifyRateLimit refusal is correctly unreachable because no rate_limit field exists. Three divergences remain. The initial bits arrive as several frames where Go sends one initial Notify. A subscriber outside Running can get a peerless InitialStatus. tnet has no --initial-status flag.",
+      "upstream": "ipn/ipnlocal/local.go, ipn/backend.go, cmd/tailscale/cli/debug.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
       "divergences": [
-        "every platform",
-        "error: prefix"
+        "one initial Notify",
+        "peerless InitialStatus",
+        "--initial-status"
       ]
     },
     {
-      "url": "https://github.com/GeiserX/tailscaled-rs/pull/497",
+      "url": "https://github.com/GeiserX/tailscaled-rs/pull/611",
+      "verdict": "faithful",
+      "notes": "Squash 54866a4. A dependency-only change: it moves the four engine pins from 9d847a6e to eabd2cf2 to take russh 0.63.2, and it claims no Go port. Its two adaptations either preserve behaviour or move toward Go. whois `user` was always None under the old engine and is now the profile's login name, falling back to the display name, which is what Go's whois prints. The new StatusNode fields `tailscale_ips` and `expired` are only filled in a test fixture. That they are not surfaced yet (Go's PeerStatus.TailscaleIPs and Expired) is an older status gap, not a divergence this PR introduced."
+    },
+    {
+      "url": "https://github.com/GeiserX/tailscaled-rs/pull/624",
       "verdict": "gaps",
-      "notes": "Squash 4dce9c2. The field has no mask bit of its own, is front-loaded only under the initial-netmap bit, and omits key_expiry for a never-expiring key, as Go's SelfChange (omitzero) does. When it fires and what it carries differ: it misses updates where only this node changes, it is sent on peer-delta ticks Go never attaches it to, the self node is read after the tick rather than taken from the netmap being announced, the pre-netmap initial frame waits up to 500 ms for a self node, and it is a 5-field subset of tailcfg.Node. Some of this is disclosed in the field's rustdoc. Tests call project_notify and self_report_from_status_node; nothing exercises fetch_self_report or the stream_notify netmap branch.",
-      "upstream": "ipn/ipnlocal/local.go, ipn/backend.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "notes": "Squash f03d958. A wording-only change to the `tnet exit-node suggest` notice for a pick the AllowedSuggestedExitNodes policy withholds. Its new claim holds: the user-initiated path logs `suggested_id` at warn (compute_suggestion in src/ipn/diag.rs). Measured against Go's runExitNodeSuggest, two divergences remain. The notice asks the operator to edit policy for a state Go never reaches. The empty-case line is not Go's text.",
+      "upstream": "cmd/tailscale/cli/exitnode.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
       "divergences": [
-        "only this node changes",
-        "peer-delta",
-        "after the tick",
-        "500 ms",
-        "5-field subset"
+        "edit policy",
+        "Go's text"
       ]
     },
     {
-      "url": "https://github.com/GeiserX/tailscaled-rs/pull/530",
+      "url": "https://github.com/GeiserX/tailscaled-rs/pull/625",
       "verdict": "gaps",
-      "notes": "Squash a787db8. The narrow mechanics hold: only an explicit true is checked (Go's EqualBool(true)), set and check-prefs now judge the pref the write would leave behind as editPrefsLocked does, and the dry run joins auto-update before advertise-routes with a newline as errors.Join does. The diff's central rationale misreads Go: it misses the load-time clear in profileManager.loadSavedPrefs, which drops a stored AutoUpdate.Apply=true when the host cannot update, so Go never reaches the locked-up state this port now produces. Also the config-file path refuses where Go accepts, the refusal text is not Go's, and the real set path stops at the first error in a different order.",
-      "upstream": "ipn/ipnlocal/local.go, ipn/ipnlocal/profiles.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "notes": "Squash 2ede56f. Adds the per-device recompute task, which runs on every netmap and when AllowedSuggestedExitNodes changes. It also makes \"\" a value the bus can publish and clears the cell silently when identity changes. Those three match suggestExitNodeLocked, setNetMapLocked, sysPolicyChanged and resetForProfileChangeLocked. Recomputing on every netmap is a superset of Go's triggers, but it does not churn the suggestion, because the engine keeps Go's sticky prevSuggestion (ts_runtime exit_node_suggest.rs at eabd2cf2). One divergence remains: a withheld pick publishes \"\" where Go publishes the best permitted node.",
+      "upstream": "ipn/ipnlocal/local.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
       "divergences": [
-        "load-time clear",
-        "config-file",
-        "refusal text",
-        "first error"
+        "best permitted node"
       ]
     },
     {
-      "url": "https://github.com/GeiserX/tailscaled-rs/pull/538",
+      "url": "https://github.com/GeiserX/tailscaled-rs/pull/631",
       "verdict": "gaps",
-      "notes": "Squash a38687b. The daemon-side text is now faithful: the `tag: %q: ` frame, CheckTag's four reasons word for word, clause order, byte classes, completion of a colon-less value before the check, and first-offender reporting all match prefsFromUpArgs and tailcfg.CheckTag. Tests call complete_and_validate_advertise_tags directly and through begin_up. What an operator reads from tnet up still differs: the CLI wraps the daemon's message in an error: prefix (and in JSON on stdout under --json), and the check order differs: the daemon's revert and login-server guards run before the tag check where Go checks tags first. Rust's {:?} also differs from Go's %q for control bytes.",
-      "upstream": "cmd/tailscale/cli/up.go, tailcfg/tailcfg.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "notes": "Squash f95330a. send_if_modified makes the compare-and-store one step, and borrow_and_update makes the front-load's read-and-mark one step. Together they close the duplicate-push and swallowed-push races against Go's prevSuggestion guard. One divergence remains, and the PR documents it itself. Completion order is not serialised the way Go's b.mu serialises it, so a race can leave the cell on the older answer.",
+      "upstream": "ipn/ipnlocal/local.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
       "divergences": [
-        "error: prefix",
-        "--json",
-        "check order",
-        "%q"
-      ]
-    },
-    {
-      "url": "https://github.com/GeiserX/tailscaled-rs/pull/544",
-      "verdict": "gaps",
-      "notes": "Squash a8b5fbf. The four refusals it tags are the right four, their text matches runServeCombined byte for byte (including the %d version), and they are written bare with exit 1 as Go's main prints a returned error; the two --service literals that carry Go's own Error: are rightly left alone. Tests call check_serve_flags and run the built tnet. The divergence is check order: this build decides all four before validateArgs and before any daemon round trip, while Go runs validateArgs first, runs verifyFunnelEnabled before the mount-point and PROXY checks on funnel, and reaches the tun refusal only after reading the serve config and status. The new integration test pins two of those outputs against a missing socket, where Go would print a daemon error. The mount-point path is quoted with {:?} rather than %q.",
-      "upstream": "cmd/tailscale/cli/serve_v2.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
-      "divergences": [
-        "verifyFunnelEnabled",
-        "tun refusal",
-        "validateArgs",
-        "%q"
-      ]
-    },
-    {
-      "url": "https://github.com/GeiserX/tailscaled-rs/pull/547",
-      "verdict": "gaps",
-      "notes": "Squash c872cca. The main fix is faithful: every interrupted run, listener or CGI, with or without a pref to restore, now ends at exit 0 as runWeb's goroutine does with os.Exit(0); the restore uses Go's !cgi && startedManagementClient guard and logs its failure without changing the exit; like Go only SIGINT is trapped. Three divergences remain: the handler is armed after the pref step rather than as runWeb's first statement, a CGI serve error still exits 1 where Go logs it and returns nil, and the stop lines are written bare where Go writes them with the standard log prefix. The interrupt tests drive serve_until_interrupt with their own closures and never call run_web, so restoring the old early return would leave them green.",
-      "upstream": "cmd/tailscale/cli/web.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
-      "divergences": [
-        "armed after the pref step",
-        "CGI serve error",
-        "log prefix"
-      ]
-    },
-    {
-      "url": "https://github.com/GeiserX/tailscaled-rs/pull/531",
-      "verdict": "gaps",
-      "notes": "Squash 3977ad9. The gate matches reloadNow: an unchanged resolve notifies nobody, a changed one stores before it ticks (swap then invoke), the reload handler returns the fresh merge either way as servePolicy does, and both watch_policy consumers (the reconnect loop's overrides and the Notify.Policy push) are gated as Go gates its one changeCallbacks bus. Three divergences sit in the comparison (StringList values compared as rendered text, AuthKey compared as redacted) and in the first resolution; none is reachable today because one source is registered once, before the LocalAPI is served. Tests call reload_and_publish, reload_effective_policy and load_json_policy_file.",
-      "upstream": "util/syspolicy/rsop/resultant_policy.go, util/syspolicy/setting/snapshot.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
-      "divergences": [
-        "StringList",
-        "redacted",
-        "first resolution"
-      ]
-    },
-    {
-      "url": "https://github.com/GeiserX/tailscaled-rs/pull/535",
-      "verdict": "gaps",
-      "notes": "Squash ddd2fb8, a docs-only PR that rewrote PARITY_AUDIT.json for #459 through #482; it claims no code port, so it is judged on whether its Go claims are true at the pinned commit. Re-checked and correct: the #472 log-prefix finding (runWeb's three lines go through the standard logger, and cli.go's log.SetFlags(0) is inside fatalf), the #466 --assert finding (runIP answers the assertion from the node's own TailscaleIPs and returns before resolving a peer), and the #469 finding (ToPrefs's only route check sits inside the AdvertiseRoutes != nil guard). Two statements about Go are wrong: the #459 finding's Start: prefix claim, and it carried the #482 tag-wording finding although #538, already an ancestor of the squash, had already fixed it.",
-      "upstream": "ipn/ipnlocal/local.go, tailcfg/tailcfg.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
-      "divergences": [
-        "Start: prefix",
-        "already fixed"
+        "older answer"
       ]
     }
   ],
+  "gate": {
+    "ran": true,
+    "pass": true,
+    "detail": "All four steps green on main at f95330a, run with CARGO_BUILD_JOBS=4, RUST_TEST_THREADS=4 and TS_RS_EXPERIMENT=this_is_unstable_software on the 1.95.0 toolchain. `cargo fmt --all --check` and `cargo clippy --all-targets -- -D warnings` were clean. `cargo test --all-targets` covered 42 test targets: 1283 passed, 0 failed, 5 ignored. `cargo build --release --bins` finished in 7m 41s. Three facts about the machine, none about the tree. First, the default toolchain is a nightly with no clippy component, so the gate ran on 1.95.0, the version CI's stable runner uses. Second, the first test run under the long per-session TMPDIR failed only tailnetd's cleanup_refuses_live_socket, with `path must be shorter than SUN_LEN` (darwin's 104-byte sun_path); it passed when rerun with a short TMPDIR. Third, one run read a half-written draft of this file and failed tests/parity_audit_ledger.rs. That test reads PARITY_AUDIT.json, so it was rerun against main's own copy, where all 6 tests passed, and then against this edition, where they also passed."
+  },
   "findings": [
     {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/484",
-      "title": "--bird-socket is refused on every platform, where Go accepts it on linux, darwin, freebsd and openbsd",
-      "detail": "feature/condregister/maybe_bird.go links feature/bird into every default build on linux, darwin, freebsd and openbsd, and feature/bird sets wgengine.HookNewBird, so on those platforms tailscaled never takes the refusal branch and passes the socket on as conf.BIRDSocket. The merged can_use_bird() (src/bin/tailnetd.rs) returns Err unconditionally, so bird_socket_refusal refuses any non-empty path and tailnetd exits 1 on every platform. The cause is engine-side (the pinned tailscale-rs has no BIRD hook) and the diff discloses it, but a Linux deployment that passes --bird-socket starts under Go and does not start here.",
-      "upstream": "cmd/tailscaled/tailscaled.go, feature/condregister/maybe_bird.go, feature/bird/bird.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/625",
+      "title": "A policy-withheld exit-node pick is published as \"\" instead of the best permitted node",
+      "detail": "Go passes the AllowedSuggestedExitNodes set into suggestExitNode. Both suggestExitNodeUsingDERP and suggestExitNodeUsingTrafficSteering skip non-allowed peers before ranking (`if allowList != nil && !allowList.Contains(peer.StableID()) { continue }`), so the bus carries the id of the best ALLOWED node. The merged code takes the engine's unfiltered pick. When the allow-list excludes it, the code publishes SuggestedExitNode \"\" (suggested_exit_node_id over a withheld_by_policy response). On a policy-managed fleet whose engine pick falls outside the list, watchers are told there is no suggestion, where Go would name the best permitted node. The engine's sticky prev_suggestion is also set to the excluded node, so later recomputes keep landing on it. The code acknowledges this as engine ask #44 (the engine has no allow-list input), so the fix is engine-side.",
+      "upstream": "ipn/ipnlocal/local.go (suggestExitNodeLocked, suggestExitNodeUsingDERP) @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
       "severity": "major"
     },
     {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/497",
-      "title": "No self_change frame is sent when only this node changes",
-      "detail": "setControlClientStatusLocked builds Notify.SelfChange from st.NetMap.SelfNode on every full netmap, so a key-expiry extension, a MagicDNS rename or new self addresses each reach watchers. The merged stream_notify (src/server.rs) attaches self_change only to a frame the engine emits with net_map, and at the pinned engine that tick comes from the peer tracker, so an update that changes only this node produces no frame. Those are the events Go's doc names as the reason the field exists. Disclosed in the field's rustdoc and filed as an engine ask; the real fix is engine-side.",
-      "upstream": "ipn/ipnlocal/local.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
-      "severity": "major"
-    },
-    {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/530",
-      "title": "No load-time clear of a stored AutoUpdate.Apply=true, so every later set fails where Go would have dropped the opt-in",
-      "detail": "ipn/ipnlocal/profiles.go loadSavedPrefs runs `if savedPrefs.AutoUpdate.Apply.EqualBool(true) && !feature.CanAutoUpdate() { savedPrefs.AutoUpdate.Apply.Clear() }`, with a comment saying such a value would otherwise make every EditPrefs fail. So in Go a persisted opt-in on a host that cannot update is gone after the next load and the node stops advertising AllowsUpdate. The merged Prefs::load (src/prefs.rs) and Backend::load (src/ipn/mod.rs) keep it, and the new prospective_auto_update makes every `tnet set` fail until `--no-auto-update` is sent, while up and boot keep advertising AllowsUpdate. The commit body asserts Go fails every later write; that holds only for a value set without a reload, which this load-time clear exists to rule out.",
-      "upstream": "ipn/ipnlocal/profiles.go, ipn/ipnlocal/local.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
-      "severity": "major"
-    },
-    {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/538",
-      "title": "tnet up prints the ported tag refusal behind an error: prefix Go does not write",
-      "detail": "runUp hands prefsFromUpArgs's error to fatalf(\"%s\", err), which runs log.SetFlags(0) and log.Fatalf, so stderr is exactly `tag: \"foo:bar\": tags must start with 'tag:'` and the exit status is 1. In this build the check runs in the daemon, which answers Response::Error, and tnet's up handler (src/bin/tnet.rs) prints `error: {message}`, so the operator reads `error: tag: \"foo:bar\": tags must start with 'tag:'`. Exit status and stream match; the line does not, which defeats the diff's stated aim of letting a script keyed to Go's sentence match. No test checks the CLI-rendered line.",
-      "upstream": "cmd/tailscale/cli/up.go, cmd/tailscale/cli/cli.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
-      "severity": "major"
-    },
-    {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/484",
-      "title": "The --bird-socket refusal keeps an error: prefix, a full stop and build text where Go prints one bare GOOS line",
-      "detail": "Go's stderr is exactly one line, `--bird-socket is not supported on linux` (log.SetFlags(0) then log.Fatalf), and nothing else. The merged first line is `error: --bird-socket is not supported on this platform or in this build of tailnetd.`, followed by explanatory lines that end with the rejected path. A substring match on Go's leading words works; a full-line or start-anchored match on Go's output does not. Disclosed in the diff and its doc comment.",
-      "upstream": "cmd/tailscaled/tailscaled.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/624",
+      "title": "exit-node suggest tells the operator to edit policy where Go would suggest a permitted node",
+      "detail": "Go's runExitNodeSuggest prints one of two things: `Suggested exit node: <name>` with the `tailscale set --exit-node=` hint, or `No exit node suggestion is available.`. The allow-list filters candidates before ranking, so Go never reaches a 'picked but withheld' state. The merged notice says the policy does not list the node this build picked, points the operator to the daemon log for `suggested_id`, and tells them to list that node in the policy. So the advice is to edit policy, widening the administrator's allow-list to work around an engine limitation, which nothing in Go's behaviour calls for. The notice is accurate about this build, but the behaviour it describes diverges from the port target. Same root cause as engine ask #44.",
+      "upstream": "cmd/tailscale/cli/exitnode.go (runExitNodeSuggest) @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
       "severity": "minor"
     },
     {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/497",
-      "title": "self_change is sent on peer-delta ticks, where Go sends none",
-      "detail": "Peer patches and online/last-seen changes go through UpdateNetmapDelta, which notifies PeersChanged/PeerChangedPatch and never sets SelfChange. The engine also ticks net_map for those deltas, and every such tick makes the daemon fetch and attach self_change, so the field's rustdoc claim that it is re-sent like Go on every netmap update is wrong in this direction too. Not disclosed.",
-      "upstream": "ipn/ipnlocal/local.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/624",
+      "title": "The empty-suggestion message is not Go's text",
+      "detail": "When res.ID is empty, Go prints exactly `No exit node suggestion is available.`. For the same case, exit_node_suggest_empty_notice (the function this PR edits) prints `No exit node suggestion available (no eligible exit-node peer right now).`, so a script matching Go's output does not match. The wording predates this PR, but it lives in the function the PR changed, and that function's tests pin it.",
+      "upstream": "cmd/tailscale/cli/exitnode.go (runExitNodeSuggest) @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
       "severity": "minor"
     },
     {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/497",
-      "title": "The self node is read after the tick rather than taken from the netmap being announced",
-      "detail": "Go derives SelfChange from the same st.NetMap it is applying, so the self view and the netmap are one snapshot. The merged fetch_self_report (src/ipn/mod.rs) asks Device::self_node() after the tick arrives, which reads the control runner's self_node cell, updated separately from the peer set, so a frame can pair a peer set with an older or newer self. Not disclosed.",
-      "upstream": "ipn/ipnlocal/local.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/605",
+      "title": "An initial-status watch splits Go's one initial Notify into several frames",
+      "detail": "Go's WatchNotificationsAs builds one initial Notify (`ini`) that carries SessionID and State, Prefs, NetMap, InitialStatus, SuggestedExitNode and Policy together, then registers the watcher. The merged path sends the status snapshot, with the requested engine state and netmap, as the first frame. Prefs, policy and the suggestion follow as separate frames (emit_status_front_loads), and the PR's own test asserts that prefs arrives on the next frame, without the session id. A client written to Go's contract, where the first Notify holds everything it asked for, sees a partial first frame.",
+      "upstream": "ipn/ipnlocal/local.go (WatchNotificationsAs) @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
       "severity": "minor"
     },
     {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/497",
-      "title": "Before the first netmap the initial frame waits up to 500 ms for a self node that Go simply leaves nil",
-      "detail": "WatchNotificationsAs sets the initial SelfChange only when the backend's netmap is non-nil and SelfNode.Valid(); otherwise it is nil and the initial notify goes out at once. The merged initial path calls fetch_self_report whenever the engine's front-load carries net_map, and the engine's self_node() (with_self_node in ts_runtime/src/control_runner.rs at the pinned engine rev) waits until a self node exists, so the call ends only at the 500 ms STATUS_QUERY_TIMEOUT. That delays the first frame of a not-yet-connected epoch. A timeout or engine error also drops self_change when a valid self exists, which Go has no path for.",
-      "upstream": "ipn/ipnlocal/local.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/605",
+      "title": "A peerless InitialStatus outside Running or on a slow netmap",
+      "detail": "Go builds the snapshot with StatusBuilder{WantPeers: true}. updateStatusLocked then calls populatePeerStatusLocked, which lists peers whenever a netmap exists, whatever the backend state. The merged snapshot reuses Backend::status(), which queries peers only in State::Running and returns none if the netmap query exceeds STATUS_QUERY_TIMEOUT. A watcher that subscribes in Starting, or while the netmap is slow, therefore gets a peerless InitialStatus that Go would have populated.",
+      "upstream": "ipn/ipnlocal/local.go (WatchNotificationsAs, updateStatusLocked, populatePeerStatusLocked) @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
       "severity": "minor"
     },
     {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/497",
-      "title": "SelfReport is a 5-field subset of Go's tailcfg.Node",
-      "detail": "Notify.SelfChange is a full *tailcfg.Node: ID, StableID, Name (FQDN with trailing dot), User, Key, KeyExpiry, Addresses, AllowedIPs, CapMap, Tags, Hostinfo and the rest. SelfReport carries stable_id, name, ipv4, ipv6 and key_expiry only; name has no trailing dot and falls back to the bare hostname, and capabilities and tags are absent although Go's doc names capability changes as a reason consumers watch the field. Disclosed as a deliberate scope choice in the diff.",
-      "upstream": "ipn/backend.go, tailcfg/tailcfg.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/605",
+      "title": "tnet debug watch-ipn has no --initial-status flag",
+      "detail": "Go's `tailscale debug watch-ipn` registers `--initial-status` (\"set NotifyInitialStatus: send current ipnstate.Status in first message\") and ORs ipn.NotifyInitialStatus into the mask when it is set. The PR says watch-ipn leaves the bit off because Go's --initial does. That is true of --initial, but the PR adds no way to set the bit from the CLI: both watch call sites in src/bin/tnet.rs hard-code `initial_status: false`. The ported subscription cannot be exercised from tnet the way Go's debug command allows.",
+      "upstream": "cmd/tailscale/cli/debug.go (watch-ipn flags, runWatchIPN) @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
       "severity": "minor"
     },
     {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/530",
-      "title": "A config-file opt-in to AutoUpdate.Apply fails the config load, where Go accepts it",
-      "detail": "initPrefsFromConfig and setConfigLocked apply the config's MaskedPrefs with ApplyEdits and SetPrefs/setPrefsLocked and never call checkPrefsLocked, so `\"AutoUpdate\": {\"Apply\": true}` is accepted on any host. The merged Config::apply_to_prefs (src/conffile.rs) asks check_auto_update_pref and refuses the whole load or reload. Disclosed in the diff as deliberate.",
-      "upstream": "ipn/ipnlocal/local.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
-      "severity": "minor"
-    },
-    {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/530",
-      "title": "The auto-update refusal text is not Go's sentence",
-      "detail": "checkAutoUpdatePrefsLocked returns exactly `Auto-updates are not supported on this platform.`, or `Auto-update support is disabled in this build` when the client-update feature is compiled out. The merged check_auto_update_pref (src/ipn/selfupdate.rs) returns a host-specific reason, an extra sentence about Hostinfo.AllowsUpdate and a caller-chosen remedy; the Homebrew case starts `Auto-updates are not supported on this installation:`, so not even Go's prefix matches there. TS_TEST_ALLOW_AUTO_UPDATE, which forces Go's CanAutoUpdate to true, is not honoured.",
-      "upstream": "ipn/ipnlocal/local.go, feature/hooks.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
-      "severity": "minor"
-    },
-    {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/530",
-      "title": "set stops at the first error and checks advertise-routes before auto-update",
-      "detail": "checkPrefsLocked joins every failing rule with errors.Join in the order profile name, SSH, exit node, funnel, auto-update, advertise routes, and editPrefsLocked returns that joined error. The commit fixed that order for check-prefs, but the real write path begin_set_gated (src/ipn/mod.rs) returns on its first failure and checks routes, then SSH, then auto-update, so a set that breaks both the route rule and the auto-update rule reports only the route error. Not disclosed.",
-      "upstream": "ipn/ipnlocal/local.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
-      "severity": "minor"
-    },
-    {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/538",
-      "title": "Under --json a bad tag is printed as JSON on stdout, where Go prints plain text on stderr",
-      "detail": "prefsFromUpArgs fails before runUp produces any JSON, and fatalf writes the plain sentence to stderr whether or not --json was given. The merged up handler, with --json, prints `{\"Error\":\"tag: ...\"}` on stdout instead.",
-      "upstream": "cmd/tailscale/cli/up.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
-      "severity": "minor"
-    },
-    {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/538",
-      "title": "The revert and login-server guards fire before the tag check, the reverse of Go's check order",
-      "detail": "runUp calls prefsFromUpArgs, where the tag check lives, before updatePrefs, which holds the accidental-revert check and `can't change --login-server without --force-reauth`. The merged server runs up_revert_guard and up_control_url_guard (src/server.rs) before begin_up reaches the tag check (src/ipn/mod.rs), so `up --advertise-tags foo:bar` on a node with unmentioned non-default settings shows the revert guidance where Go shows the tag refusal.",
-      "upstream": "cmd/tailscale/cli/up.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
-      "severity": "minor"
-    },
-    {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/538",
-      "title": "Tag refusals quote with Rust {:?}, which differs from Go's %q for control characters",
-      "detail": "Go formats the tag with %q, which escapes a control byte as `\\x01` and DEL as `\\x7f`. The merged frame uses Rust's Debug formatting, which writes `\\u{1}` and `\\u{7f}`. Such a value is valid UTF-8, reaches CheckTag's fourth clause and is refused on both sides, but with different quoted text, so the diff's claim that the two agree on every string that can reach the frame does not hold.",
-      "upstream": "cmd/tailscale/cli/up.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
-      "severity": "minor"
-    },
-    {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/544",
-      "title": "On funnel, the PROXY and mount-point refusals fire where Go would first run verifyFunnelEnabled",
-      "detail": "runServeCombined calls e.verifyFunnelEnabled(ctx, 443) for funnel right after the service-with-funnel check and before cleanURLPath, srvTypeAndPortFromFlags and both PROXY checks; that call talks to the daemon and refuses a node without Funnel access. The merged run_serve_v2 (src/bin/tnet.rs) runs check_serve_flags_or_exit first, with no daemon contact, and nothing in the tree ports verifyFunnelEnabled, so `funnel --proxy-protocol=1 3000` on a node without Funnel, or with the daemon down, prints the PROXY sentence where Go prints a funnel or status error. tests/serve_refusal_stderr_framing.rs asserts the bare PROXY line for funnel against a socket that does not exist, pinning output Go does not produce. The missing verifyFunnelEnabled itself predates this diff.",
-      "upstream": "cmd/tailscale/cli/serve_v2.go, cmd/tailscale/cli/funnel.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
-      "severity": "minor"
-    },
-    {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/544",
-      "title": "The tun refusal fires before any daemon contact, where Go reaches it only after reading the serve config and status",
-      "detail": "`tun mode is only supported for services` sits after e.lc.GetServeConfig (`error getting serve config: %w`) and the status read in runServeCombined, so with the daemon unreachable Go prints the serve-config error instead. The merged check_serve_flags raises it with no daemon at all, and the new integration test asserts it against a missing socket. With a live daemon the bytes match.",
-      "upstream": "cmd/tailscale/cli/serve_v2.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
-      "severity": "minor"
-    },
-    {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/544",
-      "title": "The four bare refusals run before validateArgs, so a malformed argument list gets a different error",
-      "detail": "runServeCombined runs the set-raw short-circuit and then e.validateArgs before any flag refusal; with two arguments whose last is not `off` validateArgs writes `Error: invalid argument format` plus the help pointer. The merged run_serve_v2 calls check_serve_flags_or_exit as its first statement, before the trailing-argument check, so `tnet serve --proxy-protocol=3 3000 foo` prints the PROXY sentence where Go prints the argument-format error.",
-      "upstream": "cmd/tailscale/cli/serve_v2.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
-      "severity": "minor"
-    },
-    {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/544",
-      "title": "The mount-point refusal quotes the path with {:?}, not Go's %q",
-      "detail": "cleanURLPath returns fmt.Errorf(\"invalid mount point %q\", urlPath), wrapped as `failed to clean the mount point: %w`. The merged path writes the value with Rust's Debug formatting; plain ASCII matches, but a control byte is written `\\u{1}` where Go writes `\\x01`, so the diff's byte-for-byte claim holds only for printable paths.",
-      "upstream": "cmd/tailscale/cli/serve_v2.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
-      "severity": "minor"
-    },
-    {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/547",
-      "title": "The web interrupt handler is armed after the pref step, not as runWeb's first statement",
-      "detail": "runWeb's first statement is signal.NotifyContext(ctx, os.Interrupt), before StatusWithoutPeers, GetPrefs and setRunWebClient(ctx, true). A Ctrl-C during those round trips cancels ctx (setRunWebClient fails, exit 1), and one that lands after the pref is on is seen by the goroutine, which turns the pref back off and exits 0. The merged run_web (src/bin/tnet.rs) awaits start_tailscaled_web_client first and only polls web_interrupt() inside serve_until_interrupt, so a Ctrl-C during the pref step still dies with the default disposition (status 130) and can leave RunWebClient on. The diff's own doc comment says the arm comes first.",
-      "upstream": "cmd/tailscale/cli/web.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
-      "severity": "minor"
-    },
-    {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/547",
-      "title": "A CGI serve error exits 1, where Go logs it and exits 0",
-      "detail": "In CGI mode runWeb does `if err := cgi.Serve(webServer); err != nil { log.Printf(\"tailscale.cgi: %v\", err) }; return nil`, so every CGI run that is not interrupted ends at status 0. The merged CGI branch returns whatever run_web_cgi returns through serve_until_interrupt, and run_web_cgi returns Err when writing or flushing stdout fails, so that run exits 1. The diff rewired exactly this branch's exit path without matching it.",
-      "upstream": "cmd/tailscale/cli/web.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
-      "severity": "minor"
-    },
-    {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/547",
-      "title": "The interrupt arm's stop lines are written bare, without Go's standard log prefix",
-      "detail": "The goroutine logs `stopping tailscaled web client` with log.Println and `stopping tailscaled web client: %v` with log.Printf, through the standard logger with its default date-time flags; nothing on the web path calls log.SetFlags (cli.go only does so inside fatalf). The on_interrupt block the diff added writes both with eprintln!, with no timestamp.",
-      "upstream": "cmd/tailscale/cli/web.go, cmd/tailscale/cli/cli.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
-      "severity": "minor"
-    },
-    {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/531",
-      "title": "The change test compares rendered StringList rows, so two different lists can compare equal",
-      "detail": "Snapshot.EqualItems compares the snapshot's deephash of the raw items, so any change to a []string value differs. The merged reload_and_publish (src/ipn/syspolicy.rs) compares rendered PolicySetting rows, and a StringList renders as Go's %v, `[a b]`, so [\"a b\"] and [\"a\",\"b\"] render identically and a real change to a list key such as AllowedSuggestedExitNodes would not tick, while consumers read the decoded lists that did change. Not disclosed; unreachable with a single registration.",
-      "upstream": "util/syspolicy/setting/snapshot.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
-      "severity": "minor"
-    },
-    {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/531",
-      "title": "The change test compares AuthKey as <redacted>, where Go compares the raw value",
-      "detail": "EqualItems hashes the raw items, AuthKey included. The merged rows carry the literal <redacted> for AuthKey and the real key lives out of band in PolicySource::auth_key, which the comparison never sees, so a change of only the key value would not tick. Disclosed on reload_and_publish; unreachable with a single registration.",
-      "upstream": "util/syspolicy/setting/snapshot.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
-      "severity": "minor"
-    },
-    {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/531",
-      "title": "The first resolution ticks, where Go's old != nil check suppresses it",
-      "detail": "reloadNow invokes the change callbacks only when `old != nil && !old.EqualItems(new)`, so the first resolution of a scope notifies nobody. The merged LAST_PUBLISHED starts as an empty snapshot, so registering the policy file is always an empty-to-rows change and ticks. Disclosed on reload_and_publish and unobservable in the daemon, because tailnetd registers the source before any watcher can exist.",
-      "upstream": "util/syspolicy/rsop/resultant_policy.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
-      "severity": "minor"
-    },
-    {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/535",
-      "title": "The #459 log-line finding says Go's skip line has no Start: prefix; Go's does",
-      "detail": "startLocked sets `logf := logger.WithPrefix(b.logf, \"Start: \")` and logs both `not setting opts.AuthKey from syspolicy; login profiles exist, state=%v` and `setting opts.AuthKey by syspolicy, len=%v` through it, so both lines carry `Start: `. The committed #459 finding states that upstream's skip line has no `Start: ` prefix. The rest of that finding (`by syspolicy`, the len=%v field, the flattened branch) is accurate.",
-      "upstream": "ipn/ipnlocal/local.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
-      "severity": "minor"
-    },
-    {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/535",
-      "title": "The #482 tag-wording finding was already fixed on main when the audit merged",
-      "detail": "The committed #482 finding says the tag refusals are reworded away from tailcfg.CheckTag's four sentences and prefsFromUpArgs's `tag: %q: %s` frame. That described #482's own code, but a38687b (#538), an ancestor of ddd2fb8, had already switched complete_and_validate_advertise_tags to Go's frame and CheckTag's sentences verbatim. A reader following the row chases a divergence that no longer existed at the commit that recorded it.",
-      "upstream": "tailcfg/tailcfg.go, cmd/tailscale/cli/up.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/631",
+      "title": "Concurrent suggestion computations can leave the cell and watchers on the older answer",
+      "detail": "Go computes and publishes under b.mu, so lastSuggestedExitNode and the bus always end on the most recently computed suggestion. In the merged code the engine call runs off-lock and only the compare-and-store is atomic. Three callers compute a suggestion: the recompute task, `exit-node suggest` and a watch front-load. If two of their computations finish in reverse order, the older answer is stored and announced last, and it stays until the next netmap recompute. The front-load in emit_suggestion_front_load can then send its own id followed by that older cell value. The PR documents this ('Ordering is not Go's') and relies on the engine's sticky suggestion to make it rare, but it still diverges from Go's serialised guard.",
+      "upstream": "ipn/ipnlocal/local.go (suggestExitNodeLocked, SuggestExitNode) @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
       "severity": "minor"
     }
   ]
