@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.67.4](https://github.com/GeiserX/tailscaled-rs/compare/v0.67.3...v0.67.4) (2026-10-10)
+
+
+### Bug Fixes
+
+* **ipn:** announce a raced exit-node suggestion once, never swallow one ([#631](https://github.com/GeiserX/tailscaled-rs/issues/631)) ([f95330a](https://github.com/GeiserX/tailscaled-rs/commit/f95330a6a9b18489b4311d08640d20a60096a6ff))
+
 ## [0.67.3](https://github.com/GeiserX/tailscaled-rs/compare/v0.67.2...v0.67.3) (2026-10-07)
 
 
