@@ -1,15 +1,34 @@
 {
   "schema": "parity-audit/v1",
+  "summary": {
+    "auditedPrs": 4,
+    "faithful": 1,
+    "gaps": 3,
+    "findings": 5,
+    "upstream": {
+      "ref": "v1.102.4",
+      "commit": "bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "note": "The revision every upstream citation below was read at, and the ref docs/PARITY_GAP_ANALYSIS.md pins.",
+      "clone": "github.com/tailscale/tailscale cloned shallow at tag v1.102.4, which resolves to bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8."
+    },
+    "note": "A re-reading of the four merged pull requests #605, #611, #624 and #625, each squash commit read against github.com/tailscale/tailscale at v1.102.4. Three carry gaps and one is faithful; the five findings are all minor. #611 is a dependency bump rather than a port, and the engine delta it brought in was not audited. Engine-side causes are named as such. Nothing is fixed here; each finding is left as follow-up work."
+  },
   "auditedPrs": [
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/605",
       "verdict": "gaps",
-      "notes": "Squash 8c97d86. Read against ipn/backend.go, ipn/ipnlocal/local.go (WatchNotificationsAs), ipn/localapi/localapi.go (serveWatchIPNBus) and cmd/tailscale/cli/debug.go at v1.102.4 (bbcd7d1f). The merged diff is the residue left after #580 had already landed the feature: one doc comment, one doc fix and two tests. The session-id-rides-the-first-frame and nil-means-unchanged claims match Go. One gap: the doc comment's statement about Go's watch-ipn flags hides that Go has --initial-status and tnet has no way to set the bit."
+      "notes": "Squash 8c97d86. Read against ipn/backend.go, ipn/ipnlocal/local.go (WatchNotificationsAs), ipn/localapi/localapi.go (serveWatchIPNBus) and cmd/tailscale/cli/debug.go at v1.102.4 (bbcd7d1f). The merged diff is the residue left after #580 had already landed the feature: one doc comment, one doc fix and two tests. The session-id-rides-the-first-frame and nil-means-unchanged claims match Go. One gap: the doc comment's statement about Go's watch-ipn flags hides that Go has --initial-status and tnet has no way to set the bit.",
+      "divergences": [
+        "--initial-status"
+      ]
     },
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/611",
       "verdict": "gaps",
-      "notes": "Squash 54866a4. A dependency bump, not a port: it cites no Go file. Checked the two source adaptations against cmd/tailscale/cli/whois.go and ipn/ipnstate/ipnstate.go at v1.102.4. The StatusNode fields are only added to a test fixture. The WhoIs.user() switch is not neutral: it turns a field that was always absent into a populated one, with a different rule than Go's. The engine itself moved from 0.43.x to 0.57.4 in this bump; that engine delta was not audited here."
+      "notes": "Squash 54866a4. A dependency bump, not a port: it cites no Go file. Checked the two source adaptations against cmd/tailscale/cli/whois.go and ipn/ipnstate/ipnstate.go at v1.102.4. The StatusNode fields are only added to a test fixture. The WhoIs.user() switch is not neutral: it turns a field that was always absent into a populated one, with a different rule than Go's. The engine itself moved from 0.43.x to 0.57.4 in this bump; that engine delta was not audited here.",
+      "divergences": [
+        "user()"
+      ]
     },
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/624",
@@ -19,7 +38,12 @@
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/625",
       "verdict": "gaps",
-      "notes": "Squash 2ede56f. Read against ipn/ipnlocal/local.go (suggestExitNodeLocked, suggestExitNode, suggestExitNodeUsingDERP, WatchNotificationsAs, sysPolicyChanged, mutationsAreWorthyOfRecalculatingSuggestedExitNode, resetForProfileChangeLocked, sendToLocked) at v1.102.4 (bbcd7d1f). Faithful: empty id sent as a change, error path sends nothing and keeps the remembered id, pushes go to every masked watch whatever its mask, one front-load per subscription, silent reset on profile change, recompute on netmap and on an allow-list change. Three gaps, all minor, listed below."
+      "notes": "Squash 2ede56f. Read against ipn/ipnlocal/local.go (suggestExitNodeLocked, suggestExitNode, suggestExitNodeUsingDERP, WatchNotificationsAs, sysPolicyChanged, mutationsAreWorthyOfRecalculatingSuggestedExitNode, resetForProfileChangeLocked, sendToLocked) at v1.102.4 (bbcd7d1f). Faithful: empty id sent as a change, error path sends nothing and keeps the remembered id, pushes go to every masked watch whatever its mask, one front-load per subscription, silent reset on profile change, recompute on netmap and on an allow-list change. Three gaps, all minor: a front-load skipped at subscribe time is never made up, a pick withheld by AllowedSuggestedExitNodes is pushed as an empty id where Go names the best permitted node, and the compare-and-publish is no longer one step once the recompute task writes without the backend lock.",
+      "divergences": [
+        "front-load skipped",
+        "withheld by AllowedSuggestedExitNodes",
+        "compare-and-publish"
+      ]
     }
   ],
   "gate": {
