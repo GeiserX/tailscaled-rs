@@ -1328,14 +1328,8 @@ async fn emit_suggested_exit_node_frame(
 }
 
 /// The `suggested_exit_node` front-load: compute this device's suggestion, then send this client that
-/// computation's answer ([`ipn::suggested_exit_node_id`]) — nothing when it failed or was not run.
+/// computation's answer through [`emit_suggestion_front_load`] — nothing when it was not run.
 /// Returns `Err` if the client hung up.
-///
-/// The computation also publishes to every watcher when the answer moved, this one included. Go
-/// builds its initial notify before registering the new session, so that session never receives
-/// the push as well. Here the push is marked seen when the cell still holds the value just sent, for
-/// the same effect. If something else published in between, the newer value stays pending and the
-/// select arm sends it after this frame.
 async fn emit_suggested_exit_node_front_load(
     write_half: &mut tokio::net::unix::OwnedWriteHalf,
     session: &mut NotifySession,
@@ -1346,13 +1340,40 @@ async fn emit_suggested_exit_node_front_load(
     let Some(response) = Backend::front_load_suggested_exit_node(backend, dev).await else {
         return Ok(()); // not computed: Go's error arm, no field
     };
-    let Some(id) = ipn::suggested_exit_node_id(&response) else {
+    emit_suggestion_front_load(write_half, session, &response, suggested_rx).await
+}
+
+/// Send the `suggested_exit_node` front-load for a suggestion this watch just computed: the answer's
+/// own id ([`ipn::suggested_exit_node_id`]), `""` when no candidate is eligible, and nothing when
+/// the engine failed (Go's error arm, which also leaves the channel alone). Returns `Err` if the
+/// client hung up. Split from the computation so it can be driven without a live device.
+///
+/// The computation also publishes to every watcher when the answer moved, this one included. Go
+/// builds its initial notify and registers the new session under one lock, so that session never
+/// receives the push as well, and no other push can land in between. Here the computation runs
+/// off-lock and the recompute task can publish a newer pick behind it. So the channel is read and
+/// marked seen in ONE step (`borrow_and_update`): the computation's own push does not come round
+/// again, and whatever the cell held at that instant is in hand. If that is not the id just sent,
+/// something published in between, and it goes out as a second frame. The watcher ends up holding
+/// what the cell holds, as a Go watcher would after the later push.
+///
+/// A separate `borrow` and `mark_unchanged` would not do: a pick published between the two is
+/// marked seen without ever being read, and the watcher keeps the older id until the next change.
+async fn emit_suggestion_front_load(
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    session: &mut NotifySession,
+    response: &Response,
+    suggested_rx: &mut tokio::sync::watch::Receiver<String>,
+) -> Result<()> {
+    let Some(id) = ipn::suggested_exit_node_id(response) else {
         return Ok(()); // the engine failed: Go's error arm, no field
     };
-    if *suggested_rx.borrow() == id {
-        suggested_rx.mark_unchanged();
+    let current = suggested_rx.borrow_and_update().clone();
+    emit_suggested_exit_node_frame(write_half, session, id).await?;
+    if current != id {
+        emit_suggested_exit_node_frame(write_half, session, &current).await?;
     }
-    emit_suggested_exit_node_frame(write_half, session, id).await
+    Ok(())
 }
 
 /// Send the session's opening frames for a watch that set `initial_status`: the status snapshot,
@@ -2934,6 +2955,188 @@ mod tests {
         );
 
         stream.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A down node's backend (no device, no engine) over a fresh state dir, shared the way the
+    /// server shares it.
+    async fn down_backend(tag: &str) -> (Arc<Mutex<Backend>>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "tailnetd-server-suggest-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let backend = Backend::load(&dir).await.expect("load an empty state dir");
+        (Arc::new(Mutex::new(backend)), dir)
+    }
+
+    fn suggestion(id: &str) -> Response {
+        Response::ExitNodeSuggestion {
+            suggestion: Some(crate::localapi::ExitNodeSuggestionView {
+                id: id.to_string(),
+                name: "berlin".to_string(),
+            }),
+            withheld_by_policy: false,
+        }
+    }
+
+    /// With no device there is nothing to compute from (Go's `ErrNoPreferredDERP`), so the
+    /// front-load is absent: the remembered pick is not sent in place of a fresh answer. The watch
+    /// still hears the next change.
+    #[tokio::test]
+    async fn no_device_means_no_suggestion_front_load_even_with_a_remembered_pick() {
+        let (backend, dir) = down_backend("nodevice").await;
+        assert!(
+            backend
+                .lock()
+                .await
+                .publish_suggested_exit_node(&suggestion("nodeid-old"))
+        );
+
+        let (client, server) = UnixStream::pair().expect("UnixStream::pair");
+        let (_server_read, mut write_half) = server.into_split();
+        let (client_read, _client_write) = client.into_split();
+        let mut reader = BufReader::new(client_read);
+
+        let stream_backend = Arc::clone(&backend);
+        let stream = tokio::spawn(async move {
+            // The suggestion bit, plus prefs so that a first frame says the watch has subscribed.
+            stream_notify(
+                &mut write_half,
+                &stream_backend,
+                false,
+                false,
+                true,
+                false,
+                true,
+                false,
+            )
+            .await
+        });
+
+        let first = next_notify_frame(&mut reader).await;
+        assert!(first.prefs.is_some(), "the prefs front-load: {first:?}");
+        assert_eq!(first.suggested_exit_node, None);
+
+        // The frames are written in order, so a front-load of the remembered pick would arrive
+        // ahead of this change. The next frame being the change shows none was sent.
+        assert!(
+            backend
+                .lock()
+                .await
+                .publish_suggested_exit_node(&suggestion("nodeid-new"))
+        );
+        let next = next_notify_frame(&mut reader).await;
+        assert_eq!(
+            next.suggested_exit_node.as_deref(),
+            Some("nodeid-new"),
+            "a failed computation carries no SuggestedExitNode, and the cell is not a substitute"
+        );
+
+        stream.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Drive [`emit_suggestion_front_load`] over a socket pair and collect the id of every frame it
+    /// wrote.
+    async fn run_front_load(
+        response: &Response,
+        rx: &mut tokio::sync::watch::Receiver<String>,
+    ) -> Vec<Option<String>> {
+        let (client, server) = UnixStream::pair().expect("UnixStream::pair");
+        let (server_read, mut write_half) = server.into_split();
+        let (client_read, _client_write) = client.into_split();
+        let mut reader = BufReader::new(client_read);
+        let mut session = NotifySession::new(false).expect("mint a session");
+        emit_suggestion_front_load(&mut write_half, &mut session, response, rx)
+            .await
+            .expect("write the front-load");
+        // Close the server end so the frames are followed by EOF.
+        drop((server_read, write_half));
+        let mut frames = Vec::new();
+        loop {
+            let mut line = String::new();
+            let read = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                reader.read_line(&mut line),
+            )
+            .await
+            .expect("a frame or EOF within 5s")
+            .expect("read a frame");
+            if read == 0 {
+                return frames;
+            }
+            match serde_json::from_str::<Response>(&line).expect("a Response line") {
+                Response::Notify(view) => frames.push(view.suggested_exit_node),
+                other => panic!("expected a notify frame, got {other:?}"),
+            }
+        }
+    }
+
+    /// The front-load carries the computation's own answer, and marks its own push seen so it is
+    /// not delivered twice.
+    #[tokio::test]
+    async fn the_front_load_sends_the_computed_answer_once() {
+        let (backend, dir) = down_backend("frontload").await;
+        let be = backend.lock().await;
+        let mut rx = be.watch_suggested_exit_node();
+
+        // What `Backend::front_load_suggested_exit_node` does: compute, then publish.
+        let response = suggestion("nodeid-a");
+        assert!(be.publish_suggested_exit_node(&response));
+        assert_eq!(
+            run_front_load(&response, &mut rx).await,
+            [Some("nodeid-a".to_string())]
+        );
+        assert!(
+            !rx.has_changed().unwrap(),
+            "the computation's own push must not come round again as a second frame"
+        );
+
+        // No eligible candidate is a nil error in Go: the front-load carries the empty id.
+        let empty = Response::ExitNodeSuggestion {
+            suggestion: None,
+            withheld_by_policy: false,
+        };
+        assert!(be.publish_suggested_exit_node(&empty));
+        assert_eq!(run_front_load(&empty, &mut rx).await, [Some(String::new())]);
+        assert!(!rx.has_changed().unwrap());
+
+        // An engine error sends nothing, and a push that is pending stays pending for the select.
+        assert!(be.publish_suggested_exit_node(&suggestion("nodeid-b")));
+        let failed = Response::Error {
+            message: "exit-node suggest failed: NoPreferredDerp".to_string(),
+        };
+        assert!(run_front_load(&failed, &mut rx).await.is_empty());
+        assert!(rx.has_changed().unwrap());
+        drop(be);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A recompute that publishes a newer pick between this watch's computation and the front-load
+    /// must not be swallowed: the watcher is sent its computed answer and then the newer one.
+    #[tokio::test]
+    async fn a_pick_published_behind_the_front_load_is_not_swallowed() {
+        let (backend, dir) = down_backend("race").await;
+        let be = backend.lock().await;
+        let mut rx = be.watch_suggested_exit_node();
+
+        let computed = suggestion("nodeid-a");
+        assert!(be.publish_suggested_exit_node(&computed));
+        // The recompute task, on a netmap that arrived in between.
+        assert!(be.publish_suggested_exit_node(&suggestion("nodeid-b")));
+
+        assert_eq!(
+            run_front_load(&computed, &mut rx).await,
+            [Some("nodeid-a".to_string()), Some("nodeid-b".to_string())],
+            "the watcher must end up holding what the cell holds"
+        );
+        assert!(
+            !rx.has_changed().unwrap(),
+            "and not be sent it a third time"
+        );
+        drop(be);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
