@@ -175,8 +175,19 @@ pub fn suggested_exit_node_id(response: &crate::localapi::Response) -> Option<&s
 /// error publishes nothing and leaves the cell alone, because Go's error path returns before both
 /// the compare and the assignment.
 ///
-/// Written with `send_replace`, never `send`: `send` refuses — and does NOT store — when there are
-/// no receivers, which is the common case, and would make every later suggestion look like a change.
+/// Written with `send_if_modified`, never `send`: `send` refuses — and does NOT store — when there
+/// are no receivers, which is the common case, and would make every later suggestion look like a
+/// change. `send_if_modified` also makes the compare and the store one step under the channel's
+/// lock, which a separate `borrow` and `send_replace` are not. The recompute task publishes through
+/// its own clone of the sender, with no backend lock, so it can race `exit-node suggest` and a watch
+/// front-load. Two that land on the same new pick must announce it once, as Go's guard does under
+/// `b.mu`.
+///
+/// **Ordering is not Go's.** Go computes and publishes under `b.mu`, so two computations land in the
+/// order they ran. Here the engine call runs off-lock and only this compare-and-store is atomic. Two
+/// computations that finish in reverse order leave the cell on the older answer until the next
+/// netmap recomputes it. The engine's suggestion is sticky, so two that run close together almost
+/// always agree.
 fn publish_suggested_exit_node(
     cell: &tokio::sync::watch::Sender<String>,
     response: &crate::localapi::Response,
@@ -184,15 +195,20 @@ fn publish_suggested_exit_node(
     let Some(id) = suggested_exit_node_id(response) else {
         return false; // an engine error: Go returns before the compare and the assignment
     };
-    if *cell.borrow() == id {
-        return false; // unchanged — Go's `prevSuggestion != res.ID` guard
+    let published = cell.send_if_modified(|prev| {
+        if prev == id {
+            return false; // unchanged — Go's `prevSuggestion != res.ID` guard
+        }
+        id.clone_into(prev);
+        true
+    });
+    if published {
+        tracing::debug!(
+            suggested_id = %id,
+            "exit-node suggestion changed; publishing to notify watchers"
+        );
     }
-    tracing::debug!(
-        suggested_id = %id,
-        "exit-node suggestion changed; publishing to notify watchers"
-    );
-    cell.send_replace(id.to_string());
-    true
+    published
 }
 
 /// Why [`suggested_exit_node_loop`] recomputes the suggestion.
@@ -2359,9 +2375,9 @@ pub struct Backend {
     /// recompute task ([`suggestion_task`](Backend::suggestion_task)), right after each computes, and
     /// never from a request handler. One compare, no second copy to fall out of step.
     ///
-    /// Written with `send_replace`, never `send`: `send` refuses — and, load-bearingly, does NOT store
-    /// — when there are no receivers, which is the common case (nobody is watching), and would leave
-    /// the cell empty so that every later suggestion looked like a change.
+    /// Written with `send_if_modified`, never `send`: `send` refuses — and, load-bearingly, does NOT
+    /// store — when there are no receivers, which is the common case (nobody is watching), and would
+    /// leave the cell empty so that every later suggestion looked like a change.
     suggested_exit_node_tx: tokio::sync::watch::Sender<String>,
     /// The exit-node suggestion recompute task ([`suggested_exit_node_loop`]): Go's
     /// `suggestExitNodeLocked` calls from the netmap path and from `sysPolicyChanged`. Like
@@ -6998,13 +7014,49 @@ mod tests {
     async fn publishing_with_no_watchers_still_records_the_pick() {
         let be = suggestion_backend();
         // Nobody is watching — the common case. `watch::Sender::send` would refuse here AND leave the
-        // value unstored, so the cell must be written with `send_replace`; otherwise every later
+        // value unstored, so the cell must be written with `send_if_modified`; otherwise every later
         // suggestion would look like a change.
         assert!(be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")));
         assert!(
             !be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")),
             "the pick must have been recorded even with zero receivers"
         );
+    }
+
+    /// The recompute task publishes through its own clone of the sender and takes no backend lock,
+    /// so it can race `exit-node suggest` and a watch front-load, which publish under that lock. Go
+    /// runs the compare and the assignment under `b.mu`, so however many computations land on the
+    /// same new pick, `sendToLocked` runs once. The same has to hold here: one publisher reports the
+    /// change and every watcher is woken once, not once per publisher.
+    #[test]
+    fn racing_publishers_of_one_pick_announce_it_once() {
+        const PUBLISHERS: usize = 4;
+        let pick = suggestion_response("nodeid-a", "berlin");
+        for round in 0..500 {
+            let (cell, rx) = tokio::sync::watch::channel(String::new());
+            let start = std::sync::Barrier::new(PUBLISHERS);
+            let announced = std::thread::scope(|scope| {
+                let publishers: Vec<_> = (0..PUBLISHERS)
+                    .map(|_| {
+                        let (cell, start, pick) = (cell.clone(), &start, &pick);
+                        scope.spawn(move || {
+                            start.wait();
+                            publish_suggested_exit_node(&cell, pick)
+                        })
+                    })
+                    .collect();
+                publishers
+                    .into_iter()
+                    .map(|publisher| publisher.join().expect("a publisher panicked"))
+                    .filter(|published| *published)
+                    .count()
+            });
+            assert_eq!(
+                announced, 1,
+                "round {round}: one pick is one change, whoever computed it"
+            );
+            assert_eq!(*rx.borrow(), "nodeid-a");
+        }
     }
 
     #[tokio::test]
@@ -7138,6 +7190,25 @@ mod tests {
             .await
             .expect("switch to a new empty profile");
         assert_eq!(*be.watch_suggested_exit_node().borrow(), "");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn down_keeps_the_last_suggestion() {
+        let dir = suggestion_state_dir("down").await;
+        let mut be = backend_for(&dir);
+        assert!(be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")));
+
+        be.down(alwayson::Actor::Operator { reason: None })
+            .await
+            .expect("down on a node that is not up");
+        // Go's `resetForProfileChangeLocked` is not on the stop path, so the same profile coming back
+        // up compares its first suggestion against the pick it had.
+        assert_eq!(*be.watch_suggested_exit_node().borrow(), "nodeid-a");
+        assert!(
+            !be.publish_suggested_exit_node(&suggestion_response("nodeid-a", "berlin")),
+            "the pick a stopped node had is still the baseline when it comes back"
+        );
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
