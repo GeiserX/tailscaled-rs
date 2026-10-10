@@ -1,22 +1,22 @@
 {
   "schema": "parity-audit/v1",
   "summary": {
-    "auditedPrs": 8,
-    "faithful": 0,
-    "gaps": 8,
-    "findings": 27,
+    "auditedPrs": 12,
+    "faithful": 1,
+    "gaps": 11,
+    "findings": 32,
     "upstream": {
       "ref": "v1.102.4",
       "commit": "bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
       "note": "The revision every upstream citation below was read at, and the ref docs/PARITY_GAP_ANALYSIS.md pins.",
       "clone": "github.com/tailscale/tailscale cloned shallow at tag v1.102.4; HEAD verified as bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8."
     },
-    "note": "An independent re-reading of the eight merged pull requests #484, #497, #530, #531, #535, #538, #544 and #547, each squash commit read diff by diff against github.com/tailscale/tailscale at v1.102.4, replacing the previous edition of the same eight. Every finding was checked on both the Go and the Rust side; findings that could not be confirmed on both sides were left out. Where the merged commit or rustdoc discloses a divergence, the finding says so. Engine-side causes are named as such. Nothing is fixed here; each finding is left as tracked work."
+    "note": "Twelve merged pull requests, each squash commit read against github.com/tailscale/tailscale at v1.102.4. #484, #497, #530, #531, #535, #538, #544 and #547 are an independent re-reading that replaced the previous edition of the same eight; every finding there was checked on both the Go and the Rust side, and findings that could not be confirmed on both sides were left out. #605, #611, #624 and #625 were re-read separately at the same pin: three carry gaps and one is faithful, and their five findings are all minor. #611 is a dependency bump rather than a port, and the engine delta it brought in was not audited. Where the merged commit or rustdoc discloses a divergence, the finding says so. Engine-side causes are named as such. Nothing is fixed here; each finding is left as tracked work."
   },
   "gate": {
     "ran": true,
     "pass": true,
-    "detail": "All four steps green on main at 877814d, run with CARGO_BUILD_JOBS=4, RUST_TEST_THREADS=4, TS_RS_EXPERIMENT=this_is_unstable_software on the stable 1.95.0 toolchain: `cargo fmt --all --check` and `cargo clippy --all-targets -- -D warnings` clean; `cargo test --all-targets` 42 test targets, 1267 passed, 0 failed, 5 ignored; `cargo build --release --bins` finished in 6m 32s. Two machine facts, neither about the tree: the default toolchain here is a nightly with no clippy component, so the gate ran on 1.95.0 (what CI's stable runner uses); and the first test run, under the long per-session TMPDIR, failed only tailnetd's cleanup_refuses_live_socket with `path must be shorter than SUN_LEN` (darwin's 104-byte sun_path). Rerun with a short TMPDIR, test and release build passed."
+    "detail": "All four steps green on main at 0d2b444, toolchain 1.95.0 (the default nightly here has no clippy), CARGO_BUILD_JOBS=4, RUST_TEST_THREADS=4, TS_RS_EXPERIMENT=this_is_unstable_software. fmt --all --check: clean. clippy --all-targets -D warnings: clean. cargo test --all-targets: 42 test targets, 1278 passed, 0 failed, 5 ignored. cargo build --release --bins: finished. Caveat: the first test pass ran with a long scratch directory and failed one test, tailnetd tests::cleanup_refuses_live_socket ('path must be shorter than SUN_LEN', a Unix socket path limit, not a code fault), and cargo stopped there. The test and release-build steps were rerun with a short TMPDIR and that run is the one counted."
   },
   "auditedPrs": [
     {
@@ -108,6 +108,37 @@
       "divergences": [
         "Start: prefix",
         "already fixed"
+      ]
+    },
+    {
+      "url": "https://github.com/GeiserX/tailscaled-rs/pull/605",
+      "verdict": "gaps",
+      "notes": "Squash 8c97d86. Read against ipn/backend.go, ipn/ipnlocal/local.go (WatchNotificationsAs), ipn/localapi/localapi.go (serveWatchIPNBus) and cmd/tailscale/cli/debug.go at v1.102.4 (bbcd7d1f). The merged diff is the residue left after #580 had already landed the feature: one doc comment, one doc fix and two tests. The session-id-rides-the-first-frame and nil-means-unchanged claims match Go. One gap: the doc comment's statement about Go's watch-ipn flags hides that Go has --initial-status and tnet has no way to set the bit.",
+      "divergences": [
+        "--initial-status"
+      ]
+    },
+    {
+      "url": "https://github.com/GeiserX/tailscaled-rs/pull/611",
+      "verdict": "gaps",
+      "notes": "Squash 54866a4. A dependency bump, not a port: it cites no Go file. Checked the two source adaptations against cmd/tailscale/cli/whois.go and ipn/ipnstate/ipnstate.go at v1.102.4. The StatusNode fields are only added to a test fixture. The WhoIs.user() switch is not neutral: it turns a field that was always absent into a populated one, with a different rule than Go's. The engine itself moved from 0.43.x to 0.57.4 in this bump; that engine delta was not audited here.",
+      "divergences": [
+        "user()"
+      ]
+    },
+    {
+      "url": "https://github.com/GeiserX/tailscaled-rs/pull/624",
+      "verdict": "faithful",
+      "notes": "Squash f03d958. Wording only, on a refusal Go does not have (Go filters by AllowedSuggestedExitNodes before ranking, so it never withholds a pick). Nothing in the diff claims an upstream line. Checked against cmd/tailscale/cli/exitnode.go (runExitNodeSuggest) at v1.102.4: the Go-shaped empty notice is untouched. The new sentence is true on current main: the daemon logs the withheld node as suggested_id at warn level for an exit-node suggest request (src/ipn/diag.rs compute_suggestion)."
+    },
+    {
+      "url": "https://github.com/GeiserX/tailscaled-rs/pull/625",
+      "verdict": "gaps",
+      "notes": "Squash 2ede56f. Read against ipn/ipnlocal/local.go (suggestExitNodeLocked, suggestExitNode, suggestExitNodeUsingDERP, WatchNotificationsAs, sysPolicyChanged, mutationsAreWorthyOfRecalculatingSuggestedExitNode, resetForProfileChangeLocked, sendToLocked) at v1.102.4 (bbcd7d1f). Faithful: empty id sent as a change, error path sends nothing and keeps the remembered id, pushes go to every masked watch whatever its mask, one front-load per subscription, silent reset on profile change, recompute on netmap and on an allow-list change. Three gaps, all minor: a front-load skipped at subscribe time is never made up, a pick withheld by AllowedSuggestedExitNodes is pushed as an empty id where Go names the best permitted node, and the compare-and-publish is no longer one step once the recompute task writes without the backend lock.",
+      "divergences": [
+        "front-load skipped",
+        "withheld by AllowedSuggestedExitNodes",
+        "compare-and-publish"
       ]
     }
   ],
@@ -299,6 +330,41 @@
       "title": "The #482 tag-wording finding was already fixed on main when the audit merged",
       "detail": "The committed #482 finding says the tag refusals are reworded away from tailcfg.CheckTag's four sentences and prefsFromUpArgs's `tag: %q: %s` frame. That described #482's own code, but a38687b (#538), an ancestor of ddd2fb8, had already switched complete_and_validate_advertise_tags to Go's frame and CheckTag's sentences verbatim. A reader following the row chases a divergence that no longer existed at the commit that recorded it.",
       "upstream": "tailcfg/tailcfg.go, cmd/tailscale/cli/up.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "severity": "minor"
+    },
+    {
+      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/605",
+      "title": "tnet debug watch-ipn has no --initial-status, and the merged doc misstates Go's flags",
+      "detail": "Upstream: `tailscale debug watch-ipn` (the subcommand is `watch-ipn`, not `watch-ipn-bus`) starts from mask NotifyNoNetMap and has one flag per bit. `--initial` adds only NotifyInitialState|NotifyInitialPrefs, and a separate `--initial-status` flag (default false) adds NotifyInitialStatus. Merged: the doc comment on run_debug_watch_ipn (src/bin/tnet.rs) says initial_status is left off 'as Go's watch-ipn-bus --initial leaves NotifyInitialStatus off'. That is true of --initial but leaves out that Go offers --initial-status. `tnet debug watch-ipn` is a flagless subcommand that hard-codes initial_state, initial_netmap, prefs, policy and suggested_exit_node to true and initial_status to false, so no CLI path can ask for the snapshot the daemon now serves. Port Go's --initial-status flag (and correct the cited command name).",
+      "upstream": "cmd/tailscale/cli/debug.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "severity": "minor"
+    },
+    {
+      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/611",
+      "title": "whois user went from always-absent to login-or-display-name, shown for tagged nodes too",
+      "detail": "Upstream: printWhoIs prints a `User:` block with `who.UserProfile.LoginName` (no fallback to DisplayName) and prints it only when the node is NOT tagged; a tagged node gets `Tags:` instead. Merged: src/ipn/diag.rs changed `user: w.user` to `user: w.user()`. At the old engine pin `WhoIs.user` was documented as always None; at the new pin `WhoIs::user()` returns the profile's login name, else its display name (UserProfile::best_label). So `tnet whois` now prints a `user:` line it never printed before, falls back to a display name where Go prints the (empty) login, and prints it alongside `tags:` for a tagged node whenever control supplies a profile for that node's user id. The change is not mentioned as a behaviour change, has no test, and the docs on WhoisReport (src/localapi.rs) and on diag::whois still say user is 'always None in this fork'. Decide the rule (Go's: LoginName only, untagged only), test it, and fix the docs.",
+      "upstream": "cmd/tailscale/cli/whois.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "severity": "minor"
+    },
+    {
+      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/625",
+      "title": "A suggestion front-load skipped at subscribe time is never made up, so the watcher can stay without the current pick",
+      "detail": "Upstream: WatchNotificationsAs calls suggestExitNodeLocked for NotifyInitialSuggestedExitNode whatever the backend state, with no time bound, and puts the id in the first Notify whenever err == nil. The netmap and lastSuggestedExitNode survive `down` (the netmap is only cleared in resetForProfileChangeLocked), so a watcher that subscribes while the node is Stopped or Starting is still front-loaded the pick. Merged: stream_notify settles the front-load as absent when the watch subscribes with no device (daemon down), and bounded_front_load returns None when the device is not Running or the engine takes longer than STATUS_QUERY_TIMEOUT (500 ms). The front-load is then never retried ('A replacement device is not front-loaded again'). The remembered id is kept across `down` (only logout and profile changes clear it), so when the next `up` recomputes the same pick, publish_suggested_exit_node sees no change and sends nothing. A watcher that asked for the front-load in any of those three cases never learns the node's current suggestion until the pick moves. Either retry the owed front-load on the first epoch that can compute, or send the remembered id.",
+      "upstream": "ipn/ipnlocal/local.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "severity": "minor"
+    },
+    {
+      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/625",
+      "title": "A pick withheld by AllowedSuggestedExitNodes is now pushed to every watcher as an empty id",
+      "detail": "Upstream: suggestExitNodeUsingDERP and suggestExitNodeUsingTrafficSteering drop peers outside the allow-list BEFORE ranking, so suggestExitNodeLocked sends the best permitted node; the empty StableNodeID goes out only when no permitted candidate exists. Merged: suggested_exit_node_id maps a withheld pick (withheld_by_policy: true) to \"\", and it is both front-loaded and published to every masked watch. Before this change a withheld pick was silence. Now a tailnet whose best node is outside the allow-list but which has a permitted exit node tells every watcher 'no suggestion', where Go names the permitted node, and it does so on every netmap-driven recompute path, not only on request. The code documents this and the root cause is engine-side (the engine returns one already-chosen node and takes no allow-list; ENGINE_ASKS #44), so the real fix is in the engine, not the daemon.",
+      "upstream": "ipn/ipnlocal/local.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "severity": "minor"
+    },
+    {
+      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/625",
+      "title": "The suggestion compare-and-publish is no longer serialized once the recompute task writes without the backend lock",
+      "detail": "Upstream: suggestExitNodeLocked runs with b.mu held from the computation through `if prevSuggestion != res.ID { sendToLocked(...) }` and `b.lastSuggestedExitNode = res.ID`, so each change produces exactly one Notify and the stored id is always the latest computation's. Merged: the new per-device task (suggested_exit_node_loop) publishes through a cloned watch::Sender with no lock, while `exit-node suggest` and the watch front-load publish under the backend lock. publish_suggested_exit_node reads the cell (`*cell.borrow() == id`) and then calls send_replace as two separate steps. On the multi-thread runtime two publishers can both pass the compare and both send the same id (a watcher can get the same suggestion frame twice), or an older computation can overwrite a newer one and leave the stale id as the baseline until the next trigger. The Backend field doc still says 'One compare, no second copy to fall out of step'. Make the compare and the store one atomic step (send_if_modified) and serialize the writers.",
+      "upstream": "ipn/ipnlocal/local.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
       "severity": "minor"
     }
   ]
