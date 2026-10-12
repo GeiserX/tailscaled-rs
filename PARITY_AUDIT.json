@@ -4,14 +4,14 @@
     "auditedPrs": 17,
     "faithful": 3,
     "gaps": 14,
-    "findings": 36,
+    "findings": 35,
     "upstream": {
       "ref": "v1.102.4",
       "commit": "bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
       "note": "The revision every upstream citation below was read at, and the ref docs/PARITY_GAP_ANALYSIS.md pins.",
       "clone": "github.com/tailscale/tailscale cloned shallow at tag v1.102.4; HEAD verified as bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8."
     },
-    "note": "Seventeen merged pull requests, each squash commit read against github.com/tailscale/tailscale at v1.102.4. #484, #497, #530, #531, #535, #538, #544 and #547 are an independent re-reading that replaced the previous edition of the same eight; every finding there was checked on both the Go and the Rust side, and findings that could not be confirmed on both sides were left out. #568, #570, #580 and #569 were audited separately at the same pin: the two engine-ask wording changes, and the watch stream's initial status, version and session id. #605, #611, #624, #625 and #631 were read separately again at the same pin: the initial-status watch, an engine bump, and the exit-node suggestion's notice, recompute and publish races. Where the merged commit or rustdoc discloses a divergence, the finding says so. Engine-side causes are named as such. Nothing is fixed here; each finding is left as tracked work."
+    "note": "Seventeen merged pull requests, each squash commit read against github.com/tailscale/tailscale at v1.102.4. #484, #497, #530, #531, #535, #538, #544 and #547 are an independent re-reading that replaced the previous edition of the same eight; every finding there was checked on both the Go and the Rust side, and findings that could not be confirmed on both sides were left out. #568, #570, #580 and #569 were audited separately at the same pin: the two engine-ask wording changes, and the watch stream's initial status, version and session id. #605, #611, #624 and #625 were re-read separately at the same pin; #611 is a dependency bump rather than a port, and the engine delta it brought in was not audited. #631, the fix for the suggestion publish races, was read at the same pin. Where the merged commit or rustdoc discloses a divergence, the finding says so. Engine-side causes are named as such. Nothing is fixed here; each finding is left as tracked work."
   },
   "gate": {
     "ran": true,
@@ -141,36 +141,32 @@
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/605",
       "verdict": "gaps",
-      "notes": "Squash 8c97d86. Ports NotifyInitialStatus. The snapshot is sent once, it is the session's first frame and carries the owed session id, and the NotifyRateLimit refusal is correctly unreachable because no rate_limit field exists. Three divergences remain. The initial bits arrive as several frames where Go sends one initial Notify. A subscriber outside Running can get a peerless InitialStatus. tnet has no --initial-status flag.",
-      "upstream": "ipn/ipnlocal/local.go, ipn/backend.go, cmd/tailscale/cli/debug.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "notes": "Squash 8c97d86. Read against ipn/backend.go, ipn/ipnlocal/local.go (WatchNotificationsAs), ipn/localapi/localapi.go (serveWatchIPNBus) and cmd/tailscale/cli/debug.go at v1.102.4 (bbcd7d1f). The merged diff is the residue left after #580 had already landed the feature: one doc comment, one doc fix and two tests. The session-id-rides-the-first-frame and nil-means-unchanged claims match Go. One gap: the doc comment's statement about Go's watch-ipn flags hides that Go has --initial-status and tnet has no way to set the bit.",
       "divergences": [
-        "one initial Notify",
-        "peerless InitialStatus",
         "--initial-status"
       ]
     },
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/611",
-      "verdict": "faithful",
-      "notes": "Squash 54866a4. A dependency-only change: it moves the four engine pins from 9d847a6e to eabd2cf2 to take russh 0.63.2, and it claims no Go port. Its two adaptations either preserve behaviour or move toward Go. whois `user` was always None under the old engine and is now the profile's login name, falling back to the display name, which is what Go's whois prints. The new StatusNode fields `tailscale_ips` and `expired` are only filled in a test fixture. That they are not surfaced yet (Go's PeerStatus.TailscaleIPs and Expired) is an older status gap, not a divergence this PR introduced."
+      "verdict": "gaps",
+      "notes": "Squash 54866a4. A dependency bump, not a port: it cites no Go file. Checked the two source adaptations against cmd/tailscale/cli/whois.go and ipn/ipnstate/ipnstate.go at v1.102.4. The StatusNode fields are only added to a test fixture. The WhoIs.user() switch is not neutral: it turns a field that was always absent into a populated one, with a different rule than Go's. The engine itself moved from 0.43.x to 0.57.4 in this bump; that engine delta was not audited here.",
+      "divergences": [
+        "user()"
+      ]
     },
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/624",
-      "verdict": "gaps",
-      "notes": "Squash f03d958. A wording-only change to the `tnet exit-node suggest` notice for a pick the AllowedSuggestedExitNodes policy withholds. Its new claim holds: the user-initiated path logs `suggested_id` at warn (compute_suggestion in src/ipn/diag.rs). Measured against Go's runExitNodeSuggest, two divergences remain. The notice asks the operator to edit policy for a state Go never reaches. The empty-case line is not Go's text.",
-      "upstream": "cmd/tailscale/cli/exitnode.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
-      "divergences": [
-        "edit policy",
-        "Go's text"
-      ]
+      "verdict": "faithful",
+      "notes": "Squash f03d958. Wording only, on a refusal Go does not have (Go filters by AllowedSuggestedExitNodes before ranking, so it never withholds a pick). Nothing in the diff claims an upstream line. Checked against cmd/tailscale/cli/exitnode.go (runExitNodeSuggest) at v1.102.4: the Go-shaped empty notice is untouched. The new sentence is true on current main: the daemon logs the withheld node as suggested_id at warn level for an exit-node suggest request (src/ipn/diag.rs compute_suggestion)."
     },
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/625",
       "verdict": "gaps",
-      "notes": "Squash 2ede56f. Adds the per-device recompute task, which runs on every netmap and when AllowedSuggestedExitNodes changes. It also makes \"\" a value the bus can publish and clears the cell silently when identity changes. Those three match suggestExitNodeLocked, setNetMapLocked, sysPolicyChanged and resetForProfileChangeLocked. Recomputing on every netmap is a superset of Go's triggers, but it does not churn the suggestion, because the engine keeps Go's sticky prevSuggestion (ts_runtime exit_node_suggest.rs at eabd2cf2). One divergence remains: a withheld pick publishes \"\" where Go publishes the best permitted node.",
-      "upstream": "ipn/ipnlocal/local.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "notes": "Squash 2ede56f. Read against ipn/ipnlocal/local.go (suggestExitNodeLocked, suggestExitNode, suggestExitNodeUsingDERP, WatchNotificationsAs, sysPolicyChanged, mutationsAreWorthyOfRecalculatingSuggestedExitNode, resetForProfileChangeLocked, sendToLocked) at v1.102.4 (bbcd7d1f). Faithful: empty id sent as a change, error path sends nothing and keeps the remembered id, pushes go to every masked watch whatever its mask, one front-load per subscription, silent reset on profile change, recompute on netmap and on an allow-list change. Three gaps, all minor: a front-load skipped at subscribe time is never made up, a pick withheld by AllowedSuggestedExitNodes is pushed as an empty id where Go names the best permitted node, and the compare-and-publish is no longer one step once the recompute task writes without the backend lock.",
       "divergences": [
-        "best permitted node"
+        "front-load skipped",
+        "withheld by AllowedSuggestedExitNodes",
+        "compare-and-publish"
       ]
     },
     {
@@ -388,45 +384,38 @@
       "severity": "minor"
     },
     {
+      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/605",
+      "title": "tnet debug watch-ipn has no --initial-status, and the merged doc misstates Go's flags",
+      "detail": "Upstream: `tailscale debug watch-ipn` (the subcommand is `watch-ipn`, not `watch-ipn-bus`) starts from mask NotifyNoNetMap and has one flag per bit. `--initial` adds only NotifyInitialState|NotifyInitialPrefs, and a separate `--initial-status` flag (default false) adds NotifyInitialStatus. Merged: the doc comment on run_debug_watch_ipn (src/bin/tnet.rs) says initial_status is left off 'as Go's watch-ipn-bus --initial leaves NotifyInitialStatus off'. That is true of --initial but leaves out that Go offers --initial-status. `tnet debug watch-ipn` is a flagless subcommand that hard-codes initial_state, initial_netmap, prefs, policy and suggested_exit_node to true and initial_status to false, so no CLI path can ask for the snapshot the daemon now serves. Port Go's --initial-status flag (and correct the cited command name).",
+      "upstream": "cmd/tailscale/cli/debug.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "severity": "minor"
+    },
+    {
+      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/611",
+      "title": "whois user went from always-absent to login-or-display-name, shown for tagged nodes too",
+      "detail": "Upstream: printWhoIs prints a `User:` block with `who.UserProfile.LoginName` (no fallback to DisplayName) and prints it only when the node is NOT tagged; a tagged node gets `Tags:` instead. Merged: src/ipn/diag.rs changed `user: w.user` to `user: w.user()`. At the old engine pin `WhoIs.user` was documented as always None; at the new pin `WhoIs::user()` returns the profile's login name, else its display name (UserProfile::best_label). So `tnet whois` now prints a `user:` line it never printed before, falls back to a display name where Go prints the (empty) login, and prints it alongside `tags:` for a tagged node whenever control supplies a profile for that node's user id. The change is not mentioned as a behaviour change, has no test, and the docs on WhoisReport (src/localapi.rs) and on diag::whois still say user is 'always None in this fork'. Decide the rule (Go's: LoginName only, untagged only), test it, and fix the docs.",
+      "upstream": "cmd/tailscale/cli/whois.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "severity": "minor"
+    },
+    {
       "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/625",
-      "title": "A policy-withheld exit-node pick is published as \"\" instead of the best permitted node",
-      "detail": "Go passes the AllowedSuggestedExitNodes set into suggestExitNode. Both suggestExitNodeUsingDERP and suggestExitNodeUsingTrafficSteering skip non-allowed peers before ranking (`if allowList != nil && !allowList.Contains(peer.StableID()) { continue }`), so the bus carries the id of the best ALLOWED node. The merged code takes the engine's unfiltered pick. When the allow-list excludes it, the code publishes SuggestedExitNode \"\" (suggested_exit_node_id over a withheld_by_policy response). On a policy-managed fleet whose engine pick falls outside the list, watchers are told there is no suggestion, where Go would name the best permitted node. The engine's sticky prev_suggestion is also set to the excluded node, so later recomputes keep landing on it. The code acknowledges this as engine ask #44 (the engine has no allow-list input), so the fix is engine-side.",
-      "upstream": "ipn/ipnlocal/local.go (suggestExitNodeLocked, suggestExitNodeUsingDERP) @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
-      "severity": "major"
-    },
-    {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/624",
-      "title": "exit-node suggest tells the operator to edit policy where Go would suggest a permitted node",
-      "detail": "Go's runExitNodeSuggest prints one of two things: `Suggested exit node: <name>` with the `tailscale set --exit-node=` hint, or `No exit node suggestion is available.`. The allow-list filters candidates before ranking, so Go never reaches a 'picked but withheld' state. The merged notice says the policy does not list the node this build picked, points the operator to the daemon log for `suggested_id`, and tells them to list that node in the policy. So the advice is to edit policy, widening the administrator's allow-list to work around an engine limitation, which nothing in Go's behaviour calls for. The notice is accurate about this build, but the behaviour it describes diverges from the port target. Same root cause as engine ask #44.",
-      "upstream": "cmd/tailscale/cli/exitnode.go (runExitNodeSuggest) @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "title": "A suggestion front-load skipped at subscribe time is never made up, so the watcher can stay without the current pick",
+      "detail": "Upstream: WatchNotificationsAs calls suggestExitNodeLocked for NotifyInitialSuggestedExitNode whatever the backend state, with no time bound, and puts the id in the first Notify whenever err == nil. The netmap and lastSuggestedExitNode survive `down` (the netmap is only cleared in resetForProfileChangeLocked), so a watcher that subscribes while the node is Stopped or Starting is still front-loaded the pick. Merged: stream_notify settles the front-load as absent when the watch subscribes with no device (daemon down), and bounded_front_load returns None when the device is not Running or the engine takes longer than STATUS_QUERY_TIMEOUT (500 ms). The front-load is then never retried ('A replacement device is not front-loaded again'). The remembered id is kept across `down` (only logout and profile changes clear it), so when the next `up` recomputes the same pick, publish_suggested_exit_node sees no change and sends nothing. A watcher that asked for the front-load in any of those three cases never learns the node's current suggestion until the pick moves. Either retry the owed front-load on the first epoch that can compute, or send the remembered id.",
+      "upstream": "ipn/ipnlocal/local.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
       "severity": "minor"
     },
     {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/624",
-      "title": "The empty-suggestion message is not Go's text",
-      "detail": "When res.ID is empty, Go prints exactly `No exit node suggestion is available.`. For the same case, exit_node_suggest_empty_notice (the function this PR edits) prints `No exit node suggestion available (no eligible exit-node peer right now).`, so a script matching Go's output does not match. The wording predates this PR, but it lives in the function the PR changed, and that function's tests pin it.",
-      "upstream": "cmd/tailscale/cli/exitnode.go (runExitNodeSuggest) @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/625",
+      "title": "A pick withheld by AllowedSuggestedExitNodes is now pushed to every watcher as an empty id",
+      "detail": "Upstream: suggestExitNodeUsingDERP and suggestExitNodeUsingTrafficSteering drop peers outside the allow-list BEFORE ranking, so suggestExitNodeLocked sends the best permitted node; the empty StableNodeID goes out only when no permitted candidate exists. Merged: suggested_exit_node_id maps a withheld pick (withheld_by_policy: true) to \"\", and it is both front-loaded and published to every masked watch. Before this change a withheld pick was silence. Now a tailnet whose best node is outside the allow-list but which has a permitted exit node tells every watcher 'no suggestion', where Go names the permitted node, and it does so on every netmap-driven recompute path, not only on request. The code documents this and the root cause is engine-side (the engine returns one already-chosen node and takes no allow-list; ENGINE_ASKS #44), so the real fix is in the engine, not the daemon.",
+      "upstream": "ipn/ipnlocal/local.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
       "severity": "minor"
     },
     {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/605",
-      "title": "An initial-status watch splits Go's one initial Notify into several frames",
-      "detail": "Go's WatchNotificationsAs builds one initial Notify (`ini`) that carries SessionID and State, Prefs, NetMap, InitialStatus, SuggestedExitNode and Policy together, then registers the watcher. The merged path sends the status snapshot, with the requested engine state and netmap, as the first frame. Prefs, policy and the suggestion follow as separate frames (emit_status_front_loads), and the PR's own test asserts that prefs arrives on the next frame, without the session id. A client written to Go's contract, where the first Notify holds everything it asked for, sees a partial first frame.",
-      "upstream": "ipn/ipnlocal/local.go (WatchNotificationsAs) @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
-      "severity": "minor"
-    },
-    {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/605",
-      "title": "A peerless InitialStatus outside Running or on a slow netmap",
-      "detail": "Go builds the snapshot with StatusBuilder{WantPeers: true}. updateStatusLocked then calls populatePeerStatusLocked, which lists peers whenever a netmap exists, whatever the backend state. The merged snapshot reuses Backend::status(), which queries peers only in State::Running and returns none if the netmap query exceeds STATUS_QUERY_TIMEOUT. A watcher that subscribes in Starting, or while the netmap is slow, therefore gets a peerless InitialStatus that Go would have populated.",
-      "upstream": "ipn/ipnlocal/local.go (WatchNotificationsAs, updateStatusLocked, populatePeerStatusLocked) @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
-      "severity": "minor"
-    },
-    {
-      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/605",
-      "title": "tnet debug watch-ipn has no --initial-status flag",
-      "detail": "Go's `tailscale debug watch-ipn` registers `--initial-status` (\"set NotifyInitialStatus: send current ipnstate.Status in first message\") and ORs ipn.NotifyInitialStatus into the mask when it is set. The PR says watch-ipn leaves the bit off because Go's --initial does. That is true of --initial, but the PR adds no way to set the bit from the CLI: both watch call sites in src/bin/tnet.rs hard-code `initial_status: false`. The ported subscription cannot be exercised from tnet the way Go's debug command allows.",
-      "upstream": "cmd/tailscale/cli/debug.go (watch-ipn flags, runWatchIPN) @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/625",
+      "title": "The suggestion compare-and-publish is no longer serialized once the recompute task writes without the backend lock",
+      "detail": "Upstream: suggestExitNodeLocked runs with b.mu held from the computation through `if prevSuggestion != res.ID { sendToLocked(...) }` and `b.lastSuggestedExitNode = res.ID`, so each change produces exactly one Notify and the stored id is always the latest computation's. Merged: the new per-device task (suggested_exit_node_loop) publishes through a cloned watch::Sender with no lock, while `exit-node suggest` and the watch front-load publish under the backend lock. publish_suggested_exit_node reads the cell (`*cell.borrow() == id`) and then calls send_replace as two separate steps. On the multi-thread runtime two publishers can both pass the compare and both send the same id (a watcher can get the same suggestion frame twice), or an older computation can overwrite a newer one and leave the stale id as the baseline until the next trigger. The Backend field doc still says 'One compare, no second copy to fall out of step'. Make the compare and the store one atomic step (send_if_modified) and serialize the writers.",
+      "upstream": "ipn/ipnlocal/local.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
       "severity": "minor"
     },
     {

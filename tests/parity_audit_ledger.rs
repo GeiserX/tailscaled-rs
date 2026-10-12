@@ -21,6 +21,11 @@
 //! findings both call each divergence by. Pinning one edition's pull request number here made the
 //! test unsatisfiable the moment the audit moved on to a different set of merged ports.
 //!
+//! Two tests are about editions that land side by side. The ledger is now added to rather than
+//! rewritten whole, because an edition that replaced the file dropped every open finding the one
+//! before it carried. So each pull request has one row, however many editions merge in, and the
+//! summary prose names every pull request the rows hold rather than only the newest batch.
+//!
 //! The last two tests are about evidence rather than arithmetic. The rows cite upstream by line
 //! number - `up.go:305-307`, `(line 222)` - and a line number is only checkable next to the
 //! revision it counts in. The file carried that revision in prose only ("against upstream
@@ -238,6 +243,35 @@ fn every_divergence_a_row_names_is_written_up_in_findings() {
                  row's notes summarise a different set of divergences than the list writes up"
             );
         }
+    }
+}
+
+#[test]
+fn each_audited_pull_request_has_one_row() {
+    let rows = rows(&audit());
+    for (i, (url, _)) in rows.iter().enumerate() {
+        assert!(
+            !rows[..i].iter().any(|(earlier, _)| earlier == url),
+            "{url} has more than one row in `auditedPrs`; two editions merged in the same pull \
+             request, and the totals now count it twice"
+        );
+    }
+}
+
+#[test]
+fn the_summary_note_names_every_audited_pull_request() {
+    let audit = audit();
+    let note = audit["summary"]["note"].as_str().unwrap_or_default();
+    for (url, _) in rows(&audit) {
+        let number = url
+            .rsplit('/')
+            .next()
+            .expect("a row's `url` should end in the pull request number");
+        assert!(
+            note.contains(&format!("#{number}")),
+            "`summary.note` never names #{number}, which has a row in `auditedPrs`; the prose \
+             describes a narrower audit than the rows record"
+        );
     }
 }
 
