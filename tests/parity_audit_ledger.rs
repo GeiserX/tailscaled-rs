@@ -402,3 +402,25 @@ fn every_upstream_citation_is_anchored_to_the_pinned_revision() {
         );
     }
 }
+
+#[test]
+fn no_two_findings_share_a_title() {
+    // A finding is looked up by its title: checking that an edition kept every finding the ledger
+    // already held means checking that every earlier title is still there. Two findings under one
+    // title make that check pass with one of them gone, and they are what two editions filing the
+    // same divergence would leave behind.
+    let audit = audit();
+    let titles = audit["findings"]
+        .as_array()
+        .expect("`findings` should be an array")
+        .iter()
+        .map(|f| f["title"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    for (i, title) in titles.iter().enumerate() {
+        assert!(
+            !titles[..i].contains(title),
+            "two entries in `findings` are titled {title:?}; one divergence was filed twice, and \
+             `summary.findings` now counts it twice"
+        );
+    }
+}

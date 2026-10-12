@@ -4,19 +4,19 @@
     "auditedPrs": 17,
     "faithful": 3,
     "gaps": 14,
-    "findings": 35,
+    "findings": 37,
     "upstream": {
       "ref": "v1.102.4",
       "commit": "bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
       "note": "The revision every upstream citation below was read at, and the ref docs/PARITY_GAP_ANALYSIS.md pins.",
       "clone": "github.com/tailscale/tailscale cloned shallow at tag v1.102.4; HEAD verified as bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8."
     },
-    "note": "Seventeen merged pull requests, each squash commit read against github.com/tailscale/tailscale at v1.102.4. #484, #497, #530, #531, #535, #538, #544 and #547 are an independent re-reading that replaced the previous edition of the same eight; every finding there was checked on both the Go and the Rust side, and findings that could not be confirmed on both sides were left out. #568, #570, #580 and #569 were audited separately at the same pin: the two engine-ask wording changes, and the watch stream's initial status, version and session id. #605, #611, #624 and #625 were re-read separately at the same pin; #611 is a dependency bump rather than a port, and the engine delta it brought in was not audited. #631, the fix for the suggestion publish races, was read at the same pin. Where the merged commit or rustdoc discloses a divergence, the finding says so. Engine-side causes are named as such. Nothing is fixed here; each finding is left as tracked work."
+    "note": "Seventeen merged pull requests, each squash commit read against github.com/tailscale/tailscale at v1.102.4. #484, #497, #530, #531, #535, #538, #544 and #547 are an independent re-reading that replaced the previous edition of the same eight; every finding there was checked on both the Go and the Rust side, and findings that could not be confirmed on both sides were left out. #568, #570, #580 and #569 were audited separately at the same pin: the two engine-ask wording changes, and the watch stream's initial status, version and session id. #605, #611, #624 and #625 were read at the same pin by two separate passes that did not see each other's work. Each has one row; where the two passes disagreed, the Go source decided. #611 is a dependency bump rather than a port, and the engine delta it brought in was not audited. #631, the fix for the suggestion publish races, was read at the same pin. Where the merged commit or rustdoc discloses a divergence, the finding says so. Engine-side causes are named as such. Nothing is fixed here; each finding is left as tracked work."
   },
   "gate": {
     "ran": true,
     "pass": true,
-    "detail": "All four steps green on main at 877814d, run with CARGO_BUILD_JOBS=4, RUST_TEST_THREADS=4, TS_RS_EXPERIMENT=this_is_unstable_software on the stable 1.95.0 toolchain: `cargo fmt --all --check` and `cargo clippy --all-targets -- -D warnings` clean; `cargo test --all-targets` 42 test targets, 1267 passed, 0 failed, 5 ignored; `cargo build --release --bins` finished in 6m 32s. Two machine facts, neither about the tree: the default toolchain here is a nightly with no clippy component, so the gate ran on 1.95.0 (what CI's stable runner uses); and the first test run, under the long per-session TMPDIR, failed only tailnetd's cleanup_refuses_live_socket with `path must be shorter than SUN_LEN` (darwin's 104-byte sun_path). Rerun with a short TMPDIR, test and release build passed."
+    "detail": "All four steps green on main at ec88f46 with this edition's two files on top (this file, and tests/parity_audit_ledger.rs with the three tests added since), run with CARGO_BUILD_JOBS=4, RUST_TEST_THREADS=4 and TS_RS_EXPERIMENT=this_is_unstable_software on the 1.95.0 toolchain, the version CI's stable runner uses (the default nightly here has no clippy component). `cargo fmt --all --check` and `cargo clippy --all-targets -- -D warnings` were clean. `cargo test --all-targets` covered 42 test targets: 1286 passed, 0 failed, 5 ignored, with all 9 tests in tests/parity_audit_ledger.rs passing against this text. `cargo build --release --bins` finished. The test step ran with a short TMPDIR: under a long one tailnetd's cleanup_refuses_live_socket fails with `path must be shorter than SUN_LEN` (darwin's 104-byte sun_path), which is a fact about the machine and not the tree."
   },
   "auditedPrs": [
     {
@@ -141,9 +141,11 @@
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/605",
       "verdict": "gaps",
-      "notes": "Squash 8c97d86. Read against ipn/backend.go, ipn/ipnlocal/local.go (WatchNotificationsAs), ipn/localapi/localapi.go (serveWatchIPNBus) and cmd/tailscale/cli/debug.go at v1.102.4 (bbcd7d1f). The merged diff is the residue left after #580 had already landed the feature: one doc comment, one doc fix and two tests. The session-id-rides-the-first-frame and nil-means-unchanged claims match Go. One gap: the doc comment's statement about Go's watch-ipn flags hides that Go has --initial-status and tnet has no way to set the bit.",
+      "notes": "Squash 8c97d86. Read against ipn/backend.go, ipn/ipnlocal/local.go (WatchNotificationsAs), ipn/localapi/localapi.go (serveWatchIPNBus) and cmd/tailscale/cli/debug.go at v1.102.4 (bbcd7d1f). The merged diff is the residue left after #580 had already landed the feature: one doc comment, one doc fix and two tests. The session-id-rides-the-first-frame and nil-means-unchanged claims match Go. Three gaps. The doc comment's statement about Go's watch-ipn flags hides that Go has --initial-status and tnet has no way to set the bit. The other two are in code #580 landed. They are filed here because this squash's message is where the port describes both, and its new integration test pins the first: the watch's initial bits go out as several frames where Go sends one initial Notify, and a watcher that subscribes outside Running, or while the netmap is slow, gets a peerless InitialStatus.",
       "divergences": [
-        "--initial-status"
+        "--initial-status",
+        "one initial Notify",
+        "peerless InitialStatus"
       ]
     },
     {
@@ -157,7 +159,8 @@
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/624",
       "verdict": "faithful",
-      "notes": "Squash f03d958. Wording only, on a refusal Go does not have (Go filters by AllowedSuggestedExitNodes before ranking, so it never withholds a pick). Nothing in the diff claims an upstream line. Checked against cmd/tailscale/cli/exitnode.go (runExitNodeSuggest) at v1.102.4: the Go-shaped empty notice is untouched. The new sentence is true on current main: the daemon logs the withheld node as suggested_id at warn level for an exit-node suggest request (src/ipn/diag.rs compute_suggestion)."
+      "notes": "Squash f03d958. Wording only, on a refusal Go does not have (Go filters by AllowedSuggestedExitNodes before ranking, so it never withholds a pick). Nothing in the diff claims an upstream line. Checked against cmd/tailscale/cli/exitnode.go (runExitNodeSuggest) at v1.102.4: the empty notice is untouched by this diff. Its text is not Go's: Go prints `No exit node suggestion is available.` (exitnode.go:169), and tnet prints `No exit node suggestion available (no eligible exit-node peer right now).`. That wording has been there since #239, so it is noted here and not filed against this row. The new sentence is true on current main: the daemon logs the withheld node as suggested_id at warn level for an exit-node suggest request (src/ipn/diag.rs compute_suggestion).",
+      "upstream": "cmd/tailscale/cli/exitnode.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8"
     },
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/625",
@@ -172,7 +175,7 @@
     {
       "url": "https://github.com/GeiserX/tailscaled-rs/pull/631",
       "verdict": "gaps",
-      "notes": "Squash f95330a. send_if_modified makes the compare-and-store one step, and borrow_and_update makes the front-load's read-and-mark one step. Together they close the duplicate-push and swallowed-push races against Go's prevSuggestion guard. One divergence remains, and the PR documents it itself. Completion order is not serialised the way Go's b.mu serialises it, so a race can leave the cell on the older answer.",
+      "notes": "Squash f95330a. send_if_modified makes the compare-and-store one step, and borrow_and_update makes the front-load's read-and-mark one step. Together they close the duplicate-push and swallowed-push races against Go's prevSuggestion guard. One divergence remains, and the PR documents it itself. Completion order is not serialised the way Go's b.mu serialises it, so a race can leave the cell on the older answer. This is the fix the #625 row's compare-and-publish finding asks for. It closes the half of that finding where two publishers send the same id; the ordering half is the divergence filed here.",
       "upstream": "ipn/ipnlocal/local.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
       "divergences": [
         "older answer"
@@ -388,6 +391,20 @@
       "title": "tnet debug watch-ipn has no --initial-status, and the merged doc misstates Go's flags",
       "detail": "Upstream: `tailscale debug watch-ipn` (the subcommand is `watch-ipn`, not `watch-ipn-bus`) starts from mask NotifyNoNetMap and has one flag per bit. `--initial` adds only NotifyInitialState|NotifyInitialPrefs, and a separate `--initial-status` flag (default false) adds NotifyInitialStatus. Merged: the doc comment on run_debug_watch_ipn (src/bin/tnet.rs) says initial_status is left off 'as Go's watch-ipn-bus --initial leaves NotifyInitialStatus off'. That is true of --initial but leaves out that Go offers --initial-status. `tnet debug watch-ipn` is a flagless subcommand that hard-codes initial_state, initial_netmap, prefs, policy and suggested_exit_node to true and initial_status to false, so no CLI path can ask for the snapshot the daemon now serves. Port Go's --initial-status flag (and correct the cited command name).",
       "upstream": "cmd/tailscale/cli/debug.go @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "severity": "minor"
+    },
+    {
+      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/605",
+      "title": "An initial-status watch splits Go's one initial Notify into several frames",
+      "detail": "Go's WatchNotificationsAs builds one initial Notify (`ini`, local.go:3762-3812) under b.mu. It carries SessionID and State, Prefs, NetMap, InitialStatus, SuggestedExitNode and Policy together, and the watcher is registered before the lock is released. The merged path sends the status snapshot, with the requested engine state and netmap, as the first frame. Prefs and policy follow as separate frames (emit_status_front_loads in src/server.rs), and the suggestion front-load is another. This squash's integration test initial_status_is_only_sent_when_asked_for_and_carries_the_id_once asserts that prefs arrives on the next frame, without the session id. A client written to Go's contract, where the first Notify holds everything it asked for, sees a partial first frame. The frame order landed with #580, whose row calls it disclosed and files nothing for it; this squash's message restates it and its test pins it.",
+      "upstream": "ipn/ipnlocal/local.go (WatchNotificationsAs) @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
+      "severity": "minor"
+    },
+    {
+      "prUrl": "https://github.com/GeiserX/tailscaled-rs/pull/605",
+      "title": "A peerless InitialStatus outside Running or on a slow netmap",
+      "detail": "Go builds the snapshot with StatusBuilder{WantPeers: true} (local.go:3745). updateStatusLocked then calls populatePeerStatusLocked (local.go:1563-1574), which lists peers whenever a netmap exists, whatever the backend state. The merged snapshot reuses Backend::status() (src/ipn/mod.rs), which queries peers only in State::Running and returns none if the netmap query exceeds STATUS_QUERY_TIMEOUT. A watcher that subscribes in Starting, or while the netmap is slow, therefore gets a peerless InitialStatus that Go would have populated. The reuse landed with #580. This squash's message records it as a decision: peers are listed 'under the same condition `tnet status` does'.",
+      "upstream": "ipn/ipnlocal/local.go (WatchNotificationsAs, updateStatusLocked, populatePeerStatusLocked) @ bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
       "severity": "minor"
     },
     {
