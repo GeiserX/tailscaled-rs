@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.68.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.67.4...v0.68.0) (2026-10-14)
+
+
+### Features
+
+* **serve:** follow the engine to Go's ServeConfig shape on the v0.57.5 pin ([#641](https://github.com/GeiserX/tailscaled-rs/issues/641)) ([7fc2a2a](https://github.com/GeiserX/tailscaled-rs/commit/7fc2a2a9ad47442e4e1003e162cefa842e7f3c85))
+
 ## [0.67.4](https://github.com/GeiserX/tailscaled-rs/compare/v0.67.3...v0.67.4) (2026-10-13)
 
 
