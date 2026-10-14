@@ -25,6 +25,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.68.1](https://github.com/GeiserX/tailscaled-rs/compare/v0.68.0...v0.68.1) (2026-10-14)
+
+
+### Bug Fixes
+
+* **serve:** status shows refused entries as refused, and CI runs the Headscale smoke test ([#644](https://github.com/GeiserX/tailscaled-rs/issues/644)) ([bec8b82](https://github.com/GeiserX/tailscaled-rs/commit/bec8b82cb60e33a5de6a93c18232f1f4097cb4cc))
+
 ## [0.68.0](https://github.com/GeiserX/tailscaled-rs/compare/v0.67.4...v0.68.0) (2026-10-14)
 
 
