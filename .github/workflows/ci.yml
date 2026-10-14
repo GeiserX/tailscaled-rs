@@ -154,8 +154,9 @@ jobs:
         run: |
           cargo test --test headscale_e2e -- --ignored --nocapture 2>&1 | tee e2e.log
           # The test skips, and passes, when its two variables are unset. A skip here means the job
-          # lost its key, so it fails rather than report a smoke test that never ran.
-          if grep -q '^SKIP' e2e.log; then
+          # lost its key, so it fails rather than report a smoke test that never ran. Matched
+          # anywhere on a line: with --nocapture, parallel tests can interleave their stderr.
+          if grep -q 'SKIP headscale_' e2e.log; then
             echo "the headscale e2e skipped instead of running"
             exit 1
           fi
