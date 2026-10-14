@@ -1,32 +1,26 @@
 //! `serve` configuration persistence + logic — the Rust analogue of Go's `ipn.ServeConfig`
-//! (`ipn/serve.go`), scoped to the **TCP-forward** subset this daemon can serve with a raw tailnet
-//! listener.
+//! (`ipn/serve.go`).
 //!
 //! The wire types ([`ServeConfig`]/[`TcpPortHandler`]) live in [`crate::localapi`] (the DTO home,
 //! like [`crate::localapi::PrefsView`]); this module re-exports them and supplies the persistence +
 //! served/not-served logic as free functions. Persisted per-profile next to `prefs.json` /
 //! `node.key.json` (see [`super::profile`]).
 //!
-//! ## What is (and isn't) served — two lanes
+//! ## Who serves what
 //!
 //! - **Plain `TCPForward`** (`tcp_forward` set, no `HTTPS`/`HTTP`/`TerminateTLS`) is served by the
 //!   daemon's own raw accept→dial→splice loop (a [`Device::tcp_listen`](tailscale::Device::tcp_listen)
 //!   per port; see the server's serve task). No TLS, no cert — so it works on any tailnet.
-//! - **`HTTPS`/`HTTP` web** entries are served by **delegating to the engine's native serve stack**
-//!   ([`Device::set_serve_config`](tailscale::Device::set_serve_config) + `ServeState`): the engine
-//!   terminates TLS for the node's MagicDNS name and reverse-proxies each decrypted stream to the
-//!   configured backend. [`build_web_serve_state`] translates the web subset of our DTO into the
-//!   engine's [`ServeState`](tailscale::ServeState). This lane is **fail-closed**: a TLS port never
-//!   downgrades to plaintext, and without an issuable cert (the engine's `acme` feature off, or a
-//!   control plane that 501s on `set-dns`) the engine returns a cert error and nothing binds.
-//!
-//! - **`TerminateTLS`** (raw-TCP-after-TLS-termination, Go `--tls-terminated-tcp`) ALSO rides the
-//!   engine-delegation lane: it maps to the same engine `Proxy` target as an `https` web entry (the
-//!   engine terminates TLS, then verbatim-splices the decrypted stream to the `tcp_forward` backend —
-//!   exactly Go's `TerminateTLS`), so it is fail-closed/acme-gated identically. Exception: a
-//!   `ProxyProtocol`-bearing terminate-tls entry stays persisted-but-not-served (the engine `Proxy`
-//!   target does not prepend the PROXY-protocol header, so serving it as a plain splice would silently
-//!   drop that semantic). See [`is_terminate_tls_serve`].
+//! - **Web ports and TLS-terminated forwards** go to the engine's own serve runtime
+//!   ([`Device::set_serve_config`](tailscale::Device::set_serve_config)). The engine stores Go's
+//!   `ipn.ServeConfig` shape, and [`build_web_serve_state`] maps this config onto it. The engine
+//!   refuses what it would serve differently from Go (plain HTTP, `TerminateTLS`, `Text` and `Path`
+//!   handlers, among others); each refused port is reported with the engine's
+//!   [`ServeConfigError`](tailscale::ServeConfigError), never served differently and never dropped
+//!   quietly. TLS is fail-closed: without an issuable cert (the engine's `acme` feature off, or a
+//!   control plane that 501s on `set-dns`) nothing binds.
+//! - **Funnel** is armed by the funnel lane through the engine's `listen_funnel`, not through the
+//!   stored Serve config.
 
 use std::path::{Path, PathBuf};
 
@@ -106,229 +100,233 @@ pub fn web_proxy_backend(cfg: &ServeConfig, port: u16) -> Option<String> {
     Some(root.proxy.clone())
 }
 
-/// Translate one [`WebMount`] into the engine's nested [`ServeTarget`](tailscale::ServeTarget).
-/// Errors (as a static reason) on the same conditions the engine's `validate_target` rejects, so an
-/// invalid mount is caught daemon-side before the engine call rather than failing the whole arm.
-fn mount_to_target(m: &WebMount) -> Result<tailscale::ServeTarget, &'static str> {
-    match m {
-        WebMount::Proxy { to } => {
-            if to.trim().is_empty() {
-                return Err("serve proxy target must not be empty");
-            }
-            Ok(tailscale::ServeTarget::Proxy { to: to.clone() })
-        }
-        WebMount::Text { body } => Ok(tailscale::ServeTarget::Text { body: body.clone() }),
-        WebMount::Redirect { to, status } => {
-            validate_redirect(to, *status)?;
-            Ok(tailscale::ServeTarget::Redirect {
-                to: to.clone(),
-                status: *status,
-            })
-        }
+/// The engine's Serve config for this daemon's persisted config, and the ports the engine refuses.
+///
+/// Built by [`build_web_serve_state`]. [`state`](Self::state) holds only ports the engine will
+/// serve. Each refused port is listed in [`refused`](Self::refused) with the engine's own reason and
+/// left out of `state`, so one refused handler does not take the node's other web ports down with
+/// it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EngineServe {
+    /// What [`Device::set_serve_config`](tailscale::Device::set_serve_config) is given.
+    pub state: tailscale::ServeState,
+    /// The ports left out of [`state`](Self::state), in port order.
+    pub refused: Vec<RefusedPort>,
+}
+
+/// One port the engine refuses to serve, with the engine's reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedPort {
+    /// The tailnet port.
+    pub port: u16,
+    /// Why: the engine's [`ServeConfigError`](tailscale::ServeConfigError) for this port.
+    pub error: tailscale::ServeConfigError,
+}
+
+impl std::fmt::Display for RefusedPort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "port {}: {}", self.port, self.error)
     }
 }
 
-/// Fail-closed redirect validation, matching (and slightly exceeding) the engine's `validate_target`:
-/// non-empty `to`, status in `300..=399`, and NO control characters in `to`.
+impl EngineServe {
+    /// The refusals as one message for the operator, or `None` when every port is served.
+    pub fn refusal_message(&self) -> Option<String> {
+        if self.refused.is_empty() {
+            return None;
+        }
+        let ports: Vec<String> = self.refused.iter().map(ToString::to_string).collect();
+        Some(format!("unable to serve {}", ports.join("; ")))
+    }
+}
+
+/// Refuse a redirect target carrying any control character.
 ///
-/// The `to` is written verbatim into the response `Location:` header, so any control char is a
-/// response-header-injection vector. CR/LF are the load-bearing response-splitting characters
-/// (they terminate a header line), but we reject ALL control characters (`char::is_control()` — NUL,
-/// other C0/C1, NEL `U+0085`, etc.), not just CR/LF: a stricter "no controls in a header value" rule
-/// is cheap and strictly safer, and matches the `is_control`-based sanitization used elsewhere in
-/// this codebase. (Found by an adversarial serve/funnel review: the prior CR/LF-only check was
-/// sufficient against splitting but left NUL/other controls passing into the header value.)
-fn validate_redirect(to: &str, status: u16) -> Result<(), &'static str> {
-    if to.trim().is_empty() {
-        return Err("serve redirect target must not be empty");
-    }
-    if to.chars().any(|c| c.is_control()) {
-        return Err("serve redirect target must not contain control characters");
-    }
-    if !(300..=399).contains(&status) {
-        return Err("serve redirect status must be in 300..=399");
+/// The target is written into the `Location:` response header. The engine refuses CR and LF, the
+/// characters that split a response; this refuses every control character (NUL, other C0/C1, NEL
+/// `U+0085`), a stricter rule that costs nothing.
+fn check_redirect_target(to: &str) -> Result<(), tailscale::ServeConfigError> {
+    if to.chars().any(char::is_control) {
+        return Err(tailscale::ServeConfigError::Invalid(
+            "serve redirect target must not contain control characters".to_string(),
+        ));
     }
     Ok(())
 }
 
-/// Translate one web [`TcpPortHandler`] into the engine [`ServeTarget`](tailscale::ServeTarget) for
-/// its port. Precedence (a port serves exactly one thing): non-empty `mounts` → `Path` (or, if the
-/// only mount is `/`, the bare target it holds); else `text` → `Text`; else `redirect` → `Redirect`;
-/// else the `tcp_forward` proxy backend → `Proxy`. Returns `Err(reason)` if the handler is web-shaped
-/// but produces nothing valid (so the caller can skip + log it rather than emit an invalid state).
-fn handler_to_target(h: &TcpPortHandler) -> Result<tailscale::ServeTarget, &'static str> {
-    if !h.mounts.is_empty() {
-        // A lone "/" mount is just the bare handler it holds (avoids a needless one-level Path mux).
-        if h.mounts.len() == 1
-            && let Some(root) = h.mounts.get("/")
-        {
-            return mount_to_target(root);
-        }
-        let mut handlers = std::collections::BTreeMap::new();
-        for (mount, m) in &h.mounts {
-            handlers.insert(mount.clone(), mount_to_target(m)?);
-        }
-        return Ok(tailscale::ServeTarget::Path { handlers });
-    }
-    if let Some(body) = &h.text {
-        return Ok(tailscale::ServeTarget::Text { body: body.clone() });
-    }
-    if let Some(r) = &h.redirect {
-        validate_redirect(&r.to, r.status)?;
-        return Ok(tailscale::ServeTarget::Redirect {
-            to: r.to.clone(),
-            status: r.status,
-        });
-    }
-    if (h.https || h.http) && !h.tcp_forward.is_empty() {
-        return Ok(tailscale::ServeTarget::Proxy {
-            to: h.tcp_forward.clone(),
-        });
-    }
-    Err("web handler has no servable target")
-}
-
-/// Parse Go's `HTTPHandler.Redirect` **string** form into `(to, status)`. A bare URL redirects with
-/// 302 (Go's default); a `"<code>:<url>"` prefix picks the status (Go `ipn/serve.go`'s redirect
-/// parsing). The split is on the FIRST `:` only when the prefix before it is all-ASCII-digits — so a
-/// bare `https://…` (whose scheme has a `:`) is NOT mistaken for a status prefix. Validated by the
-/// caller via [`validate_redirect`] (non-empty, no CR/LF, 300..=399).
-fn parse_go_redirect(redirect: &str) -> (String, u16) {
-    if let Some((maybe_code, rest)) = redirect.split_once(':')
-        && !maybe_code.is_empty()
-        && maybe_code.chars().all(|c| c.is_ascii_digit())
-        && let Ok(code) = maybe_code.parse::<u16>()
-    {
-        return (rest.to_string(), code);
-    }
-    (redirect.to_string(), 302)
-}
-
-/// Translate one Go-shaped [`HttpHandler`] into the engine's [`ServeTarget`](tailscale::ServeTarget),
-/// with the same precedence Go gives (exactly one of proxy/text/redirect is set): `proxy` → `Proxy`,
-/// `text` → `Text`, `redirect` → `Redirect` (parsing the Go string form). Go's `path` (filesystem
-/// directory serving) has no engine analogue at this pin → `Err` (recognized, not served). Returns
-/// `Err(reason)` for an empty/unservable handler so the caller can skip + log it.
-fn http_handler_to_target(h: &HttpHandler) -> Result<tailscale::ServeTarget, &'static str> {
-    if !h.proxy.is_empty() {
-        return Ok(tailscale::ServeTarget::Proxy {
-            to: h.proxy.clone(),
-        });
-    }
-    if !h.text.is_empty() {
-        return Ok(tailscale::ServeTarget::Text {
-            body: h.text.clone(),
-        });
-    }
+/// One Go-shaped [`HttpHandler`] as the engine's (Go `ipn.HTTPHandler`, field for field).
+fn engine_http_handler(
+    h: &HttpHandler,
+) -> Result<tailscale::HttpHandler, tailscale::ServeConfigError> {
     if !h.redirect.is_empty() {
-        let (to, status) = parse_go_redirect(&h.redirect);
-        validate_redirect(&to, status)?;
-        return Ok(tailscale::ServeTarget::Redirect { to, status });
+        check_redirect_target(&h.redirect)?;
     }
-    if !h.path.is_empty() {
-        // Go's `Path` serves a filesystem directory/file; the engine `ServeTarget::Path` is a
-        // path-prefix MUX, not a static-file server — no faithful analogue at this pin.
-        return Err("filesystem Path handlers are not served by this build");
-    }
-    Err("web handler has no servable target (no proxy/text/redirect)")
+    Ok(tailscale::HttpHandler {
+        path: h.path.clone(),
+        proxy: h.proxy.clone(),
+        text: h.text.clone(),
+        redirect: h.redirect.clone(),
+        ..Default::default()
+    })
 }
 
-/// Translate a Go [`WebServerConfig`] (a `host:port`'s mount→handler map) into the engine
-/// [`ServeTarget`](tailscale::ServeTarget) for its port: a lone `/` mount is the bare handler it holds
-/// (no needless one-level mux); multiple mounts become a `Path` mux (longest-match). Mirrors
-/// [`handler_to_target`]'s mount logic but over the Go-shaped [`HttpHandler`] map. `Err` if it
-/// produces no valid target.
-fn web_server_config_to_target(
-    wsc: &WebServerConfig,
-) -> Result<tailscale::ServeTarget, &'static str> {
-    if wsc.handlers.is_empty() {
-        return Err("web server config has no handlers");
+/// The Go `Web` handlers for a port this fork wrote in its legacy shape: the body on the per-port
+/// handler (`text`, `redirect`, `mounts`, or an `https`/`http` proxy in `tcp_forward`) instead of in
+/// the `Web` map. The same migration `tnet serve` applies when it next writes the port. Empty when
+/// the handler carries no legacy body.
+fn legacy_web_handlers(
+    h: &TcpPortHandler,
+) -> Result<std::collections::BTreeMap<String, tailscale::HttpHandler>, tailscale::ServeConfigError>
+{
+    fn redirect(
+        to: &str,
+        status: u16,
+    ) -> Result<tailscale::HttpHandler, tailscale::ServeConfigError> {
+        if !(300..=399).contains(&status) {
+            return Err(tailscale::ServeConfigError::Invalid(format!(
+                "serve redirect status {status} is not in 300..=399"
+            )));
+        }
+        check_redirect_target(to)?;
+        Ok(tailscale::HttpHandler {
+            redirect: format!("{status}:{to}"),
+            ..Default::default()
+        })
     }
-    if wsc.handlers.len() == 1
-        && let Some(root) = wsc.handlers.get("/")
-    {
-        return http_handler_to_target(root);
-    }
+    let proxy = |to: &str| tailscale::HttpHandler {
+        proxy: to.to_string(),
+        ..Default::default()
+    };
+    let text = |body: &str| tailscale::HttpHandler {
+        text: body.to_string(),
+        ..Default::default()
+    };
     let mut handlers = std::collections::BTreeMap::new();
-    for (mount, h) in &wsc.handlers {
-        handlers.insert(mount.clone(), http_handler_to_target(h)?);
+    if !h.mounts.is_empty() {
+        for (mount, m) in &h.mounts {
+            let handler = match m {
+                WebMount::Proxy { to } => proxy(to),
+                WebMount::Text { body } => text(body),
+                WebMount::Redirect { to, status } => redirect(to, *status)?,
+            };
+            handlers.insert(mount.clone(), handler);
+        }
+    } else if let Some(body) = &h.text {
+        handlers.insert("/".to_string(), text(body));
+    } else if let Some(r) = &h.redirect {
+        handlers.insert("/".to_string(), redirect(&r.to, r.status)?);
+    } else if (h.https || h.http) && !h.tcp_forward.is_empty() {
+        handlers.insert("/".to_string(), proxy(&h.tcp_forward));
     }
-    Ok(tailscale::ServeTarget::Path { handlers })
+    Ok(handlers)
 }
 
-/// Translate the **web** subset of a [`ServeConfig`] into the engine's
-/// [`ServeState`](tailscale::ServeState) for [`Device::set_serve_config`](tailscale::Device::set_serve_config).
+/// The engine's Go-shaped config for one port of `cfg`, or `None` when the port belongs to no
+/// engine lane: a plain TCP forward (served by the daemon's own accept loop) or a handler with
+/// nothing set.
 ///
-/// Each [`is_web_serve`] entry becomes one [`ServeTarget`](tailscale::ServeTarget) on its port via
-/// [`handler_to_target`]: a `text` body → `Text`, a `redirect` → `Redirect`, path `mounts` → `Path`
-/// (or the bare target for a lone `/` mount), and an `https`/`http` proxy → `Proxy` (the existing
-/// behavior; `HTTP` and `HTTPS` both map to `Proxy` — the engine has no distinct plaintext-web variant
-/// at this pin, every web `ServeTarget` rides a TLS-terminating port). A **TLS-terminated raw-TCP
-/// forward** ([`is_terminate_tls_serve`], Go `--tls-terminated-tcp`) also rides this lane, mapping to
-/// `Proxy { to: tcp_forward }` — the engine terminates TLS and verbatim-splices to the backend (Go's
-/// `TerminateTLS`). Plain `tcp_forward` entries (no web/TLS aspect) are **excluded** — they stay on the
-/// daemon's hand-rolled accept loop — as are proxy-protocol terminate-tls entries (the engine `Proxy`
-/// can't write the PROXY header). A web-shaped entry that produces no valid target (or an invalid
-/// mount/redirect) is skipped + logged rather than poisoning the whole state.
+/// The shapes are the ones Go's `tailscale serve` writes (`cmd/tailscale/cli/serve_v2.go`, through
+/// `ipn.ServeConfig.SetWebHandler` and `SetTCPForwarding`):
+/// - a web port is `TCP[port] = {HTTPS}` (or `{HTTP}`) plus `Web["host:port"].Handlers`, taken from
+///   this config's `Web` entry for `host:port`, else migrated from the legacy per-port body;
+/// - a TLS-terminated forward is `TCP[port] = {TCPForward, TerminateTLS, ProxyProtocol}`.
+fn engine_port(
+    cfg: &ServeConfig,
+    host: &str,
+    port: u16,
+    h: &TcpPortHandler,
+) -> Result<Option<tailscale::ServeState>, tailscale::ServeConfigError> {
+    let mut state = tailscale::ServeState::default();
+    if is_plain_tcp_forward(h) {
+        return Ok(None);
+    }
+    if !h.terminate_tls.is_empty() && !h.https && !h.http {
+        state.tcp.insert(
+            port,
+            tailscale::TcpPortHandler {
+                tcp_forward: h.tcp_forward.clone(),
+                terminate_tls: h.terminate_tls.clone(),
+                proxy_protocol: i64::from(h.proxy_protocol),
+                ..Default::default()
+            },
+        );
+        return Ok(Some(state));
+    }
+    if !(h.https || h.http || is_web_serve(h)) {
+        return Ok(None);
+    }
+    // A legacy body with no flag was served TLS-terminated; it stays HTTPS (see `serve_type`).
+    let https = h.https || !h.http;
+    state.tcp.insert(
+        port,
+        tailscale::TcpPortHandler {
+            https,
+            http: h.http && !h.https,
+            ..Default::default()
+        },
+    );
+    let handlers = match cfg.web.get(&format!("{host}:{port}")) {
+        Some(wsc) => wsc
+            .handlers
+            .iter()
+            .map(|(mount, hh)| Ok((mount.clone(), engine_http_handler(hh)?)))
+            .collect::<Result<_, tailscale::ServeConfigError>>()?,
+        None => legacy_web_handlers(h)?,
+    };
+    // No handlers at all: leave `Web` out, so the engine names the gap itself ("HTTPS port N with
+    // no Web config for it") rather than serving nothing quietly.
+    if !handlers.is_empty() {
+        state.web.insert(
+            tailscale::HostPort::new(host, port),
+            tailscale::WebServerConfig { handlers },
+        );
+    }
+    Ok(Some(state))
+}
+
+/// Map the persisted [`ServeConfig`] onto the engine's Go-shaped
+/// [`ServeState`](tailscale::ServeState) for
+/// [`Device::set_serve_config`](tailscale::Device::set_serve_config), and list the ports the engine
+/// refuses.
 ///
-/// `name` is the node's MagicDNS name (e.g. `host.tailnet.ts.net`, no trailing dot) — the cert the
-/// engine's TLS-terminating ports share. It is set only when at least one web port is produced; an
-/// input with no web entries yields [`ServeState::default()`](tailscale::ServeState) (empty name + no
-/// ports), which is a valid "serve nothing" config (and, via `set_serve_config`'s REPLACE semantics,
-/// the way to clear a previously-armed web serve). The returned state passes the engine's
-/// `ServeState::validate()` for valid inputs.
-pub fn build_web_serve_state(cfg: &ServeConfig, name: &str) -> tailscale::ServeState {
+/// `name` is the node's MagicDNS name (e.g. `host.tailnet.ts.net`, a trailing dot is dropped): the
+/// host of each `Web` key, and so the certificate each HTTPS port terminates with.
+///
+/// What goes to the engine: web ports and TLS-terminated forwards (see [`engine_port`]). What does
+/// not: plain TCP forwards, which the daemon serves itself, and `AllowFunnel`, which the funnel lane
+/// arms through the engine's `listen_funnel`. The engine refuses a funnel entry that is on in this
+/// config, so it is never sent; the engine's state always has Funnel off.
+///
+/// Every port is checked on its own with the engine's
+/// [`ServeState::serve_plan`](tailscale::ServeState::serve_plan), the same check
+/// `set_serve_config` runs. A port it refuses goes to [`EngineServe::refused`] with the engine's
+/// [`ServeConfigError`](tailscale::ServeConfigError): plain-HTTP ports, `TerminateTLS`, `Text` and
+/// `Path` handlers, a proxy at a mount other than `/` or to an `https://` backend, and the rest the
+/// engine lists. A redirect with a control character, or a legacy redirect status outside
+/// `300..=399`, is refused here the same way. A config with no engine port yields the empty state,
+/// which is how a previously armed web serve is cleared.
+pub fn build_web_serve_state(cfg: &ServeConfig, name: &str) -> EngineServe {
     let host = name.trim_end_matches('.');
-    let mut ports = std::collections::BTreeMap::new();
+    let mut out = EngineServe::default();
     for (port_str, h) in &cfg.tcp {
         let Ok(port) = port_str.parse::<u16>() else {
             // A non-numeric key can't be a tailnet port; skip (the persistence layer keeps it).
             continue;
         };
-        // Both web entries and TLS-terminated raw-TCP forwards ride this engine-delegation lane: the
-        // engine terminates TLS with the node cert and (for a `Proxy` target) verbatim-splices to the
-        // backend, which is exactly Go's `TerminateTLS`. Everything else (plain TCP forward,
-        // proxy-protocol terminate-tls, backendless web) is excluded here and handled/logged by the
-        // LANE dispatch in `spawn_serve`.
-        let target = if is_terminate_tls_serve(h) {
-            // A terminate-tls handler maps straight to `Proxy { to: tcp_forward }` (no web mounts).
-            Ok(tailscale::ServeTarget::Proxy {
-                to: h.tcp_forward.clone(),
-            })
-        } else if h.https || h.http {
-            // A web port (HTTPS/HTTP flag). Prefer the Go-shaped `Web[host:port]` handlers; fall back
-            // to the legacy per-handler fields (text/redirect/mounts/tcp_forward) when this port has no
-            // `Web` entry — the deprecation window where an older on-disk config still arms.
-            let hostport = format!("{host}:{port}");
-            match cfg.web.get(&hostport) {
-                Some(wsc) => web_server_config_to_target(wsc),
-                None => handler_to_target(h),
+        let checked = engine_port(cfg, host, port, h).and_then(|one| match one {
+            Some(one) => one.serve_plan().map(|_| Some(one)),
+            None => Ok(None),
+        });
+        match checked {
+            Ok(Some(one)) => {
+                out.state.tcp.extend(one.tcp);
+                out.state.web.extend(one.web);
             }
-        } else if is_web_serve(h) {
-            // No HTTPS/HTTP flag but legacy web bodies present (a pre-flag on-disk config): legacy path.
-            handler_to_target(h)
-        } else {
-            continue;
-        };
-        match target {
-            Ok(target) => {
-                ports.insert(port, target);
-            }
-            Err(reason) => {
-                tracing::warn!(port, reason, "serve: skipping invalid web handler");
-            }
+            Ok(None) => {}
+            Err(error) => out.refused.push(RefusedPort { port, error }),
         }
     }
-    let name = if ports.is_empty() {
-        // No TLS-terminating port → no cert needed → leave the name empty (and keep ports empty so
-        // this is the canonical "serve nothing / clear" state).
-        String::new()
-    } else {
-        // The engine's TLS ports share this single MagicDNS-name cert. Strip any trailing dot (Go's
-        // ServeConfig names carry none; the engine's `is_tailnet_name` tolerates it but we normalize).
-        name.trim_end_matches('.').to_string()
-    };
-    tailscale::ServeState { name, ports }
+    out
 }
 
 /// Whether a handler is a plain TCP forward this daemon can actually serve: a non-empty
@@ -336,22 +334,6 @@ pub fn build_web_serve_state(cfg: &ServeConfig, name: &str) -> tailscale::ServeS
 /// for handlers where this is true; everything else is persisted-but-not-served.
 pub fn is_plain_tcp_forward(h: &TcpPortHandler) -> bool {
     !h.tcp_forward.is_empty() && !h.https && !h.http && h.terminate_tls.is_empty()
-}
-
-/// Whether a handler is a **TLS-terminated raw-TCP forward** this build can serve via the engine
-/// (Go `tailscale serve --tls-terminated-tcp`): a `terminate_tls` SNI/host set, a `tcp_forward`
-/// backend to splice the decrypted stream to, and NO PROXY-protocol prefix requested. The engine
-/// terminates TLS with the node cert and verbatim-splices to the backend — exactly Go's `TerminateTLS`
-/// semantics, and the SAME engine operation as an `https` web `Proxy` (a post-TLS L4 byte-splice), so
-/// it rides the engine-delegation lane ([`build_web_serve_state`]).
-///
-/// `proxy_protocol != 0` is **excluded**: Go pairs `TerminateTLS` with an optional PROXY-protocol v1/v2
-/// header prepended to the backend stream, which the engine's `Proxy` target does NOT write. Serving
-/// such an entry as a plain splice would silently drop that semantic, so it stays "recognized only"
-/// (a faithful refusal) until PROXY-protocol support exists. A `terminate_tls` entry with no
-/// `tcp_forward` backend is likewise not servable (nothing to splice to).
-pub fn is_terminate_tls_serve(h: &TcpPortHandler) -> bool {
-    !h.terminate_tls.is_empty() && !h.tcp_forward.is_empty() && h.proxy_protocol == 0
 }
 
 /// A high-level descriptor of the *kind* of serve one port handler performs — the Rust analogue of
@@ -819,125 +801,166 @@ mod tests {
         assert!(is_web_serve(&web) && !is_plain_tcp_forward(&web));
     }
 
-    #[test]
-    fn build_web_serve_state_maps_only_web_entries_to_proxy() {
-        let mut cfg = ServeConfig::default();
-        // A plain TCP forward (hand-rolled lane) — must be EXCLUDED from the engine state.
-        set_tcp_forward(&mut cfg, 2222, "127.0.0.1:22".into());
-        // An HTTPS web entry — must become a Proxy port.
-        cfg.tcp.insert(
-            "443".into(),
-            TcpPortHandler {
-                https: true,
-                tcp_forward: "127.0.0.1:3000".into(),
-                ..Default::default()
-            },
-        );
-        let state = build_web_serve_state(&cfg, "host.example.ts.net.");
-        // Only the web port is present; the plain forward is excluded.
-        assert_eq!(state.ports.len(), 1);
-        assert_eq!(
-            state.ports.get(&443),
-            Some(&tailscale::ServeTarget::Proxy {
-                to: "127.0.0.1:3000".into()
-            })
-        );
-        assert!(!state.ports.contains_key(&2222));
-        // Name is set (trailing dot stripped) because a TLS-terminating port exists.
-        assert_eq!(state.name, "host.example.ts.net");
-        // The produced state is valid per the engine's fail-closed checks.
-        assert!(state.validate().is_ok());
+    /// The engine's Go-shaped handler for a proxy backend.
+    fn engine_proxy(to: &str) -> tailscale::HttpHandler {
+        tailscale::HttpHandler {
+            proxy: to.into(),
+            ..Default::default()
+        }
+    }
+
+    /// The handlers the engine state holds for `host:port`.
+    fn engine_web<'a>(
+        state: &'a tailscale::ServeState,
+        host: &str,
+        port: u16,
+    ) -> &'a std::collections::BTreeMap<String, tailscale::HttpHandler> {
+        &state
+            .web
+            .get(&tailscale::HostPort::new(host, port))
+            .unwrap_or_else(|| panic!("no Web entry for {host}:{port} in {state:?}"))
+            .handlers
     }
 
     #[test]
-    fn terminate_tls_predicate_and_mapping() {
-        // Servable: terminate_tls SNI + a backend + no proxy-protocol.
-        let servable = TcpPortHandler {
+    fn https_proxy_maps_to_gos_https_flag_and_web_entry() {
+        let mut cfg = ServeConfig::default();
+        // A plain TCP forward stays on the daemon's own lane: not in the engine state.
+        set_tcp_forward(&mut cfg, 2222, "127.0.0.1:22".into());
+        // An HTTPS proxy, as `tnet serve --https 443 3000` writes it (Go `SetWebHandler`).
+        go_web(&mut cfg, "host.example.ts.net", 443, true, "127.0.0.1:3000");
+        let built = build_web_serve_state(&cfg, "host.example.ts.net.");
+        assert!(built.refused.is_empty(), "{:?}", built.refused);
+        let state = &built.state;
+        // Go's shape: TCP[443] = {HTTPS} and the backend in Web["host:443"].Handlers["/"].
+        assert_eq!(
+            state.tcp.get(&443),
+            Some(&tailscale::TcpPortHandler {
+                https: true,
+                ..Default::default()
+            })
+        );
+        assert!(!state.tcp.contains_key(&2222));
+        assert_eq!(
+            engine_web(state, "host.example.ts.net", 443).get("/"),
+            Some(&engine_proxy("127.0.0.1:3000"))
+        );
+        assert!(state.allow_funnel.is_empty() && state.services.is_empty());
+        // The engine serves it: TLS terminated with the node's name, proxied to the backend.
+        let plan = state
+            .serve_plan()
+            .expect("the engine accepts an HTTPS proxy");
+        assert_eq!(plan[&443].cert_name.as_deref(), Some("host.example.ts.net"));
+        match &plan[&443].target {
+            tailscale::ServeTarget::Path { handlers } => assert_eq!(
+                handlers.get("/"),
+                Some(&tailscale::ServeTarget::Proxy {
+                    to: "127.0.0.1:3000".into()
+                })
+            ),
+            other => panic!("expected the engine's path mux, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tls_terminated_forward_maps_to_gos_shape_and_the_engine_refuses_it() {
+        // `tnet serve --tls-terminated-tcp 9000 9`, as Go's `SetTCPForwarding` writes it.
+        let tls_fwd = TcpPortHandler {
             tcp_forward: "127.0.0.1:9".into(),
             terminate_tls: "host.ts.net".into(),
             ..Default::default()
         };
-        assert!(is_terminate_tls_serve(&servable));
-        // Not servable: proxy-protocol requested (engine `Proxy` can't write the PROXY header).
-        let pp = TcpPortHandler {
-            proxy_protocol: 1,
-            ..servable.clone()
-        };
-        assert!(!is_terminate_tls_serve(&pp));
-        // Not servable: no backend to splice to.
-        let no_backend = TcpPortHandler {
-            tcp_forward: String::new(),
-            ..servable.clone()
-        };
-        assert!(!is_terminate_tls_serve(&no_backend));
-        // A servable terminate-tls is NOT a plain-tcp-forward (mutually exclusive lanes) and NOT
-        // a web serve (it has no http/https/text/redirect/mounts aspect).
-        assert!(!is_plain_tcp_forward(&servable));
-        assert!(!is_web_serve(&servable));
-
-        // build_web_serve_state maps the servable one to Proxy { backend } and excludes the pp one.
+        // It belongs to neither of the other lanes.
+        assert!(!is_plain_tcp_forward(&tls_fwd));
+        assert!(!is_web_serve(&tls_fwd));
         let mut cfg = ServeConfig::default();
-        cfg.tcp.insert("9000".into(), servable);
-        cfg.tcp.insert("9001".into(), pp);
-        let state = build_web_serve_state(&cfg, "host.ts.net");
+        cfg.tcp.insert("9000".into(), tls_fwd.clone());
+        cfg.tcp.insert(
+            "9001".into(),
+            TcpPortHandler {
+                proxy_protocol: 2,
+                ..tls_fwd
+            },
+        );
+        // The mapped port is Go's handler, field for field.
+        let one = engine_port(&cfg, "host.ts.net", 9001, &cfg.tcp["9001"])
+            .unwrap()
+            .expect("a TLS-terminated forward goes to the engine lane");
         assert_eq!(
-            state.ports.get(&9000),
-            Some(&tailscale::ServeTarget::Proxy {
-                to: "127.0.0.1:9".into()
-            }),
-            "servable terminate-tls maps to a Proxy target on the backend (engine terminates TLS + splices)"
+            one.tcp.get(&9001),
+            Some(&tailscale::TcpPortHandler {
+                tcp_forward: "127.0.0.1:9".into(),
+                terminate_tls: "host.ts.net".into(),
+                proxy_protocol: 2,
+                ..Default::default()
+            })
         );
-        assert!(
-            !state.ports.contains_key(&9001),
-            "proxy-protocol terminate-tls must NOT be armed (engine can't write the PROXY header)"
+        // The engine cannot terminate TLS on a forward the way Go does, so both ports are refused
+        // with its own reason, and nothing is handed to it.
+        let built = build_web_serve_state(&cfg, "host.ts.net");
+        let refusal =
+            tailscale::ServeConfigError::Unsupported("TCPForward with TerminateTLS".into());
+        assert_eq!(
+            built.refused,
+            vec![
+                RefusedPort {
+                    port: 9000,
+                    error: refusal.clone()
+                },
+                RefusedPort {
+                    port: 9001,
+                    error: refusal
+                },
+            ]
         );
-        assert_eq!(state.name, "host.ts.net");
-        assert!(state.validate().is_ok());
+        assert_eq!(built.state, tailscale::ServeState::default());
     }
 
     #[test]
-    fn parse_go_redirect_forms() {
-        // Bare URL → 302 (Go default).
+    fn plain_http_port_is_refused_by_the_engine() {
+        // `tnet serve --http 80 3000`: Go serves plain HTTP; the engine refuses rather than
+        // terminate TLS on a port the operator asked to be plaintext.
+        let mut cfg = ServeConfig::default();
+        go_web(&mut cfg, "host.ts.net", 80, false, "127.0.0.1:3000");
+        let built = build_web_serve_state(&cfg, "host.ts.net");
         assert_eq!(
-            parse_go_redirect("https://h/new"),
-            ("https://h/new".into(), 302)
+            built.refused,
+            vec![RefusedPort {
+                port: 80,
+                error: tailscale::ServeConfigError::Unsupported("plain-HTTP ports".into()),
+            }]
         );
-        // "<code>:<url>" picks the status.
-        assert_eq!(
-            parse_go_redirect("301:https://h/new"),
-            ("https://h/new".into(), 301)
-        );
-        // A bare https URL must NOT be mistaken for a status prefix (the scheme's `:` is not numeric).
-        assert_eq!(parse_go_redirect("http://h/x"), ("http://h/x".into(), 302));
+        assert!(built.state.tcp.is_empty());
     }
 
     #[test]
     fn build_web_serve_state_reads_the_go_web_map() {
         // A Go-shaped config: TCP[443]={HTTPS:true} + the target in Web[host:443].Handlers["/"].
-        // build_web_serve_state must derive the host:port key from `name` and serve the Web handler.
+        // The Web key is looked up with `name`, whose trailing dot is dropped.
         let go_json = r#"{"TCP":{"443":{"HTTPS":true}},"Web":{"host.ts.net:443":{"Handlers":{"/":{"Proxy":"127.0.0.1:3000"}}}}}"#;
         let cfg: ServeConfig = serde_json::from_str(go_json).unwrap();
-        let state = build_web_serve_state(&cfg, "host.ts.net.");
+        let built = build_web_serve_state(&cfg, "host.ts.net.");
+        assert!(built.refused.is_empty(), "{:?}", built.refused);
         assert_eq!(
-            state.ports.get(&443),
-            Some(&tailscale::ServeTarget::Proxy {
-                to: "127.0.0.1:3000".into()
-            }),
+            engine_web(&built.state, "host.ts.net", 443).get("/"),
+            Some(&engine_proxy("127.0.0.1:3000")),
             "the Web[host:443] proxy handler must be served, not dropped"
         );
-        assert_eq!(state.name, "host.ts.net");
-        assert!(state.validate().is_ok());
+        // And the engine's state is the same document Go would store.
+        assert_eq!(serde_json::to_string(&built.state).unwrap(), go_json);
     }
 
     #[test]
     fn build_web_serve_state_web_map_multi_mount_and_redirect() {
-        // Multiple mounts → Path mux; the Go string-form redirect is parsed. The Web key host must be
-        // a real tailnet name (the engine's validate() requires is_tailnet_name on a TLS port).
+        // A proxy at `/` plus a Go string-form redirect at `/old`: the engine serves both behind
+        // one path mux, and reads the `301:` prefix as the status.
         let go_json = r#"{"TCP":{"443":{"HTTPS":true}},"Web":{"host.ts.net:443":{"Handlers":{"/":{"Proxy":"127.0.0.1:3000"},"/old":{"Redirect":"301:https://host.ts.net/new"}}}}}"#;
         let cfg: ServeConfig = serde_json::from_str(go_json).unwrap();
-        let state = build_web_serve_state(&cfg, "host.ts.net");
-        match state.ports.get(&443) {
-            Some(tailscale::ServeTarget::Path { handlers }) => {
+        let built = build_web_serve_state(&cfg, "host.ts.net");
+        assert!(built.refused.is_empty(), "{:?}", built.refused);
+        let plan = built.state.serve_plan().unwrap();
+        match &plan[&443].target {
+            tailscale::ServeTarget::Path { handlers } => {
                 assert_eq!(
                     handlers.get("/"),
                     Some(&tailscale::ServeTarget::Proxy {
@@ -954,13 +977,12 @@ mod tests {
             }
             other => panic!("expected a Path mux, got {other:?}"),
         }
-        assert!(state.validate().is_ok());
     }
 
     #[test]
     fn build_web_serve_state_legacy_fallback_when_no_web_entry() {
-        // A legacy-shaped config (HTTPS flag + tcp_forward on the handler, NO Web map) still arms via
-        // the deprecation-window fallback to handler_to_target.
+        // A legacy-shaped config (HTTPS flag + tcp_forward on the handler, NO Web map) is migrated
+        // into the Web map the way `tnet serve` migrates it, and still serves.
         let mut cfg = ServeConfig::default();
         cfg.tcp.insert(
             "443".into(),
@@ -970,13 +992,19 @@ mod tests {
                 ..Default::default()
             },
         );
-        let state = build_web_serve_state(&cfg, "h");
+        let built = build_web_serve_state(&cfg, "h.ts.net");
+        assert!(built.refused.is_empty(), "{:?}", built.refused);
         assert_eq!(
-            state.ports.get(&443),
-            Some(&tailscale::ServeTarget::Proxy {
-                to: "127.0.0.1:3000".into()
+            built.state.tcp.get(&443),
+            Some(&tailscale::TcpPortHandler {
+                https: true,
+                ..Default::default()
             }),
-            "legacy handler with no Web entry must still serve (fallback)"
+            "the backend moves to the Web map; Go's HTTPS port carries no TCPForward"
+        );
+        assert_eq!(
+            engine_web(&built.state, "h.ts.net", 443).get("/"),
+            Some(&engine_proxy("127.0.0.1:3000"))
         );
     }
 
@@ -1074,7 +1102,7 @@ mod tests {
     }
 
     #[test]
-    fn build_web_serve_state_maps_text_and_redirect() {
+    fn a_text_handler_surfaces_the_engines_refusal_and_the_other_ports_still_serve() {
         let mut cfg = ServeConfig::default();
         cfg.tcp.insert(
             "443".into(),
@@ -1095,30 +1123,36 @@ mod tests {
                 ..Default::default()
             },
         );
-        let state = build_web_serve_state(&cfg, "host.example.ts.net");
+        let built = build_web_serve_state(&cfg, "host.example.ts.net");
+        // Go frames `Text` as an HTTP response; the engine would write bare bytes, so it refuses.
         assert_eq!(
-            state.ports.get(&443),
-            Some(&tailscale::ServeTarget::Text {
-                body: "hello world".into()
-            })
+            built.refused,
+            vec![RefusedPort {
+                port: 443,
+                error: tailscale::ServeConfigError::Unsupported("Text handlers".into()),
+            }]
         );
         assert_eq!(
-            state.ports.get(&8443),
-            Some(&tailscale::ServeTarget::Redirect {
-                to: "https://dest.ts.net/".into(),
-                status: 301
-            })
+            built.refusal_message().as_deref(),
+            Some(
+                "unable to serve port 443: serve config not supported by this runtime: Text handlers"
+            )
         );
-        assert!(state.validate().is_ok());
+        // The refused port is left out; the redirect port is still handed over and served.
+        assert!(!built.state.tcp.contains_key(&443));
+        assert_eq!(
+            engine_web(&built.state, "host.example.ts.net", 8443)
+                .get("/")
+                .map(|h| h.redirect.as_str()),
+            Some("301:https://dest.ts.net/")
+        );
+        assert!(built.state.serve_plan().is_ok());
     }
 
     #[test]
-    fn build_web_serve_state_passes_the_redirect_target_through_verbatim() {
-        // The engine writes `to` straight into `Location:` and does no variable expansion, so the
-        // daemon must not invent one either: a target holding `${HOST}`/`${REQUEST_URI}` reaches the
-        // engine byte-for-byte. This pins the behaviour `RedirectSpec::to` documents. (`tnet serve
-        // redirect` refuses to author such a target; one already persisted is still served as-is
-        // rather than silently dropped, which is why it survives translation here.)
+    fn a_redirect_placeholder_is_refused_by_the_engine() {
+        // Go expands `${HOST}` and `${REQUEST_URI}` per request; the engine writes one fixed
+        // response, so it refuses the placeholders rather than send them to the client literally.
         let mut cfg = ServeConfig::default();
         cfg.tcp.insert(
             "443".into(),
@@ -1131,21 +1165,21 @@ mod tests {
                 ..Default::default()
             },
         );
-        let state = build_web_serve_state(&cfg, "host.example.ts.net");
+        let built = build_web_serve_state(&cfg, "host.example.ts.net");
         assert_eq!(
-            state.ports.get(&443),
-            Some(&tailscale::ServeTarget::Redirect {
-                to: "https://${HOST}/${REQUEST_URI}".into(),
-                status: 302
-            }),
-            "the redirect target must reach the engine unexpanded"
+            built.refused,
+            vec![RefusedPort {
+                port: 443,
+                error: tailscale::ServeConfigError::Unsupported(
+                    "Redirect with ${HOST} or ${REQUEST_URI}".into()
+                ),
+            }]
         );
-        assert!(state.validate().is_ok());
     }
 
     #[test]
     fn build_web_serve_state_lone_root_mount_is_bare_target() {
-        // A single "/" mount collapses to the bare target (no needless Path mux).
+        // A legacy `/` mount becomes the Web map's `/` handler.
         let mut mounts = std::collections::BTreeMap::new();
         mounts.insert(
             "/".to_string(),
@@ -1162,14 +1196,11 @@ mod tests {
                 ..Default::default()
             },
         );
-        let state = build_web_serve_state(&cfg, "host.example.ts.net");
-        assert_eq!(
-            state.ports.get(&443),
-            Some(&tailscale::ServeTarget::Proxy {
-                to: "127.0.0.1:3000".into()
-            })
-        );
-        assert!(state.validate().is_ok());
+        let built = build_web_serve_state(&cfg, "host.example.ts.net");
+        assert!(built.refused.is_empty(), "{:?}", built.refused);
+        let handlers = engine_web(&built.state, "host.example.ts.net", 443);
+        assert_eq!(handlers.len(), 1);
+        assert_eq!(handlers.get("/"), Some(&engine_proxy("127.0.0.1:3000")));
     }
 
     #[test]
@@ -1177,14 +1208,15 @@ mod tests {
         let mut mounts = std::collections::BTreeMap::new();
         mounts.insert(
             "/".to_string(),
-            WebMount::Text {
-                body: "root".into(),
+            WebMount::Proxy {
+                to: "127.0.0.1:3000".into(),
             },
         );
         mounts.insert(
-            "/api".to_string(),
-            WebMount::Proxy {
-                to: "127.0.0.1:3000".into(),
+            "/old".to_string(),
+            WebMount::Redirect {
+                to: "https://host.example.ts.net/new".into(),
+                status: 308,
             },
         );
         let mut cfg = ServeConfig::default();
@@ -1192,59 +1224,97 @@ mod tests {
             "443".into(),
             TcpPortHandler {
                 https: true,
-                mounts,
+                mounts: mounts.clone(),
                 ..Default::default()
             },
         );
-        let state = build_web_serve_state(&cfg, "host.example.ts.net");
-        match state.ports.get(&443) {
-            Some(tailscale::ServeTarget::Path { handlers }) => {
+        let built = build_web_serve_state(&cfg, "host.example.ts.net");
+        assert!(built.refused.is_empty(), "{:?}", built.refused);
+        match &built.state.serve_plan().unwrap()[&443].target {
+            tailscale::ServeTarget::Path { handlers } => {
                 assert_eq!(handlers.len(), 2);
                 assert_eq!(
-                    handlers.get("/api"),
-                    Some(&tailscale::ServeTarget::Proxy {
-                        to: "127.0.0.1:3000".into()
+                    handlers.get("/old"),
+                    Some(&tailscale::ServeTarget::Redirect {
+                        to: "https://host.example.ts.net/new".into(),
+                        status: 308
                     })
                 );
             }
             other => panic!("expected Path mux, got {other:?}"),
         }
-        assert!(state.validate().is_ok());
+
+        // Go strips the mount from the path before proxying; the engine does not, so a proxy at a
+        // mount other than `/` is refused.
+        mounts.insert(
+            "/api".to_string(),
+            WebMount::Proxy {
+                to: "127.0.0.1:4000".into(),
+            },
+        );
+        cfg.tcp.get_mut("443").unwrap().mounts = mounts;
+        let built = build_web_serve_state(&cfg, "host.example.ts.net");
+        assert_eq!(
+            built.refused,
+            vec![RefusedPort {
+                port: 443,
+                error: tailscale::ServeConfigError::Unsupported(
+                    "Proxy at a mount other than /".into()
+                ),
+            }]
+        );
     }
 
     #[test]
-    fn build_web_serve_state_skips_invalid_redirect() {
-        // A redirect with an out-of-range status / CRLF is fail-closed: skipped, not emitted.
-        let mut cfg = ServeConfig::default();
-        cfg.tcp.insert(
-            "443".into(),
-            TcpPortHandler {
-                https: true,
-                redirect: Some(RedirectSpec {
-                    to: "https://x.ts.net/".into(),
-                    status: 200, // out of 300..=399
-                }),
-                ..Default::default()
-            },
+    fn build_web_serve_state_refuses_invalid_redirect() {
+        let refused = |to: &str, status: u16| {
+            let mut cfg = ServeConfig::default();
+            cfg.tcp.insert(
+                "443".into(),
+                TcpPortHandler {
+                    https: true,
+                    redirect: Some(RedirectSpec {
+                        to: to.into(),
+                        status,
+                    }),
+                    ..Default::default()
+                },
+            );
+            let built = build_web_serve_state(&cfg, "host.example.ts.net");
+            assert!(
+                built.state.tcp.is_empty(),
+                "nothing is handed over: {built:?}"
+            );
+            built.refused
+        };
+        let invalid = |msg: &str| {
+            vec![RefusedPort {
+                port: 443,
+                error: tailscale::ServeConfigError::Invalid(msg.into()),
+            }]
+        };
+        // An out-of-range status on a legacy redirect.
+        assert_eq!(
+            refused("https://x.ts.net/", 200),
+            invalid("serve redirect status 200 is not in 300..=399")
         );
-        let state = build_web_serve_state(&cfg, "host.example.ts.net");
-        assert!(state.ports.is_empty(), "invalid redirect must be skipped");
-
-        // CRLF in the target is rejected too.
-        let mut cfg = ServeConfig::default();
-        cfg.tcp.insert(
-            "443".into(),
-            TcpPortHandler {
-                https: true,
-                redirect: Some(RedirectSpec {
-                    to: "https://x.ts.net/\r\nSet-Cookie: evil".into(),
-                    status: 302,
-                }),
-                ..Default::default()
-            },
+        // CR/LF (response splitting) and any other control character in the target.
+        for to in [
+            "https://x.ts.net/\r\nSet-Cookie: evil",
+            "https://x.ts.net/\0",
+        ] {
+            assert_eq!(
+                refused(to, 302),
+                invalid("serve redirect target must not contain control characters")
+            );
+        }
+        // The same rule holds for a Go-shaped `Web` redirect.
+        let go_json = "{\"TCP\":{\"443\":{\"HTTPS\":true}},\"Web\":{\"h.ts.net:443\":{\"Handlers\":{\"/\":{\"Redirect\":\"https://x/\\u0000\"}}}}}";
+        let cfg: ServeConfig = serde_json::from_str(go_json).unwrap();
+        assert_eq!(
+            build_web_serve_state(&cfg, "h.ts.net").refused,
+            invalid("serve redirect target must not contain control characters")
         );
-        let state = build_web_serve_state(&cfg, "host.example.ts.net");
-        assert!(state.ports.is_empty(), "CRLF redirect must be skipped");
     }
 
     #[test]
@@ -1372,20 +1442,38 @@ mod tests {
     }
 
     #[test]
-    fn build_web_serve_state_empty_without_web_entries() {
-        // A config with only a plain TCP forward yields the canonical empty "serve nothing" state
-        // (empty name + no ports), which is also how a web serve is cleared via REPLACE semantics.
+    fn plain_tcp_forward_stays_on_the_daemons_lane_and_yields_the_empty_state() {
+        // A config with only a plain TCP forward hands the engine the empty config (Go's `{}`),
+        // which is also how a previously armed web serve is cleared (REPLACE semantics).
         let mut cfg = ServeConfig::default();
         set_tcp_forward(&mut cfg, 2222, "127.0.0.1:22".into());
-        let state = build_web_serve_state(&cfg, "host.example.ts.net");
-        assert!(state.ports.is_empty());
-        assert!(state.name.is_empty());
-        assert_eq!(state, tailscale::ServeState::default());
-        assert!(state.validate().is_ok());
+        let built = build_web_serve_state(&cfg, "host.example.ts.net");
+        assert_eq!(built, EngineServe::default());
+        assert_eq!(built.refusal_message(), None);
+        assert_eq!(serde_json::to_string(&built.state).unwrap(), "{}");
 
         // An entirely empty config likewise.
-        let state = build_web_serve_state(&ServeConfig::default(), "host.example.ts.net");
-        assert_eq!(state, tailscale::ServeState::default());
+        let built = build_web_serve_state(&ServeConfig::default(), "host.example.ts.net");
+        assert_eq!(built, EngineServe::default());
+    }
+
+    #[test]
+    fn funnel_stays_off_in_the_engine_state() {
+        // Funnel is armed by the funnel lane through `listen_funnel`. The engine refuses an
+        // AllowFunnel entry that is on, so the stored config the engine gets always has it off,
+        // and a funnel-enabled web port is handed over as a plain HTTPS port.
+        let mut cfg = ServeConfig::default();
+        go_web(&mut cfg, "host.ts.net", 443, true, "127.0.0.1:3000");
+        set_funnel(&mut cfg, "host.ts.net", 443, true);
+        assert_eq!(
+            funnel_ports(&cfg).into_iter().collect::<Vec<_>>(),
+            vec![443]
+        );
+        let built = build_web_serve_state(&cfg, "host.ts.net");
+        assert!(built.refused.is_empty(), "{:?}", built.refused);
+        assert!(built.state.allow_funnel.is_empty());
+        assert!(built.state.tcp[&443].https);
+        assert!(built.state.serve_plan().is_ok());
     }
 
     /// Build a web port handler in the Go shape: the `TCP[port]` flag plus a `Web[host:port]` body.

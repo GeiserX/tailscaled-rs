@@ -14244,8 +14244,8 @@ async fn run_serve_v2(socket: &std::path::Path, flags: ServeFlags, funnel: bool)
             cfg.tcp.insert(
                 port.to_string(),
                 tailscaled_rs::localapi::TcpPortHandler {
-                    // Go stores the node's DNS name as the SNI to terminate for; the daemon's
-                    // `is_terminate_tls_serve` lane then splices the plaintext to `TCPForward`.
+                    // Go stores the node's DNS name as the SNI to terminate for. The daemon hands
+                    // the entry to the engine in this shape; see `build_web_serve_state`.
                     terminate_tls: host.to_string(),
                     tcp_forward: fwd.clone(),
                     ..Default::default()
