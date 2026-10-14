@@ -6205,9 +6205,11 @@ impl Backend {
         // when `tnet serve` writes a web serve; a config written while down is checked when it is
         // armed, and each refused port is logged then. Only a refusal this write introduces is
         // refused: one the stored config already carries (written before the engine refused it)
-        // must not block removing another port, or a foreground serve restoring that config.
+        // must not block removing another port, or a foreground serve restoring that config. The
+        // name query is bounded like `status`'s, since this runs under the backend lock; a query
+        // that fails or times out skips the check, and arming still logs any refusal.
         if let Some(dev) = self.device.as_ref()
-            && let Ok(node) = dev.self_node().await
+            && let Ok(Ok(node)) = tokio::time::timeout(STATUS_QUERY_TIMEOUT, dev.self_node()).await
         {
             let fqdn = node.fqdn(false);
             if !fqdn.is_empty() {
