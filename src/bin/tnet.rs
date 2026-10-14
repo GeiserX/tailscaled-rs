@@ -13653,12 +13653,20 @@ async fn get_serve_config(
 }
 
 /// Render `serve status` / `funnel status` (Go aliases each other — one ServeConfig backs both).
+///
+/// The human output marks each port the engine refuses, judged with the node's MagicDNS name, the
+/// name the daemon arms with. The name is best effort: a node that is down has none, and
+/// [`format_serve_status`] then judges with the host its `Web` keys carry.
 async fn run_serve_status(socket: &std::path::Path, json: bool) -> Result<()> {
     let cfg = get_serve_config(socket).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&cfg)?);
     } else {
-        print!("{}", format_serve_status(&cfg, false));
+        let name = match round_trip(socket, &Request::Status).await {
+            Ok(Response::Status(s)) => s.self_name.filter(|h| !h.is_empty()),
+            _ => None,
+        };
+        print!("{}", format_serve_status(&cfg, name.as_deref()));
     }
     Ok(())
 }
@@ -14554,14 +14562,67 @@ fn web_handler_desc(h: &tailscaled_rs::localapi::HttpHandler) -> String {
     }
 }
 
+/// The name a legacy serve entry with no `Web` key is judged with when the node has no name to give
+/// (it is down): a tailnet-shaped name, so the engine checks the entry's handlers and only the
+/// check of the node's own name waits until the node is up.
+const STATUS_STAND_IN_NAME: &str = "node.ts.net";
+
+/// The ports the engine refuses in `cfg`, each with the engine's reason, judged the way the daemon
+/// judges them when it arms ([`build_web_serve_state`](tailscaled_rs::ipn::serve::build_web_serve_state)).
+/// With `name` that is exactly the daemon's verdict. Without one, each port is judged with the host
+/// of its own `Web` key, else [`STATUS_STAND_IN_NAME`].
+fn engine_refusals(
+    cfg: &tailscaled_rs::localapi::ServeConfig,
+    name: Option<&str>,
+) -> std::collections::BTreeMap<u16, tailscale::ServeConfigError> {
+    use tailscaled_rs::ipn::serve::build_web_serve_state;
+    if let Some(name) = name {
+        return build_web_serve_state(cfg, name)
+            .refused
+            .into_iter()
+            .map(|r| (r.port, r.error))
+            .collect();
+    }
+    let mut out = std::collections::BTreeMap::new();
+    for port_str in cfg.tcp.keys() {
+        if port_str.parse::<u16>().is_err() {
+            continue;
+        }
+        let suffix = format!(":{port_str}");
+        let host = cfg
+            .web
+            .keys()
+            .find_map(|k| k.strip_suffix(&suffix))
+            .unwrap_or(STATUS_STAND_IN_NAME);
+        let mut one = cfg.clone();
+        one.tcp.retain(|k, _| k == port_str);
+        for r in build_web_serve_state(&one, host).refused {
+            out.insert(r.port, r.error);
+        }
+    }
+    out
+}
+
 /// Render `tnet serve status` from a [`ServeConfig`](tailscaled_rs::localapi::ServeConfig). Lists each
-/// served entry: plain TCP forwards (the daemon's own accept loop), HTTPS/HTTP web entries (proxy /
-/// text / redirect / path-mux — Go's top-level `Web` map, or the legacy per-handler bodies — served by
-/// engine delegation), and TLS-terminated raw-TCP forwards (`--tls-terminated-tcp`, also
-/// engine-delegated). A `TerminateTLS` entry with no backend, or one requesting PROXY-protocol (which
-/// the engine `Proxy` target can't write), is flagged "NOT served". `_json` is handled by the caller.
-/// Pure → unit-testable.
-fn format_serve_status(cfg: &tailscaled_rs::localapi::ServeConfig, _json: bool) -> String {
+/// stored entry: plain TCP forwards (the daemon's own accept loop), HTTPS/HTTP web entries (proxy /
+/// text / redirect / path-mux — Go's top-level `Web` map, or the legacy per-handler bodies — handed
+/// to the engine), and TLS-terminated raw-TCP forwards (`--tls-terminated-tcp`, also handed to the
+/// engine). `--json` is handled by the caller. Pure → unit-testable.
+///
+/// A port the engine refuses is flagged "NOT served" with the engine's own
+/// [`ServeConfigError`](tailscale::ServeConfigError), the reason the daemon logs when it arms and
+/// leaves that port out ([`build_web_serve_state`](tailscaled_rs::ipn::serve::build_web_serve_state)).
+/// Such an entry can only be stored from before the engine refused it: while the node is up,
+/// `SetServeConfig` refuses a new one. Go has no line for this, because Go serves every entry it
+/// stores. A `TerminateTLS` entry with no backend, which the engine skips rather than refuses, is
+/// flagged with the daemon's own reason.
+///
+/// `name` is the node's MagicDNS name, the name the daemon arms with, so the verdict here is the
+/// one the daemon reaches. With no name (the node is down), each port is judged with the host its
+/// `Web` key carries, which is the name the CLI wrote it under; a legacy entry with no `Web` key is
+/// judged with [`STATUS_STAND_IN_NAME`], so its handler is checked but the name check waits until
+/// the node is up.
+fn format_serve_status(cfg: &tailscaled_rs::localapi::ServeConfig, name: Option<&str>) -> String {
     use tailscaled_rs::localapi::WebMount;
     // Go's `isServeConfigEmpty` (cmd/tailscale/cli/serve_status.go) is empty iff `len(TCP)==0 &&
     // len(Web)==0 && len(Services)==0 && len(AllowFunnel)==0`. This wire model carries `tcp` + `web`
@@ -14572,8 +14633,15 @@ fn format_serve_status(cfg: &tailscaled_rs::localapi::ServeConfig, _json: bool) 
     if cfg.tcp.is_empty() && cfg.web.is_empty() && cfg.allow_funnel.is_empty() {
         return "No serve config\n".to_string();
     }
+    let refusals = engine_refusals(cfg, name);
     let mut out = String::new();
     for (port, h) in &cfg.tcp {
+        let refusal = port
+            .parse::<u16>()
+            .ok()
+            .and_then(|p| refusals.get(&p))
+            .map(|e| sanitize_for_terminal(&e.to_string()));
+        let block_start = out.len();
         let scheme = if h.http { "http" } else { "https" };
         // Go-shaped Web-map handlers take precedence over the legacy per-handler bodies (when both
         // somehow coexist, the Web map is the authoritative target — it's what Stage B's translation
@@ -14628,33 +14696,43 @@ fn format_serve_status(cfg: &tailscaled_rs::localapi::ServeConfig, _json: bool) 
             out.push_str(&format!("{scheme}://<node>:{port} -> {}\n", h.tcp_forward));
         } else if !h.tcp_forward.is_empty() && !h.https && !h.http && h.terminate_tls.is_empty() {
             out.push_str(&format!("tcp :{port} -> {}\n", h.tcp_forward));
-        } else if !h.terminate_tls.is_empty() && !h.tcp_forward.is_empty() && h.proxy_protocol == 0
-        {
-            // Servable TLS-terminated raw-TCP forward (engine terminates TLS + splices to the backend).
+        } else if !h.terminate_tls.is_empty() && !h.tcp_forward.is_empty() {
+            // A TLS-terminated raw-TCP forward, handed to the engine. The engine refuses
+            // `TCPForward` with `TerminateTLS` (and with `ProxyProtocol`); the refusal is appended
+            // below with its reason.
             out.push_str(&format!(
                 "tls+tcp :{port} -> {} (TLS-terminated)\n",
                 h.tcp_forward
             ));
         } else if !h.terminate_tls.is_empty() {
-            // Not servable: no backend to splice to, or proxy-protocol requested (engine `Proxy`
-            // doesn't write the PROXY header).
-            let why = if h.tcp_forward.is_empty() {
-                "no backend"
-            } else {
-                "proxy-protocol not supported"
-            };
+            // No backend to splice to. The engine skips such an entry rather than refuse it, so the
+            // reason is the daemon's own.
             out.push_str(&format!(
-                "tcp :{port} -> {} (TLS-terminated; NOT served — {why})\n",
+                "tcp :{port} -> {} (TLS-terminated; NOT served — no backend)\n",
                 h.tcp_forward
             ));
         } else if h.https || h.http {
-            // A web flag with no backend to proxy to — can't be served.
+            // A web flag with no backend to proxy to. The engine refuses it ("... with no Web
+            // config for it", or plain HTTP), so its reason is appended below; the daemon's own is
+            // the fallback.
             let kind = if h.https { "HTTPS" } else { "HTTP" };
-            out.push_str(&format!(
-                ":{port} {kind} web (NOT served — no proxy target configured)\n"
-            ));
+            if refusal.is_some() {
+                out.push_str(&format!(":{port} {kind} web\n"));
+            } else {
+                out.push_str(&format!(
+                    ":{port} {kind} web (NOT served — no proxy target configured)\n"
+                ));
+            }
         } else {
             out.push_str(&format!(":{port} (empty handler)\n"));
+        }
+        // A port the engine refuses: its first line says so, with the engine's reason, in the
+        // same "NOT served" form the daemon's own reasons use.
+        if let Some(why) = refusal {
+            let end = out[block_start..]
+                .find('\n')
+                .map_or(out.len(), |i| block_start + i);
+            out.insert_str(end, &format!(" (NOT served — {why})"));
         }
     }
     // Funnel summary: ports exposed to the PUBLIC internet (Go's "# Funnel on:" section). Listed
@@ -19892,7 +19970,7 @@ mod tests {
     fn format_serve_status_lists_and_flags() {
         use tailscaled_rs::localapi::{ServeConfig, TcpPortHandler};
         // Empty → placeholder, with Go's exact wording (no trailing period).
-        let empty = format_serve_status(&ServeConfig::default(), false);
+        let empty = format_serve_status(&ServeConfig::default(), None);
         assert_eq!(
             empty, "No serve config\n",
             "must match Go's exact empty message"
@@ -19905,7 +19983,7 @@ mod tests {
             .allow_funnel
             .insert("node:443".to_string(), true);
         assert!(
-            !format_serve_status(&funnel_only, false).contains("No serve config"),
+            !format_serve_status(&funnel_only, None).contains("No serve config"),
             "a funnel-only config is not empty (Go isServeConfigEmpty), must not show the placeholder"
         );
 
@@ -19927,7 +20005,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        // HTTP web with a backend — served.
+        // HTTP web with a backend — the engine refuses plain HTTP.
         cfg.tcp.insert(
             "80".to_string(),
             TcpPortHandler {
@@ -19936,7 +20014,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        // HTTPS flag with NO backend — can't be served.
+        // HTTPS flag with NO backend — the engine refuses it.
         cfg.tcp.insert(
             "8444".to_string(),
             TcpPortHandler {
@@ -19944,7 +20022,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        // TLS-terminated raw TCP with a backend (no proxy-protocol) — SERVED via engine delegation.
+        // TLS-terminated raw TCP with a backend — the engine refuses `TerminateTLS` forwards.
         cfg.tcp.insert(
             "9000".to_string(),
             TcpPortHandler {
@@ -19953,7 +20031,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        // TLS-terminated requesting PROXY-protocol — NOT served (engine `Proxy` can't write the header).
+        // TLS-terminated requesting PROXY-protocol — refused for the same `TerminateTLS` reason.
         cfg.tcp.insert(
             "9001".to_string(),
             TcpPortHandler {
@@ -19963,29 +20041,93 @@ mod tests {
                 ..Default::default()
             },
         );
-        let out = format_serve_status(&cfg, false);
-        // Plain forward is served.
-        assert!(out.contains("tcp :8443 -> 127.0.0.1:5000"), "{out}");
-        // HTTPS/HTTP web entries with a backend are served (engine delegation).
+        let out = format_serve_status(&cfg, None);
+        let lines: Vec<&str> = out.lines().collect();
+        // Plain forward is served by the daemon's own accept loop.
+        assert!(lines.contains(&"tcp :8443 -> 127.0.0.1:5000"), "{out}");
+        // An HTTPS web entry with a backend is served by the engine.
         assert!(
-            out.contains("https://<node>:443 -> 127.0.0.1:3000"),
+            lines.contains(&"https://<node>:443 -> 127.0.0.1:3000"),
             "{out}"
         );
-        assert!(out.contains("http://<node>:80 -> 127.0.0.1:8080"), "{out}");
-        // HTTPS flag with no proxy target can't be served.
+        // Every entry the engine refuses says so, with the engine's reason.
         assert!(
-            out.contains("8444") && out.contains("no proxy target"),
+            lines.contains(
+                &"http://<node>:80 -> 127.0.0.1:8080 (NOT served — serve config not supported by \
+                  this runtime: plain-HTTP ports)"
+            ),
             "{out}"
         );
-        // TLS-terminated raw TCP with a backend IS served now (engine TLS-terminate + splice).
         assert!(
-            out.contains("tls+tcp :9000 -> 127.0.0.1:9 (TLS-terminated)"),
+            lines.contains(
+                &":8444 HTTPS web (NOT served — serve config not supported by this runtime: HTTPS \
+                  port 8444 with no Web config for it)"
+            ),
             "{out}"
         );
-        // The proxy-protocol terminate-tls entry is NOT served (with the reason).
+        for (port, to) in [(9000, "127.0.0.1:9"), (9001, "127.0.0.1:10")] {
+            let want = format!(
+                "tls+tcp :{port} -> {to} (TLS-terminated) (NOT served — serve config not \
+                 supported by this runtime: TCPForward with TerminateTLS)"
+            );
+            assert!(lines.contains(&want.as_str()), "{out}");
+        }
+        // A TLS-terminated entry with no backend is skipped by the engine, not refused, so the
+        // daemon's own reason is the one shown.
+        let mut no_backend = ServeConfig::default();
+        no_backend.tcp.insert(
+            "9002".to_string(),
+            TcpPortHandler {
+                terminate_tls: "host.ts.net".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            format_serve_status(&no_backend, None),
+            "tcp :9002 ->  (TLS-terminated; NOT served — no backend)\n"
+        );
+    }
+
+    #[test]
+    fn format_serve_status_shows_a_stored_refused_entry_as_refused() {
+        // A config stored before the engine refused Text handlers: `tnet serve --https=443 text:hi`
+        // wrote it in Go's shape. The daemon leaves port 443 out when it arms and logs the engine's
+        // reason; `serve status` must say the same, not list it as served. Port 8443 is a proxy
+        // the engine serves, and stays unmarked.
+        let cfg: tailscaled_rs::localapi::ServeConfig = serde_json::from_str(
+            r#"{"TCP":{"443":{"HTTPS":true},"8443":{"HTTPS":true}},"Web":{"host.tail1.ts.net:443":{"Handlers":{"/":{"Text":"hi"}}},"host.tail1.ts.net:8443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:3000"}}}}}"#,
+        )
+        .unwrap();
+        let want = "https://host.tail1.ts.net:443 -> text \"hi\" (NOT served — serve config not \
+                    supported by this runtime: Text handlers)\n\
+                    https://host.tail1.ts.net:8443 -> proxy -> http://127.0.0.1:3000\n";
+        // Up: judged with the node's own name, exactly as the daemon arms.
+        assert_eq!(format_serve_status(&cfg, Some("host.tail1.ts.net")), want);
+        // Down: judged with the host the Web key carries, the same verdict.
+        assert_eq!(format_serve_status(&cfg, None), want);
+
+        // The node's name decides when it differs from the stored one: the daemon looks the Web
+        // entry up under its own name, finds none, and the engine refuses the port for that.
+        let renamed = format_serve_status(&cfg, Some("renamed.tail1.ts.net"));
         assert!(
-            out.contains("9001") && out.contains("NOT served") && out.contains("proxy-protocol"),
-            "{out}"
+            renamed.contains(
+                "https://host.tail1.ts.net:8443 -> proxy -> http://127.0.0.1:3000 (NOT served — \
+                 serve config not supported by this runtime: HTTPS port 8443 with no Web config \
+                 for it)"
+            ),
+            "{renamed}"
+        );
+
+        // A path mux marks its header line; the mount lines stay as they are.
+        let mux: tailscaled_rs::localapi::ServeConfig = serde_json::from_str(
+            r#"{"TCP":{"443":{"HTTPS":true}},"Web":{"host.tail1.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:3000"},"/api":{"Proxy":"http://127.0.0.1:4000"}}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            format_serve_status(&mux, Some("host.tail1.ts.net")),
+            "https://host.tail1.ts.net:443 (path mux) (NOT served — serve config not supported by \
+             this runtime: Proxy at a mount other than /)\n  \
+             / -> proxy -> http://127.0.0.1:3000\n  /api -> proxy -> http://127.0.0.1:4000\n"
         );
     }
 
@@ -20152,7 +20294,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let out = format_serve_status(&cfg, false);
+        let out = format_serve_status(&cfg, None);
         assert!(
             out.contains("https://<node>:443 -> text \"hello\""),
             "{out}"
@@ -20173,7 +20315,7 @@ mod tests {
             r#"{"TCP":{"443":{"HTTPS":true}},"Web":{"host.ts.net:443":{"Handlers":{"/":{"Proxy":"127.0.0.1:3000"}}}}}"#,
         )
         .unwrap();
-        let out = format_serve_status(&cfg, false);
+        let out = format_serve_status(&cfg, None);
         assert!(
             !out.contains("No serve config"),
             "Web-only config is not empty: {out}"
@@ -20188,7 +20330,7 @@ mod tests {
             r#"{"TCP":{"443":{"HTTPS":true}},"Web":{"h:443":{"Handlers":{"/":{"Proxy":"127.0.0.1:3000"},"/old":{"Redirect":"301:https://h/new"}}}}}"#,
         )
         .unwrap();
-        let out = format_serve_status(&mux, false);
+        let out = format_serve_status(&mux, None);
         assert!(out.contains("https://h:443 (path mux)"), "{out}");
         assert!(out.contains("/ -> proxy -> 127.0.0.1:3000"), "{out}");
         assert!(
@@ -20211,10 +20353,10 @@ mod tests {
             },
         );
         // No funnel yet → no funnel section.
-        assert!(!format_serve_status(&cfg, false).contains("Funnel"));
+        assert!(!format_serve_status(&cfg, None).contains("Funnel"));
         // Enable funnel on 443 → the funnel section appears.
         serve::set_funnel(&mut cfg, "host.example.ts.net", 443, true);
-        let out = format_serve_status(&cfg, false);
+        let out = format_serve_status(&cfg, None);
         assert!(out.contains("Funnel (on the public internet):"), "{out}");
         assert!(out.contains("https://<node>:443"), "{out}");
     }
