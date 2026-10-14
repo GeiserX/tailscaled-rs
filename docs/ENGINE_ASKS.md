@@ -2,15 +2,28 @@
 
 This lists the changes the downstream daemon (`tailscaled-rs`) needs from the `tailscale-rs`
 library to unblock end-to-end features. Each ask is self-contained, additive, and
-backward-compatible. The daemon pins engine rev `35e5db22` (`v0.41.0`); individual asks
+backward-compatible. The daemon pins engine rev `eabd2cf2` (engine 0.57.4, since #611 on 2026-10-07); individual asks
 note the rev they were verified against (older "verified vs `e126bba`/v0.6.9" / `81446f88`/v0.28.2
 / `6035651b`/v0.29.1 / `f3793636`/v0.31.0 / `575104b1`/v0.32.0 / `f8192568`/v0.33.0 / `1694d208`/v0.34.2
 / `faf46b34`/v0.35.8 notes below predate the current pin and are kept as historical context — the SHIPPED
 markers reflect what the pin provides). Bumps since v0.33.0: → v0.34.2 (tka chokepoint, cap parity, taildrop
 length-verify) → v0.35.3 (control-runner unbounded mailbox, tka rotation-drop, tunnel/derp fixes) →
 v0.35.8 (netcheck hysteresis, dataplane ACL, magicsock STUN, derp wire keys, taildrop symlink-refuse) →
-v0.39.0 → v0.40.0 → v0.41.0 (current pin) — all transparent except the `DeviceState` growth noted in the
+v0.39.0 → v0.40.0 → v0.41.0 — all transparent except the `DeviceState` growth noted in the
 v0.40.0 header below, each clippy+test-verified.
+
+> **Status at the wind-down, 2026-10-14.** Read against the pin `eabd2cf2` (engine 0.57.4) and engine
+> main at `f311bba`, which is 10 commits ahead of the pin.
+>
+> - These are closed in the engine and marked below: #1, #7 (the recording half), #8 (the engine half), #14,
+>   #15, #16, #19, #22, #23, #24, #26 and #30. The pin carries every one of them.
+> - These are still open at engine main: #5, #13, #18, #20, #21 (the three Linux router flags and
+>   `--unattended`), #25 (`tka_add` and `tka_remove`), #27, #28, #29 and #31 to #46. #7 stays open
+>   for check-mode, and #17 is open in part (no add, remove, local-disable or revoke).
+> - #47 is new. Engine main at `50611ab` stores the Serve config in Go's `ipn.ServeConfig` shape, which
+>   breaks the daemon's serve layer at the next pin bump.
+> - The pin-bump notes below stop at v0.41.0. The later bumps, to `9d847a6e` (engine 0.43.0) and then
+>   to `eabd2cf2` (engine 0.57.4), were not logged here.
 
 > **Pin bump fe86ca00 (v0.40.0) → 35e5db22 (v0.41.0), 2026-06-16.** Probe-compiled first (against the
 > pre-tag HEAD `73f56b1e`): CLEAN — no breaking change, purely additive. **SHIPS + CONSUMES ask #24**:
@@ -99,6 +112,8 @@ into a working feature with a one-line change downstream.
 ---
 
 ## 1. (BLOCKER) Re-export `TransportMode` and `TunConfig` from the crate facade
+
+> **Marked closed on 2026-10-14.** Engine #11 (`68eda0b`, v0.6.7) re-exports both types from the facade, with `Config::use_tun`. The pin `eabd2cf2` carries it.
 
 **Why:** The daemon has the entire TUN-mode data path plumbed (prefs → wire → CLI `--tun/--no-tun`
 → `tun` cargo feature → root preflight), and the engine's `tun` feature compiles. The one missing
@@ -350,6 +365,8 @@ this lane but has no analogous hardcoded-path trap.
 
 ## 7. ✅ PARTIALLY FIXED in engine v0.7.3 — SSH session-recording enforcement (engine bead `tsr-0h2`)
 
+> **Marked closed on 2026-10-14.** The recording half is closed in the engine: engine #357 (`3ab93f7`, v0.47.0) records sessions to a recorder instead of refusing them. Check-mode (`HoldAndDelegate`) is still open. The pin `eabd2cf2` carries it.
+
 > **UPDATE:** the engine shipped the **session-recording enforcement** half in **v0.7.3** (`dd4b33e`,
 > PR #25): `recorders` / `on_recording_failure` are no longer dropped in the domain conversion, and
 > the SSH server now **fails closed** — when a matched rule requires recording but no recorder
@@ -378,6 +395,8 @@ parity only; the daemon documents the gap. Mirrors Go `tailssh`'s `evaluatePolic
 `fetchSSHAction` + `sessionrecording`.
 
 ## 8. Exit-node DNS path for forwarded clients — advertise side (engine bead `tsr-c39`)
+
+> **Marked closed on 2026-10-14.** The engine half is closed: `004b1b2` (engine 0.5.9) added the peerAPI DoH server an exit node runs for its clients, bound when `Config::peerapi_port` is set (engine `ts_control/src/config.rs:296-305` at the pin). The daemon never sets that port, so nothing binds it yet. That remaining half is daemon work, not an engine ask. The pin `eabd2cf2` carries it.
 
 When THIS node advertises itself as an exit node (`advertise_exit_node`, shipped daemon v0.4.0) and
 egress is enabled, traffic forwarded **through** it has no DNS handling — the overlay router only
@@ -468,6 +487,8 @@ existing serve re-exports). Pure re-export, no behavior change. Lets the daemon 
 
 ## 14. `accept_dns` / CorpDNS Config gate (engine bead — to file)
 
+> **Marked closed on 2026-10-14.** Engine #124 (`427d5e0`, v0.29.0) added the `accept_dns` preference that gates the MagicDNS responder. The pin `eabd2cf2` carries it.
+
 The daemon wants `tnet up --accept-dns` / `--no-accept-dns` (Go `tailscale up --accept-dns`, the
 `CorpDNS` pref: accept the tailnet's MagicDNS config onto the host resolver). This is the last
 high-use `up`/`set` flag still unmodeled, and it is engine-blocked **only by a missing Config field** —
@@ -506,6 +527,8 @@ scutil/resolvectl effect wants the live Mac-Mini TUN gate.
 
 ## 15. `Device::query_dns(name, qtype)` — a real forwarder DNS query (for a faithful `tnet dns query`)
 
+> **Marked closed on 2026-10-14.** Engine #152 (`d737e08`, v0.30.0) added `Device::query_dns` through the live MagicDNS forwarder. The pin `eabd2cf2` carries it.
+
 The daemon wants `tnet dns query <name> [type]` (Go `tailscale dns query`), which resolves a name
 **through the node's DNS path** and prints the answer records, the RCODE, and which resolver(s)
 answered. The engine's only resolution primitive today is `Device::resolve()` (verified at pin
@@ -524,6 +547,8 @@ read (the `whois`/`id-token` plumbing pattern) consumed via a pin bump. No rush 
 recorded, not forgotten.
 
 ## 16. `Device::cert_pair(name, min_validity)` — PEM cert **and private key** (for a faithful `tnet cert`)
+
+> **Marked closed on 2026-10-14.** Engine #129 (`b66eb5a`, v0.29.0) added `Device::cert_pair`, which exports the ACME leaf, chain and key as PEM. The pin `eabd2cf2` carries it.
 
 The daemon wants `tnet cert <domain>` (Go `tailscale cert`), which writes BOTH `<domain>.crt` and
 `<domain>.key` PEM files to disk (the key at mode `0600`) — Go's `localClient.CertPairWithValidity`
@@ -578,6 +603,8 @@ API / `netsh`, DNS via the NRPT or per-interface resolver). Filed so the gap is 
 consumes it for free (it's automatic in the TUN datapath) once it lands. No rush. — daemon lane
 
 ## 19. (BUG — TUN mode has no peer connectivity) `host_routes_from_node` omits peer AllowedIPs
+
+> **Marked closed on 2026-10-14.** Engine #127 (`1ed5303`, v0.29.0) routes the union of peer AllowedIPs into the TUN host routing table. The pin `eabd2cf2` carries it.
 
 **Severity: HIGH for `--tun` mode** (TUN-mode nodes can reach MagicDNS but NOT their tailnet peers).
 **Found via a live Linux TUN end-to-end on a fresh ARM64 VM (2026-06-12)** — the first live `--tun`
@@ -716,6 +743,8 @@ tsd-1m9, which is BLOCKED on this ask. — daemon lane
 
 ## 22. A configurable WireGuard/disco listen port on `Config` (for `tailnetd --port` / `PORT`)
 
+> **Marked closed on 2026-10-14.** Engine #263 (`66f8626`, v0.40.0) added `Config.wireguard_listen_port`. The pin `eabd2cf2` carries it.
+
 **Why:** Go `tailscaled` takes `--port` (and `PORT=` via its systemd/openrc `EnvironmentFile`, default
 `41641`) — the UDP port magicsock binds for WireGuard + disco. Operators behind a firewall that only
 forwards/pinholes a fixed UDP port need to pin it; a node that binds an ephemeral port can't be
@@ -741,6 +770,8 @@ Tracked in daemon bead tsd-k7s (the one remaining engine-gated item there). — 
 
 ## 23. Per-peer SSH host keys in `StatusNode` (for `tnet ssh`)
 
+> **Marked closed on 2026-10-14.** Engine #263 (`66f8626`, v0.40.0) added `StatusNode.ssh_host_keys`. The pin `eabd2cf2` carries it.
+
 **Why:** Go's `tailscale ssh [user@]<host>` resolves the peer via the daemon status, writes a
 `known_hosts` file from each peer's **SSH host keys** (`genKnownHosts` reads `ps.SSH_HostKeys`), and
 execs the system `ssh` with `StrictHostKeyChecking=yes` + that `UserKnownHostsFile` — so `ssh`
@@ -761,6 +792,8 @@ into the status the daemon reads), matching Go's `ipnstate.PeerStatus.SSH_HostKe
 `ProxyCommand`. Consumed via a pin bump. Tracked in daemon bead tsd-dy5. — daemon lane
 
 ## 24. `Device::suggest_exit_node()` — best-available exit node (for `tnet exit-node suggest`)
+
+> **Marked closed on 2026-10-14.** Engine #267 (`73f56b1`, v0.41.0) added `Device::suggest_exit_node`. The pin `eabd2cf2` carries it.
 
 **Why:** Go's `tailscale exit-node suggest` calls `LocalClient.SuggestExitNode`, which asks the
 daemon to pick the best available exit-node peer (by DERP-region proximity / latency / priority) and
@@ -820,6 +853,8 @@ in daemon bead tsd-lq8. — daemon lane
 ---
 
 ## 26. `Device::re_stun()` — force a STUN re-probe (for `tnet debug restun`)
+
+> **Marked closed on 2026-10-14.** Engine #263 (`66f8626`, v0.40.0) added `Device::re_stun`. The pin `eabd2cf2` carries it.
 
 **Why:** `tnet debug rebind` already ships over the engine's `Device::rebind()` (re-creates the UDP
 sockets). Go's magicsock debug surface pairs `rebind` with **`restun`** — a lighter knob that forces a
@@ -908,6 +943,8 @@ a weaker any-tailnet-peer gate, which would *exceed* Go's permissiveness). Track
 (the ManageServerMode half). — daemon lane
 
 ## 30. (BUG — serve path mux uses substring match, not segment-boundary) `serve_path` `path.starts_with(prefix)` over-matches
+
+> **Marked closed on 2026-10-14.** Engine #307 (`e41d208`, v0.44.0) stopped a `/api` mount from matching `/apifoo`. The pin `eabd2cf2` carries it.
 
 **Severity: MEDIUM** (a request can be routed to the WRONG serve handler — e.g. an unauthenticated path
 bleeds into a mount intended for a different, possibly sensitive, prefix). **Found by reading the engine
@@ -2087,3 +2124,25 @@ existing netmap arm already fetches and attaches the self node. A test beside th
 `stream_notify` tests pins that a self-only change delivers a frame with `self_change` set, and the
 "Narrower than Go" paragraph on `NotifyView::self_change` is deleted. With (2), `project_notify`
 takes the self node from the engine `Notify`. Consumed via a pin bump. — engine lane
+
+## 47. The daemon's serve layer must move to the engine's Go-shaped Serve config at the next pin bump
+
+**Why:** Engine main at `50611ab` (engine #588) stores the Serve config in Go's `ipn.ServeConfig` wire
+shape. At the pin, `ServeState` is one certificate name plus a port map of `ServeTarget` values
+(engine `ts_control/src/serve.rs:118` at `eabd2cf2`). At `50611ab` it holds Go's `TCP`, `Web`,
+`Services` and `AllowFunnel` maps (engine `ts_control/src/serve/ipn.rs:298`), and the facade
+re-exports `HostPort`, `HttpHandler`, `ServeConfigError`, `ServiceConfig`, `TcpPortHandler` and
+`WebServerConfig` (engine `src/lib.rs:172-173`).
+
+The daemon builds the old shape at `src/ipn/serve.rs:331`, and its tests read
+`.ports` and `.name` from `src/ipn/serve.rs:838` on. The next pin bump does not compile until this
+layer is ported.
+
+At `50611ab`, `set_serve_config` refuses, as unsupported, anything its runtime
+would serve differently from Go: plain-HTTP ports, `TCPForward` with `TerminateTLS`, `ProxyProtocol`
+or a `unix:` socket, `Text` and `Path` handlers, `Services`, `Foreground`, and an `AllowFunnel` entry
+that is on (engine `ts_control/src/serve/ipn.rs:386-394` at `50611ab`). The port maps the daemon's
+persisted serve config onto the new shape and reports which of its handlers the engine now refuses.
+
+**Ask:** nothing of the engine. This is the daemon's half of engine #588, recorded here so the pin
+bump that pulls it carries the port.

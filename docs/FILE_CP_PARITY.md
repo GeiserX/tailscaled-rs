@@ -7,12 +7,14 @@ by *shape*, and its gating note is wrong (see [§6](#6-correcting-the-parity-doc
 is the source-grounded version: for each item, what Go actually does, what this fork actually does,
 and what closing it costs — so the implementing change can be scoped without re-deriving any of it.
 
-**Sources read.** Go `tailscale` **v1.100.0**: `cmd/tailscale/cli/file.go` (`runCp`,
+**Sources read.** Go `tailscale` **v1.100.0** (the parity ledger now pins v1.102.4, and this page was
+not re-read against it): `cmd/tailscale/cli/file.go` (`runCp`,
 `watchOutgoingFiles`, `getTargetStableID`, `pickStdinFilename`, `runCpTargets`) and
 `cmd/tailscale/cli/ping.go` (`tailscaleIPFromArg`). This fork at the current tree:
 `src/bin/tnet.rs` (`run_file_cp`, `resolve_cp_file`, `parse_cp_target`, `format_file_targets`),
 `src/ipn/diag.rs` (`file_cp`, `file_targets`), `src/localapi.rs`, `src/server.rs`. Engine
-`geiserx_tailscale` at the **pinned rev `9d847a6e` (v0.43.0)**: `src/lib.rs`
+`geiserx_tailscale` at rev **`9d847a6e` (v0.43.0)**, the pin when this page was written (the pin is now
+`eabd2cf2`, engine 0.57.4, and the engine claims here were not re-checked against it): `src/lib.rs`
 (`Device::{send_file, file_targets, peer_by_name, peer_by_tailnet_ip}`),
 `ts_runtime/src/taildrop_send.rs`, `ts_runtime/src/status.rs`, `ts_control/src/node.rs`,
 `ts_runtime/src/peer_tracker/peer_db.rs`.
@@ -47,10 +49,10 @@ flowchart TB
 ```
 
 What is **already faithful** and must not regress: the `<target>:` trailing-colon rule and the
-IPv6-bracket grammar (`parse_cp_target`, `src/bin/tnet.rs:1274`, unit-tested); `--targets` rejecting
+IPv6-bracket grammar (`parse_cp_target`, `src/bin/tnet.rs:2304`, unit-tested); `--targets` rejecting
 positional args; the `--name`-with-multiple-files and `-`-with-multiple-files guards; per-file
-basename derivation; and the send-name hardening (`cp_send_name_ok`, `src/ipn/diag.rs:678`) plus the
-`symlink_metadata` + `O_NOFOLLOW` source hardening (`taildrop_source_ok`, `src/ipn/diag.rs:1321`),
+basename derivation; and the send-name hardening (`cp_send_name_ok`, `src/ipn/diag.rs:949`) plus the
+`symlink_metadata` + `O_NOFOLLOW` source hardening (`taildrop_source_ok`, `src/ipn/diag.rs:1615`),
 which are this fork's own additions over Go and are deliberate.
 
 ---
@@ -64,7 +66,7 @@ it fall back to the host resolver — `net.Resolver.LookupHost(ctx, hostOrIP)`, 
 `error looking up IP of %q: %v` on failure and `no IPs found for %q` on an empty answer. The self node
 is matched too (it resolves, then fails later at `getTargetStableID` as "not in your Tailnet").
 
-**This fork** (`diag::file_cp`, `src/ipn/diag.rs:585`) does the first two steps and stops: a literal
+**This fork** (`diag::file_cp`, `src/ipn/diag.rs:848`) does the first two steps and stops: a literal
 IP goes to `Device::peer_by_tailnet_ip`, anything else to `Device::peer_by_name`, and a miss is
 `no tailnet peer matches "<target>"`.
 
@@ -151,7 +153,7 @@ So the netmap `Online` bit only picks the *wording*; the trigger is "no bytes ha
 does not gate the send on it either way.
 
 **This fork** prints nothing. It has the `online` bit — `FileTargetReport.online`
-(`src/localapi.rs:866`) already carries it tri-state, and `format_file_targets` renders it — but only
+(`src/localapi.rs:1890`) already carries it tri-state, and `format_file_targets` renders it — but only
 on the `--targets` path, never on a send.
 
 **Delta and what closes it.** Two halves:
@@ -186,16 +188,16 @@ progress callback a small engine change, not a new subsystem.
 prefix concatenated with the unread remainder, so nothing is lost. With `--name`, the sniff is skipped
 entirely.
 
-**This fork** rejects `-` up front in `resolve_cp_file` (`src/bin/tnet.rs:4597`), which is the honest
+**This fork** rejects `-` up front in `resolve_cp_file` (`src/bin/tnet.rs:9358`), which is the honest
 behavior for a build that cannot do it.
 
 **The blockers, precisely — and the parity-doc note has them wrong:**
 
 1. **Transport: not a blocker.** The LocalAPI is one JSON line in / one JSON line out, capped at
-   `MAX_LINE_BYTES` = 64 KiB (`src/server.rs:31`), so a body cannot ride the request. But the pattern
+   `MAX_LINE_BYTES` = 64 KiB (`src/server.rs:33`), so a body cannot ride the request. But the pattern
    for streaming a body *into* the daemon already exists in this tree: `Request::Nc`
-   (`src/localapi.rs:406`) answers with a one-line ack and then **hijacks** the connection for a
-   bidirectional byte splice (`stream_nc`, `src/server.rs:686`), with the very same `BufReader`
+   (`src/localapi.rs:741`) answers with a one-line ack and then **hijacks** the connection for a
+   bidirectional byte splice (`stream_nc`, `src/server.rs:1522`), with the very same `BufReader`
    carrying whatever the client already sent after the request line. A `file cp -` body is the
    client→daemon half of exactly that shape. No new framing has to be invented.
 2. **Engine: the real blocker.** `Device::send_file(peer, name, content_length: u64, reader)`
@@ -251,15 +253,16 @@ Recorded so it is not lost, and deliberately left alone; each wants its own bead
 
 - **`--targets` omits Go's last-seen detail.** `runCpTargets` (`file.go:563`) appends
   `; last seen <d> ago`, rounded to the minute, to the `offline` / `unknown-status` column.
-  `format_file_targets` (`src/bin/tnet.rs:5687`) prints the status word only, and
+  `format_file_targets` (`src/bin/tnet.rs:11156`) prints the status word only, and
   `FileTargetReport` has no `last_seen` field — though the engine's `Node::last_seen` is right there
   next to the `online` bit already projected.
 - **No `--verbose`, no `--update-interval` progress line.** Go's `cp` has both (`sending %q to
   %v/%v/%v ...` / `sent %q`, and a repainting progress line gated on stderr being a TTY). Both are
   downstream of the same missing send-progress signal as Gap C.
 - **Batch failure semantics differ.** Go's `runCp` returns on the first failing file, abandoning the
-  rest; `run_file_cp` (`src/bin/tnet.rs:4513`) reports each failure, continues, and exits 1 at the
+  rest; `run_file_cp` (`src/bin/tnet.rs:9274`) reports each failure, continues, and exits 1 at the
   end. The fork's behavior is arguably kinder, but it is a divergence and is currently undocumented.
-- **Stale engine pin in the docs.** `ENGINE_ASKS.md` and `PARITY_GAP_ANALYSIS.md` both state the pin
-  is `35e5db22` / v0.41.0; `Cargo.toml` and `Cargo.lock` pin `9d847a6e` / **v0.43.0**. Every engine
-  claim in this document was re-verified against the rev actually pinned.
+- **Stale engine pin in the docs (fixed).** When this page was written, `ENGINE_ASKS.md` and
+  `PARITY_GAP_ANALYSIS.md` stated the pin as `35e5db22` / v0.41.0 while `Cargo.toml` pinned
+  `9d847a6e` / v0.43.0. Both now name the real pin, `eabd2cf2` (engine 0.57.4). The engine claims in
+  this document were verified at `9d847a6e`.
