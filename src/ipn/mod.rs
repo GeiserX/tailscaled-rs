@@ -2510,6 +2510,17 @@ pub struct Backend {
     ///
     /// Seeded and updated exactly like [`always_on_keys`](Backend::always_on_keys).
     exit_node_keys: syspolicy::ExitNodeKeys,
+    /// This node's MagicDNS name from its last netmap: what Go's
+    /// `NetMapNoPeers().SelfNode` names, and the name each serve port is judged and armed with.
+    ///
+    /// Go keeps its netmap while the node is Stopped and drops it only when a profile is reset (a
+    /// profile switch or a logout, `resetForProfileChangeLocked`), so it has one whenever the node
+    /// has been up since `tailscaled` started on this profile. This daemon tears its device down on
+    /// `down`, so it keeps the name here instead: refreshed from the live device by
+    /// [`current_netmap_name`](Backend::current_netmap_name), kept across [`stop_device`](Backend::stop_device),
+    /// and cleared on logout and on a profile switch or reset. `None` is Go's nil netmap, and
+    /// [`set_serve_config`](Backend::set_serve_config) refuses a write then, as Go does.
+    netmap_name: Option<String>,
 }
 
 /// One arming of the always-on reconnect timer — the state Go's `startReconnectTimerLocked` captures
@@ -2765,6 +2776,7 @@ impl Backend {
             // reason it is not persisted: the reconcile below puts the administrator's node back.
             override_exit_node_policy: false,
             exit_node_keys: syspolicy::exit_node_keys(),
+            netmap_name: None,
         };
         backend.has_node_key = backend.has_persisted_node_key().await;
         // Go reconciles system policy on every profile load, and this is one (the daemon's own, at
@@ -3349,6 +3361,8 @@ impl Backend {
         }
         self.stop_device().await;
         self.bump_generation();
+        // A profile reset drops the netmap (Go `resetForProfileChangeLocked`).
+        self.netmap_name = None;
         if named {
             if let Some(m) = meta.profiles.get_mut(&self.current_profile) {
                 m.name.clear();
@@ -3452,6 +3466,8 @@ impl Backend {
         // rebuilt from the new profile on the next `up`.)
         self.stop_device().await;
         self.bump_generation();
+        // A profile switch drops the netmap (Go `resetForProfileChangeLocked`).
+        self.netmap_name = None;
 
         // Compute the target's state into LOCALS first, and do every fallible disk write BEFORE
         // committing anything to `self`. This is the D1 fix: the in-memory active-profile identity
@@ -4859,9 +4875,9 @@ impl Backend {
                         let fqdn = node.fqdn(false);
                         let built = serve::build_web_serve_state(&cfg, &fqdn);
                         // A port the engine refuses is left out and reported with the engine's
-                        // reason; the other ports still serve. (A config written while the node
-                        // was up was already refused at `set_serve_config`; this catches one
-                        // persisted before the engine refused it, or written while down.)
+                        // reason; the other ports still serve. (A write is refused at
+                        // `set_serve_config`, judged with the netmap name; this catches a config
+                        // persisted before the engine refused it, or a node renamed since.)
                         for refused in &built.refused {
                             tracing::warn!(
                                 port = refused.port,
@@ -5133,6 +5149,8 @@ impl Backend {
         // 2. Tear down the datapath.
         self.stop_device().await;
         self.bump_generation();
+        // Go's `Logout` ends in `resetForProfileChangeLocked`, which drops the netmap.
+        self.netmap_name = None;
         // The registration is ending, so the last suggestion (a node on this tailnet) goes with it.
         self.forget_suggested_exit_node();
 
@@ -6165,10 +6183,16 @@ impl Backend {
     ///
     /// 1. an incoming config that turns Funnel on while `shields_up` is set — Go
     ///    `setServeConfigLocked`'s first statement (`config.IsFunnelOn() && prefs.ShieldsUp()`);
-    /// 2. an incoming config that would change the serve type of a port the current config already
+    /// 2. any write while the node has no netmap, with Go's `netMap is nil`. Go's
+    ///    `setServeConfigLocked` refuses it before it validates anything, and it has a netmap
+    ///    whenever the node has been up since the daemon started on this profile, including while
+    ///    it is Stopped. This daemon keeps the name from that netmap in
+    ///    [`netmap_name`](Backend::netmap_name) for the same span;
+    /// 3. an incoming config that would change the serve type of a port the current config already
     ///    serves — Go `validateServeConfigUpdate`; see [`serve::validate_serve_config_update`];
-    /// 3. while the node is up, an incoming config holding a port the engine refuses to serve (see
-    ///    [`serve::build_web_serve_state`]): the message names each port and the engine's
+    /// 4. an incoming config holding a port the engine refuses to serve (see
+    ///    [`serve::build_web_serve_state`]), judged with the netmap name, so also while the node is
+    ///    down: the message names each port and the engine's
     ///    [`ServeConfigError`](tailscale::ServeConfigError), so what is stored is what runs.
     pub async fn set_serve_config(&mut self, cfg: &serve::ServeConfig) -> Result<()> {
         // Funnel publishes a port to the PUBLIC internet; shields-up blocks every inbound connection
@@ -6188,6 +6212,14 @@ impl Backend {
         if !serve::funnel_ports(cfg).is_empty() && self.prefs.shields_up {
             anyhow::bail!("Unable to turn on Funnel while shields-up is enabled");
         }
+        // Go refuses a write when it has no netmap, next, before the ETag and the serve-type check
+        // (`setServeConfigLocked`: "netMap is nil"). Go's netmap outlives a stop, so a write while
+        // the node is merely down goes through; one before the node has ever come up on this
+        // profile, or after a logout or a profile switch, is refused. Go's second message,
+        // "netMap SelfNode is nil", is for a netmap without a self node, which a name cannot be.
+        let Some(fqdn) = self.current_netmap_name().await else {
+            anyhow::bail!("netMap is nil");
+        };
         // Refuse a change that would silently destroy a live serve BEFORE anything is written: an
         // incoming config may not change the serve type of a port the current config already serves
         // (Go `validateServeConfigUpdate`). Every CLI write is a read-modify-write of the current
@@ -6200,26 +6232,17 @@ impl Backend {
         if let Err(conflict) = serve::validate_serve_config_update(&existing, cfg) {
             anyhow::bail!(conflict);
         }
-        // Refuse a port the engine will not serve, before it is stored. The check needs the node's
-        // MagicDNS name (the host of each `Web` key), so it runs while the node is up, which is
-        // when `tnet serve` writes a web serve; a config written while down is checked when it is
-        // armed, and each refused port is logged then. Only a refusal this write introduces is
-        // refused: one the stored config already carries (written before the engine refused it)
-        // must not block removing another port, or a foreground serve restoring that config. The
-        // name query is bounded like `status`'s, since this runs under the backend lock; a query
-        // that fails or times out skips the check, and arming still logs any refusal.
-        if let Some(dev) = self.device.as_ref()
-            && let Ok(Ok(node)) = tokio::time::timeout(STATUS_QUERY_TIMEOUT, dev.self_node()).await
-        {
-            let fqdn = node.fqdn(false);
-            if !fqdn.is_empty() {
-                let already = serve::build_web_serve_state(&existing, &fqdn).refused;
-                let mut incoming = serve::build_web_serve_state(cfg, &fqdn);
-                incoming.refused.retain(|r| !already.contains(r));
-                if let Some(refusal) = incoming.refusal_message() {
-                    anyhow::bail!(refusal);
-                }
-            }
+        // Refuse a port the engine will not serve, before it is stored. The check is judged with
+        // the netmap name (the host of each `Web` key and the certificate name), the one the
+        // daemon arms with, so it runs while the node is down too. Only a refusal this write
+        // introduces is refused: one the stored config already carries (written before the engine
+        // refused it) must not block removing another port, or a foreground serve restoring that
+        // config. Arming still logs any refusal, for a name that changed since the write.
+        let already = serve::build_web_serve_state(&existing, &fqdn).refused;
+        let mut incoming = serve::build_web_serve_state(cfg, &fqdn);
+        incoming.refused.retain(|r| !already.contains(r));
+        if let Some(refusal) = incoming.refusal_message() {
+            anyhow::bail!(refusal);
         }
         // Heads-up if a funnel-enabled port forwards to a NON-loopback backend: funnel publishes to
         // the PUBLIC internet, so a non-loopback target means inbound internet traffic is spliced to
@@ -6244,6 +6267,23 @@ impl Backend {
             self.spawn_serve(dev);
         }
         Ok(())
+    }
+
+    /// This node's MagicDNS name from its netmap, or `None` when it has none (Go's nil netmap; see
+    /// the [`netmap_name`](Backend::netmap_name) field). A live device with a self node answers
+    /// and refreshes the kept name; otherwise the name kept from the last netmap stands. The query
+    /// is bounded like `status`'s, since callers hold the backend lock: a device that does not
+    /// answer in time leaves the kept name as it is.
+    async fn current_netmap_name(&mut self) -> Option<String> {
+        if let Some(dev) = self.device.as_ref()
+            && let Ok(Ok(node)) = tokio::time::timeout(STATUS_QUERY_TIMEOUT, dev.self_node()).await
+        {
+            let fqdn = node.fqdn(false);
+            if !fqdn.is_empty() {
+                self.netmap_name = Some(fqdn);
+            }
+        }
+        self.netmap_name.clone()
     }
 
     /// Resolve a tailnet IP to the peer that owns it (the `tnet whois` / Go `tailscale whois` path).
@@ -6422,6 +6462,12 @@ impl Backend {
     ///    we log and drop — the engine's `Runtime::drop` still kills its actors — rather than leak.
     ///    With the `ssh` feature off there is never a clone, so reclaim is trivially infallible.
     async fn stop_device(&mut self) {
+        // Step 0: keep the node's name from its netmap before the device goes. Go keeps its netmap
+        // across a stop, so a serve write made while the node is down is still accepted and checked
+        // against it (see `netmap_name`). The query is bounded like `status`'s.
+        if self.device.is_some() {
+            self.current_netmap_name().await;
+        }
         // Bounded teardown: the engine shutdown below is capped at SHUTDOWN_TIMEOUT (5s), so a caller
         // holding the backend lock across this (e.g. the Down/Logout dispatch arms) blocks at most that.
         // Step 1: stop the SSH server task first so its `Arc` clone of the device is released before
@@ -6806,6 +6852,7 @@ mod tests {
             always_on_keys: syspolicy::AlwaysOnKeys::default(),
             override_exit_node_policy: false,
             exit_node_keys: syspolicy::ExitNodeKeys::default(),
+            netmap_name: None,
         }
     }
 
@@ -8532,6 +8579,9 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let mut be = backend_for(&dir);
+        // The node was up and is down now: Go keeps the netmap across the stop, and the daemon
+        // keeps its name, so a write is accepted.
+        be.netmap_name = Some("host.example.ts.net".into());
 
         // Initially empty.
         assert!(be.serve_config().await.tcp.is_empty());
@@ -8581,6 +8631,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_serve_write_needs_a_netmap_and_is_checked_against_it_while_down() {
+        // Go's `setServeConfigLocked` refuses any write while it has no netmap ("netMap is nil"),
+        // before it validates anything. Its netmap outlives a stop, so a write while the node is
+        // down is accepted, and here the engine's check runs against the kept name rather than
+        // waiting for the node to come up.
+        let dir =
+            std::env::temp_dir().join(format!("tailnetd-serve-netmap-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut be = Backend::load(&dir).await.unwrap();
+
+        // Never up on this profile: no netmap, so every write is refused, a reset included, and
+        // nothing is stored.
+        let mut tcp = serve::ServeConfig::default();
+        serve::set_tcp_forward(&mut tcp, 8443, "127.0.0.1:5000".into());
+        for cfg in [&tcp, &serve::ServeConfig::default()] {
+            let err = be
+                .set_serve_config(cfg)
+                .await
+                .expect_err("no netmap, no write");
+            assert_eq!(format!("{err:#}"), "netMap is nil", "Go's message verbatim");
+        }
+        assert_eq!(be.serve_config().await, serve::ServeConfig::default());
+
+        // The node has been up and is down again: `down` keeps the name, so the write goes through.
+        be.netmap_name = Some("host.tail1.ts.net".into());
+        be.down(alwayson::Actor::Operator { reason: None })
+            .await
+            .unwrap();
+        assert_eq!(be.netmap_name.as_deref(), Some("host.tail1.ts.net"));
+        be.set_serve_config(&tcp)
+            .await
+            .expect("a write while down, with a netmap");
+        assert_eq!(be.serve_config().await, tcp);
+
+        // And the engine's check runs while down: a Text handler is refused with the engine's
+        // reason, before it is stored, instead of being logged when the node next comes up.
+        let mut text = tcp.clone();
+        text.tcp.insert(
+            "443".into(),
+            crate::localapi::TcpPortHandler {
+                https: true,
+                ..Default::default()
+            },
+        );
+        text.web.insert(
+            "host.tail1.ts.net:443".into(),
+            crate::localapi::WebServerConfig {
+                handlers: std::collections::BTreeMap::from([(
+                    "/".to_string(),
+                    crate::localapi::HttpHandler {
+                        text: "hi".into(),
+                        ..Default::default()
+                    },
+                )]),
+            },
+        );
+        let err = be
+            .set_serve_config(&text)
+            .await
+            .expect_err("the engine refuses Text handlers");
+        assert_eq!(
+            format!("{err:#}"),
+            "unable to serve port 443: serve config not supported by this runtime: Text handlers"
+        );
+        assert_eq!(
+            be.serve_config().await,
+            tcp,
+            "the refused write was not stored"
+        );
+
+        // A profile switch drops the netmap (Go `resetForProfileChangeLocked`) …
+        be.create_profile("work").await.unwrap();
+        assert_eq!(be.netmap_name, None, "a profile switch drops the netmap");
+        let err = be.set_serve_config(&tcp).await.expect_err("no netmap");
+        assert_eq!(format!("{err:#}"), "netMap is nil");
+
+        // … and so does a logout (Go's `Logout` ends in the same reset).
+        be.netmap_name = Some("host.tail1.ts.net".into());
+        be.logout(alwayson::Actor::Operator { reason: None })
+            .await
+            .unwrap();
+        assert_eq!(be.netmap_name, None, "a logout drops the netmap");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
     async fn a_second_serve_on_a_busy_port_is_refused_not_silently_swapped() {
         // A serve config is replaced wholesale, and the CLI builds each one by fetching the current
         // config and inserting into its port map. Aiming a `--tcp` serve at a port that already
@@ -8592,6 +8730,8 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let mut be = backend_for(&dir);
+        // The node has been up: the name from its netmap (Go's `NetMapNoPeers`) is known.
+        be.netmap_name = Some("host.example.ts.net".into());
 
         // Port 443 terminates HTTPS and reverse-proxies to a local backend.
         let mut https = serve::ServeConfig::default();
@@ -8687,6 +8827,8 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let mut be = backend_for(&dir);
+        // The node has been up: the name from its netmap (Go's `NetMapNoPeers`) is known.
+        be.netmap_name = Some("host.example.ts.net".into());
         be.prefs.shields_up = true;
 
         // Port 443 terminates HTTPS to a local backend, with Funnel on — what `tnet funnel

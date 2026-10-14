@@ -11,6 +11,10 @@
 //! `cargo test -- --ignored` (which would un-skip the `#[ignore]`) makes no network call and cannot
 //! fail. The default `cargo test` regime stays fully offline.
 //!
+//! The one place it runs is CI's `headscale e2e` job (`.github/workflows/ci.yml`), the smoke test
+//! for every pull request: it starts the compose stack, mints the pre-auth key inside the job, runs
+//! this file with `--ignored`, and fails the build on a failure or a skip.
+//!
 //! ## Running it (the full local loop is in `docs/development.md`)
 //!
 //! ```bash
@@ -23,10 +27,10 @@
 //! #    ID (not the name), so resolve it from `users list` first.
 //! docker compose -f test-support/headscale/docker-compose.yml exec headscale \
 //!     headscale users create test
-//! UID=$(docker compose -f test-support/headscale/docker-compose.yml exec -T headscale \
+//! HS_UID=$(docker compose -f test-support/headscale/docker-compose.yml exec -T headscale \
 //!     headscale users list -o json | python3 -c "import sys,json; print(next(u['id'] for u in json.load(sys.stdin) if u['name']=='test'))")
 //! KEY=$(docker compose -f test-support/headscale/docker-compose.yml exec -T headscale \
-//!     headscale preauthkeys create --user "$UID" --reusable --expiration 24h)
+//!     headscale preauthkeys create --user "$HS_UID" --reusable --expiration 24h)
 //!
 //! # 3. Point the test at it and run the (otherwise-ignored) e2e.
 //! export TAILNETD_HS_URL=http://localhost:8080

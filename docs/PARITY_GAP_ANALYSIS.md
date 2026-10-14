@@ -1,5 +1,11 @@
 # What's left to port from Go `tailscaled` — parity gap analysis
 
+> **2026-10-14: this document is an audit snapshot.** It was taken at engine pin `eabd2cf2` (engine
+> 0.57.4, pinned on 2026-10-07). The pin is now `d64186e` (engine 0.57.6): #641 ported the serve
+> layer to the engine's Go-shaped Serve config and #643 moved the pin, which closed ask #47.
+> [`docs/ENGINE_ASKS.md`](ENGINE_ASKS.md) is the live record of the engine boundary; where it and this
+> snapshot disagree, it is right.
+
 > **2026-10-14: the code factory that drove this repo stopped.** The state at that point, the gaps by
 > area, the open backlog and how to resume are in
 > [Wind-down audit, 2026-10-14](#wind-down-audit-2026-10-14). The rest of this document is the
@@ -113,7 +119,8 @@ are at the pin, readable with `git show eabd2cf2:<path>` in the engine repo.
   asks are closed in the engine and are now marked closed in `docs/ENGINE_ASKS.md`. Twenty-seven stay
   open, two of them in part (#7 and #17). Engine main at `50611ab` changes the Serve config's wire
   shape and breaks the daemon's serve layer at `src/ipn/serve.rs:331`, so the next pin bump has to
-  carry a port. That is filed as ask #47.
+  carry a port. That is filed as ask #47, closed on 2026-10-14 by #641 (the port) and #643 (the pin
+  bump to `d64186e`).
 
 ### Gaps: the CLI
 
@@ -238,7 +245,7 @@ The daemon audit rated severity as blocks-parity, minor or product-decision.
 | blocks-parity | SSH check-mode `HoldAndDelegate` | refused (engine `src/ssh/channel_server.rs:93-96`) | Ask #7, check-mode half. |
 | blocks-parity | Cert cache in the state dir plus a refresh loop (`ipn/ipnlocal/cert.go:97, 127`) | none: every call issues a fresh cert (`src/localapi.rs:631-635`; engine `src/lib.rs:1810-1814`) | Repeated `cert` runs or serve restarts run into Let's Encrypt's duplicate-cert limit. No row before this audit. |
 | blocks-parity | Taildrive (`serve-taildrive`, `cmd/tailscaled/tailscaled_drive.go:19`) | absent | `tsd-eka`. |
-| blocks-parity | Serve and Funnel server side: Services, `--proxy-protocol`, `--tun` | engine-owned | `tsd-z40`. Engine main's serve rewrite breaks `src/ipn/serve.rs:331` (ask #47). |
+| blocks-parity | Serve and Funnel server side: Services, `--proxy-protocol`, `--tun` | engine-owned | `tsd-z40`. The engine's serve rewrite is ported (#641) and pinned (#643), closing ask #47; the engine refuses `Services` and `ProxyProtocol` at `d64186e`. |
 | blocks-parity | c2n remote-config (`/remoteapi/localapi/*`) | the engine hook has existed since engine `1579fb5` on 2026-08-30 (engine `src/config.rs:386-412`; `ts_control/src/config.rs:636`); the daemon leaves it unset and refuses it (`src/conffile.rs:793-794`; `src/bin/tnet.rs:532`) | Daemon-buildable now, behind an HTTP-shaped LocalAPI shim (`tsd-euv`). The other c2n paths are ask #43. |
 | minor | Reads an existing `tailscaled.state` | not found | A node moved off Go registers as a new machine. |
 | minor | `--syslog` (`feature/syslog/syslog.go:29`) | not found | |
@@ -300,7 +307,7 @@ The CLI and IPN audits both found these rows still open. They were not re-rated.
 | --- | --- | --- |
 | `docs/DESIGN.md:101` | the `tnet login` verb is still out | it exists (`src/bin/tnet.rs:657`) |
 | `docs/DESIGN.md:105-106` | `--port` is engine-gated (ask #22) | shipped on 2026-06-15 in #231 (`src/bin/tailnetd.rs:582-594`; `src/ipn/config.rs:258`) |
-| `docs/ENGINE.md:29` and `:48-49` | the pin is package `tailscale-rs`, rev `afa970c0`, engine 0.6.5 | `Cargo.toml:83` pins `geiserx_tailscale` at `eabd2cf2`, engine 0.57.4 |
+| `docs/ENGINE.md:29` and `:48-49` | the pin is package `tailscale-rs`, rev `afa970c0`, engine 0.6.5 | `Cargo.toml:85` pins `geiserx_tailscale` at `d64186e`, engine 0.57.6 |
 | `docs/THREAT_MODEL.md:73, 110, 112, 136, 139-140` | `src/lib.rs:60`, `src/auth.rs:75`, `src/server.rs:132`, `src/server.rs:59` | now `src/lib.rs:184` (`ensure_state_dir_secure`), `src/auth.rs:78` (`access_for_uid`), `src/server.rs:321` (`ensure_dir_0700`) and `src/server.rs:206` (its call) |
 
 ### Corrected in place on 2026-10-14
@@ -405,9 +412,9 @@ in-progress ones.
    Pull it (`bd dolt pull`) and compare it with the table above before trusting either.
 2. **Respin the factory from its own runbook.** The wind-down and respin steps live with the factory,
    not in this repo.
-3. **Port the serve layer before the next pin bump.** Ask #47 describes the change. Then re-check the
-   engine-gated rows against the new pin. They were confirmed at `9d847a6e` or `eabd2cf2`, not at
-   engine main.
+3. **Port the serve layer before the next pin bump.** Done on 2026-10-14 in #641 and #643, which
+   closed ask #47. Then re-check the engine-gated rows against the new pin. They were confirmed at
+   `9d847a6e` or `eabd2cf2`, not at engine main.
 4. **Re-file the beads closed without the work.** The list is in the backlog notes above. Use the gap
    tables in this section as the source for each one.
 5. **Take the daemon-buildable blocks-parity rows first.** These need no engine change:

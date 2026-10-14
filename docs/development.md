@@ -21,16 +21,17 @@ engine, rebuild the daemon, no manifest change. To bump the pinned engine delibe
 
 `tailscaled-rs` is a daemon that speaks a live, evolving control protocol, so "does it work" has
 three different answers at three different costs. This section lays out the **three test tiers**,
-what each proves, and how to run them. Only the first runs in CI; the other two are opt-in.
+what each proves, and how to run them. CI runs the first two on every pull request; the third is
+optional.
 
 ```mermaid
 flowchart TD
     A["<b>Tier A — unit + offline integration</b><br/>cargo test --all-targets<br/><i>no network, no control server</i>"]
       -->|"green is required to merge"| CI["CI (.github/workflows/ci.yml)<br/>fmt · clippy · test · build"]
     B["<b>Tier B — Headscale-backed e2e</b><br/>self-hosted control server<br/><i>ToS-clean, real join/netmap</i>"]
-      -.->|"manual / opt-in<br/>#91;ignore#93; + env-gated"| DEV["Developer / nightly"]
+      -->|"the smoke test<br/>key minted in the job"| HSCI["CI job: headscale e2e"]
     C["<b>Tier C — live e2e vs real Tailscale</b><br/>production control plane<br/><i>highest fidelity, ToS exposure</i>"]
-      -.->|"manual, real authkey"| DEV
+      -.->|"optional, real authkey"| DEV["Developer"]
 
     A -. "compiles but does not run<br/>Tier B/C tests" .-> B
     B -. "headscale lags upstream capver →<br/>green here ≠ full Tailscale compat" .-> C
@@ -72,13 +73,14 @@ hermetic and CI ToS-clean. The two tiers below fill that gap.
 
 > The Headscale-backed test file ([`tests/headscale_e2e.rs`](https://github.com/GeiserX/tailscaled-rs/blob/main/tests/headscale_e2e.rs)) is **compiled**
 > by `cargo test --all-targets` (so it can't bit-rot) but is marked `#[ignore]` **and** env-gated, so
-> it never runs — and cannot make a network call — in this tier. See Tier B.
+> it never runs — and cannot make a network call — in this tier. CI's `headscale e2e` job runs it as
+> Tier B.
 
 ---
 
 ### Tier B — Headscale-backed e2e (self-hosted, ToS-clean)
 
-The tier this scaffold ([bead `tsd-7ie`](#)) adds. It runs the **real** join → netmap → down flow
+The smoke test for every change, engine bumps included, and run by CI on every pull request. It runs the **real** join → netmap → down flow
 against a self-hosted [Headscale](https://github.com/juanfont/headscale) control server — a
 protocol-compatible, independent reimplementation of Tailscale's control plane — so you exercise
 registration and map-polling **without touching production Tailscale** (no ToS or rate-limit
@@ -107,10 +109,10 @@ docker compose -f test-support/headscale/docker-compose.yml up -d
 docker compose -f test-support/headscale/docker-compose.yml exec headscale \
     headscale users create test
 # In 0.28.0 `preauthkeys --user` takes the numeric user ID, not the name, so resolve it first:
-UID=$(docker compose -f test-support/headscale/docker-compose.yml exec -T headscale \
+HS_UID=$(docker compose -f test-support/headscale/docker-compose.yml exec -T headscale \
     headscale users list -o json | python3 -c "import sys,json; print(next(u['id'] for u in json.load(sys.stdin) if u['name']=='test'))")
 docker compose -f test-support/headscale/docker-compose.yml exec -T headscale \
-    headscale preauthkeys create --user "$UID" --reusable --expiration 24h
+    headscale preauthkeys create --user "$HS_UID" --reusable --expiration 24h
 #   → prints a key like  <hskey-auth-…>
 
 # 3a. Drive it by hand with the real binaries:
@@ -134,13 +136,21 @@ docker compose -f test-support/headscale/docker-compose.yml down -v
 See [`test-support/headscale/README.md`](https://github.com/GeiserX/tailscaled-rs/blob/main/test-support/headscale/README.md) for the same loop kept
 next to the compose file.
 
-#### How the gated test stays out of CI
+#### How CI runs it
+
+The `headscale e2e` job in [`.github/workflows/ci.yml`](https://github.com/GeiserX/tailscaled-rs/blob/main/.github/workflows/ci.yml) runs the loop
+above on every pull request: it starts the pinned Headscale and waits for its healthcheck, creates
+the `test` user, mints a reusable pre-auth key inside the job (never from a secret), runs the test
+with `--ignored`, and tears the server down. The job fails if the test fails, and also if it skips,
+because a skip means the key never reached it.
+
+#### How the gated test stays out of the offline run
 
 [`tests/headscale_e2e.rs`](https://github.com/GeiserX/tailscaled-rs/blob/main/tests/headscale_e2e.rs) is guarded **two** ways so it can never break
 the offline Tier A run:
 
-1. `#[ignore]` — excluded from `cargo test` (and CI's `cargo test --all-targets`); it only runs when
-   explicitly un-ignored with `-- --ignored`.
+1. `#[ignore]` — excluded from `cargo test` (and the Tier A job's `cargo test --all-targets`); it
+   only runs when explicitly un-ignored with `-- --ignored`, as the `headscale e2e` job does.
 2. **Env gate** — even when un-ignored, it early-returns (a clean *skip*, printing how to run it) if
    `TAILNETD_HS_URL` / `TAILNETD_HS_AUTHKEY` are absent. So it makes no network call and cannot fail
    unless an operator has deliberately stood up the server and set both vars.
@@ -150,12 +160,13 @@ committed file.
 
 ---
 
-### Tier C — live e2e against real Tailscale (highest fidelity, manual)
+### Tier C — live e2e against real Tailscale (optional)
 
 The genuine article: join an actual Tailscale tailnet with a real pre-auth key. This is the only
-tier that proves compatibility with the **real** control plane, and it is therefore the smoke test
-gating an [engine bump](ENGINE.md#1-bumping-the-engine-rev). It is **manual** — it needs a real
-`tskey-auth-…` key and incurs Tailscale ToS / rate-limit exposure, so it is never automated here.
+tier that proves compatibility with the **real** control plane. It is **optional**: it needs a real
+`tskey-auth-…` key and incurs Tailscale ToS / rate-limit exposure, so it is never automated here,
+and an [engine bump](ENGINE.md#1-bumping-the-engine-rev) is gated on Tier B instead. Run it when you
+have a key.
 
 ```bash
 export TS_RS_EXPERIMENT=this_is_unstable_software
@@ -195,6 +206,6 @@ Two independent fidelity gaps stack here:
 The consequence: **a green Tier B run proves the daemon registers and netmaps against
 *Headscale's* understanding of the protocol — not that it is correct against the genuine Tailscale
 control plane.** You are testing one reimplementation of a moving protocol against another; gaps
-that only surface against the real server slip straight through Tier B. That is exactly why Tier C
-(real Tailscale) remains the fidelity gate for an engine bump, and why the dashed B→C arrow above is
+that only surface against the real server slip straight through Tier B. That is why a Tier C run
+(real Tailscale) is still worth doing when a key is at hand, and why the dashed B→C arrow above is
 the load-bearing caveat of this whole document.

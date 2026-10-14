@@ -10,10 +10,10 @@
 #   docker compose -f test-support/headscale/docker-compose.yml up -d
 #   docker compose -f test-support/headscale/docker-compose.yml exec headscale headscale users create test
 #   # 0.28.0's `preauthkeys --user` takes the numeric user ID, NOT the name, so resolve it first:
-#   UID=$(docker compose -f test-support/headscale/docker-compose.yml exec -T headscale \
+#   HS_UID=$(docker compose -f test-support/headscale/docker-compose.yml exec -T headscale \
 #       headscale users list -o json | python3 -c "import sys,json; print(next(u['id'] for u in json.load(sys.stdin) if u['name']=='test'))")
 #   docker compose -f test-support/headscale/docker-compose.yml exec -T headscale \
-#       headscale preauthkeys create --user "$UID" --reusable --expiration 24h
+#       headscale preauthkeys create --user "$HS_UID" --reusable --expiration 24h
 #   # then point the daemon at http://localhost:8080 with that hskey-auth-… key.
 
 services:

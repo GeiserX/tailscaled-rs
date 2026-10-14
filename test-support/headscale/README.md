@@ -26,10 +26,10 @@ docker compose -f test-support/headscale/docker-compose.yml up -d
 docker compose -f test-support/headscale/docker-compose.yml exec headscale \
     headscale users create test
 # In 0.28.0 `preauthkeys --user` is the numeric user ID, not the name, so resolve it first:
-UID=$(docker compose -f test-support/headscale/docker-compose.yml exec -T headscale \
+HS_UID=$(docker compose -f test-support/headscale/docker-compose.yml exec -T headscale \
     headscale users list -o json | python3 -c "import sys,json; print(next(u['id'] for u in json.load(sys.stdin) if u['name']=='test'))")
 docker compose -f test-support/headscale/docker-compose.yml exec -T headscale \
-    headscale preauthkeys create --user "$UID" --reusable --expiration 24h
+    headscale preauthkeys create --user "$HS_UID" --reusable --expiration 24h
 #   → prints a pre-auth key (hskey-auth-…)
 
 # 3. Point the daemon at it (either of these works):
@@ -50,6 +50,9 @@ docker compose -f test-support/headscale/docker-compose.yml down -v
 
 ## Notes
 
+- **CI runs this loop on every pull request**, in the `headscale e2e` job of
+  [`../../.github/workflows/ci.yml`](../../.github/workflows/ci.yml), with the key minted inside the
+  job. It is the smoke test for an engine bump ([`../../docs/ENGINE.md`](../../docs/ENGINE.md) §1).
 - **Keep the pre-auth key in the environment only** — never paste it into a committed file. Node
   state (sqlite db, noise key) lives in named docker volumes, not in the repo tree.
 - **Green here is not full Tailscale compatibility.** Headscale lags upstream's capability version,
