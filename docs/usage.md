@@ -44,7 +44,8 @@ export TS_RS_EXPERIMENT=this_is_unstable_software
 #   tailnetd debug --get-url <url>       fetch a URL with a connection trace ("login" = the
 #                                        default control plane's login URL)
 # (Go's --derp and --portmap are declared and refused BY NAME: a DERP round-trip test needs a
-# standalone DERP client this daemon does not own, and port mapping does not exist in the engine.)
+# standalone DERP client this daemon does not own. Go moved its port-mapping probe to
+# `tailscale debug portmap`, and here the same probe is `tnet debug portmap`, run against a daemon.)
 #
 # NOTE: --statedir also moves the default socket to <dir>/tailnetd.sock. Since `tnet` has no
 # --statedir, point the client at it explicitly:  tnet --socket /var/lib/tailnetd/tailnetd.sock status
@@ -150,9 +151,9 @@ one.
 `tnet switch <target>` only ever *selects* a profile that exists: a target matching no profile by id
 or nickname is refused, exactly as Go's `tailscale switch` refuses it (`No profile named ...`), so a
 typo can no longer disconnect the node into an empty profile. Creating one is its own request —
-`tnet switch --new <id>`, a flag with no upstream counterpart, standing in for the interactive
-`tailscale login` this fork does not have yet. The new profile starts empty and logged out; run
-`tnet up` to register it.
+`tnet switch --new <id>`, a flag with no upstream counterpart. The new profile starts empty and
+logged out; run `tnet up` to register it. `tnet login` is the Go-shaped way to do both at once: like
+Go's `tailscale login`, it switches to a new empty profile and then logs in.
 
 Four of Go's `set` flags are **parsed but not modelled**, so a command line ported from Go reaches a
 refusal that names the gap instead of dying at the parser. For each, the value asking for the state
