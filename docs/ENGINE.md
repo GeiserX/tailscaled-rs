@@ -88,26 +88,32 @@ Do these in order. Do not commit until the gate suite passes.
    which also sets `TS_RS_EXPERIMENT`. Running them locally first means a format/lint slip never
    burns a CI cycle.
 
-5. **Run a live smoke test.** Unit tests do not exercise a real control plane, and an engine bump
-   can change wire behavior (see [§2](#2-capability-version-tracking-discipline)). Join a real
-   tailnet, confirm status, and tear down:
+5. **Run the smoke test: the Headscale e2e.** Unit tests do not exercise a real control plane, and
+   an engine bump can change wire behavior (see [§2](#2-capability-version-tracking-discipline)).
+   The smoke test is [`tests/headscale_e2e.rs`](../tests/headscale_e2e.rs): it joins a self-hosted
+   Headscale, polls until the node is `Running` with a tailnet address and a netmap, and takes it
+   down again. It needs no Tailscale account and no `tskey-auth-` key.
+
+   CI runs it on every pull request, in the `headscale e2e` job of
+   [`.github/workflows/ci.yml`](../.github/workflows/ci.yml), which starts the pinned Headscale,
+   mints a pre-auth key inside the job and fails the build if the test fails or skips. A bump
+   whose pull request has that job green has passed the smoke test. To run it before you push, use
+   the loop in [`test-support/headscale/README.md`](../test-support/headscale/README.md):
 
    ```bash
    export TS_RS_EXPERIMENT=this_is_unstable_software
-
-   # Terminal 1: run the daemon in the foreground.
-   ./target/release/tailnetd
-
-   # Terminal 2: bring the node up with a pre-auth key, check it, take it down.
-   ./target/release/tnet up --authkey tskey-auth-XXXX --hostname bump-smoke
-   ./target/release/tnet status   # expect: Running, with a tailnet IP
-   ./target/release/tnet down
+   docker compose -f test-support/headscale/docker-compose.yml up -d --wait
+   # mint a user and a reusable pre-auth key as the README shows, then:
+   export TAILNETD_HS_URL=http://localhost:8080 TAILNETD_HS_AUTHKEY=<hskey-auth-…>
+   cargo test --test headscale_e2e -- --ignored --nocapture
+   docker compose -f test-support/headscale/docker-compose.yml down -v
    ```
 
-   A clean run reaches `Running` with a tailnet IP and a peer/netmap, then returns to `Stopped` on
-   `down`. If `status` stalls before `Running` or the control handshake errors after a bump, treat
-   it as a capability-version / control-protocol regression and investigate before committing
-   (again, see [§2](#2-capability-version-tracking-discipline)).
+   If the node stalls before `Running` or the control handshake errors after a bump, treat it as a
+   capability-version / control-protocol regression and investigate before committing (again, see
+   [§2](#2-capability-version-tracking-discipline)). Headscale lags the real control plane, so a
+   run against production Tailscale with a real `tskey-auth-` key is still worth doing when you
+   have one; it is optional, not a gate ([Tier C](development.md#tier-c--live-e2e-against-real-tailscale-optional)).
 
 6. **Only now, commit.** Commit `Cargo.toml` and `Cargo.lock` **together** in one change — the
    manifest and lockfile must never disagree about the engine rev. Note the engine version and the
@@ -125,7 +131,7 @@ A maintainer can follow this on every bump:
 - [ ] `cargo clippy --all-targets -- -D warnings` clean.
 - [ ] `cargo test --all-targets` green.
 - [ ] `cargo build --release --bins` succeeds.
-- [ ] Live smoke test: `tnet up` → `status` reaches **Running** → `down` returns to **Stopped**.
+- [ ] Smoke test: the `headscale e2e` CI job is green on the pull request (or `cargo test --test headscale_e2e -- --ignored` passed locally against the test-support Headscale). A real-key run against production Tailscale is optional.
 - [ ] Engine `CapabilityVersion::CURRENT` re-checked; any move understood (see [§2](#2-capability-version-tracking-discipline)).
 - [ ] `Cargo.toml` + `Cargo.lock` committed **together**.
 
@@ -216,8 +222,8 @@ Because the value is inherited, capver discipline is concentrated almost entirel
   `ts_capabilityversion/src/lib.rs` between the old and new pin. If `CURRENT` changed, read the
   doc-comment(s) for the new version(s) to understand what control-plane behavior the bump opts into.
 - **Treat each bump as a tested change.** A capver move can change wire semantics with the control
-  plane, which is exactly why the live smoke test in [§1](#1-bumping-the-engine-rev) (join → status →
-  down) is part of the gate. Compile-time success does not prove control-plane negotiation still
+  plane, which is exactly why the smoke test in [§1](#1-bumping-the-engine-rev) (join → status →
+  down, against Headscale) is part of the gate. Compile-time success does not prove control-plane negotiation still
   works.
 - **Don't chase upstream blindly.** A higher number is not automatically better. Advertise a capver
   only when the engine actually implements its semantics.
@@ -317,7 +323,7 @@ sentence here.
 
 Because of the above, replacing `git` + `rev` with `version = "…"` is **an engine-version change,
 not a source swap**, even when the numbers look adjacent. Run it through the full bump discipline
-in [§1](#1-bumping-the-engine-rev) — including the live smoke test and the capver re-check in
+in [§1](#1-bumping-the-engine-rev) — including the smoke test and the capver re-check in
 [§2](#2-capability-version-tracking-discipline) — and pick the release whose `.cargo_vcs_info.json`
 sha1 you have actually reviewed.
 

@@ -103,6 +103,71 @@ jobs:
       - name: Build release (ssh feature)
         run: cargo build --release --bins --features ssh
 
+  # The smoke test for every change, engine bumps included: the real join, netmap and down flow of
+  # tests/headscale_e2e.rs against a self-hosted Headscale, the loop in
+  # test-support/headscale/README.md. The pre-auth key is minted inside this job from a throwaway
+  # control server and never read from a secret, so the job runs on every pull request, forks
+  # included. Headscale-green is not Tailscale-green; see docs/development.md.
+  headscale-e2e:
+    name: headscale e2e
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        # Explicit `bash` gives `-eo pipefail`, so the `tee` below cannot hide a failing test.
+        shell: bash
+    env:
+      HS_COMPOSE: test-support/headscale/docker-compose.yml
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build the e2e test
+        run: cargo test --test headscale_e2e --no-run
+
+      # The image is pinned in the compose file (headscale/headscale:0.28.0, never `:latest`).
+      # `--wait` returns once the healthcheck (`headscale nodes list`) passes.
+      - name: Start Headscale and wait for its healthcheck
+        run: docker compose -f "$HS_COMPOSE" up -d --wait --wait-timeout 120
+
+      - name: Mint a user and a reusable pre-auth key
+        run: |
+          hs() { docker compose -f "$HS_COMPOSE" exec -T headscale headscale "$@"; }
+          hs users create test
+          # 0.28.0's `preauthkeys --user` takes the numeric user id, not the name.
+          HS_UID=$(hs users list -o json | python3 -c "import sys,json; print(next(u['id'] for u in json.load(sys.stdin) if u['name']=='test'))")
+          KEY=$(hs preauthkeys create --user "$HS_UID" --reusable --expiration 24h)
+          case "$KEY" in
+            hskey-auth-*) ;;
+            *) echo "headscale minted no pre-auth key"; exit 1 ;;
+          esac
+          echo "::add-mask::$KEY"
+          echo "TAILNETD_HS_AUTHKEY=$KEY" >> "$GITHUB_ENV"
+
+      - name: Run the e2e
+        env:
+          TAILNETD_HS_URL: http://localhost:8080
+        run: |
+          cargo test --test headscale_e2e -- --ignored --nocapture 2>&1 | tee e2e.log
+          # The test skips, and passes, when its two variables are unset. A skip here means the job
+          # lost its key, so it fails rather than report a smoke test that never ran.
+          if grep -q '^SKIP' e2e.log; then
+            echo "the headscale e2e skipped instead of running"
+            exit 1
+          fi
+
+      - name: Headscale logs
+        if: failure()
+        run: docker compose -f "$HS_COMPOSE" logs headscale
+
+      - name: Tear Headscale down
+        if: always()
+        run: docker compose -f "$HS_COMPOSE" down -v
+
   coverage:
     name: coverage (codecov)
     runs-on: ubuntu-latest
@@ -124,9 +189,9 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      # Runs `cargo test` under instrumentation. `#[ignore]`d tests (e.g.
-      # headscale_e2e, which needs network) are skipped by default — we do NOT
-      # pass `--ignored`, so they never run under coverage.
+      # Runs `cargo test` under instrumentation. `#[ignore]`d tests (headscale_e2e,
+      # which needs a control server) are skipped: we do NOT pass `--ignored`, so they
+      # never run under coverage. The `headscale e2e` job above runs them.
       - name: Generate coverage (lcov)
         run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
 
