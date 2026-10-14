@@ -2,7 +2,7 @@
 
 This lists the changes the downstream daemon (`tailscaled-rs`) needs from the `tailscale-rs`
 library to unblock end-to-end features. Each ask is self-contained, additive, and
-backward-compatible. The daemon pins engine rev `cabfbb6b` (engine 0.57.5, tag `v0.57.5`, since 2026-10-14); individual asks
+backward-compatible. The daemon pins engine rev `d64186e2` (engine 0.57.6, tag `v0.57.6`, since 2026-10-14); individual asks
 note the rev they were verified against (older "verified vs `e126bba`/v0.6.9" / `81446f88`/v0.28.2
 / `6035651b`/v0.29.1 / `f3793636`/v0.31.0 / `575104b1`/v0.32.0 / `f8192568`/v0.33.0 / `1694d208`/v0.34.2
 / `faf46b34`/v0.35.8 notes below predate the current pin and are kept as historical context — the SHIPPED
@@ -24,6 +24,20 @@ v0.40.0 header below, each clippy+test-verified.
 >   the daemon's port to Go's `ipn.ServeConfig` shape. See the first pin-bump note below.
 > - The bumps to `9d847a6e` (engine 0.43.0) and `eabd2cf2` (engine 0.57.4) were not logged when they
 >   landed. Each now has a one-line note below.
+
+> **Pin bump cabfbb6b (v0.57.5) → d64186e2 (v0.57.6), 2026-10-14.** Probe-compiled first: clean,
+> no daemon code change. It brings six engine fixes: the exit forwarder keeps exit users off the exit
+> host's own LAN, as Go does (#617); TUN mode keeps MagicDNS and cert domains across netmap deltas
+> (#618); an abandoned netstack Accept, Connect or Receive no longer loses the connection or its data
+> (#619); the all-features clippy, deny and vet gates are green again (#621); a parked magicsock
+> receive loop follows the socket across a rebind (#622); and key files are written atomically, with
+> missing state directories created 0700 (#623). The engine's rustls 0.23.46 bump is lockfile-only, so
+> the daemon takes it in its own lockfile (RUSTSEC-2026-0346 to 0349). #623 reaches the daemon through
+> `load_key_file`. The key file was already 0600 since #605. The daemon already makes its state
+> directory 0700 itself (`ensure_state_dir_secure`), and the engine tightens an existing directory only
+> when it is named `tailscale`, which `tailnetd` never is, so no directory mode changes. A crash can now
+> leave a `node.key.json.tmp<n>` file beside the key; nothing in the daemon lists that directory except
+> the debug `stat` view. The capability version stays V125.
 
 > **Pin bump eabd2cf2 (v0.57.4) → cabfbb6b (v0.57.5), 2026-10-14.** Probe-compiled first. One
 > breaking change, the Serve config shape (ask #47). Engine #588 (`50611ab`) made `ServeState` Go's
