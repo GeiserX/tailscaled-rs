@@ -292,7 +292,7 @@ The CLI and IPN audits both found these rows still open. They were not re-rated.
 | `src/socks5.rs:26` | the bare-IP gap is tracked under "tsd-httpfwd's sibling" | no such bead is open |
 | `src/bin/tailnetd.rs:265-268` | `be-child` is Go's Windows subprocess plumbing | Go uses it on every Unix for the SSH incubator and sftp (`ssh/tailssh/incubator.go:59, 190`) |
 | `src/hardening.rs:7-8` | points at THREAT_MODEL §5.2 | the section is now §4.7 (`docs/THREAT_MODEL.md:195`) |
-| `packaging/homebrew/tailscaled-rs.rb:16` | builds v0.52.2 | the crate is 0.67.3 (`Cargo.toml:3`) |
+| `packaging/homebrew/tailscaled-rs.rb:16` | builds v0.52.2 | the crate was 0.67.3 at the audit (`Cargo.toml:3`), and the formula was never bumped |
 
 ### Stale claims in other docs, not changed here
 
