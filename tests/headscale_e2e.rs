@@ -83,6 +83,12 @@ async fn headscale_join_netmap_down() {
         }
     };
 
+    // DELIBERATE RED: proves the `headscale e2e` CI job fails when this test fails. Reverted next.
+    assert_eq!(
+        hs_url, "http://deliberately-wrong.invalid",
+        "deliberate red for the CI job"
+    );
+
     // The engine refuses to operate without this acknowledgement; surface it as a clear failure
     // rather than a confusing engine-internal error if the operator forgot to export it.
     assert!(
