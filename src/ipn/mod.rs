@@ -4796,9 +4796,9 @@ impl Backend {
     ///   (full-replace; fail-closed on cert error, never a plaintext downgrade). The engine's serve
     ///   loops are owned by the `Device` (torn down on the next `set_serve_config` / device shutdown),
     ///   so this lane needs no entry in [`serve_tasks`](Backend::serve_tasks); a removed last web entry
-    ///   is cleared with an empty full-replace.
-    ///
-    /// `TerminateTLS` raw-TCP entries have no engine analogue at this pin and are logged + skipped.
+    ///   is cleared with an empty full-replace. `TerminateTLS` forwards ride this lane too. A port the
+    ///   engine refuses ([`serve::build_web_serve_state`]) is logged with the engine's reason and left
+    ///   out; the rest still serve.
     ///
     /// The TCP-forward tasks hold `Arc` clones of `device` and are torn down in
     /// [`stop_device`](Backend::stop_device) before the device is reclaimed; the engine web serve is
@@ -4831,31 +4831,9 @@ impl Backend {
                     let conn_limit =
                         std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_SERVE_CONNECTIONS));
                     loops.spawn(serve_accept_loop(dev, port, target, conn_limit));
-                } else if serve::port_is_web_serve(&cfg, port_str, handler)
-                    || serve::is_terminate_tls_serve(handler)
-                {
-                    // Handled by LANE 2 below (engine delegation): web entries (legacy-bodied OR
-                    // Go `Web`-map-bodied) AND servable TLS-terminated raw-TCP forwards (the engine
-                    // terminates TLS + splices to the backend — Go's `TerminateTLS`). Nothing here.
-                } else if !handler.terminate_tls.is_empty() {
-                    // A terminate-tls entry we CAN'T serve via the engine `Proxy` target: either no
-                    // `tcp_forward` backend to splice to, or `proxy_protocol != 0` (the engine doesn't
-                    // write the PROXY-protocol header, so serving it as a plain splice would silently
-                    // drop that semantic). Recognized only — a faithful refusal, not a silent serve.
-                    tracing::info!(
-                        port,
-                        proxy_protocol = handler.proxy_protocol,
-                        "serve: TLS-terminated TCP entry not servable (no backend, or proxy-protocol \
-                         requested) — recognized only"
-                    );
-                } else if handler.https || handler.http {
-                    // A web flag with no proxy backend — can't be served (LANE 2 needs a target).
-                    // Surfaced in `serve status` too; log it so a daemon-log tail sees the skipped port.
-                    tracing::info!(
-                        port,
-                        "serve: web entry with no proxy backend — not served (recognized only)"
-                    );
                 }
+                // Every other shape (web ports, TLS-terminated forwards) is LANE 2's: the engine
+                // serves it or refuses it, and LANE 2 reports each refusal.
             }
             // LANE 2 — HTTPS/HTTP web: delegate to the engine's native serve stack (full-replace
             // reconcile). The engine's `ServeManager` lives in the `Device` (its per-port accept loops
@@ -4864,10 +4842,11 @@ impl Backend {
             // drop the receiver immediately and the serve stays up regardless of this supervisor.
             // `get_serve_config` is a pure read; reconcile when the new config has web entries OR the
             // engine still has a web serve bound (so removing the last web entry clears it too).
-            // Arm LANE 2 for web entries (legacy or Go `Web`-map) AND servable TLS-terminated raw-TCP
-            // forwards (both produce engine `ServeState` ports via `build_web_serve_state`).
-            let has_web = cfg.tcp.iter().any(|(port_str, h)| {
-                serve::port_is_web_serve(&cfg, port_str, h) || serve::is_terminate_tls_serve(h)
+            // Arm LANE 2 for every port that is not a plain TCP forward: web entries (Go `Web`-map,
+            // legacy body, or a bare HTTPS/HTTP flag) AND TLS-terminated forwards. Each maps onto the
+            // engine's Go-shaped `ServeState` via `build_web_serve_state`, or is reported refused.
+            let has_web = cfg.tcp.values().any(|h| {
+                h.https || h.http || !h.terminate_tls.is_empty() || serve::is_web_serve(h)
             });
             // Arm the web serve (resolve the node MagicDNS name — the shared TLS cert name — and
             // full-replace the engine serve config). `Ok(())` = armed; `Err` = could not arm (device
@@ -4878,23 +4857,39 @@ impl Backend {
                 match device.self_node().await {
                     Ok(node) => {
                         let fqdn = node.fqdn(false);
-                        let state = serve::build_web_serve_state(&cfg, &fqdn);
-                        match device.set_serve_config(state).await {
-                            Ok(_rx) => {
-                                tracing::info!(
-                                    name = %fqdn,
-                                    ports = cfg.tcp.values().filter(|h| serve::is_web_serve(h)).count(),
-                                    "serve: armed HTTPS/HTTP web serve via engine delegation"
-                                );
-                                true
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "serve: engine web serve failed (cert/serve error — needs the `acme` \
-                                     feature + a SaaS tailnet that answers set-dns); TCP-forward serve continues"
-                                );
-                                false
+                        let built = serve::build_web_serve_state(&cfg, &fqdn);
+                        // A port the engine refuses is left out and reported with the engine's
+                        // reason; the other ports still serve. (A config written while the node
+                        // was up was already refused at `set_serve_config`; this catches one
+                        // persisted before the engine refused it, or written while down.)
+                        for refused in &built.refused {
+                            tracing::warn!(
+                                port = refused.port,
+                                error = %refused.error,
+                                "serve: the engine refuses this port; not served"
+                            );
+                        }
+                        let ports = built.state.tcp.len();
+                        if ports == 0 {
+                            false
+                        } else {
+                            match device.set_serve_config(built.state).await {
+                                Ok(_rx) => {
+                                    tracing::info!(
+                                        name = %fqdn,
+                                        ports,
+                                        "serve: armed HTTPS web serve via engine delegation"
+                                    );
+                                    true
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "serve: engine web serve failed (cert/serve error — needs the `acme` \
+                                         feature + a SaaS tailnet that answers set-dns); TCP-forward serve continues"
+                                    );
+                                    false
+                                }
                             }
                         }
                     }
@@ -4917,7 +4912,7 @@ impl Backend {
             // tears it down. (No cert/fqdn needed for an empty state.) Covers both "web removed" and
             // "web present but arm failed".
             if !armed
-                && !device.get_serve_config().ports.is_empty()
+                && !device.get_serve_config().tcp.is_empty()
                 && let Err(e) = device
                     .set_serve_config(tailscale::ServeState::default())
                     .await
@@ -6171,7 +6166,10 @@ impl Backend {
     /// 1. an incoming config that turns Funnel on while `shields_up` is set — Go
     ///    `setServeConfigLocked`'s first statement (`config.IsFunnelOn() && prefs.ShieldsUp()`);
     /// 2. an incoming config that would change the serve type of a port the current config already
-    ///    serves — Go `validateServeConfigUpdate`; see [`serve::validate_serve_config_update`].
+    ///    serves — Go `validateServeConfigUpdate`; see [`serve::validate_serve_config_update`];
+    /// 3. while the node is up, an incoming config holding a port the engine refuses to serve (see
+    ///    [`serve::build_web_serve_state`]): the message names each port and the engine's
+    ///    [`ServeConfigError`](tailscale::ServeConfigError), so what is stored is what runs.
     pub async fn set_serve_config(&mut self, cfg: &serve::ServeConfig) -> Result<()> {
         // Funnel publishes a port to the PUBLIC internet; shields-up blocks every inbound connection
         // (it is `Config.block_incoming`). A node with both accepts nothing on the endpoint it just
@@ -6201,6 +6199,27 @@ impl Backend {
         let existing = self.serve_config().await;
         if let Err(conflict) = serve::validate_serve_config_update(&existing, cfg) {
             anyhow::bail!(conflict);
+        }
+        // Refuse a port the engine will not serve, before it is stored. The check needs the node's
+        // MagicDNS name (the host of each `Web` key), so it runs while the node is up, which is
+        // when `tnet serve` writes a web serve; a config written while down is checked when it is
+        // armed, and each refused port is logged then. Only a refusal this write introduces is
+        // refused: one the stored config already carries (written before the engine refused it)
+        // must not block removing another port, or a foreground serve restoring that config. The
+        // name query is bounded like `status`'s, since this runs under the backend lock; a query
+        // that fails or times out skips the check, and arming still logs any refusal.
+        if let Some(dev) = self.device.as_ref()
+            && let Ok(Ok(node)) = tokio::time::timeout(STATUS_QUERY_TIMEOUT, dev.self_node()).await
+        {
+            let fqdn = node.fqdn(false);
+            if !fqdn.is_empty() {
+                let already = serve::build_web_serve_state(&existing, &fqdn).refused;
+                let mut incoming = serve::build_web_serve_state(cfg, &fqdn);
+                incoming.refused.retain(|r| !already.contains(r));
+                if let Some(refusal) = incoming.refusal_message() {
+                    anyhow::bail!(refusal);
+                }
+            }
         }
         // Heads-up if a funnel-enabled port forwards to a NON-loopback backend: funnel publishes to
         // the PUBLIC internet, so a non-loopback target means inbound internet traffic is spliced to

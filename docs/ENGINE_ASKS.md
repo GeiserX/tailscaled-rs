@@ -2,7 +2,7 @@
 
 This lists the changes the downstream daemon (`tailscaled-rs`) needs from the `tailscale-rs`
 library to unblock end-to-end features. Each ask is self-contained, additive, and
-backward-compatible. The daemon pins engine rev `eabd2cf2` (engine 0.57.4, since #611 on 2026-10-07); individual asks
+backward-compatible. The daemon pins engine rev `cabfbb6b` (engine 0.57.5, tag `v0.57.5`, since 2026-10-14); individual asks
 note the rev they were verified against (older "verified vs `e126bba`/v0.6.9" / `81446f88`/v0.28.2
 / `6035651b`/v0.29.1 / `f3793636`/v0.31.0 / `575104b1`/v0.32.0 / `f8192568`/v0.33.0 / `1694d208`/v0.34.2
 / `faf46b34`/v0.35.8 notes below predate the current pin and are kept as historical context — the SHIPPED
@@ -20,10 +20,42 @@ v0.40.0 header below, each clippy+test-verified.
 > - These are still open at engine main: #5, #13, #18, #20, #21 (the three Linux router flags and
 >   `--unattended`), #25 (`tka_add` and `tka_remove`), #27, #28, #29 and #31 to #46. #7 stays open
 >   for check-mode, and #17 is open in part (no add, remove, local-disable or revoke).
-> - #47 is new. Engine main at `50611ab` stores the Serve config in Go's `ipn.ServeConfig` shape, which
->   breaks the daemon's serve layer at the next pin bump.
-> - The pin-bump notes below stop at v0.41.0. The later bumps, to `9d847a6e` (engine 0.43.0) and then
->   to `eabd2cf2` (engine 0.57.4), were not logged here.
+> - #47 was new at the wind-down and is now closed: the pin bump to `cabfbb6b` (engine 0.57.5) carries
+>   the daemon's port to Go's `ipn.ServeConfig` shape. See the first pin-bump note below.
+> - The bumps to `9d847a6e` (engine 0.43.0) and `eabd2cf2` (engine 0.57.4) were not logged when they
+>   landed. Each now has a one-line note below.
+
+> **Pin bump eabd2cf2 (v0.57.4) → cabfbb6b (v0.57.5), 2026-10-14.** Probe-compiled first. One
+> breaking change, the Serve config shape (ask #47). Engine #588 (`50611ab`) made `ServeState` Go's
+> `ipn.ServeConfig` (the `TCP`, `Web`, `Services`, `AllowFunnel` and `Foreground` maps) in place of
+> one certificate name plus a port map of `ServeTarget` values, and dropped `ServeState::validate()`.
+> The daemon's serve layer no longer compiled against it. It now maps the persisted config onto Go's
+> shape the way Go's `tailscale serve` writes it: a web port is `TCP[port] = {HTTPS}` plus
+> `Web["host:port"]`, and a TLS-terminated forward is `TCP[port] = {TCPForward, TerminateTLS,
+> ProxyProtocol}`. Plain TCP forwards stay on the daemon's own accept loop. Funnel stays on the
+> `listen_funnel` lane, so the engine's stored config always has `AllowFunnel` off. Each port is
+> checked with the engine's `ServeState::serve_plan`, the check `set_serve_config` runs. A port the
+> engine refuses is reported with the engine's `ServeConfigError`: `SetServeConfig` refuses it while
+> the node is up, and arming logs it and leaves it out otherwise, so the other ports still serve.
+> The old pin served these, each differently from Go, and the engine now refuses them: plain-HTTP
+> ports (served TLS-terminated), `TerminateTLS` forwards, `Text` handlers, a proxy at a mount other
+> than `/`, and a redirect holding `${HOST}` or `${REQUEST_URI}` (sent literally). Nothing else broke:
+> the capability version stays V125, russh stays 0.63.2, and smoltcp 0.13.1 → 0.14.0 (with heapless
+> 0.8 → 0.9) arrives through the engine. Also pulled: exit-node support for official clients (#597)
+> and a faster exit-node data path (#598), host exit flows confined to internet destinations (#603),
+> netstack fixes (#599, #614, #616), session revocation on a key change and expired-peer removal
+> (#601), self-only netmaps and complete Hostinfo (#602), an owner-only key file (#605), magicsock
+> path fixes (#606, #613) and ruzstd 0.9.1 (#594). All 40 engine crates are on crates.io at 0.57.5,
+> and the facade's 0.57.5 was cut from the pinned commit. The live smoke test (`docs/ENGINE.md` §1
+> step 5) was not run for this bump.
+
+> **Pin bump 9d847a6e (v0.43.0) → eabd2cf2 (v0.57.4), 2026-10-07 (#611).** Taken for russh 0.63.2,
+> which closes GHSA-47hw-gvq5-r2gm, GHSA-35g8-35p8-c8fw, GHSA-w3jg-pjxf-73p4 and GHSA-p8qx-h547-fjw9.
+> The daemon adapted to `WhoIs.user()` and two new `StatusNode` fields.
+
+> **Pin bump 35e5db22 (v0.41.0) → 9d847a6e (v0.43.0), 2026-08-12 (#256).** Taken for russh 0.62.6,
+> which closes GHSA-5xvq-cp9x-6p6r, GHSA-cqjc-rmpq-xprq, GHSA-g9hv-x236-4qp3 and GHSA-m65r-rprj-r5rg.
+> No daemon code changed.
 
 > **Pin bump fe86ca00 (v0.40.0) → 35e5db22 (v0.41.0), 2026-06-16.** Probe-compiled first (against the
 > pre-tag HEAD `73f56b1e`): CLEAN — no breaking change, purely additive. **SHIPS + CONSUMES ask #24**:
@@ -982,7 +1014,7 @@ prefers the most-specific / trailing-slash mount). A regression test: mounts `{"
 `/apifoo` ⇒ must route to `B` (root), NOT `A`; request `/api/x` ⇒ `A`; request `/api` ⇒ `A`.
 
 **Daemon impact once landed:** none in the daemon — the daemon only *builds* the `ServeTarget::Path`
-handler map (`src/ipn/serve.rs` `handler_to_target`/`http_handler_to_target`); the request-time mux is
+handler map (`src/ipn/serve.rs` `build_web_serve_state`, which hands the engine Go's `Web` map); the request-time mux is
 entirely engine-owned, so this fix is transparent to the daemon (no wiring change). Tracked in daemon bead
 tsd-k4q. — daemon lane
 
@@ -2126,6 +2158,10 @@ existing netmap arm already fetches and attaches the self node. A test beside th
 takes the self node from the engine `Notify`. Consumed via a pin bump. — engine lane
 
 ## 47. The daemon's serve layer must move to the engine's Go-shaped Serve config at the next pin bump
+
+> **Marked closed on 2026-10-14.** The pin bump to `cabfbb6b` (engine 0.57.5) carries the port: the
+> daemon maps its persisted serve config onto Go's `TCP` and `Web` maps and reports each port the
+> engine refuses with the engine's `ServeConfigError`. See the pin-bump note at the top.
 
 **Why:** Engine main at `50611ab` (engine #588) stores the Serve config in Go's `ipn.ServeConfig` wire
 shape. At the pin, `ServeState` is one certificate name plus a port map of `ServeTarget` values
