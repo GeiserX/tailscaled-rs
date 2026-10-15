@@ -1113,8 +1113,8 @@ async fn stream_notify(
                             // the engine's bus carries only peers, so a netmap tick fetches it here.
                             // The upgraded `Arc` lives only for the bounded query; a `down` racing it
                             // sees the benign extra clone `device_handle` documents. A netmap that
-                            // changes only this node sends no tick at all, so it is not fetched here
-                            // either (engine gap, `docs/ENGINE_ASKS.md` #46); no timer polls for it.
+                            // changes only this node ticks too (engine #630, ask #46), so this arm
+                            // covers it with no timer.
                             let self_change = if notify.net_map.is_none() {
                                 None
                             } else if let Some(dev) = epoch_dev.upgrade() {

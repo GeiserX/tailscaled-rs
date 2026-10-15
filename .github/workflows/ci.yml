@@ -134,7 +134,7 @@ jobs:
       - name: Start Headscale and wait for its healthcheck
         run: docker compose -f "$HS_COMPOSE" up -d --wait --wait-timeout 120
 
-      - name: Mint a user and a reusable pre-auth key
+      - name: Mint a user, a reusable pre-auth key and an API key
         run: |
           hs() { docker compose -f "$HS_COMPOSE" exec -T headscale headscale "$@"; }
           hs users create test
@@ -147,6 +147,14 @@ jobs:
           esac
           echo "::add-mask::$KEY"
           echo "TAILNETD_HS_AUTHKEY=$KEY" >> "$GITHUB_ENV"
+          # The self-only change test renames its node through Headscale's REST API.
+          API=$(hs apikeys create --expiration 2h)
+          case "$API" in
+            hskey-api-*) ;;
+            *) echo "headscale minted no API key"; exit 1 ;;
+          esac
+          echo "::add-mask::$API"
+          echo "TAILNETD_HS_APIKEY=$API" >> "$GITHUB_ENV"
 
       - name: Run the e2e
         env:

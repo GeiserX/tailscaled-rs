@@ -35,6 +35,9 @@
 //! # 3. Point the test at it and run the (otherwise-ignored) e2e.
 //! export TAILNETD_HS_URL=http://localhost:8080
 //! export TAILNETD_HS_AUTHKEY="$KEY"
+//! # The self-only change test also needs an API key, to rename its node:
+//! export TAILNETD_HS_APIKEY=$(docker compose -f test-support/headscale/docker-compose.yml exec -T \
+//!     headscale headscale apikeys create --expiration 2h)
 //! cargo test --test headscale_e2e -- --ignored --nocapture
 //! ```
 //!
@@ -659,4 +662,213 @@ async fn headscale_readonly_diagnostics_on_running_node() {
         ip.parse::<std::net::Ipv4Addr>().is_ok(),
         "self address {ip:?} should be a valid IPv4 from the tailnet pool"
     );
+}
+
+/// A netmap update that changes only this node reaches a bus watcher, as Go's `SelfChange` does.
+///
+/// Go sends `Notify.SelfChange` on every netmap update (`ipn/ipnlocal/local.go:2063-2078`,
+/// v1.102.4), so a watcher learns when only this node moved: a rename, an address change, a key
+/// expiry extension. The engine ticks the bus on such a change since tailscale-rs #630 (engine ask
+/// #46), and the daemon's `stream_notify` attaches the current self node to every `net_map` frame.
+///
+/// The test renames the node on the control server through Headscale's REST API. A rename changes
+/// this node's MagicDNS name and nothing about any peer, so the frame that carries the new name can
+/// only come from the self-only tick. Before #630 no frame arrived until some peer changed.
+///
+/// Same `#[ignore]` + env gate as the join test, plus `TAILNETD_HS_APIKEY`, a Headscale API key
+/// (`headscale apikeys create`) for the rename. Run alone, it is red on an engine without #630.
+#[tokio::test]
+#[ignore = "requires a running headscale (test-support/headscale) + TAILNETD_HS_URL/TAILNETD_HS_AUTHKEY/TAILNETD_HS_APIKEY; see docs/development.md"]
+async fn headscale_self_only_change_reaches_a_bus_watcher() {
+    use tailscaled_rs::localapi::Response;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let (hs_url, hs_authkey, hs_apikey) = match (
+        std::env::var("TAILNETD_HS_URL"),
+        std::env::var("TAILNETD_HS_AUTHKEY"),
+        std::env::var("TAILNETD_HS_APIKEY"),
+    ) {
+        (Ok(url), Ok(key), Ok(api)) if !url.is_empty() && !key.is_empty() && !api.is_empty() => {
+            (url, key, api)
+        }
+        _ => {
+            eprintln!(
+                "SKIP headscale_self_only_change_reaches_a_bus_watcher: set TAILNETD_HS_URL, \
+                 TAILNETD_HS_AUTHKEY and TAILNETD_HS_APIKEY (`headscale apikeys create`) to run \
+                 this; see test-support/headscale/README.md."
+            );
+            return;
+        }
+    };
+    if std::env::var("TS_RS_EXPERIMENT").as_deref() != Ok("this_is_unstable_software") {
+        eprintln!("SKIP headscale_self_only_change_reaches_a_bus_watcher: export TS_RS_EXPERIMENT");
+        return;
+    }
+
+    let state_dir = unique_state_dir();
+    let _ = tokio::fs::remove_dir_all(&state_dir).await;
+    tokio::fs::create_dir_all(&state_dir)
+        .await
+        .expect("create temp state dir");
+    let backend = std::sync::Arc::new(tokio::sync::Mutex::new(
+        Backend::load(&state_dir)
+            .await
+            .expect("Backend::load (offline file read) must succeed"),
+    ));
+
+    let hostname = format!("tsd-self-{}", std::process::id());
+    backend
+        .lock()
+        .await
+        .up(
+            Some(secrecy::SecretString::from(hs_authkey)),
+            tailscaled_rs::ipn::UpOptions {
+                hostname: Some(hostname.clone()),
+                control_url: Some(hs_url.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("up() against headscale {hs_url} failed: {e:?}"));
+
+    // Wait for Running with a self address, as the join test does.
+    let mut self_ipv4 = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while tokio::time::Instant::now() < deadline {
+        let report = backend.lock().await.status().await;
+        if report.state == "Running" && report.self_ipv4.is_some() {
+            self_ipv4 = report.self_ipv4;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // Serve the LocalAPI on a socket in the state dir and open a bus watcher on it.
+    let socket = state_dir.join("tailnetd.sock");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let serve_task = tokio::spawn({
+        let socket = socket.clone();
+        let backend = std::sync::Arc::clone(&backend);
+        async move {
+            let _ = tailscaled_rs::server::serve(&socket, backend, async {
+                shutdown_rx.await.ok();
+            })
+            .await;
+        }
+    });
+
+    let outcome = async {
+        let self_ipv4 = self_ipv4.ok_or("the node never reached Running with a self address")?;
+        let mut stream = None;
+        for _ in 0..200 {
+            if let Ok(s) = tokio::net::UnixStream::connect(&socket).await {
+                stream = Some(s);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let (read_half, mut write_half) =
+            stream.ok_or("LocalAPI socket never came up")?.into_split();
+        write_half
+            .write_all(b"{\"cmd\":\"watch\",\"initial_netmap\":true}\n")
+            .await
+            .map_err(|e| format!("write watch request: {e}"))?;
+        let mut lines = tokio::io::BufReader::new(read_half).lines();
+
+        // The self name on the next frame, or None when nothing arrives within `wait`.
+        async fn next_self_name(
+            lines: &mut tokio::io::Lines<tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>>,
+            wait: Duration,
+        ) -> Result<Option<Option<String>>, String> {
+            match tokio::time::timeout(wait, lines.next_line()).await {
+                Err(_) => Ok(None),
+                Ok(Err(e)) => Err(format!("read watch frame: {e}")),
+                Ok(Ok(None)) => Err("the watch stream closed".into()),
+                Ok(Ok(Some(line))) => match serde_json::from_str::<Response>(&line) {
+                    Ok(Response::Notify(view)) => Ok(Some(view.self_change.map(|s| s.name))),
+                    Ok(_) => Ok(Some(None)),
+                    Err(e) => Err(format!("watch frame is not a Response ({e}): {line}")),
+                },
+            }
+        }
+
+        // The initial netmap names the node as it registered. Drain until the stream is quiet.
+        let mut first_name = None;
+        while let Some(name) = next_self_name(&mut lines, Duration::from_secs(3)).await? {
+            first_name = first_name.or(name);
+        }
+        let first_name = first_name.ok_or("the initial netmap frame carried no self node")?;
+        if !first_name.starts_with(&hostname) {
+            return Err(format!(
+                "initial self name {first_name:?} is not {hostname:?}"
+            ));
+        }
+
+        // Rename the node on the control server. Headscale finds it by its tailnet address.
+        let new_name = format!("tsd-renamed-{}", std::process::id());
+        let api = hs_url.trim_end_matches('/').to_string();
+        let auth = format!("Bearer {hs_apikey}");
+        let renamed = new_name.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let body = ureq::get(&format!("{api}/api/v1/node"))
+                .header("Authorization", &auth)
+                .call()
+                .map_err(|e| format!("list nodes: {e}"))?
+                .body_mut()
+                .read_to_string()
+                .map_err(|e| format!("read node list: {e}"))?;
+            let nodes: serde_json::Value =
+                serde_json::from_str(&body).map_err(|e| format!("node list JSON: {e}"))?;
+            let id = nodes["nodes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|n| {
+                    n["ipAddresses"]
+                        .as_array()
+                        .is_some_and(|a| a.iter().any(|ip| ip.as_str() == Some(&self_ipv4)))
+                })
+                .and_then(|n| n["id"].as_str())
+                .ok_or_else(|| format!("no headscale node holds {self_ipv4}: {body}"))?
+                .to_string();
+            ureq::post(&format!("{api}/api/v1/node/{id}/rename/{renamed}"))
+                .header("Authorization", &auth)
+                .send_empty()
+                .map_err(|e| format!("rename node {id}: {e}"))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("rename task: {e}"))??;
+
+        // The rename alone must reach the watcher, as a frame whose self node has the new name.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match next_self_name(&mut lines, left).await? {
+                None => {
+                    return Err(format!(
+                        "no frame named the node {new_name:?} within 20s of the rename: a \
+                         self-only netmap change did not reach the bus watcher"
+                    ));
+                }
+                Some(Some(name)) if name.starts_with(&new_name) => return Ok(()),
+                Some(_) => {}
+            }
+        }
+    }
+    .await;
+
+    // Always tear down before asserting, so a failure leaves no node up and no temp dir.
+    let _ = shutdown_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(5), serve_task).await;
+    {
+        let mut be = backend.lock().await;
+        let _ = be.down(Actor::Operator { reason: None }).await;
+        be.shutdown().await;
+    }
+    let _ = tokio::fs::remove_dir_all(&state_dir).await;
+
+    if let Err(why) = outcome {
+        panic!("{why}");
+    }
 }
