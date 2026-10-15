@@ -27,6 +27,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.68.2](https://github.com/GeiserX/tailscaled-rs/compare/v0.68.1...v0.68.2) (2026-10-15)
+
+
+### Bug Fixes
+
+* **deps:** release the daemon on the tailscale-rs 0.57.7 pin ([#647](https://github.com/GeiserX/tailscaled-rs/issues/647)) ([0fc70d9](https://github.com/GeiserX/tailscaled-rs/commit/0fc70d994a5c057699d759f3791ca93aff667b0a))
+
 ## [0.68.1](https://github.com/GeiserX/tailscaled-rs/compare/v0.68.0...v0.68.1) (2026-10-14)
 
 
