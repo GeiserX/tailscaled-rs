@@ -21,6 +21,8 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
 - `feat:` → **minor** bump.
 - `fix:` → **patch** bump.
 - `chore:` / `docs:` / `style:` / `refactor:` / `test:` → no release on their own.
+- `build(deps):` → no release on its own either. An engine pin bump that carries engine fixes
+  goes in as `fix(deps):`, so the daemon binaries that ship those fixes get a release.
 - Because the project is **pre-1.0**, breaking changes may land in a **minor** bump
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
