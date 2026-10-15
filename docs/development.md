@@ -127,6 +127,9 @@ TS_CONTROL_URL=http://localhost:8080 \
 # 3b. …or run the gated integration test, which does the same join → poll-to-Running → down:
 export TAILNETD_HS_URL=http://localhost:8080
 export TAILNETD_HS_AUTHKEY=<hs-preauth-key>
+# The self-only change test also renames its node through Headscale's REST API:
+export TAILNETD_HS_APIKEY=$(docker compose -f test-support/headscale/docker-compose.yml exec -T \
+    headscale headscale apikeys create --expiration 2h)
 cargo test --test headscale_e2e -- --ignored --nocapture
 
 # 4. Tear the server down when done.
@@ -189,14 +192,14 @@ not the genuine one — and the two can disagree.
 
 The Tailscale control protocol is a moving target keyed by a single integer, the
 **`CapabilityVersion`** (capver): every behavioral change to the client⇄control contract bumps it.
-The daemon **inherits** whatever capver its pinned engine advertises — currently **130** (engine
-`0.6.5`); the full mechanism and discipline are documented in
+The daemon **inherits** whatever capver its pinned engine advertises — currently **125** (engine
+`0.57.7`); the full mechanism and discipline are documented in
 [`docs/ENGINE.md` §2](ENGINE.md#2-capability-version-tracking-discipline).
 
 Two independent fidelity gaps stack here:
 
 - **The engine advertises a capped capver.** It *defines* constants past the one it claims (up to
-  V133) but deliberately sets `CURRENT = V130`, asserting only the semantics it actually implements
+  V133) but deliberately holds `CURRENT = V125`, asserting only the semantics it actually implements
   (see [ENGINE.md §2 "The risk"](ENGINE.md#the-risk)). So the daemon is already behind live upstream.
 - **Headscale itself lags upstream.** Headscale is an independent, best-effort reimplementation with
   a deliberately narrow scope (a single tailnet, for self-hosters); it does not advertise capability
