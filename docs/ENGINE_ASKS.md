@@ -2,7 +2,7 @@
 
 This lists the changes the downstream daemon (`tailscaled-rs`) needs from the `tailscale-rs`
 library to unblock end-to-end features. Each ask is self-contained, additive, and
-backward-compatible. The daemon pins engine rev `d64186e2` (engine 0.57.6, tag `v0.57.6`, since 2026-10-14); individual asks
+backward-compatible. The daemon pins engine rev `f36c757e` (engine 0.57.7, tag `v0.57.7`, since 2026-10-15); individual asks
 note the rev they were verified against (older "verified vs `e126bba`/v0.6.9" / `81446f88`/v0.28.2
 / `6035651b`/v0.29.1 / `f3793636`/v0.31.0 / `575104b1`/v0.32.0 / `f8192568`/v0.33.0 / `1694d208`/v0.34.2
 / `faf46b34`/v0.35.8 notes below predate the current pin and are kept as historical context — the SHIPPED
@@ -24,6 +24,17 @@ v0.40.0 header below, each clippy+test-verified.
 >   the daemon's port to Go's `ipn.ServeConfig` shape. See the first pin-bump note below.
 > - The bumps to `9d847a6e` (engine 0.43.0) and `eabd2cf2` (engine 0.57.4) were not logged when they
 >   landed. Each now has a one-line note below.
+
+> **Pin bump d64186e2 (v0.57.6) → f36c757e (v0.57.7), 2026-10-15.** Closes ask #46: engine #630
+> ticks the IPN bus on a self-only netmap change, so a rename, an address change or a key-expiry
+> extension reaches a watcher as `self_change`, as Go's `SelfChange` does. The daemon needed no code
+> change for it. The "Narrower than Go" paragraph on `NotifyView::self_change` is gone, and the
+> Headscale e2e gains `headscale_self_only_change_reaches_a_bus_watcher`, which fails on the old pin.
+> Also pulled: exit users kept off the LAN on the proxy path too (#624), the Windows state directory
+> locked to the owner and Administrators (#625), Reno congestion control as Go's gVisor runs it
+> (#627), a magicsock rebind that keeps its port with the v6 gate following the socket (#626), and
+> russh moved onto ring (#628), which drops aws-lc-rs, aws-lc-sys and their cmake build from the
+> daemon's lockfile. russh stays 0.63.2 and the capability version stays V125.
 
 > **Pin bump cabfbb6b (v0.57.5) → d64186e2 (v0.57.6), 2026-10-14.** Probe-compiled first: clean,
 > no daemon code change. It brings six engine fixes: the exit forwarder keeps exit users off the exit
@@ -2134,6 +2145,14 @@ The lag frame carries `error` with no `state`, which is how Go overloads `Notify
 the field's doc comment has to say so. Consumed via a pin bump. — engine lane
 
 ## 46. A `net_map` tick on a self-node change — so `Notify.SelfChange` reaches a watcher when only this node moved
+
+> **Marked closed on 2026-10-15.** Engine #630 (`be5eb65`) took option 1: the bus now watches the
+> control runner's `self_node` cell and ticks `net_map` when the self node changes. The pin bump to
+> `f36c757e` (engine 0.57.7) carries it. `stream_notify` needed no change. The "Narrower than Go"
+> paragraph on `NotifyView::self_change` is gone. The test is the Headscale e2e
+> `headscale_self_only_change_reaches_a_bus_watcher` rather than a `stream_notify` unit test,
+> because only a real control server can send a self-only netmap: it renames the node through
+> Headscale's API and waits for a frame naming the new name. Run alone, it fails on the old pin.
 
 **Why:** Go's `SelfChange` (`ipn/ipnlocal/local.go` @ `bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8`)
 is built from `NetMap.SelfNode` on every netmap update, so a watcher learns about its own node even

@@ -42,6 +42,9 @@ TS_CONTROL_URL=http://localhost:8080 ./target/release/tnet up --authkey <key> --
 # …or run the gated integration test instead of the CLI:
 export TAILNETD_HS_URL=http://localhost:8080
 export TAILNETD_HS_AUTHKEY=<key>
+# The self-only change test also renames its node through Headscale's REST API:
+export TAILNETD_HS_APIKEY=$(docker compose -f test-support/headscale/docker-compose.yml exec -T \
+    headscale headscale apikeys create --expiration 2h)
 cargo test --test headscale_e2e -- --ignored --nocapture
 
 # 4. Tear it down (-v also drops the sqlite/noise-key volumes).

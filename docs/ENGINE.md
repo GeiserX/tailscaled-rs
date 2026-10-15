@@ -23,17 +23,19 @@ This document covers three related maintainer responsibilities:
 
 ### Where the pin lives
 
-The pin is one line in [`Cargo.toml`](../Cargo.toml):
+The pin is the same `rev` on four lines in [`Cargo.toml`](../Cargo.toml): the facade and the three
+engine crates the daemon names directly. The facade line is:
 
 ```toml
-tailscale = { package = "tailscale-rs", git = "https://github.com/GeiserX/tailscale-rs", rev = "afa970c04ad1a98e6dc88484294f360439a24725" }
+tailscale = { package = "geiserx_tailscale", git = "https://github.com/GeiserX/tailscale-rs", rev = "f36c757efd9b283be1fc97d09ecc9b3fa1c831af" }
 ```
 
-Three things to note:
+and `ts_control`, `ts_capabilityversion` and `ts_tka` follow it with the same `rev`. Three things to
+note:
 
-- The crate is imported as `tailscale` but its published package name is `tailscale-rs`. That
-  `package = "tailscale-rs"` name is what `cargo update -p …` and `Cargo.lock` key on — **not**
-  `tailscale`.
+- The crate is imported as `tailscale` but its published package name is `geiserx_tailscale` (each
+  engine crate is published as `geiserx_<name>`). That package name is what `cargo update -p …` and
+  `Cargo.lock` key on — **not** `tailscale`.
 - `rev` is a **full commit SHA**, not a branch or tag. A branch would let the engine drift between
   builds; a SHA freezes it.
 - [`Cargo.lock`](../Cargo.lock) **is committed** (this is a daemon/binary crate, not a library).
@@ -45,9 +47,9 @@ Three things to note:
 
 | Field                              | Value                                                                 |
 | ---------------------------------- | --------------------------------------------------------------------- |
-| Pinned engine `rev`                | `afa970c04ad1a98e6dc88484294f360439a24725`                            |
-| Engine version at that rev         | `0.6.5`                                                               |
-| Engine `CapabilityVersion::CURRENT`| `130` (see [§2](#2-capability-version-tracking-discipline))           |
+| Pinned engine `rev`                | `f36c757efd9b283be1fc97d09ecc9b3fa1c831af`                            |
+| Engine version at that rev         | `0.57.7` (tag `v0.57.7`)                                              |
+| Engine `CapabilityVersion::CURRENT`| `125` (see [§2](#2-capability-version-tracking-discipline))           |
 
 ### Step-by-step
 
@@ -59,18 +61,19 @@ Do these in order. Do not commit until the gate suite passes.
    anything touching `ts_control`, `ts_capabilityversion`, the Noise/control handshake, or
    `ts_runtime`'s config boundary.
 
-2. **Update `rev=` in `Cargo.toml`.** Replace the SHA in the `tailscale = { … rev = "…" }` line
-   with the new one. Change nothing else on that line.
+2. **Update `rev=` in `Cargo.toml`.** Replace the SHA on all four engine lines (`tailscale`,
+   `ts_control`, `ts_capabilityversion`, `ts_tka`) with the new one. They must always match. Change
+   nothing else on those lines.
 
 3. **Update the lockfile:**
 
    ```bash
-   cargo update -p tailscale-rs
+   cargo update -p geiserx_tailscale
    ```
 
-   This re-resolves only the engine (and any of its transitive deps that moved) to match the new
+   This re-resolves the engine crates (and any of their transitive deps that moved) to match the new
    `rev`, and rewrites `Cargo.lock`. Confirm the new SHA now appears in the lockfile's
-   `source = "git+…?rev=<sha>#<sha>"` line for `tailscale-rs`.
+   `source = "git+…?rev=<sha>#<sha>"` lines and the old one appears nowhere.
 
 4. **Run the full gate suite.** The engine requires an explicit acknowledgement that it is
    experimental, so export it first:
@@ -103,8 +106,9 @@ Do these in order. Do not commit until the gate suite passes.
    ```bash
    export TS_RS_EXPERIMENT=this_is_unstable_software
    docker compose -f test-support/headscale/docker-compose.yml up -d --wait
-   # mint a user and a reusable pre-auth key as the README shows, then:
+   # mint a user, a reusable pre-auth key and an API key as the README shows, then:
    export TAILNETD_HS_URL=http://localhost:8080 TAILNETD_HS_AUTHKEY=<hskey-auth-…>
+   export TAILNETD_HS_APIKEY=<hskey-api-…>
    cargo test --test headscale_e2e -- --ignored --nocapture
    docker compose -f test-support/headscale/docker-compose.yml down -v
    ```
@@ -124,8 +128,8 @@ Do these in order. Do not commit until the gate suite passes.
 A maintainer can follow this on every bump:
 
 - [ ] New upstream `rev` chosen (a specific commit SHA), and its changelog/diff since the current pin reviewed.
-- [ ] `rev=` updated in `Cargo.toml`.
-- [ ] `cargo update -p tailscale-rs` run; new SHA confirmed in `Cargo.lock`.
+- [ ] `rev=` updated on all four engine lines in `Cargo.toml`.
+- [ ] `cargo update -p geiserx_tailscale` run; new SHA confirmed in `Cargo.lock`, old SHA gone.
 - [ ] `export TS_RS_EXPERIMENT=this_is_unstable_software`.
 - [ ] `cargo fmt --all --check` clean.
 - [ ] `cargo clippy --all-targets -- -D warnings` clean.
@@ -176,35 +180,37 @@ in turn decides which response semantics to use.
 
 ### The current value
 
-As of the pinned engine rev (`afa970c0`, engine `0.6.5`), the engine advertises:
+As of the pinned engine rev (`f36c757e`, engine `0.57.7`), the engine advertises:
 
 ```rust
-/// The current capability version of this Tailscale node.
-pub const CURRENT: Self = Self::V130;
+/// The capability version this node declares to control.
+pub const CURRENT: Self = Self::V125;
 ```
 
-So the daemon's effective capability version is **130** — dated `2025-10-06` in the engine's table,
-described there as *"Fixed sleep/wake deadlock in magicsock when using peer relay."*
+So the daemon's effective capability version is **125**, dated `2025-08-11` in the engine's table
+(*"dnstype.Resolver adds UseWithExitNode field"*). It is also the version Tailscale `v1.88.0`
+declares.
 
-Note that the engine's source file *defines constants past the one it advertises* — it carries
-`V131`, `V132`, and `V133` (the latter dated `2026-02-17`) as known points on the upstream timeline,
-but `CURRENT` is deliberately set to **V130**. Defining a constant is not the same as claiming it:
-the engine only asserts the capabilities it has actually implemented. The exact upstream Go
-`CurrentCapabilityVersion` is not vendored into this repo, so compare against the
+The engine's source file *defines constants past the one it advertises*: it carries `V126` to
+`V133` (the last dated `2026-02-17`) as known points on the upstream timeline, but `CURRENT` is
+deliberately held at **V125**. Its doc comment gives the reason: 126 is seamless key renewal, 127 is
+c2n `/debug/netmap` and 128 is c2n `/debug/health`, and the engine implements none of them. Defining
+a constant is not the same as claiming it: the engine only asserts the capabilities it has actually
+implemented. The exact upstream Go `CurrentCapabilityVersion` is not vendored into this repo, so
+compare against the
 [upstream `tailcfg` source](https://github.com/tailscale/tailscale/blob/main/tailcfg/tailcfg.go)
-directly when you need the live upstream number; the presence of `V131`–`V133` constants here
-indicates upstream had advanced at least to **133** when this rev was cut, while the engine
-deliberately still advertises **130**.
+directly when you need the live upstream number; the `V126` to `V133` constants show upstream had
+reached at least **133** when this rev was cut.
 
 ### The version flow
 
 ```mermaid
 flowchart LR
     GO["Upstream Go <code>tailcfg.go</code><br/>CurrentCapabilityVersion<br/><i>(the moving target)</i>"]
-      -->|"hand-ported,<br/>kept in sync"| ENG_SRC["Engine <code>ts_capabilityversion</code><br/>CapabilityVersion::CURRENT = V130"]
-    ENG_SRC -->|"compiled into"| REV["Pinned engine rev<br/><code>afa970c0</code> (v0.6.5)"]
-    REV -->|"linked via Cargo.toml + Cargo.lock"| DAEMON["tailscaled-rs daemon<br/><i>inherits capver 130</i>"]
-    DAEMON -->|"advertises 130 in<br/>register / map poll"| CTRL["Control server<br/><i>selects response semantics</i>"]
+      -->|"hand-ported,<br/>kept in sync"| ENG_SRC["Engine <code>ts_capabilityversion</code><br/>CapabilityVersion::CURRENT = V125"]
+    ENG_SRC -->|"compiled into"| REV["Pinned engine rev<br/><code>f36c757e</code> (v0.57.7)"]
+    REV -->|"linked via Cargo.toml + Cargo.lock"| DAEMON["tailscaled-rs daemon<br/><i>inherits capver 125</i>"]
+    DAEMON -->|"advertises 125 in<br/>register / map poll"| CTRL["Control server<br/><i>selects response semantics</i>"]
 ```
 
 The arrow that matters: the daemon **inherits** whatever capver the pinned engine advertises. The
@@ -235,7 +241,7 @@ to and including this one." Over-claiming — advertising a capver whose behavio
 fully implement — invites **silent control-plane mis-negotiation**: the control server tailors its
 `MapResponse` (packet filters, DNS config, peer-change patches, and similar) to a contract the
 client does not actually honor, and the failure mode is quiet wrong behavior rather than a clean
-error. This is why the engine sets `CURRENT` to **130** even though it *defines* constants up to
+error. This is why the engine holds `CURRENT` at **125** even though it *defines* constants up to
 **133**: it refuses to claim more than it implements.
 
 Crucially, this correctness boundary is **fundamentally an engine concern that the daemon
