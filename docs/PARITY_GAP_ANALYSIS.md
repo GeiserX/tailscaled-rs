@@ -3,7 +3,8 @@
 > **2026-10-14: this document is an audit snapshot.** It was taken at engine pin `eabd2cf2` (engine
 > 0.57.4, pinned on 2026-10-07). The pin is now `d64186e` (engine 0.57.6): #641 ported the serve
 > layer to the engine's Go-shaped Serve config and #643 moved the pin, which closed ask #47. On
-> 2026-10-15 the pin moved again, to `f36c757e` (engine 0.57.7), which closed ask #46.
+> 2026-10-15 the pin moved again, to `f36c757e` (engine 0.57.7), which closed ask #46, and on
+> 2026-10-17 to `4fd3276b` (engine 0.57.8), which fixed a stalled map poll and a stopped UDP receive.
 > [`docs/ENGINE_ASKS.md`](ENGINE_ASKS.md) is the live record of the engine boundary; where it and this
 > snapshot disagree, it is right.
 
