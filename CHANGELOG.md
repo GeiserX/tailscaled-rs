@@ -27,6 +27,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.68.3](https://github.com/GeiserX/tailscaled-rs/compare/v0.68.2...v0.68.3) (2026-10-17)
+
+
+### Bug Fixes
+
+* **deps:** reconnect a stalled map poll and keep UDP receive alive on tailscale-rs 0.57.8 ([#649](https://github.com/GeiserX/tailscaled-rs/issues/649)) ([0f7de6e](https://github.com/GeiserX/tailscaled-rs/commit/0f7de6e4f85caaccf81d450d359fe8d8207a63b7))
+
 ## [0.68.2](https://github.com/GeiserX/tailscaled-rs/compare/v0.68.1...v0.68.2) (2026-10-15)
 
 
