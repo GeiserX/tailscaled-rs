@@ -27,6 +27,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.68.4](https://github.com/GeiserX/tailscaled-rs/compare/v0.68.3...v0.68.4) (2026-10-19)
+
+
+### Bug Fixes
+
+* **deps:** reach peers behind hard NATs directly with engine 0.58.0 port mapping ([#651](https://github.com/GeiserX/tailscaled-rs/issues/651)) ([ac65e07](https://github.com/GeiserX/tailscaled-rs/commit/ac65e07f9f0109fecf760ecf29b64ae95225a776))
+
 ## [0.68.3](https://github.com/GeiserX/tailscaled-rs/compare/v0.68.2...v0.68.3) (2026-10-17)
 
 
