@@ -27,7 +27,7 @@ The pin is the same `rev` on four lines in [`Cargo.toml`](../Cargo.toml): the fa
 engine crates the daemon names directly. The facade line is:
 
 ```toml
-tailscale = { package = "geiserx_tailscale", git = "https://github.com/GeiserX/tailscale-rs", rev = "4fd3276bee87ffd7eaad94b74d110a54bb979e30" }
+tailscale = { package = "geiserx_tailscale", git = "https://github.com/GeiserX/tailscale-rs", rev = "6ff0ee70975cb8abd7c1b43a7d9fbff80f41bbf4" }
 ```
 
 and `ts_control`, `ts_capabilityversion` and `ts_tka` follow it with the same `rev`. Three things to
@@ -47,8 +47,8 @@ note:
 
 | Field                              | Value                                                                 |
 | ---------------------------------- | --------------------------------------------------------------------- |
-| Pinned engine `rev`                | `4fd3276bee87ffd7eaad94b74d110a54bb979e30`                            |
-| Engine version at that rev         | `0.57.8` (tag `v0.57.8`)                                              |
+| Pinned engine `rev`                | `6ff0ee70975cb8abd7c1b43a7d9fbff80f41bbf4`                            |
+| Engine version at that rev         | `0.58.0` (tag `v0.58.0`)                                              |
 | Engine `CapabilityVersion::CURRENT`| `125` (see [§2](#2-capability-version-tracking-discipline))           |
 
 ### Step-by-step
@@ -180,7 +180,7 @@ in turn decides which response semantics to use.
 
 ### The current value
 
-As of the pinned engine rev (`4fd3276b`, engine `0.57.8`), the engine advertises:
+As of the pinned engine rev (`6ff0ee70`, engine `0.58.0`), the engine advertises:
 
 ```rust
 /// The capability version this node declares to control.
@@ -208,7 +208,7 @@ reached at least **133** when this rev was cut.
 flowchart LR
     GO["Upstream Go <code>tailcfg.go</code><br/>CurrentCapabilityVersion<br/><i>(the moving target)</i>"]
       -->|"hand-ported,<br/>kept in sync"| ENG_SRC["Engine <code>ts_capabilityversion</code><br/>CapabilityVersion::CURRENT = V125"]
-    ENG_SRC -->|"compiled into"| REV["Pinned engine rev<br/><code>4fd3276b</code> (v0.57.8)"]
+    ENG_SRC -->|"compiled into"| REV["Pinned engine rev<br/><code>6ff0ee70</code> (v0.58.0)"]
     REV -->|"linked via Cargo.toml + Cargo.lock"| DAEMON["tailscaled-rs daemon<br/><i>inherits capver 125</i>"]
     DAEMON -->|"advertises 125 in<br/>register / map poll"| CTRL["Control server<br/><i>selects response semantics</i>"]
 ```

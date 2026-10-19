@@ -2,7 +2,7 @@
 
 This lists the changes the downstream daemon (`tailscaled-rs`) needs from the `tailscale-rs`
 library to unblock end-to-end features. Each ask is self-contained, additive, and
-backward-compatible. The daemon pins engine rev `4fd3276b` (engine 0.57.8, tag `v0.57.8`, since 2026-10-17); individual asks
+backward-compatible. The daemon pins engine rev `6ff0ee70` (engine 0.58.0, tag `v0.58.0`, since 2026-10-19); individual asks
 note the rev they were verified against (older "verified vs `e126bba`/v0.6.9" / `81446f88`/v0.28.2
 / `6035651b`/v0.29.1 / `f3793636`/v0.31.0 / `575104b1`/v0.32.0 / `f8192568`/v0.33.0 / `1694d208`/v0.34.2
 / `faf46b34`/v0.35.8 notes below predate the current pin and are kept as historical context — the SHIPPED
@@ -24,6 +24,13 @@ v0.40.0 header below, each clippy+test-verified.
 >   the daemon's port to Go's `ipn.ServeConfig` shape. See the first pin-bump note below.
 > - The bumps to `9d847a6e` (engine 0.43.0) and `eabd2cf2` (engine 0.57.4) were not logged when they
 >   landed. Each now has a one-line note below.
+
+> **Pin bump 4fd3276b (v0.57.8) → 6ff0ee70 (v0.58.0), 2026-10-19.** No ask. Engine #643 to #645
+> add a NAT-PMP and PCP port mapper, on by default as in Go, so a node behind a home router can be
+> reached directly by a peer behind a hard NAT. `TS_DISABLE_PORTMAPPER` turns it off. Engine #638 to
+> #642 and #647 bring direct-path discovery closer to Go: interface addresses instead of `0.0.0.0`,
+> LAN and hairpin ping sources learned, reflexive addresses kept while idle, and pings only for peers
+> with traffic.
 
 > **Pin bump f36c757e (v0.57.7) → 4fd3276b (v0.57.8), 2026-10-17.** No ask. Engine #634 and #636 put
 > one 120 s watchdog around the whole map poll, so a hung setup, header wait or side request reconnects

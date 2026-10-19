@@ -70,10 +70,11 @@ path = "src/bin/tnet.rs"
 # here with `scripts/check-engine-on-crates-io.sh`, and that the facade was cut from this rev with
 # `scripts/check-engine-rev-released.sh`.
 #
-# The pin is this rev, the engine v0.57.8 release. Since v0.57.5 the engine stores the Serve config
+# The pin is this rev, the engine v0.58.0 release. Since v0.57.5 the engine stores the Serve config
 # in Go's `ipn.ServeConfig` shape, which `src/ipn/serve.rs` maps onto (docs/ENGINE_ASKS.md ask
 # #47), and since v0.57.7 its IPN bus ticks on a self-only netmap change (ask #46). Since v0.57.8 a stalled map poll
-# reconnects after 120 s and direct UDP receive survives a receive error. It keeps russh
+# reconnects after 120 s and direct UDP receive survives a receive error. Since v0.58.0 the engine
+# maps its UDP port with NAT-PMP or PCP, on by default as in Go (TS_DISABLE_PORTMAPPER turns it off). It keeps russh
 # at 0.63.2, closing GHSA-47hw-gvq5-r2gm, GHSA-35g8-35p8-c8fw, GHSA-w3jg-pjxf-73p4 and
 # GHSA-p8qx-h547-fjw9 (engine commit fc862384), now on ring rather than aws-lc. Moving to a
 # `version = "..."` registry dependency is a deliberate engine-version change, gated on the bump
@@ -84,7 +85,7 @@ path = "src/bin/tnet.rs"
 #   paths = ["/path/to/your/tailscale-rs/checkout"]
 # transparently overrides this git dep when the local checkout's version matches the pin —
 # so you can edit the engine and rebuild the daemon with no manifest change. See README.
-tailscale = { package = "geiserx_tailscale", git = "https://github.com/GeiserX/tailscale-rs", rev = "4fd3276bee87ffd7eaad94b74d110a54bb979e30" }
+tailscale = { package = "geiserx_tailscale", git = "https://github.com/GeiserX/tailscale-rs", rev = "6ff0ee70975cb8abd7c1b43a7d9fbff80f41bbf4" }
 # The engine's control crate, pinned to the SAME rev as `tailscale` above (Cargo unifies it to the
 # identical crate instance, so its types ARE the ones the `tailscale` facade's signatures use). We
 # need it directly only to NAME `ts_control::FunnelOptions` for `Device::listen_funnel`: the engine
@@ -92,20 +93,20 @@ tailscale = { package = "geiserx_tailscale", git = "https://github.com/GeiserX/t
 # NOT `FunnelOptions`/`FunnelError`, so the funnel listener is otherwise uncallable from outside the
 # engine crate. Keep this rev in lockstep with `tailscale`'s. (TODO: drop this dep once the engine
 # re-exports the Funnel types at its root — coordinated upstream.)
-ts_control = { package = "geiserx_ts_control", git = "https://github.com/GeiserX/tailscale-rs", rev = "4fd3276bee87ffd7eaad94b74d110a54bb979e30" }
+ts_control = { package = "geiserx_ts_control", git = "https://github.com/GeiserX/tailscale-rs", rev = "6ff0ee70975cb8abd7c1b43a7d9fbff80f41bbf4" }
 
 # The engine's capability-version constant (`CapabilityVersion::CURRENT`), needed to report `cap` in
 # `tnet version --json` (Go's `version.Meta.cap`). Already an engine transitive dep + a published
 # crate; the facade does not re-export it, so name it directly — same workaround pattern as the
 # `ts_control` dep above. Keep this rev in lockstep with `tailscale`'s.
-ts_capabilityversion = { package = "geiserx_ts_capabilityversion", git = "https://github.com/GeiserX/tailscale-rs", rev = "4fd3276bee87ffd7eaad94b74d110a54bb979e30" }
+ts_capabilityversion = { package = "geiserx_ts_capabilityversion", git = "https://github.com/GeiserX/tailscale-rs", rev = "6ff0ee70975cb8abd7c1b43a7d9fbff80f41bbf4" }
 
 # The engine's Tailnet Lock crate, for its AUM CBOR decoder (`ts_tka::Aum::from_cbor`) and hash.
 # `tnet lock log --json=1` decodes each update the way Go's `PrintTailnetLockLogJSONV1` does, and
 # a second, hand-written decoder of a consensus-relevant format would be the wrong thing to own.
 # Already an engine transitive dep; the facade does not re-export it. Keep this rev in lockstep
 # with `tailscale`'s.
-ts_tka = { package = "geiserx_ts_tka", git = "https://github.com/GeiserX/tailscale-rs", rev = "4fd3276bee87ffd7eaad94b74d110a54bb979e30" }
+ts_tka = { package = "geiserx_ts_tka", git = "https://github.com/GeiserX/tailscale-rs", rev = "6ff0ee70975cb8abd7c1b43a7d9fbff80f41bbf4" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "signal"] }
 serde = { version = "1", features = ["derive"] }
