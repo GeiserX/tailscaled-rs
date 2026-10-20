@@ -27,6 +27,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.68.5](https://github.com/GeiserX/tailscaled-rs/compare/v0.68.4...v0.68.5) (2026-10-20)
+
+
+### Bug Fixes
+
+* **deps:** stop trusting certificates minted with the leaked eMudhra keys ([#655](https://github.com/GeiserX/tailscaled-rs/issues/655)) ([54eae07](https://github.com/GeiserX/tailscaled-rs/commit/54eae07f80c9525597c217fdcd916e6846bb1d9c))
+
 ## [0.68.4](https://github.com/GeiserX/tailscaled-rs/compare/v0.68.3...v0.68.4) (2026-10-19)
 
 
