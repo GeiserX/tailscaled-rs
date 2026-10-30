@@ -27,6 +27,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.68.7](https://github.com/GeiserX/tailscaled-rs/compare/v0.68.6...v0.68.7) (2026-10-30)
+
+
+### Bug Fixes
+
+* **deps:** keep advertised endpoints after a control reconnect with engine 0.58.4 ([#662](https://github.com/GeiserX/tailscaled-rs/issues/662)) ([d0b2e02](https://github.com/GeiserX/tailscaled-rs/commit/d0b2e02b7b44ba290e5d8d89437862d0890ca573))
+
 ## [0.68.6](https://github.com/GeiserX/tailscaled-rs/compare/v0.68.5...v0.68.6) (2026-10-21)
 
 
