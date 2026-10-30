@@ -193,7 +193,7 @@ not the genuine one — and the two can disagree.
 The Tailscale control protocol is a moving target keyed by a single integer, the
 **`CapabilityVersion`** (capver): every behavioral change to the client⇄control contract bumps it.
 The daemon **inherits** whatever capver its pinned engine advertises — currently **125** (engine
-`0.58.2`); the full mechanism and discipline are documented in
+`0.58.4`); the full mechanism and discipline are documented in
 [`docs/ENGINE.md` §2](ENGINE.md#2-capability-version-tracking-discipline).
 
 Two independent fidelity gaps stack here:

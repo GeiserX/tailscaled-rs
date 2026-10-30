@@ -4,7 +4,7 @@
 > 0.57.4, pinned on 2026-10-07). The pin is now `d64186e` (engine 0.57.6): #641 ported the serve
 > layer to the engine's Go-shaped Serve config and #643 moved the pin, which closed ask #47. On
 > 2026-10-15 the pin moved again, to `f36c757e` (engine 0.57.7), which closed ask #46, and on
-> 2026-10-17 to `4fd3276b` (engine 0.57.8), which fixed a stalled map poll and a stopped UDP receive, and on 2026-10-19 to `6ff0ee70` (engine 0.58.0), which added the NAT-PMP/PCP port mapper, and on 2026-10-21 to `0631a5fc` (engine 0.58.2), which moved russh to 0.64.1 and evicts the stalest learned candidate.
+> 2026-10-17 to `4fd3276b` (engine 0.57.8), which fixed a stalled map poll and a stopped UDP receive, and on 2026-10-19 to `6ff0ee70` (engine 0.58.0), which added the NAT-PMP/PCP port mapper, and on 2026-10-21 to `0631a5fc` (engine 0.58.2), which moved russh to 0.64.1 and evicts the stalest learned candidate, and on 2026-10-30 to `d92b8598` (engine 0.58.4), which sends the advertised endpoints on every map request.
 > [`docs/ENGINE_ASKS.md`](ENGINE_ASKS.md) is the live record of the engine boundary; where it and this
 > snapshot disagree, it is right.
 
