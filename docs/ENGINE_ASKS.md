@@ -2,7 +2,7 @@
 
 This lists the changes the downstream daemon (`tailscaled-rs`) needs from the `tailscale-rs`
 library to unblock end-to-end features. Each ask is self-contained, additive, and
-backward-compatible. The daemon pins engine rev `d92b8598` (engine 0.58.4, tag `v0.58.4`, since 2026-10-30); individual asks
+backward-compatible. The daemon pins engine rev `12d63f89` (engine 0.58.5, tag `v0.58.5`, since 2026-11-01); individual asks
 note the rev they were verified against (older "verified vs `e126bba`/v0.6.9" / `81446f88`/v0.28.2
 / `6035651b`/v0.29.1 / `f3793636`/v0.31.0 / `575104b1`/v0.32.0 / `f8192568`/v0.33.0 / `1694d208`/v0.34.2
 / `faf46b34`/v0.35.8 notes below predate the current pin and are kept as historical context — the SHIPPED
@@ -24,6 +24,10 @@ v0.40.0 header below, each clippy+test-verified.
 >   the daemon's port to Go's `ipn.ServeConfig` shape. See the first pin-bump note below.
 > - The bumps to `9d847a6e` (engine 0.43.0) and `eabd2cf2` (engine 0.57.4) were not logged when they
 >   landed. Each now has a one-line note below.
+
+> **Pin bump d92b8598 (v0.58.4) → 12d63f89 (v0.58.5), 2026-11-01.** No ask. Engine #666 moves russh
+> to 0.65 and pageant to 0.2.5, and engine #668 moves crypto-bigint to 0.7.10, which clears five russh/pageant
+> advisories and RUSTSEC-2026-0387 from the ssh feature the release binaries ship. Capver stays 125.
 
 > **Pin bump 0631a5fc (v0.58.2) → d92b8598 (v0.58.4), 2026-10-30.** No ask. Engine #662 sends the
 > advertised endpoints on every map request, so control no longer drops them after a map-poll
