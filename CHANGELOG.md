@@ -27,6 +27,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.68.8](https://github.com/GeiserX/tailscaled-rs/compare/v0.68.7...v0.68.8) (2026-11-01)
+
+
+### Bug Fixes
+
+* **deps:** pin engine v0.58.5 so release binaries ship patched russh and crypto-bigint ([#665](https://github.com/GeiserX/tailscaled-rs/issues/665)) ([ad14919](https://github.com/GeiserX/tailscaled-rs/commit/ad149190225af2598a45ce8053e4ed44643ab00e))
+
 ## [0.68.7](https://github.com/GeiserX/tailscaled-rs/compare/v0.68.6...v0.68.7) (2026-10-30)
 
 
