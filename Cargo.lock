@@ -1544,7 +1544,7 @@ dependencies = [
  "ipnet",
  "nix 0.30.1",
  "pty-process",
- "rand 0.10.3",
+ "rand 0.10.4",
  "ratatui",
  "russh",
  "secrecy",
@@ -1639,7 +1639,7 @@ dependencies = [
  "lazy_static",
  "libc",
  "pin-project-lite",
- "rand 0.10.3",
+ "rand 0.10.4",
  "rcgen",
  "ring",
  "rustls-pemfile",
@@ -1854,7 +1854,7 @@ dependencies = [
  "geiserx_ts_transport",
  "if-addrs",
  "libc",
- "rand 0.10.3",
+ "rand 0.10.4",
  "socket2",
  "thiserror 2.0.18",
  "tokio",
@@ -2047,7 +2047,7 @@ dependencies = [
  "kameo",
  "kameo_actors",
  "libc",
- "rand 0.10.3",
+ "rand 0.10.4",
  "smallvec",
  "thiserror 2.0.18",
  "tokio",
@@ -2123,7 +2123,7 @@ dependencies = [
  "geiserx_ts_time",
  "hkdf 0.12.4",
  "itertools",
- "rand 0.10.3",
+ "rand 0.10.4",
  "tracing",
  "x25519-dalek 3.0.0-rc.0",
  "zerocopy",
@@ -3264,7 +3264,7 @@ checksum = "93e7820bc0a80a0238e650327316f929ba18d5be054b647490a3a6a339f3e7c0"
 dependencies = [
  "num-integer",
  "num-traits",
- "rand 0.10.3",
+ "rand 0.10.4",
  "rand_core 0.10.1",
 ]
 
@@ -3392,7 +3392,7 @@ dependencies = [
  "delegate",
  "futures",
  "log",
- "rand 0.10.3",
+ "rand 0.10.4",
  "sha2 0.11.0",
  "thiserror 2.0.18",
  "tokio",
@@ -3857,9 +3857,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.10.3"
+version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
+checksum = "8f6fa277c67e6ea590466f04c3fe82cb509f0864fe470643e5570de9514a9b11"
 dependencies = [
  "chacha20 0.10.0",
  "getrandom 0.4.2",
@@ -4126,7 +4126,7 @@ dependencies = [
  "pkcs5",
  "pkcs8 0.11.0",
  "polyval 0.7.1",
- "rand 0.10.3",
+ "rand 0.10.4",
  "rand_core 0.10.1",
  "ring",
  "russh-cryptovec",
@@ -4837,7 +4837,7 @@ dependencies = [
  "if-addrs",
  "ipnet",
  "libc",
- "rand 0.10.3",
+ "rand 0.10.4",
  "rustls",
  "rustls-pemfile",
  "secrecy",
