@@ -27,6 +27,13 @@ Releases are driven by [Conventional Commits](https://www.conventionalcommits.or
   (and are called out under **Changed**) rather than forcing a major bump. The major
   version stays at `0` until the LocalAPI, prefs schema, and CLI are declared stable.
 
+## [0.68.9](https://github.com/GeiserX/tailscaled-rs/compare/v0.68.8...v0.68.9) (2026-11-24)
+
+
+### Bug Fixes
+
+* **deps:** take etherparse 0.19.1 for the RUSTSEC-2026-0596 out-of-bounds read ([#674](https://github.com/GeiserX/tailscaled-rs/issues/674)) ([74f56cf](https://github.com/GeiserX/tailscaled-rs/commit/74f56cfc2db1744a448b2c3376f9a7d51041119a))
+
 ## [0.68.8](https://github.com/GeiserX/tailscaled-rs/compare/v0.68.7...v0.68.8) (2026-11-01)
 
 

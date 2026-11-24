@@ -4821,7 +4821,7 @@ dependencies = [
 
 [[package]]
 name = "tailscaled-rs"
-version = "0.68.8"
+version = "0.68.9"
 dependencies = [
  "anyhow",
  "argon2",
